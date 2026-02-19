@@ -6,8 +6,8 @@ use zoon::*;
 
 use super::engine::{
     ActorContext, ActorHandle, ActorLoop, ConstructContext, ConstructInfo, ListChange, LOG_DEBUG, NamedChannel, Object,
-    TaggedObject, TimestampedEvent, TypedStream, Value, ValueActor, ValueIdempotencyKey, Variable,
-    Text as EngineText, Tag as EngineTag, switch_map, inc_metric,
+    ScopeId, TaggedObject, TimestampedEvent, TypedStream, Value, ValueIdempotencyKey, Variable,
+    Text as EngineText, Tag as EngineTag, create_actor, switch_map, inc_metric,
 };
 use crate::parser;
 
@@ -2869,7 +2869,7 @@ fn element_text_input(
         .fuse();
 
     // Helper to create change event value with captured Lamport timestamp
-    fn create_change_event_value(construct_context: &ConstructContext, text: String, lamport_time: u64) -> Value {
+    fn create_change_event_value(construct_context: &ConstructContext, text: String, lamport_time: u64, scope_id: ScopeId) -> Value {
         inc_metric!(CHANGE_EVENTS_CONSTRUCTED);
         Object::new_value_with_lamport_time(
             ConstructInfo::new("text_input::change_event", None, "TextInput change event"),
@@ -2880,7 +2880,7 @@ fn element_text_input(
                 ConstructInfo::new("text_input::change_event::text", None, "change text"),
                 construct_context.clone(),
                 "text",
-                ValueActor::new_arc(
+                create_actor(
                     ConstructInfo::new("text_input::change_event::text_actor", None, "change text actor"),
                     ActorContext::default(),
                     TypedStream::infinite(stream::once(future::ready(EngineText::new_value_with_lamport_time(
@@ -2891,7 +2891,8 @@ fn element_text_input(
                         text,
                     ))).chain(stream::pending())),
                     parser::PersistenceId::new(),
-                ).into(),
+                    scope_id,
+                ),
                 parser::PersistenceId::default(),
                 parser::Scope::Root,
             )],
@@ -2900,7 +2901,7 @@ fn element_text_input(
 
     // Helper to create key_down event value with captured Lamport timestamp
     // Only contains 'key', no 'text' - text should be obtained from the change event using LATEST
-    fn create_key_down_event_value(construct_context: &ConstructContext, key: String, lamport_time: u64) -> Value {
+    fn create_key_down_event_value(construct_context: &ConstructContext, key: String, lamport_time: u64, scope_id: ScopeId) -> Value {
         inc_metric!(KEYDOWN_EVENTS_CONSTRUCTED);
         Object::new_value_with_lamport_time(
             ConstructInfo::new("text_input::key_down_event", None, "TextInput key_down event"),
@@ -2912,7 +2913,7 @@ fn element_text_input(
                     ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
                     construct_context.clone(),
                     "key",
-                    ValueActor::new_arc(
+                    create_actor(
                         ConstructInfo::new("text_input::key_down_event::key_actor", None, "key_down key actor"),
                         ActorContext::default(),
                         TypedStream::infinite(stream::once(future::ready(EngineTag::new_value_with_lamport_time(
@@ -2923,7 +2924,8 @@ fn element_text_input(
                             key,
                         ))).chain(stream::pending())),
                         parser::PersistenceId::new(),
-                    ).into(),
+                        scope_id,
+                    ),
                     parser::PersistenceId::default(),
                     parser::Scope::Root,
                 ),
@@ -2935,6 +2937,7 @@ fn element_text_input(
         let construct_context = construct_context.clone();
         async move {
             if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Event handler loop STARTED"); }
+            let scope_id = construct_context.bridge_scope_id.expect("Bug: bridge_scope_id not set for text_input event handler");
             let mut change_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut key_down_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut blur_link_value_sender: Option<NamedChannel<Value>> = None;
@@ -2960,7 +2963,7 @@ fn element_text_input(
                             // Flush the latest buffered change event (only most recent matters)
                             if let Some(buffered_event) = pending_change_event.take() {
                                 if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered change event: lamport={}", buffered_event.lamport_time); }
-                                sender.send_or_drop(create_change_event_value(&construct_context, buffered_event.data, buffered_event.lamport_time));
+                                sender.send_or_drop(create_change_event_value(&construct_context, buffered_event.data, buffered_event.lamport_time, scope_id));
                             }
                             change_link_value_sender = Some(sender);
                         }
@@ -2971,7 +2974,7 @@ fn element_text_input(
                             // Flush any buffered events first
                             for buffered_event in pending_key_down_events.drain(..) {
                                 if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered key_down event: key='{}', lamport={}", buffered_event.data, buffered_event.lamport_time); }
-                                let event_value = create_key_down_event_value(&construct_context, buffered_event.data, buffered_event.lamport_time);
+                                let event_value = create_key_down_event_value(&construct_context, buffered_event.data, buffered_event.lamport_time, scope_id);
                                 let _ = sender.try_send(event_value);
                             }
                             key_down_link_value_sender = Some(sender);
@@ -3046,7 +3049,7 @@ fn element_text_input(
                         }
                         last_change_text = Some(event.data.clone());
                         if let Some(sender) = change_link_value_sender.as_ref() {
-                            sender.send_or_drop(create_change_event_value(&construct_context, event.data, event.lamport_time));
+                            sender.send_or_drop(create_change_event_value(&construct_context, event.data, event.lamport_time, scope_id));
                         } else {
                             // Buffer latest event until sender is ready (keep-latest, lossy)
                             if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering change event (sender not ready)"); }
@@ -3056,7 +3059,7 @@ fn element_text_input(
                     event = key_down_event_receiver.select_next_some() => {
                         if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LOOP received key_down: key='{}', lamport={}, sender_ready={}", event.data, event.lamport_time, key_down_link_value_sender.is_some()); }
                         if let Some(sender) = key_down_link_value_sender.as_ref() {
-                            let event_value = create_key_down_event_value(&construct_context, event.data, event.lamport_time);
+                            let event_value = create_key_down_event_value(&construct_context, event.data, event.lamport_time, scope_id);
                             let result = sender.try_send(event_value);
                             if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LINK send key_down result: {:?}", result.is_ok()); }
                             if result.is_err() {

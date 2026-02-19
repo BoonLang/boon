@@ -412,7 +412,7 @@ pub fn function_element_button(
     .filter_map(future::ready)
     .flatten();
 
-    let event_actor = ValueActor::new_arc(
+    let event_actor = create_actor(
         ConstructInfo::new(
             function_call_id.with_child_id(7),
             None,
@@ -421,7 +421,8 @@ pub fn function_element_button(
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
         PersistenceId::new(),
-    ).into();
+        actor_context.scope_id(),
+    );
 
     TaggedObject::new_constant(
         ConstructInfo::new(
@@ -549,7 +550,7 @@ pub fn function_element_text_input(
     .filter_map(future::ready)
     .flatten();
 
-    let event_actor = ValueActor::new_arc(
+    let event_actor = create_actor(
         ConstructInfo::new(
             function_call_id.with_child_id(9),
             None,
@@ -558,7 +559,8 @@ pub fn function_element_text_input(
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
         PersistenceId::new(),
-    ).into();
+        actor_context.scope_id(),
+    );
 
     TaggedObject::new_constant(
         ConstructInfo::new(
@@ -733,7 +735,7 @@ pub fn function_element_checkbox(
     .filter_map(future::ready)
     .flatten();
 
-    let event_actor = ValueActor::new_arc(
+    let event_actor = create_actor(
         ConstructInfo::new(
             function_call_id.with_child_id(8),
             None,
@@ -742,7 +744,8 @@ pub fn function_element_checkbox(
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
         PersistenceId::new(),
-    ).into();
+        actor_context.scope_id(),
+    );
 
     TaggedObject::new_constant(
         ConstructInfo::new(
@@ -889,7 +892,7 @@ pub fn function_element_label(
     .filter_map(future::ready)
     .flatten();
 
-    let event_actor = ValueActor::new_arc(
+    let event_actor = create_actor(
         ConstructInfo::new(
             function_call_id.with_child_id(6),
             None,
@@ -898,7 +901,8 @@ pub fn function_element_label(
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
         PersistenceId::new(),
-    ).into();
+        actor_context.scope_id(),
+    );
 
     TaggedObject::new_constant(
         ConstructInfo::new(
@@ -1766,7 +1770,7 @@ pub fn function_list_append(
             // containing that specific value and push it.
             // Note: SKIP is not a Value - it's a stream behavior where streams end without
             // producing values. If item is SKIP, this map closure is never called.
-            let new_item_actor = ValueActor::new_arc(
+            let new_item_actor = create_actor(
                 ConstructInfo::new(
                     function_call_id_for_append.with_child_id("appended_item"),
                     None,
@@ -1775,7 +1779,8 @@ pub fn function_list_append(
                 actor_context_for_append.clone(),
                 constant(value),
                 PersistenceId::new(),
-            ).into();
+                actor_context_for_append.scope_id(),
+            );
             TaggedChange::FromAppend(ListChange::Push { item: new_item_actor })
         });
 

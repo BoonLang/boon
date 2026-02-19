@@ -406,11 +406,21 @@ impl<T> NamedChannel<T> {
     pub fn send_or_drop(&self, value: T) {
         if self.inner.clone().try_send(value).is_err() {
             inc_metric!(CHANNEL_DROPS);
-            // Log at debug level - this is expected behavior for high-frequency events
+            if LOG_ACTOR_FLOW {
+                zoon::eprintln!(
+                    "[FLOW] send_or_drop FAILED on '{}' (full or disconnected, capacity: {})",
+                    self.name, self.capacity
+                );
+            }
             #[cfg(feature = "debug-channels")]
             zoon::eprintln!(
                 "[BACKPRESSURE DROP] '{}' dropped event (full, capacity: {})",
                 self.name, self.capacity
+            );
+        } else if LOG_ACTOR_FLOW && self.name == "value_actor.subscriptions" {
+            zoon::println!(
+                "[FLOW] send_or_drop OK on '{}' (subscription sent)",
+                self.name
             );
         }
     }
@@ -455,6 +465,7 @@ impl<T> NamedChannel<T> {
 /// - ValueActor dropped while subscriptions are still active
 /// - Extra owned data not properly keeping actors alive
 const LOG_DROPS_AND_LOOP_ENDS: bool = false;
+const LOG_ACTOR_FLOW: bool = false;
 
 /// Master debug logging flag for the engine.
 /// When enabled, prints detailed information about:
@@ -1265,7 +1276,7 @@ impl Stream for LazySubscription {
 
 // --- ActorMessage ---
 
-/// Messages that can be sent to a ValueActor.
+/// Messages that can be sent to an actor.
 /// All actor communication happens via these typed messages.
 pub enum ActorMessage {
     // === Value Updates ===
@@ -1275,7 +1286,7 @@ pub enum ActorMessage {
     // === Migration Protocol (Phase 3) ===
     /// Request to migrate state to a new actor
     MigrateTo {
-        target: Arc<ValueActor>,
+        target: ActorHandle,
         /// Optional transform to apply to values during migration
         transform: Option<Box<dyn Fn(Value) -> Value + Send>>,
     },
@@ -1293,7 +1304,7 @@ pub enum ActorMessage {
     MigrationComplete,
     /// Redirect all subscribers to a new actor
     RedirectSubscribers {
-        target: Arc<ValueActor>,
+        target: ActorHandle,
     },
 
     // === Lifecycle ===
@@ -1311,7 +1322,7 @@ pub enum MigrationState {
 
     /// Sending state to new actor
     Migrating {
-        target: Arc<ValueActor>,
+        target: ActorHandle,
         /// Optional transform to apply to values
         transform: Option<Box<dyn Fn(Value) -> Value + Send>>,
         /// IDs of batches that haven't been acknowledged yet
@@ -1322,7 +1333,7 @@ pub enum MigrationState {
 
     /// Receiving state from old actor
     Receiving {
-        source: Arc<ValueActor>,
+        source: ActorHandle,
         /// Batches received, keyed by batch_id for ordering
         received_batches: BTreeMap<u64, Vec<Value>>,
     },
@@ -1557,6 +1568,9 @@ impl VirtualFilesystem {
 pub struct ConstructContext {
     pub construct_storage: Arc<ConstructStorage>,
     pub virtual_fs: VirtualFilesystem,
+    /// Registry scope ID for bridge-created actors (event value actors).
+    /// Set by the evaluator from the root scope.
+    pub bridge_scope_id: Option<ScopeId>,
     // NOTE: `previous_actors` was intentionally REMOVED from here.
     // It should NOT be part of ConstructContext because:
     // 1. It gets captured in stream closures, causing memory leaks
@@ -1990,6 +2004,12 @@ pub struct ActorContext {
 }
 
 impl ActorContext {
+    /// Get the registry scope ID, panicking if not set.
+    /// All actors should be created within a scope after evaluation starts.
+    pub fn scope_id(&self) -> ScopeId {
+        self.registry_scope_id.expect("Bug: no registry scope - all actors should be created within a scope")
+    }
+
     /// Creates a child context with a new unique nested scope.
     ///
     /// Use this when evaluating code that needs isolation from siblings:
@@ -2333,6 +2353,7 @@ impl Variable {
         let (link_value_sender, link_value_receiver) = NamedChannel::new("link.values", 128);
         // Capture the scope before actor_context is moved
         let scope = actor_context.scope.clone();
+        let scope_id = actor_context.scope_id();
 
         // Wrap the receiver stream with logging to trace values reaching the link_value_actor
         // We'll capture the actor's address after Arc creation for correlation
@@ -2349,18 +2370,14 @@ impl Variable {
             value
         });
 
-        let value_actor =
-            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(logged_receiver), persistence_id);
-        let value_actor = Arc::new(value_actor);
-
-        // Log the actor's unique ID (pointer address) for correlation with forwarding loops
         if LOG_DEBUG {
-            let actor_addr = Arc::as_ptr(&value_actor) as usize;
-            zoon::println!("[LINK_ACTOR] Created link_value_actor addr={:x} pid={} scope={:?} for {}",
-                actor_addr, persistence_id, scope, variable_description_for_log);
+            zoon::println!("[LINK_ACTOR] Created link_value_actor pid={} scope={:?} for {}",
+                persistence_id, scope, variable_description_for_log);
         }
 
-        let value_actor: ActorHandle = value_actor.into();
+        let value_actor = create_actor_complete(
+            actor_construct_info, actor_context, TypedStream::infinite(logged_receiver), persistence_id, scope_id,
+        );
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
@@ -2707,12 +2724,14 @@ impl VariableOrArgumentReference {
             });
         }
         // Subscription-based streams are infinite (subscriptions never terminate first)
-        Arc::new(ValueActor::new(
+        let scope_id = actor_context.scope_id();
+        create_actor_complete(
             construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
             parser::PersistenceId::new(),
-        )).into()
+            scope_id,
+        )
     }
 }
 
@@ -3210,18 +3229,21 @@ impl FunctionCall {
         // In lazy mode, use LazyValueActor for demand-driven evaluation.
         // This is critical for HOLD body context where sequential state updates are needed.
         if actor_context.use_lazy_actors {
-            ValueActor::new_arc_lazy(
+            create_actor_lazy(
                 construct_info,
                 combined_stream,
                 parser::PersistenceId::new(),
-            ).into()
+                actor_context.scope_id(),
+            )
         } else {
-            Arc::new(ValueActor::new(
+            let scope_id = actor_context.scope_id();
+            create_actor_complete(
                 construct_info,
                 actor_context,
                 TypedStream::infinite(combined_stream),
                 parser::PersistenceId::new(),
-            )).into()
+                scope_id,
+            )
         }
     }
 }
@@ -3312,12 +3334,14 @@ impl LatestCombinator {
             .filter_map(future::ready);
 
         // Subscription-based streams are infinite (subscriptions never terminate first)
-        Arc::new(ValueActor::new(
+        let scope_id = actor_context.scope_id();
+        create_actor_complete(
             construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
             parser::PersistenceId::new(),
-        )).into()
+            scope_id,
+        )
     }
 }
 
@@ -3347,10 +3371,9 @@ impl BinaryOperatorCombinator {
         // Use stream() to properly handle lazy actors in HOLD body context.
         // Sort by Lamport timestamp to restore happened-before ordering when both
         // operands have values ready at the same time.
-        let value_stream = stream::select_all([
-            operand_a.clone().stream().map(|v| (0usize, v)).boxed_local(),
-            operand_b.clone().stream().map(|v| (1usize, v)).boxed_local(),
-        ])
+        let a_stream = operand_a.stream().map(|v| (0usize, v));
+        let b_stream = operand_b.stream().map(|v| (1usize, v));
+        let value_stream = stream::select_all([a_stream.boxed_local(), b_stream.boxed_local()])
         .ready_chunks(4)  // Buffer concurrent values
         .flat_map(|mut chunk| {
             chunk.sort_by_key(|(_, value)| value.lamport_time());
@@ -3381,12 +3404,14 @@ impl BinaryOperatorCombinator {
         });
 
         // Subscription-based streams are infinite (subscriptions never terminate first)
-        Arc::new(ValueActor::new(
+        let scope_id = actor_context.scope_id();
+        create_actor_complete(
             construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
             parser::PersistenceId::new(),
-        )).into()
+            scope_id,
+        )
     }
 }
 
@@ -3786,6 +3811,32 @@ pub struct OwnedActor {
     construct_info: Arc<ConstructInfoComplete>,
     scope_id: ScopeId,
     list_item_origin: Option<Arc<ListItemOrigin>>,
+    /// Lazy delegate (kept alive by OwnedActor, referenced by ActorHandle for routing).
+    lazy_delegate: Option<Arc<LazyValueActor>>,
+    /// Keepalive copies of channel senders. The actor loop holds the receivers.
+    /// Without these, when all ActorHandle clones are dropped (e.g., evaluation state cleanup),
+    /// the channel senders are lost, causing receivers to close and the actor loop to exit.
+    /// The registry owns the actor's lifetime, so these senders must live as long as the OwnedActor.
+    _channel_keepalive: ChannelKeepalive,
+}
+
+/// Holds sender clones to keep actor channels alive as long as the OwnedActor exists in the registry.
+/// When the OwnedActor is dropped (scope destruction), these are dropped too, closing the channels
+/// and allowing the actor loop to exit naturally.
+struct ChannelKeepalive {
+    _subscription: NamedChannel<SubscriptionSetup>,
+    _message: NamedChannel<ActorMessage>,
+    _direct_store: NamedChannel<Value>,
+    _query: NamedChannel<StoredValueQuery>,
+}
+
+impl Drop for OwnedActor {
+    fn drop(&mut self) {
+        inc_metric!(ACTORS_DROPPED);
+        if LOG_DROPS_AND_LOOP_ENDS {
+            zoon::println!("Dropped: {}", self.construct_info);
+        }
+    }
 }
 
 /// A scope groups actors with a common lifetime.
@@ -3870,6 +3921,9 @@ impl ActorRegistry {
         // Collect children and actors before removing
         let children: Vec<ScopeId> = scope.children.clone();
         let actors: Vec<ActorId> = scope.actors.clone();
+        if LOG_ACTOR_FLOW {
+            zoon::println!("[FLOW] destroy_scope({:?}): {} children, {} actors: {:?}", scope_id, children.len(), actors.len(), actors);
+        }
 
         // Free the scope slot with incremented generation
         let old_gen = scope_id.generation;
@@ -3914,7 +3968,11 @@ impl ActorRegistry {
     pub fn remove_actor(&mut self, actor_id: ActorId) {
         let actor_idx = usize::try_from(actor_id.index).unwrap();
         match &self.actors.get(actor_idx) {
-            Some(Slot::Occupied { generation, .. }) if *generation == actor_id.generation => {}
+            Some(Slot::Occupied { generation, value }) if *generation == actor_id.generation => {
+                if LOG_ACTOR_FLOW {
+                    zoon::println!("[FLOW] remove_actor({:?}): dropping {}", actor_id, value.construct_info);
+                }
+            }
             _ => return,
         }
         let old_gen = actor_id.generation;
@@ -3926,6 +3984,15 @@ impl ActorRegistry {
     pub fn get_actor(&self, actor_id: ActorId) -> Option<&OwnedActor> {
         let actor_idx = usize::try_from(actor_id.index).ok()?;
         match self.actors.get(actor_idx)? {
+            Slot::Occupied { generation, value } if *generation == actor_id.generation => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Get a mutable reference to an owned actor.
+    pub fn get_actor_mut(&mut self, actor_id: ActorId) -> Option<&mut OwnedActor> {
+        let actor_idx = usize::try_from(actor_id.index).ok()?;
+        match self.actors.get_mut(actor_idx)? {
             Slot::Occupied { generation, value } if *generation == actor_id.generation => Some(value),
             _ => None,
         }
@@ -3954,13 +4021,12 @@ impl ActorRegistry {
 
 /// Lightweight, clone-able handle for interacting with an actor.
 ///
-/// Unlike `Arc<ValueActor>`, cloning an ActorHandle does NOT keep the actor alive
-/// (unless `_keepalive` is set during the transition period).
+/// Unlike `Arc<ValueActor>`, cloning an ActorHandle does NOT keep the actor alive.
 /// The `ActorRegistry` owns the actor (via `OwnedActor`). The handle only holds
 /// channel senders and metadata needed to send messages to the actor.
 ///
-/// This is the Track D replacement for `Arc<ValueActor>` — it separates
-/// "how to talk to an actor" (ActorHandle) from "who owns the actor" (registry scope).
+/// This separates "how to talk to an actor" (ActorHandle) from
+/// "who owns the actor" (registry scope).
 #[derive(Clone)]
 pub struct ActorHandle {
     actor_id: ActorId,
@@ -3991,11 +4057,6 @@ pub struct ActorHandle {
 
     /// Origin info for items created by persisted List/append.
     list_item_origin: Option<Arc<ListItemOrigin>>,
-
-    /// Transition compatibility: keeps the underlying Arc<ValueActor> alive
-    /// for actors created via old code paths. Will be removed when registry
-    /// scope destruction (Step 5.7) handles all actor lifetimes.
-    _keepalive: Option<Arc<ValueActor>>,
 }
 
 impl ActorHandle {
@@ -4044,28 +4105,21 @@ impl ActorHandle {
 
     /// Subscribe to continuous stream of all values from version 0.
     ///
-    /// During transition: captures _keepalive to keep the actor alive.
-    /// After full migration: registry scope owns the actor's lifetime.
+    /// The registry scope owns the actor's lifetime.
     pub fn stream(&self) -> LocalBoxStream<'static, Value> {
         if let Some(ref lazy_delegate) = self.lazy_delegate {
+            if LOG_ACTOR_FLOW { zoon::println!("[FLOW] stream() on {:?} → lazy delegate", self.actor_id); }
             return lazy_delegate.clone().stream().boxed_local();
         }
 
         let (tx, rx) = mpsc::channel(32);
+        if LOG_ACTOR_FLOW { zoon::println!("[FLOW] stream() on {:?} → sending subscription (v0)", self.actor_id); }
         self.subscription_sender.send_or_drop(SubscriptionSetup {
             sender: tx,
             starting_version: 0,
         });
 
-        // Capture _keepalive in the stream to keep the actor alive for its lifetime
-        let keepalive = self._keepalive.clone();
-        stream::unfold(rx, move |mut rx| {
-            let _keepalive = keepalive.clone();
-            async move {
-                let item = rx.next().await?;
-                Some((item, rx))
-            }
-        }).boxed_local()
+        rx.boxed_local()
     }
 
     /// Subscribe starting from current version - only future values.
@@ -4081,15 +4135,7 @@ impl ActorHandle {
             starting_version: current_version,
         });
 
-        // Capture _keepalive in the stream to keep the actor alive for its lifetime
-        let keepalive = self._keepalive.clone();
-        stream::unfold(rx, move |mut rx| {
-            let _keepalive = keepalive.clone();
-            async move {
-                let item = rx.next().await?;
-                Some((item, rx))
-            }
-        }).boxed_local()
+        rx.boxed_local()
     }
 
     /// Get exactly ONE value - waiting if necessary.
@@ -4110,16 +4156,7 @@ impl ActorHandle {
         self
     }
 
-    /// Extract the inner keepalive Arc<ValueActor> (transition helper).
-    ///
-    /// Returns the underlying Arc<ValueActor> for handles created via
-    /// `From<Arc<ValueActor>>`. Returns None for registry-owned handles.
-    /// Used for creating Weak references (e.g., in HOLD to avoid cycles).
-    pub fn keepalive(&self) -> Option<Arc<ValueActor>> {
-        self._keepalive.clone()
-    }
-
-    /// Set extra loops (builder pattern, used during transition).
+    /// Set extra loops (builder pattern).
     pub fn set_extra_loops_on_owned(&self, extra_loops: Vec<ActorLoop>) {
         REGISTRY.with(|reg| {
             let mut reg = reg.borrow_mut();
@@ -4133,43 +4170,42 @@ impl ActorHandle {
     }
 }
 
-/// Sentinel ActorId for handles created from legacy Arc<ValueActor>.
-/// These actors are NOT in the registry — they're kept alive by _keepalive.
-const LEGACY_ACTOR_ID: ActorId = ActorId { index: u32::MAX, generation: u32::MAX };
-
-impl From<Arc<ValueActor>> for ActorHandle {
-    fn from(actor: Arc<ValueActor>) -> Self {
-        Self {
-            actor_id: LEGACY_ACTOR_ID,
-            subscription_sender: actor.subscription_sender.clone(),
-            direct_store_sender: actor.direct_store_sender.clone(),
-            stored_value_query_sender: actor.stored_value_query_sender.clone(),
-            message_sender: actor.message_sender.clone(),
-            ready_signal: actor.ready_signal.clone(),
-            current_version: actor.current_version.clone(),
-            persistence_id: actor.persistence_id,
-            lazy_delegate: actor.lazy_delegate.clone(),
-            list_item_origin: actor.list_item_origin.clone(),
-            _keepalive: Some(actor),
-        }
-    }
-}
-
 /// Create an actor in the registry and return a handle to interact with it.
 ///
-/// This is the Track D replacement for `ValueActor::new`.
 /// The `OwnedActor` (loop, construct_info) goes into the registry under `scope_id`.
-/// The returned `ActorHandle` holds only channel senders.
-#[allow(dead_code)]
-fn create_actor<S: Stream<Item = Value> + 'static>(
+/// The returned `ActorHandle` holds only channel senders — cloning it does NOT keep the actor alive.
+pub fn create_actor<S: Stream<Item = Value> + 'static>(
+    construct_info: ConstructInfo,
+    actor_context: ActorContext,
+    value_stream: TypedStream<S, Infinite>,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+) -> ActorHandle {
+    let construct_info = Arc::new(construct_info.complete(ConstructType::ValueActor));
+    create_actor_arc_info(construct_info, actor_context, value_stream, persistence_id, scope_id)
+}
+
+/// Create an actor from a pre-completed `ConstructInfoComplete`.
+///
+/// Use this in construct implementations that already have `ConstructInfoComplete`.
+pub fn create_actor_complete<S: Stream<Item = Value> + 'static>(
     construct_info: ConstructInfoComplete,
     actor_context: ActorContext,
     value_stream: TypedStream<S, Infinite>,
     persistence_id: parser::PersistenceId,
     scope_id: ScopeId,
 ) -> ActorHandle {
+    create_actor_arc_info(Arc::new(construct_info), actor_context, value_stream, persistence_id, scope_id)
+}
+
+fn create_actor_arc_info<S: Stream<Item = Value> + 'static>(
+    construct_info: Arc<ConstructInfoComplete>,
+    actor_context: ActorContext,
+    value_stream: TypedStream<S, Infinite>,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+) -> ActorHandle {
     inc_metric!(ACTORS_CREATED);
-    let construct_info = Arc::new(construct_info);
     let (message_sender, message_receiver) = NamedChannel::new("value_actor.messages", 16);
     let current_version = Arc::new(AtomicU64::new(0));
 
@@ -4189,6 +4225,7 @@ fn create_actor<S: Stream<Item = Value> + 'static>(
         let output_valve_signal = actor_context.output_valve_signal;
 
         async move {
+            if LOG_ACTOR_FLOW { zoon::println!("[FLOW] Actor loop STARTED: {construct_info}"); }
             let mut value_history = ValueHistory::new(64);
             let mut subscribers: Vec<mpsc::Sender<Value>> = Vec::new();
             let mut stream_ever_produced = false;
@@ -4215,11 +4252,14 @@ fn create_actor<S: Stream<Item = Value> + 'static>(
                     setup = subscription_receiver.next() => {
                         if let Some(SubscriptionSetup { mut sender, starting_version }) = setup {
                             if stream_ended && !stream_ever_produced {
+                                if LOG_ACTOR_FLOW { zoon::println!("[FLOW] {construct_info}: subscription dropped (stream ended, never produced)"); }
                                 drop(sender);
                             } else {
-                                let historical_values = value_history.get_values_since(starting_version).0;
+                                let (historical_values, _) = value_history.get_values_since(starting_version);
+                                if LOG_ACTOR_FLOW { zoon::println!("[FLOW] {construct_info}: new subscriber (v{starting_version}), replaying {} historical values, stream_ended={stream_ended}", historical_values.len()); }
                                 for value in historical_values {
                                     if sender.try_send(value.clone()).is_err() {
+                                        if LOG_ACTOR_FLOW { zoon::println!("[FLOW] {construct_info}: historical value replay FAILED (channel full/closed)"); }
                                         break;
                                     }
                                 }
@@ -4309,6 +4349,7 @@ fn create_actor<S: Stream<Item = Value> + 'static>(
 
                     new_value = value_stream.next() => {
                         let Some(new_value) = new_value else {
+                            if LOG_ACTOR_FLOW { zoon::println!("[FLOW] {construct_info}: value_stream ENDED (stream_ever_produced={stream_ever_produced})"); }
                             stream_ended = true;
                             if !stream_ever_produced {
                                 subscribers.clear();
@@ -4323,6 +4364,7 @@ fn create_actor<S: Stream<Item = Value> + 'static>(
                             }
                         }
                         let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                        if LOG_ACTOR_FLOW { zoon::println!("[FLOW] {construct_info}: value_stream produced v{new_version}, broadcasting to {} subscribers", subscribers.len()); }
                         value_history.add(new_version, new_value.clone());
                         subscribers.retain_mut(|tx| {
                             match tx.try_send(new_value.clone()) {
@@ -4360,6 +4402,13 @@ fn create_actor<S: Stream<Item = Value> + 'static>(
         construct_info: construct_info.clone(),
         scope_id,
         list_item_origin: None,
+        lazy_delegate: None,
+        _channel_keepalive: ChannelKeepalive {
+            _subscription: subscription_sender.clone(),
+            _message: message_sender.clone(),
+            _direct_store: direct_store_sender.clone(),
+            _query: stored_value_query_sender.clone(),
+        },
     };
 
     let actor_id = REGISTRY.with(|reg| {
@@ -4377,1009 +4426,345 @@ fn create_actor<S: Stream<Item = Value> + 'static>(
         persistence_id,
         lazy_delegate: None,
         list_item_origin: None,
-        _keepalive: None,
     }
 }
 
-// --- ValueActor ---
-
-/// A message-based actor that manages a reactive value stream.
-///
-/// ValueActor uses explicit message passing for all communication:
-/// - Subscriptions are managed via Subscribe/Unsubscribe messages
-/// - Values flow from the input stream to subscribers
-///
-/// Input actors are kept alive by `ActorHandle::_keepalive` captures in
-/// subscription streams (via `ActorHandle::stream()`), not by explicit tracking.
-///
-/// This design prevents "receiver is gone" errors by:
-/// 1. Never terminating the internal loop when input stream ends
-/// 2. Only shutting down via explicit Shutdown message
-pub struct ValueActor {
-    construct_info: Arc<ConstructInfoComplete>,
+/// Create an actor with a pre-set initial value (version starts at 1, ready fires immediately).
+pub fn create_actor_with_initial_value<S: Stream<Item = Value> + 'static>(
+    construct_info: ConstructInfo,
+    actor_context: ActorContext,
+    value_stream: TypedStream<S, Infinite>,
     persistence_id: parser::PersistenceId,
+    initial_value: Value,
+    scope_id: ScopeId,
+) -> ActorHandle {
+    inc_metric!(ACTORS_CREATED);
+    let value_stream = value_stream.inner;
+    let construct_info = Arc::new(construct_info.complete(ConstructType::ValueActor));
+    let (message_sender, message_receiver) = NamedChannel::new("value_actor.initial.messages", 16);
+    let current_version = Arc::new(AtomicU64::new(1));
 
-    /// Message channel for actor communication (migration, shutdown).
-    /// Bounded(16) - low frequency control messages.
-    message_sender: NamedChannel<ActorMessage>,
+    let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.initial.subscriptions", 32);
+    let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.initial.direct_store", 64);
+    let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.initial.queries", 8);
 
-    /// Current version number - increments on each value change.
-    current_version: Arc<AtomicU64>,
+    let (ready_tx, ready_rx) = oneshot::channel::<()>();
+    ready_tx.send(()).ok();
+    let ready_signal = ready_rx.shared();
 
-    /// Channel for fire-and-forget subscription setup.
-    /// The caller creates the channel and sends the sender - no reply needed.
-    /// Bounded(32) - subscription bursts during initialization.
-    subscription_sender: NamedChannel<SubscriptionSetup>,
+    let actor_loop = ActorLoop::new({
+        let construct_info = construct_info.clone();
+        let current_version = current_version.clone();
+        let output_valve_signal = actor_context.output_valve_signal;
 
-    /// Channel for direct value storage.
-    /// Used by HOLD to store values without going through the input stream.
-    /// Bounded(64) - high frequency state updates from HOLD.
-    direct_store_sender: NamedChannel<Value>,
+        async move {
+            let mut value_history = {
+                let mut history = ValueHistory::new(64);
+                history.add(1, initial_value);
+                history
+            };
+            let mut subscribers: Vec<mpsc::Sender<Value>> = Vec::new();
+            let mut stream_ever_produced = true;
+            let mut stream_ended = false;
 
-    /// Channel for stored value queries.
-    /// Used by stored_value() and snapshot() to get current value.
-    /// Bounded(8) - low frequency queries.
-    stored_value_query_sender: NamedChannel<StoredValueQuery>,
+            let mut output_valve_impulse_stream =
+                if let Some(output_valve_signal) = &output_valve_signal {
+                    output_valve_signal.stream().left_stream()
+                } else {
+                    stream::pending().right_stream()
+                }
+                .fuse();
+            let mut value_stream = pin!(value_stream.fuse());
+            let mut message_receiver = pin!(message_receiver.fuse());
+            let mut subscription_receiver = pin!(subscription_receiver.fuse());
+            let mut direct_store_receiver = pin!(direct_store_receiver.fuse());
+            let mut stored_value_query_receiver = pin!(stored_value_query_receiver.fuse());
+            let migration_state = MigrationState::Normal;
 
-    /// Signal that fires when actor has processed at least one value.
-    /// Used by stream() to wait for initial value instead of arbitrary yields.
-    ready_signal: Shared<oneshot::Receiver<()>>,
-
-    /// The actor's internal loop.
-    actor_loop: ActorLoop,
-
-    /// Optional lazy delegate for demand-driven evaluation.
-    /// When Some, subscribe() delegates to this lazy actor instead of the normal subscription.
-    lazy_delegate: Option<Arc<LazyValueActor>>,
-
-    /// Extra ActorLoops that should be kept alive with this actor.
-    extra_loops: Vec<ActorLoop>,
-
-    /// Origin info for items created by persisted List/append.
-    /// When this item is removed by List/remove, the origin is used
-    /// to update the branch's removed set in storage.
-    list_item_origin: Option<Arc<ListItemOrigin>>,
-}
-
-impl ValueActor {
-    /// Create a new ValueActor from a stream.
-    ///
-    /// # Arguments
-    /// - `construct_info`: Metadata about this construct
-    /// - `actor_context`: Context including output valve signal
-    /// - `value_stream`: The input stream of values (should be infinite)
-    /// - `persistence_id`: Optional ID for state persistence
-    ///
-    /// # Notes
-    /// The stream SHOULD be infinite for best results, but the actor will
-    /// NOT terminate when the stream ends - it continues waiting for messages.
-    pub fn new<S: Stream<Item = Value> + 'static>(
-        construct_info: ConstructInfoComplete,
-        actor_context: ActorContext,
-        value_stream: TypedStream<S, Infinite>,
-        persistence_id: parser::PersistenceId,
-    ) -> Self {
-        inc_metric!(ACTORS_CREATED);
-        let construct_info = Arc::new(construct_info);
-        let (message_sender, message_receiver) = NamedChannel::new("value_actor.messages", 16);
-        let current_version = Arc::new(AtomicU64::new(0));
-
-        // Bounded channel for fire-and-forget subscription setup
-        let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.subscriptions", 32);
-
-        // Bounded channel for direct value storage
-        let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.direct_store", 64);
-
-        // Bounded channel for stored value queries
-        let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.queries", 8);
-
-        // Oneshot channel for ready signal - fires when first value is processed
-        let (ready_tx, ready_rx) = oneshot::channel::<()>();
-        let ready_signal = ready_rx.shared();
-
-        let boxed_stream: std::pin::Pin<Box<dyn Stream<Item = Value>>> =
-            Box::pin(value_stream.inner);
-
-        let actor_loop = ActorLoop::new({
-            let construct_info = construct_info.clone();
-            let current_version = current_version.clone();
-            let output_valve_signal = actor_context.output_valve_signal;
-
-            async move {
-                // Actor-local state (no Mutex needed!)
-                let mut value_history = ValueHistory::new(64);
-                let mut subscribers: Vec<mpsc::Sender<Value>> = Vec::new();
-                let mut stream_ever_produced = false;
-                let mut stream_ended = false;
-                // Ready signal sender - consumed on first value
-                let mut ready_tx = Some(ready_tx);
-
-                let mut output_valve_impulse_stream =
-                    if let Some(output_valve_signal) = &output_valve_signal {
-                        output_valve_signal.stream().left_stream()
-                    } else {
-                        stream::pending().right_stream()
+            loop {
+                select! {
+                    setup = subscription_receiver.next() => {
+                        if let Some(SubscriptionSetup { mut sender, starting_version }) = setup {
+                            if stream_ended && !stream_ever_produced {
+                                drop(sender);
+                            } else {
+                                for value in value_history.get_values_since(starting_version).0 {
+                                    if sender.try_send(value.clone()).is_err() { break; }
+                                }
+                                subscribers.push(sender);
+                            }
+                        }
                     }
-                    .fuse();
 
-                let mut value_stream = boxed_stream.fuse();
-                let mut message_receiver = pin!(message_receiver.fuse());
-                let mut subscription_receiver = pin!(subscription_receiver.fuse());
-                let mut direct_store_receiver = pin!(direct_store_receiver.fuse());
-                let mut stored_value_query_receiver = pin!(stored_value_query_receiver.fuse());
-                let mut migration_state = MigrationState::Normal;
-
-                loop {
-                    select! {
-                        // Handle fire-and-forget subscription setup
-                        setup = subscription_receiver.next() => {
-                            if let Some(SubscriptionSetup { mut sender, starting_version }) = setup {
-                                // If stream ended without producing any value (SKIP case),
-                                // just close the sender to signal completion
-                                if stream_ended && !stream_ever_produced {
-                                    drop(sender); // Close immediately - caller's receiver will see closed channel
-                                } else {
-                                    // Send historical values from starting_version
-                                    let historical_values = value_history.get_values_since(starting_version).0;
-                                    for value in historical_values {
-                                        // Best effort - if channel full or disconnected, skip
-                                        if sender.try_send(value.clone()).is_err() {
-                                            break;
-                                        }
-                                    }
-                                    // Add to live subscribers list
-                                    // If sender is already disconnected (caller dropped), it will be cleaned up
-                                    // on next value push via retain_mut
-                                    subscribers.push(sender);
-                                }
-                            }
-                        }
-
-                        // Handle direct value storage (from store_value_directly)
-                        value = direct_store_receiver.next() => {
-                            if let Some(value) = value {
-                                if !stream_ever_produced {
-                                    stream_ever_produced = true;
-                                    if let Some(tx) = ready_tx.take() {
-                                        // Ready signal receiver dropped is fine - caller may not care about readiness
-                                        tx.send(()).ok();
-                                    }
-                                }
-                                let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                                value_history.add(new_version, value.clone());
-
-                                // Push value to all subscribers (only remove on disconnect, not backpressure)
-                                subscribers.retain_mut(|tx| {
-                                    match tx.try_send(value.clone()) {
-                                        Ok(()) => true,
-                                        Err(e) if e.is_disconnected() => false,
-                                        Err(_) => true,
-                                    }
-                                });
-                            }
-                        }
-
-                        // Handle stored value queries
-                        query = stored_value_query_receiver.next() => {
-                            if let Some(StoredValueQuery { reply }) = query {
-                                let current_value = value_history.get_latest();
-                                if reply.send(current_value).is_err() {
-                                    zoon::println!("[VALUE_ACTOR] Stored value query reply receiver dropped");
-                                }
-                            }
-                        }
-
-                        // Handle messages from the message channel
-                        msg = message_receiver.next() => {
-                            let Some(msg) = msg else {
-                                // Channel closed - ValueActor was dropped, exit the loop
-                                break;
-                            };
-                            match msg {
-                                ActorMessage::StreamValue(value) => {
-                                    // Value received from migration source
-                                    if !stream_ever_produced {
-                                        stream_ever_produced = true;
-                                        if let Some(tx) = ready_tx.take() {
-                                            // Ready signal receiver dropped is fine - caller may not care about readiness
-                                            tx.send(()).ok();
-                                        }
-                                    }
-                                    let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                                    value_history.add(new_version, value.clone());
-
-                                    // Push value to all subscribers (only remove on disconnect, not backpressure)
-                                    subscribers.retain_mut(|tx| {
-                                        match tx.try_send(value.clone()) {
-                                            Ok(()) => true,
-                                            Err(e) if e.is_disconnected() => false,
-                                            Err(_) => true,
-                                        }
-                                    });
-                                }
-                                ActorMessage::MigrateTo { target, transform } => {
-                                    migration_state = MigrationState::Migrating {
-                                        target,
-                                        transform,
-                                        pending_batches: HashSet::new(),
-                                        buffered_writes: Vec::new(),
-                                    };
-                                }
-                                ActorMessage::MigrationBatch { batch_id, items, is_final: _ } => {
-                                    if let MigrationState::Receiving { received_batches, source: _ } = &mut migration_state {
-                                        received_batches.insert(batch_id, items);
-                                    }
-                                }
-                                ActorMessage::BatchAck { batch_id } => {
-                                    if let MigrationState::Migrating { pending_batches, .. } = &mut migration_state {
-                                        pending_batches.remove(&batch_id);
-                                    }
-                                }
-                                ActorMessage::MigrationComplete => {
-                                    migration_state = MigrationState::Normal;
-                                }
-                                ActorMessage::RedirectSubscribers { target: _ } => {
-                                    migration_state = MigrationState::ShuttingDown;
-                                }
-                                ActorMessage::Shutdown => {
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Handle values from the input stream
-                        new_value = value_stream.next() => {
-                            let Some(new_value) = new_value else {
-                                // Stream ended - but we DON'T break!
-                                stream_ended = true;
-                                if !stream_ever_produced {
-                                    // Clear subscribers - they'll see channel closed
-                                    subscribers.clear();
-                                }
-                                continue;
-                            };
-
-                            if !stream_ever_produced {
-                                stream_ever_produced = true;
-                                if let Some(tx) = ready_tx.take() {
-                                    // Ready signal receiver dropped is fine - caller may not care about readiness
-                                    tx.send(()).ok();
-                                }
-                            }
+                    value = direct_store_receiver.next() => {
+                        if let Some(value) = value {
+                            stream_ever_produced = true;
                             let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-
-                            value_history.add(new_version, new_value.clone());
-
-                            // Push value to all subscribers
-                            // Only remove on Disconnected (receiver dropped), NOT on Full (backpressure)
-                            subscribers.retain_mut(|tx| {
-                                match tx.try_send(new_value.clone()) {
-                                    Ok(()) => true,
-                                    Err(e) if e.is_disconnected() => false,
-                                    Err(_) => true, // Full or other - keep subscriber
-                                }
-                            });
-
-                            // Handle migration forwarding
-                            if let MigrationState::Migrating { buffered_writes, target, .. } = &mut migration_state {
-                                buffered_writes.push(new_value.clone());
-                                if let Err(e) = target.send_message(ActorMessage::StreamValue(new_value)) {
-                                    zoon::println!("[VALUE_ACTOR] Migration forward failed: {e}");
-                                }
-                            }
+                            value_history.add(new_version, value.clone());
+                            subscribers.retain_mut(|tx| match tx.try_send(value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
                         }
+                    }
 
-                        // Handle output valve impulses
-                        impulse = output_valve_impulse_stream.next() => {
-                            if impulse.is_none() {
-                                continue;
+                    query = stored_value_query_receiver.next() => {
+                        if let Some(StoredValueQuery { reply }) = query {
+                            let current_value = value_history.get_latest();
+                            if reply.send(current_value).is_err() {
+                                zoon::println!("[VALUE_ACTOR] Stored value query reply receiver dropped");
                             }
                         }
                     }
-                }
 
-                if LOG_DROPS_AND_LOOP_ENDS {
-                    zoon::println!("Loop ended {construct_info}");
-                }
-            }
-        });
-
-        Self {
-            construct_info,
-            persistence_id,
-            message_sender,
-            current_version,
-            subscription_sender,
-            direct_store_sender,
-            stored_value_query_sender,
-            ready_signal,
-            actor_loop,
-            lazy_delegate: None,
-            extra_loops: Vec::new(),
-            list_item_origin: None,
-        }
-    }
-
-    /// Send a message to this actor.
-    /// Uses try_send (non-blocking) - returns error if channel full or closed.
-    pub fn send_message(&self, msg: ActorMessage) -> Result<(), mpsc::TrySendError<ActorMessage>> {
-        self.message_sender.try_send(msg)
-    }
-
-    pub fn new_arc<S: Stream<Item = Value> + 'static>(
-        construct_info: ConstructInfo,
-        actor_context: ActorContext,
-        value_stream: TypedStream<S, Infinite>,
-        persistence_id: parser::PersistenceId,
-    ) -> Arc<Self> {
-        Arc::new(Self::new(
-            construct_info.complete(ConstructType::ValueActor),
-            actor_context,
-            value_stream,
-            persistence_id,
-        ))
-    }
-
-    /// Create a new Arc<ValueActor> with list item origin info.
-    /// Used for items created by persisted List/append - the origin allows
-    /// List/remove to track removals in branch-local storage.
-    pub fn new_arc_with_origin<S: Stream<Item = Value> + 'static>(
-        construct_info: ConstructInfo,
-        actor_context: ActorContext,
-        value_stream: TypedStream<S, Infinite>,
-        persistence_id: parser::PersistenceId,
-        origin: ListItemOrigin,
-    ) -> Arc<Self> {
-        let mut actor = Self::new(
-            construct_info.complete(ConstructType::ValueActor),
-            actor_context,
-            value_stream,
-            persistence_id,
-        );
-        actor.list_item_origin = Some(Arc::new(origin));
-        Arc::new(actor)
-    }
-
-    /// Create a new Arc<ValueActor> with list item origin info from a boxed stream.
-    /// Used for restored items where the stream is dynamically typed.
-    pub fn new_arc_with_origin_boxed(
-        construct_info: ConstructInfo,
-        actor_context: ActorContext,
-        value_stream: Pin<Box<dyn Stream<Item = Value> + 'static>>,
-        persistence_id: parser::PersistenceId,
-        origin: ListItemOrigin,
-    ) -> Arc<Self> {
-        let mut actor = Self::new(
-            construct_info.complete(ConstructType::ValueActor),
-            actor_context,
-            TypedStream::infinite(value_stream),
-            persistence_id,
-        );
-        actor.list_item_origin = Some(Arc::new(origin));
-        Arc::new(actor)
-    }
-
-    /// Create a ValueActor that delegates to a LazyValueActor for demand-driven evaluation.
-    ///
-    /// Used in HOLD body context where lazy evaluation is needed for sequential state updates.
-    /// The returned ValueActor is a shell that forwards subscribe() calls to the lazy actor.
-    ///
-    /// Note: The shell actor doesn't have its own loop - all subscription happens through
-    /// the lazy delegate. The shell exists so the return type is Arc<ValueActor>.
-    pub fn new_arc_lazy<S: Stream<Item = Value> + 'static>(
-        construct_info: ConstructInfoComplete,
-        value_stream: S,
-        persistence_id: parser::PersistenceId,
-    ) -> Arc<Self> {
-        // Create the lazy actor that does the actual work
-        let lazy_actor = Arc::new(LazyValueActor::new(
-            construct_info.clone(),
-            value_stream,
-        ));
-
-        // Create a shell ValueActor - the lazy_delegate handles all subscriptions
-        let construct_info = Arc::new(construct_info);
-        let (message_sender, _message_receiver) = NamedChannel::new("value_actor.lazy.messages", 16);
-        let current_version = Arc::new(AtomicU64::new(0));
-
-        // Dummy channels (won't be used since lazy_delegate handles subscriptions)
-        let (subscription_sender, _subscription_receiver) = NamedChannel::<SubscriptionSetup>::new("value_actor.lazy.subscriptions", 32);
-        let (direct_store_sender, _direct_store_receiver) = NamedChannel::new("value_actor.lazy.direct_store", 64);
-        let (stored_value_query_sender, _stored_value_query_receiver) = NamedChannel::new("value_actor.lazy.queries", 8);
-
-        // Dummy ready signal (lazy actors bypass it in stream())
-        let (ready_tx, ready_rx) = oneshot::channel::<()>();
-        drop(ready_tx); // Won't be used
-        let ready_signal = ready_rx.shared();
-
-        // Create a no-op task (the lazy delegate owns the real processing)
-        let actor_loop = ActorLoop::new(async {});
-
-        Arc::new(Self {
-            construct_info,
-            persistence_id,
-            message_sender,
-            current_version,
-            subscription_sender,
-            direct_store_sender,
-            stored_value_query_sender,
-            ready_signal,
-            actor_loop,
-            lazy_delegate: Some(lazy_actor),
-            extra_loops: Vec::new(),
-            list_item_origin: None,
-        })
-    }
-
-    /// Create a new ValueActor with an initial value and a stream.
-    /// Combines immediate value availability with stream-based updates.
-    ///
-    /// Use this for combinators that have an initial value that can be
-    /// computed synchronously along with a stream of subsequent updates.
-    pub fn new_with_initial_value<S: Stream<Item = Value> + 'static>(
-        construct_info: ConstructInfoComplete,
-        actor_context: ActorContext,
-        value_stream: TypedStream<S, Infinite>,
-        persistence_id: parser::PersistenceId,
-        initial_value: Value,
-    ) -> Self {
-        let value_stream = value_stream.inner;
-        let construct_info = Arc::new(construct_info);
-        let (message_sender, message_receiver) = NamedChannel::new("value_actor.initial.messages", 16);
-        // Start at version 1 since we have an initial value
-        let current_version = Arc::new(AtomicU64::new(1));
-
-        // Bounded channels for subscription, direct store, and stored value queries
-        let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.initial.subscriptions", 32);
-        let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.initial.direct_store", 64);
-        let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.initial.queries", 8);
-
-        // Oneshot channel for ready signal - immediately fire since we have initial value
-        let (ready_tx, ready_rx) = oneshot::channel::<()>();
-        // Fire immediately - receiver will always be there since we just created it
-        ready_tx.send(()).ok();
-        let ready_signal = ready_rx.shared();
-
-        let actor_loop = ActorLoop::new({
-            let construct_info = construct_info.clone();
-            let current_version = current_version.clone();
-            let output_valve_signal = actor_context.output_valve_signal;
-
-            async move {
-                // Actor-local state with initial value
-                let mut value_history = {
-                    let mut history = ValueHistory::new(64);
-                    history.add(1, initial_value);
-                    history
-                };
-                let mut subscribers: Vec<mpsc::Sender<Value>> = Vec::new();
-                let mut stream_ever_produced = true; // We have initial value
-                let mut stream_ended = false;
-
-                let mut output_valve_impulse_stream =
-                    if let Some(output_valve_signal) = &output_valve_signal {
-                        output_valve_signal.stream().left_stream()
-                    } else {
-                        stream::pending().right_stream()
-                    }
-                    .fuse();
-                let mut value_stream = pin!(value_stream.fuse());
-                let mut message_receiver = pin!(message_receiver.fuse());
-                let mut subscription_receiver = pin!(subscription_receiver.fuse());
-                let mut direct_store_receiver = pin!(direct_store_receiver.fuse());
-                let mut stored_value_query_receiver = pin!(stored_value_query_receiver.fuse());
-                let migration_state = MigrationState::Normal;
-
-                loop {
-                    select! {
-                        // Handle fire-and-forget subscription setup
-                        setup = subscription_receiver.next() => {
-                            if let Some(SubscriptionSetup { mut sender, starting_version }) = setup {
-                                if stream_ended && !stream_ever_produced {
-                                    drop(sender);
-                                } else {
-                                    for value in value_history.get_values_since(starting_version).0 {
-                                        if sender.try_send(value.clone()).is_err() { break; }
-                                    }
-                                    subscribers.push(sender);
-                                }
-                            }
-                        }
-
-                        value = direct_store_receiver.next() => {
-                            if let Some(value) = value {
+                    msg = message_receiver.next() => {
+                        let Some(msg) = msg else { break; };
+                        match msg {
+                            ActorMessage::StreamValue(value) => {
                                 stream_ever_produced = true;
                                 let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                 value_history.add(new_version, value.clone());
                                 subscribers.retain_mut(|tx| match tx.try_send(value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
                             }
-                        }
-
-                        query = stored_value_query_receiver.next() => {
-                            if let Some(StoredValueQuery { reply }) = query {
-                                let current_value = value_history.get_latest();
-                                if reply.send(current_value).is_err() {
-                                    zoon::println!("[VALUE_ACTOR] Stored value query reply receiver dropped");
-                                }
-                            }
-                        }
-
-                        msg = message_receiver.next() => {
-                            let Some(msg) = msg else { break; };
-                            match msg {
-                                ActorMessage::StreamValue(value) => {
-                                    stream_ever_produced = true;
-                                    let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                                    value_history.add(new_version, value.clone());
-                                    subscribers.retain_mut(|tx| match tx.try_send(value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        new_value = value_stream.next() => {
-                            let Some(new_value) = new_value else {
-                                stream_ended = true;
-                                if !stream_ever_produced && let MigrationState::Normal = migration_state {
-                                    break;
-                                }
-                                continue;
-                            };
-
-                            stream_ever_produced = true;
-                            let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                            value_history.add(new_version, new_value.clone());
-
-                            subscribers.retain_mut(|tx| match tx.try_send(new_value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
-                        }
-
-                        impulse = output_valve_impulse_stream.next() => {
-                            if impulse.is_none() { continue; }
+                            _ => {}
                         }
                     }
-                }
 
-                if LOG_DROPS_AND_LOOP_ENDS {
-                    zoon::println!("Loop ended {construct_info}");
-                }
-            }
-        });
+                    new_value = value_stream.next() => {
+                        let Some(new_value) = new_value else {
+                            stream_ended = true;
+                            if !stream_ever_produced && let MigrationState::Normal = migration_state {
+                                break;
+                            }
+                            continue;
+                        };
 
-        Self {
-            construct_info,
-            persistence_id,
-            message_sender,
-            current_version,
-            subscription_sender,
-            direct_store_sender,
-            stored_value_query_sender,
-            ready_signal,
-            actor_loop,
-            lazy_delegate: None,
-            extra_loops: Vec::new(),
-            list_item_origin: None,
-        }
-    }
-
-    pub fn persistence_id(&self) -> parser::PersistenceId {
-        self.persistence_id
-    }
-
-    /// Get the list item origin info, if this actor represents a persisted list item.
-    pub fn list_item_origin(&self) -> Option<&ListItemOrigin> {
-        self.list_item_origin.as_deref()
-    }
-
-    /// Get the current version of this actor's value.
-    pub fn version(&self) -> u64 {
-        self.current_version.load(Ordering::SeqCst)
-    }
-
-    /// Get the current stored value (async).
-    ///
-    /// Returns `Ok(value)` if the actor has a stored value.
-    /// Returns `Err(NoValueYet)` if the actor exists but hasn't stored a value yet.
-    /// Returns `Err(ActorDropped)` if the actor was dropped.
-    ///
-    /// For properties with Boon-level initial values, use `.expect("reason")`.
-    /// For LINK variables (user interaction), handle the error gracefully.
-    pub async fn current_value(&self) -> Result<Value, CurrentValueError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self.stored_value_query_sender.send(StoredValueQuery { reply: reply_tx }).await.is_err() {
-            return Err(CurrentValueError::ActorDropped);
-        }
-        match reply_rx.await {
-            Ok(Some(value)) => Ok(value),
-            Ok(None) => Err(CurrentValueError::NoValueYet),
-            Err(_) => Err(CurrentValueError::ActorDropped),
-        }
-    }
-
-    /// Create a new ValueActor with a channel-based stream for forwarding values.
-    /// Returns the actor and a sender that can be used to forward values to it.
-    ///
-    /// This is useful when you need to register an actor with ReferenceConnector
-    /// before the actual value-producing expression is evaluated. The sender
-    /// can then be used to forward values from the evaluated expression.
-    ///
-    /// # Usage Pattern
-    /// 1. Create the forwarding actor and register it immediately
-    /// 2. Evaluate the source expression to get its actor
-    /// 3. Subscribe to the source actor and forward values through the sender
-    pub fn new_arc_forwarding(
-        construct_info: ConstructInfo,
-        actor_context: ActorContext,
-        persistence_id: parser::PersistenceId,
-    ) -> (Arc<Self>, NamedChannel<Value>) {
-        let (sender, receiver) = NamedChannel::new("forwarding.values", 64);
-        let stream = TypedStream::infinite(receiver);
-        let actor = Self::new_arc(
-            construct_info,
-            actor_context,
-            stream,
-            persistence_id,
-        );
-        (actor, sender)
-    }
-
-    /// Connect a forwarding actor to its source actor.
-    ///
-    /// This creates an ActorLoop that subscribes to the source actor and forwards
-    /// all values through the provided sender to the forwarding actor.
-    /// Optionally sends an initial value synchronously before starting the async forwarding.
-    ///
-    /// # Arguments
-    /// - `forwarding_sender`: The sender from `new_arc_forwarding()` to send values to
-    /// - `source_actor`: The source actor to subscribe to
-    /// - `initial_value`: Optional initial value to send synchronously before async forwarding
-    ///
-    /// # Returns
-    /// An ActorLoop that must be kept alive for forwarding to continue.
-    ///
-    /// # Usage Pattern
-    /// ```ignore
-    /// let (forwarding_actor, sender) = ValueActor::new_arc_forwarding(...);
-    /// // Register forwarding_actor immediately
-    /// // Later, when source_actor is available:
-    /// let actor_loop = ValueActor::connect_forwarding(sender, source_actor, initial_value);
-    /// // Store actor_loop to keep forwarding alive
-    /// ```
-    pub fn connect_forwarding(
-        forwarding_sender: NamedChannel<Value>,
-        source_actor: ActorHandle,
-        initial_value_future: impl Future<Output = Option<Value>> + 'static,
-    ) -> ActorLoop {
-        ActorLoop::new(async move {
-            if LOG_DEBUG { zoon::println!("[FWD2] connect_forwarding loop STARTED"); }
-            // Send initial value first (awaiting if needed)
-            if let Some(value) = initial_value_future.await {
-                if LOG_DEBUG { zoon::println!("[FORWARDING] Sending initial value"); }
-                if let Err(e) = forwarding_sender.send(value).await {
-                    if LOG_DEBUG { zoon::println!("[FORWARDING] Initial forwarding FAILED: {e} - EXITING!"); }
-                    return;
-                }
-                if LOG_DEBUG { zoon::println!("[FORWARDING] Initial value sent OK"); }
-            } else {
-                if LOG_DEBUG { zoon::println!("[FORWARDING] No initial value"); }
-            }
-
-            if LOG_DEBUG { zoon::println!("[FORWARDING] Subscribing to source_actor..."); }
-            let mut subscription = source_actor.stream();
-            if LOG_DEBUG { zoon::println!("[FORWARDING] Subscribed, entering forwarding loop"); }
-            while let Some(value) = subscription.next().await {
-                if LOG_DEBUG {
-                    let value_desc = match &value {
-                        Value::Tag(tag, _) => format!("Tag({})", tag.tag()),
-                        Value::Object(_, _) => "Object".to_string(),
-                        _ => "Other".to_string(),
-                    };
-                    zoon::println!("[FORWARDING] Received value: {}", value_desc);
-                }
-                if forwarding_sender.send(value).await.is_err() {
-                    if LOG_DEBUG { zoon::println!("[FORWARDING] Forwarding FAILED - breaking loop"); }
-                    break;
-                }
-            }
-            if LOG_DEBUG { zoon::println!("[FORWARDING] Forwarding loop ENDED"); }
-        })
-    }
-
-    /// Create a new Arc<ValueActor> with an initial value pre-set.
-    /// This ensures the value is immediately available to subscribers without
-    /// waiting for the async task to poll the stream.
-    ///
-    /// Use this for constant values where the initial value is known synchronously.
-    pub fn new_arc_with_initial_value<S: Stream<Item = Value> + 'static>(
-        construct_info: ConstructInfo,
-        actor_context: ActorContext,
-        value_stream: TypedStream<S, Infinite>,
-        persistence_id: parser::PersistenceId,
-        initial_value: Value,
-    ) -> Arc<Self> {
-        let construct_info = construct_info.complete(ConstructType::ValueActor);
-        let value_stream = value_stream.inner;
-        let construct_info = Arc::new(construct_info);
-        let (message_sender, message_receiver) = NamedChannel::new("value_actor.arc_initial.messages", 16);
-        // Start at version 1 since we have an initial value
-        let current_version = Arc::new(AtomicU64::new(1));
-
-        // Bounded channels for subscription, direct store, and stored value queries
-        let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.arc_initial.subscriptions", 32);
-        let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.arc_initial.direct_store", 64);
-        let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.arc_initial.queries", 8);
-
-        // Oneshot channel for ready signal - immediately fire since we have initial value
-        let (ready_tx, ready_rx) = oneshot::channel::<()>();
-        // Fire immediately - receiver will always be there since we just created it
-        ready_tx.send(()).ok();
-        let ready_signal = ready_rx.shared();
-
-        let actor_loop = ActorLoop::new({
-            let construct_info = construct_info.clone();
-            let current_version = current_version.clone();
-            let output_valve_signal = actor_context.output_valve_signal.clone();
-
-            async move {
-                // Actor-local state with initial value
-                let mut value_history = {
-                    let mut history = ValueHistory::new(64);
-                    history.add(1, initial_value);
-                    history
-                };
-                let mut subscribers: Vec<mpsc::Sender<Value>> = Vec::new();
-                let stream_ever_produced = true; // We have an initial value
-                let mut stream_ended = false;
-
-                let mut output_valve_impulse_stream =
-                    if let Some(output_valve_signal) = &output_valve_signal {
-                        output_valve_signal.stream().left_stream()
-                    } else {
-                        stream::pending().right_stream()
+                        stream_ever_produced = true;
+                        let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                        value_history.add(new_version, new_value.clone());
+                        subscribers.retain_mut(|tx| match tx.try_send(new_value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
                     }
-                    .fuse();
-                let mut value_stream = pin!(value_stream.fuse());
-                let mut message_receiver = pin!(message_receiver.fuse());
-                let mut subscription_receiver = pin!(subscription_receiver.fuse());
-                let mut direct_store_receiver = pin!(direct_store_receiver.fuse());
-                let mut stored_value_query_receiver = pin!(stored_value_query_receiver.fuse());
 
-                loop {
-                    select! {
-                        query = stored_value_query_receiver.next() => {
-                            if let Some(StoredValueQuery { reply }) = query {
-                                if reply.send(value_history.get_latest()).is_err() {
-                                    zoon::println!("[VALUE_ACTOR] Stored value query reply receiver dropped");
-                                }
-                            }
-                        }
-
-                        // Handle fire-and-forget subscription setup
-                        setup = subscription_receiver.next() => {
-                            if let Some(SubscriptionSetup { mut sender, starting_version }) = setup {
-                                if stream_ended && !stream_ever_produced {
-                                    drop(sender);
-                                } else {
-                                    for value in value_history.get_values_since(starting_version).0 {
-                                        if sender.try_send(value.clone()).is_err() { break; }
-                                    }
-                                    subscribers.push(sender);
-                                }
-                            }
-                        }
-
-                        value = direct_store_receiver.next() => {
-                            if let Some(value) = value {
-                                let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                                value_history.add(new_version, value.clone());
-                                // Only remove on Disconnected (receiver dropped), NOT on Full (backpressure)
-                                subscribers.retain_mut(|tx| {
-                                    match tx.try_send(value.clone()) {
-                                        Ok(()) => true,
-                                        Err(e) if e.is_disconnected() => false,
-                                        Err(_) => true,
-                                    }
-                                });
-                            }
-                        }
-
-                        msg = message_receiver.next() => {
-                            let Some(msg) = msg else { break; };
-                            match msg {
-                                ActorMessage::StreamValue(new_value) => {
-                                    let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                                    value_history.add(new_version, new_value.clone());
-                                    subscribers.retain_mut(|tx| match tx.try_send(new_value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
-                                }
-                                ActorMessage::Shutdown => break,
-                                _ => {}
-                            }
-                        }
-
-                        _ = output_valve_impulse_stream.next() => {
-                            break;
-                        }
-
-                        new_value = value_stream.next() => {
-                            if let Some(new_value) = new_value {
-                                let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                                value_history.add(new_version, new_value.clone());
-                                subscribers.retain_mut(|tx| match tx.try_send(new_value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
-                            } else {
-                                stream_ended = true;
-                            }
-                        }
+                    impulse = output_valve_impulse_stream.next() => {
+                        if impulse.is_none() { continue; }
                     }
                 }
-                if LOG_DROPS_AND_LOOP_ENDS {
-                    zoon::println!("Loop ended {construct_info}");
-                }
             }
-        });
 
-        Arc::new(Self {
-            construct_info,
-            persistence_id,
-            message_sender,
-            current_version,
-            subscription_sender,
-            direct_store_sender,
-            stored_value_query_sender,
-            ready_signal,
-            actor_loop,
-            lazy_delegate: None,
-            extra_loops: Vec::new(),
-            list_item_origin: None,
-        })
-    }
-
-    /// Directly store a value, bypassing the async input stream.
-    /// Used by HOLD to update state between body evaluations.
-    ///
-    /// The actor loop processes the value and notifies all subscribers.
-    /// Uses send_or_drop (non-blocking) - logs if channel is full.
-    pub fn store_value_directly(&self, value: Value) {
-        self.direct_store_sender.send_or_drop(value);
-    }
-
-    /// Check if this actor has a lazy delegate.
-    pub fn has_lazy_delegate(&self) -> bool {
-        self.lazy_delegate.is_some()
-    }
-
-    // === Clean Subscription API ===
-    //
-    // Primary methods for getting values:
-    // - value() returns Future<Result<Value, ValueError>> - exactly ONE value
-    // - stream() returns Stream<Item=Value> - continuous updates
-    //
-    // Deprecated wrappers are provided for incremental migration.
-
-    /// Get exactly ONE value - waiting if necessary.
-    ///
-    /// Returns a `Future`, not a `Stream`. This makes it **impossible to misuse**:
-    /// - Future resolves once → you get one value
-    /// - No need for `.take(1)` - the type itself enforces single-value semantics
-    ///
-    /// Use this in THEN/WHEN bodies where you need a point-in-time value.
-    ///
-    /// Returns `Ok(value)` when a value is available.
-    /// Returns `Err(ActorDropped)` if the actor dies before producing a value.
-    ///
-    /// For LINK variables (user interaction), handle ActorDropped gracefully -
-    /// the user may navigate away without triggering the event.
-    pub async fn value(self: Arc<Self>) -> Result<Value, ValueError> {
-        // If we already have a value, return it directly
-        if self.version() > 0 {
-            return self.current_value().await.map_err(|e| match e {
-                CurrentValueError::NoValueYet => unreachable!("version > 0 implies value exists"),
-                CurrentValueError::ActorDropped => ValueError::ActorDropped,
-            });
-        }
-        // Otherwise stream and wait for first value
-        let mut s = self.stream();
-        s.next().await.ok_or(ValueError::ActorDropped)
-    }
-
-    /// Subscribe to continuous stream of all values from version 0.
-    ///
-    /// Use this for WHILE bodies, LATEST inputs, and reactive bindings where you
-    /// need continuous updates.
-    ///
-    /// Takes ownership of the Arc to keep the actor alive for the subscription lifetime.
-    /// Callers should use `.clone().stream()` if they need to retain a reference.
-    ///
-    /// This is synchronous and cancellation-safe - the caller creates the subscription
-    /// channel and sends one end to the actor. If the caller is dropped, the actor
-    /// simply sees a disconnected sender and cleans up silently.
-    pub fn stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        // Handle lazy actors
-        if let Some(ref lazy_delegate) = self.lazy_delegate {
-            return lazy_delegate.clone().stream().boxed_local();
-        }
-
-        // Create the subscription channel (caller keeps receiver)
-        let (tx, rx) = mpsc::channel(32);
-
-        // Send setup to actor (best effort - if actor is dead, rx will be empty)
-        // Uses send_or_drop() which logs in debug mode if channel is full
-        self.subscription_sender.send_or_drop(SubscriptionSetup {
-            sender: tx,
-            starting_version: 0,
-        });
-
-        // Return the receiver with self captured to keep the actor alive
-        stream::unfold(rx, move |mut rx| {
-            let _keepalive = self.clone();
-            async move {
-                let item = rx.next().await?;
-                Some((item, rx))
+            if LOG_DROPS_AND_LOOP_ENDS {
+                zoon::println!("Loop ended {construct_info}");
             }
-        }).boxed_local()
-    }
-
-    /// Subscribe starting from current version - only future values.
-    ///
-    /// Use this for event triggers (THEN, WHEN, List/remove) where historical
-    /// events should NOT be replayed. Subscribers will only receive values
-    /// emitted AFTER this subscription is created.
-    ///
-    /// Takes ownership of the Arc to keep the actor alive for the subscription lifetime.
-    ///
-    /// This is synchronous and cancellation-safe.
-    pub fn stream_from_now(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        // Handle lazy actors
-        if let Some(ref lazy_delegate) = self.lazy_delegate {
-            return lazy_delegate.clone().stream().boxed_local();
         }
+    });
 
-        // Capture current version BEFORE subscribing - this is the key difference from stream()
-        let current_version = self.version();
+    let owned_actor = OwnedActor {
+        actor_loop,
+        extra_loops: Vec::new(),
+        construct_info: construct_info.clone(),
+        scope_id,
+        list_item_origin: None,
+        lazy_delegate: None,
+        _channel_keepalive: ChannelKeepalive {
+            _subscription: subscription_sender.clone(),
+            _message: message_sender.clone(),
+            _direct_store: direct_store_sender.clone(),
+            _query: stored_value_query_sender.clone(),
+        },
+    };
 
-        // Create the subscription channel (caller keeps receiver)
-        let (tx, rx) = mpsc::channel(32);
+    let actor_id = REGISTRY.with(|reg| {
+        reg.borrow_mut().insert_actor(scope_id, owned_actor)
+    });
 
-        // Send setup to actor with current version as starting point
-        // Uses send_or_drop() which logs in debug mode if channel is full
-        self.subscription_sender.send_or_drop(SubscriptionSetup {
-            sender: tx,
-            starting_version: current_version,
-        });
-
-        // Return the receiver with self captured to keep the actor alive
-        stream::unfold(rx, move |mut rx| {
-            let _keepalive = self.clone();
-            async move {
-                let item = rx.next().await?;
-                Some((item, rx))
-            }
-        }).boxed_local()
-    }
-
-    /// Get optimal update for subscriber at given version (async).
-    ///
-    /// For scalar values, always returns a snapshot (cheap to copy).
-    /// For collections with DiffHistory (future), may return diffs if
-    /// subscriber is close enough to current version.
-    pub async fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
-        let current = self.version();
-        if subscriber_version >= current {
-            return ValueUpdate::Current;
-        }
-        // For now, always return snapshot. Phase 4 will add diff support for LIST.
-        match self.current_value().await {
-            Ok(value) => ValueUpdate::Snapshot(value),
-            Err(_) => ValueUpdate::Current,
-        }
+    ActorHandle {
+        actor_id,
+        subscription_sender,
+        direct_store_sender,
+        stored_value_query_sender,
+        message_sender,
+        ready_signal,
+        current_version,
+        persistence_id,
+        lazy_delegate: None,
+        list_item_origin: None,
     }
 }
 
-impl Drop for ValueActor {
-    fn drop(&mut self) {
-        inc_metric!(ACTORS_DROPPED);
-        if LOG_DROPS_AND_LOOP_ENDS {
-            zoon::println!("Dropped: {}", self.construct_info);
+/// Create an actor with a channel-based stream for forwarding values.
+/// Returns the actor handle and a sender for pushing values.
+pub fn create_actor_forwarding(
+    construct_info: ConstructInfo,
+    actor_context: ActorContext,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+) -> (ActorHandle, NamedChannel<Value>) {
+    let (sender, receiver) = NamedChannel::new("forwarding.values", 64);
+    let handle = create_actor(
+        construct_info,
+        actor_context,
+        TypedStream::infinite(receiver),
+        persistence_id,
+        scope_id,
+    );
+    (handle, sender)
+}
+
+/// Create an actor with list item origin metadata.
+pub fn create_actor_with_origin<S: Stream<Item = Value> + 'static>(
+    construct_info: ConstructInfo,
+    actor_context: ActorContext,
+    value_stream: TypedStream<S, Infinite>,
+    persistence_id: parser::PersistenceId,
+    origin: ListItemOrigin,
+    scope_id: ScopeId,
+) -> ActorHandle {
+    let mut handle = create_actor(construct_info, actor_context, value_stream, persistence_id, scope_id);
+    let origin = Arc::new(origin);
+    handle.list_item_origin = Some(origin.clone());
+    // Also set on OwnedActor in registry
+    REGISTRY.with(|reg| {
+        if let Some(owned) = reg.borrow_mut().get_actor_mut(handle.actor_id) {
+            owned.list_item_origin = Some(origin);
         }
+    });
+    handle
+}
+
+/// Create an actor with list item origin metadata from a boxed stream.
+pub fn create_actor_with_origin_boxed(
+    construct_info: ConstructInfo,
+    actor_context: ActorContext,
+    value_stream: Pin<Box<dyn Stream<Item = Value> + 'static>>,
+    persistence_id: parser::PersistenceId,
+    origin: ListItemOrigin,
+    scope_id: ScopeId,
+) -> ActorHandle {
+    create_actor_with_origin(
+        construct_info,
+        actor_context,
+        TypedStream::infinite(value_stream),
+        persistence_id,
+        origin,
+        scope_id,
+    )
+}
+
+/// Create a lazy actor for demand-driven evaluation (used in HOLD body context).
+pub fn create_actor_lazy<S: Stream<Item = Value> + 'static>(
+    construct_info: ConstructInfoComplete,
+    value_stream: S,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+) -> ActorHandle {
+    inc_metric!(ACTORS_CREATED);
+    let lazy_actor = Arc::new(LazyValueActor::new(
+        construct_info.clone(),
+        value_stream,
+    ));
+
+    let construct_info = Arc::new(construct_info);
+    // Dummy channels (not used — lazy_delegate handles subscriptions)
+    let (message_sender, _message_receiver) = NamedChannel::new("value_actor.lazy.messages", 16);
+    let current_version = Arc::new(AtomicU64::new(0));
+    let (subscription_sender, _subscription_receiver) = NamedChannel::<SubscriptionSetup>::new("value_actor.lazy.subscriptions", 32);
+    let (direct_store_sender, _direct_store_receiver) = NamedChannel::new("value_actor.lazy.direct_store", 64);
+    let (stored_value_query_sender, _stored_value_query_receiver) = NamedChannel::new("value_actor.lazy.queries", 8);
+    let (ready_tx, ready_rx) = oneshot::channel::<()>();
+    drop(ready_tx);
+    let ready_signal = ready_rx.shared();
+
+    let actor_loop = ActorLoop::new(async {});
+
+    let owned_actor = OwnedActor {
+        actor_loop,
+        extra_loops: Vec::new(),
+        construct_info: construct_info.clone(),
+        scope_id,
+        list_item_origin: None,
+        lazy_delegate: Some(lazy_actor.clone()),
+        _channel_keepalive: ChannelKeepalive {
+            _subscription: subscription_sender.clone(),
+            _message: message_sender.clone(),
+            _direct_store: direct_store_sender.clone(),
+            _query: stored_value_query_sender.clone(),
+        },
+    };
+
+    let actor_id = REGISTRY.with(|reg| {
+        reg.borrow_mut().insert_actor(scope_id, owned_actor)
+    });
+
+    ActorHandle {
+        actor_id,
+        subscription_sender,
+        direct_store_sender,
+        stored_value_query_sender,
+        message_sender,
+        ready_signal,
+        current_version,
+        persistence_id,
+        lazy_delegate: Some(lazy_actor),
+        list_item_origin: None,
     }
+}
+
+/// Connect a forwarding actor to its source actor.
+///
+/// This creates an ActorLoop that subscribes to the source actor and forwards
+/// all values through the provided sender to the forwarding actor.
+/// Optionally sends an initial value synchronously before starting the async forwarding.
+///
+/// # Arguments
+/// - `forwarding_sender`: The sender from `create_actor_forwarding()` to send values to
+/// - `source_actor`: The source actor to subscribe to
+/// - `initial_value_future`: Future that resolves to an optional initial value to send before async forwarding
+///
+/// # Returns
+/// An ActorLoop that must be kept alive for forwarding to continue.
+///
+/// # Usage Pattern
+/// ```ignore
+/// let (handle, sender) = create_actor_forwarding(...);
+/// // Register handle immediately
+/// // Later, when source_actor is available:
+/// let actor_loop = connect_forwarding(sender, source_actor, initial_value);
+/// // Store actor_loop to keep forwarding alive
+/// ```
+pub fn connect_forwarding(
+    forwarding_sender: NamedChannel<Value>,
+    source_actor: ActorHandle,
+    initial_value_future: impl Future<Output = Option<Value>> + 'static,
+) -> ActorLoop {
+    ActorLoop::new(async move {
+        if LOG_DEBUG { zoon::println!("[FWD2] connect_forwarding loop STARTED"); }
+        // Send initial value first (awaiting if needed)
+        if let Some(value) = initial_value_future.await {
+            if LOG_DEBUG { zoon::println!("[FORWARDING] Sending initial value"); }
+            if let Err(e) = forwarding_sender.send(value).await {
+                if LOG_DEBUG { zoon::println!("[FORWARDING] Initial forwarding FAILED: {e} - EXITING!"); }
+                return;
+            }
+            if LOG_DEBUG { zoon::println!("[FORWARDING] Initial value sent OK"); }
+        } else {
+            if LOG_DEBUG { zoon::println!("[FORWARDING] No initial value"); }
+        }
+
+        if LOG_DEBUG { zoon::println!("[FORWARDING] Subscribing to source_actor..."); }
+        let mut subscription = source_actor.stream();
+        if LOG_DEBUG { zoon::println!("[FORWARDING] Subscribed, entering forwarding loop"); }
+        while let Some(value) = subscription.next().await {
+            if LOG_DEBUG {
+                let value_desc = match &value {
+                    Value::Tag(tag, _) => format!("Tag({})", tag.tag()),
+                    Value::Object(_, _) => "Object".to_string(),
+                    _ => "Other".to_string(),
+                };
+                zoon::println!("[FORWARDING] Received value: {}", value_desc);
+            }
+            if forwarding_sender.send(value).await.is_err() {
+                if LOG_DEBUG { zoon::println!("[FORWARDING] Forwarding FAILED - breaking loop"); }
+                break;
+            }
+        }
+        if LOG_DEBUG { zoon::println!("[FORWARDING] Forwarding loop ENDED"); }
+    })
 }
 
 // --- ValueUpdate ---
@@ -5905,12 +5290,14 @@ pub fn value_actor_from_json(
         None,
         "ValueActor from JSON",
     ).complete(ConstructType::ValueActor);
-    Arc::new(ValueActor::new(
+    let scope_id = actor_context.scope_id();
+    create_actor_complete(
         actor_construct_info,
         actor_context,
         constant(value),
         parser::PersistenceId::new(),
-    )).into()
+        scope_id,
+    )
 }
 
 /// Saves a list of ValueActors to JSON for persistence.
@@ -5943,6 +5330,7 @@ pub async fn materialize_value(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> Value {
+    let scope_id = actor_context.scope_id();
     match value {
         Value::Object(object, metadata) => {
             let mut materialized_vars: Vec<Arc<Variable>> = Vec::new();
@@ -5957,7 +5345,7 @@ pub async fn materialize_value(
                         actor_context.clone(),
                     )).await;
                     // Create a constant ValueActor for the materialized value
-                    let value_actor = Arc::new(ValueActor::new(
+                    let value_actor = create_actor_complete(
                         ConstructInfo::new(
                             format!("materialized_{}", variable.name()),
                             None,
@@ -5966,7 +5354,8 @@ pub async fn materialize_value(
                         actor_context.clone(),
                         constant(materialized),
                         parser::PersistenceId::new(),
-                    )).into();
+                        scope_id,
+                    );
                     // Create new Variable with the constant actor
                     let new_var = Variable::new_arc(
                         ConstructInfo::new(
@@ -6000,7 +5389,7 @@ pub async fn materialize_value(
                         construct_context.clone(),
                         actor_context.clone(),
                     )).await;
-                    let value_actor = Arc::new(ValueActor::new(
+                    let value_actor = create_actor_complete(
                         ConstructInfo::new(
                             format!("materialized_{}", variable.name()),
                             None,
@@ -6009,7 +5398,8 @@ pub async fn materialize_value(
                         actor_context.clone(),
                         constant(materialized),
                         parser::PersistenceId::new(),
-                    )).into();
+                        scope_id,
+                    );
                     let new_var = Variable::new_arc(
                         ConstructInfo::new(
                             format!("materialized_var_{}", variable.name()),
@@ -6148,16 +5538,18 @@ impl Object {
         // version 2 from stream)
         let value_stream = TypedStream::infinite(stream::pending());
 
-        // Use new_arc_with_initial_value so the value is immediately available
+        // Use create_actor_with_initial_value so the value is immediately available
         // This is critical for WASM single-threaded runtime where spawned tasks
         // don't run until we yield - subscriptions need immediate access to values.
-        ValueActor::new_arc_with_initial_value(
+        let scope_id = actor_context.scope_id();
+        create_actor_with_initial_value(
             actor_construct_info,
             actor_context,
             value_stream,
             parser::PersistenceId::new(),
             initial_value,
-        ).into()
+            scope_id,
+        )
     }
 
     pub fn variable(&self, name: &str) -> Option<Arc<Variable>> {
@@ -6286,16 +5678,18 @@ impl TaggedObject {
         // version 2 from stream)
         let value_stream = TypedStream::infinite(stream::pending());
 
-        // Use new_arc_with_initial_value so the value is immediately available
+        // Use create_actor_with_initial_value so the value is immediately available
         // This is critical for WASM single-threaded runtime where spawned tasks
         // don't run until we yield - subscriptions need immediate access to values.
-        ValueActor::new_arc_with_initial_value(
+        let scope_id = actor_context.scope_id();
+        create_actor_with_initial_value(
             actor_construct_info,
             actor_context,
             value_stream,
             parser::PersistenceId::new(),
             initial_value,
-        ).into()
+            scope_id,
+        )
     }
 
     pub fn variable(&self, name: &str) -> Option<Arc<Variable>> {
@@ -6428,13 +5822,15 @@ impl Text {
         // version 2 from stream)
         let value_stream = TypedStream::infinite(stream::pending());
         // Use the new method that pre-sets initial value
-        ValueActor::new_arc_with_initial_value(
+        let scope_id = actor_context.scope_id();
+        create_actor_with_initial_value(
             actor_construct_info,
             actor_context,
             value_stream,
             parser::PersistenceId::new(),
             initial_value,
-        ).into()
+            scope_id,
+        )
     }
 
     pub fn text(&self) -> &str {
@@ -6547,13 +5943,15 @@ impl Tag {
         // version 2 from stream)
         let value_stream = TypedStream::infinite(stream::pending());
         // Use the new method that pre-sets initial value
-        ValueActor::new_arc_with_initial_value(
+        let scope_id = actor_context.scope_id();
+        create_actor_with_initial_value(
             actor_construct_info,
             actor_context,
             value_stream,
             parser::PersistenceId::new(),
             initial_value,
-        ).into()
+            scope_id,
+        )
     }
 
     pub fn tag(&self) -> &str {
@@ -6652,13 +6050,15 @@ impl Number {
         // version 2 from stream)
         let value_stream = TypedStream::infinite(stream::pending());
         // Use the new method that pre-sets initial value
-        ValueActor::new_arc_with_initial_value(
+        let scope_id = actor_context.scope_id();
+        create_actor_with_initial_value(
             actor_construct_info,
             actor_context,
             value_stream,
             parser::PersistenceId::new(),
             initial_value,
-        ).into()
+            scope_id,
+        )
     }
 
     pub fn number(&self) -> f64 {
@@ -7032,12 +6432,14 @@ impl List {
             actor_context.clone(),
             items.into(),
         );
-        Arc::new(ValueActor::new(
+        let scope_id = actor_context.scope_id();
+        create_actor_complete(
             actor_construct_info,
             actor_context,
             value_stream,
             parser::PersistenceId::new(),
-        )).into()
+            scope_id,
+        )
     }
 
     /// Subscribe to this list's changes.
@@ -7439,12 +6841,14 @@ impl List {
             "Persistent list wrapper",
         ).complete(ConstructType::ValueActor);
 
-        Arc::new(ValueActor::new(
+        let scope_id = actor_context.scope_id();
+        create_actor_complete(
             actor_construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
             parser::PersistenceId::new(),
-        )).into()
+            scope_id,
+        )
     }
 }
 
@@ -8100,7 +7504,8 @@ impl ListBindingFunction {
             source_list_actor.clone(),
         );
 
-        Arc::new(ValueActor::new(
+        let scope_id = actor_context.scope_id();
+        create_actor_complete(
             construct_info,
             actor_context,
             constant(Value::List(
@@ -8108,7 +7513,8 @@ impl ListBindingFunction {
                 ValueMetadata::new(ValueIdempotencyKey::new()),
             )),
             parser::PersistenceId::new(),
-        )).into()
+            scope_id,
+        )
     }
 
     /// Creates a retain actor that filters items based on predicate evaluation.
@@ -8756,7 +8162,8 @@ impl ListBindingFunction {
             source_list_actor.clone(),
         );
 
-        Arc::new(ValueActor::new(
+        let scope_id = actor_context_for_result.scope_id();
+        create_actor_complete(
             construct_info,
             actor_context_for_result,
             constant(Value::List(
@@ -8764,7 +8171,8 @@ impl ListBindingFunction {
                 ValueMetadata::new(ValueIdempotencyKey::new()),
             )),
             parser::PersistenceId::new(),
-        )).into()
+            scope_id,
+        )
     }
 
     /// Creates a remove actor that removes items when their `when` event fires.
@@ -9104,7 +8512,8 @@ impl ListBindingFunction {
             )
         };
 
-        Arc::new(ValueActor::new(
+        let scope_id = actor_context_for_result.scope_id();
+        create_actor_complete(
             construct_info,
             actor_context_for_result,
             constant(Value::List(
@@ -9112,7 +8521,8 @@ impl ListBindingFunction {
                 ValueMetadata::new(ValueIdempotencyKey::new()),
             )),
             parser::PersistenceId::new(),
-        )).into()
+            scope_id,
+        )
     }
 
     /// Creates an every/any actor that produces True/False based on predicates.
@@ -9340,12 +8750,14 @@ impl ListBindingFunction {
             }
         }).filter_map(future::ready);
 
-        Arc::new(ValueActor::new(
+        let scope_id = actor_context_for_result.scope_id();
+        create_actor_complete(
             construct_info,
             actor_context_for_result,
             TypedStream::infinite(deduplicated_stream),
             parser::PersistenceId::new(),
-        )).into()
+            scope_id,
+        )
     }
 
     /// Creates a sort_by actor that sorts list items based on a key expression.
@@ -9549,7 +8961,8 @@ impl ListBindingFunction {
             source_list_actor.clone(),
         );
 
-        Arc::new(ValueActor::new(
+        let scope_id = actor_context_for_result.scope_id();
+        create_actor_complete(
             construct_info,
             actor_context_for_result,
             constant(Value::List(
@@ -9557,7 +8970,8 @@ impl ListBindingFunction {
                 ValueMetadata::new(ValueIdempotencyKey::new()),
             )),
             parser::PersistenceId::new(),
-        )).into()
+            scope_id,
+        )
     }
 
     /// Transform a single list item using the config's transform expression.
@@ -9621,7 +9035,8 @@ impl ListBindingFunction {
                 // We need unique PersistenceIds for identity-based Remove to work.
                 // Wrap the result in a new ValueActor with the ORIGINAL item's PersistenceId.
                 let original_pid = item_actor.persistence_id();
-                ValueActor::new_arc(
+                let scope_id = new_actor_context.scope_id();
+                create_actor(
                     ConstructInfo::new(
                         ConstructId::new("List/map mapped item"),
                         None,
@@ -9630,7 +9045,8 @@ impl ListBindingFunction {
                     new_actor_context,
                     TypedStream::infinite(result_actor.stream()),
                     original_pid,  // Preserve original PersistenceId!
-                ).into()
+                    scope_id,
+                )
             }
             Err(e) => {
                 zoon::eprintln!("Error evaluating transform expression: {e}");

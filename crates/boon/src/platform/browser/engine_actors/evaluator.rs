@@ -430,6 +430,7 @@ pub enum WorkItem {
         object_slot: SlotId,
         output_slot: SlotId,
         result_slot: SlotId,
+        scope_id: ScopeId,
     },
 
     /// Evaluate pipe step with piped value from previous slot.
@@ -989,7 +990,7 @@ fn schedule_expression(
                 // when multiple Objects are created from the same function definition
                 let forwarding_actor = if is_referenced {
                     let var_persistence_id = var_persistence.as_ref().expect("variable persistence should be set by resolver").id;
-                    let (actor, sender) = ValueActor::new_arc_forwarding(
+                    let (actor, sender) = create_actor_forwarding(
                         ConstructInfo::new(
                             format!("PersistenceId: {}", var_persistence_id),
                             var_persistence.clone(),
@@ -997,8 +998,8 @@ fn schedule_expression(
                         ),
                         ctx.actor_context.clone(),
                         var_persistence_id,
+                        ctx.actor_context.scope_id(),
                     );
-                    let actor: ActorHandle = actor.into();
                     // Store in object_locals for local resolution
                     object_locals.insert(var_span, actor.clone());
                     // Also register with ReferenceConnector for backward compatibility
@@ -1048,6 +1049,7 @@ fn schedule_expression(
                 object_slot,
                 output_slot: output_expr_slot,
                 result_slot,
+                scope_id: ctx.actor_context.scope_id(),
             });
 
             // Schedule output expression second - these work items will be processed AFTER BuildObject
@@ -1097,7 +1099,7 @@ fn schedule_expression(
                 // when multiple Objects are created from the same function definition
                 let forwarding_actor = if is_referenced {
                     let var_persistence_id = var_persistence.as_ref().expect("variable persistence should be set by resolver").id;
-                    let (actor, sender) = ValueActor::new_arc_forwarding(
+                    let (actor, sender) = create_actor_forwarding(
                         ConstructInfo::new(
                             format!("PersistenceId: {}", var_persistence_id),
                             var_persistence.clone(),
@@ -1105,8 +1107,8 @@ fn schedule_expression(
                         ),
                         ctx.actor_context.clone(),
                         var_persistence_id,
+                        ctx.actor_context.scope_id(),
                     );
-                    let actor: ActorHandle = actor.into();
                     // Store in object_locals for local resolution
                     object_locals.insert(var_span, actor.clone());
                     // Also register with ReferenceConnector for backward compatibility
@@ -1197,7 +1199,7 @@ fn schedule_expression(
                 // when multiple Objects are created from the same function definition
                 let forwarding_actor = if is_referenced {
                     let var_persistence_id = var_persistence.as_ref().expect("variable persistence should be set by resolver").id;
-                    let (actor, sender) = ValueActor::new_arc_forwarding(
+                    let (actor, sender) = create_actor_forwarding(
                         ConstructInfo::new(
                             format!("PersistenceId: {}", var_persistence_id),
                             var_persistence.clone(),
@@ -1205,8 +1207,8 @@ fn schedule_expression(
                         ),
                         ctx.actor_context.clone(),
                         var_persistence_id,
+                        ctx.actor_context.scope_id(),
                     );
-                    let actor: ActorHandle = actor.into();
                     // Store in object_locals for local resolution
                     object_locals.insert(var_span, actor.clone());
                     // Also register with ReferenceConnector for backward compatibility
@@ -1367,7 +1369,7 @@ fn schedule_expression(
                         // For referenced arguments, create a forwarding actor BEFORE scheduling
                         // This allows subsequent arguments to reference this one
                         if is_referenced {
-                            let (forwarding_actor, sender) = ValueActor::new_arc_forwarding(
+                            let (forwarding_actor, sender) = create_actor_forwarding(
                                 ConstructInfo::new(
                                     format!("arg:{}", arg_name),
                                     None,
@@ -1375,8 +1377,8 @@ fn schedule_expression(
                                 ),
                                 ctx.actor_context.clone(),
                                 PersistenceId::new(),
+                                ctx.actor_context.scope_id(),
                             );
-                            let forwarding_actor: ActorHandle = forwarding_actor.into();
                             // Store in arg_locals for local resolution
                             // This prevents overwrites when same function is called multiple times
                             arg_locals.insert(arg_span, forwarding_actor.clone());
@@ -1513,7 +1515,8 @@ fn schedule_expression(
             state.register_function(func_name.clone(), func_def);
 
             // Function definitions don't produce a value, return SKIP
-            let actor = ValueActor::new_arc(
+            let scope_id = ctx.actor_context.scope_id();
+            let actor = create_actor(
                 ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}"),
                     persistence,
@@ -1522,7 +1525,8 @@ fn schedule_expression(
                 ctx.actor_context,
                 TypedStream::infinite(stream::pending::<Value>()),
                 persistence_id,
-            ).into();
+                scope_id,
+            );
             state.store(result_slot, actor);
         }
 
@@ -1786,7 +1790,7 @@ fn process_work_item(
 
                     // Connect LINK's value_actor to the forwarding actor so sibling fields see LINK values
                     let link_value_actor_for_initial = link_value_actor.clone();
-                    let forwarding_loop = ValueActor::connect_forwarding(
+                    let forwarding_loop = connect_forwarding(
                         forwarding_sender.clone(),
                         link_value_actor.clone(),
                         async move { link_value_actor_for_initial.current_value().await.ok() },
@@ -1829,7 +1833,7 @@ fn process_work_item(
                     // connect_forwarding sends initial value asynchronously, then forwards async values
                     // Note: We create a 'static future by cloning source_actor into the async block
                     let source_actor_for_initial = source_actor.clone();
-                    let forwarding_loop = ValueActor::connect_forwarding(
+                    let forwarding_loop = connect_forwarding(
                         sender.clone(),
                         source_actor.clone(),
                         async move { source_actor_for_initial.current_value().await.ok() },
@@ -1862,16 +1866,17 @@ fn process_work_item(
                         vd.value_changed,
                     );
 
-                    let persisted_actor = Arc::new(ValueActor::new(
+                    let persisted_actor = create_actor(
                         ConstructInfo::new(
                             format!("PersistenceId: {} (persisted)", var_persistence_id),
                             vd.persistence.clone(),
                             format!("{}: (variable persistence wrapper)", vd.name),
-                        ).complete(ConstructType::ValueActor),
+                        ),
                         ctx.actor_context.clone(),
                         TypedStream::infinite(persistence_stream),
                         var_persistence_id,
-                    )).into();
+                        ctx.actor_context.scope_id(),
+                    );
 
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -1957,7 +1962,7 @@ fn process_work_item(
 
                     // Connect LINK's value_actor to the forwarding actor
                     let link_value_actor_for_initial = link_value_actor.clone();
-                    let forwarding_loop = ValueActor::connect_forwarding(
+                    let forwarding_loop = connect_forwarding(
                         forwarding_sender.clone(),
                         link_value_actor.clone(),
                         async move { link_value_actor_for_initial.current_value().await.ok() },
@@ -1999,7 +2004,7 @@ fn process_work_item(
                     // connect_forwarding sends initial value asynchronously, then forwards async values
                     // Note: We create a 'static future by cloning source_actor into the async block
                     let source_actor_for_initial = source_actor.clone();
-                    let forwarding_loop = ValueActor::connect_forwarding(
+                    let forwarding_loop = connect_forwarding(
                         sender.clone(),
                         source_actor.clone(),
                         async move { source_actor_for_initial.current_value().await.ok() },
@@ -2032,16 +2037,17 @@ fn process_work_item(
                         vd.value_changed,
                     );
 
-                    let persisted_actor = Arc::new(ValueActor::new(
+                    let persisted_actor = create_actor(
                         ConstructInfo::new(
                             format!("PersistenceId: {} (persisted)", var_persistence_id),
                             vd.persistence.clone(),
                             format!("{}: (variable persistence wrapper)", vd.name),
-                        ).complete(ConstructType::ValueActor),
+                        ),
                         ctx.actor_context.clone(),
                         TypedStream::infinite(persistence_stream),
                         var_persistence_id,
-                    )).into();
+                        ctx.actor_context.scope_id(),
+                    );
 
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -2180,7 +2186,7 @@ fn process_work_item(
             }
         }
 
-        WorkItem::BuildBlock { object_slot, output_slot, result_slot } => {
+        WorkItem::BuildBlock { object_slot, output_slot, result_slot, scope_id } => {
             // If output slot is empty, this block produces nothing
             let Some(output_actor) = state.get(output_slot) else { return Ok(()); };
 
@@ -2202,16 +2208,17 @@ fn process_work_item(
                         subscription.next().await.map(|value| (value, (Some(subscription), None, obj)))
                     },
                 );
-                let wrapper = Arc::new(ValueActor::new(
+                let wrapper = create_actor(
                     ConstructInfo::new(
                         "Block wrapper".to_string(),
                         None,
                         "Block wrapper keeping variables alive".to_string(),
-                    ).complete(ConstructType::ValueActor),
+                    ),
                     ActorContext::default(),
                     TypedStream::infinite(value_stream),
                     PersistenceId::new(),
-                )).into();
+                    scope_id,
+                );
                 state.store(result_slot, wrapper);
             } else {
                 // No Object (block has no variables) - just use output directly
@@ -2410,7 +2417,7 @@ fn process_work_item(
                 });
 
                 // Create forwarder actor - this does the actual forwarding work
-                let forwarder_actor: ActorHandle = ValueActor::new_arc(
+                let forwarder_actor: ActorHandle = create_actor(
                     ConstructInfo::new(
                         "LinkSetter forwarder",
                         expr.persistence.clone(),
@@ -2419,7 +2426,8 @@ fn process_work_item(
                     new_ctx.actor_context.clone(),
                     TypedStream::infinite(forwarder_stream.chain(stream::pending())),
                     PersistenceId::new(),
-                ).into();
+                    new_ctx.actor_context.scope_id(),
+                );
 
                 // Send forwarder to async setup for storage on re-evaluation
                 if forwarder_tx.send(forwarder_actor.clone()).is_err() {
@@ -2428,7 +2436,7 @@ fn process_work_item(
 
                 // Create pass-through actor that emits from the channel
                 let pass_through_stream = value_rx.chain(stream::pending());
-                let pass_through_actor: ActorHandle = ValueActor::new_arc(
+                let pass_through_actor: ActorHandle = create_actor(
                     ConstructInfo::new(
                         "LinkSetter stable pass-through",
                         expr.persistence.clone(),
@@ -2437,7 +2445,8 @@ fn process_work_item(
                     new_ctx.actor_context.clone(),
                     TypedStream::infinite(pass_through_stream),
                     PersistenceId::new(),
-                ).into();
+                    new_ctx.actor_context.scope_id(),
+                );
 
                 // Send actor to forwarder for registration (if first evaluation)
                 if actor_tx.send(pass_through_actor.clone()).is_err() {
@@ -2473,7 +2482,7 @@ fn process_work_item(
                     v
                 });
 
-                let result_actor = ValueActor::new_arc(
+                let result_actor = create_actor(
                     ConstructInfo::new(
                         "LinkSetter result (pass-through or relay)",
                         expr.persistence.clone(),
@@ -2482,7 +2491,8 @@ fn process_work_item(
                     new_ctx.actor_context.clone(),
                     TypedStream::infinite(merged_stream.chain(stream::pending())),
                     PersistenceId::new(),
-                ).into();
+                    new_ctx.actor_context.scope_id(),
+                );
 
                 state.store(result_slot, result_actor);
             } else {
@@ -2554,7 +2564,7 @@ fn process_work_item(
                 // If there are forwarding loops, wrap the result to keep them alive
                 if !forwarding_loops.is_empty() {
                     // Create a wrapper actor that forwards values and keeps forwarding loops alive
-                    let wrapper = ValueActor::new_arc(
+                    let wrapper = create_actor(
                         ConstructInfo::new(
                             format!("PersistenceId: {:?}", persistence.as_ref().map(|p| p.id)),
                             persistence.clone(),
@@ -2566,7 +2576,8 @@ fn process_work_item(
                             async move { Some(value) }
                         })),
                         persistence.map(|p| p.id).unwrap_or_else(PersistenceId::new),
-                    ).into();
+                        ctx.actor_context.scope_id(),
+                    );
                     state.store(result_slot, wrapper);
                 } else {
                     state.store(result_slot, actor);
@@ -2580,7 +2591,7 @@ fn process_work_item(
             // The forwarding actor was created with an empty channel that needs values.
             for (slot, sender) in connections {
                 if let Some(source_actor) = state.get(slot) {
-                    // Use ValueActor::connect_forwarding which properly subscribes and forwards ALL values.
+                    // Use connect_forwarding which properly subscribes and forwards ALL values.
                     // This creates an ActorLoop that:
                     // 1. Subscribes to source_actor
                     // 2. Forwards every value through sender
@@ -2588,7 +2599,7 @@ fn process_work_item(
                     //
                     // We store the ActorLoop in the state to keep it alive for the duration
                     // of the function call evaluation.
-                    let forwarding_loop = ValueActor::connect_forwarding(
+                    let forwarding_loop = connect_forwarding(
                         sender,
                         source_actor.clone(),
                         async { None }, // No initial value needed - subscription provides it
@@ -2616,16 +2627,17 @@ fn process_work_item(
                     value_changed,
                 );
 
-                let persisted_actor = Arc::new(ValueActor::new(
+                let persisted_actor = create_actor(
                     ConstructInfo::new(
                         format!("PersistenceId: {} (argument persistence)", persistence_id),
                         None,
                         format!("function argument persistence wrapper"),
-                    ).complete(ConstructType::ValueActor),
+                    ),
                     ctx.actor_context.clone(),
                     TypedStream::infinite(persistence_stream),
                     persistence_id,
-                )).into();
+                    ctx.actor_context.scope_id(),
+                );
 
                 state.store(result_slot, persisted_actor);
             }
@@ -2779,7 +2791,7 @@ fn build_then_actor(
                 permit.acquire().await;
             }
 
-            let value_actor: ActorHandle = ValueActor::new_arc(
+            let value_actor: ActorHandle = create_actor(
                 ConstructInfo::new(
                     "THEN input value".to_string(),
                     None,
@@ -2788,7 +2800,8 @@ fn build_then_actor(
                 actor_context_clone.clone(),
                 constant(value),
                 PersistenceId::new(),
-            ).into();
+                actor_context_clone.scope_id(),
+            );
 
             // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics.
             // When THEN body references `state` (from HOLD), we want the CURRENT value at the
@@ -2809,7 +2822,7 @@ fn build_then_actor(
             for (name, actor) in actor_context_clone.parameters.iter() {
                 // Create a constant actor from the current stored value (async)
                 if let Ok(current_value) = actor.current_value().await {
-                    let frozen_actor = ValueActor::new_arc(
+                    let frozen_actor = create_actor(
                         ConstructInfo::new(
                             format!("frozen param: {name}"),
                             None,
@@ -2818,7 +2831,8 @@ fn build_then_actor(
                         actor_context_clone.clone(),
                         constant(current_value),
                         PersistenceId::new(),
-                    ).into();
+                        actor_context_clone.scope_id(),
+                    );
                     frozen_parameters.insert(name.clone(), frozen_actor);
                 } else {
                     // No value yet, keep original actor
@@ -2956,7 +2970,8 @@ fn build_then_actor(
 
     // Use lazy actor construction when in HOLD body context for sequential state updates
     if ctx.actor_context.use_lazy_actors {
-        Ok(ValueActor::new_arc_lazy(
+        let scope_id = ctx.actor_context.scope_id();
+        Ok(create_actor_lazy(
             ConstructInfo::new(
                 format!("PersistenceId: {persistence_id}"),
                 persistence,
@@ -2964,9 +2979,11 @@ fn build_then_actor(
             ).complete(ConstructType::ValueActor),
             flattened_stream,
             persistence_id,
-        ).into())
+            scope_id,
+        ))
     } else {
-        Ok(ValueActor::new_arc(
+        let scope_id = ctx.actor_context.scope_id();
+        Ok(create_actor(
             ConstructInfo::new(
                 format!("PersistenceId: {persistence_id}"),
                 persistence,
@@ -2975,7 +2992,8 @@ fn build_then_actor(
             ctx.actor_context,
             TypedStream::infinite(flattened_stream),
             persistence_id,
-        ).into())
+            scope_id,
+        ))
     }
 }
 
@@ -3039,7 +3057,7 @@ fn build_when_actor(
                 // Use async pattern matching to properly extract bindings from Objects
                 if let Some(bindings) = match_pattern(&arm.pattern, &value).await {
                     if LOG_DEBUG { zoon::println!("[WHEN] Pattern MATCHED: {:?}", arm.pattern); }
-                    let value_actor: ActorHandle = ValueActor::new_arc(
+                    let value_actor: ActorHandle = create_actor(
                         ConstructInfo::new(
                             "WHEN input value".to_string(),
                             None,
@@ -3048,7 +3066,8 @@ fn build_when_actor(
                         actor_context_clone.clone(),
                         constant(value.clone()),
                         PersistenceId::new(),
-                    ).into();
+                        actor_context_clone.scope_id(),
+                    );
 
                     // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics (same as THEN).
                     // When WHEN body references `state` (from HOLD), we want the CURRENT value at the
@@ -3056,7 +3075,7 @@ fn build_when_actor(
                     let mut frozen_parameters: HashMap<String, ActorHandle> = HashMap::new();
                     for (name, actor) in actor_context_clone.parameters.iter() {
                         if let Ok(current_value) = actor.current_value().await {
-                            let frozen_actor = ValueActor::new_arc(
+                            let frozen_actor = create_actor(
                                 ConstructInfo::new(
                                     format!("frozen param: {name}"),
                                     None,
@@ -3065,7 +3084,8 @@ fn build_when_actor(
                                 actor_context_clone.clone(),
                                 constant(current_value),
                                 PersistenceId::new(),
-                            ).into();
+                                actor_context_clone.scope_id(),
+                            );
                             frozen_parameters.insert(name.clone(), frozen_actor);
                         } else {
                             frozen_parameters.insert(name.clone(), actor.clone());
@@ -3075,7 +3095,7 @@ fn build_when_actor(
                     // Create parameter actors for the pattern bindings
                     let mut parameters = frozen_parameters;
                     for (name, bound_value) in bindings {
-                        let bound_actor = ValueActor::new_arc(
+                        let bound_actor = create_actor(
                             ConstructInfo::new(
                                 format!("WHEN binding: {}", name),
                                 None,
@@ -3084,7 +3104,8 @@ fn build_when_actor(
                             actor_context_clone.clone(),
                             constant(bound_value),
                             PersistenceId::new(),
-                        ).into();
+                            actor_context_clone.scope_id(),
+                        );
                         parameters.insert(name, bound_actor);
                     }
 
@@ -3187,7 +3208,8 @@ fn build_when_actor(
         Box::pin(stream)
     };
 
-    Ok(ValueActor::new_arc(
+    let scope_id = ctx.actor_context.scope_id();
+    Ok(create_actor(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -3196,7 +3218,8 @@ fn build_when_actor(
         ctx.actor_context,
         TypedStream::infinite(flattened_stream),
         persistence_id,
-    ).into())
+        scope_id,
+    ))
 }
 
 /// Build a WHILE actor (continuous processing while pattern matches).
@@ -3272,7 +3295,7 @@ fn build_while_actor(
                     (scope_id, ScopeDestroyGuard::new(scope_id))
                 });
 
-                let value_actor: ActorHandle = ValueActor::new_arc(
+                let value_actor: ActorHandle = create_actor(
                     ConstructInfo::new(
                         "WHILE input value".to_string(),
                         None,
@@ -3281,11 +3304,12 @@ fn build_while_actor(
                     actor_context_clone.clone(),
                     constant(value),
                     PersistenceId::new(),
-                ).into();
+                    actor_context_clone.scope_id(),
+                );
 
                 let mut parameters = actor_context_clone.parameters.clone();
                 for (name, bound_value) in bindings {
-                    let bound_actor = ValueActor::new_arc(
+                    let bound_actor = create_actor(
                         ConstructInfo::new(
                             format!("WHILE binding: {}", name),
                             None,
@@ -3294,7 +3318,8 @@ fn build_while_actor(
                         actor_context_clone.clone(),
                         constant(bound_value),
                         PersistenceId::new(),
-                    ).into();
+                        actor_context_clone.scope_id(),
+                    );
                     parameters.insert(name, bound_actor);
                 }
 
@@ -3392,7 +3417,8 @@ fn build_while_actor(
         }).flatten()
     });
 
-    Ok(ValueActor::new_arc(
+    let scope_id = ctx.actor_context.scope_id();
+    Ok(create_actor(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -3401,7 +3427,8 @@ fn build_while_actor(
         ctx.actor_context,
         TypedStream::infinite(stream),
         persistence_id,
-    ).into())
+        scope_id,
+    ))
 }
 
 /// Asynchronously extract a field value from a Value following a path of field names.
@@ -3508,7 +3535,8 @@ fn build_field_access_actor(
         });
     }
 
-    Ok(ValueActor::new_arc(
+    let scope_id = ctx.actor_context.scope_id();
+    Ok(create_actor(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -3517,7 +3545,8 @@ fn build_field_access_actor(
         ctx.actor_context,
         TypedStream::infinite(value_stream),
         persistence_id,
-    ).into())
+        scope_id,
+    ))
 }
 
 /// Build a HOLD actor (stateful accumulator).
@@ -3602,7 +3631,7 @@ fn build_hold_actor(
     );
 
     // Create state actor - initial value will come through the stream asynchronously
-    let state_actor: ActorHandle = ValueActor::new_arc(
+    let state_actor: ActorHandle = create_actor(
         ConstructInfo::new(
             format!("Hold state actor for {state_param}"),
             None,
@@ -3611,7 +3640,8 @@ fn build_hold_actor(
         ctx.actor_context.clone(),
         TypedStream::infinite(state_stream),
         PersistenceId::new(),
-    ).into();
+        ctx.actor_context.scope_id(),
+    );
 
     // Bind the state parameter in the context so body can reference it
     let mut body_parameters = ctx.actor_context.parameters.clone();
@@ -3744,7 +3774,8 @@ fn build_hold_actor(
     // Clone contexts before they're moved into output
     let construct_context_for_initial = ctx.construct_context.clone();
     let actor_context_for_initial = ctx.actor_context.clone();
-    let output: ActorHandle = ValueActor::new_arc(
+    let scope_id = ctx.actor_context.scope_id();
+    let output: ActorHandle = create_actor(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -3753,7 +3784,8 @@ fn build_hold_actor(
         ctx.actor_context,
         TypedStream::infinite(output_stream),
         persistence_id,
-    ).into();
+        scope_id,
+    );
 
     // NOTE: We do NOT copy body_result's history here anymore.
     // The state_update_stream (below) will emit those values when polled, and it calls
@@ -3764,16 +3796,16 @@ fn build_hold_actor(
     // First emission: state_actor gets it via take(1), so we don't send to state_receiver.
     // Subsequent emissions: send to state_receiver so body sees the reset value.
     //
-    // IMPORTANT: Use Weak<ValueActor> instead of Arc to avoid circular reference!
-    // The output actor holds (via Arc chain) the driver task, which holds combined_stream,
-    // which holds these closures. Using Arc would create a cycle preventing cleanup.
+    // With arena-based ActorHandle, there's no circular reference issue.
+    // ActorHandle doesn't keep the actor alive (the registry does), so we can
+    // just clone the handle instead of using Weak references.
     //
     // Use AtomicBool instead of Rc<RefCell<bool>> for lock-free flag.
     let is_first_input = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let output_weak_for_initial = output.keepalive().map(|arc| Arc::downgrade(&arc));
+    let output_clone_for_initial = output.clone();
     let initial_stream = initial_actor.clone().stream().then(move |value| {
         let is_first_input = is_first_input.clone();
-        let output_weak = output_weak_for_initial.clone();
+        let output_clone = output_clone_for_initial.clone();
         let mut state_sender = state_sender_for_reset.clone();
         let storage = storage_for_initial_save.clone();
         let construct_context = construct_context_for_initial.clone();
@@ -3794,17 +3826,13 @@ fn build_hold_actor(
                         ValueIdempotencyKey::new(),
                         actor_context,
                     );
-                    if let Some(output) = output_weak.as_ref().and_then(|w| w.upgrade()) {
-                        output.store_value_directly(restored_value);
-                    }
+                    output_clone.store_value_directly(restored_value);
                     // Don't save - we just loaded this value
                     return value;
                 }
                 // No stored state, this is truly the first value
                 // Store to output and save
-                if let Some(output) = output_weak.as_ref().and_then(|w| w.upgrade()) {
-                    output.store_value_directly(value.clone());
-                }
+                output_clone.store_value_directly(value.clone());
                 let json = value.to_json().await;
                 storage.save_state(persistence_id, &json);
             } else {
@@ -3813,10 +3841,7 @@ fn build_hold_actor(
                     zoon::println!("[HOLD] Failed to send state reset: {e}");
                 }
                 // Store value directly to output
-                // Use weak reference to avoid circular reference
-                if let Some(output) = output_weak.as_ref().and_then(|w| w.upgrade()) {
-                    output.store_value_directly(value.clone());
-                }
+                output_clone.store_value_directly(value.clone());
                 // Save reset state to storage
                 let json = value.to_json().await;
                 storage.save_state(persistence_id, &json);
@@ -3827,13 +3852,10 @@ fn build_hold_actor(
     }).boxed_local();
 
     // Modify state_update_stream to also store values directly to output
-    // IMPORTANT: Use Weak<ValueActor> to avoid circular reference!
-    let output_weak_for_update = output.keepalive().map(|arc| Arc::downgrade(&arc));
+    // With arena-based ActorHandle, no circular reference issue - just clone the handle.
+    let output_clone_for_update = output.clone();
     let state_update_stream = state_update_stream.map(move |value| {
-        // Use weak reference to avoid circular reference
-        if let Some(output) = output_weak_for_update.as_ref().and_then(|w| w.upgrade()) {
-            output.store_value_directly(value.clone());
-        }
+        output_clone_for_update.store_value_directly(value.clone());
         value
     }).boxed_local();
 
@@ -3910,7 +3932,7 @@ fn build_text_literal_actor(
                     let ref_span_copy = *ref_span;
 
                     // Create forwarding actor for the base variable
-                    let (base_ref_actor, base_sender) = ValueActor::new_arc_forwarding(
+                    let (base_ref_actor, base_sender) = create_actor_forwarding(
                         ConstructInfo::new(
                             format!("TextInterpolation:{}:base", var_name),
                             None,
@@ -3918,8 +3940,8 @@ fn build_text_literal_actor(
                         ),
                         ctx.actor_context.clone(),
                         PersistenceId::new(),
+                        ctx.actor_context.scope_id(),
                     );
-                    let base_ref_actor: ActorHandle = base_ref_actor.into();
 
                     let actor_loop = ActorLoop::new(async move {
                         let actor = ref_connector.referenceable(ref_span_copy).await;
@@ -3942,7 +3964,7 @@ fn build_text_literal_actor(
                         part_actors.push((false, base_actor));
                     } else {
                         // Field access path - create forwarding actor that subscribes to the final field
-                        let (field_actor, field_sender) = ValueActor::new_arc_forwarding(
+                        let (field_actor, field_sender) = create_actor_forwarding(
                             ConstructInfo::new(
                                 format!("TextInterpolation:{}", var_name),
                                 None,
@@ -3950,8 +3972,8 @@ fn build_text_literal_actor(
                             ),
                             ctx.actor_context.clone(),
                             PersistenceId::new(),
+                            ctx.actor_context.scope_id(),
                         );
-                        let field_actor: ActorHandle = field_actor.into();
 
                         let actor_loop = ActorLoop::new(async move {
                             // First, wait for base actor to have a value so we can navigate to the field
@@ -4122,7 +4144,8 @@ fn build_text_literal_actor(
             )
         });
 
-        Ok(ValueActor::new_arc(
+        let scope_id = ctx.actor_context.scope_id();
+        Ok(create_actor(
             ConstructInfo::new(
                 format!("PersistenceId: {persistence_id}"),
                 persistence,
@@ -4131,7 +4154,8 @@ fn build_text_literal_actor(
             ctx.actor_context,
             TypedStream::infinite(text_value_stream),
             persistence_id,
-        ).into())
+            scope_id,
+        ))
     }
 }
 
@@ -4161,7 +4185,8 @@ fn build_link_setter_actor(
         value
     });
 
-    Ok(ValueActor::new_arc(
+    let scope_id = ctx.actor_context.scope_id();
+    Ok(create_actor(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -4170,7 +4195,8 @@ fn build_link_setter_actor(
         ctx.actor_context,
         TypedStream::infinite(stream),
         persistence_id,
-    ).into())
+        scope_id,
+    ))
 }
 
 /// Traverse an alias path and return the LINK sender at the end of the path.
@@ -4482,7 +4508,7 @@ fn build_list_append_with_recording(
                 zoon::eprintln!("[DEBUG] Failed to restore input for item {}", index);
                 continue;
             };
-            let input_actor: ActorHandle = ValueActor::new_arc(
+            let input_actor: ActorHandle = create_actor(
                 ConstructInfo::new(
                     format!("restored_input_{}", index),
                     None,
@@ -4491,7 +4517,8 @@ fn build_list_append_with_recording(
                 ctx.actor_context.clone(),
                 constant(input_value),
                 PersistenceId::new(),
-            ).into();
+                ctx.actor_context.scope_id(),
+            );
 
             // 2. Look up the function in registry
             let function_path = recorded_call.path.join("/");
@@ -4532,7 +4559,7 @@ fn build_list_append_with_recording(
                         source_storage_key: storage_key.clone(),
                         call_id: recorded_call.id.clone(),
                     };
-                    let wrapped_item = ValueActor::new_arc_with_origin_boxed(
+                    let wrapped_item = create_actor_with_origin_boxed(
                         ConstructInfo::new(
                             format!("restored_item_wrapper_{}", index),
                             None,
@@ -4542,7 +4569,8 @@ fn build_list_append_with_recording(
                         Box::pin(item_actor.stream()),
                         PersistenceId::new(),
                         origin,
-                    ).into();
+                        ctx.actor_context.scope_id(),
+                    );
                     restored_items.push(wrapped_item);
                 }
                 Ok(None) => {
@@ -4592,7 +4620,7 @@ fn build_list_append_with_recording(
             source_storage_key: storage_key_for_append.clone(),
             call_id,
         };
-        let new_item_actor = ValueActor::new_arc_with_origin(
+        let new_item_actor = create_actor_with_origin(
             ConstructInfo::new(
                 function_call_id_for_append.with_child_id("appended_item"),
                 None,
@@ -4602,7 +4630,8 @@ fn build_list_append_with_recording(
             constant(value),
             PersistenceId::new(),
             origin,
-        ).into();
+            actor_context_for_append.scope_id(),
+        );
         TaggedChange::FromAppend(ListChange::Push { item: new_item_actor })
     });
 
@@ -4691,7 +4720,7 @@ fn build_list_append_with_recording(
         ValueMetadata::new(ValueIdempotencyKey::new()),
     ));
 
-    let result_actor = ValueActor::new_arc(
+    let result_actor = create_actor(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -4700,7 +4729,8 @@ fn build_list_append_with_recording(
         ctx.actor_context.clone(),
         result_stream,
         persistence_id,
-    ).into();
+        ctx.actor_context.scope_id(),
+    );
 
     Ok(Some(result_actor))
 }
@@ -4801,7 +4831,7 @@ fn call_function(
                 }
 
                 // Create a constant actor for this specific piped value
-                let value_actor: ActorHandle = ValueActor::new_arc(
+                let value_actor: ActorHandle = create_actor(
                     ConstructInfo::new(
                         "piped function input".to_string(),
                         None,
@@ -4810,7 +4840,8 @@ fn call_function(
                     ctx_for_closure.actor_context.clone(),
                     constant(piped_value),
                     PersistenceId::new(),
-                ).into();
+                    ctx_for_closure.actor_context.scope_id(),
+                );
 
                 // Bind the constant value actor to the parameter
                 let mut params = parameters_for_closure.clone();
@@ -4883,7 +4914,7 @@ fn call_function(
             });
 
             // Create the wrapper actor
-            let wrapper_actor = ValueActor::new_arc(
+            let wrapper_actor = create_actor(
                 ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}"),
                     persistence_for_construct,
@@ -4892,7 +4923,8 @@ fn call_function(
                 ctx.actor_context.clone(),
                 TypedStream::infinite(result_stream),
                 persistence_id,
-            ).into();
+                ctx.actor_context.scope_id(),
+            );
 
             return Ok(Some(wrapper_actor));
         }
@@ -4901,6 +4933,7 @@ fn call_function(
         // Collect argument actors to keep them alive for the duration of the function result
         // Note: we collect from parameters which now contains the arg_map values
         let arg_actors: Vec<ActorHandle> = parameters.values().cloned().collect();
+        let scope_id = ctx.actor_context.scope_id();
 
         // Create a nested scope using the function call's persistence_id.
         // This ensures that HOLDs inside the function body get unique persistence IDs
@@ -4954,7 +4987,7 @@ fn call_function(
         match result {
             Ok(Some(result_actor)) if !arg_actors.is_empty() => {
                 // Create a wrapper actor that forwards the result
-                let wrapper: ActorHandle = ValueActor::new_arc(
+                let wrapper: ActorHandle = create_actor(
                     ConstructInfo::new(
                         format!("PersistenceId: {persistence_id}"),
                         persistence,
@@ -4963,7 +4996,8 @@ fn call_function(
                     ctx.actor_context,
                     TypedStream::infinite(result_actor.stream()),
                     persistence_id,
-                ).into();
+                    scope_id,
+                );
                 return Ok(Some(wrapper));
             }
             _ => return result,
@@ -5511,14 +5545,15 @@ pub fn evaluate_with_registry(
     mut function_registry: FunctionRegistry,
     module_loader: ModuleLoader,
 ) -> Result<(Arc<Object>, ConstructContext, FunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>, Arc<PassThroughConnector>, ScopeDestroyGuard), String> {
-    let construct_context = ConstructContext {
-        construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
-        virtual_fs,
-    };
     // Create root scope in the actor registry for deterministic lifetime management
     let root_scope_id = REGISTRY.with(|reg: &std::cell::RefCell<ActorRegistry>| {
         reg.borrow_mut().create_scope(None)
     });
+    let construct_context = ConstructContext {
+        construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
+        virtual_fs,
+        bridge_scope_id: Some(root_scope_id),
+    };
     let actor_context = ActorContext {
         registry_scope_id: Some(root_scope_id),
         ..ActorContext::default()

@@ -2,7 +2,7 @@
   "mcpServers": {
     "boon-browser": {
       "command": "/home/martinkavik/repos/boon/target/release/boon-tools",
-      "args": ["mcp"]
+      "args": ["mcp", "--port", "9226"]
     }
   }
 }
