@@ -23,6 +23,19 @@ struct FuncDef {
 use super::ir::*;
 
 // ---------------------------------------------------------------------------
+// Saved element bindings (for proper nesting of Element calls)
+// ---------------------------------------------------------------------------
+
+/// Saved state of element.* bindings from `name_to_cell` and `element_events`.
+/// Used by `process_element_self_ref` / `restore_element_self_ref` to properly
+/// restore outer element bindings when nested Element calls finish.
+#[derive(Default)]
+struct SavedElementBindings {
+    bindings: Vec<(String, Option<CellId>)>,
+    events: Option<HashMap<String, EventId>>,
+}
+
+// ---------------------------------------------------------------------------
 // Compile errors
 // ---------------------------------------------------------------------------
 
@@ -94,6 +107,25 @@ struct Lowerer {
     /// even if the fields aren't reactive. Set during list constructor template inlining
     /// so that field access resolves to actual cells instead of ObjectConstruct.
     force_object_store: bool,
+
+    /// Deferred per-item List/remove operations. When List/remove(item, on: item.X.Y.event.Z)
+    /// can't find the per-item event (because it's created later in List/map template lowering),
+    /// the remove is deferred and resolved during List/map where the events exist.
+    /// Key: list source CellId, Value: list of pending removes.
+    pending_per_item_removes: HashMap<CellId, Vec<PendingPerItemRemove>>,
+}
+
+/// A deferred per-item List/remove operation.
+/// Created when List/remove references per-item events that don't exist yet
+/// (they'll be created during List/map template lowering).
+#[derive(Clone)]
+struct PendingPerItemRemove {
+    /// The item parameter name used in the List/remove declaration (e.g., "item").
+    item_name: String,
+    /// Index of the ListRemove node in self.nodes (for patching the trigger).
+    node_index: usize,
+    /// The original `on:` expression AST (e.g., `item.todo_elements.remove_todo_button.event.press`).
+    on_expr: Spanned<Expression>,
 }
 
 impl Lowerer {
@@ -118,6 +150,7 @@ impl Lowerer {
             current_var_name: None,
             current_passed: None,
             force_object_store: false,
+            pending_per_item_removes: HashMap::new(),
         }
     }
 
@@ -167,6 +200,10 @@ impl Lowerer {
     fn propagate_list_constructor(&mut self, source: CellId, target: CellId) {
         if let Some(c) = self.list_item_constructor.get(&source).cloned() {
             self.list_item_constructor.insert(target, c);
+        }
+        // Also propagate pending per-item removes along the list chain.
+        if let Some(removes) = self.pending_per_item_removes.get(&source).cloned() {
+            self.pending_per_item_removes.entry(target).or_default().extend(removes);
         }
     }
 
@@ -448,9 +485,21 @@ impl Lowerer {
                 let style = self.find_arg_expr_or_default(arguments, "style");
                 let focus = self.has_element_bool_field(arguments, "focus")
                     || self.has_top_level_bool_arg(arguments, "focus");
+                // Lower the `text` argument to get the cell providing reactive text.
+                let text_cell = arguments
+                    .iter()
+                    .find(|a| a.node.name.as_str() == "text")
+                    .and_then(|a| a.node.value.as_ref())
+                    .and_then(|v| {
+                        let expr = self.lower_expr(&v.node, v.span);
+                        match expr {
+                            IrExpr::CellRead(c) => Some(c),
+                            _ => None,
+                        }
+                    });
                 self.nodes.push(IrNode::Element {
                     cell,
-                    kind: ElementKind::TextInput { placeholder, style, focus },
+                    kind: ElementKind::TextInput { placeholder, style, focus, text_cell },
                     links,
                     hovered_cell,
                 });
@@ -771,7 +820,21 @@ impl Lowerer {
         &mut self,
         arguments: &[Spanned<Argument>],
         span: Span,
-    ) -> Option<CellId> {
+    ) -> SavedElementBindings {
+        // Always save ALL current element.* bindings first, so that
+        // restore_element_self_ref can properly restore them even if
+        // this Element call has no `element:` argument.
+        let mut saved_bindings = Vec::new();
+        let keys: Vec<String> = self.name_to_cell.keys()
+            .filter(|k| *k == "element" || k.starts_with("element."))
+            .cloned()
+            .collect();
+        for k in &keys {
+            saved_bindings.push((k.clone(), self.name_to_cell.get(k).copied()));
+        }
+        let saved_events = self.element_events.get("element").cloned();
+        let saved = SavedElementBindings { bindings: saved_bindings, events: saved_events };
+
         let elem_arg = arguments.iter().find(|a| a.node.name.as_str() == "element");
         let elem_obj = match elem_arg {
             Some(arg) => match arg.node.value.as_ref() {
@@ -781,14 +844,12 @@ impl Lowerer {
                 },
                 None => None,
             },
-            None => return None,
+            None => return saved,
         };
         let obj = match elem_obj {
             Some(o) => o,
-            None => return None,
+            None => return saved,
         };
-
-        let saved = self.name_to_cell.get("element").copied();
 
         // Allocate a namespace cell for "element".
         let element_cell = self.alloc_cell("element", span);
@@ -806,18 +867,28 @@ impl Lowerer {
                 "event" => {
                     // event: [press: LINK, key_down: LINK, change: LINK, ...]
                     if let Expression::Object(event_obj) = &field.node.value.node {
+                        // Check if pre-allocated events exist for the LINK target.
+                        // When current_var_name is set (LINK connection), reuse
+                        // pre-allocated EventIds so the bridge and event consumers
+                        // (HOLD body, THEN, etc.) use the same EventId.
+                        let prealloc_events = self.current_var_name.as_ref()
+                            .and_then(|name| self.element_events.get(name))
+                            .cloned();
                         let mut events = HashMap::new();
                         for event_field in &event_obj.variables {
                             if matches!(event_field.node.value.node, Expression::Link) {
                                 let event_name = event_field.node.name.as_str().to_string();
-                                let event_id = self.alloc_event(
-                                    &format!("element.{}", event_name),
-                                    EventSource::Link {
-                                        element: element_cell,
-                                        event_name: event_name.clone(),
-                                    },
-                                    span,
-                                );
+                                // Reuse pre-allocated EventId if available.
+                                let event_id = prealloc_events.as_ref()
+                                    .and_then(|pe| pe.get(&event_name).copied())
+                                    .unwrap_or_else(|| self.alloc_event(
+                                        &format!("element.{}", event_name),
+                                        EventSource::Link {
+                                            element: element_cell,
+                                            event_name: event_name.clone(),
+                                        },
+                                        span,
+                                    ));
                                 events.insert(event_name.clone(), event_id);
 
                                 // Pre-allocate payload cells for known event types.
@@ -859,7 +930,14 @@ impl Lowerer {
                                 }
                             }
                         }
-                        self.element_events.insert(element_name.clone(), events);
+                        self.element_events.insert(element_name.clone(), events.clone());
+                        // Also store events under current_var_name (LINK target)
+                        // so they survive restore_element_self_ref cleanup.
+                        // Without this, the LINK processing in lower_pipe can't find
+                        // events under "element" because restore already removed them.
+                        if let Some(ref var_name) = self.current_var_name {
+                            self.element_events.insert(var_name.clone(), events);
+                        }
                     }
                 }
                 "hovered" => {
@@ -906,22 +984,28 @@ impl Lowerer {
         saved
     }
 
-    /// Restore the "element" name binding after processing an Element call.
-    fn restore_element_self_ref(&mut self, saved: Option<CellId>) {
-        if let Some(prev) = saved {
-            self.name_to_cell.insert("element".to_string(), prev);
-        } else {
-            self.name_to_cell.remove("element");
-        }
-        // Clean up element.* names — they're local to this Element call.
+    /// Restore element bindings after processing an Element call.
+    fn restore_element_self_ref(&mut self, saved: SavedElementBindings) {
+        // Remove ALL current element.* names (created by this Element call).
         let to_remove: Vec<String> = self.name_to_cell.keys()
-            .filter(|k| k.starts_with("element."))
+            .filter(|k| *k == "element" || k.starts_with("element."))
             .cloned()
             .collect();
         for k in to_remove {
             self.name_to_cell.remove(&k);
         }
-        self.element_events.remove("element");
+        // Restore previously saved bindings.
+        for (name, cell) in saved.bindings {
+            if let Some(c) = cell {
+                self.name_to_cell.insert(name, c);
+            }
+        }
+        // Restore saved element_events.
+        if let Some(events) = saved.events {
+            self.element_events.insert("element".to_string(), events);
+        } else {
+            self.element_events.remove("element");
+        }
     }
 
     /// Check if a top-level argument is present with value True (e.g. `focus: True`).
@@ -1033,6 +1117,10 @@ impl Lowerer {
                 let saved_var_name = self.current_var_name.take();
                 self.current_var_name = Some(name.clone());
                 let source_cell = self.lower_expr_to_cell(from, "pipe_from");
+                // Note: event propagation to LINK target name is handled by
+                // process_element_self_ref (which stores events under current_var_name).
+                // Do NOT copy from "element" here — restore_element_self_ref has
+                // already run, so "element" holds the OUTER element's events.
                 self.nodes.push(IrNode::PipeThrough {
                     cell: target,
                     source: source_cell,
@@ -1054,6 +1142,7 @@ impl Lowerer {
                     let source_cell = self.lower_expr_to_cell(from, "pipe_from");
                     let mid_cell = self.alloc_cell("pipe_mid", to.span);
                     self.lower_pipe_with_source_cell(mid_cell, source_cell, mid, var_span);
+                    // Note: event propagation handled by process_element_self_ref.
                     self.nodes.push(IrNode::PipeThrough {
                         cell: target,
                         source: mid_cell,
@@ -1236,6 +1325,32 @@ impl Lowerer {
                         // Wrap in a Derived node for the template.
                         let template_cell = self.alloc_cell("list_map_template", call_span);
                         let template_node = IrNode::Derived { cell: template_cell, expr: template_expr };
+                        // Resolve any deferred per-item removes for this list.
+                        // Template-scoped events from LINK propagation are now available.
+                        if let Some(removes) = self.pending_per_item_removes.remove(&source_cell) {
+                            for remove in removes {
+                                // Temporarily bind the remove's item_name to the map's item cell
+                                // so resolve_event_from_expr can follow through field cells.
+                                let saved = self.name_to_cell.get(&remove.item_name).copied();
+                                let bind_cell = self.name_to_cell.get(&item_name).copied().unwrap_or(item_cell);
+                                self.name_to_cell.insert(
+                                    remove.item_name.clone(),
+                                    bind_cell,
+                                );
+                                if let Some(event_id) = self.resolve_event_from_expr(&remove.on_expr.node) {
+                                    // Patch the placeholder trigger in the existing ListRemove node.
+                                    if let IrNode::ListRemove { trigger, .. } = &mut self.nodes[remove.node_index] {
+                                        *trigger = event_id;
+                                    }
+                                }
+                                // Restore binding.
+                                if let Some(s) = saved {
+                                    self.name_to_cell.insert(remove.item_name.clone(), s);
+                                } else {
+                                    self.name_to_cell.remove(&remove.item_name);
+                                }
+                            }
+                        }
                         let cell_end = self.cells.len() as u32;
                         let event_end = self.events.len() as u32;
                         self.nodes.push(IrNode::ListMap {
@@ -1391,14 +1506,68 @@ impl Lowerer {
                             }
                         }
                         // Case 1: Direct event (per-item or simple global).
-                        let trigger = self.resolve_event_from_expr(&val.node)
-                            .or_else(|| {
-                                let trigger_cell = self.lower_expr_to_cell(val, "remove_trigger");
-                                self.resolve_event_from_cell(trigger_cell)
-                            })
-                            .unwrap_or_else(|| {
-                                self.alloc_event("list_remove_trigger", EventSource::Synthetic, call_span)
+                        let trigger = self.resolve_event_from_expr(&val.node);
+                        if let Some(trigger) = trigger {
+                            // Restore item binding.
+                            if let Some(prev) = saved_item {
+                                self.name_to_cell.insert(item_name, prev);
+                            } else {
+                                self.name_to_cell.remove(&item_name);
+                            }
+                            self.nodes.push(IrNode::ListRemove {
+                                cell: target,
+                                source: source_cell,
+                                trigger,
+                                predicate: None,
+                                item_cell: None,
+                                item_field_cells: vec![],
                             });
+                            self.propagate_list_constructor(source_cell, target);
+                            return;
+                        }
+                        // Check if this is a per-item event reference (alias starting with
+                        // the item parameter name). If so, defer resolution to List/map where
+                        // template-scoped events will be created by LINK propagation.
+                        let is_per_item_event = Self::is_per_item_event_expr(&val.node, &item_name);
+                        if is_per_item_event {
+                            // Restore item binding.
+                            if let Some(prev) = saved_item {
+                                self.name_to_cell.insert(item_name.clone(), prev);
+                            } else {
+                                self.name_to_cell.remove(&item_name);
+                            }
+                            // Create ListRemove with a placeholder trigger. The trigger will
+                            // be patched during List/map template lowering when the actual
+                            // template-scoped event is available. Use a sentinel EventId that
+                            // won't match any real event.
+                            let placeholder = EventId(u32::MAX);
+                            let node_index = self.nodes.len();
+                            self.nodes.push(IrNode::ListRemove {
+                                cell: target,
+                                source: source_cell,
+                                trigger: placeholder,
+                                predicate: None,
+                                item_cell: None,
+                                item_field_cells: vec![],
+                            });
+                            self.pending_per_item_removes
+                                .entry(source_cell)
+                                .or_default()
+                                .push(PendingPerItemRemove {
+                                    item_name,
+                                    node_index,
+                                    on_expr: val.clone(),
+                                });
+                            self.propagate_list_constructor(source_cell, target);
+                            return;
+                        }
+                        // Fallback: lower expression to cell and try to resolve event.
+                        let trigger = {
+                            let trigger_cell = self.lower_expr_to_cell(val, "remove_trigger");
+                            self.resolve_event_from_cell(trigger_cell)
+                        }.unwrap_or_else(|| {
+                            self.alloc_event("list_remove_trigger", EventSource::Synthetic, call_span)
+                        });
                         // Restore item binding.
                         if let Some(prev) = saved_item {
                             self.name_to_cell.insert(item_name, prev);
@@ -1623,8 +1792,62 @@ impl Lowerer {
     ) -> Vec<(EventId, IrExpr)> {
         match body {
             // `event_source |> THEN { expr }` — single trigger
+            // Special case: `LATEST { ... } |> THEN { body }` — extract triggers
+            // from each LATEST arm and pair each with the outer THEN body.
             Expression::Pipe { from, to } => {
                 if let Expression::Then { body: then_body } = &to.node {
+                    // Check if `from` is a LATEST expression — if so, expand into
+                    // multiple trigger-body pairs (one per LATEST arm).
+                    if let Expression::Latest { inputs } = &from.node {
+                        let outer_body_expr = self.lower_expr(&then_body.node, then_body.span);
+                        let mut trigger_bodies = Vec::new();
+                        for input in inputs {
+                            if let Expression::Pipe { from: inner_from, to: inner_to } = &input.node {
+                                let trigger = self.resolve_event_from_expr(&inner_from.node)
+                                    .or_else(|| {
+                                        let from_cell = self.lower_expr_to_cell(inner_from, "hold_trigger_source");
+                                        self.resolve_event_from_cell(from_cell)
+                                    })
+                                    .unwrap_or_else(|| {
+                                        self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span)
+                                    });
+                                if let Expression::When { arms } = &inner_to.node {
+                                    // WHEN arm inside LATEST: wrap outer THEN body in PatternMatch.
+                                    // Matching WHEN arms → evaluate outer body; SKIP arms → SKIP.
+                                    let source_cell = self.lower_expr_to_cell(inner_from, "hold_when_source");
+                                    let ir_arms: Vec<(IrPattern, IrExpr)> = arms
+                                        .iter()
+                                        .map(|arm| {
+                                            let pattern = self.lower_pattern(&arm.pattern);
+                                            // Check if this arm's body is SKIP.
+                                            let is_skip = matches!(&arm.body.node, Expression::Skip);
+                                            if is_skip {
+                                                (pattern, IrExpr::Constant(IrValue::Skip))
+                                            } else {
+                                                // Matching arm → evaluate outer THEN body.
+                                                (pattern, outer_body_expr.clone())
+                                            }
+                                        })
+                                        .collect();
+                                    let body_expr = IrExpr::PatternMatch {
+                                        source: source_cell,
+                                        arms: ir_arms,
+                                    };
+                                    trigger_bodies.push((trigger, body_expr));
+                                } else {
+                                    // THEN arm or other pipe inside LATEST:
+                                    // trigger fires → evaluate outer THEN body directly.
+                                    trigger_bodies.push((trigger, outer_body_expr.clone()));
+                                }
+                            }
+                        }
+                        if trigger_bodies.is_empty() {
+                            let trigger = self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span);
+                            trigger_bodies.push((trigger, outer_body_expr));
+                        }
+                        return trigger_bodies;
+                    }
+                    // Simple case: single event source |> THEN { body }
                     let trigger = self.resolve_event_from_expr(&from.node)
                         .or_else(|| {
                             let from_cell = self.lower_expr_to_cell(from, "hold_trigger_source");
@@ -1657,6 +1880,51 @@ impl Lowerer {
                                     self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span)
                                 });
                             let body_expr = self.lower_expr(&then_body.node, then_body.span);
+                            trigger_bodies.push((trigger, body_expr));
+                        } else if let Expression::When { arms } = &to.node {
+                            // `event_source |> WHEN { pattern => body }` inside HOLD/LATEST.
+                            // Extract the trigger from the event source chain (same logic
+                            // as THEN arms). Instead of creating a separate WHEN node,
+                            // produce an inline PatternMatch expression so the HOLD handler
+                            // evaluates the match directly (avoiding ordering issues with
+                            // downstream updates).
+                            let trigger = self.resolve_event_from_expr(&from.node)
+                                .or_else(|| {
+                                    let from_cell = self.lower_expr_to_cell(from, "hold_trigger_source");
+                                    self.resolve_event_from_cell(from_cell)
+                                })
+                                .unwrap_or_else(|| {
+                                    self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span)
+                                });
+                            // Lower the source to a cell (key_data_cell).
+                            let source_cell = self.lower_expr_to_cell(from, "hold_when_source");
+                            // Lower pattern arms inline.
+                            let ir_arms: Vec<(IrPattern, IrExpr)> = arms
+                                .iter()
+                                .map(|arm| {
+                                    let pattern = self.lower_pattern(&arm.pattern);
+                                    let saved = if let IrPattern::Binding(ref name) = pattern {
+                                        let prev = self.name_to_cell.get(name).copied();
+                                        self.name_to_cell.insert(name.clone(), source_cell);
+                                        Some((name.clone(), prev))
+                                    } else {
+                                        None
+                                    };
+                                    let body = self.lower_expr(&arm.body.node, arm.body.span);
+                                    if let Some((name, prev)) = saved {
+                                        if let Some(prev_cell) = prev {
+                                            self.name_to_cell.insert(name, prev_cell);
+                                        } else {
+                                            self.name_to_cell.remove(&name);
+                                        }
+                                    }
+                                    (pattern, body)
+                                })
+                                .collect();
+                            let body_expr = IrExpr::PatternMatch {
+                                source: source_cell,
+                                arms: ir_arms,
+                            };
                             trigger_bodies.push((trigger, body_expr));
                         }
                     }
@@ -1855,6 +2123,21 @@ impl Lowerer {
             }
             _ => None,
         }
+    }
+
+    /// Check if an expression is a per-item event reference (alias starting with item_name
+    /// and containing ".event." in the path).
+    /// E.g., `item.todo_elements.remove_todo_button.event.press` with item_name="item" → true.
+    fn is_per_item_event_expr(expr: &Expression, item_name: &str) -> bool {
+        if let Expression::Alias(Alias::WithoutPassed { parts, .. }) = expr {
+            if parts.len() >= 3
+                && parts[0].as_str() == item_name
+                && parts.iter().any(|p| p.as_str() == "event")
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Try to find a reactive cell dependency in an expression (for List/append watch_cell).
@@ -2347,9 +2630,13 @@ impl Lowerer {
 
                 let focus = self.has_element_bool_field(arguments, "focus")
                     || self.has_top_level_bool_arg(arguments, "focus");
+                let text_cell = text_expr.and_then(|expr| match expr {
+                    IrExpr::CellRead(c) => Some(c),
+                    _ => None,
+                });
                 self.nodes.push(IrNode::Element {
                     cell,
-                    kind: ElementKind::TextInput { placeholder, style, focus },
+                    kind: ElementKind::TextInput { placeholder, style, focus, text_cell },
                     links,
                     hovered_cell,
                 });
@@ -3883,6 +4170,27 @@ impl Lowerer {
                                 let template_expr = self.lower_expr(&val.node, val.span);
                                 let template_cell = self.alloc_cell("list_map_template", to.span);
                                 let template_node = IrNode::Derived { cell: template_cell, expr: template_expr };
+                                // Resolve deferred per-item removes (same as primary List/map handler).
+                                if let Some(removes) = self.pending_per_item_removes.remove(&source_cell) {
+                                    for remove in removes {
+                                        let saved = self.name_to_cell.get(&remove.item_name).copied();
+                                        let bind_cell = self.name_to_cell.get(&item_name).copied().unwrap_or(item_cell);
+                                        self.name_to_cell.insert(
+                                            remove.item_name.clone(),
+                                            bind_cell,
+                                        );
+                                        if let Some(event_id) = self.resolve_event_from_expr(&remove.on_expr.node) {
+                                            if let IrNode::ListRemove { trigger, .. } = &mut self.nodes[remove.node_index] {
+                                                *trigger = event_id;
+                                            }
+                                        }
+                                        if let Some(s) = saved {
+                                            self.name_to_cell.insert(remove.item_name.clone(), s);
+                                        } else {
+                                            self.name_to_cell.remove(&remove.item_name);
+                                        }
+                                    }
+                                }
                                 let cell_end = self.cells.len() as u32;
                                 let event_end = self.events.len() as u32;
                                 self.nodes.push(IrNode::ListMap {
@@ -3987,14 +4295,60 @@ impl Lowerer {
                                     }
                                 }
                                 // Case 1: Direct event (per-item or simple global).
-                                let trigger = self.resolve_event_from_expr(&val.node)
-                                    .or_else(|| {
-                                        let trigger_cell = self.lower_expr_to_cell(val, "remove_trigger");
-                                        self.resolve_event_from_cell(trigger_cell)
-                                    })
-                                    .unwrap_or_else(|| {
-                                        self.alloc_event("list_remove_trigger", EventSource::Synthetic, to.span)
+                                let trigger = self.resolve_event_from_expr(&val.node);
+                                if let Some(trigger) = trigger {
+                                    if let Some(prev) = saved_item {
+                                        self.name_to_cell.insert(item_name, prev);
+                                    } else {
+                                        self.name_to_cell.remove(&item_name);
+                                    }
+                                    self.nodes.push(IrNode::ListRemove {
+                                        cell: target,
+                                        source: source_cell,
+                                        trigger,
+                                        predicate: None,
+                                        item_cell: None,
+                                        item_field_cells: vec![],
                                     });
+                                    self.propagate_list_constructor(source_cell, target);
+                                    return;
+                                }
+                                // Check if per-item event, defer to List/map.
+                                let is_per_item_event = Self::is_per_item_event_expr(&val.node, &item_name);
+                                if is_per_item_event {
+                                    if let Some(prev) = saved_item {
+                                        self.name_to_cell.insert(item_name.clone(), prev);
+                                    } else {
+                                        self.name_to_cell.remove(&item_name);
+                                    }
+                                    let placeholder = EventId(u32::MAX);
+                                    let node_index = self.nodes.len();
+                                    self.nodes.push(IrNode::ListRemove {
+                                        cell: target,
+                                        source: source_cell,
+                                        trigger: placeholder,
+                                        predicate: None,
+                                        item_cell: None,
+                                        item_field_cells: vec![],
+                                    });
+                                    self.pending_per_item_removes
+                                        .entry(source_cell)
+                                        .or_default()
+                                        .push(PendingPerItemRemove {
+                                            item_name,
+                                            node_index,
+                                            on_expr: val.clone(),
+                                        });
+                                    self.propagate_list_constructor(source_cell, target);
+                                    return;
+                                }
+                                // Fallback: lower expression to cell.
+                                let trigger = {
+                                    let trigger_cell = self.lower_expr_to_cell(val, "remove_trigger");
+                                    self.resolve_event_from_cell(trigger_cell)
+                                }.unwrap_or_else(|| {
+                                    self.alloc_event("list_remove_trigger", EventSource::Synthetic, to.span)
+                                });
                                 if let Some(prev) = saved_item {
                                     self.name_to_cell.insert(item_name, prev);
                                 } else {
@@ -4350,6 +4704,12 @@ fn collect_cell_refs(expr: &IrExpr, out: &mut Vec<CellId>) {
             }
         }
         IrExpr::Constant(_) => {}
+        IrExpr::PatternMatch { source, arms } => {
+            out.push(*source);
+            for (_, body) in arms {
+                collect_cell_refs(body, out);
+            }
+        }
     }
 }
 

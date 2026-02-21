@@ -453,6 +453,12 @@ enum ExecAction {
         /// Path to navigate to
         path: String,
     },
+
+    /// Evaluate arbitrary JavaScript in the page context
+    EvalJs {
+        /// JavaScript expression to evaluate
+        expression: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -1197,6 +1203,20 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             match response {
                 WsResponse::Success { .. } => {
                     println!("ok");
+                }
+                _ => print_response(response),
+            }
+        }
+
+        ExecAction::EvalJs { expression } => {
+            let response = send_command_to_server(port, WsCommand::EvalJs { expression }).await?;
+            match response {
+                WsResponse::Success { data } => {
+                    if let Some(d) = data {
+                        println!("{}", d);
+                    } else {
+                        println!("ok");
+                    }
                 }
                 _ => print_response(response),
             }

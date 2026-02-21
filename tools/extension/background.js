@@ -2882,6 +2882,15 @@ async function handleCommand(id, command) {
           return { type: 'elementStyle', found: false, error: 'GetElementStyle failed: ' + e.message };
         }
 
+      case 'evalJs':
+        // Evaluate arbitrary JavaScript in the page context
+        try {
+          const evalResult = await cdpEvaluate(tab.id, command.expression);
+          return { type: 'success', data: evalResult };
+        } catch (e) {
+          return { type: 'error', message: `EvalJs failed: ${e.message}` };
+        }
+
       default:
         return { type: 'error', message: `Unknown command: ${type}` };
     }

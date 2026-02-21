@@ -1218,6 +1218,79 @@ impl<'a> WasmEmitter<'a> {
         }
     }
 
+    /// Re-evaluate the dependency chain for a CellRead expression (per-item version).
+    /// Uses memory context to read/write per-item cells from WASM linear memory.
+    fn emit_reevaluate_chain_ctx(&self, func: &mut Function, expr: &IrExpr, mem_ctx: &MemoryContext) {
+        if let IrExpr::CellRead(cell) = expr {
+            self.emit_reevaluate_cell_ctx(func, *cell, mem_ctx);
+        }
+    }
+
+    /// Re-evaluate a single cell and its upstream dependencies (per-item version).
+    fn emit_reevaluate_cell_ctx(&self, func: &mut Function, cell: CellId, mem_ctx: &MemoryContext) {
+        if let Some(node) = self.find_node_for_cell(cell) {
+            match node {
+                IrNode::Derived { expr: IrExpr::CellRead(source), .. } => {
+                    self.emit_reevaluate_cell_ctx(func, *source, mem_ctx);
+                    self.emit_cell_get(func, *source, Some(mem_ctx));
+                    self.emit_cell_set(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    self.emit_cell_get(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                }
+                IrNode::TextTrim { source, .. } => {
+                    self.emit_reevaluate_cell_ctx(func, *source, mem_ctx);
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_TRIM));
+                    self.emit_cell_get(func, *source, Some(mem_ctx));
+                    self.emit_cell_set(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    self.emit_cell_get(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                }
+                IrNode::TextIsNotEmpty { source, .. } => {
+                    self.emit_reevaluate_cell_ctx(func, *source, mem_ctx);
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_IS_NOT_EMPTY));
+                    self.emit_cell_set(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    self.emit_cell_get(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                }
+                IrNode::When { source, arms, .. } => {
+                    self.emit_reevaluate_cell_ctx(func, *source, mem_ctx);
+                    // Also re-evaluate any CellRead arm bodies that have their own
+                    // dependency chains (e.g., inner WHEN depending on TextIsNotEmpty).
+                    // Without this, nested chains are stale when the pattern match reads them.
+                    for (_, arm_body) in arms {
+                        if let IrExpr::CellRead(arm_cell) = arm_body {
+                            self.emit_reevaluate_cell_ctx(func, *arm_cell, mem_ctx);
+                        }
+                    }
+                    self.emit_pattern_match_ctx(func, *source, arms, cell, Some(mem_ctx));
+                }
+                IrNode::PipeThrough { source, .. } => {
+                    self.emit_reevaluate_cell_ctx(func, *source, mem_ctx);
+                    self.emit_cell_get(func, *source, Some(mem_ctx));
+                    self.emit_cell_set(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    self.emit_cell_get(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                }
+                _ => {
+                    // Other node types (Derived with Void, Element, etc.): don't need re-evaluation.
+                }
+            }
+        }
+    }
+
     /// Find the IrNode that defines a cell (for re-evaluation).
     fn find_node_for_cell(&self, cell: CellId) -> Option<&IrNode> {
         for node in &self.program.nodes {
@@ -1453,18 +1526,33 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                     self.emit_downstream_updates(func, *cell);
                 }
-                // ListAppend/ListClear/ListRemove/ListRetain chain
+                // ListAppend/ListClear/ListRemove/ListRetain chain:
+                // When traversed as downstream (not their own trigger), copy source → cell.
                 IrNode::ListAppend { cell, source, .. } if *source == list_cell => {
+                    func.instruction(&Instruction::GlobalGet(source.0));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                     self.emit_list_downstream_updates(func, *cell);
                 }
                 IrNode::ListClear { cell, source, .. } if *source == list_cell => {
+                    func.instruction(&Instruction::GlobalGet(source.0));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                     self.emit_list_downstream_updates(func, *cell);
                 }
                 IrNode::ListRemove { cell, source, .. }
                     if *source == list_cell =>
                 {
-                    // ListRemove shares the source list_id (in-place modification).
-                    // Just propagate to downstream nodes.
+                    // Copy source list_id to this cell so downstream sees the updated list.
+                    func.instruction(&Instruction::GlobalGet(source.0));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                     self.emit_list_downstream_updates(func, *cell);
                 }
                 IrNode::ListRetain { cell, source, predicate, item_cell, item_field_cells }
@@ -1610,10 +1698,12 @@ impl<'a> WasmEmitter<'a> {
                     if *watch == updated_cell =>
                 {
                     // The watch cell changed — check for SKIP sentinel before appending.
-                    // Read the watch cell value; if NaN (SKIP), don't append.
+                    // Compare bit pattern against specific SKIP sentinel (not any NaN,
+                    // since text-only cells have NaN f64 values).
                     func.instruction(&Instruction::GlobalGet(watch.0));
-                    func.instruction(&Instruction::GlobalGet(watch.0));
-                    func.instruction(&Instruction::F64Ne); // NaN != NaN → true (i.e., is NaN)
+                    func.instruction(&Instruction::I64ReinterpretF64);
+                    func.instruction(&Instruction::I64Const(SKIP_SENTINEL_BITS as i64));
+                    func.instruction(&Instruction::I64Eq); // true if IS skip sentinel
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                     // SKIP: do nothing
                     func.instruction(&Instruction::Else);
@@ -1694,6 +1784,28 @@ impl<'a> WasmEmitter<'a> {
             IrExpr::Compare { .. } => true,
             IrExpr::Constant(IrValue::Bool(_)) => true,
             _ => false,
+        }
+    }
+
+    /// Extract the text source CellId from a body expression.
+    /// For `CellRead(cell)`, returns the cell directly.
+    /// For `PatternMatch { arms }`, returns the CellRead source from the first
+    /// non-SKIP arm body. This is used by the HOLD handler to copy text from
+    /// the body result cell to the HOLD cell.
+    fn extract_text_source_cell(expr: &IrExpr) -> Option<CellId> {
+        match expr {
+            IrExpr::CellRead(cell) => Some(*cell),
+            IrExpr::PatternMatch { arms, .. } => {
+                for (_, arm_body) in arms {
+                    if !matches!(arm_body, IrExpr::Constant(IrValue::Skip)) {
+                        if let Some(cell) = Self::extract_text_source_cell(arm_body) {
+                            return Some(cell);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -1818,6 +1930,101 @@ impl<'a> WasmEmitter<'a> {
             }
             IrExpr::TaggedObject { .. } => {
                 func.instruction(&Instruction::F64Const(0.0));
+            }
+            IrExpr::PatternMatch { source, arms } => {
+                // Inline pattern match: evaluate source, match patterns,
+                // push result f64 on stack. SKIP arms produce the SKIP sentinel NaN.
+                self.emit_pattern_match_inline(func, *source, arms, mem_ctx, 0);
+            }
+        }
+    }
+
+    /// Emit inline pattern match that pushes the result as an f64 on the WASM stack.
+    /// Used for PatternMatch expressions in HOLD bodies.
+    fn emit_pattern_match_inline(
+        &self,
+        func: &mut Function,
+        source: CellId,
+        arms: &[(IrPattern, IrExpr)],
+        mem_ctx: Option<&MemoryContext>,
+        idx: usize,
+    ) {
+        if idx >= arms.len() {
+            // No arm matched: push SKIP sentinel.
+            func.instruction(&Instruction::F64Const(f64::from_bits(SKIP_SENTINEL_BITS)));
+            return;
+        }
+        let (pattern, body) = &arms[idx];
+        let is_skip = matches!(body, IrExpr::Constant(IrValue::Skip));
+        let has_more = idx + 1 < arms.len();
+
+        match pattern {
+            IrPattern::Tag(tag) => {
+                let encoded = self.program.tag_table.iter()
+                    .position(|t| t == tag)
+                    .map(|i| (i + 1) as f64)
+                    .unwrap_or(0.0);
+                self.emit_cell_get(func, source, mem_ctx);
+                func.instruction(&Instruction::F64Const(encoded));
+                func.instruction(&Instruction::F64Eq);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::F64)));
+                if is_skip {
+                    func.instruction(&Instruction::F64Const(f64::from_bits(SKIP_SENTINEL_BITS)));
+                } else {
+                    self.emit_expr_ctx(func, body, mem_ctx);
+                }
+                func.instruction(&Instruction::Else);
+                if has_more {
+                    self.emit_pattern_match_inline(func, source, arms, mem_ctx, idx + 1);
+                } else {
+                    func.instruction(&Instruction::F64Const(f64::from_bits(SKIP_SENTINEL_BITS)));
+                }
+                func.instruction(&Instruction::End);
+            }
+            IrPattern::Number(n) => {
+                self.emit_cell_get(func, source, mem_ctx);
+                func.instruction(&Instruction::F64Const(*n));
+                func.instruction(&Instruction::F64Eq);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::F64)));
+                if is_skip {
+                    func.instruction(&Instruction::F64Const(f64::from_bits(SKIP_SENTINEL_BITS)));
+                } else {
+                    self.emit_expr_ctx(func, body, mem_ctx);
+                }
+                func.instruction(&Instruction::Else);
+                if has_more {
+                    self.emit_pattern_match_inline(func, source, arms, mem_ctx, idx + 1);
+                } else {
+                    func.instruction(&Instruction::F64Const(f64::from_bits(SKIP_SENTINEL_BITS)));
+                }
+                func.instruction(&Instruction::End);
+            }
+            IrPattern::Wildcard | IrPattern::Binding(_) => {
+                if is_skip {
+                    func.instruction(&Instruction::F64Const(f64::from_bits(SKIP_SENTINEL_BITS)));
+                } else {
+                    self.emit_expr_ctx(func, body, mem_ctx);
+                }
+            }
+            IrPattern::Text(text) => {
+                let pattern_idx = self.register_text_pattern(text);
+                let text_source = self.resolve_text_cell(source);
+                func.instruction(&Instruction::I32Const(text_source.0 as i32));
+                func.instruction(&Instruction::I32Const(pattern_idx as i32));
+                func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_MATCHES));
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::F64)));
+                if is_skip {
+                    func.instruction(&Instruction::F64Const(f64::from_bits(SKIP_SENTINEL_BITS)));
+                } else {
+                    self.emit_expr_ctx(func, body, mem_ctx);
+                }
+                func.instruction(&Instruction::Else);
+                if has_more {
+                    self.emit_pattern_match_inline(func, source, arms, mem_ctx, idx + 1);
+                } else {
+                    func.instruction(&Instruction::F64Const(f64::from_bits(SKIP_SENTINEL_BITS)));
+                }
+                func.instruction(&Instruction::End);
             }
         }
     }
@@ -2331,6 +2538,30 @@ impl<'a> WasmEmitter<'a> {
                 {
                     self.emit_pattern_match_ctx(&mut func, *source, arms, *cell, Some(&mem_ctx));
                 }
+                IrNode::Latest { target, arms }
+                    if target.0 >= mem_ctx.cell_start && target.0 < mem_ctx.cell_end =>
+                {
+                    // Initialize with the first arm's body (static or triggered).
+                    // For per-item LATEST like `text: LATEST { todo.title, element.event.change.text }`,
+                    // this sets the initial value from the first arm (e.g., copies todo.title text).
+                    if let Some(arm) = arms.first() {
+                        if self.is_text_body(&arm.body) {
+                            self.emit_text_setting_ctx(&mut func, *target, &arm.body, Some(&mem_ctx));
+                        } else {
+                            self.emit_expr_ctx(&mut func, &arm.body, Some(&mem_ctx));
+                            self.emit_cell_set(&mut func, *target, Some(&mem_ctx));
+                        }
+                        func.instruction(&Instruction::I32Const(target.0 as i32));
+                        self.emit_cell_get(&mut func, *target, Some(&mem_ctx));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                        // Copy text from the body's source cell.
+                        if let IrExpr::CellRead(src) = &arm.body {
+                            func.instruction(&Instruction::I32Const(target.0 as i32));
+                            func.instruction(&Instruction::I32Const(src.0 as i32));
+                            func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -2489,16 +2720,67 @@ impl<'a> WasmEmitter<'a> {
                 {
                     for (trigger, body) in trigger_bodies {
                         if *trigger == event_id {
-                            self.emit_expr_ctx(func, body, Some(mem_ctx));
-                            self.emit_cell_set(func, *cell, Some(mem_ctx));
-                            func.instruction(&Instruction::I32Const(cell.0 as i32));
-                            self.emit_cell_get(func, *cell, Some(mem_ctx));
-                            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
-                            // Update text for boolean-producing bodies.
-                            if Self::expr_produces_bool(body) {
-                                self.emit_bool_text_update(func, *cell);
+                            let may_skip = matches!(body, IrExpr::PatternMatch { .. });
+                            // Extract text source cell from body for text copy.
+                            let text_source = Self::extract_text_source_cell(body);
+                            // Re-evaluate the text dependency chain before reading.
+                            // The body may reference cells (via CellRead) whose text
+                            // was updated by the bridge (e.g., text input's .text cell)
+                            // but not re-evaluated through TextTrim/When nodes yet.
+                            if let Some(src) = text_source {
+                                self.emit_reevaluate_cell_ctx(func, src, mem_ctx);
                             }
-                            self.emit_item_downstream_updates(func, *cell, mem_ctx);
+                            if may_skip {
+                                // PatternMatch may produce SKIP sentinel (specific NaN).
+                                // Evaluate, store to temp global, check for SKIP sentinel,
+                                // only update cell if NOT SKIP.
+                                // Note: We check the exact SKIP sentinel bit pattern
+                                // (not just any NaN) because text-only cells have NaN
+                                // as their f64 value and should not be treated as SKIP.
+                                let skip_global = self.program.cells.len() as u32;
+                                self.emit_expr_ctx(func, body, Some(mem_ctx));
+                                // Store result to temp global.
+                                func.instruction(&Instruction::GlobalSet(skip_global));
+                                // Check: is it the SKIP sentinel? Compare bit pattern.
+                                func.instruction(&Instruction::GlobalGet(skip_global));
+                                func.instruction(&Instruction::I64ReinterpretF64);
+                                func.instruction(&Instruction::I64Const(SKIP_SENTINEL_BITS as i64));
+                                func.instruction(&Instruction::I64Ne); // true if NOT skip sentinel
+                                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                                // Not SKIP: load value, store to cell, propagate.
+                                func.instruction(&Instruction::GlobalGet(skip_global));
+                                self.emit_cell_set(func, *cell, Some(mem_ctx));
+                                // Copy text from body result cell to HOLD cell.
+                                if let Some(src) = text_source {
+                                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                    func.instruction(&Instruction::I32Const(src.0 as i32));
+                                    func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                                }
+                                func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                self.emit_cell_get(func, *cell, Some(mem_ctx));
+                                func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                                if Self::expr_produces_bool(body) {
+                                    self.emit_bool_text_update(func, *cell);
+                                }
+                                self.emit_item_downstream_updates(func, *cell, mem_ctx);
+                                func.instruction(&Instruction::End);
+                            } else {
+                                self.emit_expr_ctx(func, body, Some(mem_ctx));
+                                self.emit_cell_set(func, *cell, Some(mem_ctx));
+                                // Copy text from body result cell to HOLD cell.
+                                if let Some(src) = text_source {
+                                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                    func.instruction(&Instruction::I32Const(src.0 as i32));
+                                    func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                                }
+                                func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                self.emit_cell_get(func, *cell, Some(mem_ctx));
+                                func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                                if Self::expr_produces_bool(body) {
+                                    self.emit_bool_text_update(func, *cell);
+                                }
+                                self.emit_item_downstream_updates(func, *cell, mem_ctx);
+                            }
                         }
                     }
                 }

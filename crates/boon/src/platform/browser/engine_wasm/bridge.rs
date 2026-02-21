@@ -342,7 +342,7 @@ fn build_element_node(
             style,
             ..
         } => build_stripe(program, instance, direction, *items, gap, style),
-        ElementKind::TextInput { placeholder, style, focus } => {
+        ElementKind::TextInput { placeholder, style, focus, .. } => {
             build_text_input(program, instance, placeholder.as_ref(), style, links, *focus)
         }
         ElementKind::Checkbox { checked, style, icon } => {
@@ -716,6 +716,19 @@ fn find_data_cell_for_event(
     event_name: &str,
     field_name: &str,
 ) -> Option<u32> {
+    find_data_cell_for_event_in_range(program, links, event_name, field_name, None)
+}
+
+/// Find event data cell, optionally restricted to a template cell range.
+/// When a range is given, prefer cells within that range (for per-item templates).
+/// Falls back to any matching cell if none found in the range.
+fn find_data_cell_for_event_in_range(
+    program: &IrProgram,
+    links: &[(String, EventId)],
+    event_name: &str,
+    field_name: &str,
+    template_range: Option<(u32, u32)>,
+) -> Option<u32> {
     // Find the event to get its name (which contains the element path).
     let event_id = links.iter()
         .find(|(name, _)| name == event_name)
@@ -726,6 +739,18 @@ fn find_data_cell_for_event(
     let element_path = event_info.name.strip_suffix(&format!(".{}", event_name))?;
     // Look for the data cell.
     let data_cell_name = format!("{}.event.{}.{}", element_path, event_name, field_name);
+    // If a template range is given, prefer cells within that range.
+    if let Some((start, end)) = template_range {
+        let template_match = program.cells.iter().enumerate()
+            .find(|(idx, info)| {
+                let id = *idx as u32;
+                id >= start && id < end && info.name == data_cell_name
+            })
+            .map(|(idx, _)| idx as u32);
+        if template_match.is_some() {
+            return template_match;
+        }
+    }
     program.cells.iter().enumerate()
         .find(|(_, info)| info.name == data_cell_name)
         .map(|(idx, _)| idx as u32)
@@ -736,6 +761,15 @@ fn find_text_property_cell(
     program: &IrProgram,
     links: &[(String, EventId)],
 ) -> Option<u32> {
+    find_text_property_cell_in_range(program, links, None)
+}
+
+/// Find text property cell, optionally restricted to a template cell range.
+fn find_text_property_cell_in_range(
+    program: &IrProgram,
+    links: &[(String, EventId)],
+    template_range: Option<(u32, u32)>,
+) -> Option<u32> {
     // Use any link event to find the element path.
     let event_id = links.first().map(|(_, eid)| *eid)?;
     let event_info = &program.events[event_id.0 as usize];
@@ -744,6 +778,18 @@ fn find_text_property_cell(
     let dot_pos = event_info.name.rfind('.')?;
     let element_path = &event_info.name[..dot_pos];
     let text_cell_name = format!("{}.text", element_path);
+    // If a template range is given, prefer cells within that range.
+    if let Some((start, end)) = template_range {
+        let template_match = program.cells.iter().enumerate()
+            .find(|(idx, info)| {
+                let id = *idx as u32;
+                id >= start && id < end && info.name == text_cell_name
+            })
+            .map(|(idx, _)| idx as u32);
+        if template_match.is_some() {
+            return template_match;
+        }
+    }
     program.cells.iter().enumerate()
         .find(|(_, info)| info.name == text_cell_name)
         .map(|(idx, _)| idx as u32)
@@ -821,6 +867,10 @@ fn build_link(
     let url_text = resolve_static_text(program, url);
     let mut raw = RawHtmlEl::new("a")
         .attr("href", &url_text)
+        .attr("target", "_blank")
+        .attr("rel", "noopener noreferrer")
+        .style("color", "inherit")
+        .style("text-decoration", "none")
         .child(zoon::Text::new(label_text));
     raw = apply_styles(raw, style, program, instance);
     raw.into_raw_unchecked()
@@ -1049,6 +1099,18 @@ fn is_element_body(program: &IrProgram, body: &IrExpr) -> bool {
 /// Strategy: wrap each arm's element in a div, set initial display based on
 /// current value, then use after_insert + Task to watch the signal and toggle
 /// display via raw DOM API.
+/// When a WHILE conditional arm becomes visible, focus any child input
+/// with the `autofocus` attribute. This is needed because `after_insert`
+/// fires at mount time when the element may be hidden (`display:none`),
+/// and calling `.focus()` on a hidden element has no effect.
+fn focus_autofocus_child(el: &web_sys::HtmlElement) {
+    if let Ok(Some(input)) = el.query_selector("input[autofocus]") {
+        if let Ok(html_el) = input.dyn_into::<web_sys::HtmlElement>() {
+            let _ = html_el.focus();
+        }
+    }
+}
+
 fn build_conditional_element(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
@@ -1132,7 +1194,12 @@ fn build_conditional_element(
                         .for_each_sync(move |val| {
                             let cell_text = store_inner.get_cell_text(source_id);
                             let matched = find_matching_arm_idx(&matchers_inner, val, &cell_text);
-                            let _ = el.style().set_property("display", if matched == Some(i) { "contents" } else { "none" });
+                            let visible = matched == Some(i);
+                            let _ = el.style().set_property("display", if visible { "contents" } else { "none" });
+                            // When becoming visible, focus any autofocus input inside.
+                            if visible {
+                                focus_autofocus_child(&el);
+                            }
                         })
                 );
                 std::mem::forget(handle);
@@ -1262,6 +1329,7 @@ fn build_list_map(
 ) -> RawElOrText {
     let store = instance.cell_store.clone();
 
+
     // Get the version signal from the map cell to trigger re-renders.
     let version_signal = store.get_cell_signal(map_cell.0);
 
@@ -1303,10 +1371,38 @@ fn build_list_map(
     // only newly appended items get init_item called.
     let initialized_count: Rc<std::cell::Cell<usize>> = Rc::new(std::cell::Cell::new(0));
 
+    // Deduplicate the version signal: rerun_retain_filters bumps the version
+    // even when the filter result hasn't changed (e.g. on change events that
+    // don't affect filtering). Without deduplication, every keystroke in an
+    // edit input destroys and recreates all list elements, losing the user's
+    // in-progress edits.
+    //
+    // We track previous item indices (memory indices for each list position)
+    // and only fire when they actually change. This converts the raw version
+    // signal into a stable "list content changed" signal.
+    let inst_dedup = instance.clone();
+    let prev_indices: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
+    let deduped_signal = version_signal.filter_map(move |_version| {
+        let current_list_id = inst_dedup.cell_store.get_cell_value(source.0);
+        let text_items = inst_dedup.list_store.items_text(current_list_id);
+        let f64_items = inst_dedup.list_store.items(current_list_id);
+        let item_count = if !text_items.is_empty() { text_items.len() } else { f64_items.len() };
+        let current: Vec<u32> = (0..item_count)
+            .map(|i| inst_dedup.list_store.item_memory_index(current_list_id, i) as u32)
+            .collect();
+        let mut prev = prev_indices.borrow_mut();
+        if *prev == current {
+            None // Same items — suppress signal, don't re-render
+        } else {
+            *prev = current;
+            Some(()) // Items changed — allow signal through
+        }
+    });
+
     // Build a container that reactively re-renders children when the list changes.
     RawHtmlEl::new("div")
         .style("display", "contents")
-        .child_signal(version_signal.map(move |_version| {
+        .child_signal(deduped_signal.map(move |_opt| {
             // Re-read list_id from source cell each time — the filter loop may
             // have replaced the list with a new filtered copy.
             let current_list_id = inst.cell_store.get_cell_value(source.0);
@@ -1675,8 +1771,8 @@ fn build_item_element_node(
         ElementKind::Stripe { direction, items, gap, style, .. } => {
             build_item_stripe(program, instance, ctx, direction, *items, gap, style)
         }
-        ElementKind::TextInput { placeholder, style, focus } => {
-            build_item_text_input(program, instance, ctx, placeholder.as_ref(), style, links, *focus)
+        ElementKind::TextInput { placeholder, style, focus, text_cell: reactive_text_cell } => {
+            build_item_text_input(program, instance, ctx, placeholder.as_ref(), style, links, *focus, *reactive_text_cell)
         }
         ElementKind::Checkbox { checked, style, icon } => {
             build_item_checkbox(program, instance, ctx, checked.as_ref(), style, links, icon.as_ref())
@@ -1744,12 +1840,14 @@ fn attach_item_events(
             });
         } else {
             let inst = instance.clone();
+            let cell_id = cell.0;
             wrapper = wrapper.event_handler(move |_: events::MouseEnter| {
-                inst.set_cell_value(cell.0, 1.0);
+                inst.set_cell_value(cell_id, 1.0);
             });
             let inst = instance.clone();
+            let cell_id = cell.0;
             wrapper = wrapper.event_handler(move |_: events::MouseLeave| {
-                inst.set_cell_value(cell.0, 0.0);
+                inst.set_cell_value(cell_id, 0.0);
             });
         }
     }
@@ -1940,6 +2038,7 @@ fn build_item_text_input(
     style: &IrExpr,
     links: &[(String, EventId)],
     focus: bool,
+    reactive_text_cell: Option<CellId>,
 ) -> RawElOrText {
     let mut raw = RawHtmlEl::new("input")
         .attr("type", "text")
@@ -1949,26 +2048,64 @@ fn build_item_text_input(
         .style("color", "inherit")
         .style("background", "transparent");
 
-    if focus {
-        raw = raw.attr("autofocus", "");
-        raw = raw.after_insert(|el| { let _ = el.focus(); });
-    }
-
     raw = apply_styles_item(raw, style, program, instance, ctx);
 
-    let raw = if let Some(ph) = placeholder {
+    if let Some(ph) = placeholder {
         let text = extract_placeholder_text(ph, program);
-        if !text.is_empty() { raw.attr("placeholder", &text) } else { raw }
-    } else { raw };
+        if !text.is_empty() { raw = raw.attr("placeholder", &text); }
+    }
 
     let key_down_event = links.iter().find(|(name, _)| name == "key_down").map(|(_, eid)| *eid);
     let change_event = links.iter().find(|(name, _)| name == "change").map(|(_, eid)| *eid);
-    let key_data_cell = find_data_cell_for_event(program, links, "key_down", "key");
-    let change_text_cell = find_data_cell_for_event(program, links, "change", "text");
-    let text_cell = find_text_property_cell(program, links);
+    let tmpl_range = Some(ctx.template_cell_range);
+    let key_data_cell = find_data_cell_for_event_in_range(program, links, "key_down", "key", tmpl_range);
+    let change_text_cell = find_data_cell_for_event_in_range(program, links, "change", "text", tmpl_range);
+    let text_cell = find_text_property_cell_in_range(program, links, tmpl_range);
 
     let item_idx = ctx.item_idx;
     let ics_clone = instance.item_cell_store.clone();
+
+    // Set initial input value from the reactive text cell (e.g., LATEST target)
+    // or the .text property cell. For edit inputs, this pre-fills the input
+    // with the current title.
+    let initial_text_for_insert = {
+        // Try reactive_text_cell first (LATEST target with actual text), then .text property cell.
+        let cells_to_try: Vec<u32> = reactive_text_cell.iter().map(|c| c.0)
+            .chain(text_cell.iter().copied())
+            .collect();
+        let mut found_text: Option<String> = None;
+        for cell_id in cells_to_try {
+            let text = if cell_id >= ctx.template_cell_range.0 && cell_id < ctx.template_cell_range.1 {
+                instance.item_cell_store.as_ref()
+                    .map(|ics| ics.get_text(item_idx, cell_id))
+                    .unwrap_or_default()
+            } else {
+                instance.cell_store.get_cell_text(cell_id)
+            };
+            if !text.is_empty() {
+                found_text = Some(text);
+                break;
+            }
+        }
+        found_text
+    };
+    if focus || initial_text_for_insert.is_some() {
+        if focus {
+            raw = raw.attr("autofocus", "");
+        }
+        raw = raw.after_insert(move |el| {
+            if initial_text_for_insert.is_some() || focus {
+                if let Ok(input) = el.dyn_into::<web_sys::HtmlInputElement>() {
+                    if let Some(ref text) = initial_text_for_insert {
+                        input.set_value(text);
+                    }
+                    if focus {
+                        let _ = input.focus();
+                    }
+                }
+            }
+        });
+    }
 
     let raw = if let Some(event_id) = key_down_event {
         let inst = instance.clone();
@@ -1997,11 +2134,18 @@ fn build_item_text_input(
                             }
                         }
                     }
-                    if key == "Enter" { input.set_value(""); }
                 }
             }
+            // Set key data cell: for template-scoped cells, write to per-item
+            // WASM linear memory (where on_item_event reads from), not just
+            // the global. Without this, WHEN/HOLD bodies that read the key cell
+            // see stale values and don't trigger.
             if let Some(cell_id) = key_data_cell {
-                inst.set_cell_value(cell_id, tag_value);
+                if cell_id >= template_cell_range.0 && cell_id < template_cell_range.1 {
+                    inst.set_item_cell_value(item_idx, cell_id, tag_value);
+                } else {
+                    inst.set_cell_value(cell_id, tag_value);
+                }
             }
             if is_template {
                 let _ = inst.call_on_item_event(item_idx, event_id.0);
@@ -2203,7 +2347,6 @@ fn build_item_conditional_element(
     arms: &[(IrPattern, IrExpr)],
 ) -> RawElOrText {
     let tag_table = &program.tag_table;
-
     let arm_elements: Vec<(ArmMatcher, RawElOrText)> = arms.iter().map(|(pattern, body)| {
         let matcher = pattern_to_matcher(pattern, tag_table);
         let element = match body {
@@ -2285,7 +2428,12 @@ fn build_item_conditional_element(
                                 let cell_text = ics_inner.get_text(item_idx, source_id);
                                 let val = ics_inner.get_value(item_idx, source_id);
                                 let matched = find_matching_arm_idx(&matchers_watch, val, &cell_text);
-                                let _ = el.style().set_property("display", if matched == Some(i) { "contents" } else { "none" });
+                                let visible = matched == Some(i);
+                                let _ = el.style().set_property("display", if visible { "contents" } else { "none" });
+                                // When becoming visible, focus any autofocus input inside.
+                                if visible {
+                                    focus_autofocus_child(&el);
+                                }
                             })
                     );
                     std::mem::forget(handle);
@@ -2311,7 +2459,12 @@ fn build_item_conditional_element(
                             .for_each_sync(move |val| {
                                 let cell_text = store_inner.get_cell_text(source_id);
                                 let matched = find_matching_arm_idx(&matchers_watch, val, &cell_text);
-                                let _ = el.style().set_property("display", if matched == Some(i) { "contents" } else { "none" });
+                                let visible = matched == Some(i);
+                                let _ = el.style().set_property("display", if visible { "contents" } else { "none" });
+                                // When becoming visible, focus any autofocus input inside.
+                                if visible {
+                                    focus_autofocus_child(&el);
+                                }
                             })
                     );
                     std::mem::forget(handle);

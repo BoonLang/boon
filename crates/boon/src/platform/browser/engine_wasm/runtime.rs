@@ -1075,6 +1075,37 @@ impl WasmInstance {
         );
     }
 
+    /// Set a per-item cell value in WASM linear memory, ItemCellStore, and CellStore.
+    /// Used by bridge event handlers for template-scoped data cells (e.g., key_down.key).
+    /// The WASM `on_item_event` reads template cells from linear memory, so we must
+    /// write there (not just to the global) before firing the event.
+    pub fn set_item_cell_value(&self, item_idx: u32, cell_id: u32, value: f64) {
+        // 1. Update ItemCellStore (for reactive bridge signals).
+        if let Some(ref ics) = self.item_cell_store {
+            ics.set_cell(item_idx, cell_id, value);
+            // Compute WASM linear memory address and write.
+            let cell_start = ics.template_cell_start();
+            let cell_count = ics.template_cell_count();
+            let stride = cell_count * 8;
+            let local_offset = (cell_id - cell_start) * 8;
+            let addr = item_idx * stride + local_offset;
+            // Access WASM memory buffer and write the f64.
+            let exports = self.instance.exports();
+            if let Ok(mem_val) = Reflect::get(&exports, &"memory".into()) {
+                let mem: WebAssembly::Memory = mem_val.unchecked_into();
+                let buffer = mem.buffer();
+                let view = js_sys::Float64Array::new_with_byte_offset_and_length(
+                    &buffer,
+                    addr,
+                    1,
+                );
+                view.set_index(0, value);
+            }
+        }
+        // 2. Also update CellStore (host-side signals, e.g. for global cell watchers).
+        self.cell_store.set_cell_f64(cell_id, value);
+    }
+
     /// Call `on_event(event_id)` to fire an event.
     /// After the WASM handler runs, calls any registered post-event hooks
     /// (used for cross-scope event propagation to per-item templates).

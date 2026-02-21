@@ -57,6 +57,13 @@ pub enum IrExpr {
         tag: String,
         fields: Vec<(String, IrExpr)>,
     },
+    /// Inline pattern match expression (used in HOLD bodies with WHEN).
+    /// Reads source cell, matches patterns, returns corresponding body value.
+    /// If no arm matches (or SKIP), produces the SKIP sentinel NaN.
+    PatternMatch {
+        source: CellId,
+        arms: Vec<(IrPattern, IrExpr)>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -80,7 +87,9 @@ pub enum IrValue {
 
 /// Special f64 bit pattern used as SKIP sentinel in WASM.
 /// Using a specific NaN payload that won't occur in normal arithmetic.
-/// We check for "is NaN" in codegen to detect SKIP.
+/// We compare this exact bit pattern via i64.reinterpret_f64 + i64.eq in codegen
+/// to detect SKIP. Do NOT use generic NaN checks (f64.ne with self) because
+/// text-only cells have regular NaN f64 values that should not be treated as SKIP.
 pub const SKIP_SENTINEL_BITS: u64 = 0x7FF8_0000_0000_0001; // quiet NaN with payload 1
 
 #[derive(Debug, Clone, Copy)]
@@ -339,6 +348,9 @@ pub enum ElementKind {
         placeholder: Option<IrExpr>,
         style: IrExpr,
         focus: bool,
+        /// Cell providing the reactive text value (e.g., a LATEST target cell).
+        /// Used by the bridge to set the initial input value.
+        text_cell: Option<CellId>,
     },
     Checkbox {
         checked: Option<CellId>,

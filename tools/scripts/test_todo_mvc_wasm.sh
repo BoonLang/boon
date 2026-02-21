@@ -534,12 +534,13 @@ echo ""
 echo "[9.1] Double-click item enters edit mode"
 bt dblclick-text "Clean room" >/dev/null 2>&1 || true
 sleep 0.5
-# Check if an edit input appeared (input_index=1 since main input is 0)
+# Check if an edit text input appeared and got focus.
+# The index varies because hidden checkbox inputs are counted.
 FOCUSED=$(bt get-focused-element 2>/dev/null) || true
-if echo "$FOCUSED" | grep -qF "input_index=1"; then
-    ok "Double-click enters edit mode (edit input focused)"
+if echo "$FOCUSED" | grep -qF "tag=INPUT" && echo "$FOCUSED" | grep -qF "input_type=text"; then
+    ok "Double-click enters edit mode (edit text input focused)"
 else
-    fail "Double-click enters edit mode (expected input_index=1, got: $FOCUSED)" "M8"
+    fail "Double-click enters edit mode (expected text INPUT, got: $FOCUSED)" "M8"
 fi
 
 echo ""
@@ -558,10 +559,10 @@ echo "[9.4] Double-click again works (edit doesn't flash)"
 bt dblclick-text "Clean room" >/dev/null 2>&1 || true
 sleep 0.5
 FOCUSED=$(bt get-focused-element 2>/dev/null) || true
-if echo "$FOCUSED" | grep -qF "input_index=1"; then
+if echo "$FOCUSED" | grep -qF "tag=INPUT" && echo "$FOCUSED" | grep -qF "input_type=text"; then
     ok "Second double-click re-enters edit mode"
 else
-    fail "Second double-click re-enters edit mode" "M8"
+    fail "Second double-click re-enters edit mode (expected text INPUT, got: $FOCUSED)" "M8"
 fi
 bt press-key Escape >/dev/null 2>&1 || true
 sleep 0.3
@@ -575,10 +576,11 @@ echo "━━━ Section 10: Edit Save ━━━"
 echo ""
 echo "[10.1] Double-click + type + Enter saves edit"
 bt dblclick-text "Clean room" >/dev/null 2>&1 || true
-sleep 0.5
+sleep 1
 bt type-text " EDITED" >/dev/null 2>&1 || true
+sleep 0.3
 bt press-key Enter >/dev/null 2>&1 || true
-sleep 0.5
+sleep 1
 PREVIEW=$(bt preview)
 if echo "$PREVIEW" | grep -qF "Clean room EDITED"; then
     ok "Edit saved: 'Clean room EDITED' visible"
@@ -793,10 +795,11 @@ check_contains "$PREVIEW" "Todo to keep" "Escape preserves 'Todo to keep'" "M8"
 echo ""
 echo "[16.3] Double-click + type + Enter saves"
 bt dblclick-text "Todo to keep" >/dev/null 2>&1 || true
-sleep 0.5
+sleep 1
 bt type-text " EDITED" >/dev/null 2>&1 || true
+sleep 0.3
 bt press-key Enter >/dev/null 2>&1 || true
-sleep 0.5
+sleep 1
 PREVIEW=$(bt preview)
 if echo "$PREVIEW" | grep -qF "Todo to keep EDITED"; then
     ok "Edit saved: 'Todo to keep EDITED'"

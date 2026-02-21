@@ -195,6 +195,12 @@ pub enum Command {
         /// Engine name: "Actors" or "DD"
         engine: String,
     },
+
+    /// Evaluate arbitrary JavaScript in the page context via CDP Runtime.evaluate
+    EvalJs {
+        /// JavaScript expression to evaluate
+        expression: String,
+    },
 }
 
 /// Response from Extension to CLI via Server
