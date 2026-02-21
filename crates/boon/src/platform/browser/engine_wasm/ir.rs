@@ -233,10 +233,19 @@ pub enum IrNode {
     },
 
     /// List remove: remove item(s) when trigger fires.
+    /// When `predicate` is Some, uses a per-item filter loop (inverted retain):
+    /// items where predicate is truthy are removed, others are kept.
+    /// When `predicate` is None, the trigger is a per-item event and the
+    /// specific item that fired the event is removed.
     ListRemove {
         cell: CellId,
         source: CellId,
         trigger: EventId,
+        predicate: Option<CellId>,
+        /// The item placeholder cell (used as iteration variable in filter loop).
+        item_cell: Option<CellId>,
+        /// Field sub-cells for per-item evaluation (e.g., [("completed", sub_cell_id)]).
+        item_field_cells: Vec<(String, CellId)>,
     },
 
     /// List retain: filter items based on predicate.
@@ -334,6 +343,7 @@ pub enum ElementKind {
     Checkbox {
         checked: Option<CellId>,
         style: IrExpr,
+        icon: Option<CellId>,
     },
     Stripe {
         direction: IrExpr,
@@ -439,7 +449,7 @@ pub fn node_debug_short(node: &IrNode) -> String {
         IrNode::ListClear { cell, source, trigger } => format!("ListClear(cell={}, source={}, trigger={:?})", cell.0, source.0, trigger),
         IrNode::ListCount { cell, source } => format!("ListCount(cell={}, source={})", cell.0, source.0),
         IrNode::ListMap { cell, source, item_name, template_cell_range, template_event_range, .. } => format!("ListMap(cell={}, source={}, item={}, cells={:?}, events={:?})", cell.0, source.0, item_name, template_cell_range, template_event_range),
-        IrNode::ListRemove { cell, source, trigger } => format!("ListRemove(cell={}, source={}, trigger={:?})", cell.0, source.0, trigger),
+        IrNode::ListRemove { cell, source, trigger, predicate, item_cell, item_field_cells } => format!("ListRemove(cell={}, source={}, trigger={:?}, pred={:?}, item={:?}, fields={:?})", cell.0, source.0, trigger, predicate.map(|p| p.0), item_cell.map(|c| c.0), item_field_cells.iter().map(|(n, c)| format!("{}:{}", n, c.0)).collect::<Vec<_>>()),
         IrNode::ListRetain { cell, source, predicate, item_cell, item_field_cells } => format!("ListRetain(cell={}, source={}, pred={:?}, item={:?}, fields={:?})", cell.0, source.0, predicate.map(|p| p.0), item_cell.map(|c| c.0), item_field_cells.iter().map(|(n, c)| format!("{}:{}", n, c.0)).collect::<Vec<_>>()),
         IrNode::ListIsEmpty { cell, source } => format!("ListIsEmpty(cell={}, source={})", cell.0, source.0),
         IrNode::RouterGoTo { cell, source } => format!("RouterGoTo(cell={}, source={})", cell.0, source.0),

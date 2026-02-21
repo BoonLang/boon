@@ -91,6 +91,14 @@ struct ListStoreInner {
     /// Version counter per list, incremented on each mutation.
     /// Used to trigger reactive updates.
     versions: RefCell<Vec<Mutable<f64>>>,
+    /// Tracks which lists store original item indices (from host_list_copy_item).
+    /// For index-based lists, items[i] is the original memory index.
+    /// For regular lists, the memory index equals the position.
+    index_based: RefCell<Vec<bool>>,
+    /// Next available memory index per list (monotonically increasing).
+    /// Used when appending to index-based lists to assign fresh memory slots
+    /// that are guaranteed to be zero-initialized in WASM linear memory.
+    next_memory_index: RefCell<Vec<usize>>,
 }
 
 impl ListStore {
@@ -100,6 +108,8 @@ impl ListStore {
                 lists: RefCell::new(Vec::new()),
                 text_lists: RefCell::new(Vec::new()),
                 versions: RefCell::new(Vec::new()),
+                index_based: RefCell::new(Vec::new()),
+                next_memory_index: RefCell::new(Vec::new()),
             }),
         }
     }
@@ -109,10 +119,14 @@ impl ListStore {
         let mut lists = self.inner.lists.borrow_mut();
         let mut text_lists = self.inner.text_lists.borrow_mut();
         let mut versions = self.inner.versions.borrow_mut();
+        let mut index_based = self.inner.index_based.borrow_mut();
+        let mut next_mem = self.inner.next_memory_index.borrow_mut();
         let id = lists.len();
         lists.push(Vec::new());
         text_lists.push(Vec::new());
         versions.push(Mutable::new(0.0));
+        index_based.push(false);
+        next_mem.push(0);
         (id + 1) as f64 // 1-based
     }
 
@@ -121,7 +135,21 @@ impl ListStore {
         let idx = (list_id as usize).wrapping_sub(1);
         let mut lists = self.inner.lists.borrow_mut();
         if let Some(list) = lists.get_mut(idx) {
-            list.push(value);
+            let is_index_based = self.inner.index_based.borrow()
+                .get(idx).copied().unwrap_or(false);
+            if is_index_based {
+                // For index-based lists, assign the next available memory index
+                // instead of using the passed value. This ensures the new item
+                // gets a fresh WASM memory slot (zero-initialized, never used).
+                let mut next_mem = self.inner.next_memory_index.borrow_mut();
+                let mem_idx = next_mem.get(idx).copied().unwrap_or(0);
+                list.push(mem_idx as f64);
+                if let Some(slot) = next_mem.get_mut(idx) {
+                    *slot = mem_idx + 1;
+                }
+            } else {
+                list.push(value);
+            }
         }
         // Bump version.
         let versions = self.inner.versions.borrow();
@@ -130,7 +158,32 @@ impl ListStore {
         }
     }
 
-    /// Append a text item to a list.
+    /// Append an item with an explicit memory index, bypassing the index-based auto-assignment.
+    /// Used by `host_list_copy_item` to preserve original memory indices through filter chains.
+    pub fn append_with_index(&self, list_id: f64, memory_index: f64) {
+        let idx = (list_id as usize).wrapping_sub(1);
+        let mut lists = self.inner.lists.borrow_mut();
+        if let Some(list) = lists.get_mut(idx) {
+            list.push(memory_index);
+        }
+        // Update next_memory_index so future fresh appends get unused slots.
+        let mem_idx = memory_index as usize;
+        let mut next_mem = self.inner.next_memory_index.borrow_mut();
+        if let Some(slot) = next_mem.get_mut(idx) {
+            if mem_idx + 1 > *slot {
+                *slot = mem_idx + 1;
+            }
+        }
+        // Bump version.
+        let versions = self.inner.versions.borrow();
+        if let Some(ver) = versions.get(idx) {
+            ver.set(ver.get() + 1.0);
+        }
+    }
+
+    /// Append a text item to a list (text only — does NOT add f64 item).
+    /// Callers that need f64 sync for index-based lists must do so separately
+    /// (e.g., `host_list_append_text` calls `append_with_next_memory_index`).
     pub fn append_text(&self, list_id: f64, text: String) {
         let idx = (list_id as usize).wrapping_sub(1);
         let mut text_lists = self.inner.text_lists.borrow_mut();
@@ -140,6 +193,91 @@ impl ListStore {
         // Bump version.
         let versions = self.inner.versions.borrow();
         if let Some(ver) = versions.get(idx) {
+            ver.set(ver.get() + 1.0);
+        }
+    }
+
+    /// Append an f64 item with the next available memory index.
+    /// Used to keep f64 items in sync with text items for index-based lists.
+    pub fn append_with_next_memory_index(&self, list_id: f64) {
+        let idx = (list_id as usize).wrapping_sub(1);
+        let is_index_based = self.inner.index_based.borrow()
+            .get(idx).copied().unwrap_or(false);
+        if is_index_based {
+            let mut next_mem = self.inner.next_memory_index.borrow_mut();
+            let mem_idx = next_mem.get(idx).copied().unwrap_or(0);
+            let mut lists = self.inner.lists.borrow_mut();
+            if let Some(list) = lists.get_mut(idx) {
+                list.push(mem_idx as f64);
+            }
+            if let Some(slot) = next_mem.get_mut(idx) {
+                *slot = mem_idx + 1;
+            }
+        }
+    }
+
+    /// Replace dest list's contents with source list's contents.
+    /// The dest list keeps its list_id but gets the source's items, text, and index tracking.
+    pub fn replace_contents(&self, dest_list_id: f64, source_list_id: f64) {
+        let dest_idx = (dest_list_id as usize).wrapping_sub(1);
+        let src_idx = (source_list_id as usize).wrapping_sub(1);
+        // Compute next_memory_index from the max of:
+        // - dest's current max memory index (before replacement)
+        // - source's max memory index
+        // This ensures new appends get fresh, never-used memory slots.
+        let next_mem_idx = {
+            let lists = self.inner.lists.borrow();
+            let is_dest_index_based = self.inner.index_based.borrow()
+                .get(dest_idx).copied().unwrap_or(false);
+            let dest_max = if is_dest_index_based {
+                lists.get(dest_idx)
+                    .and_then(|l| l.iter().map(|v| *v as usize).max())
+                    .unwrap_or(0)
+            } else {
+                // Position-based: max memory index = count - 1
+                lists.get(dest_idx)
+                    .map(|l| if l.is_empty() { 0 } else { l.len() - 1 })
+                    .unwrap_or(0)
+            };
+            let src_max = lists.get(src_idx)
+                .and_then(|l| l.iter().map(|v| *v as usize).max())
+                .unwrap_or(0);
+            dest_max.max(src_max) + 1
+        };
+        // Copy f64 items.
+        {
+            let mut lists = self.inner.lists.borrow_mut();
+            let src_items = lists.get(src_idx).cloned().unwrap_or_default();
+            if let Some(dest) = lists.get_mut(dest_idx) {
+                *dest = src_items;
+            }
+        };
+        // Copy text items.
+        {
+            let mut text_lists = self.inner.text_lists.borrow_mut();
+            let src_items = text_lists.get(src_idx).cloned().unwrap_or_default();
+            if let Some(dest) = text_lists.get_mut(dest_idx) {
+                *dest = src_items;
+            }
+        }
+        // Copy index-based tracking.
+        {
+            let mut index_based = self.inner.index_based.borrow_mut();
+            let src_flag = index_based.get(src_idx).copied().unwrap_or(false);
+            if let Some(dest) = index_based.get_mut(dest_idx) {
+                *dest = src_flag;
+            }
+        }
+        // Set next_memory_index so new appends get fresh, never-used memory slots.
+        {
+            let mut next_mem = self.inner.next_memory_index.borrow_mut();
+            if let Some(slot) = next_mem.get_mut(dest_idx) {
+                *slot = next_mem_idx;
+            }
+        }
+        // Bump version.
+        let versions = self.inner.versions.borrow();
+        if let Some(ver) = versions.get(dest_idx) {
             ver.set(ver.get() + 1.0);
         }
     }
@@ -155,6 +293,13 @@ impl ListStore {
         if let Some(list) = text_lists.get_mut(idx) {
             list.clear();
         }
+        // Reset index tracking — after clear, fresh appends use sequential indices.
+        if let Some(flag) = self.inner.index_based.borrow_mut().get_mut(idx) {
+            *flag = false;
+        }
+        if let Some(slot) = self.inner.next_memory_index.borrow_mut().get_mut(idx) {
+            *slot = 0;
+        }
         let versions = self.inner.versions.borrow();
         if let Some(ver) = versions.get(idx) {
             ver.set(ver.get() + 1.0);
@@ -168,7 +313,7 @@ impl ListStore {
         let text_lists = self.inner.text_lists.borrow();
         let f64_count = lists.get(idx).map(|l| l.len()).unwrap_or(0);
         let text_count = text_lists.get(idx).map(|l| l.len()).unwrap_or(0);
-        (f64_count + text_count) as f64
+        f64_count.max(text_count) as f64
     }
 
     /// Get a signal for the list version (triggers on mutations).
@@ -195,6 +340,33 @@ impl ListStore {
         let text_lists = self.inner.text_lists.borrow();
         text_lists.get(idx).cloned().unwrap_or_default()
     }
+
+    /// Mark a list as index-based (items store original memory indices).
+    pub fn set_index_based(&self, list_id: f64) {
+        let idx = (list_id as usize).wrapping_sub(1);
+        let mut index_based = self.inner.index_based.borrow_mut();
+        if let Some(flag) = index_based.get_mut(idx) {
+            *flag = true;
+        }
+    }
+
+    /// Get the original memory index for a given position in a list.
+    /// For index-based lists (from copy_item), returns the stored original index.
+    /// For regular lists, returns the position itself.
+    pub fn item_memory_index(&self, list_id: f64, position: usize) -> usize {
+        let idx = (list_id as usize).wrapping_sub(1);
+        let index_based = self.inner.index_based.borrow();
+        if index_based.get(idx).copied().unwrap_or(false) {
+            let lists = self.inner.lists.borrow();
+            lists.get(idx)
+                .and_then(|l| l.get(position))
+                .map(|v| *v as usize)
+                .unwrap_or(position)
+        } else {
+            position
+        }
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +536,7 @@ pub struct WasmInstance {
     init_item_fn: js_sys::Function,
     on_item_event_fn: js_sys::Function,
     get_item_cell_fn: js_sys::Function,
+    rerun_retain_filters_fn: js_sys::Function,
     /// Post-event hooks for cross-scope event propagation (global events → per-item updates).
     post_event_hooks: Rc<RefCell<Vec<Box<dyn Fn(u32)>>>>,
 }
@@ -469,11 +642,62 @@ impl WasmInstance {
             if let Some(text) = text_items.get(item_idx as usize) {
                 ls_clone.append_text(new_list_id, text.clone());
             }
-            ls_clone.append(new_list_id, item_idx as f64);
+            // Propagate the original memory index through filter chains.
+            // For index-based lists (from previous copy_item), look up the original index.
+            // For regular lists, position == original index.
+            let orig_idx = ls_clone.item_memory_index(source_list_id, item_idx as usize);
+            ls_clone.set_index_based(new_list_id);
+            ls_clone.append_with_index(new_list_id, orig_idx as f64);
         }) as Box<dyn FnMut(f64, i32, i32)>);
         Reflect::set(&env, &"host_list_copy_item".into(), list_copy_item.as_ref().unchecked_ref())
             .map_err(|e| format!("Failed to set host_list_copy_item: {:?}", e))?;
         list_copy_item.forget();
+
+        // host_list_item_memory_index(list_cell_id: i32, position: i32) -> i32
+        // Returns the original memory index for a given position in a list.
+        // For index-based lists (from copy_item), returns the stored original index.
+        // For regular lists, returns the position itself.
+        let ls_clone = list_store.clone();
+        let cs_clone = cell_store.clone();
+        let list_item_memory_index = Closure::wrap(Box::new(move |list_cell_id: i32, position: i32| -> i32 {
+            let list_id = cs_clone.get_cell_value(list_cell_id as u32);
+            ls_clone.item_memory_index(list_id, position as usize) as i32
+        }) as Box<dyn FnMut(i32, i32) -> i32>);
+        Reflect::set(&env, &"host_list_item_memory_index".into(), list_item_memory_index.as_ref().unchecked_ref())
+            .map_err(|e| format!("Failed to set host_list_item_memory_index: {:?}", e))?;
+        list_item_memory_index.forget();
+
+        // host_list_get_item_f64(list_cell_id: i32, position: i32) -> f64
+        // Returns the f64 value of a numeric list item at the given position.
+        // Used in filter loops to load per-item values when items have no field cells.
+        let ls_clone = list_store.clone();
+        let cs_clone = cell_store.clone();
+        let list_get_item_f64 = Closure::wrap(Box::new(move |list_cell_id: i32, position: i32| -> f64 {
+            let list_id = cs_clone.get_cell_value(list_cell_id as u32);
+            let idx = (list_id as usize).wrapping_sub(1);
+            let lists = ls_clone.inner.lists.borrow();
+            lists.get(idx)
+                .and_then(|l| l.get(position as usize))
+                .copied()
+                .unwrap_or(0.0)
+        }) as Box<dyn FnMut(i32, i32) -> f64>);
+        Reflect::set(&env, &"host_list_get_item_f64".into(), list_get_item_f64.as_ref().unchecked_ref())
+            .map_err(|e| format!("Failed to set host_list_get_item_f64: {:?}", e))?;
+        list_get_item_f64.forget();
+
+        // host_list_replace(dest_cell: i32, source_cell: i32)
+        // Replace dest list's contents with source list's contents in-place.
+        // Used by ListRemove to copy filtered result back to source list.
+        let ls_clone = list_store.clone();
+        let cs_clone = cell_store.clone();
+        let list_replace = Closure::wrap(Box::new(move |dest_cell: i32, source_cell: i32| {
+            let dest_list_id = cs_clone.get_cell_value(dest_cell as u32);
+            let source_list_id = cs_clone.get_cell_value(source_cell as u32);
+            ls_clone.replace_contents(dest_list_id, source_list_id);
+        }) as Box<dyn FnMut(i32, i32)>);
+        Reflect::set(&env, &"host_list_replace".into(), list_replace.as_ref().unchecked_ref())
+            .map_err(|e| format!("Failed to set host_list_replace: {:?}", e))?;
+        list_replace.forget();
 
         // host_text_trim(dest_cell: i32, src_cell: i32)
         // Dual-mode: routes to ItemCellStore when item context is active.
@@ -552,12 +776,20 @@ impl WasmInstance {
         copy_text.forget();
 
         // host_list_append_text(list_cell_id: i32, item_cell_id: i32)
+        // Appends a text item AND syncs the f64 item for index-based lists.
+        // This is the entry point for ListAppend operations. The f64 sync is
+        // needed because after a ListRemove (which uses replace_contents to
+        // convert the list to index-based), subsequent appends must keep
+        // f64 items and text items in sync for correct count() results.
         let ls_clone = list_store.clone();
         let cs_clone = cell_store.clone();
         let list_append_text = Closure::wrap(Box::new(move |list_cell_id: i32, item_cell_id: i32| {
             let list_id = cs_clone.get_cell_value(list_cell_id as u32);
             let text = cs_clone.get_cell_text(item_cell_id as u32);
             ls_clone.append_text(list_id, text);
+            // For index-based lists, also add an f64 item with the next memory index
+            // to keep f64 items and text items in sync.
+            ls_clone.append_with_next_memory_index(list_id);
         }) as Box<dyn FnMut(i32, i32)>);
         Reflect::set(&env, &"host_list_append_text".into(), list_append_text.as_ref().unchecked_ref())
             .map_err(|e| format!("Failed to set host_list_append_text: {:?}", e))?;
@@ -679,7 +911,18 @@ impl WasmInstance {
             let formatted = if !cell_text.is_empty() {
                 cell_text
             } else {
-                let val = cs_clone.get_cell_value(cell_id as u32);
+                // Read f64 from correct store: ItemCellStore for template cells,
+                // CellStore for globals. Without this, template cells read NaN
+                // from CellStore (default) and format as empty string.
+                let val = if let (Some(item_idx), Some(ics)) = (item_ctx, &ics_clone) {
+                    if ics.is_template_cell(cell_id as u32) {
+                        ics.get_value(item_idx, cell_id as u32)
+                    } else {
+                        cs_clone.get_cell_value(cell_id as u32)
+                    }
+                } else {
+                    cs_clone.get_cell_value(cell_id as u32)
+                };
                 format_f64_for_text(val)
             };
             // Write to target: check item store first.
@@ -754,6 +997,10 @@ impl WasmInstance {
             .map_err(|e| format!("No get_item_cell export: {:?}", e))?
             .dyn_into()
             .map_err(|_| "get_item_cell is not a function".to_string())?;
+        let rerun_retain_filters_fn: js_sys::Function = Reflect::get(&exports, &"rerun_retain_filters".into())
+            .map_err(|e| format!("No rerun_retain_filters export: {:?}", e))?
+            .dyn_into()
+            .map_err(|_| "rerun_retain_filters is not a function".to_string())?;
 
         let program_tag_table = program.tag_table.clone();
 
@@ -770,6 +1017,7 @@ impl WasmInstance {
             init_item_fn,
             on_item_event_fn,
             get_item_cell_fn,
+            rerun_retain_filters_fn,
             post_event_hooks: Rc::new(RefCell::new(Vec::new())),
         })
     }
@@ -838,6 +1086,9 @@ impl WasmInstance {
         for hook in self.post_event_hooks.borrow().iter() {
             hook(event_id);
         }
+        // After all event handlers (global + per-item) have run,
+        // re-evaluate per-item retain filters with updated values.
+        let _ = self.call_rerun_retain_filters();
         Ok(())
     }
 
@@ -856,7 +1107,8 @@ impl WasmInstance {
     }
 
     /// Call `on_item_event(item_idx, event_id)` to handle a per-item event.
-    pub fn call_on_item_event(&self, item_idx: u32, event_id: u32) -> Result<(), String> {
+    /// Does NOT call rerun_retain_filters — caller is responsible for batching.
+    fn call_on_item_event_raw(&self, item_idx: u32, event_id: u32) -> Result<(), String> {
         self.on_item_event_fn
             .call2(
                 &JsValue::NULL,
@@ -865,6 +1117,20 @@ impl WasmInstance {
             )
             .map_err(|e| format!("on_item_event({}, {}) failed: {:?}", item_idx, event_id, e))?;
         Ok(())
+    }
+
+    /// Call `on_item_event(item_idx, event_id)` and re-run retain filters.
+    /// Use this for single per-item events from the bridge (click, blur, etc.).
+    pub fn call_on_item_event(&self, item_idx: u32, event_id: u32) -> Result<(), String> {
+        self.call_on_item_event_raw(item_idx, event_id)?;
+        let _ = self.call_rerun_retain_filters();
+        Ok(())
+    }
+
+    /// Call `on_item_event` for multiple items without re-running retain filters
+    /// after each one. Caller must call `rerun_retain_filters` once when done.
+    pub fn call_on_item_event_batch(&self, item_idx: u32, event_id: u32) -> Result<(), String> {
+        self.call_on_item_event_raw(item_idx, event_id)
     }
 
     /// Call `get_item_cell(item_idx, cell_offset)` to read a per-item cell value.
@@ -877,6 +1143,16 @@ impl WasmInstance {
             Ok(val) => val.as_f64().unwrap_or(0.0),
             Err(_) => 0.0,
         }
+    }
+
+    /// Call `rerun_retain_filters()` to re-evaluate per-item retain filter loops.
+    /// Called after cross-scope events update per-item cells so global retains
+    /// see the new values.
+    pub fn call_rerun_retain_filters(&self) -> Result<(), String> {
+        self.rerun_retain_filters_fn
+            .call0(&JsValue::NULL)
+            .map_err(|e| format!("rerun_retain_filters failed: {:?}", e))?;
+        Ok(())
     }
 }
 

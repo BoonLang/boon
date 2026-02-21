@@ -8,7 +8,7 @@ use wasm_bindgen::JsCast;
 use zoon::*;
 
 use super::ir::*;
-use super::runtime::WasmInstance;
+use super::runtime::{CellStore, WasmInstance};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -222,6 +222,10 @@ fn build_expr_element(
         IrExpr::Constant(IrValue::Text(t)) => {
             zoon::Text::new(t.clone()).unify()
         }
+        IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => {
+            // NoElement renders as nothing — empty hidden span.
+            RawHtmlEl::new("span").style("display", "none").into_raw_unchecked()
+        }
         IrExpr::Constant(IrValue::Tag(t)) => {
             zoon::Text::new(t.clone()).unify()
         }
@@ -334,14 +338,15 @@ fn build_element_node(
         ElementKind::Stripe {
             direction,
             items,
+            gap,
             style,
             ..
-        } => build_stripe(program, instance, direction, *items, style),
+        } => build_stripe(program, instance, direction, *items, gap, style),
         ElementKind::TextInput { placeholder, style, focus } => {
             build_text_input(program, instance, placeholder.as_ref(), style, links, *focus)
         }
-        ElementKind::Checkbox { checked, style } => {
-            build_checkbox(program, instance, checked.as_ref(), style, links)
+        ElementKind::Checkbox { checked, style, icon } => {
+            build_checkbox(program, instance, checked.as_ref(), style, links, icon.as_ref())
         }
         ElementKind::Container { child, style } => {
             build_container(program, instance, *child, style)
@@ -436,6 +441,35 @@ fn attach_common_events(
     wrapper.into_raw_unchecked()
 }
 
+/// Resolve a label expression to TextConcat segments (following CellRead chains).
+fn resolve_label_segments<'a>(program: &'a IrProgram, label: &'a IrExpr) -> Option<&'a [TextSegment]> {
+    match label {
+        IrExpr::TextConcat(segs) => Some(segs),
+        IrExpr::CellRead(cell) => {
+            if let Some(IrNode::Derived { expr: IrExpr::TextConcat(segs), .. }) = find_node_for_cell(program, *cell) {
+                Some(segs)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Build a label child element — reactive if it contains CellRead segments, static otherwise.
+fn build_label_child(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    label: &IrExpr,
+) -> RawElOrText {
+    if let Some(segs) = resolve_label_segments(program, label) {
+        if segs.iter().any(|s| matches!(s, TextSegment::Expr(IrExpr::CellRead(_)))) {
+            return build_text_from_segments(instance, segs);
+        }
+    }
+    zoon::Text::new(resolve_static_text(program, label)).unify()
+}
+
 /// Build a Button element.
 fn build_button(
     program: &IrProgram,
@@ -444,8 +478,6 @@ fn build_button(
     style: &IrExpr,
     links: &[(String, EventId)],
 ) -> RawElOrText {
-    let label_text = resolve_static_text(program, label);
-
     let press_event = links
         .iter()
         .find(|(name, _)| name == "press")
@@ -457,9 +489,9 @@ fn build_button(
         .style("border", "none")
         .style("background", "transparent")
         .style("color", "inherit")
-        .child(zoon::Text::new(label_text));
+        .child(build_label_child(program, instance, label));
 
-    raw = apply_styles(raw, style, program);
+    raw = apply_styles(raw, style, program, instance);
 
     if let Some(event_id) = press_event {
         let inst = instance.clone();
@@ -477,6 +509,7 @@ fn build_stripe(
     instance: &Rc<WasmInstance>,
     direction: &IrExpr,
     items_cell: CellId,
+    gap: &IrExpr,
     style: &IrExpr,
 ) -> RawElOrText {
     let children = collect_stripe_children(program, instance, items_cell);
@@ -488,12 +521,22 @@ fn build_stripe(
 
     let mut raw = RawHtmlEl::new("div");
     if is_column {
-        raw = raw.style("display", "flex").style("flex-direction", "column");
+        raw = raw.style("display", "inline-flex").style("flex-direction", "column");
     } else {
-        raw = raw.style("display", "flex").style("flex-direction", "row");
+        raw = raw
+            .style("display", "inline-flex")
+            .style("flex-direction", "row")
+            .style("align-items", "center");
     }
 
-    raw = apply_styles(raw, style, program);
+    // Apply gap if specified.
+    if let IrExpr::Constant(IrValue::Number(n)) = gap {
+        if *n > 0.0 {
+            raw = raw.style("gap", &format!("{}px", n));
+        }
+    }
+
+    raw = apply_styles(raw, style, program, instance);
     raw = raw.children(children);
     raw.into_raw_unchecked()
 }
@@ -572,11 +615,11 @@ fn build_text_input(
         });
     }
 
-    raw = apply_styles(raw, style, program);
+    raw = apply_styles(raw, style, program, instance);
 
     // Extract placeholder text — could be nested in an object with text field.
     let raw = if let Some(ph) = placeholder {
-        let text = extract_placeholder_text(ph);
+        let text = extract_placeholder_text(ph, program);
         if !text.is_empty() {
             raw.attr("placeholder", &text)
         } else {
@@ -715,7 +758,7 @@ fn build_container(
 ) -> RawElOrText {
     let child_el = build_cell_element(program, instance, child);
     let mut raw = RawHtmlEl::new("div").child(child_el);
-    raw = apply_styles(raw, style, program);
+    raw = apply_styles(raw, style, program, instance);
     raw.into_raw_unchecked()
 }
 
@@ -746,7 +789,7 @@ fn build_label(
     };
     // Wrap in a span with styles applied.
     let mut raw = RawHtmlEl::new("span").child(content);
-    raw = apply_styles(raw, style, program);
+    raw = apply_styles(raw, style, program, instance);
     raw.into_raw_unchecked()
 }
 
@@ -760,7 +803,7 @@ fn build_stack(
     let children = collect_stripe_children(program, instance, layers_cell);
     let mut raw = RawHtmlEl::new("div")
         .style("position", "relative");
-    raw = apply_styles(raw, style, program);
+    raw = apply_styles(raw, style, program, instance);
     raw = raw.children(children);
     raw.into_raw_unchecked()
 }
@@ -768,7 +811,7 @@ fn build_stack(
 /// Build a Link element.
 fn build_link(
     program: &IrProgram,
-    _instance: &Rc<WasmInstance>,
+    instance: &Rc<WasmInstance>,
     label: &IrExpr,
     url: &IrExpr,
     style: &IrExpr,
@@ -779,7 +822,7 @@ fn build_link(
     let mut raw = RawHtmlEl::new("a")
         .attr("href", &url_text)
         .child(zoon::Text::new(label_text));
-    raw = apply_styles(raw, style, program);
+    raw = apply_styles(raw, style, program, instance);
     raw.into_raw_unchecked()
 }
 
@@ -791,7 +834,7 @@ fn build_paragraph(
     style: &IrExpr,
 ) -> RawElOrText {
     let mut raw = RawHtmlEl::new("p");
-    raw = apply_styles(raw, style, program);
+    raw = apply_styles(raw, style, program, instance);
 
     match content {
         IrExpr::TextConcat(segments) => {
@@ -854,44 +897,47 @@ fn build_paragraph(
 }
 
 /// Build a Checkbox element.
+/// When an `icon` is provided, renders as a `<label>` with a hidden `<input>` and the icon
+/// as a custom visual replacement (matching Zoon's Checkbox component behavior).
 fn build_checkbox(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     checked: Option<&CellId>,
     style: &IrExpr,
     links: &[(String, EventId)],
+    icon: Option<&CellId>,
 ) -> RawElOrText {
-    let click_event = links.iter().find(|(n, _)| n == "click").map(|(_, e)| *e);
+    // NOTE: Click handler is NOT added here — attach_common_events wraps this element
+    // with a <div display:contents> that handles click/blur/focus/etc. Adding a click
+    // handler directly on the <input> would cause double-firing due to event bubbling.
 
-    let mut raw = RawHtmlEl::new("input")
+    // Build the hidden <input type="checkbox">
+    // role="checkbox" is placed on the label (when icon present) so click detection
+    // tools can find a visible element with that role.
+    let mut input = RawHtmlEl::new("input")
         .attr("type", "checkbox")
-        .attr("role", "checkbox");
-    raw = apply_styles(raw, style, program);
-
-    if let Some(event_id) = click_event {
-        let inst = instance.clone();
-        raw = raw.event_handler(move |_: events::Click| {
-            let _ = inst.fire_event(event_id.0);
-        });
-    }
+        .style("position", "absolute")
+        .style("opacity", "0")
+        .style("width", "0")
+        .style("height", "0")
+        .style("margin", "0")
+        .style("padding", "0");
 
     // Reactively bind the `checked` property to the cell value.
     if let Some(&checked_cell) = checked {
         let store = instance.cell_store.clone();
         let cell_id = checked_cell.0;
-        // Set initial checked state.
         let initial = store.get_cell_value(cell_id) != 0.0;
         if initial {
-            raw = raw.attr("checked", "");
+            input = input.attr("checked", "");
         }
-        // Watch for changes.
-        raw = raw.after_insert(move |el: web_sys::HtmlElement| {
+        input = input.after_insert(move |el: web_sys::HtmlElement| {
             let handle = Task::start_droppable(
                 store.get_cell_signal(cell_id)
                     .for_each_sync(move |val| {
                         let is_checked = val != 0.0;
-                        if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
-                            input.set_checked(is_checked);
+                        if let Some(inp) = el.dyn_ref::<web_sys::HtmlInputElement>() {
+                            inp.set_checked(is_checked);
                         }
                     })
             );
@@ -899,7 +945,44 @@ fn build_checkbox(
         });
     }
 
-    raw.into_raw_unchecked()
+    // If an icon is provided, wrap with the icon as visual representation.
+    // Use <div> instead of <label> to avoid native label click-forwarding
+    // which interferes with the event wrapper from attach_common_events.
+    if let Some(&icon_cell) = icon {
+        let icon_el = build_cell_element(program, instance, icon_cell);
+        let mut wrapper = RawHtmlEl::new("div")
+            .attr("role", "checkbox")
+            .style("display", "flex")
+            .style("align-items", "center")
+            .style("cursor", "pointer")
+            .style("position", "relative");
+        // Reactively set aria-checked for accessibility and test tooling.
+        if let Some(&checked_cell) = checked {
+            let store2 = instance.cell_store.clone();
+            let cell_id2 = checked_cell.0;
+            let initial2 = store2.get_cell_value(cell_id2) != 0.0;
+            wrapper = wrapper.attr("aria-checked", if initial2 { "true" } else { "false" });
+            wrapper = wrapper.after_insert(move |el: web_sys::HtmlElement| {
+                let handle = Task::start_droppable(
+                    store2.get_cell_signal(cell_id2)
+                        .for_each_sync(move |val| {
+                            let _ = el.set_attribute("aria-checked", if val != 0.0 { "true" } else { "false" });
+                        })
+                );
+                std::mem::forget(handle);
+            });
+        }
+        wrapper = apply_styles(wrapper, style, program, instance);
+        wrapper = wrapper
+            .child(input)
+            .child(icon_el);
+        wrapper.into_raw_unchecked()
+    } else {
+        // No icon — visible checkbox input with role for click detection.
+        input = input.attr("role", "checkbox");
+        input = apply_styles(input, style, program, instance);
+        input.into_raw_unchecked()
+    }
 }
 
 /// Build a WHILE element — reactively switches child based on source cell value.
@@ -1208,7 +1291,8 @@ fn build_list_map(
             if cross_events.contains(&event_id) {
                 let count = *live_ref.borrow();
                 for i in 0..count {
-                    let _ = inst_hook.call_on_item_event(i, event_id);
+                    // Use batch version — fire_event calls rerun_retain_filters once at end.
+                    let _ = inst_hook.call_on_item_event_batch(i, event_id);
                 }
             }
         }));
@@ -1231,6 +1315,8 @@ fn build_list_map(
             let item_count = if !text_items.is_empty() { text_items.len() } else { f64_items.len() };
             if item_count == 0 {
                 *live_items_for_closure.borrow_mut() = 0;
+                // Reset initialized count so all items re-initialize on next render.
+                initialized_count.set(0);
                 return None;
             }
 
@@ -1238,21 +1324,24 @@ fn build_list_map(
 
             let program = &inst.program;
             let prev_init = initialized_count.get();
+            // If the list shrank (items were removed), reset init tracking
+            // so re-added items at reused positions get init_item called.
+            let prev_init = if item_count < prev_init { 0 } else { prev_init };
 
             let children: Vec<RawElOrText> = (0..item_count).map(|i| {
-                // For filtered lists, f64_items stores original item indices.
-                // Use those to map back to the correct ItemCellStore slot.
-                let item_idx = if i < f64_items.len() {
-                    f64_items[i] as u32
-                } else {
-                    i as u32
-                };
+                // Use item_memory_index to correctly map position → memory index.
+                // For index-based lists (after ListRetain/ListRemove), f64 values
+                // are original memory indices. For regular lists, use sequential index.
+                let item_idx = inst.list_store.item_memory_index(current_list_id, i) as u32;
 
                 // Set per-item text on item_cell from ListStore item data.
                 if let Some(ref ics) = inst.item_cell_store {
                     ics.ensure_item(item_idx);
                     if i < text_items.len() {
                         ics.set_text(item_idx, item_cell.0, text_items[i].clone());
+                    } else if i < f64_items.len() {
+                        // Numeric list items: format value as text for label display.
+                        ics.set_text(item_idx, item_cell.0, format_number(f64_items[i]));
                     }
                 }
 
@@ -1302,9 +1391,7 @@ fn build_list_map(
             }).collect();
 
             // Update initialized count so future re-renders don't re-init existing items.
-            if item_count > prev_init {
-                initialized_count.set(item_count);
-            }
+            initialized_count.set(item_count);
 
             Some(
                 RawHtmlEl::new("div")
@@ -1376,6 +1463,9 @@ fn build_item_element(
                 match expr {
                     IrExpr::CellRead(source) => build_item_element(program, instance, ctx, *source),
                     IrExpr::Constant(IrValue::Text(t)) => zoon::Text::new(t.clone()).unify(),
+                    IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => {
+                        RawHtmlEl::new("span").style("display", "none").into_raw_unchecked()
+                    }
                     IrExpr::Constant(IrValue::Tag(t)) => zoon::Text::new(t.clone()).unify(),
                     IrExpr::Constant(IrValue::Number(n)) => zoon::Text::new(format_number(*n)).unify(),
                     IrExpr::TextConcat(segments) => {
@@ -1582,14 +1672,14 @@ fn build_item_element_node(
         ElementKind::Button { label, style } => {
             build_item_button(program, instance, ctx, label, style, links)
         }
-        ElementKind::Stripe { direction, items, style, .. } => {
-            build_item_stripe(program, instance, ctx, direction, *items, style)
+        ElementKind::Stripe { direction, items, gap, style, .. } => {
+            build_item_stripe(program, instance, ctx, direction, *items, gap, style)
         }
         ElementKind::TextInput { placeholder, style, focus } => {
             build_item_text_input(program, instance, ctx, placeholder.as_ref(), style, links, *focus)
         }
-        ElementKind::Checkbox { checked, style } => {
-            build_item_checkbox(program, instance, ctx, checked.as_ref(), style, links)
+        ElementKind::Checkbox { checked, style, icon } => {
+            build_item_checkbox(program, instance, ctx, checked.as_ref(), style, links, icon.as_ref())
         }
         ElementKind::Container { child, style } => {
             build_item_container(program, instance, ctx, *child, style)
@@ -1741,7 +1831,7 @@ fn build_item_button(
         .style("color", "inherit")
         .child(zoon::Text::new(label_text));
 
-    raw = apply_styles(raw, style, program);
+    raw = apply_styles_item(raw, style, program, instance, ctx);
 
     if let Some(event_id) = press_event {
         let inst = instance.clone();
@@ -1766,6 +1856,7 @@ fn build_item_stripe(
     ctx: &ItemContext,
     direction: &IrExpr,
     items_cell: CellId,
+    gap: &IrExpr,
     style: &IrExpr,
 ) -> RawElOrText {
     let children = collect_item_stripe_children(program, instance, ctx, items_cell);
@@ -1777,12 +1868,22 @@ fn build_item_stripe(
 
     let mut raw = RawHtmlEl::new("div");
     if is_column {
-        raw = raw.style("display", "flex").style("flex-direction", "column");
+        raw = raw.style("display", "inline-flex").style("flex-direction", "column");
     } else {
-        raw = raw.style("display", "flex").style("flex-direction", "row");
+        raw = raw
+            .style("display", "inline-flex")
+            .style("flex-direction", "row")
+            .style("align-items", "center");
     }
 
-    raw = apply_styles(raw, style, program);
+    // Apply gap if specified.
+    if let IrExpr::Constant(IrValue::Number(n)) = gap {
+        if *n > 0.0 {
+            raw = raw.style("gap", &format!("{}px", n));
+        }
+    }
+
+    raw = apply_styles_item(raw, style, program, instance, ctx);
     raw = raw.children(children);
     raw.into_raw_unchecked()
 }
@@ -1853,10 +1954,10 @@ fn build_item_text_input(
         raw = raw.after_insert(|el| { let _ = el.focus(); });
     }
 
-    raw = apply_styles(raw, style, program);
+    raw = apply_styles_item(raw, style, program, instance, ctx);
 
     let raw = if let Some(ph) = placeholder {
-        let text = extract_placeholder_text(ph);
+        let text = extract_placeholder_text(ph, program);
         if !text.is_empty() { raw.attr("placeholder", &text) } else { raw }
     } else { raw };
 
@@ -1951,14 +2052,21 @@ fn build_item_checkbox(
     checked: Option<&CellId>,
     style: &IrExpr,
     links: &[(String, EventId)],
+    icon: Option<&CellId>,
 ) -> RawElOrText {
     // NOTE: Click handler is NOT added here — attach_item_events wraps this element
     // with a <div display:contents> that handles click/blur/focus/etc. Adding a click
     // handler directly on the <input> would cause double-firing due to event bubbling.
-    let mut raw = RawHtmlEl::new("input")
+    // role="checkbox" is placed on the label (when icon present) so click detection
+    // tools can find a visible element with that role.
+    let mut input = RawHtmlEl::new("input")
         .attr("type", "checkbox")
-        .attr("role", "checkbox");
-    raw = apply_styles(raw, style, program);
+        .style("position", "absolute")
+        .style("opacity", "0")
+        .style("width", "0")
+        .style("height", "0")
+        .style("margin", "0")
+        .style("padding", "0");
 
     // Reactively bind the `checked` property to the cell value.
     if let Some(&checked_cell) = checked {
@@ -1966,20 +2074,18 @@ fn build_item_checkbox(
             let ics = ics.clone();
             let item_idx = ctx.item_idx;
             let cell_id = checked_cell.0;
-            // Set initial checked state from item cell store.
             let initial_val = ics.get_value(item_idx, cell_id);
             let initial = initial_val != 0.0;
             if initial {
-                raw = raw.attr("checked", "");
+                input = input.attr("checked", "");
             }
-            // Watch for changes via item cell signal.
-            raw = raw.after_insert(move |el: web_sys::HtmlElement| {
+            input = input.after_insert(move |el: web_sys::HtmlElement| {
                 let handle = Task::start_droppable(
                     ics.get_signal(item_idx, cell_id)
                         .for_each_sync(move |val| {
                             let is_checked = val != 0.0;
-                            if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
-                                input.set_checked(is_checked);
+                            if let Some(inp) = el.dyn_ref::<web_sys::HtmlInputElement>() {
+                                inp.set_checked(is_checked);
                             }
                         })
                 );
@@ -1988,7 +2094,46 @@ fn build_item_checkbox(
         }
     }
 
-    raw.into_raw_unchecked()
+    if let Some(&icon_cell) = icon {
+        let icon_el = build_item_element(program, instance, ctx, icon_cell);
+        // Use <div> instead of <label> to avoid native label click-forwarding
+        // which interferes with the event wrapper from attach_item_events.
+        let mut wrapper = RawHtmlEl::new("div")
+            .attr("role", "checkbox")
+            .style("display", "flex")
+            .style("align-items", "center")
+            .style("cursor", "pointer")
+            .style("position", "relative");
+        // Reactively set aria-checked for accessibility and test tooling.
+        if let Some(&checked_cell) = checked {
+            if let Some(ref ics) = instance.item_cell_store {
+                let ics2 = ics.clone();
+                let item_idx2 = ctx.item_idx;
+                let cell_id2 = checked_cell.0;
+                let initial2 = ics2.get_value(item_idx2, cell_id2) != 0.0;
+                wrapper = wrapper.attr("aria-checked", if initial2 { "true" } else { "false" });
+                wrapper = wrapper.after_insert(move |el: web_sys::HtmlElement| {
+                    let handle = Task::start_droppable(
+                        ics2.get_signal(item_idx2, cell_id2)
+                            .for_each_sync(move |val| {
+                                let _ = el.set_attribute("aria-checked", if val != 0.0 { "true" } else { "false" });
+                            })
+                    );
+                    std::mem::forget(handle);
+                });
+            }
+        }
+        wrapper = apply_styles_item(wrapper, style, program, instance, ctx);
+        wrapper = wrapper
+            .child(input)
+            .child(icon_el);
+        wrapper.into_raw_unchecked()
+    } else {
+        // No icon — visible checkbox input with role for click detection.
+        input = input.attr("role", "checkbox");
+        input = apply_styles_item(input, style, program, instance, ctx);
+        input.into_raw_unchecked()
+    }
 }
 
 /// Build a per-item Container element.
@@ -2001,7 +2146,7 @@ fn build_item_container(
 ) -> RawElOrText {
     let child_el = build_item_element(program, instance, ctx, child);
     let mut raw = RawHtmlEl::new("div").child(child_el);
-    raw = apply_styles(raw, style, program);
+    raw = apply_styles_item(raw, style, program, instance, ctx);
     raw.into_raw_unchecked()
 }
 
@@ -2030,7 +2175,7 @@ fn build_item_label(
         }
     };
     let mut raw = RawHtmlEl::new("span").child(content);
-    raw = apply_styles(raw, style, program);
+    raw = apply_styles_item(raw, style, program, instance, ctx);
     raw.into_raw_unchecked()
 }
 
@@ -2044,7 +2189,7 @@ fn build_item_stack(
 ) -> RawElOrText {
     let children = collect_item_stripe_children(program, instance, ctx, layers_cell);
     let mut raw = RawHtmlEl::new("div").style("position", "relative");
-    raw = apply_styles(raw, style, program);
+    raw = apply_styles_item(raw, style, program, instance, ctx);
     raw = raw.children(children);
     raw.into_raw_unchecked()
 }
@@ -2243,7 +2388,7 @@ fn find_node_for_cell(program: &IrProgram, cell: CellId) -> Option<&IrNode> {
 
 /// Extract placeholder text from a placeholder expression.
 /// Handles both simple text and complex objects like `[style: ..., text: TEXT { ... }]`.
-fn extract_placeholder_text(expr: &IrExpr) -> String {
+fn extract_placeholder_text(expr: &IrExpr, program: &IrProgram) -> String {
     match expr {
         IrExpr::Constant(IrValue::Text(t)) => t.clone(),
         IrExpr::TextConcat(segs) => {
@@ -2256,7 +2401,17 @@ fn extract_placeholder_text(expr: &IrExpr) -> String {
             // Look for a "text" field in the object.
             for (name, val) in fields {
                 if name == "text" {
-                    return extract_placeholder_text(val);
+                    return extract_placeholder_text(val, program);
+                }
+            }
+            String::new()
+        }
+        IrExpr::CellRead(cell) => {
+            // Placeholder lowered as cell store — reconstruct and look for "text" field.
+            let fields = reconstruct_object_fields(program, *cell);
+            for (name, val) in &fields {
+                if name == "text" {
+                    return extract_placeholder_text(val, program);
                 }
             }
             String::new()
@@ -2377,12 +2532,41 @@ fn resolve_expr_constant(program: &IrProgram, expr: &IrExpr, depth: u32) -> Opti
 
 /// Apply Boon style properties as CSS to a RawHtmlEl.
 fn apply_styles(
+    el: RawHtmlEl<web_sys::HtmlElement>,
+    style: &IrExpr,
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+) -> RawHtmlEl<web_sys::HtmlElement> {
+    apply_styles_inner(el, style, program, instance, None)
+}
+
+fn apply_styles_item(
+    el: RawHtmlEl<web_sys::HtmlElement>,
+    style: &IrExpr,
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    ctx: &ItemContext,
+) -> RawHtmlEl<web_sys::HtmlElement> {
+    apply_styles_inner(el, style, program, instance, Some(ctx))
+}
+
+fn apply_styles_inner(
     mut el: RawHtmlEl<web_sys::HtmlElement>,
     style: &IrExpr,
     program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    item_ctx: Option<&ItemContext>,
 ) -> RawHtmlEl<web_sys::HtmlElement> {
-    let fields = match style {
+    // Style can be ObjectConstruct (direct) or CellRead (when nested objects
+    // caused the lowerer to use the object-store pattern). For CellRead, we
+    // reconstruct the field expressions from the IR node tree.
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match style {
         IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
         IrExpr::Constant(IrValue::Void) => return el,
         _ => return el,
     };
@@ -2393,10 +2577,18 @@ fn apply_styles(
                 if let Some(css) = dimension_to_css(value) {
                     el = el.style("width", &css);
                 }
+                // Fill width also needs flex-grow for inline-flex parents.
+                if matches!(value, IrExpr::Constant(IrValue::Tag(t)) if t == "Fill") {
+                    el = el.style("flex-grow", "1");
+                }
             }
             "height" => {
                 if let Some(css) = dimension_to_css(value) {
                     el = el.style("height", &css);
+                }
+                // Fill height also needs flex-grow for inline-flex parents.
+                if matches!(value, IrExpr::Constant(IrValue::Tag(t)) if t == "Fill") {
+                    el = el.style("flex-grow", "1");
                 }
             }
             "size" => {
@@ -2412,7 +2604,7 @@ fn apply_styles(
                 el = apply_font(el, value, program);
             }
             "background" => {
-                el = apply_background(el, value);
+                el = apply_background(el, value, program, instance, item_ctx);
             }
             "align" => {
                 el = apply_align(el, value);
@@ -2425,8 +2617,14 @@ fn apply_styles(
             "font_smoothing" => {
                 if let IrExpr::Constant(IrValue::Tag(t)) = value {
                     if t == "Antialiased" {
-                        el = el.style("-webkit-font-smoothing", "antialiased");
-                        el = el.style("-moz-osx-font-smoothing", "grayscale");
+                        // Use raw DOM API because dominator's .style() auto-adds
+                        // vendor prefixes, which creates invalid double-prefixed
+                        // names like "-webkit--moz-osx-font-smoothing".
+                        el = el.after_insert(|element: web_sys::HtmlElement| {
+                            let style = element.style();
+                            let _ = style.set_property("-webkit-font-smoothing", "antialiased");
+                            let _ = style.set_property("-moz-osx-font-smoothing", "grayscale");
+                        });
                     }
                 }
             }
@@ -2439,15 +2637,57 @@ fn apply_styles(
                 el = apply_borders(el, value);
             }
             "shadows" => {
-                el = apply_shadows(el, value);
+                el = apply_shadows(el, value, program);
             }
             "outline" => {
-                el = apply_outline(el, value);
+                el = apply_outline(el, value, program, instance);
+            }
+            "transform" => {
+                el = apply_transform(el, value, program);
             }
             _ => {}
         }
     }
     el
+}
+
+/// Reconstruct object fields from a cell store (namespace cell).
+/// When an object was lowered with the object-store pattern (because it had
+/// nested objects), its fields are stored as separate cells. This function
+/// looks up `cell_field_cells` for the cell and extracts each field's expression
+/// from the corresponding Derived node.
+///
+/// When a field is itself a namespace cell (Derived with Void + has cell_field_cells),
+/// recursively reconstruct it as ObjectConstruct so style handlers can process it.
+fn reconstruct_object_fields(program: &IrProgram, cell: CellId) -> Vec<(String, IrExpr)> {
+    let mut fields = Vec::new();
+    if let Some(field_map) = program.cell_field_cells.get(&cell) {
+        for (name, field_cell) in field_map {
+            if let Some(node) = find_node_for_cell(program, *field_cell) {
+                match node {
+                    IrNode::Derived { expr, .. } => {
+                        // Check if this field is itself a namespace cell (nested object
+                        // lowered via lower_object_store). In that case, expr is Void
+                        // and the actual fields are in cell_field_cells.
+                        if matches!(expr, IrExpr::Constant(IrValue::Void))
+                            && program.cell_field_cells.contains_key(field_cell)
+                        {
+                            let inner = reconstruct_object_fields(program, *field_cell);
+                            fields.push((name.clone(), IrExpr::ObjectConstruct(inner)));
+                        } else {
+                            fields.push((name.clone(), expr.clone()));
+                        }
+                    }
+                    // Non-Derived nodes (When, While, Hold, etc.) — expose as
+                    // CellRead so style handlers can process them reactively.
+                    _ => {
+                        fields.push((name.clone(), IrExpr::CellRead(*field_cell)));
+                    }
+                }
+            }
+        }
+    }
+    fields
 }
 
 /// Convert a Boon dimension value to CSS.
@@ -2621,24 +2861,141 @@ fn resolve_font_family(expr: &IrExpr, program: &IrProgram) -> Option<String> {
 fn apply_background(
     mut el: RawHtmlEl<web_sys::HtmlElement>,
     value: &IrExpr,
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    item_ctx: Option<&ItemContext>,
 ) -> RawHtmlEl<web_sys::HtmlElement> {
-    if let IrExpr::ObjectConstruct(fields) = value {
-        for (name, val) in fields {
-            match name.as_str() {
-                "color" => {
-                    if let Some(css) = resolve_color_full(val) {
-                        el = el.style("background-color", &css);
-                    }
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match value {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
+        _ => return el,
+    };
+    for (name, val) in fields {
+        match name.as_str() {
+            "color" => {
+                if let Some(css) = resolve_color_full(val) {
+                    el = el.style("background-color", &css);
                 }
-                "url" => {
-                    let url = eval_static_text(val);
+            }
+            "url" => {
+                // Try static text first, then follow CellRead chains.
+                let url = eval_static_text(val);
+                if !url.is_empty() {
+                    el = el.style("background-image", &format!("url({})", url));
+                    el = el.style("background-size", "contain");
+                    el = el.style("background-repeat", "no-repeat");
+                } else {
+                    let url = resolve_static_text(program, val);
                     if !url.is_empty() {
                         el = el.style("background-image", &format!("url({})", url));
                         el = el.style("background-size", "contain");
                         el = el.style("background-repeat", "no-repeat");
+                    } else {
+                        // Reactive URL: the value is a CellRead to a WHEN/WHILE node
+                        // whose arms produce text (e.g. SVG data URIs for checkbox icons).
+                        el = apply_reactive_background_url(el, val, program, instance, item_ctx);
                     }
                 }
-                _ => {}
+            }
+            _ => {}
+        }
+    }
+    el
+}
+
+/// Set up a reactive background-image from a WHEN/WHILE expression.
+/// Collects text for each arm statically, watches the source cell, and
+/// switches the CSS property when the source value changes.
+fn apply_reactive_background_url(
+    mut el: RawHtmlEl<web_sys::HtmlElement>,
+    url_expr: &IrExpr,
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    item_ctx: Option<&ItemContext>,
+) -> RawHtmlEl<web_sys::HtmlElement> {
+    if let IrExpr::CellRead(cell) = url_expr {
+        if let Some(node) = find_node_for_cell(program, *cell) {
+            if let IrNode::When { source, arms, .. } | IrNode::While { source, arms, .. } = node {
+                // Collect (pattern_f64, url_text) for each arm.
+                let mut arm_urls: Vec<(f64, String)> = Vec::new();
+                for (pat, body) in arms {
+                    let f64_val = pattern_to_f64(pat, program);
+                    let text = resolve_static_text(program, body);
+                    if !text.is_empty() {
+                        arm_urls.push((f64_val, text));
+                    }
+                }
+                if arm_urls.is_empty() {
+                    return el;
+                }
+
+                let source_id = source.0;
+                el = el.style("background-size", "contain");
+                el = el.style("background-repeat", "no-repeat");
+
+                // Per-item case: source cell is a template cell, use ItemCellStore signals.
+                if let (Some(ctx), Some(ics)) = (item_ctx, &instance.item_cell_store) {
+                    if ics.is_template_cell(source_id) {
+                        let item_idx = ctx.item_idx;
+                        let initial_val = ics.get_value(item_idx, source_id);
+                        for (pat_val, url) in &arm_urls {
+                            if initial_val == *pat_val {
+                                el = el.style("background-image", &format!("url({})", url));
+                                break;
+                            }
+                        }
+                        let ics_clone = ics.clone();
+                        el = el.after_insert(move |element: web_sys::HtmlElement| {
+                            let handle = Task::start_droppable(
+                                ics_clone.get_signal(item_idx, source_id)
+                                    .for_each_sync(move |val| {
+                                        for (pat_val, url) in &arm_urls {
+                                            if val == *pat_val {
+                                                let _ = element.style().set_property(
+                                                    "background-image",
+                                                    &format!("url({})", url),
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    })
+                            );
+                            std::mem::forget(handle);
+                        });
+                        return el;
+                    }
+                }
+
+                // Global cell: use cell_store.
+                let initial_val = instance.cell_store.get_cell_value(source_id);
+                for (pat_val, url) in &arm_urls {
+                    if initial_val == *pat_val {
+                        el = el.style("background-image", &format!("url({})", url));
+                        break;
+                    }
+                }
+                let store = instance.cell_store.clone();
+                el = el.after_insert(move |element: web_sys::HtmlElement| {
+                    let handle = Task::start_droppable(
+                        store.get_cell_signal(source_id)
+                            .for_each_sync(move |val| {
+                                for (pat_val, url) in &arm_urls {
+                                    if val == *pat_val {
+                                        let _ = element.style().set_property(
+                                            "background-image",
+                                            &format!("url({})", url),
+                                        );
+                                        break;
+                                    }
+                                }
+                            })
+                    );
+                    std::mem::forget(handle);
+                });
             }
         }
     }
@@ -2704,43 +3061,62 @@ fn apply_borders(
 fn apply_shadows(
     mut el: RawHtmlEl<web_sys::HtmlElement>,
     value: &IrExpr,
+    program: &IrProgram,
 ) -> RawHtmlEl<web_sys::HtmlElement> {
-    // Shadows can be a ListConstruct of ObjectConstruct items.
+    // Shadows can be a ListConstruct directly, or a CellRead to a Derived
+    // node holding a ListConstruct (when the style used the object-store pattern).
+    let resolved;
     let items = match value {
         IrExpr::ListConstruct(items) => items,
+        IrExpr::CellRead(cell) => {
+            if let Some(IrNode::Derived { expr: IrExpr::ListConstruct(items), .. }) = find_node_for_cell(program, *cell) {
+                resolved = items.clone();
+                &resolved
+            } else {
+                return el;
+            }
+        }
         _ => return el,
     };
 
     let shadows: Vec<String> = items.iter().filter_map(|item| {
-        if let IrExpr::ObjectConstruct(fields) = item {
-            let mut x = 0.0f64;
-            let mut y = 0.0f64;
-            let mut blur = 0.0f64;
-            let mut spread = 0.0f64;
-            let mut color = "rgba(0,0,0,0.2)".to_string();
-            let mut inset = false;
-
-            for (name, val) in fields {
-                match name.as_str() {
-                    "x" => if let IrExpr::Constant(IrValue::Number(n)) = val { x = *n; },
-                    "y" => if let IrExpr::Constant(IrValue::Number(n)) = val { y = *n; },
-                    "blur" => if let IrExpr::Constant(IrValue::Number(n)) = val { blur = *n; },
-                    "spread" => if let IrExpr::Constant(IrValue::Number(n)) = val { spread = *n; },
-                    "color" => { color = resolve_color_full(val).unwrap_or(color); },
-                    "direction" => {
-                        if let IrExpr::Constant(IrValue::Tag(t)) = val {
-                            if t == "Inwards" { inset = true; }
-                        }
-                    }
-                    _ => {}
-                }
+        // Items may be ObjectConstruct (direct) or CellRead (when force_object_store
+        // was active during lowering). Handle both by reconstructing if needed.
+        let reconstructed;
+        let fields: &[(String, IrExpr)] = match item {
+            IrExpr::ObjectConstruct(f) => f,
+            IrExpr::CellRead(cell) => {
+                reconstructed = reconstruct_object_fields(program, *cell);
+                &reconstructed
             }
+            _ => return None,
+        };
 
-            let inset_str = if inset { "inset " } else { "" };
-            Some(format!("{}{}px {}px {}px {}px {}", inset_str, x, y, blur, spread, color))
-        } else {
-            None
+        let mut x = 0.0f64;
+        let mut y = 0.0f64;
+        let mut blur = 0.0f64;
+        let mut spread = 0.0f64;
+        let mut color = "rgba(0,0,0,0.2)".to_string();
+        let mut inset = false;
+
+        for (name, val) in fields {
+            match name.as_str() {
+                "x" => if let IrExpr::Constant(IrValue::Number(n)) = val { x = *n; },
+                "y" => if let IrExpr::Constant(IrValue::Number(n)) = val { y = *n; },
+                "blur" => if let IrExpr::Constant(IrValue::Number(n)) = val { blur = *n; },
+                "spread" => if let IrExpr::Constant(IrValue::Number(n)) = val { spread = *n; },
+                "color" => { color = resolve_color_full(val).unwrap_or(color); },
+                "direction" => {
+                    if let IrExpr::Constant(IrValue::Tag(t)) = val {
+                        if t == "Inwards" { inset = true; }
+                    }
+                }
+                _ => {}
+            }
         }
+
+        let inset_str = if inset { "inset " } else { "" };
+        Some(format!("{}{}px {}px {}px {}px {}", inset_str, x, y, blur, spread, color))
     }).collect();
 
     if !shadows.is_empty() {
@@ -2749,14 +3125,25 @@ fn apply_shadows(
     el
 }
 
-/// Apply outline properties.
-fn apply_outline(
-    mut el: RawHtmlEl<web_sys::HtmlElement>,
-    value: &IrExpr,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+/// Convert an IrPattern to the f64 value the WASM cell would hold when that arm matches.
+fn pattern_to_f64(pat: &IrPattern, program: &IrProgram) -> f64 {
+    match pat {
+        IrPattern::Number(n) => *n,
+        IrPattern::Tag(tag) => {
+            program.tag_table.iter()
+                .position(|t| t == tag)
+                .map(|i| (i + 1) as f64)
+                .unwrap_or(0.0)
+        }
+        IrPattern::Text(_) | IrPattern::Wildcard | IrPattern::Binding(_) => 0.0,
+    }
+}
+
+/// Compute outline CSS from a static IrExpr. Returns (outline_css, box_shadow_css).
+fn resolve_outline_css(value: &IrExpr) -> (String, String) {
     match value {
         IrExpr::Constant(IrValue::Tag(t)) if t == "NoOutline" => {
-            el = el.style("outline", "none");
+            ("none".to_string(), "none".to_string())
         }
         IrExpr::ObjectConstruct(fields) => {
             let color = fields.iter()
@@ -2767,12 +3154,182 @@ fn apply_outline(
                 .find(|(n, _)| n == "side")
                 .and_then(|(_, v)| if let IrExpr::Constant(IrValue::Tag(t)) = v { Some(t.as_str()) } else { None });
             if side == Some("Inner") {
-                el = el.style("box-shadow", &format!("inset 0 0 0 1px {}", color));
+                ("none".to_string(), format!("inset 0 0 0 1px {}", color))
             } else {
-                el = el.style("outline", &format!("1px solid {}", color));
+                (format!("1px solid {}", color), "none".to_string())
             }
         }
-        _ => {}
+        _ => ("none".to_string(), "none".to_string()),
+    }
+}
+
+/// Recursively collect all (f64_pattern_value, outline_css, box_shadow_css) from WHILE/WHEN arms.
+/// For nested CellRead bodies, follows to inner WHILE/WHEN nodes and collects their arms too,
+/// using the SOURCE cell's signal for each level.
+fn collect_outline_arm_css(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    arms: &[(IrPattern, IrExpr)],
+    source: CellId,
+    result: &mut Vec<(CellId, f64, String, String)>,
+) {
+    for (pat, body) in arms {
+        let f64_val = pattern_to_f64(pat, program);
+        match body {
+            IrExpr::CellRead(inner_cell) => {
+                // Nested WHILE/WHEN — recurse.
+                if let Some(node) = find_node_for_cell(program, *inner_cell) {
+                    match node {
+                        IrNode::While { source: inner_source, arms: inner_arms, .. }
+                        | IrNode::When { source: inner_source, arms: inner_arms, .. } => {
+                            collect_outline_arm_css(program, instance, inner_arms, *inner_source, result);
+                        }
+                        IrNode::Derived { expr, .. } => {
+                            // Check if this is a namespace cell (Void + cell_field_cells)
+                            // from the object-store pattern. If so, reconstruct and resolve.
+                            if matches!(expr, IrExpr::Constant(IrValue::Void))
+                                && program.cell_field_cells.contains_key(inner_cell)
+                            {
+                                let fields = reconstruct_object_fields(program, *inner_cell);
+                                let obj = IrExpr::ObjectConstruct(fields);
+                                let (outline, shadow) = resolve_outline_css(&obj);
+                                result.push((source, f64_val, outline, shadow));
+                            } else {
+                                let (outline, shadow) = resolve_outline_css(expr);
+                                result.push((source, f64_val, outline, shadow));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {
+                let (outline, shadow) = resolve_outline_css(body);
+                result.push((source, f64_val, outline, shadow));
+            }
+        }
+    }
+}
+
+fn apply_outline(
+    mut el: RawHtmlEl<web_sys::HtmlElement>,
+    value: &IrExpr,
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+) -> RawHtmlEl<web_sys::HtmlElement> {
+    match value {
+        IrExpr::CellRead(cell) => {
+            if let Some(node) = find_node_for_cell(program, *cell) {
+                match node {
+                    IrNode::While { source, arms, .. } | IrNode::When { source, arms, .. } => {
+                        // Collect all (source_cell, pattern_f64, outline, shadow) entries,
+                        // recursively following nested WHILEs.
+                        let mut all_css = Vec::new();
+                        collect_outline_arm_css(program, instance, arms, *source, &mut all_css);
+
+                        // Collect unique source cells to watch.
+                        let mut source_cells: Vec<CellId> = all_css.iter().map(|(s, _, _, _)| *s).collect();
+                        source_cells.sort_by_key(|c| c.0);
+                        source_cells.dedup();
+
+                        // Set initial outline from current cell values.
+                        let initial_css = resolve_active_outline(&all_css, &instance.cell_store);
+                        if let Some((outline, shadow)) = initial_css {
+                            if !outline.is_empty() { el = el.style("outline", &outline); }
+                            if !shadow.is_empty() { el = el.style("box-shadow", &shadow); }
+                        }
+
+                        // Watch all source cells and update outline reactively.
+                        let store = instance.cell_store.clone();
+                        let source_cells_clone = source_cells.clone();
+                        el = el.after_insert(move |element: web_sys::HtmlElement| {
+                            for source_cell in &source_cells_clone {
+                                let all_css = all_css.clone();
+                                let store2 = store.clone();
+                                let el2 = element.clone();
+                                let handle = Task::start_droppable(
+                                    store.get_cell_signal(source_cell.0)
+                                        .for_each_sync(move |_val| {
+                                            if let Some((outline, shadow)) = resolve_active_outline(&all_css, &store2) {
+                                                let style = el2.style();
+                                                let _ = style.set_property("outline", &outline);
+                                                let _ = style.set_property("box-shadow", &shadow);
+                                            }
+                                        })
+                                );
+                                std::mem::forget(handle);
+                            }
+                        });
+                    }
+                    IrNode::Derived { expr, .. } => {
+                        let (outline, shadow) = resolve_outline_css(expr);
+                        if !outline.is_empty() { el = el.style("outline", &outline); }
+                        if !shadow.is_empty() { el = el.style("box-shadow", &shadow); }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        other => {
+            let (outline, shadow) = resolve_outline_css(other);
+            if !outline.is_empty() { el = el.style("outline", &outline); }
+            if !shadow.is_empty() { el = el.style("box-shadow", &shadow); }
+        }
+    }
+    el
+}
+
+/// Given all collected outline arm CSS entries and current cell values,
+/// determine which outline is currently active. Priority: first matching entry wins.
+fn resolve_active_outline(
+    all_css: &[(CellId, f64, String, String)],
+    store: &CellStore,
+) -> Option<(String, String)> {
+    // Walk entries in order — the FIRST one whose source cell matches wins.
+    // This preserves the priority: outer WHILE arms checked before inner ones.
+    for (source, pat_val, outline, shadow) in all_css {
+        let current = store.get_cell_value(source.0);
+        if current == *pat_val {
+            return Some((outline.clone(), shadow.clone()));
+        }
+    }
+    // Default: no outline
+    Some(("none".to_string(), "none".to_string()))
+}
+
+/// Apply CSS transform properties.
+fn apply_transform(
+    mut el: RawHtmlEl<web_sys::HtmlElement>,
+    value: &IrExpr,
+    program: &IrProgram,
+) -> RawHtmlEl<web_sys::HtmlElement> {
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match value {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
+        _ => return el,
+    };
+    let mut transforms = Vec::new();
+    for (name, val) in fields {
+        match name.as_str() {
+            "rotate" => {
+                if let IrExpr::Constant(IrValue::Number(n)) = val {
+                    transforms.push(format!("rotate({}deg)", n));
+                }
+            }
+            "scale" => {
+                if let IrExpr::Constant(IrValue::Number(n)) = val {
+                    transforms.push(format!("scale({})", n));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !transforms.is_empty() {
+        el = el.style("transform", &transforms.join(" "));
     }
     el
 }
@@ -2784,7 +3341,7 @@ fn resolve_color_full(expr: &IrExpr) -> Option<String> {
             Some(tag.to_lowercase())
         }
         IrExpr::TaggedObject { tag, fields } if tag == "Oklch" => {
-            let mut lightness = 0.5;
+            let mut lightness = 0.0;
             let mut chroma = 0.0;
             let mut hue = 0.0;
             let mut alpha = 1.0;

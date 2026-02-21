@@ -1,7 +1,7 @@
 # Plan: Direct Boon to Wasm Engine for Playground (No Fallback)
 
-**Status:** Complete (M0-M6 all delivered)
-**Date:** 2026-02-18 (plan), 2026-02-19 (completed)
+**Status:** M0-M7 complete, M8-M11 planned
+**Date:** 2026-02-18 (plan), 2026-02-19 (M0-M6 completed), 2026-02-21 (M7 completed, M8-M11 planned)
 **Owner:** Boon runtime/compiler team
 
 ---
@@ -527,7 +527,78 @@ Required runtime checks:
 
 ---
 
-## 15. Execution Note
+## 15. Follow-up Milestones (M7-M11)
 
-Implementation complete. All milestones M0-M6 delivered. See architecture docs at
-`docs/plans/wasm/WASM_ENGINE_ARCHITECTURE.md`.
+M0-M6 delivered the core WASM engine with TodoMVC visual parity. The following milestones
+address remaining feature gaps identified by the definitive test suite
+(`tools/scripts/test_todo_mvc_wasm.sh`). Test section references map failures to milestones.
+
+### M7 — Input Clearing & Empty Submit Guard ✓ COMPLETE
+
+Deliverables:
+
+- Clear text input after todo is added (`clear_text_input` host import wired up in codegen),
+- Reject empty/whitespace-only submissions (nested WHEN/SKIP propagation via skip_global flag).
+- Init new item memory before downstream updates (emit_init_new_item helper).
+- Visual parity improvements: inline-flex, align-items:center, gap, flex-grow for Fill.
+- Screenshot CLI fix: handle ScreenshotFile response from WS server.
+
+Exit criteria:
+
+- Test script Section 6 passes (6.2 input cleared after add, 6.5 empty submit rejected).
+- Test script exits 0 with 92 passed, 0 unexpected failures.
+
+### M8 — Per-Item Event Templates
+
+Deliverables:
+
+- Per-item hover reveal (× delete button appears on hover),
+- Per-item double-click to enter edit mode,
+- Per-item edit save (Enter/blur) and cancel (Escape),
+- Per-item checkbox isolation for dynamically-added items.
+
+Exit criteria:
+
+- Test script Sections 8, 9, 10, 14, 15, 16 pass.
+
+### M9 — Filter Visibility (display:none → DOM removal)
+
+Deliverables:
+
+- Current: WASM bridge uses `display:none` for WHILE conditional elements,
+- Needed: Remove elements from DOM (or use a method that `boon_preview`/accessibility tree
+  can distinguish from visible elements).
+
+Exit criteria:
+
+- Test script Section 3 filter hiding assertions pass via `boon_preview` or accessibility tree.
+
+### M10 — Persistence
+
+Deliverables:
+
+- `persist_write`/`persist_read` host imports wired to localStorage,
+- Serialize cell + list state, restore on page refresh.
+
+Exit criteria:
+
+- Test script Section 22 persistence tests pass.
+
+### M11 — Full API & Language Parity
+
+Deliverables:
+
+- Remaining Math/Text/List functions,
+- Map literals, modules, FLUSH error semantics,
+- Any other feature gaps between WASM and Actors engines.
+
+Exit criteria:
+
+- Feature gap between WASM and Actors engines eliminated.
+
+---
+
+## 16. Execution Note
+
+M0-M6 implementation complete. See architecture docs at
+`docs/plans/wasm/WASM_ENGINE_ARCHITECTURE.md`. M7-M11 track remaining TodoMVC feature gaps.

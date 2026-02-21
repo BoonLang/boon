@@ -212,6 +212,33 @@ enum ExecAction {
         key: String,
     },
 
+    /// Focus an input element by index in the preview panel (0-indexed)
+    FocusInput {
+        /// Input index (0-based)
+        index: u32,
+    },
+
+    /// Type text into the currently focused element
+    TypeText {
+        /// Text to type
+        text: String,
+    },
+
+    /// Press a special key on the currently focused element (Enter, Escape, Tab, Backspace, Delete)
+    PressKey {
+        /// Key name
+        key: String,
+    },
+
+    /// Hover over element containing specific text in the preview panel
+    HoverText {
+        /// Text to find and hover over
+        text: String,
+        /// Match exact text (default: contains match)
+        #[arg(long)]
+        exact: bool,
+    },
+
     /// Check connection status
     Status,
 
@@ -389,6 +416,42 @@ enum ExecAction {
     SetEngine {
         /// Engine to use: "Actors" or "DD"
         engine: String,
+    },
+
+    /// Get the currently focused element in the preview panel
+    GetFocusedElement,
+
+    /// Get checkbox state (checked/unchecked) by index
+    GetCheckboxState {
+        /// Checkbox index (0-based)
+        index: u32,
+    },
+
+    /// Get input element properties (value, placeholder, type) by index
+    GetInputProps {
+        /// Input index (0-based)
+        index: u32,
+    },
+
+    /// Verify that an input element is typeable (not disabled, hidden, or readonly)
+    VerifyInputTypeable {
+        /// Input index (0-based)
+        index: u32,
+    },
+
+    /// Assert that a button with given text has an outline style
+    AssertButtonOutline {
+        /// Button text to find
+        text: String,
+    },
+
+    /// Get the accessibility tree of the preview panel
+    AccessibilityTree,
+
+    /// Navigate to a route path (e.g., "/", "/active", "/completed")
+    Navigate {
+        /// Path to navigate to
+        path: String,
     },
 }
 
@@ -583,11 +646,18 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                     std::fs::write(&output, data)?;
                     println!("Screenshot saved to: {}", output);
                 }
+                WsResponse::ScreenshotFile { filepath } => {
+                    // WS server already saved the file — copy to requested output path
+                    if filepath != output {
+                        std::fs::copy(&filepath, &output)?;
+                    }
+                    println!("Screenshot saved to: {}", output);
+                }
                 WsResponse::Error { message } => {
                     eprintln!("Error: {}", message);
                 }
-                _ => {
-                    eprintln!("Unexpected response");
+                other => {
+                    eprintln!("Unexpected response: {:?}", other);
                 }
             }
         }
@@ -612,12 +682,19 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                         println!("Preview screenshot saved to: {}", output);
                     }
                 }
+                WsResponse::ScreenshotFile { filepath } => {
+                    // WS server already saved the file — copy to requested output path
+                    if filepath != output {
+                        std::fs::copy(&filepath, &output)?;
+                    }
+                    println!("Preview screenshot saved to: {}", output);
+                }
                 WsResponse::Error { message } => {
                     eprintln!("Error: {}", message);
                     std::process::exit(1);
                 }
-                _ => {
-                    eprintln!("Unexpected response");
+                other => {
+                    eprintln!("Unexpected response: {:?}", other);
                     std::process::exit(1);
                 }
             }
@@ -645,6 +722,26 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
 
         ExecAction::Key { key } => {
             let response = send_command_to_server(port, WsCommand::Key { key }).await?;
+            print_response(response);
+        }
+
+        ExecAction::FocusInput { index } => {
+            let response = send_command_to_server(port, WsCommand::FocusInput { index }).await?;
+            print_response(response);
+        }
+
+        ExecAction::TypeText { text } => {
+            let response = send_command_to_server(port, WsCommand::TypeText { text }).await?;
+            print_response(response);
+        }
+
+        ExecAction::PressKey { key } => {
+            let response = send_command_to_server(port, WsCommand::PressKey { key }).await?;
+            print_response(response);
+        }
+
+        ExecAction::HoverText { text, exact } => {
+            let response = send_command_to_server(port, WsCommand::HoverByText { text, exact }).await?;
             print_response(response);
         }
 
@@ -1005,6 +1102,101 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                     } else {
                         println!("Engine set to: {}", engine);
                     }
+                }
+                _ => print_response(response),
+            }
+        }
+
+        ExecAction::GetFocusedElement => {
+            let response = send_command_to_server(port, WsCommand::GetFocusedElement).await?;
+            match response {
+                WsResponse::FocusedElement { tag_name, input_type, input_index } => {
+                    let tag = tag_name.as_deref().unwrap_or("none");
+                    println!("tag={}", tag.to_uppercase());
+                    if let Some(idx) = input_index {
+                        println!("input_index={}", idx);
+                    }
+                    if let Some(itype) = input_type {
+                        println!("input_type={}", itype);
+                    }
+                }
+                _ => print_response(response),
+            }
+        }
+
+        ExecAction::GetCheckboxState { index } => {
+            let response = send_command_to_server(port, WsCommand::GetCheckboxState { index }).await?;
+            match response {
+                WsResponse::CheckboxState { found, checked } => {
+                    println!("found={} checked={}", found, checked);
+                }
+                _ => print_response(response),
+            }
+        }
+
+        ExecAction::GetInputProps { index } => {
+            let response = send_command_to_server(port, WsCommand::GetInputProperties { index }).await?;
+            match response {
+                WsResponse::InputProperties { found, placeholder, value, input_type } => {
+                    println!("found={}", found);
+                    if let Some(v) = value {
+                        println!("value={}", v);
+                    }
+                    if let Some(p) = placeholder {
+                        println!("placeholder={}", p);
+                    }
+                    if let Some(t) = input_type {
+                        println!("type={}", t);
+                    }
+                }
+                _ => print_response(response),
+            }
+        }
+
+        ExecAction::VerifyInputTypeable { index } => {
+            let response = send_command_to_server(port, WsCommand::VerifyInputTypeable { index }).await?;
+            match response {
+                WsResponse::InputTypeableStatus { typeable, reason, .. } => {
+                    if typeable {
+                        println!("typeable=true");
+                    } else {
+                        eprintln!("typeable=false reason={}", reason.unwrap_or_default());
+                        std::process::exit(1);
+                    }
+                }
+                _ => print_response(response),
+            }
+        }
+
+        ExecAction::AssertButtonOutline { text } => {
+            let response = send_command_to_server(port, WsCommand::AssertButtonHasOutline { text: text.clone() }).await?;
+            match response {
+                WsResponse::Success { .. } => {
+                    println!("outline=true");
+                }
+                WsResponse::Error { message } => {
+                    eprintln!("outline=false text={} error={}", text, message);
+                    std::process::exit(1);
+                }
+                _ => print_response(response),
+            }
+        }
+
+        ExecAction::AccessibilityTree => {
+            let response = send_command_to_server(port, WsCommand::GetAccessibilityTree).await?;
+            match response {
+                WsResponse::AccessibilityTree { tree } => {
+                    println!("{}", serde_json::to_string_pretty(&tree).unwrap());
+                }
+                _ => print_response(response),
+            }
+        }
+
+        ExecAction::Navigate { path } => {
+            let response = send_command_to_server(port, WsCommand::NavigateTo { path }).await?;
+            match response {
+                WsResponse::Success { .. } => {
+                    println!("ok");
                 }
                 _ => print_response(response),
             }

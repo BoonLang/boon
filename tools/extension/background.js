@@ -2373,20 +2373,24 @@ async function handleCommand(id, command) {
               const outline = style.outline;
               const outlineWidth = style.outlineWidth;
               const outlineStyle = style.outlineStyle;
+              const boxShadow = style.boxShadow;
 
               // Outline is visible if:
-              // 1. outlineStyle is not 'none'
-              // 2. outlineWidth is not '0px' or '0'
-              const hasOutline = outlineStyle !== 'none' &&
-                                 outlineWidth !== '0px' &&
-                                 outlineWidth !== '0';
+              // 1. outlineStyle is not 'none' and outlineWidth > 0, OR
+              // 2. box-shadow contains 'inset' (inner outline rendered as inset box-shadow)
+              const hasOutlineCSS = outlineStyle !== 'none' &&
+                                    outlineWidth !== '0px' &&
+                                    outlineWidth !== '0';
+              const hasInsetShadow = boxShadow && boxShadow !== 'none' && boxShadow.includes('inset');
+              const hasOutline = hasOutlineCSS || hasInsetShadow;
 
               return {
                 found: true,
                 hasOutline: hasOutline,
                 outline: outline,
                 outlineWidth: outlineWidth,
-                outlineStyle: outlineStyle
+                outlineStyle: outlineStyle,
+                boxShadow: boxShadow
               };
             })()
           `);
@@ -2395,7 +2399,7 @@ async function handleCommand(id, command) {
             return { type: 'error', message: result.error || 'Button not found' };
           }
           if (!result.hasOutline) {
-            return { type: 'error', message: `Button "${command.text}" does not have a visible outline. Got: outline="${result.outline}", outlineWidth="${result.outlineWidth}", outlineStyle="${result.outlineStyle}"` };
+            return { type: 'error', message: `Button "${command.text}" does not have a visible outline. Got: outline="${result.outline}", outlineWidth="${result.outlineWidth}", outlineStyle="${result.outlineStyle}", boxShadow="${result.boxShadow}"` };
           }
           return { type: 'success', data: { outline: result.outline, outlineWidth: result.outlineWidth } };
         } catch (e) {

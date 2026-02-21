@@ -37,8 +37,11 @@ const IMPORT_HOST_TEXT_BUILD_CELL: u32 = 14;
 const IMPORT_HOST_SET_ITEM_CONTEXT: u32 = 15;
 const IMPORT_HOST_CLEAR_ITEM_CONTEXT: u32 = 16;
 const IMPORT_HOST_LIST_COPY_ITEM: u32 = 17;
+const IMPORT_HOST_LIST_ITEM_MEMORY_INDEX: u32 = 18;
+const IMPORT_HOST_LIST_GET_ITEM_F64: u32 = 19;
+const IMPORT_HOST_LIST_REPLACE: u32 = 20;
 
-const NUM_IMPORTS: u32 = 18;
+const NUM_IMPORTS: u32 = 21;
 
 // Exported function indices (offset by NUM_IMPORTS)
 const FN_INIT: u32 = NUM_IMPORTS;
@@ -47,6 +50,7 @@ const FN_SET_GLOBAL: u32 = NUM_IMPORTS + 2;
 const FN_INIT_ITEM: u32 = NUM_IMPORTS + 3;
 const FN_ON_ITEM_EVENT: u32 = NUM_IMPORTS + 4;
 const FN_GET_ITEM_CELL: u32 = NUM_IMPORTS + 5;
+const FN_RERUN_RETAIN_FILTERS: u32 = NUM_IMPORTS + 6;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -94,10 +98,10 @@ struct WasmEmitter<'a> {
     /// Uses RefCell to allow mutation through &self (avoids borrow conflicts
     /// when iterating over program.nodes while calling emit_* methods).
     text_patterns: RefCell<Vec<String>>,
-    /// Local indices for the per-item retain filter loop: (new_list_id, count, i).
+    /// Local indices for the per-item retain filter loop: (new_list_id, count, i, mem_idx).
     /// Set by emit_init / emit_on_event before emitting code that may trigger
     /// the filter loop via emit_downstream_updates.
-    filter_locals: RefCell<Option<(u32, u32, u32)>>,
+    filter_locals: RefCell<Option<(u32, u32, u32, u32)>>,
 }
 
 impl<'a> WasmEmitter<'a> {
@@ -184,6 +188,9 @@ impl<'a> WasmEmitter<'a> {
         imports.import("env", "host_set_item_context", wasm_encoder::EntityType::Function(4));
         imports.import("env", "host_clear_item_context", wasm_encoder::EntityType::Function(1));
         imports.import("env", "host_list_copy_item", wasm_encoder::EntityType::Function(11));
+        imports.import("env", "host_list_item_memory_index", wasm_encoder::EntityType::Function(9));
+        imports.import("env", "host_list_get_item_f64", wasm_encoder::EntityType::Function(10));
+        imports.import("env", "host_list_replace", wasm_encoder::EntityType::Function(8));
         module.section(&imports);
 
         // 3. Function section (declares init, on_event, set_global, init_item, on_item_event, get_item_cell)
@@ -194,6 +201,7 @@ impl<'a> WasmEmitter<'a> {
         functions.function(7);  // init_item: (i32) -> ()
         functions.function(8);  // on_item_event: (i32, i32) -> ()
         functions.function(10); // get_item_cell: (i32, i32) -> f64
+        functions.function(6);  // rerun_retain_filters: () -> ()
         module.section(&functions);
 
         // 4. Memory section (1 page for text data)
@@ -239,6 +247,7 @@ impl<'a> WasmEmitter<'a> {
         exports.export("init_item", ExportKind::Func, FN_INIT_ITEM);
         exports.export("on_item_event", ExportKind::Func, FN_ON_ITEM_EVENT);
         exports.export("get_item_cell", ExportKind::Func, FN_GET_ITEM_CELL);
+        exports.export("rerun_retain_filters", ExportKind::Func, FN_RERUN_RETAIN_FILTERS);
         module.section(&exports);
 
         // 7. Code section
@@ -267,6 +276,10 @@ impl<'a> WasmEmitter<'a> {
         // get_item_cell(item_idx: i32, cell_offset: i32) -> f64 body
         let get_item_cell_func = self.emit_get_item_cell();
         code.function(&get_item_cell_func);
+
+        // rerun_retain_filters() body
+        let rerun_retain_func = self.emit_rerun_retain_filters();
+        code.function(&rerun_retain_func);
 
         module.section(&code);
 
@@ -299,7 +312,7 @@ impl<'a> WasmEmitter<'a> {
                 num_hold_loop_locals = num_hold_loop_locals.max(1 + field_cells.len() as u32);
             }
         }
-        let has_filter = self.has_per_item_retain();
+        let has_filter = self.has_per_item_filter();
         // f64 locals: HoldLoop locals + 1 filter local (new_list_id)
         let num_f64_locals = num_hold_loop_locals + if has_filter { 1 } else { 0 };
         let mut locals: Vec<(u32, ValType)> = Vec::new();
@@ -307,7 +320,7 @@ impl<'a> WasmEmitter<'a> {
             locals.push((num_f64_locals, ValType::F64));
         }
         if has_filter {
-            locals.push((2, ValType::I32)); // count, i
+            locals.push((3, ValType::I32)); // count, i, mem_idx
         }
         let mut func = Function::new(locals);
 
@@ -349,7 +362,8 @@ impl<'a> WasmEmitter<'a> {
             let local_new_list = num_hold_loop_locals;
             let local_count = num_f64_locals;
             let local_i = num_f64_locals + 1;
-            *self.filter_locals.borrow_mut() = Some((local_new_list, local_count, local_i));
+            let local_mem_idx = num_f64_locals + 2;
+            *self.filter_locals.borrow_mut() = Some((local_new_list, local_count, local_i, local_mem_idx));
         }
 
         // Phase 2: Evaluate all nodes that may trigger downstream updates.
@@ -478,7 +492,12 @@ impl<'a> WasmEmitter<'a> {
                                         // Build text on the list cell, then append from it.
                                         // Use the list cell as a temp text buffer (its text
                                         // doesn't matter since the cell stores a list ID as f64).
+                                        // Save list ID: emit_text_build bumps the global,
+                                        // which would corrupt the list ID for downstream nodes.
+                                        func.instruction(&Instruction::GlobalGet(cell.0));
                                         self.emit_text_build(&mut func, *cell, segments);
+                                        // Restore list ID.
+                                        func.instruction(&Instruction::GlobalSet(cell.0));
                                         func.instruction(&Instruction::I32Const(cell.0 as i32));
                                         func.instruction(&Instruction::I32Const(cell.0 as i32));
                                         func.instruction(&Instruction::Call(IMPORT_HOST_LIST_APPEND_TEXT));
@@ -553,20 +572,20 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
                 IrNode::ListRemove { cell, source, .. } => {
-                    // Pass list ID through, like ListAppend.
+                    // At init, nothing has been removed yet. Pass source list through.
                     func.instruction(&Instruction::GlobalGet(source.0));
                     func.instruction(&Instruction::GlobalSet(cell.0));
                     func.instruction(&Instruction::I32Const(cell.0 as i32));
                     func.instruction(&Instruction::GlobalGet(cell.0));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
-                IrNode::ListRetain { cell, source, predicate, item_field_cells, .. } => {
-                    if !item_field_cells.is_empty() {
+                IrNode::ListRetain { cell, source, predicate, item_cell, item_field_cells } => {
+                    if item_cell.is_some() {
                         // Per-item filtering: run filter loop using saved locals.
-                        if let (Some(pred), Some((l0, l1, l2))) = (predicate, *self.filter_locals.borrow()) {
-                            self.emit_retain_filter_loop(
+                        if let (Some(pred), Some((l0, l1, l2, l3))) = (predicate, *self.filter_locals.borrow()) {
+                            self.emit_filter_loop(
                                 &mut func, *cell, *source, *pred,
-                                item_field_cells, l0, l1, l2,
+                                *item_cell, item_field_cells, l0, l1, l2, l3, false,
                             );
                         }
                     } else if let Some(pred) = predicate {
@@ -661,15 +680,15 @@ impl<'a> WasmEmitter<'a> {
     fn emit_on_event(&self) -> Function {
         // on_event has param local 0 (event_id: i32).
         // Add filter loop locals if needed.
-        let has_filter = self.has_per_item_retain();
+        let has_filter = self.has_per_item_filter();
         let locals: Vec<(u32, ValType)> = if has_filter {
-            vec![(1, ValType::F64), (2, ValType::I32)] // new_list_id (f64), count + i (i32 x2)
+            vec![(1, ValType::F64), (3, ValType::I32)] // new_list_id (f64), count + i + mem_idx (i32 x3)
         } else {
             vec![]
         };
         if has_filter {
-            // on_event locals: param 0=event_id(i32), local 1=new_list(f64), local 2=count(i32), local 3=i(i32)
-            *self.filter_locals.borrow_mut() = Some((1, 2, 3));
+            // on_event locals: param 0=event_id(i32), local 1=new_list(f64), local 2=count(i32), local 3=i(i32), local 4=mem_idx(i32)
+            *self.filter_locals.borrow_mut() = Some((1, 2, 3, 4));
         }
         let mut func = Function::new(locals);
         let num_events = self.program.events.len();
@@ -782,6 +801,11 @@ impl<'a> WasmEmitter<'a> {
                             func.instruction(&Instruction::I32Const(cell.0 as i32));
                             func.instruction(&Instruction::GlobalGet(cell.0));
                             func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                            // Update text for boolean-producing bodies so downstream
+                            // TextConcat interpolation reads correct "True"/"False".
+                            if Self::expr_produces_bool(body) {
+                                self.emit_bool_text_update(func, *cell);
+                            }
                             // Propagate to downstream nodes (e.g., PipeThrough, MathSum).
                             self.emit_downstream_updates(func, *cell);
                         }
@@ -810,25 +834,42 @@ impl<'a> WasmEmitter<'a> {
                         // Namespace cell (object): find the text source and append text.
                         if let Some(text_source) = self.find_text_source_for_namespace(*item) {
                             // Re-evaluate the text source chain to get current text.
+                            // Set skip_global = 1.0 (no skip assumed) before re-evaluation.
+                            // If the chain includes a WHEN that SKIPs, skip_global will
+                            // be left at 0.0, and we won't append.
+                            let skip_global = self.program.cells.len() as u32;
+                            func.instruction(&Instruction::F64Const(1.0));
+                            func.instruction(&Instruction::GlobalSet(skip_global));
                             self.emit_reevaluate_cell(func, text_source);
+                            // Check skip flag: if 0.0, a WHEN in the chain SKIPped — don't append.
+                            func.instruction(&Instruction::GlobalGet(skip_global));
+                            func.instruction(&Instruction::F64Const(0.0));
+                            func.instruction(&Instruction::F64Ne);
+                            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                             // Append text from the text source cell.
                             func.instruction(&Instruction::I32Const(source.0 as i32));
                             func.instruction(&Instruction::I32Const(text_source.0 as i32));
                             func.instruction(&Instruction::Call(IMPORT_HOST_LIST_APPEND_TEXT));
+                            self.emit_init_new_item(func, *source);
+                            // Update downstream (ListCount, ListMap cells).
+                            self.emit_list_downstream_updates(func, *cell);
+                            func.instruction(&Instruction::End);
                         } else {
                             // Fallback: append f64 value.
                             func.instruction(&Instruction::I32Const(source.0 as i32));
                             func.instruction(&Instruction::GlobalGet(item.0));
                             func.instruction(&Instruction::Call(IMPORT_HOST_LIST_APPEND));
+                            self.emit_init_new_item(func, *source);
+                            self.emit_list_downstream_updates(func, *cell);
                         }
                     } else {
                         // Append: call host_list_append(list_cell_id, item_value)
                         func.instruction(&Instruction::I32Const(source.0 as i32));
                         func.instruction(&Instruction::GlobalGet(item.0));
                         func.instruction(&Instruction::Call(IMPORT_HOST_LIST_APPEND));
+                        self.emit_init_new_item(func, *source);
+                        self.emit_list_downstream_updates(func, *cell);
                     }
-                    // Update downstream (ListCount, ListMap cells).
-                    self.emit_list_downstream_updates(func, *cell);
                 }
                 IrNode::ListClear { cell, source, trigger } if *trigger == event_id => {
                     // Clear: call host_list_clear(list_cell_id)
@@ -837,8 +878,32 @@ impl<'a> WasmEmitter<'a> {
                     // Update downstream.
                     self.emit_list_downstream_updates(func, *cell);
                 }
-                IrNode::ListRemove { cell, trigger, .. } if *trigger == event_id => {
-                    // Remove is handled host-side; just trigger downstream updates.
+                IrNode::ListRemove { cell, source, trigger, predicate, item_cell, item_field_cells }
+                    if *trigger == event_id =>
+                {
+                    if let (Some(pred), Some((l0, l1, l2, l3))) = (predicate, *self.filter_locals.borrow()) {
+                        if !item_field_cells.is_empty() {
+                            // Global event + per-item predicate → inverted filter loop.
+                            // Creates a temp list with surviving items.
+                            self.emit_filter_loop(
+                                func, *cell, *source, *pred,
+                                *item_cell, item_field_cells, l0, l1, l2, l3, true,
+                            );
+                            // Copy filtered result back to source list (in-place modification).
+                            // This ensures all cells sharing the source list_id see the change,
+                            // matching the Actors engine's behavior where ListRemove modifies
+                            // the shared list.
+                            func.instruction(&Instruction::I32Const(source.0 as i32));
+                            func.instruction(&Instruction::I32Const(cell.0 as i32));
+                            func.instruction(&Instruction::Call(IMPORT_HOST_LIST_REPLACE));
+                            // Reset remove cell to point to same list as source.
+                            func.instruction(&Instruction::GlobalGet(source.0));
+                            func.instruction(&Instruction::GlobalSet(cell.0));
+                            func.instruction(&Instruction::I32Const(cell.0 as i32));
+                            func.instruction(&Instruction::GlobalGet(cell.0));
+                            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                        }
+                    }
                     self.emit_list_downstream_updates(func, *cell);
                 }
                 _ => {}
@@ -1018,11 +1083,30 @@ impl<'a> WasmEmitter<'a> {
 
     /// Emit a WHEN/WHILE arm body: evaluate expression, set target cell, copy text if
     /// the body reads from another cell, and propagate downstream.
+    ///
+    /// If the body's dependency chain includes a WHEN that SKIPped, the entire arm body
+    /// is skipped (no cell update, no downstream propagation). This implements nested
+    /// SKIP propagation: inner WHEN SKIP → outer arm body also skips.
     fn emit_arm_body(&self, func: &mut Function, body: &IrExpr, target: CellId) {
+        let skip_global = self.program.cells.len() as u32;
+
+        // Set skip flag = 1.0 (no skip) before re-evaluating the dependency chain.
+        // If the chain includes a WHEN that SKIPs, emit_reevaluate_cell will leave
+        // skip_global at 0.0.
+        func.instruction(&Instruction::F64Const(1.0));
+        func.instruction(&Instruction::GlobalSet(skip_global));
+
         // Before evaluating the body, re-evaluate any block-local dependency chain.
         // If the body is CellRead(cell), walk up the node graph for that cell
         // and re-evaluate TextTrim/TextIsNotEmpty/Derived(CellRead) nodes.
         self.emit_reevaluate_chain(func, body);
+
+        // Check skip flag: if 0.0, an upstream WHEN in the chain SKIPped — don't
+        // update the target cell or propagate downstream.
+        func.instruction(&Instruction::GlobalGet(skip_global));
+        func.instruction(&Instruction::F64Const(0.0));
+        func.instruction(&Instruction::F64Ne);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
         if self.is_text_body(body) {
             // Text body: build text and bump f64 BEFORE notifying host,
@@ -1051,6 +1135,12 @@ impl<'a> WasmEmitter<'a> {
         func.instruction(&Instruction::GlobalGet(target.0));
         func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
         self.emit_downstream_updates(func, target);
+
+        // Signal that this arm produced a value (for callers checking skip_global).
+        func.instruction(&Instruction::F64Const(1.0));
+        func.instruction(&Instruction::GlobalSet(skip_global));
+
+        func.instruction(&Instruction::End); // end skip check if-block
     }
 
     /// Re-evaluate the dependency chain for a CellRead expression.
@@ -1102,6 +1192,11 @@ impl<'a> WasmEmitter<'a> {
                 }
                 IrNode::When { source, arms, .. } => {
                     self.emit_reevaluate_cell(func, *source);
+                    // Set skip flag = 0.0 before re-evaluation.
+                    // emit_pattern_arms will set it to 1.0 if a non-SKIP arm executes.
+                    let skip_global = self.program.cells.len() as u32;
+                    func.instruction(&Instruction::F64Const(0.0));
+                    func.instruction(&Instruction::GlobalSet(skip_global));
                     // Re-evaluate the pattern match inline.
                     self.emit_pattern_match(func, *source, arms, cell);
                 }
@@ -1209,21 +1304,31 @@ impl<'a> WasmEmitter<'a> {
             IrExpr::CellRead(cell) => self.resolve_cell_text_statically_depth(*cell, depth + 1),
             IrExpr::Constant(IrValue::Text(t)) => Some(t.clone()),
             IrExpr::Constant(IrValue::Tag(t)) => Some(t.clone()),
+            IrExpr::Constant(IrValue::Bool(b)) => Some(if *b { "True" } else { "False" }.to_string()),
             _ => None,
         }
     }
 
-    /// For a namespace cell (object), find the first text-bearing field cell
-    /// and resolve its text statically.
+    /// For a namespace cell (object), find the primary text-bearing field cell
+    /// and resolve its text statically. Prefers real text over Bool values
+    /// because cell_field_cells is a HashMap with non-deterministic iteration
+    /// order — without preference, Bool fields like `editing: False` can be
+    /// returned instead of the actual title field.
     fn resolve_namespace_text_statically(&self, cell: CellId) -> Option<String> {
         if let Some(fields) = self.program.cell_field_cells.get(&cell) {
+            let mut bool_fallback: Option<String> = None;
             for (_name, field_cell) in fields.iter() {
                 if let Some(text) = self.resolve_cell_text_statically(*field_cell) {
                     if !text.is_empty() {
-                        return Some(text);
+                        if text != "True" && text != "False" {
+                            return Some(text);
+                        } else if bool_fallback.is_none() {
+                            bool_fallback = Some(text);
+                        }
                     }
                 }
             }
+            return bool_fallback;
         }
         None
     }
@@ -1236,27 +1341,73 @@ impl<'a> WasmEmitter<'a> {
     /// For a namespace cell (object), find the runtime text source cell.
     /// Follows field cells to find a HOLD with CellRead init (returns the source)
     /// or a Derived with text (returns the field cell itself).
+    /// Prefers sources that resolve to real text over Bool values (same HashMap
+    /// iteration order issue as resolve_namespace_text_statically).
     fn find_text_source_for_namespace(&self, cell: CellId) -> Option<CellId> {
         let fields = self.program.cell_field_cells.get(&cell)?;
+        let mut fallback: Option<CellId> = None;
         for (_name, field_cell) in fields.iter() {
             if let Some(node) = self.find_node_for_cell(*field_cell) {
-                match node {
+                let candidate = match node {
                     IrNode::Hold { init, .. } => {
                         if let IrExpr::CellRead(source) = init {
-                            return Some(*source);
-                        }
+                            Some(*source)
+                        } else { None }
                     }
                     IrNode::Derived { expr: IrExpr::CellRead(source), .. } => {
-                        return Some(*source);
+                        Some(*source)
                     }
                     IrNode::Derived { expr: IrExpr::TextConcat(_), .. } => {
-                        return Some(*field_cell);
+                        return Some(*field_cell); // TextConcat is always real text
                     }
-                    _ => {}
+                    _ => None,
+                };
+                if let Some(source) = candidate {
+                    // Check if source resolves to non-Bool text.
+                    if let Some(text) = self.resolve_cell_text_statically(source) {
+                        if text != "True" && text != "False" {
+                            return Some(source);
+                        }
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(source);
+                    }
                 }
             }
         }
-        None
+        fallback
+    }
+
+    /// After a ListRemove filter, propagate the new filtered list ID from
+    /// `filtered_cell` back up through the chain to the root ListConstruct.
+    /// This ensures subsequent ListAppend operations append to the filtered list.
+    fn emit_list_chain_propagate(&self, func: &mut Function, source: CellId, filtered_cell: CellId) {
+        // Walk up the chain from source to root, collecting cells to update.
+        let mut cells_to_update = Vec::new();
+        let mut current = source;
+        loop {
+            cells_to_update.push(current);
+            // Find the node that defines `current` and get its source.
+            let parent = self.program.nodes.iter().find_map(|node| match node {
+                IrNode::ListAppend { cell, source, .. } if *cell == current => Some(*source),
+                IrNode::ListRemove { cell, source, .. } if *cell == current => Some(*source),
+                IrNode::ListClear { cell, source, .. } if *cell == current => Some(*source),
+                IrNode::ListRetain { cell, source, .. } if *cell == current => Some(*source),
+                _ => None,
+            });
+            match parent {
+                Some(p) => current = p,
+                None => break, // Reached ListConstruct or root
+            }
+        }
+        // Set each upstream cell's global and host value to the filtered list ID.
+        for cell in cells_to_update {
+            func.instruction(&Instruction::GlobalGet(filtered_cell.0));
+            func.instruction(&Instruction::GlobalSet(cell.0));
+            func.instruction(&Instruction::I32Const(cell.0 as i32));
+            func.instruction(&Instruction::GlobalGet(cell.0));
+            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+        }
     }
 
     /// After a list mutation (append/clear), update downstream ListCount and ListMap cells.
@@ -1309,18 +1460,22 @@ impl<'a> WasmEmitter<'a> {
                 IrNode::ListClear { cell, source, .. } if *source == list_cell => {
                     self.emit_list_downstream_updates(func, *cell);
                 }
-                IrNode::ListRemove { cell, source, .. } if *source == list_cell => {
-                    self.emit_list_downstream_updates(func, *cell);
-                }
-                IrNode::ListRetain { cell, source, predicate, item_field_cells, .. }
+                IrNode::ListRemove { cell, source, .. }
                     if *source == list_cell =>
                 {
-                    if let (Some(pred), Some((l0, l1, l2))) = (predicate, *self.filter_locals.borrow()) {
-                        if !item_field_cells.is_empty() {
+                    // ListRemove shares the source list_id (in-place modification).
+                    // Just propagate to downstream nodes.
+                    self.emit_list_downstream_updates(func, *cell);
+                }
+                IrNode::ListRetain { cell, source, predicate, item_cell, item_field_cells }
+                    if *source == list_cell =>
+                {
+                    if let (Some(pred), Some((l0, l1, l2, l3))) = (predicate, *self.filter_locals.borrow()) {
+                        if item_cell.is_some() {
                             // Per-item filtering: re-run filter loop when source list changes.
-                            self.emit_retain_filter_loop(
+                            self.emit_filter_loop(
                                 func, *cell, *source, *pred,
-                                item_field_cells, l0, l1, l2,
+                                *item_cell, item_field_cells, l0, l1, l2, l3, false,
                             );
                         }
                     }
@@ -1378,8 +1533,15 @@ impl<'a> WasmEmitter<'a> {
                     if !matches!(expr, IrExpr::CellRead(_))
                         && Self::expr_references_cell(expr, updated_cell) =>
                 {
-                    self.emit_expr(func, expr);
-                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    if let IrExpr::TextConcat(segments) = expr {
+                        // TextConcat: rebuild text on the host side segment by segment.
+                        // emit_text_build calls host_text_build_start/literal/cell and
+                        // bumps the f64 global so signals fire.
+                        self.emit_text_build(func, *cell, segments);
+                    } else {
+                        self.emit_expr(func, expr);
+                        func.instruction(&Instruction::GlobalSet(cell.0));
+                    }
                     func.instruction(&Instruction::I32Const(cell.0 as i32));
                     func.instruction(&Instruction::GlobalGet(cell.0));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
@@ -1440,6 +1602,7 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::I32Const(item.0 as i32));
                     func.instruction(&Instruction::Call(IMPORT_HOST_LIST_APPEND_TEXT));
+                    self.emit_init_new_item(func, *source);
                     self.emit_list_downstream_updates(func, *cell);
                 }
                 // ListAppend triggered by watch_cell change (reactive dependency).
@@ -1458,21 +1621,22 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::I32Const(watch.0 as i32));
                     func.instruction(&Instruction::Call(IMPORT_HOST_LIST_APPEND_TEXT));
+                    self.emit_init_new_item(func, *source);
                     self.emit_list_downstream_updates(func, *cell);
                     func.instruction(&Instruction::End);
                 }
                 // ListRetain: when predicate cell changes, re-evaluate retain.
-                IrNode::ListRetain { cell, source, predicate: Some(pred), item_field_cells, .. }
+                IrNode::ListRetain { cell, source, predicate: Some(pred), item_cell, item_field_cells }
                     if *pred == updated_cell =>
                 {
-                    if let (true, Some((l0, l1, l2))) = (!item_field_cells.is_empty(), *self.filter_locals.borrow()) {
+                    if let (true, Some((l0, l1, l2, l3))) = (item_cell.is_some(), *self.filter_locals.borrow()) {
                         // Per-item filtering: run filter loop.
-                        self.emit_retain_filter_loop(
+                        self.emit_filter_loop(
                             func, *cell, *source, *pred,
-                            item_field_cells, l0, l1, l2,
+                            *item_cell, item_field_cells, l0, l1, l2, l3, false,
                         );
                         self.emit_list_downstream_updates(func, *cell);
-                    } else if item_field_cells.is_empty() {
+                    } else if item_cell.is_none() {
                         // Binary predicate: truthy → source, falsy → empty.
                         func.instruction(&Instruction::GlobalGet(pred.0));
                         func.instruction(&Instruction::F64Const(0.0));
@@ -1490,6 +1654,9 @@ impl<'a> WasmEmitter<'a> {
                         self.emit_list_downstream_updates(func, *cell);
                     }
                 }
+                // ListRemove: predicate changes don't trigger re-filtering.
+                // Removal only happens when the trigger event fires.
+                IrNode::ListRemove { .. } => {}
                 _ => {}
             }
         }
@@ -1518,6 +1685,37 @@ impl<'a> WasmEmitter<'a> {
             }
             _ => false,
         }
+    }
+
+    /// Check if an expression produces a boolean value (True/False).
+    fn expr_produces_bool(expr: &IrExpr) -> bool {
+        match expr {
+            IrExpr::Not(_) => true,
+            IrExpr::Compare { .. } => true,
+            IrExpr::Constant(IrValue::Bool(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// Emit conditional text update for a boolean cell: sets "True" or "False"
+    /// based on the cell's current f64 value (0.0 = False, non-zero = True).
+    fn emit_bool_text_update(&self, func: &mut Function, cell: CellId) {
+        let true_idx = self.register_text_pattern("True");
+        let false_idx = self.register_text_pattern("False");
+        func.instruction(&Instruction::GlobalGet(cell.0));
+        func.instruction(&Instruction::F64Const(0.0));
+        func.instruction(&Instruction::F64Ne);
+        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        // True case.
+        func.instruction(&Instruction::I32Const(cell.0 as i32));
+        func.instruction(&Instruction::I32Const(true_idx as i32));
+        func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
+        func.instruction(&Instruction::Else);
+        // False case.
+        func.instruction(&Instruction::I32Const(cell.0 as i32));
+        func.instruction(&Instruction::I32Const(false_idx as i32));
+        func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
+        func.instruction(&Instruction::End);
     }
 
     /// Emit instructions that evaluate an IrExpr and leave the result on the WASM stack as f64.
@@ -1605,7 +1803,11 @@ impl<'a> WasmEmitter<'a> {
                 func.instruction(&Instruction::F64Const(0.0));
             }
             IrExpr::ObjectConstruct(_) => {
-                func.instruction(&Instruction::F64Const(0.0));
+                // Objects are "something" (truthy) — they exist, even if empty.
+                // This is critical for filter predicates where `True => []` must
+                // produce a truthy value distinguishable from SKIP (which leaves
+                // the predicate at the reset value 0.0).
+                func.instruction(&Instruction::F64Const(1.0));
             }
             IrExpr::ListConstruct(items) => {
                 if items.is_empty() {
@@ -1709,14 +1911,31 @@ impl<'a> WasmEmitter<'a> {
         })
     }
 
+    /// After appending an item, call init_item to initialize the new item's
+    /// WASM memory slot before downstream updates (retain filters) run.
+    /// Without this, retain filters read stale memory values from previously
+    /// cleared items, causing incorrect counts.
+    fn emit_init_new_item(&self, func: &mut Function, source: CellId) {
+        if self.find_list_map_info().is_some() {
+            // Get new item's index: count - 1 (item was just appended).
+            func.instruction(&Instruction::I32Const(source.0 as i32));
+            func.instruction(&Instruction::Call(IMPORT_HOST_LIST_COUNT));
+            func.instruction(&Instruction::F64Const(1.0));
+            func.instruction(&Instruction::F64Sub);
+            func.instruction(&Instruction::I32TruncF64S);
+            func.instruction(&Instruction::Call(FN_INIT_ITEM));
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Per-item retain (filter loop)
     // -----------------------------------------------------------------------
 
-    /// Check if any ListRetain has per-item filtering.
-    fn has_per_item_retain(&self) -> bool {
+    /// Check if any ListRetain or ListRemove has per-item filtering.
+    fn has_per_item_filter(&self) -> bool {
         self.program.nodes.iter().any(|node| {
-            matches!(node, IrNode::ListRetain { item_field_cells, .. } if !item_field_cells.is_empty())
+            matches!(node, IrNode::ListRetain { item_cell: Some(_), .. })
+            || matches!(node, IrNode::ListRemove { item_field_cells, .. } if !item_field_cells.is_empty())
         })
     }
 
@@ -1733,19 +1952,27 @@ impl<'a> WasmEmitter<'a> {
     /// Emit a WASM filter loop that iterates source list items, evaluates the
     /// predicate per-item, and builds a filtered list via host_list_copy_item.
     ///
+    /// When `invert` is false (retain), items where predicate is truthy are kept.
+    /// When `invert` is true (remove), items where predicate is truthy are removed
+    /// (i.e., items where predicate is 0.0 are kept). The predicate is reset to 0.0
+    /// before each iteration so SKIP (which doesn't update the cell) defaults to "keep".
+    ///
     /// `local_new_list`: f64 local for new list ID
     /// `local_count`: i32 local for item count
     /// `local_i`: i32 local for loop counter
-    fn emit_retain_filter_loop(
+    fn emit_filter_loop(
         &self,
         func: &mut Function,
-        retain_cell: CellId,
+        output_cell: CellId,
         source_cell: CellId,
         predicate: CellId,
+        item_cell: Option<CellId>,
         item_field_cells: &[(String, CellId)],
         local_new_list: u32,
         local_count: u32,
         local_i: u32,
+        local_mem_idx: u32,
+        invert: bool,
     ) {
         let (cell_start, cell_end, _, _) = match self.find_list_map_info() {
             Some(info) => info,
@@ -1781,7 +2008,27 @@ impl<'a> WasmEmitter<'a> {
         func.instruction(&Instruction::I32GeS);
         func.instruction(&Instruction::BrIf(1)); // br $break
 
+        // For inverted filter (remove): reset predicate to 0.0 before evaluating.
+        // SKIP doesn't update the cell, so without reset the previous iteration's
+        // truthy value would bleed into the next iteration.
+        if invert {
+            func.instruction(&Instruction::F64Const(0.0));
+            func.instruction(&Instruction::GlobalSet(predicate.0));
+        }
+
         // Read per-item field values from WASM linear memory into field sub-cell globals.
+        // Use host_list_item_memory_index to get the correct WASM memory slot for each
+        // list position. After List/remove, the source list becomes index-based — position 0
+        // may map to original memory index 1 if item 0 was removed. Without this lookup,
+        // the filter loop reads stale data from the removed item's memory slot.
+        //
+        // For non-index-based lists (initial state, after append), memory_index == position,
+        // so the lookup is a no-op identity mapping.
+        func.instruction(&Instruction::I32Const(source_cell.0 as i32));
+        func.instruction(&Instruction::LocalGet(local_i));
+        func.instruction(&Instruction::Call(IMPORT_HOST_LIST_ITEM_MEMORY_INDEX));
+        func.instruction(&Instruction::LocalSet(local_mem_idx));
+
         for (field_name, sub_cell) in item_field_cells {
             // Find the template field cell for this field name.
             let template_field_cell = self.program.cell_field_cells
@@ -1790,8 +2037,8 @@ impl<'a> WasmEmitter<'a> {
                 .copied();
             if let Some(tfc) = template_field_cell {
                 let field_offset = (tfc.0 - cell_start) * 8;
-                // addr = i * stride + field_offset
-                func.instruction(&Instruction::LocalGet(local_i));
+                // addr = mem_idx * stride + field_offset
+                func.instruction(&Instruction::LocalGet(local_mem_idx));
                 func.instruction(&Instruction::I32Const(stride as i32));
                 func.instruction(&Instruction::I32Mul);
                 func.instruction(&Instruction::I32Const(field_offset as i32));
@@ -1806,9 +2053,27 @@ impl<'a> WasmEmitter<'a> {
             }
         }
 
+        // For numeric list items (no field cells), load the item value from the host.
+        // The item cell's global needs the actual item value for predicates like `n == 2`.
+        if item_field_cells.is_empty() {
+            if let Some(ic) = item_cell {
+                // host_list_get_item_f64(source_cell, i) -> f64
+                func.instruction(&Instruction::I32Const(source_cell.0 as i32));
+                func.instruction(&Instruction::LocalGet(local_i));
+                func.instruction(&Instruction::Call(IMPORT_HOST_LIST_GET_ITEM_F64));
+                func.instruction(&Instruction::GlobalSet(ic.0));
+            }
+        }
+
         // Re-evaluate any intermediate Derived cells that reference field sub-cells.
         // (e.g., Bool/not(item.completed) → Not(CellRead(completed_sub_cell)))
-        let field_cell_ids: Vec<CellId> = item_field_cells.iter().map(|(_, c)| *c).collect();
+        let mut field_cell_ids: Vec<CellId> = item_field_cells.iter().map(|(_, c)| *c).collect();
+        // Also include item_cell when it has no field cells (numeric items).
+        if item_field_cells.is_empty() {
+            if let Some(ic) = item_cell {
+                field_cell_ids.push(ic);
+            }
+        }
         for node in &self.program.nodes {
             if let IrNode::Derived { cell, expr } = node {
                 if field_cell_ids.iter().any(|fc| Self::expr_references_cell(expr, *fc)) {
@@ -1823,10 +2088,10 @@ impl<'a> WasmEmitter<'a> {
         let pred_node = self.find_node_for_cell(predicate);
         match pred_node {
             Some(IrNode::While { source, arms, .. }) => {
-                self.emit_pattern_arms_no_notify(func, *source, arms, predicate, 0);
+                self.emit_pattern_arms_no_notify(func, *source, arms, predicate, 0, invert);
             }
             Some(IrNode::When { source, arms, .. }) => {
-                self.emit_pattern_arms_no_notify(func, *source, arms, predicate, 0);
+                self.emit_pattern_arms_no_notify(func, *source, arms, predicate, 0, invert);
             }
             _ => {
                 // Predicate is directly a field sub-cell or simple derived —
@@ -1834,10 +2099,15 @@ impl<'a> WasmEmitter<'a> {
             }
         }
 
-        // If predicate is truthy, copy item to new list.
+        // Retain: copy items where predicate is truthy (non-zero).
+        // Remove (invert): copy items where predicate is falsy (zero).
         func.instruction(&Instruction::GlobalGet(predicate.0));
         func.instruction(&Instruction::F64Const(0.0));
-        func.instruction(&Instruction::F64Ne);
+        if invert {
+            func.instruction(&Instruction::F64Eq);
+        } else {
+            func.instruction(&Instruction::F64Ne);
+        }
         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         // host_list_copy_item(new_list_id, source_cell_id, item_idx)
         func.instruction(&Instruction::LocalGet(local_new_list));
@@ -1856,16 +2126,23 @@ impl<'a> WasmEmitter<'a> {
         func.instruction(&Instruction::End); // end loop
         func.instruction(&Instruction::End); // end block
 
-        // 4. Set retain output cell to new list
+        // 4. Set output cell to new list
         func.instruction(&Instruction::LocalGet(local_new_list));
-        func.instruction(&Instruction::GlobalSet(retain_cell.0));
-        func.instruction(&Instruction::I32Const(retain_cell.0 as i32));
-        func.instruction(&Instruction::GlobalGet(retain_cell.0));
+        func.instruction(&Instruction::GlobalSet(output_cell.0));
+        func.instruction(&Instruction::I32Const(output_cell.0 as i32));
+        func.instruction(&Instruction::GlobalGet(output_cell.0));
         func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
     }
 
     /// Like `emit_pattern_arms` but without host notification or downstream propagation.
-    /// Used inside filter loops where we only need the f64 predicate value.
+    /// Used inside filter loops where we only need the predicate value.
+    ///
+    /// When `force_truthy` is false (retain mode): stores the body's actual f64 value as the
+    /// predicate, so the caller can distinguish truthy from falsy results.
+    ///
+    /// When `force_truthy` is true (remove mode): discards the body value and stores 1.0
+    /// when a non-SKIP arm matches. This is necessary because some body expressions
+    /// (e.g., `[]` = empty object) produce 0.0 which would be indistinguishable from "no match".
     fn emit_pattern_arms_no_notify(
         &self,
         func: &mut Function,
@@ -1873,6 +2150,7 @@ impl<'a> WasmEmitter<'a> {
         arms: &[(IrPattern, IrExpr)],
         target: CellId,
         idx: usize,
+        force_truthy: bool,
     ) {
         if idx >= arms.len() {
             return;
@@ -1894,11 +2172,15 @@ impl<'a> WasmEmitter<'a> {
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 if !is_skip {
                     self.emit_expr(func, body);
+                    if force_truthy {
+                        func.instruction(&Instruction::Drop);
+                        func.instruction(&Instruction::F64Const(1.0));
+                    }
                     func.instruction(&Instruction::GlobalSet(target.0));
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms_no_notify(func, source, arms, target, idx + 1);
+                    self.emit_pattern_arms_no_notify(func, source, arms, target, idx + 1, force_truthy);
                 }
                 func.instruction(&Instruction::End);
             }
@@ -1909,11 +2191,15 @@ impl<'a> WasmEmitter<'a> {
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 if !is_skip {
                     self.emit_expr(func, body);
+                    if force_truthy {
+                        func.instruction(&Instruction::Drop);
+                        func.instruction(&Instruction::F64Const(1.0));
+                    }
                     func.instruction(&Instruction::GlobalSet(target.0));
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms_no_notify(func, source, arms, target, idx + 1);
+                    self.emit_pattern_arms_no_notify(func, source, arms, target, idx + 1, force_truthy);
                 }
                 func.instruction(&Instruction::End);
             }
@@ -1926,17 +2212,25 @@ impl<'a> WasmEmitter<'a> {
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 if !is_skip {
                     self.emit_expr(func, body);
+                    if force_truthy {
+                        func.instruction(&Instruction::Drop);
+                        func.instruction(&Instruction::F64Const(1.0));
+                    }
                     func.instruction(&Instruction::GlobalSet(target.0));
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms_no_notify(func, source, arms, target, idx + 1);
+                    self.emit_pattern_arms_no_notify(func, source, arms, target, idx + 1, force_truthy);
                 }
                 func.instruction(&Instruction::End);
             }
             IrPattern::Wildcard | IrPattern::Binding(_) => {
                 if !is_skip {
                     self.emit_expr(func, body);
+                    if force_truthy {
+                        func.instruction(&Instruction::Drop);
+                        func.instruction(&Instruction::F64Const(1.0));
+                    }
                     func.instruction(&Instruction::GlobalSet(target.0));
                 }
             }
@@ -1984,6 +2278,13 @@ impl<'a> WasmEmitter<'a> {
                         func.instruction(&Instruction::I32Const(cell.0 as i32));
                         func.instruction(&Instruction::I32Const(src.0 as i32));
                         func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                    } else if let Some(text) = self.resolve_expr_text_statically(init) {
+                        if !text.is_empty() {
+                            let pattern_idx = self.register_text_pattern(&text);
+                            func.instruction(&Instruction::I32Const(cell.0 as i32));
+                            func.instruction(&Instruction::I32Const(pattern_idx as i32));
+                            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
+                        }
                     }
                 }
                 IrNode::Derived { cell, expr }
@@ -1994,6 +2295,31 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::I32Const(cell.0 as i32));
                     self.emit_cell_get(&mut func, *cell, Some(&mem_ctx));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    // Set text: CellRead copies from source, TextConcat builds
+                    // dynamically, static expressions use pattern.
+                    if let IrExpr::CellRead(src) = expr {
+                        func.instruction(&Instruction::I32Const(cell.0 as i32));
+                        func.instruction(&Instruction::I32Const(src.0 as i32));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                    } else if let IrExpr::TextConcat(segments) = expr {
+                        if segments.iter().any(|s| matches!(s, TextSegment::Expr(IrExpr::CellRead(_)))) {
+                            self.emit_text_build_ctx(&mut func, *cell, segments, Some(&mem_ctx));
+                        } else if let Some(text) = self.resolve_expr_text_statically(expr) {
+                            if !text.is_empty() {
+                                let pattern_idx = self.register_text_pattern(&text);
+                                func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                func.instruction(&Instruction::I32Const(pattern_idx as i32));
+                                func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
+                            }
+                        }
+                    } else if let Some(text) = self.resolve_expr_text_statically(expr) {
+                        if !text.is_empty() {
+                            let pattern_idx = self.register_text_pattern(&text);
+                            func.instruction(&Instruction::I32Const(cell.0 as i32));
+                            func.instruction(&Instruction::I32Const(pattern_idx as i32));
+                            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
+                        }
+                    }
                 }
                 IrNode::When { cell, source, arms }
                     if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
@@ -2018,13 +2344,32 @@ impl<'a> WasmEmitter<'a> {
     /// Emit `on_item_event(item_idx: i32, event_id: i32)`.
     /// Handles per-item events using br_table dispatch.
     fn emit_on_item_event(&self) -> Function {
+        // Check if any ListRemove uses per-item events (Case 1: predicate is None,
+        // trigger is template-scoped).
+        let has_per_item_remove = self.program.nodes.iter().any(|node| {
+            matches!(node, IrNode::ListRemove { predicate: None, .. })
+        });
+
         // local 0 = item_idx, local 1 = event_id
-        let mut func = Function::new([]);
+        // If per-item remove exists, add locals for the remove loop + downstream filter:
+        // local 2 = new_list_id (f64), local 3 = count (i32), local 4 = i (i32), local 5 = mem_idx (i32)
+        let locals: Vec<(u32, ValType)> = if has_per_item_remove {
+            vec![(1, ValType::F64), (3, ValType::I32)]
+        } else {
+            vec![]
+        };
+        let mut func = Function::new(locals);
+        if has_per_item_remove {
+            *self.filter_locals.borrow_mut() = Some((2, 3, 4, 5));
+        }
         let mem_ctx = self.build_memory_context(0); // local 0 = item_idx
 
         let mem_ctx = match mem_ctx {
             Some(ctx) => ctx,
             None => {
+                if has_per_item_remove {
+                    *self.filter_locals.borrow_mut() = None;
+                }
                 func.instruction(&Instruction::End);
                 return func;
             }
@@ -2064,11 +2409,22 @@ impl<'a> WasmEmitter<'a> {
                         }
                     }
                 }
+                // Per-item ListRemove: trigger is template-scoped, cell is global.
+                IrNode::ListRemove { trigger, predicate: None, .. }
+                    if trigger.0 >= event_start && trigger.0 < event_end =>
+                {
+                    if !relevant_events.contains(&trigger.0) {
+                        relevant_events.push(trigger.0);
+                    }
+                }
                 _ => {}
             }
         }
 
         if relevant_events.is_empty() {
+            if has_per_item_remove {
+                *self.filter_locals.borrow_mut() = None;
+            }
             func.instruction(&Instruction::End);
             return func;
         }
@@ -2102,6 +2458,9 @@ impl<'a> WasmEmitter<'a> {
 
         // Clear item context.
         func.instruction(&Instruction::Call(IMPORT_HOST_CLEAR_ITEM_CONTEXT));
+        if has_per_item_remove {
+            *self.filter_locals.borrow_mut() = None;
+        }
         func.instruction(&Instruction::End);
         func
     }
@@ -2135,6 +2494,10 @@ impl<'a> WasmEmitter<'a> {
                             func.instruction(&Instruction::I32Const(cell.0 as i32));
                             self.emit_cell_get(func, *cell, Some(mem_ctx));
                             func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                            // Update text for boolean-producing bodies.
+                            if Self::expr_produces_bool(body) {
+                                self.emit_bool_text_update(func, *cell);
+                            }
                             self.emit_item_downstream_updates(func, *cell, mem_ctx);
                         }
                     }
@@ -2155,6 +2518,69 @@ impl<'a> WasmEmitter<'a> {
                             func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                             self.emit_item_downstream_updates(func, *target, mem_ctx);
                         }
+                    }
+                }
+                // Per-item ListRemove (Case 1): trigger is template-scoped event.
+                // Build a new list excluding the item at item_idx (local 0).
+                IrNode::ListRemove { cell, source, trigger, predicate: None, .. }
+                    if *trigger == event_id =>
+                {
+                    if let Some((local_new_list, local_count, local_i, _local_mem_idx)) = *self.filter_locals.borrow() {
+                        // 1. Create new empty list
+                        func.instruction(&Instruction::Call(IMPORT_HOST_LIST_CREATE));
+                        func.instruction(&Instruction::LocalSet(local_new_list));
+
+                        // 2. Get item count from source list
+                        func.instruction(&Instruction::I32Const(source.0 as i32));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_LIST_COUNT));
+                        func.instruction(&Instruction::I32TruncF64S);
+                        func.instruction(&Instruction::LocalSet(local_count));
+
+                        // 3. Loop: i = 0
+                        func.instruction(&Instruction::I32Const(0));
+                        func.instruction(&Instruction::LocalSet(local_i));
+
+                        // block $break { loop $continue { ... } }
+                        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                        func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+                        // if (i >= count) break
+                        func.instruction(&Instruction::LocalGet(local_i));
+                        func.instruction(&Instruction::LocalGet(local_count));
+                        func.instruction(&Instruction::I32GeS);
+                        func.instruction(&Instruction::BrIf(1));
+
+                        // if (i != item_idx) → copy item
+                        func.instruction(&Instruction::LocalGet(local_i));
+                        func.instruction(&Instruction::LocalGet(0)); // item_idx
+                        func.instruction(&Instruction::I32Ne);
+                        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                        // host_list_copy_item(new_list_id, source_cell_id, i)
+                        func.instruction(&Instruction::LocalGet(local_new_list));
+                        func.instruction(&Instruction::I32Const(source.0 as i32));
+                        func.instruction(&Instruction::LocalGet(local_i));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_LIST_COPY_ITEM));
+                        func.instruction(&Instruction::End); // end if
+
+                        // i++
+                        func.instruction(&Instruction::LocalGet(local_i));
+                        func.instruction(&Instruction::I32Const(1));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::LocalSet(local_i));
+                        func.instruction(&Instruction::Br(0));
+
+                        func.instruction(&Instruction::End); // end loop
+                        func.instruction(&Instruction::End); // end block
+
+                        // 4. Set ListRemove cell to new list
+                        func.instruction(&Instruction::LocalGet(local_new_list));
+                        func.instruction(&Instruction::GlobalSet(cell.0));
+                        func.instruction(&Instruction::I32Const(cell.0 as i32));
+                        func.instruction(&Instruction::GlobalGet(cell.0));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+
+                        // 5. Emit downstream updates (ListCount, ListMap, ListRetain, etc.)
+                        self.emit_list_downstream_updates(func, *cell);
                     }
                 }
                 _ => {}
@@ -2392,8 +2818,12 @@ impl<'a> WasmEmitter<'a> {
                         && Self::expr_references_cell(expr, updated_cell)
                         && cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
                 {
-                    self.emit_expr_ctx(func, expr, Some(mem_ctx));
-                    self.emit_cell_set(func, *cell, Some(mem_ctx));
+                    if let IrExpr::TextConcat(segments) = expr {
+                        self.emit_text_build_ctx(func, *cell, segments, Some(mem_ctx));
+                    } else {
+                        self.emit_expr_ctx(func, expr, Some(mem_ctx));
+                        self.emit_cell_set(func, *cell, Some(mem_ctx));
+                    }
                     func.instruction(&Instruction::I32Const(cell.0 as i32));
                     self.emit_cell_get(func, *cell, Some(mem_ctx));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
@@ -2468,6 +2898,43 @@ impl<'a> WasmEmitter<'a> {
             }
             None => {
                 func.instruction(&Instruction::F64Const(0.0));
+            }
+        }
+
+        func.instruction(&Instruction::End);
+        func
+    }
+
+    /// Emit `rerun_retain_filters()` — re-evaluates all per-item retain filter loops.
+    /// Called from the host after cross-scope events update per-item cells,
+    /// so global retain filters see the new per-item values.
+    fn emit_rerun_retain_filters(&self) -> Function {
+        // Check if we have any per-item retains.
+        if !self.has_per_item_filter() {
+            let mut func = Function::new([]);
+            func.instruction(&Instruction::End);
+            return func;
+        }
+
+        // Locals: 0=f64 (loop var), 1=i32 (counter), 2=i32 (count), 3=i32 (mem_idx)
+        let mut func = Function::new([(1, ValType::F64), (3, ValType::I32)]);
+
+        // Set filter_locals for the filter loop helper.
+        *self.filter_locals.borrow_mut() = Some((0, 1, 2, 3));
+
+        for node in &self.program.nodes {
+            match node {
+                IrNode::ListRetain { cell, source, predicate: Some(pred), item_cell, item_field_cells }
+                    if item_cell.is_some() =>
+                {
+                    self.emit_filter_loop(
+                        &mut func, *cell, *source, *pred,
+                        *item_cell, item_field_cells, 0, 1, 2, 3, false,
+                    );
+                    self.emit_list_downstream_updates(&mut func, *cell);
+                }
+                IrNode::ListRemove { .. } => {}
+                _ => {}
             }
         }
 
