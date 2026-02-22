@@ -386,7 +386,8 @@ fn build_element_node(
 
 /// Attach common event handlers (hovered, blur, focus, click, double_click) to an element.
 /// If no common events are needed, returns the element unchanged.
-/// For hover, wraps the element in a container div to capture mouse events.
+/// Events are attached directly to the element (no wrapper div) to avoid
+/// Chrome's buggy mouse events on `display: contents` elements.
 fn attach_common_events(
     el: RawElOrText,
     instance: &Rc<WasmInstance>,
@@ -405,19 +406,20 @@ fn attach_common_events(
         return el;
     }
 
-    // Wrap in a div to attach event handlers.
-    let mut wrapper = RawHtmlEl::new("div")
-        .style("display", "contents")
-        .child(el);
+    // Extract the HTML element for direct event attachment (text nodes can't have events).
+    let mut html_el = match el {
+        RawElOrText::RawHtmlEl(html_el) => html_el,
+        other => return other,
+    };
 
     // Hover: mouseenter → set cell to True (1.0), mouseleave → False (0.0).
     if let Some(cell) = hovered_cell {
         let inst = instance.clone();
-        wrapper = wrapper.event_handler(move |_: events::MouseEnter| {
+        html_el = html_el.event_handler(move |_: events::MouseEnter| {
             inst.set_cell_value(cell.0, 1.0);
         });
         let inst = instance.clone();
-        wrapper = wrapper.event_handler(move |_: events::MouseLeave| {
+        html_el = html_el.event_handler(move |_: events::MouseLeave| {
             inst.set_cell_value(cell.0, 0.0);
         });
     }
@@ -425,7 +427,7 @@ fn attach_common_events(
     // Blur event.
     if let Some(event_id) = blur_event {
         let inst = instance.clone();
-        wrapper = wrapper.event_handler(move |_: events::Blur| {
+        html_el = html_el.event_handler(move |_: events::Blur| {
             let _ = inst.fire_event(event_id.0);
         });
     }
@@ -433,7 +435,7 @@ fn attach_common_events(
     // Focus event.
     if let Some(event_id) = focus_event {
         let inst = instance.clone();
-        wrapper = wrapper.event_handler(move |_: events::Focus| {
+        html_el = html_el.event_handler(move |_: events::Focus| {
             let _ = inst.fire_event(event_id.0);
         });
     }
@@ -441,7 +443,7 @@ fn attach_common_events(
     // Click event.
     if let Some(event_id) = click_event {
         let inst = instance.clone();
-        wrapper = wrapper.event_handler(move |_: events::Click| {
+        html_el = html_el.event_handler(move |_: events::Click| {
             let _ = inst.fire_event(event_id.0);
         });
     }
@@ -449,12 +451,12 @@ fn attach_common_events(
     // Double-click event.
     if let Some(event_id) = double_click_event {
         let inst = instance.clone();
-        wrapper = wrapper.event_handler(move |_: events::DoubleClick| {
+        html_el = html_el.event_handler(move |_: events::DoubleClick| {
             let _ = inst.fire_event(event_id.0);
         });
     }
 
-    wrapper.into_raw_unchecked()
+    html_el.into_raw_unchecked()
 }
 
 /// Resolve a label expression to TextConcat segments (following CellRead chains).
@@ -1187,35 +1189,34 @@ fn build_conditional_element(
 ) -> RawElOrText {
     let tag_table = &program.tag_table;
 
-    // Build a mapping: (pattern matcher, element) for each arm.
-    let arm_elements: Vec<(ArmMatcher, RawElOrText)> = arms
+    // Build arm elements, marking NoElement arms as None.
+    // Skipping NoElement arms avoids creating a `display: contents` wrapper div,
+    // which breaks CDP's Input.dispatchMouseEvent — dominator event handlers on
+    // elements inside `display: contents` wrappers don't fire for real CDP clicks.
+    let arm_elements: Vec<(ArmMatcher, Option<RawElOrText>)> = arms
         .iter()
         .map(|(pattern, body)| {
             let matcher = pattern_to_matcher(pattern, tag_table);
             let element = match body {
                 IrExpr::CellRead(cell) => {
                     if is_no_element(program, *cell) {
-                        RawHtmlEl::new("span")
-                            .style("display", "none")
-                            .into_raw_unchecked()
+                        None
                     } else {
-                        build_cell_element(program, instance, *cell)
+                        Some(build_cell_element(program, instance, *cell))
                     }
                 }
                 IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => {
-                    RawHtmlEl::new("span")
-                        .style("display", "none")
-                        .into_raw_unchecked()
+                    None
                 }
                 IrExpr::TextConcat(segments) => {
-                    build_text_from_segments(instance, segments)
+                    Some(build_text_from_segments(instance, segments))
                 }
                 _ => {
                     let text = eval_static_text(body);
                     if text.is_empty() {
-                        build_reactive_text(instance, source)
+                        Some(build_reactive_text(instance, source))
                     } else {
-                        zoon::Text::new(text).unify()
+                        Some(zoon::Text::new(text).unify())
                     }
                 }
             };
@@ -1223,20 +1224,28 @@ fn build_conditional_element(
         })
         .collect();
 
-    // Single arm — return directly, no switching needed.
+    // Single arm with element — return directly, no switching needed.
     if arm_elements.len() == 1 {
-        return arm_elements.into_iter().next().unwrap().1;
+        if let Some(el) = arm_elements.into_iter().next().unwrap().1 {
+            return el;
+        } else {
+            return RawHtmlEl::new("span").style("display", "none").into_raw_unchecked();
+        }
     }
 
     let matchers: Vec<ArmMatcher> = arm_elements.iter().map(|(m, _)| m.clone()).collect();
-    let elements: Vec<RawElOrText> = arm_elements.into_iter().map(|(_, e)| e).collect();
+    let elements: Vec<Option<RawElOrText>> = arm_elements.into_iter().map(|(_, e)| e).collect();
 
-    // Build wrapper divs. Each gets after_insert to capture the DOM element,
-    // then a Task watches the source signal and toggles display via raw DOM.
+    // Apply display toggling directly to elements (no wrapper divs).
     let store = instance.cell_store.clone();
     let source_id = source.0;
     let mut result_children: Vec<RawElOrText> = Vec::new();
     for (i, element) in elements.into_iter().enumerate() {
+        // Skip NoElement arms — they're always hidden and redundant.
+        let element = match element {
+            Some(el) => el,
+            None => continue,
+        };
         let matchers_clone = matchers.clone();
         let store_clone = store.clone();
         // Set initial display based on current cell value.
@@ -1244,41 +1253,120 @@ fn build_conditional_element(
         let initial_text = store.get_cell_text(source_id);
         let initial_matched = find_matching_arm_idx(&matchers, initial_val, &initial_text);
         let initially_visible = initial_matched == Some(i);
-        let wrapper = RawHtmlEl::new("div")
-            .style("display", if initially_visible { "contents" } else { "none" })
-            .child(element)
-            .after_insert(move |el: web_sys::HtmlElement| {
+
+        let toggled = apply_conditional_display_toggle(
+            element, initially_visible,
+            move |el: &web_sys::HtmlElement, set_vis: &dyn Fn(&web_sys::HtmlElement, bool)| {
                 // Re-set display in case value changed between build and mount.
                 let val = store_clone.get_cell_value(source_id);
                 let cell_text = store_clone.get_cell_text(source_id);
                 let matched = find_matching_arm_idx(&matchers_clone, val, &cell_text);
-                let _ = el.style().set_property("display", if matched == Some(i) { "contents" } else { "none" });
+                set_vis(el, matched == Some(i));
 
                 // Watch for changes.
                 let matchers_inner = matchers_clone.clone();
                 let store_inner = store_clone.clone();
+                let el_clone = el.clone();
                 let handle = Task::start_droppable(
                     store_clone.get_cell_signal(source_id)
                         .for_each_sync(move |val| {
                             let cell_text = store_inner.get_cell_text(source_id);
                             let matched = find_matching_arm_idx(&matchers_inner, val, &cell_text);
                             let visible = matched == Some(i);
-                            let _ = el.style().set_property("display", if visible { "contents" } else { "none" });
-                            // When becoming visible, focus any autofocus input inside.
+                            set_conditional_visibility(&el_clone, visible);
                             if visible {
-                                focus_autofocus_child(&el);
+                                focus_autofocus_child(&el_clone);
                             }
                         })
                 );
                 std::mem::forget(handle);
-            });
-        result_children.push(wrapper.into_raw_unchecked());
+            },
+        );
+        result_children.push(toggled);
     }
 
-    RawHtmlEl::new("div")
-        .style("display", "contents")
-        .children(result_children)
-        .into_raw_unchecked()
+    if result_children.len() == 1 {
+        result_children.into_iter().next().unwrap()
+    } else {
+        RawHtmlEl::new("div")
+            .style("display", "contents")
+            .children(result_children)
+            .into_raw_unchecked()
+    }
+}
+
+/// Apply conditional display toggling directly to an element (avoiding wrapper divs).
+///
+/// For `RawHtmlEl` elements, saves the original display value and toggles between
+/// it and `display: none`. For text nodes, wraps in a minimal `<span>`.
+///
+/// This avoids `display: contents` wrappers which break CDP's `Input.dispatchMouseEvent`
+/// hit-testing — clicks miss elements inside conditionals.
+fn apply_conditional_display_toggle(
+    element: RawElOrText,
+    initially_visible: bool,
+    setup: impl FnOnce(&web_sys::HtmlElement, &dyn Fn(&web_sys::HtmlElement, bool)) + 'static,
+) -> RawElOrText {
+    match element {
+        RawElOrText::RawHtmlEl(mut html_el) => {
+            if !initially_visible {
+                html_el = html_el.style("display", "none");
+            }
+            html_el
+                .after_insert(move |el: web_sys::HtmlElement| {
+                    // Save the element's original display (before any toggling).
+                    let original = el.style().get_property_value("display").unwrap_or_default();
+                    let orig = if original == "none" || original.is_empty() {
+                        String::new() // will use remove_property to restore default
+                    } else {
+                        original
+                    };
+                    let set_vis = move |el: &web_sys::HtmlElement, visible: bool| {
+                        set_conditional_visibility_with_orig(el, visible, &orig);
+                    };
+                    setup(&el, &set_vis);
+                })
+                .into_raw_unchecked()
+        }
+        other => {
+            // Text nodes can't have display toggled directly — use a minimal span wrapper.
+            let mut wrapper = RawHtmlEl::new("span");
+            if !initially_visible {
+                wrapper = wrapper.style("display", "none");
+            }
+            wrapper
+                .child(other)
+                .after_insert(move |el: web_sys::HtmlElement| {
+                    let set_vis = |el: &web_sys::HtmlElement, visible: bool| {
+                        set_conditional_visibility(el, visible);
+                    };
+                    setup(&el, &set_vis);
+                })
+                .into_raw_unchecked()
+        }
+    }
+}
+
+/// Set visibility on a conditional element, restoring its original display or hiding it.
+fn set_conditional_visibility(el: &web_sys::HtmlElement, visible: bool) {
+    if visible {
+        let _ = el.style().remove_property("display");
+    } else {
+        let _ = el.style().set_property("display", "none");
+    }
+}
+
+/// Set visibility with a known original display value.
+fn set_conditional_visibility_with_orig(el: &web_sys::HtmlElement, visible: bool, orig: &str) {
+    if visible {
+        if orig.is_empty() {
+            let _ = el.style().remove_property("display");
+        } else {
+            let _ = el.style().set_property("display", orig);
+        }
+    } else {
+        let _ = el.style().set_property("display", "none");
+    }
 }
 
 /// Check if a cell resolves to the NoElement tag.
@@ -1883,6 +1971,8 @@ fn build_item_element_node(
 
 /// Attach event handlers to a per-item element.
 /// Template-scoped events route through on_item_event; global events through on_event.
+/// Events are attached directly to the element (no wrapper div) to avoid
+/// Chrome's buggy mouse events on `display: contents` elements.
 fn attach_item_events(
     el: RawElOrText,
     instance: &Rc<WasmInstance>,
@@ -1902,22 +1992,24 @@ fn attach_item_events(
         return el;
     }
 
-    let mut wrapper = RawHtmlEl::new("div")
-        .style("display", "contents")
-        .child(el);
+    // Extract the HTML element for direct event attachment (text nodes can't have events).
+    let mut html_el = match el {
+        RawElOrText::RawHtmlEl(html_el) => html_el,
+        other => return other,
+    };
 
     // Hover: use per-item cell if in template range.
     if let Some(cell) = hovered_cell {
         if ctx.is_template_cell(cell) {
             let ics = instance.item_cell_store.clone();
             let item_idx = ctx.item_idx;
-            wrapper = wrapper.event_handler(move |_: events::MouseEnter| {
+            html_el = html_el.event_handler(move |_: events::MouseEnter| {
                 if let Some(ref ics) = ics {
                     ics.set_cell(item_idx, cell.0, 1.0);
                 }
             });
             let ics = instance.item_cell_store.clone();
-            wrapper = wrapper.event_handler(move |_: events::MouseLeave| {
+            html_el = html_el.event_handler(move |_: events::MouseLeave| {
                 if let Some(ref ics) = ics {
                     ics.set_cell(item_idx, cell.0, 0.0);
                 }
@@ -1925,12 +2017,12 @@ fn attach_item_events(
         } else {
             let inst = instance.clone();
             let cell_id = cell.0;
-            wrapper = wrapper.event_handler(move |_: events::MouseEnter| {
+            html_el = html_el.event_handler(move |_: events::MouseEnter| {
                 inst.set_cell_value(cell_id, 1.0);
             });
             let inst = instance.clone();
             let cell_id = cell.0;
-            wrapper = wrapper.event_handler(move |_: events::MouseLeave| {
+            html_el = html_el.event_handler(move |_: events::MouseLeave| {
                 inst.set_cell_value(cell_id, 0.0);
             });
         }
@@ -1942,7 +2034,7 @@ fn attach_item_events(
     if let Some(event_id) = blur_event {
         let inst = instance.clone();
         let is_template = ctx.is_template_event(event_id);
-        wrapper = wrapper.event_handler(move |_: events::Blur| {
+        html_el = html_el.event_handler(move |_: events::Blur| {
             if is_template {
                 let _ = inst.call_on_item_event(item_idx, event_id.0);
             } else {
@@ -1954,7 +2046,7 @@ fn attach_item_events(
     if let Some(event_id) = focus_event {
         let inst = instance.clone();
         let is_template = ctx.is_template_event(event_id);
-        wrapper = wrapper.event_handler(move |_: events::Focus| {
+        html_el = html_el.event_handler(move |_: events::Focus| {
             if is_template {
                 let _ = inst.call_on_item_event(item_idx, event_id.0);
             } else {
@@ -1966,7 +2058,7 @@ fn attach_item_events(
     if let Some(event_id) = click_event {
         let inst = instance.clone();
         let is_template = ctx.is_template_event(event_id);
-        wrapper = wrapper.event_handler(move |_: events::Click| {
+        html_el = html_el.event_handler(move |_: events::Click| {
             if is_template {
                 let _ = inst.call_on_item_event(item_idx, event_id.0);
             } else {
@@ -1978,7 +2070,7 @@ fn attach_item_events(
     if let Some(event_id) = double_click_event {
         let inst = instance.clone();
         let is_template = ctx.is_template_event(event_id);
-        wrapper = wrapper.event_handler(move |_: events::DoubleClick| {
+        html_el = html_el.event_handler(move |_: events::DoubleClick| {
             if is_template {
                 let _ = inst.call_on_item_event(item_idx, event_id.0);
             } else {
@@ -1987,7 +2079,7 @@ fn attach_item_events(
         });
     }
 
-    wrapper.into_raw_unchecked()
+    html_el.into_raw_unchecked()
 }
 
 /// Build a per-item Button element.
@@ -2405,44 +2497,55 @@ fn build_item_conditional_element(
     arms: &[(IrPattern, IrExpr)],
 ) -> RawElOrText {
     let tag_table = &program.tag_table;
-    let arm_elements: Vec<(ArmMatcher, RawElOrText)> = arms.iter().map(|(pattern, body)| {
+    // Build arm elements, marking NoElement arms as None.
+    // NoElement arms produce always-hidden spans that are redundant when other arms
+    // handle their own display toggling via apply_conditional_display_toggle.
+    // Skipping them avoids creating a `display: contents` wrapper div, which breaks
+    // CDP's Input.dispatchMouseEvent — dominator event handlers on elements inside
+    // `display: contents` wrappers don't fire for real CDP clicks.
+    let arm_elements: Vec<(ArmMatcher, Option<RawElOrText>)> = arms.iter().map(|(pattern, body)| {
         let matcher = pattern_to_matcher(pattern, tag_table);
         let element = match body {
             IrExpr::CellRead(cell) => {
                 if is_no_element(program, *cell) {
-                    RawHtmlEl::new("span").style("display", "none").into_raw_unchecked()
+                    None
                 } else {
-                    build_item_element(program, instance, ctx, *cell)
+                    Some(build_item_element(program, instance, ctx, *cell))
                 }
             }
             IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => {
-                RawHtmlEl::new("span").style("display", "none").into_raw_unchecked()
+                None
             }
             IrExpr::TextConcat(segments) => {
-                build_item_text_from_segments(instance, ctx, segments)
+                Some(build_item_text_from_segments(instance, ctx, segments))
             }
             _ => {
                 let text = eval_static_text(body);
                 if text.is_empty() {
                     if ctx.is_template_cell(source) {
-                        build_item_reactive_text(instance, ctx, source)
+                        Some(build_item_reactive_text(instance, ctx, source))
                     } else {
-                        build_reactive_text(instance, source)
+                        Some(build_reactive_text(instance, source))
                     }
                 } else {
-                    zoon::Text::new(text).unify()
+                    Some(zoon::Text::new(text).unify())
                 }
             }
         };
         (matcher, element)
     }).collect();
 
+    // Single arm with element — return directly, no switching needed.
     if arm_elements.len() == 1 {
-        return arm_elements.into_iter().next().unwrap().1;
+        if let Some(el) = arm_elements.into_iter().next().unwrap().1 {
+            return el;
+        } else {
+            return RawHtmlEl::new("span").style("display", "none").into_raw_unchecked();
+        }
     }
 
     let matchers: Vec<ArmMatcher> = arm_elements.iter().map(|(m, _)| m.clone()).collect();
-    let elements: Vec<RawElOrText> = arm_elements.into_iter().map(|(_, e)| e).collect();
+    let elements: Vec<Option<RawElOrText>> = arm_elements.into_iter().map(|(_, e)| e).collect();
 
     // Use per-item signal if source is template-scoped, otherwise global.
     let is_item_source = ctx.is_template_cell(source);
@@ -2450,6 +2553,11 @@ fn build_item_conditional_element(
 
     let mut result_children: Vec<RawElOrText> = Vec::new();
     for (i, element) in elements.into_iter().enumerate() {
+        // Skip NoElement arms — they're always hidden and redundant.
+        let element = match element {
+            Some(el) => el,
+            None => continue,
+        };
         let matchers_clone = matchers.clone();
 
         // Determine initial visibility.
@@ -2469,17 +2577,17 @@ fn build_item_conditional_element(
             let ics = instance.item_cell_store.clone().unwrap();
             let item_idx = ctx.item_idx;
             let matchers_inner = matchers_clone.clone();
-            let wrapper = RawHtmlEl::new("div")
-                .style("display", if initially_visible { "contents" } else { "none" })
-                .child(element)
-                .after_insert(move |el: web_sys::HtmlElement| {
+            let toggled = apply_conditional_display_toggle(
+                element, initially_visible,
+                move |el: &web_sys::HtmlElement, set_vis: &dyn Fn(&web_sys::HtmlElement, bool)| {
                     let val = ics.get_value(item_idx, source_id);
                     let cell_text = ics.get_text(item_idx, source_id);
                     let matched = find_matching_arm_idx(&matchers_inner, val, &cell_text);
-                    let _ = el.style().set_property("display", if matched == Some(i) { "contents" } else { "none" });
+                    set_vis(el, matched == Some(i));
 
                     let ics_inner = ics.clone();
                     let matchers_watch = matchers_inner.clone();
+                    let el_clone = el.clone();
                     let handle = Task::start_droppable(
                         ics.get_signal(item_idx, source_id)
                             .for_each_sync(move |_val| {
@@ -2487,54 +2595,58 @@ fn build_item_conditional_element(
                                 let val = ics_inner.get_value(item_idx, source_id);
                                 let matched = find_matching_arm_idx(&matchers_watch, val, &cell_text);
                                 let visible = matched == Some(i);
-                                let _ = el.style().set_property("display", if visible { "contents" } else { "none" });
-                                // When becoming visible, focus any autofocus input inside.
+                                set_conditional_visibility(&el_clone, visible);
                                 if visible {
-                                    focus_autofocus_child(&el);
+                                    focus_autofocus_child(&el_clone);
                                 }
                             })
                     );
                     std::mem::forget(handle);
-                });
-            result_children.push(wrapper.into_raw_unchecked());
+                },
+            );
+            result_children.push(toggled);
         } else {
             // Global source — same as build_conditional_element.
             let store = instance.cell_store.clone();
             let matchers_inner = matchers_clone;
-            let wrapper = RawHtmlEl::new("div")
-                .style("display", if initially_visible { "contents" } else { "none" })
-                .child(element)
-                .after_insert(move |el: web_sys::HtmlElement| {
+            let toggled = apply_conditional_display_toggle(
+                element, initially_visible,
+                move |el: &web_sys::HtmlElement, set_vis: &dyn Fn(&web_sys::HtmlElement, bool)| {
                     let val = store.get_cell_value(source_id);
                     let cell_text = store.get_cell_text(source_id);
                     let matched = find_matching_arm_idx(&matchers_inner, val, &cell_text);
-                    let _ = el.style().set_property("display", if matched == Some(i) { "contents" } else { "none" });
+                    set_vis(el, matched == Some(i));
 
                     let store_inner = store.clone();
                     let matchers_watch = matchers_inner.clone();
+                    let el_clone = el.clone();
                     let handle = Task::start_droppable(
                         store.get_cell_signal(source_id)
                             .for_each_sync(move |val| {
                                 let cell_text = store_inner.get_cell_text(source_id);
                                 let matched = find_matching_arm_idx(&matchers_watch, val, &cell_text);
                                 let visible = matched == Some(i);
-                                let _ = el.style().set_property("display", if visible { "contents" } else { "none" });
-                                // When becoming visible, focus any autofocus input inside.
+                                set_conditional_visibility(&el_clone, visible);
                                 if visible {
-                                    focus_autofocus_child(&el);
+                                    focus_autofocus_child(&el_clone);
                                 }
                             })
                     );
                     std::mem::forget(handle);
-                });
-            result_children.push(wrapper.into_raw_unchecked());
+                },
+            );
+            result_children.push(toggled);
         }
     }
 
-    RawHtmlEl::new("div")
-        .style("display", "contents")
-        .children(result_children)
-        .into_raw_unchecked()
+    if result_children.len() == 1 {
+        result_children.into_iter().next().unwrap()
+    } else {
+        RawHtmlEl::new("div")
+            .style("display", "contents")
+            .children(result_children)
+            .into_raw_unchecked()
+    }
 }
 
 /// Resolve a color expression to a CSS color string.

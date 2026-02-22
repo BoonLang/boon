@@ -1439,6 +1439,24 @@ async function handleCommand(id, command) {
           // Click using real CDP mouse events at the button center coordinates
           await cdpClickAtViewport(tab.id, clickResult.centerX, clickResult.centerY);
 
+          // Fallback: CDP Input.dispatchMouseEvent doesn't fire handlers on elements
+          // that were toggled from display:none to visible (Chrome compositor limitation).
+          // Use element.click() which generates a trusted click event directly.
+          await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return;
+              let buttons = Array.from(preview.querySelectorAll('[role="button"]'));
+              buttons = buttons.filter(el => {
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0 &&
+                  window.getComputedStyle(el).display !== 'none';
+              });
+              const button = buttons[${command.index}];
+              if (button) button.click();
+            })()
+          `);
+
           return { type: 'success', data: clickResult };
         } catch (e) {
           return { type: 'error', message: `Click button failed: ${e.message}` };
@@ -1523,6 +1541,38 @@ async function handleCommand(id, command) {
 
           // Click using real CDP mouse events at the element center coordinates
           await cdpClickAtViewport(tab.id, result.element.centerX, result.element.centerY);
+
+          // Fallback: CDP Input.dispatchMouseEvent doesn't fire handlers on elements
+          // toggled from display:none (Chrome compositor limitation).
+          // Re-find and click via element.click() which generates trusted events.
+          await cdpEvaluate(tab.id, `
+            (function() {
+              const searchText = ${JSON.stringify(command.text)};
+              const exact = ${command.exact || false};
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return;
+              const allElements = preview.querySelectorAll('*');
+              let bestEl = null;
+              let bestSize = Infinity;
+              allElements.forEach((el) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return;
+                let directText = '';
+                for (const node of el.childNodes) {
+                  if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
+                }
+                directText = directText.trim();
+                const matches = exact ? directText === searchText : directText.includes(searchText);
+                if (matches && rect.width * rect.height < bestSize) {
+                  bestSize = rect.width * rect.height;
+                  bestEl = el;
+                }
+              });
+              if (bestEl) bestEl.click();
+            })()
+          `);
 
           return { type: 'success', data: { text: result.element.text, x: result.element.centerX, y: result.element.centerY } };
         } catch (e) {
@@ -1714,6 +1764,56 @@ async function handleCommand(id, command) {
 
           // Click using real CDP mouse events at the button center coordinates
           await cdpClickAtViewport(tab.id, clickResult.centerX, clickResult.centerY);
+
+          // Fallback: CDP Input.dispatchMouseEvent doesn't fire handlers on elements
+          // toggled from display:none (Chrome compositor limitation).
+          // Re-find and click via element.click() which generates trusted events.
+          await cdpEvaluate(tab.id, `
+            (function() {
+              const searchText = ${JSON.stringify(command.text)};
+              const buttonText = ${JSON.stringify(command.buttonText || '×')};
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return;
+              // Find target element
+              let targetElement = null;
+              let smallestSize = Infinity;
+              preview.querySelectorAll('*').forEach((el) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return;
+                if (window.getComputedStyle(el).display === 'none') return;
+                let directText = '';
+                for (const node of el.childNodes) {
+                  if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
+                }
+                if (directText.trim() === searchText) {
+                  const size = rect.width * rect.height;
+                  if (size < smallestSize) { smallestSize = size; targetElement = el; }
+                }
+              });
+              if (!targetElement) return;
+              // Walk up to find the button
+              let container = targetElement.parentElement;
+              let maxDepth = 5;
+              while (container && maxDepth > 0) {
+                const buttons = container.querySelectorAll('[role="button"]');
+                for (const btn of buttons) {
+                  let btnText = '';
+                  for (const node of btn.childNodes) {
+                    if (node.nodeType === Node.TEXT_NODE) btnText += node.textContent;
+                  }
+                  if (btnText.trim() === buttonText) {
+                    const r = btn.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0 && window.getComputedStyle(btn).display !== 'none') {
+                      btn.click();
+                      return;
+                    }
+                  }
+                }
+                container = container.parentElement;
+                maxDepth--;
+              }
+            })()
+          `);
 
           return { type: 'success', data: clickResult };
         } catch (e) {

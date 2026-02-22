@@ -2854,14 +2854,29 @@ impl<'a> WasmEmitter<'a> {
                         func.instruction(&Instruction::End); // end loop
                         func.instruction(&Instruction::End); // end block
 
-                        // 4. Set ListRemove cell to new list
+                        // 4. Set ListRemove cell to new (filtered) list
                         func.instruction(&Instruction::LocalGet(local_new_list));
                         func.instruction(&Instruction::GlobalSet(cell.0));
                         func.instruction(&Instruction::I32Const(cell.0 as i32));
                         func.instruction(&Instruction::GlobalGet(cell.0));
                         func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
 
-                        // 5. Emit downstream updates (ListCount, ListMap, ListRetain, etc.)
+                        // 5. Copy filtered result back to source list (in-place modification).
+                        // Without this, the source list still contains the removed item.
+                        // When a new item is appended to the source list, the removed item
+                        // would reappear because the downstream propagation copies the source
+                        // list_id directly to the ListRemove cell.
+                        func.instruction(&Instruction::I32Const(source.0 as i32));
+                        func.instruction(&Instruction::I32Const(cell.0 as i32));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_LIST_REPLACE));
+                        // Reset remove cell to point to same list as source.
+                        func.instruction(&Instruction::GlobalGet(source.0));
+                        func.instruction(&Instruction::GlobalSet(cell.0));
+                        func.instruction(&Instruction::I32Const(cell.0 as i32));
+                        func.instruction(&Instruction::GlobalGet(cell.0));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+
+                        // 6. Emit downstream updates (ListCount, ListMap, ListRetain, etc.)
                         self.emit_list_downstream_updates(func, *cell);
                     }
                 }
