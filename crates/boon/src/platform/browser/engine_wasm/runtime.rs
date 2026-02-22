@@ -50,7 +50,11 @@ impl CellStore {
 
     pub fn set_cell_f64(&self, cell_id: u32, value: f64) {
         if let Some(cell) = self.inner.cells.get(cell_id as usize) {
-            cell.set(value);
+            // Only fire signal when value actually changes.
+            // Bit-exact comparison handles NaN correctly (NaN.to_bits() == NaN.to_bits()).
+            if cell.get().to_bits() != value.to_bits() {
+                cell.set(value);
+            }
         }
     }
 
@@ -430,7 +434,10 @@ impl ItemCellStore {
         let cells = self.inner.cells.borrow();
         if let Some(item) = cells.get(item_idx as usize) {
             if let Some(cell) = item.get(local) {
-                cell.set(value);
+                // Only fire signal when value actually changes.
+                if cell.get().to_bits() != value.to_bits() {
+                    cell.set(value);
+                }
             }
         }
     }

@@ -177,40 +177,41 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 // ============ CDP OPERATIONS ============
 
-// Click at coordinates using JavaScript events
-// NOTE: We do NOT use CDP Input.dispatchMouseEvent for clicks because CDP mouse events
-// trigger click handlers via the browser, AND we also dispatch JS click events for
-// cross-browser compatibility. This causes double-firing for Zoon buttons.
-// Instead, we just dispatch a single JS click event like clickButton does.
-// IMPORTANT: x,y are page coordinates (from DOM.getBoxModel).
+// Click at viewport coordinates using real CDP mouse events (Input.dispatchMouseEvent).
+// This mimics real user clicks: browser does hit-testing, generates the full event sequence
+// (pointerdown → mousedown → pointerup → mouseup → click), and events are isTrusted: true.
+// viewportX/viewportY are CSS pixel coordinates relative to the viewport.
+async function cdpClickAtViewport(tabId, viewportX, viewportY) {
+  await attachDebugger(tabId);
+
+  // Move mouse to position first (generates mouseover/mouseenter)
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved', x: viewportX, y: viewportY, button: 'none'
+  });
+
+  // mousePressed + mouseReleased = full click (browser generates the click event)
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed', x: viewportX, y: viewportY, button: 'left', clickCount: 1
+  });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x: viewportX, y: viewportY, button: 'left', clickCount: 1
+  });
+
+  console.log(`[Boon] CDP: Real click at viewport (${viewportX}, ${viewportY})`);
+}
+
+// Click at page coordinates using real CDP mouse events.
+// IMPORTANT: x,y are page coordinates (from DOM.getBoxModel). Converted to viewport internally.
 async function cdpClickAt(tabId, x, y) {
   await attachDebugger(tabId);
 
-  // Dispatch only a JavaScript click event on the element at the coordinates.
-  // This matches the approach used by clickButton which works correctly.
-  // NOTE: x,y from DOM.getBoxModel are page coordinates, but elementFromPoint needs viewport coordinates
-  await cdpEvaluate(tabId, `
-    (function() {
-      // Convert page coordinates to viewport coordinates
-      const viewportX = ${x} - window.scrollX;
-      const viewportY = ${y} - window.scrollY;
-      const el = document.elementFromPoint(viewportX, viewportY);
-      if (!el) {
-        console.warn('[Boon] No element at viewport coords:', viewportX, viewportY, 'page coords:', ${x}, ${y});
-        return;
-      }
+  // Convert page coordinates to viewport coordinates
+  const scrollOffset = await cdpEvaluate(tabId, `({ scrollX: window.scrollX, scrollY: window.scrollY })`);
+  const viewportX = x - (scrollOffset?.scrollX || 0);
+  const viewportY = y - (scrollOffset?.scrollY || 0);
 
-      // Dispatch a single click event (no CDP mouse events to avoid double-firing)
-      el.dispatchEvent(new MouseEvent('click', {
-        bubbles: true, cancelable: true, view: window,
-        clientX: viewportX, clientY: viewportY,
-        detail: 1
-      }));
-      console.log('[Boon] Dispatched JS click event on:', el.tagName, el.className || '(no class)');
-    })()
-  `);
-
-  console.log(`[Boon] Clicked at (${x}, ${y})`);
+  await cdpClickAtViewport(tabId, viewportX, viewportY);
+  console.log(`[Boon] CDP: Real click at page (${x}, ${y}) -> viewport (${viewportX}, ${viewportY})`);
 }
 
 // Double-click at coordinates (trusted event)
@@ -1332,60 +1333,9 @@ async function handleCommand(id, command) {
           }
           const checkbox = checkboxes[checkboxIndex];
 
-          // Click directly on the checkbox element using its ID or position
-          const clickResult = await cdpEvaluate(tab.id, `
-            (function() {
-              const preview = document.querySelector('[data-boon-panel="preview"]');
-              if (!preview) return { error: 'Preview panel not found' };
-
-              // Find checkbox by ID if available, otherwise by index in sorted list
-              let checkbox = null;
-              const checkboxId = ${JSON.stringify(checkbox.id)};
-              if (checkboxId) {
-                checkbox = document.getElementById(checkboxId);
-              }
-
-              if (!checkbox) {
-                // Fallback: find by position in sorted list
-                const roleCheckboxes = Array.from(preview.querySelectorAll('[role="checkbox"]'));
-                const idCheckboxes = Array.from(preview.querySelectorAll('[id^="cb-"]'));
-                const seen = new Set();
-                const allCheckboxes = [];
-                roleCheckboxes.forEach(el => { seen.add(el); allCheckboxes.push(el); });
-                idCheckboxes.forEach(el => { if (!seen.has(el)) { seen.add(el); allCheckboxes.push(el); } });
-                allCheckboxes.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-                checkbox = allCheckboxes[${checkboxIndex}];
-              }
-
-              if (!checkbox) return { error: 'Checkbox not found' };
-
-              // Get info about what we're clicking
-              const rect = checkbox.getBoundingClientRect();
-              const elementAtCenter = document.elementFromPoint(rect.x + rect.width/2, rect.y + rect.height/2);
-
-              // Dispatch click event directly on the checkbox element
-              const clickEvent = new MouseEvent('click', {
-                bubbles: true,
-                cancelable: true,
-                view: window,
-                clientX: rect.x + rect.width/2,
-                clientY: rect.y + rect.height/2
-              });
-              checkbox.dispatchEvent(clickEvent);
-
-              return {
-                success: true,
-                id: checkbox.id,
-                rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
-                elementAtCenter: elementAtCenter?.tagName,
-                elementAtCenterRole: elementAtCenter?.getAttribute('role')
-              };
-            })()
-          `);
-
-          if (clickResult.error) {
-            return { type: 'error', message: clickResult.error };
-          }
+          // Click using real CDP mouse events at the checkbox center coordinates.
+          // getBoundingClientRect() returns viewport coordinates, which is what cdpClickAtViewport expects.
+          await cdpClickAtViewport(tab.id, checkbox.centerX, checkbox.centerY);
 
           return { type: 'success', data: {
             index: checkboxIndex,
@@ -1394,8 +1344,7 @@ async function handleCommand(id, command) {
             x: checkbox.centerX,
             y: checkbox.centerY,
             width: checkbox.width,
-            height: checkbox.height,
-            clickResult
+            height: checkbox.height
           } };
         } catch (e) {
           return { type: 'error', message: `Click checkbox failed: ${e.message}` };
@@ -1470,34 +1419,7 @@ async function handleCommand(id, command) {
               const centerX = rect.x + rect.width / 2;
               const centerY = rect.y + rect.height / 2;
 
-              // Debug: check what element is at the click coordinates
-              const elementAtPoint = document.elementFromPoint(centerX, centerY);
-              const elementAtPointInfo = elementAtPoint ? {
-                tag: elementAtPoint.tagName,
-                role: elementAtPoint.getAttribute('role'),
-                text: (elementAtPoint.textContent || '').substring(0, 20),
-                isSameAsButton: elementAtPoint === button
-              } : null;
-
-              // Dispatch click directly on button element (same as checkbox approach)
-              const clickEvent = new MouseEvent('click', {
-                bubbles: true,
-                cancelable: true,
-                view: window,
-                clientX: centerX,
-                clientY: centerY
-              });
-              button.dispatchEvent(clickEvent);
-
-              // Also log that we dispatched the event
-              console.log('[Boon Debug] Dispatched click on button:', {
-                index: buttonIndex,
-                text: text,
-                role: button.getAttribute('role'),
-                tagName: button.tagName,
-                className: button.className
-              });
-
+              // Return coordinates — click will be dispatched via real CDP mouse events
               return {
                 success: true,
                 index: buttonIndex,
@@ -1505,8 +1427,7 @@ async function handleCommand(id, command) {
                 rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
                 role: button.getAttribute('role'),
                 centerX: centerX,
-                centerY: centerY,
-                elementAtPoint: elementAtPointInfo
+                centerY: centerY
               };
             })()
           `);
@@ -1514,6 +1435,9 @@ async function handleCommand(id, command) {
           if (clickResult.error) {
             return { type: 'error', message: clickResult.error };
           }
+
+          // Click using real CDP mouse events at the button center coordinates
+          await cdpClickAtViewport(tab.id, clickResult.centerX, clickResult.centerY);
 
           return { type: 'success', data: clickResult };
         } catch (e) {
@@ -1588,29 +1512,17 @@ async function handleCommand(id, command) {
                 return { found: false, error: 'No element found with text: ' + searchText };
               }
 
-              // Click the element IMMEDIATELY within this same evaluation
-              // This prevents timing issues where DOM is rebuilt between find and click
-              const rect = bestMatchElement.getBoundingClientRect();
-              const centerX = rect.x + rect.width / 2;
-              const centerY = rect.y + rect.height / 2;
-
-              bestMatchElement.dispatchEvent(new MouseEvent('click', {
-                bubbles: true,
-                cancelable: true,
-                view: window,
-                clientX: centerX,
-                clientY: centerY,
-                detail: 1
-              }));
-
-              console.log('[Boon] clickByText: clicked', bestMatch.text, 'at', Math.round(centerX), Math.round(centerY));
-              return { found: true, clicked: true, element: bestMatch };
+              // Return coordinates — click will be dispatched via real CDP mouse events
+              return { found: true, element: bestMatch };
             })()
           `);
 
           if (!result.found) {
             return { type: 'error', message: result.error || 'Element not found' };
           }
+
+          // Click using real CDP mouse events at the element center coordinates
+          await cdpClickAtViewport(tab.id, result.element.centerX, result.element.centerY);
 
           return { type: 'success', data: { text: result.element.text, x: result.element.centerX, y: result.element.centerY } };
         } catch (e) {
@@ -1780,26 +1692,13 @@ async function handleCommand(id, command) {
                 return { found: false, error: 'No button "' + buttonText + '" found near text: ' + searchText + ' (button may not appear on hover)' };
               }
 
-              // Click the button IMMEDIATELY within this same evaluation
-              // This prevents timing issues where DOM is rebuilt between find and click
+              // Return coordinates — click will be dispatched via real CDP mouse events
               const btnRect = foundButton.getBoundingClientRect();
               const centerX = btnRect.x + btnRect.width / 2;
               const centerY = btnRect.y + btnRect.height / 2;
 
-              foundButton.dispatchEvent(new MouseEvent('click', {
-                bubbles: true,
-                cancelable: true,
-                view: window,
-                clientX: centerX,
-                clientY: centerY,
-                detail: 1
-              }));
-
-              console.log('[Boon] clickButtonNearText: clicked', buttonText, 'near', searchText, 'at', Math.round(centerX), Math.round(centerY));
-
               return {
                 found: true,
-                clicked: true,
                 text: searchText,
                 buttonText: buttonText,
                 centerX: Math.round(centerX),
@@ -1812,6 +1711,9 @@ async function handleCommand(id, command) {
           if (!clickResult.found) {
             return { type: 'error', message: clickResult.error || 'Button not found after hover' };
           }
+
+          // Click using real CDP mouse events at the button center coordinates
+          await cdpClickAtViewport(tab.id, clickResult.centerX, clickResult.centerY);
 
           return { type: 'success', data: clickResult };
         } catch (e) {
@@ -1851,8 +1753,12 @@ async function handleCommand(id, command) {
             return { type: 'error', message: result.error || 'Input not found' };
           }
 
-          // Also click via CDP to ensure focus
-          await cdpClickAt(tab.id, result.x, result.y);
+          // Also click via real CDP mouse events to ensure focus,
+          // but only if the element has a visible rect (hidden/zero-size
+          // elements return 0,0 and would steal focus from the intended target).
+          if (result.x > 0 || result.y > 0) {
+            await cdpClickAtViewport(tab.id, result.x, result.y);
+          }
           return { type: 'success', data: result };
         } catch (e) {
           return { type: 'error', message: `Focus input failed: ${e.message}` };
@@ -2136,21 +2042,11 @@ async function handleCommand(id, command) {
                 return { found: false, error: 'No element found with text: ' + searchText };
               }
 
-              // Dispatch dblclick directly on the element (works even when off-screen)
+              // Return coordinates — double-click will be dispatched via real CDP mouse events
               const rect = bestMatchElement.getBoundingClientRect();
               const centerX = rect.x + rect.width / 2;
               const centerY = rect.y + rect.height / 2;
 
-              bestMatchElement.dispatchEvent(new MouseEvent('dblclick', {
-                bubbles: true,
-                cancelable: true,
-                view: window,
-                clientX: centerX,
-                clientY: centerY,
-                detail: 2
-              }));
-
-              console.log('[Boon] doubleClickByText: dblclick dispatched on', bestMatch.text, 'at', Math.round(centerX), Math.round(centerY));
               bestMatch.centerX = Math.round(centerX);
               bestMatch.centerY = Math.round(centerY);
               return { found: true, element: bestMatch };
@@ -2160,6 +2056,13 @@ async function handleCommand(id, command) {
           if (!result.found) {
             return { type: 'error', message: result.error || 'Element not found' };
           }
+
+          // Double-click using real CDP mouse events at the element center coordinates.
+          // cdpDoubleClickAt expects page coordinates, so add scroll offset.
+          const scrollOffset = await cdpEvaluate(tab.id, `({ scrollX: window.scrollX, scrollY: window.scrollY })`);
+          const pageX = result.element.centerX + (scrollOffset?.scrollX || 0);
+          const pageY = result.element.centerY + (scrollOffset?.scrollY || 0);
+          await cdpDoubleClickAt(tab.id, pageX, pageY);
 
           return { type: 'success', data: { text: result.element.text, x: result.element.centerX, y: result.element.centerY } };
         } catch (e) {

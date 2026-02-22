@@ -258,11 +258,11 @@ check_contains "$PREVIEW" "2 items left" "All items active initially"
 
 echo ""
 echo "[1.7] Input has focus"
-check_focused 1 "Main input has focus on load" "M11"
+check_focused 0 "Main input has focus on load" "M11"
 
 echo ""
 echo "[1.8] Input is typeable"
-check_input_typeable 1 "Main input is typeable"
+check_input_typeable 0 "Main input is typeable"
 
 echo ""
 echo "[1.9] 'All' filter button has outline"
@@ -425,7 +425,7 @@ rerun
 
 echo ""
 echo "[6.1] Add 'Learn Boon'"
-bt focus-input 1 >/dev/null 2>&1 || true
+bt focus-input 0 >/dev/null 2>&1 || true
 bt type-text "Learn Boon" >/dev/null 2>&1 || true
 bt press-key Enter >/dev/null 2>&1 || true
 sleep 1
@@ -439,7 +439,7 @@ check_input_empty 1 "Input cleared after adding item" "M7"
 
 echo ""
 echo "[6.3] Add 'Write tests'"
-bt focus-input 1 >/dev/null 2>&1 || true
+bt focus-input 0 >/dev/null 2>&1 || true
 bt type-text "Write tests" >/dev/null 2>&1 || true
 bt press-key Enter >/dev/null 2>&1 || true
 sleep 1
@@ -449,7 +449,7 @@ check_contains "$PREVIEW" "4 items left" "Counter '4 items left'"
 
 echo ""
 echo "[6.4] Empty submit does not add item"
-bt focus-input 1 >/dev/null 2>&1 || true
+bt focus-input 0 >/dev/null 2>&1 || true
 bt press-key Enter >/dev/null 2>&1 || true
 sleep 1
 PREVIEW=$(bt preview)
@@ -636,7 +636,7 @@ rerun
 
 echo ""
 echo "[12.1] Add 'Test todo'"
-bt focus-input 1 >/dev/null 2>&1 || true
+bt focus-input 0 >/dev/null 2>&1 || true
 bt type-text "Test todo" >/dev/null 2>&1 || true
 bt press-key Enter >/dev/null 2>&1 || true
 sleep 1
@@ -682,7 +682,7 @@ sleep 1
 
 echo ""
 echo "[13.3] Add 'Buy milk'"
-bt focus-input 1 >/dev/null 2>&1 || true
+bt focus-input 0 >/dev/null 2>&1 || true
 bt type-text "Buy milk" >/dev/null 2>&1 || true
 bt press-key Enter >/dev/null 2>&1 || true
 sleep 1
@@ -742,11 +742,11 @@ rerun
 
 echo ""
 echo "[15.1] Add 'Todo to complete' and 'Todo to keep'"
-bt focus-input 1 >/dev/null 2>&1 || true
+bt focus-input 0 >/dev/null 2>&1 || true
 bt type-text "Todo to complete" >/dev/null 2>&1 || true
 bt press-key Enter >/dev/null 2>&1 || true
 sleep 0.5
-bt focus-input 1 >/dev/null 2>&1 || true
+bt focus-input 0 >/dev/null 2>&1 || true
 bt type-text "Todo to keep" >/dev/null 2>&1 || true
 bt press-key Enter >/dev/null 2>&1 || true
 sleep 1
@@ -938,7 +938,7 @@ check_contains "$PREVIEW" "todos" "Header still visible after clearing all"
 
 echo ""
 echo "[21.2] Add item brings back footer/filters"
-bt focus-input 1 >/dev/null 2>&1 || true
+bt focus-input 0 >/dev/null 2>&1 || true
 bt type-text "New item" >/dev/null 2>&1 || true
 bt press-key Enter >/dev/null 2>&1 || true
 sleep 1
@@ -957,7 +957,7 @@ rerun
 
 echo ""
 echo "[22.1] Setup: add 'Persistent todo' and check one item"
-bt focus-input 1 >/dev/null 2>&1 || true
+bt focus-input 0 >/dev/null 2>&1 || true
 bt type-text "Persistent todo" >/dev/null 2>&1 || true
 bt press-key Enter >/dev/null 2>&1 || true
 sleep 0.5

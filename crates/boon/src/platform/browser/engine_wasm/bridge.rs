@@ -331,8 +331,13 @@ fn build_element_node(
     links: &[(String, EventId)],
     hovered_cell: Option<CellId>,
 ) -> RawElOrText {
+    // Track which event names are handled directly by the element builder
+    // so attach_common_events doesn't duplicate them.
+    let mut handled_events: &[&str] = &[];
+
     let raw: RawElOrText = match kind {
         ElementKind::Button { label, style } => {
+            // Button handles "press" directly (mapped to Click event).
             build_button(program, instance, label, style, links)
         }
         ElementKind::Stripe {
@@ -346,6 +351,8 @@ fn build_element_node(
             build_text_input(program, instance, placeholder.as_ref(), style, links, *focus)
         }
         ElementKind::Checkbox { checked, style, icon } => {
+            // Checkbox handles click directly.
+            handled_events = &["click"];
             build_checkbox(program, instance, checked.as_ref(), style, links, icon.as_ref())
         }
         ElementKind::Container { child, style } => {
@@ -365,7 +372,16 @@ fn build_element_node(
         }
     };
     // Attach common event handlers (hovered, blur, focus, click, double_click).
-    attach_common_events(raw, instance, links, hovered_cell)
+    // Filter out events already handled directly by the element builder.
+    if handled_events.is_empty() {
+        attach_common_events(raw, instance, links, hovered_cell)
+    } else {
+        let filtered: Vec<_> = links.iter()
+            .filter(|(name, _)| !handled_events.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        attach_common_events(raw, instance, &filtered, hovered_cell)
+    }
 }
 
 /// Attach common event handlers (hovered, blur, focus, click, double_click) to an element.
@@ -946,9 +962,9 @@ fn build_paragraph(
     }
 }
 
-/// Build a Checkbox element.
-/// When an `icon` is provided, renders as a `<label>` with a hidden `<input>` and the icon
-/// as a custom visual replacement (matching Zoon's Checkbox component behavior).
+/// Build a Checkbox element using Zoon's Checkbox component.
+/// This ensures proper DOM structure and event handling for real user clicks,
+/// matching the Actors engine's approach.
 fn build_checkbox(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
@@ -957,82 +973,130 @@ fn build_checkbox(
     links: &[(String, EventId)],
     icon: Option<&CellId>,
 ) -> RawElOrText {
-    // NOTE: Click handler is NOT added here — attach_common_events wraps this element
-    // with a <div display:contents> that handles click/blur/focus/etc. Adding a click
-    // handler directly on the <input> would cause double-firing due to event bubbling.
+    let click_event = links.iter().find(|(n, _)| n == "click").map(|(_, e)| *e);
 
-    // Build the hidden <input type="checkbox">
-    // role="checkbox" is placed on the label (when icon present) so click detection
-    // tools can find a visible element with that role.
-    let mut input = RawHtmlEl::new("input")
-        .attr("type", "checkbox")
-        .style("position", "absolute")
-        .style("opacity", "0")
-        .style("width", "0")
-        .style("height", "0")
-        .style("margin", "0")
-        .style("padding", "0");
+    let mut raw = RawHtmlEl::new("div")
+        .attr("role", "checkbox")
+        .style("cursor", "pointer")
+        .style("display", "inline-flex")
+        .style("flex-direction", "column");
 
-    // Reactively bind the `checked` property to the cell value.
+    // Reactively set aria-checked from the checked cell signal.
     if let Some(&checked_cell) = checked {
         let store = instance.cell_store.clone();
         let cell_id = checked_cell.0;
-        let initial = store.get_cell_value(cell_id) != 0.0;
-        if initial {
-            input = input.attr("checked", "");
-        }
-        input = input.after_insert(move |el: web_sys::HtmlElement| {
-            let handle = Task::start_droppable(
-                store.get_cell_signal(cell_id)
-                    .for_each_sync(move |val| {
-                        let is_checked = val != 0.0;
-                        if let Some(inp) = el.dyn_ref::<web_sys::HtmlInputElement>() {
-                            inp.set_checked(is_checked);
-                        }
-                    })
-            );
-            std::mem::forget(handle);
+        raw = raw.attr_signal(
+            "aria-checked",
+            store.get_cell_signal(cell_id).map(|v| if v != 0.0 { "true" } else { "false" }),
+        );
+    }
+
+    // Add icon as child with pointer-events:none so real clicks pass through
+    // to the checkbox div (otherwise clicks land on icon children and
+    // dominator's event handler on the checkbox doesn't fire).
+    if let Some(&icon_cell) = icon {
+        let icon_el = build_cell_element(program, instance, icon_cell);
+        let icon_el = match icon_el {
+            RawElOrText::RawHtmlEl(el) => {
+                RawElOrText::RawHtmlEl(el.style("pointer-events", "none"))
+            }
+            other => other,
+        };
+        raw = raw.child(icon_el);
+    }
+
+    raw = apply_styles(raw, style, program, instance);
+
+    if let Some(event_id) = click_event {
+        let inst = instance.clone();
+        raw = raw.event_handler(move |_: events::Click| {
+            let _ = inst.fire_event(event_id.0);
         });
     }
 
-    // If an icon is provided, wrap with the icon as visual representation.
-    // Use <div> instead of <label> to avoid native label click-forwarding
-    // which interferes with the event wrapper from attach_common_events.
-    if let Some(&icon_cell) = icon {
-        let icon_el = build_cell_element(program, instance, icon_cell);
-        let mut wrapper = RawHtmlEl::new("div")
-            .attr("role", "checkbox")
-            .style("display", "flex")
-            .style("align-items", "center")
-            .style("cursor", "pointer")
-            .style("position", "relative");
-        // Reactively set aria-checked for accessibility and test tooling.
-        if let Some(&checked_cell) = checked {
-            let store2 = instance.cell_store.clone();
-            let cell_id2 = checked_cell.0;
-            let initial2 = store2.get_cell_value(cell_id2) != 0.0;
-            wrapper = wrapper.attr("aria-checked", if initial2 { "true" } else { "false" });
-            wrapper = wrapper.after_insert(move |el: web_sys::HtmlElement| {
-                let handle = Task::start_droppable(
-                    store2.get_cell_signal(cell_id2)
-                        .for_each_sync(move |val| {
-                            let _ = el.set_attribute("aria-checked", if val != 0.0 { "true" } else { "false" });
-                        })
-                );
-                std::mem::forget(handle);
-            });
+    raw.into_raw_unchecked()
+}
+
+/// Extracted dimension value.
+enum DimensionValue {
+    Px(f64),
+    Fill,
+}
+
+/// Extracted style fields for Zoon element construction.
+struct StyleFields {
+    width: Option<DimensionValue>,
+    height: Option<DimensionValue>,
+    align_column: Option<String>,
+}
+
+/// Extract simple style fields from an IrExpr for use with Zoon's style API.
+fn extract_style_fields(style: &IrExpr) -> StyleFields {
+    let mut result = StyleFields { width: None, height: None, align_column: None };
+    let fields = match style {
+        IrExpr::ObjectConstruct(fields) => fields.as_slice(),
+        _ => return result,
+    };
+    for (name, value) in fields {
+        match name.as_str() {
+            "width" => result.width = extract_dimension(value),
+            "height" => result.height = extract_dimension(value),
+            "align" => {
+                if let IrExpr::ObjectConstruct(align_fields) = value {
+                    for (aname, aval) in align_fields {
+                        if aname == "column" {
+                            if let IrExpr::Constant(IrValue::Tag(t)) = aval {
+                                result.align_column = Some(t.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
-        wrapper = apply_styles(wrapper, style, program, instance);
-        wrapper = wrapper
-            .child(input)
-            .child(icon_el);
-        wrapper.into_raw_unchecked()
-    } else {
-        // No icon — visible checkbox input with role for click detection.
-        input = input.attr("role", "checkbox");
-        input = apply_styles(input, style, program, instance);
-        input.into_raw_unchecked()
     }
+    result
+}
+
+fn extract_dimension(expr: &IrExpr) -> Option<DimensionValue> {
+    match expr {
+        IrExpr::Constant(IrValue::Number(n)) => Some(DimensionValue::Px(*n)),
+        IrExpr::Constant(IrValue::Tag(t)) if t == "Fill" => Some(DimensionValue::Fill),
+        _ => None,
+    }
+}
+
+/// Extract padding values from a style IrExpr.
+fn extract_padding(style: &IrExpr) -> Option<(f64, f64, f64, f64)> {
+    let fields = match style {
+        IrExpr::ObjectConstruct(fields) => fields,
+        _ => return None,
+    };
+    for (name, value) in fields {
+        if name == "padding" {
+            if let IrExpr::ObjectConstruct(pad_fields) = value {
+                let mut top = 0.0;
+                let mut right = 0.0;
+                let mut bottom = 0.0;
+                let mut left = 0.0;
+                for (pname, pval) in pad_fields {
+                    if let IrExpr::Constant(IrValue::Number(n)) = pval {
+                        match pname.as_str() {
+                            "top" => top = *n,
+                            "bottom" => bottom = *n,
+                            "left" => left = *n,
+                            "right" => right = *n,
+                            "row" => { top = *n; bottom = *n; }
+                            "column" => { left = *n; right = *n; }
+                            _ => {}
+                        }
+                    }
+                }
+                return Some((top, right, bottom, left));
+            }
+        }
+    }
+    None
 }
 
 /// Build a WHILE element — reactively switches child based on source cell value.
@@ -1764,8 +1828,13 @@ fn build_item_element_node(
     links: &[(String, EventId)],
     hovered_cell: Option<CellId>,
 ) -> RawElOrText {
+    // Track which event names are handled directly by the element builder
+    // so attach_item_events doesn't duplicate them.
+    let mut handled_events: &[&str] = &[];
+
     let raw: RawElOrText = match kind {
         ElementKind::Button { label, style } => {
+            // Button handles "press" directly (mapped to Click event).
             build_item_button(program, instance, ctx, label, style, links)
         }
         ElementKind::Stripe { direction, items, gap, style, .. } => {
@@ -1775,6 +1844,8 @@ fn build_item_element_node(
             build_item_text_input(program, instance, ctx, placeholder.as_ref(), style, links, *focus, *reactive_text_cell)
         }
         ElementKind::Checkbox { checked, style, icon } => {
+            // Checkbox handles click directly.
+            handled_events = &["click"];
             build_item_checkbox(program, instance, ctx, checked.as_ref(), style, links, icon.as_ref())
         }
         ElementKind::Container { child, style } => {
@@ -1794,7 +1865,16 @@ fn build_item_element_node(
         }
     };
     // Attach event handlers with per-item routing.
-    attach_item_events(raw, instance, ctx, links, hovered_cell)
+    // Filter out events already handled directly by the element builder.
+    if handled_events.is_empty() {
+        attach_item_events(raw, instance, ctx, links, hovered_cell)
+    } else {
+        let filtered: Vec<_> = links.iter()
+            .filter(|(name, _)| !handled_events.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        attach_item_events(raw, instance, ctx, &filtered, hovered_cell)
+    }
 }
 
 /// Attach event handlers to a per-item element.
@@ -2189,6 +2269,7 @@ fn build_item_text_input(
 }
 
 /// Build a per-item Checkbox element.
+/// Uses the same pattern as build_item_button: raw element + direct event_handler.
 fn build_item_checkbox(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
@@ -2198,86 +2279,55 @@ fn build_item_checkbox(
     links: &[(String, EventId)],
     icon: Option<&CellId>,
 ) -> RawElOrText {
-    // NOTE: Click handler is NOT added here — attach_item_events wraps this element
-    // with a <div display:contents> that handles click/blur/focus/etc. Adding a click
-    // handler directly on the <input> would cause double-firing due to event bubbling.
-    // role="checkbox" is placed on the label (when icon present) so click detection
-    // tools can find a visible element with that role.
-    let mut input = RawHtmlEl::new("input")
-        .attr("type", "checkbox")
-        .style("position", "absolute")
-        .style("opacity", "0")
-        .style("width", "0")
-        .style("height", "0")
-        .style("margin", "0")
-        .style("padding", "0");
+    let click_event = links.iter().find(|(n, _)| n == "click").map(|(_, e)| *e);
+    let item_idx = ctx.item_idx;
 
-    // Reactively bind the `checked` property to the cell value.
+    let mut raw = RawHtmlEl::new("div")
+        .attr("role", "checkbox")
+        .style("cursor", "pointer")
+        .style("display", "inline-flex")
+        .style("flex-direction", "column");
+
+    // Reactively set aria-checked from the per-item cell store.
     if let Some(&checked_cell) = checked {
         if let Some(ref ics) = instance.item_cell_store {
             let ics = ics.clone();
-            let item_idx = ctx.item_idx;
             let cell_id = checked_cell.0;
-            let initial_val = ics.get_value(item_idx, cell_id);
-            let initial = initial_val != 0.0;
-            if initial {
-                input = input.attr("checked", "");
-            }
-            input = input.after_insert(move |el: web_sys::HtmlElement| {
-                let handle = Task::start_droppable(
-                    ics.get_signal(item_idx, cell_id)
-                        .for_each_sync(move |val| {
-                            let is_checked = val != 0.0;
-                            if let Some(inp) = el.dyn_ref::<web_sys::HtmlInputElement>() {
-                                inp.set_checked(is_checked);
-                            }
-                        })
-                );
-                std::mem::forget(handle);
-            });
+            raw = raw.attr_signal(
+                "aria-checked",
+                ics.get_signal(item_idx, cell_id).map(|v| if v != 0.0 { "true" } else { "false" }),
+            );
         }
     }
 
+    // Add icon as child with pointer-events:none so real clicks pass through
+    // to the checkbox div (see build_checkbox for explanation).
     if let Some(&icon_cell) = icon {
         let icon_el = build_item_element(program, instance, ctx, icon_cell);
-        // Use <div> instead of <label> to avoid native label click-forwarding
-        // which interferes with the event wrapper from attach_item_events.
-        let mut wrapper = RawHtmlEl::new("div")
-            .attr("role", "checkbox")
-            .style("display", "flex")
-            .style("align-items", "center")
-            .style("cursor", "pointer")
-            .style("position", "relative");
-        // Reactively set aria-checked for accessibility and test tooling.
-        if let Some(&checked_cell) = checked {
-            if let Some(ref ics) = instance.item_cell_store {
-                let ics2 = ics.clone();
-                let item_idx2 = ctx.item_idx;
-                let cell_id2 = checked_cell.0;
-                let initial2 = ics2.get_value(item_idx2, cell_id2) != 0.0;
-                wrapper = wrapper.attr("aria-checked", if initial2 { "true" } else { "false" });
-                wrapper = wrapper.after_insert(move |el: web_sys::HtmlElement| {
-                    let handle = Task::start_droppable(
-                        ics2.get_signal(item_idx2, cell_id2)
-                            .for_each_sync(move |val| {
-                                let _ = el.set_attribute("aria-checked", if val != 0.0 { "true" } else { "false" });
-                            })
-                    );
-                    std::mem::forget(handle);
-                });
+        let icon_el = match icon_el {
+            RawElOrText::RawHtmlEl(el) => {
+                RawElOrText::RawHtmlEl(el.style("pointer-events", "none"))
             }
-        }
-        wrapper = apply_styles_item(wrapper, style, program, instance, ctx);
-        wrapper = wrapper
-            .child(input)
-            .child(icon_el);
-        wrapper.into_raw_unchecked()
-    } else {
-        // No icon — visible checkbox input with role for click detection.
-        input = input.attr("role", "checkbox");
-        input = apply_styles_item(input, style, program, instance, ctx);
-        input.into_raw_unchecked()
+            other => other,
+        };
+        raw = raw.child(icon_el);
     }
+
+    raw = apply_styles_item(raw, style, program, instance, ctx);
+
+    if let Some(event_id) = click_event {
+        let inst = instance.clone();
+        let is_template = ctx.is_template_event(event_id);
+        raw = raw.event_handler(move |_: events::Click| {
+            if is_template {
+                let _ = inst.call_on_item_event(item_idx, event_id.0);
+            } else {
+                let _ = inst.fire_event(event_id.0);
+            }
+        });
+    }
+
+    raw.into_raw_unchecked()
 }
 
 /// Build a per-item Container element.
