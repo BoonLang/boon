@@ -54,7 +54,7 @@ default = ["debug-channels", "engine-dd"]
 # Use engine-both to enable runtime engine switching
 engine-actors = []
 engine-dd = ["dep:ordered-float", "dep:indexmap", "dep:js-sys", "dep:timely", "dep:differential-dataflow"]
-engine-wasm = ["dep:wasm-encoder", "dep:js-sys", "dep:wasm-bindgen"]
+engine-wasm = ["dep:wasm-encoder", "dep:js-sys", "dep:wasm-bindgen", "dep:serde_json"]
 engine-both = ["engine-actors", "engine-dd"]
 engine-all = ["engine-actors", "engine-dd", "engine-wasm"]
 

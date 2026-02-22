@@ -985,7 +985,9 @@ fn build_checkbox(
         .attr("role", "checkbox")
         .style("cursor", "pointer")
         .style("display", "inline-flex")
-        .style("flex-direction", "column");
+        .style("flex-direction", "column")
+        .style("justify-content", "center")
+        .style("align-items", "center");
 
     // Reactively set aria-checked from the checked cell signal.
     if let Some(&checked_cell) = checked {
@@ -1644,6 +1646,15 @@ fn build_list_map(
 
             // Update initialized count so future re-renders don't re-init existing items.
             initialized_count.set(item_count);
+
+            // Finalize snapshot restore: re-derive global values from
+            // restored per-item WASM memory and re-apply global cells.
+            inst.finalize_restore();
+
+            // Enable persistence saving now that all items are initialized.
+            // This prevents premature saves (e.g., from router events during startup)
+            // before per-item state is ready.
+            inst.enable_save();
 
             Some(
                 RawHtmlEl::new("div")
@@ -2386,7 +2397,9 @@ fn build_item_checkbox(
         .attr("role", "checkbox")
         .style("cursor", "pointer")
         .style("display", "inline-flex")
-        .style("flex-direction", "column");
+        .style("flex-direction", "column")
+        .style("justify-content", "center")
+        .style("align-items", "center");
 
     // Reactively set aria-checked from the per-item cell store.
     if let Some(&checked_cell) = checked {
@@ -3109,7 +3122,7 @@ fn apply_font(
                 if let Some(css) = resolve_color(val) {
                     el = el.style("color", &css);
                 } else {
-                    el = apply_reactive_color(el, "color", val, instance);
+                    el = apply_reactive_color(el, "color", val, program, instance, item_ctx);
                 }
             }
             "weight" => {
@@ -3848,13 +3861,15 @@ fn apply_reactive_color(
     el: RawHtmlEl<web_sys::HtmlElement>,
     css_prop: &'static str,
     expr: &IrExpr,
+    program: &IrProgram,
     instance: &Rc<WasmInstance>,
+    item_ctx: Option<&ItemContext>,
 ) -> RawHtmlEl<web_sys::HtmlElement> {
+    // Case 1: TaggedObject with reactive CellRead fields (e.g., Oklch with reactive lightness).
     if let IrExpr::TaggedObject { tag, fields } = expr {
         if tag != "Oklch" {
             return el;
         }
-        // Extract static defaults and reactive cell IDs for each field.
         let mut lightness_cell = None;
         let mut chroma_cell = None;
         let mut hue_cell = None;
@@ -3885,7 +3900,6 @@ fn apply_reactive_color(
                 _ => {}
             }
         }
-        // Use the first reactive cell as the signal source.
         let store = instance.cell_store.clone();
         if let Some(cell_id) = lightness_cell {
             return el.style_signal(css_prop, store.get_cell_signal(cell_id).map(move |v| {
@@ -3900,5 +3914,101 @@ fn apply_reactive_color(
             }));
         }
     }
+    // Case 2: CellRead pointing to a PatternMatch node whose arms produce constant Oklch values.
+    // This handles: `completed |> WHILE { True => Oklch[lightness: 0.647], False => Oklch[lightness: 0.42] }`
+    // The PatternMatch source cell (completed) changes per-item, and each arm body resolves to a static CSS color.
+    if let IrExpr::CellRead(cell) = expr {
+        if let Some(color_mapping) = resolve_pattern_match_colors(program, *cell) {
+            // color_mapping: (source_cell, vec of (pattern_value, css_color), default_css)
+            let (source_cell, arms, default_css) = color_mapping;
+            let is_template = item_ctx.map_or(false, |ctx|
+                source_cell.0 >= ctx.template_cell_range.0 && source_cell.0 < ctx.template_cell_range.1
+            );
+            if is_template {
+                if let Some(ctx) = item_ctx {
+                    if let Some(ref ics) = instance.item_cell_store {
+                        let signal = ics.get_signal(ctx.item_idx, source_cell.0);
+                        return el.style_signal(css_prop, signal.map(move |v| {
+                            for (pattern_val, css) in &arms {
+                                if v.to_bits() == pattern_val.to_bits() {
+                                    return Some(css.clone());
+                                }
+                            }
+                            Some(default_css.clone())
+                        }));
+                    }
+                }
+            } else {
+                let store = instance.cell_store.clone();
+                return el.style_signal(css_prop, store.get_cell_signal(source_cell.0).map(move |v| {
+                    for (pattern_val, css) in &arms {
+                        if v.to_bits() == pattern_val.to_bits() {
+                            return Some(css.clone());
+                        }
+                    }
+                    Some(default_css.clone())
+                }));
+            }
+        }
+    }
     el
+}
+
+/// Try to resolve a CellRead to a PatternMatch with constant Oklch arm bodies.
+/// Returns (source_cell, vec of (pattern_f64_value, css_color_string), default_css).
+fn resolve_pattern_match_colors(
+    program: &IrProgram,
+    cell: CellId,
+) -> Option<(CellId, Vec<(f64, String)>, String)> {
+    // Find the node for this cell.
+    for node in &program.nodes {
+        // Extract source and arms from When or While nodes.
+        let (source, arms) = match node {
+            IrNode::When { cell: c, source, arms } if *c == cell => (source, arms),
+            IrNode::While { cell: c, source, arms, .. } if *c == cell => (source, arms),
+            _ => continue,
+        };
+        let mut color_arms: Vec<(f64, String)> = Vec::new();
+        let mut default_css = String::new();
+        for (pattern, body) in arms {
+            let css = resolve_color_full(body)?;
+            let pattern_val = pattern_to_f64_opt(pattern, &program.tag_table)?;
+            if default_css.is_empty() {
+                default_css = css.clone();
+            }
+            color_arms.push((pattern_val, css));
+        }
+        if color_arms.is_empty() {
+            return None;
+        }
+        // Resolve source: if it's a CellRead chain, follow it.
+        let source_cell = follow_cell_read(program, *source);
+        return Some((source_cell, color_arms, default_css));
+    }
+    None
+}
+
+/// Convert an IrPattern to its f64 representation for color mapping.
+/// Returns None for patterns that can't be mapped (Text, Binding).
+fn pattern_to_f64_opt(pattern: &IrPattern, tag_table: &[String]) -> Option<f64> {
+    match pattern {
+        IrPattern::Number(n) => Some(*n),
+        IrPattern::Tag(t) => {
+            tag_table.iter().position(|s| s == t).map(|i| (i + 1) as f64)
+        }
+        IrPattern::Wildcard => Some(f64::NAN),
+        _ => None,
+    }
+}
+
+/// Follow a CellRead chain through Derived { expr: CellRead } nodes.
+fn follow_cell_read(program: &IrProgram, cell: CellId) -> CellId {
+    for node in &program.nodes {
+        if let IrNode::Derived { cell: c, expr: IrExpr::CellRead(source) } = node {
+            if *c == cell {
+                return follow_cell_read(program, *source);
+            }
+        }
+    }
+    cell
 }

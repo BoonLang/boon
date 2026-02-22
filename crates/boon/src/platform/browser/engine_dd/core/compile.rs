@@ -657,11 +657,12 @@ impl Compiler {
                         // Evaluate 'element' arg first for self-references (element.hovered etc.)
                         let mut elem_scope = local_scope.clone();
                         let mut hover_path: Option<String> = None;
+                        let mut has_hovered_link = false;
                         if let Some(el_arg) = arguments.iter().find(|a| a.node.name.as_str() == "element") {
                             if let Some(ref val_expr) = el_arg.node.value {
                                 let el_val = self.eval_static_tolerant(val_expr, local_scope);
                                 // Check for hovered: LINK and resolve hover state from scope
-                                let has_hovered_link = el_val.get_field("hovered")
+                                has_hovered_link = el_val.get_field("hovered")
                                     .map(|v| v.as_tag() == Some("LINK"))
                                     .unwrap_or(false);
                                 if has_hovered_link {
@@ -691,6 +692,20 @@ impl Compiler {
                         // Inject __hover_path__ for the bridge
                         if let Some(ref path) = hover_path {
                             fields.insert(Arc::from(HOVER_PATH_FIELD), Value::text(path.as_str()));
+                        }
+                        // If element has hovered: LINK, also evaluate style with hovered=True
+                        // and store as __style_hovered__ so the bridge can create hover signals.
+                        if has_hovered_link {
+                            let mut hovered_scope = elem_scope.clone();
+                            if let Some(el_val) = hovered_scope.get("element").cloned() {
+                                hovered_scope.insert("element".to_string(), el_val.update_field("hovered", Value::tag("True")));
+                            }
+                            if let Some(style_arg) = arguments.iter().find(|a| a.node.name.as_str() == "style") {
+                                if let Some(ref val_expr) = style_arg.node.value {
+                                    let hovered_style = self.eval_static_tolerant(val_expr, &hovered_scope);
+                                    fields.insert(Arc::from("__style_hovered__"), hovered_style);
+                                }
+                            }
                         }
                         Value::Tagged {
                             tag: Arc::from(tag),
@@ -921,11 +936,12 @@ impl Compiler {
         // LINK markers are replaced with defaults (hovered → False, events → Unit).
         let mut elem_scope = local_scope.clone();
         let mut hover_path: Option<String> = None;
+        let mut has_hovered_link = false;
         if let Some(el_arg) = arguments.iter().find(|a| a.node.name.as_str() == "element") {
             if let Some(ref val_expr) = el_arg.node.value {
                 let el_val = self.eval_static_with_scope(val_expr, local_scope)?;
                 // Check if element has hovered: LINK and resolve hover state from scope
-                let has_hovered_link = el_val.get_field("hovered")
+                has_hovered_link = el_val.get_field("hovered")
                     .map(|v| v.as_tag() == Some("LINK"))
                     .unwrap_or(false);
                 if has_hovered_link {
@@ -958,6 +974,23 @@ impl Compiler {
         // Inject __hover_path__ for the bridge to extract
         if let Some(ref path) = hover_path {
             fields.insert(Arc::from(HOVER_PATH_FIELD), Value::text(path.as_str()));
+        }
+        // If element has hovered: LINK, also evaluate style with hovered=True
+        // and store as __style_hovered__ so the bridge can create hover signals.
+        // Check has_hovered_link (not hover_path) because non-list elements get their
+        // hover path from __link_path__ (LINK pipe), not from scope's __hover_path__.
+        if has_hovered_link {
+            let mut hovered_scope = elem_scope.clone();
+            if let Some(el_val) = hovered_scope.get("element").cloned() {
+                hovered_scope.insert("element".to_string(), el_val.update_field("hovered", Value::tag("True")));
+            }
+            if let Some(style_arg) = arguments.iter().find(|a| a.node.name.as_str() == "style") {
+                if let Some(ref val_expr) = style_arg.node.value {
+                    if let Ok(hovered_style) = self.eval_static_with_scope(val_expr, &hovered_scope) {
+                        fields.insert(Arc::from("__style_hovered__"), hovered_style);
+                    }
+                }
+            }
         }
         Ok(Value::Tagged {
             tag: Arc::from(tag),

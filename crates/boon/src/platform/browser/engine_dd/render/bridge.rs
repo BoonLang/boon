@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -550,6 +551,33 @@ fn extract_outline_from_fields(fields: &Fields) -> Option<Outline> {
 
 fn extract_outline(value: &Value) -> Option<Outline> {
     extract_outline_from_fields(get_fields(value)?)
+}
+
+/// Extract outline from a style Value (not full element — used for hovered style variant).
+fn extract_outline_from_style(style_value: &Value) -> Option<Outline> {
+    let style_fields = match style_value {
+        Value::Object(fields) => fields,
+        _ => return None,
+    };
+    let outline = style_fields.get("outline")?;
+    match outline {
+        Value::Tag(t) if t.as_ref() == "NoOutline" => None,
+        Value::Object(obj) => {
+            let color_css = obj.get("color").and_then(value_to_css_color)?;
+            let side = obj
+                .get("side")
+                .and_then(|v| v.as_tag())
+                .unwrap_or("Outer");
+            let mut o = if side == "Inner" {
+                Outline::inner()
+            } else {
+                Outline::outer()
+            };
+            o = o.color(color_css);
+            Some(o)
+        }
+        _ => None,
+    }
 }
 
 /// Extract Borders from element fields' style.
@@ -1096,6 +1124,10 @@ fn build_retained_button(
     let link_ref = Rc::new(RefCell::new(effective_link.clone()));
     let hover_link = extract_hover_link_path(fields, link_path);
 
+    // Check if this element has a hovered style variant from the compiler.
+    let has_hover_style = fields.contains_key("__style_hovered__");
+    let hover_state = Mutable::new(false);
+
     let el = Button::new()
         .update_raw_el(|raw_el| raw_el.attr("role", "button"))
         .label_signal(vm.signal_cloned().map(|v| {
@@ -1120,7 +1152,27 @@ fn build_retained_button(
                 .map(|n| n as u32)
         })))
         .s(Transform::with_signal_self(vm.signal_cloned().map(|v| extract_transform(&v))))
-        .s(Outline::with_signal_self(vm.signal_cloned().map(|v| extract_outline(&v))))
+        .s(Outline::with_signal_self(if has_hover_style {
+            // Combine DD value signal with local hover state for reactive outline.
+            let hs = hover_state.clone();
+            Box::pin(map_ref! {
+                let v = vm.signal_cloned(),
+                let hovered = hs.signal() => {
+                    if *hovered {
+                        // When hovered, extract outline from the __style_hovered__ variant.
+                        get_fields(v)
+                            .and_then(|f| f.get("__style_hovered__"))
+                            .and_then(|sv| extract_outline_from_style(sv))
+                            .or_else(|| extract_outline(v))
+                    } else {
+                        extract_outline(v)
+                    }
+                }
+            }) as Pin<Box<dyn Signal<Item = Option<Outline>>>>
+        } else {
+            Box::pin(vm.signal_cloned().map(|v| extract_outline(&v)))
+                as Pin<Box<dyn Signal<Item = Option<Outline>>>>
+        }))
         .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
         .update_raw_el({
             let vm = vm.clone();
@@ -1136,7 +1188,17 @@ fn build_retained_button(
                 }
             }
         })
-        .on_hovered_change(make_hover_handler(handle.clone_ref(), hover_link.clone()));
+        .on_hovered_change({
+            let hs = hover_state;
+            let handle_ref = handle.clone_ref();
+            let hover_link_clone = hover_link.clone();
+            move |hovered| {
+                hs.set_neq(hovered);
+                if let Some(ref path) = hover_link_clone {
+                    handle_ref.inject_dd_event(Event::HoverChange { link_path: path.clone(), hovered });
+                }
+            }
+        });
 
     (
         el.unify(),
@@ -1895,7 +1957,14 @@ impl RetainedNode {
             }
 
             RetainedNode::Button { value, link_path: lp } => {
-                value.set_neq(Arc::new(new_value.clone()));
+                // Preserve __style_hovered__ from old value (set by compiler, not DD runtime).
+                let mut updated = new_value.clone();
+                if let Some(old_fields) = get_fields(&value.get_cloned()) {
+                    if let Some(hovered_style) = old_fields.get("__style_hovered__") {
+                        updated = updated.update_field("__style_hovered__", hovered_style.clone());
+                    }
+                }
+                value.set_neq(Arc::new(updated));
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = extract_effective_link(fields, link_path);
                 }

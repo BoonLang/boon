@@ -969,9 +969,7 @@ check_contains "$PREVIEW" "Persistent todo" "'Persistent todo' added"
 echo ""
 echo "[22.2] Refresh and restore"
 bt refresh >/dev/null 2>&1 || true
-sleep 3
-bt run >/dev/null 2>&1 || true
-sleep 2
+sleep 5
 PREVIEW=$(bt preview)
 if echo "$PREVIEW" | grep -qF "Persistent todo"; then
     ok "Persistent todo survives refresh"

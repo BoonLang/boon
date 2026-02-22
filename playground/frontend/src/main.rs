@@ -23,6 +23,10 @@ use boon::platform::browser::engine_dd::{
     clear_dd_persisted_states,
 };
 
+// WASM engine imports (feature-gated)
+#[cfg(feature = "engine-wasm")]
+use boon::platform::browser::engine_wasm::clear_wasm_persisted_states;
+
 mod code_editor;
 use code_editor::CodeEditor;
 
@@ -814,6 +818,11 @@ impl Playground {
                             #[cfg(feature = "engine-dd")]
                             if engine_type_for_select.get() == EngineType::DifferentialDataflow {
                                 clear_dd_persisted_states();
+                            }
+
+                            #[cfg(feature = "engine-wasm")]
+                            if engine_type_for_select.get() == EngineType::Wasm {
+                                clear_wasm_persisted_states();
                             }
                         }
 
@@ -1667,11 +1676,14 @@ impl Playground {
                 #[cfg(feature = "engine-dd")]
                 clear_dd_persisted_states();
 
+                #[cfg(feature = "engine-wasm")]
+                clear_wasm_persisted_states();
+
                 local_storage().remove(STATES_STORAGE_KEY);
                 local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                 local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                 // Clear dynamically-keyed persistence data (list calls, removed sets, DD engine state)
-                clear_prefixed_storage_keys(&["list_calls:", "list_removed:", "dd_"]);
+                clear_prefixed_storage_keys(&["list_calls:", "list_removed:", "dd_", "wasm_"]);
             })
     }
 
@@ -2177,6 +2189,11 @@ impl Playground {
                         #[cfg(feature = "engine-dd")]
                         if engine_type.get() == EngineType::DifferentialDataflow {
                             clear_dd_persisted_states();
+                        }
+
+                        #[cfg(feature = "engine-wasm")]
+                        if engine_type.get() == EngineType::Wasm {
+                            clear_wasm_persisted_states();
                         }
                     }
 

@@ -12,6 +12,7 @@ use wasm_bindgen::JsCast;
 use zoon::*;
 
 use super::ir::{BinOp, IrExpr, IrNode, IrProgram, IrValue};
+use super::persistence;
 
 #[wasm_bindgen]
 extern "C" {
@@ -74,6 +75,10 @@ impl CellStore {
 
     pub fn get_cell_text(&self, cell_id: u32) -> String {
         self.inner.text_cells.borrow().get(cell_id as usize).cloned().unwrap_or_default()
+    }
+
+    pub fn cell_count(&self) -> usize {
+        self.inner.cells.len()
     }
 }
 
@@ -354,6 +359,43 @@ impl ListStore {
         }
     }
 
+    pub fn list_count(&self) -> usize {
+        self.inner.lists.borrow().len()
+    }
+
+    pub fn is_index_based(&self, list_id: f64) -> bool {
+        let idx = (list_id as usize).wrapping_sub(1);
+        self.inner.index_based.borrow().get(idx).copied().unwrap_or(false)
+    }
+
+    pub fn next_memory_index(&self, list_id: f64) -> usize {
+        let idx = (list_id as usize).wrapping_sub(1);
+        self.inner.next_memory_index.borrow().get(idx).copied().unwrap_or(0)
+    }
+
+    pub fn set_next_memory_index(&self, list_id: f64, val: usize) {
+        let idx = (list_id as usize).wrapping_sub(1);
+        if let Some(slot) = self.inner.next_memory_index.borrow_mut().get_mut(idx) {
+            *slot = val;
+        }
+    }
+
+    pub fn restore_index_based(&self, list_id: f64) {
+        let idx = (list_id as usize).wrapping_sub(1);
+        if let Some(flag) = self.inner.index_based.borrow_mut().get_mut(idx) {
+            *flag = true;
+        }
+    }
+
+    /// Bump the version of a list to trigger downstream signal updates.
+    pub fn bump_version(&self, list_id: f64) {
+        let idx = (list_id as usize).wrapping_sub(1);
+        let versions = self.inner.versions.borrow();
+        if let Some(ver) = versions.get(idx) {
+            ver.set(ver.get() + 1.0);
+        }
+    }
+
     /// Get the original memory index for a given position in a list.
     /// For index-based lists (from copy_item), returns the stored original index.
     /// For regular lists, returns the position itself.
@@ -511,6 +553,42 @@ impl ItemCellStore {
     pub fn template_cell_count(&self) -> u32 {
         self.inner.template_cell_count
     }
+
+    /// Number of item slots allocated (including removed items).
+    pub fn item_count(&self) -> usize {
+        self.inner.cells.borrow().len()
+    }
+
+    /// Dump all f64 cell values for an item. Returns (cell_id, value) pairs for non-NaN cells.
+    pub fn all_cell_values(&self, item_idx: u32) -> Vec<(u32, f64)> {
+        let cells = self.inner.cells.borrow();
+        let mut result = Vec::new();
+        if let Some(item) = cells.get(item_idx as usize) {
+            for (local, cell) in item.iter().enumerate() {
+                let val = cell.get();
+                if !val.is_nan() {
+                    let cell_id = self.inner.template_cell_start + local as u32;
+                    result.push((cell_id, val));
+                }
+            }
+        }
+        result
+    }
+
+    /// Dump all text cell values for an item. Returns (cell_id, text) pairs for non-empty texts.
+    pub fn all_text_values(&self, item_idx: u32) -> Vec<(u32, String)> {
+        let text_cells = self.inner.text_cells.borrow();
+        let mut result = Vec::new();
+        if let Some(item) = text_cells.get(item_idx as usize) {
+            for (local, text) in item.iter().enumerate() {
+                if !text.is_empty() {
+                    let cell_id = self.inner.template_cell_start + local as u32;
+                    result.push((cell_id, text.clone()));
+                }
+            }
+        }
+        result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +624,13 @@ pub struct WasmInstance {
     rerun_retain_filters_fn: js_sys::Function,
     /// Post-event hooks for cross-scope event propagation (global events → per-item updates).
     post_event_hooks: Rc<RefCell<Vec<Box<dyn Fn(u32)>>>>,
+    /// Persistence hook: called after all event processing (global + per-item) completes.
+    save_hook: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    /// Guard: save hook only fires after init_item has completed for all items.
+    /// Prevents premature saves (e.g., from router events) before per-item state is ready.
+    save_ready: std::cell::Cell<bool>,
+    /// Pending snapshot for deferred restore (applied during init_item calls).
+    pending_snapshot: Rc<RefCell<Option<Box<persistence::WasmSnapshot>>>>,
 }
 
 impl WasmInstance {
@@ -1010,6 +1095,7 @@ impl WasmInstance {
             .map_err(|_| "rerun_retain_filters is not a function".to_string())?;
 
         let program_tag_table = program.tag_table.clone();
+        let has_per_item_cells = item_cell_store.is_some();
 
         Ok(Self {
             instance,
@@ -1026,7 +1112,42 @@ impl WasmInstance {
             get_item_cell_fn,
             rerun_retain_filters_fn,
             post_event_hooks: Rc::new(RefCell::new(Vec::new())),
+            save_hook: Rc::new(RefCell::new(None)),
+            save_ready: std::cell::Cell::new(!has_per_item_cells),
+            pending_snapshot: Rc::new(RefCell::new(None)),
         })
+    }
+
+    /// Read bytes from WASM linear memory.
+    pub fn read_memory(&self, offset: usize, len: usize) -> Vec<u8> {
+        let exports = self.instance.exports();
+        if let Ok(mem_val) = Reflect::get(&exports, &"memory".into()) {
+            let mem: WebAssembly::Memory = mem_val.unchecked_into();
+            let buffer = mem.buffer();
+            let view = Uint8Array::new_with_byte_offset_and_length(
+                &buffer,
+                offset as u32,
+                len as u32,
+            );
+            view.to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Write bytes to WASM linear memory.
+    pub fn write_memory(&self, offset: usize, data: &[u8]) {
+        let exports = self.instance.exports();
+        if let Ok(mem_val) = Reflect::get(&exports, &"memory".into()) {
+            let mem: WebAssembly::Memory = mem_val.unchecked_into();
+            let buffer = mem.buffer();
+            let view = Uint8Array::new_with_byte_offset_and_length(
+                &buffer,
+                offset as u32,
+                data.len() as u32,
+            );
+            view.copy_from(data);
+        }
     }
 
     /// Call the `init()` exported function.
@@ -1127,6 +1248,7 @@ impl WasmInstance {
         // After all event handlers (global + per-item) have run,
         // re-evaluate per-item retain filters with updated values.
         let _ = self.call_rerun_retain_filters();
+        self.run_save_hook();
         Ok(())
     }
 
@@ -1136,12 +1258,53 @@ impl WasmInstance {
         self.post_event_hooks.borrow_mut().push(hook);
     }
 
+    /// Set the persistence save hook, called after all event processing completes.
+    pub fn set_save_hook(&self, hook: Box<dyn Fn()>) {
+        *self.save_hook.borrow_mut() = Some(hook);
+    }
+
+    fn run_save_hook(&self) {
+        if !self.save_ready.get() {
+            return;
+        }
+        if let Some(hook) = self.save_hook.borrow().as_ref() {
+            hook();
+        }
+    }
+
+    /// Enable the save hook. Call after all init_item calls have completed
+    /// and finalize_restore has run, so the first save captures complete state.
+    pub fn enable_save(&self) {
+        self.save_ready.set(true);
+    }
+
+    /// Store a snapshot for deferred restore during init_item calls.
+    pub(super) fn set_pending_snapshot(&self, snapshot: Box<persistence::WasmSnapshot>) {
+        *self.pending_snapshot.borrow_mut() = Some(snapshot);
+    }
+
     /// Call `init_item(item_idx)` to initialize per-item template cells.
+    /// If a pending snapshot exists, restores per-item cells and WASM memory
+    /// for this item immediately after init (overwriting defaults with persisted values).
     pub fn call_init_item(&self, item_idx: u32) -> Result<(), String> {
         self.init_item_fn
             .call1(&JsValue::NULL, &JsValue::from(item_idx as f64))
             .map_err(|e| format!("init_item({}) failed: {:?}", item_idx, e))?;
+        // Restore per-item state from snapshot if pending.
+        if let Some(ref snap) = *self.pending_snapshot.borrow() {
+            persistence::restore_single_item(self, item_idx, snap);
+        }
         Ok(())
+    }
+
+    /// Finalize snapshot restore after all items have been initialized.
+    /// Re-derives global values (e.g., active count) from restored WASM memory
+    /// and re-applies global cell values. Clears the pending snapshot.
+    pub fn finalize_restore(&self) {
+        let snap = self.pending_snapshot.borrow_mut().take();
+        if let Some(ref snap) = snap {
+            persistence::restore_globals(self, snap);
+        }
     }
 
     /// Call `on_item_event(item_idx, event_id)` to handle a per-item event.
@@ -1162,6 +1325,7 @@ impl WasmInstance {
     pub fn call_on_item_event(&self, item_idx: u32, event_id: u32) -> Result<(), String> {
         self.call_on_item_event_raw(item_idx, event_id)?;
         let _ = self.call_rerun_retain_filters();
+        self.run_save_hook();
         Ok(())
     }
 
@@ -1193,6 +1357,8 @@ impl WasmInstance {
         Ok(())
     }
 }
+
+
 
 /// Format an f64 value as text for display (integers without decimals).
 fn format_f64_for_text(val: f64) -> String {

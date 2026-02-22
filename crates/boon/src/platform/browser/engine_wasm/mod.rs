@@ -8,7 +8,9 @@ mod lower;
 mod codegen;
 pub mod runtime;
 pub mod bridge;
+mod persistence;
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use zoon::*;
@@ -18,10 +20,24 @@ use crate::parser::{
     static_expression, SourceCode, Token,
 };
 
+pub use persistence::clear_wasm_persisted_states;
+
+// Track whether this is the first run after page load (= page refresh).
+// On page refresh, WASM module reloads and this resets to true.
+// Only the first run should load persisted state; subsequent re-runs start fresh.
+thread_local! {
+    static FIRST_RUN: Cell<bool> = const { Cell::new(true) };
+}
+
 /// Run the WASM engine: compile source → generate WASM → instantiate → build UI.
 /// Returns a Zoon element tree.
 pub fn run_wasm(source: &str) -> RawElOrText {
-    match compile_and_run(source) {
+    let is_page_refresh = FIRST_RUN.with(|f| {
+        let first = f.get();
+        f.set(false);
+        first
+    });
+    match compile_and_run(source, is_page_refresh) {
         Ok(element) => element,
         Err(msg) => {
             El::new()
@@ -32,7 +48,7 @@ pub fn run_wasm(source: &str) -> RawElOrText {
     }
 }
 
-fn compile_and_run(source: &str) -> Result<RawElOrText, String> {
+fn compile_and_run(source: &str, restore_persistence: bool) -> Result<RawElOrText, String> {
     // 1. Parse and lower to IR.
     let program = Rc::new(compile(source)?);
 
@@ -53,11 +69,40 @@ fn compile_and_run(source: &str) -> Result<RawElOrText, String> {
     instance.call_init()
         .map_err(|e| format!("init() failed: {}", e))?;
 
-    // 7. Start timers.
+    // 7. Load persisted snapshot (only on page refresh, not on re-run).
+    let storage_key = persistence::storage_key(source);
+    let snapshot = if restore_persistence {
+        persistence::load_snapshot(&storage_key)
+    } else {
+        None
+    };
+
+    // 8. Phase 1 restore: global cells, texts, list structure, WASM memory.
+    //    Must happen before build_ui so the list has the right items.
+    //    Phase 2 (per-item cells) is deferred: the snapshot is stored on the
+    //    instance and applied inside each init_item call during reactive rendering.
+    if let Some(snap) = snapshot {
+        persistence::restore_phase1(&instance, &snap);
+        instance.set_pending_snapshot(snap);
+    }
+
+    // 9. Register persistence save hook (fires after every event).
+    let save_inst = instance.clone();
+    let save_key = storage_key.clone();
+    instance.set_save_hook(Box::new(move || {
+        persistence::save_and_store(&save_inst, &save_key);
+    }));
+
+    // 10. Start timers.
     instance.start_timers(&program);
 
-    // 8. Build Zoon element tree from IR + runtime.
-    Ok(bridge::build_ui(&program, instance))
+    // 11. Build Zoon element tree from IR + runtime.
+    //     init_item runs reactively (in child_signal closure) for each list item.
+    //     If a pending snapshot exists, each init_item auto-restores per-item state.
+    //     After all items are initialized, finalize_restore re-derives global values.
+    let ui = bridge::build_ui(&program, instance.clone());
+
+    Ok(ui)
 }
 
 fn compile(source: &str) -> Result<ir::IrProgram, String> {
