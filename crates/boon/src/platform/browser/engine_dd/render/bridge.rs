@@ -686,86 +686,140 @@ fn extract_self_align(value: &Value) -> Option<Align> {
     }
 }
 
-/// Apply all Zoon typed style signals from a Mutable<Value> to any element.
-/// Returns a closure suitable for `update_raw_el`.
-fn apply_zoon_style_signals<T: RawEl>(
+/// Extract typed Padding from a Mutable<Value> signal.
+fn extract_padding_style(vm: &Mutable<Arc<Value>>) -> Padding<'static> {
+    fn extract_sides(v: &Value) -> Option<(u32, u32, u32, u32)> {
+        let style = get_style_obj(get_fields(v)?)?;
+        let padding_val = style.get("padding")?;
+        match padding_val {
+            Value::Number(n) => {
+                let px = n.0 as u32;
+                Some((px, px, px, px))
+            }
+            Value::Object(padding) => {
+                let row = padding.get("row").and_then(|v| v.as_number()).unwrap_or(0.0);
+                let col = padding.get("column").and_then(|v| v.as_number()).unwrap_or(0.0);
+                let top = padding.get("top").and_then(|v| v.as_number()).unwrap_or(col) as u32;
+                let bottom = padding.get("bottom").and_then(|v| v.as_number()).unwrap_or(col) as u32;
+                let left = padding.get("left").and_then(|v| v.as_number()).unwrap_or(row) as u32;
+                let right = padding.get("right").and_then(|v| v.as_number()).unwrap_or(row) as u32;
+                Some((top, right, bottom, left))
+            }
+            _ => None,
+        }
+    }
+    let vm2 = vm.clone();
+    let vm3 = vm.clone();
+    let vm4 = vm.clone();
+    Padding::new()
+        .top_signal(vm.signal_cloned().map(|v| extract_sides(&v).map(|s| s.0)))
+        .right_signal(vm2.signal_cloned().map(|v| extract_sides(&v).map(|s| s.1)))
+        .bottom_signal(vm3.signal_cloned().map(|v| extract_sides(&v).map(|s| s.2)))
+        .left_signal(vm4.signal_cloned().map(|v| extract_sides(&v).map(|s| s.3)))
+}
+
+/// Extract typed Shadows from a Value.
+fn extract_shadows_from_value(v: &Value) -> Vec<Shadow> {
+    let style = match get_fields(v).and_then(get_style_obj) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    if let Some(Value::Tagged { tag, fields: list_fields }) = style.get("shadows") {
+        if tag.as_ref() == LIST_TAG {
+            let mut shadows = Vec::new();
+            for item in list_fields.values() {
+                if let Value::Object(shadow_obj) = item {
+                    let x = shadow_obj.get("x").and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                    let y = shadow_obj.get("y").and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                    let blur = shadow_obj.get("blur").and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+                    let spread = shadow_obj.get("spread").and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+                    let inset = shadow_obj.get("direction").and_then(|v| v.as_tag()).map(|t| t == "Inwards").unwrap_or(false);
+                    let color_css = shadow_obj.get("color").and_then(value_to_css_color).unwrap_or_else(|| "rgba(0,0,0,0.5)".to_string());
+                    let mut shadow = Shadow::new().x(x).y(y).blur(blur).spread(spread).color(color_css);
+                    if inset {
+                        shadow = shadow.inner();
+                    }
+                    shadows.push(shadow);
+                }
+            }
+            return shadows;
+        }
+    }
+    Vec::new()
+}
+
+/// Extract typed Shadows style from a Mutable<Value> signal.
+fn extract_shadows_style(vm: &Mutable<Arc<Value>>) -> Shadows<'static> {
+    Shadows::with_signal(vm.signal_cloned().map(|v| extract_shadows_from_value(&v)))
+}
+
+/// Extract a typed Border from a full element Value for a given side.
+fn extract_border_from_value(v: &Value, side: &str) -> Option<Border> {
+    let style = get_style_obj(get_fields(v)?)?;
+    let borders = match style.get("borders") {
+        Some(Value::Object(b)) => b,
+        _ => return None,
+    };
+    let side_obj = match borders.get(side) {
+        Some(Value::Object(s)) => s.as_ref(),
+        _ => return None,
+    };
+    extract_border_side(side_obj)
+}
+
+/// Extract typed Borders from a Mutable<Value> signal.
+fn extract_borders_style(vm: &Mutable<Arc<Value>>) -> Borders<'static> {
+    let vm2 = vm.clone();
+    let vm3 = vm.clone();
+    let vm4 = vm.clone();
+    Borders::new()
+        .top_signal(vm.signal_cloned().map(|v| extract_border_from_value(&v, "top")))
+        .bottom_signal(vm2.signal_cloned().map(|v| extract_border_from_value(&v, "bottom")))
+        .left_signal(vm3.signal_cloned().map(|v| extract_border_from_value(&v, "left")))
+        .right_signal(vm4.signal_cloned().map(|v| extract_border_from_value(&v, "right")))
+}
+
+/// Extract typed FontLine (strikethrough/underline) from a Value.
+fn extract_font_line_from_value(v: &Value) -> Option<FontLine<'static>> {
+    let style = get_style_obj(get_fields(v)?)?;
+    let font = match style.get("font")? {
+        Value::Object(f) => f.as_ref(),
+        Value::Tagged { fields, .. } => fields.as_ref(),
+        _ => return None,
+    };
+    let line = match font.get("line")? {
+        Value::Object(l) => l.as_ref(),
+        _ => return None,
+    };
+    let strike = line.get("strikethrough").and_then(|v| v.as_bool()).unwrap_or(false);
+    let underline = line.get("underline").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !strike && !underline {
+        return None;
+    }
+    let mut fl = FontLine::new();
+    if strike {
+        fl = fl.strike();
+    }
+    if underline {
+        fl = fl.underline();
+    }
+    Some(fl)
+}
+
+/// Extract typed Font with FontLine from a Mutable<Value> signal.
+fn extract_font_line_style(vm: &Mutable<Arc<Value>>) -> Font<'static> {
+    Font::with_signal_self(vm.signal_cloned().map(|v| {
+        extract_font_line_from_value(&v).map(|fl| Font::new().line(fl))
+    }))
+}
+
+/// Apply raw CSS properties that have no Zoon typed equivalent
+/// (line-height, text-shadow, -webkit-font-smoothing).
+fn apply_raw_css_signals<T: RawEl>(
     raw_el: T,
     vm: &Mutable<Arc<Value>>,
 ) -> T {
     raw_el
-        .style_signal("padding", vm.signal_cloned().map(|v| {
-            let fields = get_fields(&v)?;
-            let style = get_style_obj(fields)?;
-            let padding_val = style.get("padding")?;
-            match padding_val {
-                Value::Number(n) => Some(format!("{}px", n.0)),
-                Value::Object(padding) => {
-                    let row = padding.get("row").and_then(|v| v.as_number()).unwrap_or(0.0);
-                    let col = padding.get("column").and_then(|v| v.as_number()).unwrap_or(0.0);
-                    let top = padding.get("top").and_then(|v| v.as_number()).unwrap_or(col);
-                    let bottom = padding.get("bottom").and_then(|v| v.as_number()).unwrap_or(col);
-                    let left = padding.get("left").and_then(|v| v.as_number()).unwrap_or(row);
-                    let right = padding.get("right").and_then(|v| v.as_number()).unwrap_or(row);
-                    Some(format!("{}px {}px {}px {}px", top, right, bottom, left))
-                }
-                _ => None,
-            }
-        }))
-        .style_signal("box-shadow", vm.signal_cloned().map(|v| {
-            let fields = get_fields(&v)?;
-            let style = get_style_obj(fields)?;
-            if let Some(Value::Tagged {
-                tag,
-                fields: list_fields,
-            }) = style.get("shadows")
-            {
-                if tag.as_ref() == LIST_TAG {
-                    let mut shadow_parts = Vec::new();
-                    for item in list_fields.values() {
-                        if let Value::Object(shadow_obj) = item {
-                            let x = shadow_obj
-                                .get("x")
-                                .and_then(|v| v.as_number())
-                                .unwrap_or(0.0);
-                            let y = shadow_obj
-                                .get("y")
-                                .and_then(|v| v.as_number())
-                                .unwrap_or(0.0);
-                            let blur = shadow_obj
-                                .get("blur")
-                                .and_then(|v| v.as_number())
-                                .unwrap_or(0.0);
-                            let spread = shadow_obj
-                                .get("spread")
-                                .and_then(|v| v.as_number())
-                                .unwrap_or(0.0);
-                            let inset = shadow_obj
-                                .get("direction")
-                                .and_then(|v| v.as_tag())
-                                .map(|t| t == "Inwards")
-                                .unwrap_or(false);
-                            let color_css = shadow_obj
-                                .get("color")
-                                .and_then(value_to_css_color)
-                                .unwrap_or_else(|| "rgba(0,0,0,0.5)".to_string());
-                            let inset_str = if inset { "inset " } else { "" };
-                            shadow_parts.push(format!(
-                                "{}{}px {}px {}px {}px {}",
-                                inset_str, x, y, blur, spread, color_css
-                            ));
-                        }
-                    }
-                    if !shadow_parts.is_empty() {
-                        return Some(shadow_parts.join(", "));
-                    }
-                }
-            }
-            None
-        }))
-        .style_signal("border-top", vm.signal_cloned().map(|v| css_border_side(&v, "top")))
-        .style_signal("border-bottom", vm.signal_cloned().map(|v| css_border_side(&v, "bottom")))
-        .style_signal("border-left", vm.signal_cloned().map(|v| css_border_side(&v, "left")))
-        .style_signal("border-right", vm.signal_cloned().map(|v| css_border_side(&v, "right")))
         .style_signal("line-height", vm.signal_cloned().map(|v| {
             let style = get_style_obj(get_fields(&v)?)?;
             let lh = style.get("line_height")?.as_number()?;
@@ -793,49 +847,8 @@ fn apply_zoon_style_signals<T: RawEl>(
                 _ => None,
             }
         }))
-        .style_signal("text-decoration", vm.signal_cloned().map(|v| {
-            let style = get_style_obj(get_fields(&v)?)?;
-            let font = match style.get("font")? {
-                Value::Object(f) => f.as_ref(),
-                Value::Tagged { fields, .. } => fields.as_ref(),
-                _ => return None,
-            };
-            let line = match font.get("line")? {
-                Value::Object(l) => l.as_ref(),
-                _ => return None,
-            };
-            let strike = line.get("strikethrough").and_then(|v| v.as_bool()).unwrap_or(false);
-            let underline = line.get("underline").and_then(|v| v.as_bool()).unwrap_or(false);
-            match (strike, underline) {
-                (true, true) => Some("line-through underline".to_string()),
-                (true, false) => Some("line-through".to_string()),
-                (false, true) => Some("underline".to_string()),
-                (false, false) => Some("none".to_string()),
-            }
-        }))
 }
 
-/// CSS border-side extractor (kept for raw CSS signal use in retained tree).
-fn css_border_side(value: &Value, side: &str) -> Option<String> {
-    let style = get_style_obj(get_fields(value)?)?;
-    let borders = match style.get("borders") {
-        Some(Value::Object(b)) => b,
-        _ => return None,
-    };
-    let side_obj = match borders.get(side) {
-        Some(Value::Object(s)) => s,
-        _ => return None,
-    };
-    let width = side_obj
-        .get("width")
-        .and_then(|v| v.as_number())
-        .unwrap_or(1.0);
-    let color_css = side_obj
-        .get("color")
-        .and_then(value_to_css_color)
-        .unwrap_or_else(|| "currentColor".to_string());
-    Some(format!("{}px solid {}", width, color_css))
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Retained tree types
@@ -1174,9 +1187,13 @@ fn build_retained_button(
                 as Pin<Box<dyn Signal<Item = Option<Outline>>>>
         }))
         .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
+        .s(extract_padding_style(&vm))
+        .s(extract_shadows_style(&vm))
+        .s(extract_borders_style(&vm))
+        .s(extract_font_line_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
-            move |raw_el| apply_zoon_style_signals(raw_el, &vm)
+            move |raw_el| apply_raw_css_signals(raw_el, &vm)
         })
         .on_press({
             let handle_ref = handle.clone_ref();
@@ -1291,9 +1308,13 @@ fn build_retained_stripe(
         .s(Transform::with_signal_self(vm.signal_cloned().map(|v| extract_transform(&v))))
         .s(Outline::with_signal_self(vm.signal_cloned().map(|v| extract_outline(&v))))
         .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
+        .s(extract_padding_style(&vm))
+        .s(extract_shadows_style(&vm))
+        .s(extract_borders_style(&vm))
+        .s(extract_font_line_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
-            move |raw_el| apply_zoon_style_signals(raw_el, &vm)
+            move |raw_el| apply_raw_css_signals(raw_el, &vm)
         })
         .items_signal_vec(VecDiffStreamSignalVec(items_rx));
 
@@ -1439,11 +1460,15 @@ fn build_retained_container(
         .s(Transform::with_signal_self(vm.signal_cloned().map(|v| extract_transform(&v))))
         .s(Outline::with_signal_self(vm.signal_cloned().map(|v| extract_outline(&v))))
         .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
+        .s(extract_padding_style(&vm))
+        .s(extract_shadows_style(&vm))
+        .s(extract_borders_style(&vm))
+        .s(extract_font_line_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
             let child_rx = child_rx;
             move |raw_el| {
-                let raw_el = apply_zoon_style_signals(raw_el, &vm);
+                let raw_el = apply_raw_css_signals(raw_el, &vm);
                 raw_el.children_signal_vec(VecDiffStreamSignalVec(child_rx))
             }
         });
@@ -1480,41 +1505,25 @@ fn build_retained_label(
                 .and_then(|f| f.get("label"))
                 .map(|l| l.to_display_string())
                 .unwrap_or_default();
-            // Extract text-decoration from font.line (strikethrough/underline)
-            // Must be applied to inner El because CSS text-decoration doesn't propagate to block children
-            let text_decoration = fields
-                .and_then(|f| get_style_obj(f))
-                .and_then(|s| match s.get("font")? {
-                    Value::Object(f) => Some(f.as_ref()),
-                    Value::Tagged { fields, .. } => Some(fields.as_ref()),
-                    _ => None,
-                })
-                .and_then(|f| match f.get("line")? {
-                    Value::Object(l) => Some(l.as_ref()),
-                    _ => None,
-                })
-                .map(|line| {
-                    let strike = line.get("strikethrough").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let underline = line.get("underline").and_then(|v| v.as_bool()).unwrap_or(false);
-                    match (strike, underline) {
-                        (true, true) => "line-through underline",
-                        (true, false) => "line-through",
-                        (false, true) => "underline",
-                        _ => "none",
-                    }
-                });
+            // Apply text-decoration to inner El because CSS text-decoration
+            // doesn't propagate to block children
+            let font_line = extract_font_line_from_value(&v);
             let el = El::new().child(label);
-            if let Some(td) = text_decoration {
-                el.update_raw_el(|raw_el| raw_el.style("text-decoration", td))
+            if let Some(fl) = font_line {
+                el.s(Font::new().line(fl))
             } else {
                 el
             }
         }))
         .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
         .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
+        .s(extract_padding_style(&vm))
+        .s(extract_shadows_style(&vm))
+        .s(extract_borders_style(&vm))
+        .s(extract_font_line_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
-            move |raw_el| apply_zoon_style_signals(raw_el, &vm)
+            move |raw_el| apply_raw_css_signals(raw_el, &vm)
         })
         .on_double_click({
             let handle_ref = handle.clone_ref();
@@ -1590,13 +1599,17 @@ fn build_retained_text_input(
         .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
         .s(Background::new()
             .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
+        .s(extract_padding_style(&vm))
+        .s(extract_shadows_style(&vm))
+        .s(extract_borders_style(&vm))
+        .s(extract_font_line_style(&vm))
         .update_raw_el({
             let dom_el_ref = dom_el.clone();
             let initial_text = text.clone();
             let initial_focus = focus;
             let vm = vm.clone();
             move |raw_el| {
-                let raw_el = apply_zoon_style_signals(raw_el, &vm);
+                let raw_el = apply_raw_css_signals(raw_el, &vm);
                 raw_el.after_insert(move |input_el: web_sys::HtmlInputElement| {
                     if initial_focus {
                         input_el.set_value(&initial_text);
@@ -1731,9 +1744,13 @@ fn build_retained_checkbox(
             .s(Transform::with_signal_self(vm.signal_cloned().map(|v| extract_transform(&v))))
             .s(Outline::with_signal_self(vm.signal_cloned().map(|v| extract_outline(&v))))
             .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
+            .s(extract_padding_style(&vm))
+            .s(extract_shadows_style(&vm))
+            .s(extract_borders_style(&vm))
+            .s(extract_font_line_style(&vm))
             .update_raw_el({
                 let vm = vm.clone();
-                move |raw_el| apply_zoon_style_signals(raw_el, &vm)
+                move |raw_el| apply_raw_css_signals(raw_el, &vm)
             });
 
         if !effective_link.is_empty() {
@@ -1828,9 +1845,13 @@ fn build_retained_paragraph(
     let el = Paragraph::new()
         .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
         .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
+        .s(extract_padding_style(&vm))
+        .s(extract_shadows_style(&vm))
+        .s(extract_borders_style(&vm))
+        .s(extract_font_line_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
-            move |raw_el| apply_zoon_style_signals(raw_el, &vm)
+            move |raw_el| apply_raw_css_signals(raw_el, &vm)
         })
         .contents_signal_vec(VecDiffStreamSignalVec(contents_rx));
 
@@ -1871,9 +1892,13 @@ fn build_retained_link(
         }))
         .new_tab(NewTab::new())
         .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
+        .s(extract_padding_style(&vm))
+        .s(extract_shadows_style(&vm))
+        .s(extract_borders_style(&vm))
+        .s(extract_font_line_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
-            move |raw_el| apply_zoon_style_signals(raw_el, &vm)
+            move |raw_el| apply_raw_css_signals(raw_el, &vm)
         });
 
     // Wire hover events for element.hovered LINK

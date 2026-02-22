@@ -10,9 +10,6 @@ use zoon::*;
 use super::ir::*;
 use super::runtime::{CellStore, WasmInstance};
 
-thread_local! {
-    static PLACEHOLDER_STYLE_COUNT: Cell<u32> = Cell::new(0);
-}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -505,24 +502,21 @@ fn build_button(
         .find(|(name, _)| name == "press")
         .map(|(_, eid)| *eid);
 
-    let mut raw = RawHtmlEl::new("button")
-        .attr("role", "button")
-        .style("cursor", "pointer")
-        .style("border", "none")
-        .style("background", "transparent")
-        .style("color", "inherit")
-        .child(build_label_child(program, instance, label));
-
-    raw = apply_styles(raw, style, program, instance);
-
-    if let Some(event_id) = press_event {
-        let inst = instance.clone();
-        raw = raw.event_handler(move |_: events::Click| {
-            let _ = inst.fire_event(event_id.0);
-        });
-    }
-
-    raw.into_raw_unchecked()
+    let label_child = build_label_child(program, instance, label);
+    let inst = instance.clone();
+    Button::new()
+        .update_raw_el(|raw_el| {
+            let raw_el = raw_el.child(label_child);
+            let raw_el = apply_styles(raw_el, style, program, instance);
+            if let Some(event_id) = press_event {
+                raw_el.event_handler(move |_: events::Click| {
+                    let _ = inst.fire_event(event_id.0);
+                })
+            } else {
+                raw_el
+            }
+        })
+        .into_raw_unchecked()
 }
 
 /// Build a Stripe (row/column) element.
@@ -541,30 +535,29 @@ fn build_stripe(
         _ => true,
     };
 
-    let mut raw = RawHtmlEl::new("div");
-    if is_column {
-        raw = raw.style("display", "inline-flex").style("flex-direction", "column");
+    let stripe = if is_column {
+        Stripe::new()
     } else {
-        raw = raw
-            .style("display", "inline-flex")
-            .style("flex-direction", "row")
-            .style("align-items", "center");
-    }
+        Stripe::new().direction(Direction::Row)
+    };
 
-    // Apply gap if specified.
-    if let IrExpr::Constant(IrValue::Number(n)) = gap {
-        if *n > 0.0 {
-            raw = raw.style("gap", &format!("{}px", n));
-        }
-    }
-
-    if is_column {
-        raw = apply_styles(raw, style, program, instance);
-    } else {
-        raw = apply_styles_row(raw, style, program, instance);
-    }
-    raw = raw.children(children);
-    raw.into_raw_unchecked()
+    stripe
+        .update_raw_el(|raw_el| {
+            let mut raw_el = raw_el;
+            // Apply gap if specified.
+            if let IrExpr::Constant(IrValue::Number(n)) = gap {
+                if *n > 0.0 {
+                    raw_el = raw_el.style("gap", &format!("{}px", n));
+                }
+            }
+            raw_el = if is_column {
+                apply_styles(raw_el, style, program, instance)
+            } else {
+                apply_styles_row(raw_el, style, program, instance)
+            };
+            raw_el.children(children)
+        })
+        .into_raw_unchecked()
 }
 
 /// Collect children for a stripe element.
@@ -625,43 +618,6 @@ fn build_text_input(
     links: &[(String, EventId)],
     focus: bool,
 ) -> RawElOrText {
-    let mut raw = RawHtmlEl::new("input")
-        .attr("type", "text")
-        .style("box-sizing", "border-box")
-        .style("border", "none")
-        .style("outline", "none")
-        .style("color", "inherit")
-        .style("background", "transparent");
-
-    if focus {
-        raw = raw.attr("autofocus", "");
-        // Also programmatically focus after mount via after_insert.
-        raw = raw.after_insert(|el| {
-            let _ = el.focus();
-        });
-    }
-
-    raw = apply_styles(raw, style, program, instance);
-
-    // Extract placeholder text and styling.
-    let raw = if let Some(ph) = placeholder {
-        let text = extract_placeholder_text(ph, program);
-        let mut raw = if !text.is_empty() {
-            raw.attr("placeholder", &text)
-        } else {
-            raw
-        };
-        // Apply placeholder styles (font-style, color) via ::placeholder CSS rule.
-        let ph_styles = extract_placeholder_styles(ph, program);
-        if !ph_styles.is_empty() {
-            let class_name = next_placeholder_class();
-            raw = apply_placeholder_style_rule(raw, &class_name, &ph_styles);
-        }
-        raw
-    } else {
-        raw
-    };
-
     // Find events from links.
     let key_down_event = links.iter()
         .find(|(name, _)| name == "key_down")
@@ -670,75 +626,105 @@ fn build_text_input(
         .find(|(name, _)| name == "change")
         .map(|(_, eid)| *eid);
 
-    // Find data cells for event payloads by searching the program's cells.
-    // Convention: LINK placeholder cells have associated data cells named
-    // "{element_name}.event.key_down.key", "{element_name}.event.change.text", "{element_name}.text".
-    // We find them by looking for cells whose names end with these suffixes and match our events.
+    // Find data cells for event payloads.
     let key_data_cell = find_data_cell_for_event(program, links, "key_down", "key");
     let change_text_cell = find_data_cell_for_event(program, links, "change", "text");
     let text_cell = find_text_property_cell(program, links);
 
-    // Set up keydown event listener.
-    let raw = if let Some(event_id) = key_down_event {
-        let inst = instance.clone();
-        raw.event_handler(move |event: events::KeyDown| {
-            let key = event.key();
-            let tag_value = match key.as_str() {
-                "Enter" => inst.program_tag_index("Enter"),
-                "Escape" => inst.program_tag_index("Escape"),
-                _ => 0.0,
+    TextInput::new()
+        .update_raw_el(|raw_el| {
+            let mut raw_el = raw_el
+                .style("box-sizing", "border-box")
+                .style("border", "none")
+                .style("outline", "none")
+                .style("color", "inherit")
+                .style("background", "transparent");
+
+            if focus {
+                raw_el = raw_el.attr("autofocus", "");
+                raw_el = raw_el.after_insert(|el| {
+                    let _ = el.focus();
+                });
+            }
+
+            raw_el = apply_styles(raw_el, style, program, instance);
+
+            // Apply placeholder text and styles via Zoon's style_group
+            // (replaces the old <style> injection hack).
+            if let Some(ph) = placeholder {
+                let text = extract_placeholder_text(ph, program);
+                if !text.is_empty() {
+                    raw_el = raw_el.attr("placeholder", &text);
+                }
+                let ph_styles = extract_placeholder_styles(ph, program);
+                if !ph_styles.is_empty() {
+                    let mut group = StyleGroup::new("::placeholder");
+                    for (prop, val) in &ph_styles {
+                        match prop.as_str() {
+                            "font-style" => { group = group.style("font-style", val.clone()); }
+                            "color" => { group = group.style("color", val.clone()); }
+                            _ => {}
+                        }
+                    }
+                    raw_el = raw_el.style_group(group);
+                }
+            }
+
+            // Set up keydown event listener.
+            let raw_el = if let Some(event_id) = key_down_event {
+                let inst = instance.clone();
+                raw_el.event_handler(move |event: events::KeyDown| {
+                    let key = event.key();
+                    let tag_value = match key.as_str() {
+                        "Enter" => inst.program_tag_index("Enter"),
+                        "Escape" => inst.program_tag_index("Escape"),
+                        _ => 0.0,
+                    };
+                    if let Some(target) = event.target() {
+                        if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
+                            let input_text = input.value();
+                            if let Some(cell_id) = change_text_cell {
+                                inst.cell_store.set_cell_text(cell_id, input_text.clone());
+                            }
+                            if let Some(cell_id) = text_cell {
+                                inst.cell_store.set_cell_text(cell_id, input_text.clone());
+                            }
+                            if key == "Enter" {
+                                input.set_value("");
+                            }
+                        }
+                    }
+                    if let Some(cell_id) = key_data_cell {
+                        inst.set_cell_value(cell_id, tag_value);
+                    }
+                    let _ = inst.fire_event(event_id.0);
+                })
+            } else {
+                raw_el
             };
-            // Read input text from the DOM element.
-            if let Some(target) = event.target() {
-                if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
-                    let input_text = input.value();
-                    // Store text in the change text cell and the .text property cell.
-                    if let Some(cell_id) = change_text_cell {
-                        inst.cell_store.set_cell_text(cell_id, input_text.clone());
-                    }
-                    if let Some(cell_id) = text_cell {
-                        inst.cell_store.set_cell_text(cell_id, input_text.clone());
-                    }
-                    // Clear the input if Enter was pressed.
-                    if key == "Enter" {
-                        input.set_value("");
-                    }
-                }
-            }
-            // Set the key data cell.
-            if let Some(cell_id) = key_data_cell {
-                inst.set_cell_value(cell_id, tag_value);
-            }
-            // Fire the event.
-            let _ = inst.fire_event(event_id.0);
-        })
-    } else {
-        raw
-    };
 
-    // Set up input change event listener.
-    let raw = if let Some(event_id) = change_event {
-        let inst = instance.clone();
-        raw.event_handler(move |event: events::Input| {
-            // Read input text from the DOM element.
-            if let Some(target) = event.target() {
-                if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
-                    let input_text = input.value();
-                    if let Some(cell_id) = change_text_cell {
-                        inst.cell_store.set_cell_text(cell_id, input_text.clone());
+            // Set up input change event listener.
+            if let Some(event_id) = change_event {
+                let inst = instance.clone();
+                raw_el.event_handler(move |event: events::Input| {
+                    if let Some(target) = event.target() {
+                        if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
+                            let input_text = input.value();
+                            if let Some(cell_id) = change_text_cell {
+                                inst.cell_store.set_cell_text(cell_id, input_text.clone());
+                            }
+                            if let Some(cell_id) = text_cell {
+                                inst.cell_store.set_cell_text(cell_id, input_text);
+                            }
+                        }
                     }
-                    if let Some(cell_id) = text_cell {
-                        inst.cell_store.set_cell_text(cell_id, input_text);
-                    }
-                }
+                    let _ = inst.fire_event(event_id.0);
+                })
+            } else {
+                raw_el
             }
-            let _ = inst.fire_event(event_id.0);
         })
-    } else {
-        raw
-    };
-
-    raw.into_raw_unchecked()
+        .into_raw_unchecked()
 }
 
 /// Find a data cell for an event payload (e.g., key_down.key, change.text).
@@ -836,9 +822,12 @@ fn build_container(
     style: &IrExpr,
 ) -> RawElOrText {
     let child_el = build_cell_element(program, instance, child);
-    let mut raw = RawHtmlEl::new("div").child(child_el);
-    raw = apply_styles(raw, style, program, instance);
-    raw.into_raw_unchecked()
+    El::new()
+        .update_raw_el(|raw_el| {
+            let raw_el = raw_el.child(child_el);
+            apply_styles(raw_el, style, program, instance)
+        })
+        .into_raw_unchecked()
 }
 
 /// Build a Label element (displays text).
@@ -866,10 +855,12 @@ fn build_label(
             zoon::Text::new(text).unify()
         }
     };
-    // Wrap in a span with styles applied.
-    let mut raw = RawHtmlEl::new("span").child(content);
-    raw = apply_styles(raw, style, program, instance);
-    raw.into_raw_unchecked()
+    Label::new()
+        .update_raw_el(|raw_el| {
+            let raw_el = raw_el.child(content);
+            apply_styles(raw_el, style, program, instance)
+        })
+        .into_raw_unchecked()
 }
 
 /// Build a Stack element (z-axis layering).
@@ -880,11 +871,12 @@ fn build_stack(
     style: &IrExpr,
 ) -> RawElOrText {
     let children = collect_stripe_children(program, instance, layers_cell);
-    let mut raw = RawHtmlEl::new("div")
-        .style("position", "relative");
-    raw = apply_styles(raw, style, program, instance);
-    raw = raw.children(children);
-    raw.into_raw_unchecked()
+    Stack::new()
+        .update_raw_el(|raw_el| {
+            let raw_el = raw_el.children(children);
+            apply_styles(raw_el, style, program, instance)
+        })
+        .into_raw_unchecked()
 }
 
 /// Build a Link element.
@@ -898,15 +890,14 @@ fn build_link(
 ) -> RawElOrText {
     let label_text = resolve_static_text(program, label);
     let url_text = resolve_static_text(program, url);
-    let mut raw = RawHtmlEl::new("a")
-        .attr("href", &url_text)
-        .attr("target", "_blank")
-        .attr("rel", "noopener noreferrer")
-        .style("color", "inherit")
-        .style("text-decoration", "none")
-        .child(zoon::Text::new(label_text));
-    raw = apply_styles(raw, style, program, instance);
-    raw.into_raw_unchecked()
+    Link::new()
+        .to(&url_text)
+        .new_tab(NewTab::new())
+        .update_raw_el(|raw_el| {
+            let raw_el = raw_el.child(zoon::Text::new(label_text));
+            apply_styles(raw_el, style, program, instance)
+        })
+        .into_raw_unchecked()
 }
 
 /// Build a Paragraph element.
@@ -916,20 +907,16 @@ fn build_paragraph(
     content: &IrExpr,
     style: &IrExpr,
 ) -> RawElOrText {
-    let mut raw = RawHtmlEl::new("p");
-    raw = apply_styles(raw, style, program, instance);
-
-    match content {
+    // Build children based on content type.
+    let children: Vec<RawElOrText> = match content {
         IrExpr::TextConcat(segments) => {
-            raw.child(build_text_from_segments(instance, segments))
-                .into_raw_unchecked()
+            vec![build_text_from_segments(instance, segments)]
         }
         IrExpr::CellRead(cell) => {
-            // Check if it's a list of items (for `contents: LIST { ... }`).
             if let Some(node) = find_node_for_cell(program, *cell) {
                 match node {
                     IrNode::Derived { expr: IrExpr::ListConstruct(items), .. } => {
-                        let children: Vec<RawElOrText> = items.iter().map(|item| {
+                        items.iter().map(|item| {
                             match item {
                                 IrExpr::CellRead(child_cell) => {
                                     build_cell_element(program, instance, *child_cell)
@@ -942,21 +929,18 @@ fn build_paragraph(
                                     zoon::Text::new(t).unify()
                                 }
                             }
-                        }).collect();
-                        raw.children(children).into_raw_unchecked()
+                        }).collect()
                     }
                     _ => {
-                        raw.child(build_cell_element(program, instance, *cell))
-                            .into_raw_unchecked()
+                        vec![build_cell_element(program, instance, *cell)]
                     }
                 }
             } else {
-                raw.child(build_reactive_text(instance, *cell))
-                    .into_raw_unchecked()
+                vec![build_reactive_text(instance, *cell)]
             }
         }
         IrExpr::ListConstruct(items) => {
-            let children: Vec<RawElOrText> = items.iter().map(|item| {
+            items.iter().map(|item| {
                 match item {
                     IrExpr::CellRead(child_cell) => {
                         build_cell_element(program, instance, *child_cell)
@@ -969,14 +953,19 @@ fn build_paragraph(
                         zoon::Text::new(t).unify()
                     }
                 }
-            }).collect();
-            raw.children(children).into_raw_unchecked()
+            }).collect()
         }
         _ => {
             let text = eval_static_text(content);
-            raw.child(zoon::Text::new(text)).into_raw_unchecked()
+            vec![zoon::Text::new(text).unify()]
         }
-    }
+    };
+    Paragraph::new()
+        .update_raw_el(|raw_el| {
+            let raw_el = raw_el.children(children);
+            apply_styles(raw_el, style, program, instance)
+        })
+        .into_raw_unchecked()
 }
 
 /// Build a Checkbox element using Zoon's Checkbox component.
@@ -2109,30 +2098,26 @@ fn build_item_button(
         .find(|(name, _)| name == "press")
         .map(|(_, eid)| *eid);
 
-    let mut raw = RawHtmlEl::new("button")
-        .attr("role", "button")
-        .style("cursor", "pointer")
-        .style("border", "none")
-        .style("background", "transparent")
-        .style("color", "inherit")
-        .child(zoon::Text::new(label_text));
-
-    raw = apply_styles_item(raw, style, program, instance, ctx);
-
-    if let Some(event_id) = press_event {
-        let inst = instance.clone();
-        let item_idx = ctx.item_idx;
-        let is_template = ctx.is_template_event(event_id);
-        raw = raw.event_handler(move |_: events::Click| {
-            if is_template {
-                let _ = inst.call_on_item_event(item_idx, event_id.0);
+    let inst = instance.clone();
+    let item_idx = ctx.item_idx;
+    Button::new()
+        .update_raw_el(|raw_el| {
+            let raw_el = raw_el.child(zoon::Text::new(label_text));
+            let raw_el = apply_styles_item(raw_el, style, program, instance, ctx);
+            if let Some(event_id) = press_event {
+                let is_template = ctx.is_template_event(event_id);
+                raw_el.event_handler(move |_: events::Click| {
+                    if is_template {
+                        let _ = inst.call_on_item_event(item_idx, event_id.0);
+                    } else {
+                        let _ = inst.fire_event(event_id.0);
+                    }
+                })
             } else {
-                let _ = inst.fire_event(event_id.0);
+                raw_el
             }
-        });
-    }
-
-    raw.into_raw_unchecked()
+        })
+        .into_raw_unchecked()
 }
 
 /// Build a per-item Stripe element.
@@ -2152,30 +2137,29 @@ fn build_item_stripe(
         _ => true,
     };
 
-    let mut raw = RawHtmlEl::new("div");
-    if is_column {
-        raw = raw.style("display", "inline-flex").style("flex-direction", "column");
+    let stripe = if is_column {
+        Stripe::new()
     } else {
-        raw = raw
-            .style("display", "inline-flex")
-            .style("flex-direction", "row")
-            .style("align-items", "center");
-    }
+        Stripe::new().direction(Direction::Row)
+    };
 
-    // Apply gap if specified.
-    if let IrExpr::Constant(IrValue::Number(n)) = gap {
-        if *n > 0.0 {
-            raw = raw.style("gap", &format!("{}px", n));
-        }
-    }
-
-    if is_column {
-        raw = apply_styles_item(raw, style, program, instance, ctx);
-    } else {
-        raw = apply_styles_item_row(raw, style, program, instance, ctx);
-    }
-    raw = raw.children(children);
-    raw.into_raw_unchecked()
+    stripe
+        .update_raw_el(|raw_el| {
+            let mut raw_el = raw_el;
+            // Apply gap if specified.
+            if let IrExpr::Constant(IrValue::Number(n)) = gap {
+                if *n > 0.0 {
+                    raw_el = raw_el.style("gap", &format!("{}px", n));
+                }
+            }
+            raw_el = if is_column {
+                apply_styles_item(raw_el, style, program, instance, ctx)
+            } else {
+                apply_styles_item_row(raw_el, style, program, instance, ctx)
+            };
+            raw_el.children(children)
+        })
+        .into_raw_unchecked()
 }
 
 /// Collect children for a per-item stripe element.
@@ -2232,26 +2216,6 @@ fn build_item_text_input(
     focus: bool,
     reactive_text_cell: Option<CellId>,
 ) -> RawElOrText {
-    let mut raw = RawHtmlEl::new("input")
-        .attr("type", "text")
-        .style("box-sizing", "border-box")
-        .style("border", "none")
-        .style("outline", "none")
-        .style("color", "inherit")
-        .style("background", "transparent");
-
-    raw = apply_styles_item(raw, style, program, instance, ctx);
-
-    if let Some(ph) = placeholder {
-        let text = extract_placeholder_text(ph, program);
-        if !text.is_empty() { raw = raw.attr("placeholder", &text); }
-        let ph_styles = extract_placeholder_styles(ph, program);
-        if !ph_styles.is_empty() {
-            let class_name = next_placeholder_class();
-            raw = apply_placeholder_style_rule(raw, &class_name, &ph_styles);
-        }
-    }
-
     let key_down_event = links.iter().find(|(name, _)| name == "key_down").map(|(_, eid)| *eid);
     let change_event = links.iter().find(|(name, _)| name == "change").map(|(_, eid)| *eid);
     let tmpl_range = Some(ctx.template_cell_range);
@@ -2266,7 +2230,6 @@ fn build_item_text_input(
     // or the .text property cell. For edit inputs, this pre-fills the input
     // with the current title.
     let initial_text_for_insert = {
-        // Try reactive_text_cell first (LATEST target with actual text), then .text property cell.
         let cells_to_try: Vec<u32> = reactive_text_cell.iter().map(|c| c.0)
             .chain(text_cell.iter().copied())
             .collect();
@@ -2286,103 +2249,130 @@ fn build_item_text_input(
         }
         found_text
     };
-    if focus || initial_text_for_insert.is_some() {
-        if focus {
-            raw = raw.attr("autofocus", "");
-        }
-        raw = raw.after_insert(move |el| {
-            if initial_text_for_insert.is_some() || focus {
-                if let Ok(input) = el.dyn_into::<web_sys::HtmlInputElement>() {
+
+    TextInput::new()
+        .update_raw_el(|raw_el| {
+            let mut raw_el = raw_el
+                .style("box-sizing", "border-box")
+                .style("border", "none")
+                .style("outline", "none")
+                .style("color", "inherit")
+                .style("background", "transparent");
+
+            raw_el = apply_styles_item(raw_el, style, program, instance, ctx);
+
+            // Apply placeholder text and styles via Zoon's style_group
+            // (replaces the old <style> injection hack).
+            if let Some(ph) = placeholder {
+                let text = extract_placeholder_text(ph, program);
+                if !text.is_empty() {
+                    raw_el = raw_el.attr("placeholder", &text);
+                }
+                let ph_styles = extract_placeholder_styles(ph, program);
+                if !ph_styles.is_empty() {
+                    let mut group = StyleGroup::new("::placeholder");
+                    for (prop, val) in &ph_styles {
+                        match prop.as_str() {
+                            "font-style" => { group = group.style("font-style", val.clone()); }
+                            "color" => { group = group.style("color", val.clone()); }
+                            _ => {}
+                        }
+                    }
+                    raw_el = raw_el.style_group(group);
+                }
+            }
+
+            // Set initial value and/or focus via after_insert.
+            if focus || initial_text_for_insert.is_some() {
+                if focus {
+                    raw_el = raw_el.attr("autofocus", "");
+                }
+                raw_el = raw_el.after_insert(move |el| {
                     if let Some(ref text) = initial_text_for_insert {
-                        input.set_value(text);
+                        el.set_value(text);
                     }
                     if focus {
-                        let _ = input.focus();
+                        let _ = el.focus();
                     }
-                }
+                });
             }
-        });
-    }
 
-    let raw = if let Some(event_id) = key_down_event {
-        let inst = instance.clone();
-        let is_template = ctx.is_template_event(event_id);
-        let ics = ics_clone.clone();
-        let template_cell_range = ctx.template_cell_range;
-        raw.event_handler(move |event: events::KeyDown| {
-            let key = event.key();
-            let tag_value = match key.as_str() {
-                "Enter" => inst.program_tag_index("Enter"),
-                "Escape" => inst.program_tag_index("Escape"),
-                _ => 0.0,
-            };
-            if let Some(target) = event.target() {
-                if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
-                    let input_text = input.value();
-                    // Store text in data cells (per-item or global).
-                    for cell_id_opt in [change_text_cell, text_cell] {
-                        if let Some(cell_id) = cell_id_opt {
-                            if cell_id >= template_cell_range.0 && cell_id < template_cell_range.1 {
-                                if let Some(ref ics) = ics {
-                                    ics.set_text(item_idx, cell_id, input_text.clone());
+            // Set up keydown event listener.
+            let raw_el = if let Some(event_id) = key_down_event {
+                let inst = instance.clone();
+                let is_template = ctx.is_template_event(event_id);
+                let ics = ics_clone.clone();
+                let template_cell_range = ctx.template_cell_range;
+                raw_el.event_handler(move |event: events::KeyDown| {
+                    let key = event.key();
+                    let tag_value = match key.as_str() {
+                        "Enter" => inst.program_tag_index("Enter"),
+                        "Escape" => inst.program_tag_index("Escape"),
+                        _ => 0.0,
+                    };
+                    if let Some(target) = event.target() {
+                        if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
+                            let input_text = input.value();
+                            for cell_id_opt in [change_text_cell, text_cell] {
+                                if let Some(cell_id) = cell_id_opt {
+                                    if cell_id >= template_cell_range.0 && cell_id < template_cell_range.1 {
+                                        if let Some(ref ics) = ics {
+                                            ics.set_text(item_idx, cell_id, input_text.clone());
+                                        }
+                                    } else {
+                                        inst.cell_store.set_cell_text(cell_id, input_text.clone());
+                                    }
                                 }
-                            } else {
-                                inst.cell_store.set_cell_text(cell_id, input_text.clone());
                             }
                         }
                     }
-                }
-            }
-            // Set key data cell: for template-scoped cells, write to per-item
-            // WASM linear memory (where on_item_event reads from), not just
-            // the global. Without this, WHEN/HOLD bodies that read the key cell
-            // see stale values and don't trigger.
-            if let Some(cell_id) = key_data_cell {
-                if cell_id >= template_cell_range.0 && cell_id < template_cell_range.1 {
-                    inst.set_item_cell_value(item_idx, cell_id, tag_value);
-                } else {
-                    inst.set_cell_value(cell_id, tag_value);
-                }
-            }
-            if is_template {
-                let _ = inst.call_on_item_event(item_idx, event_id.0);
-            } else {
-                let _ = inst.fire_event(event_id.0);
-            }
-        })
-    } else { raw };
+                    if let Some(cell_id) = key_data_cell {
+                        if cell_id >= template_cell_range.0 && cell_id < template_cell_range.1 {
+                            inst.set_item_cell_value(item_idx, cell_id, tag_value);
+                        } else {
+                            inst.set_cell_value(cell_id, tag_value);
+                        }
+                    }
+                    if is_template {
+                        let _ = inst.call_on_item_event(item_idx, event_id.0);
+                    } else {
+                        let _ = inst.fire_event(event_id.0);
+                    }
+                })
+            } else { raw_el };
 
-    let raw = if let Some(event_id) = change_event {
-        let inst = instance.clone();
-        let is_template = ctx.is_template_event(event_id);
-        let ics = ics_clone.clone();
-        let template_cell_range = ctx.template_cell_range;
-        raw.event_handler(move |event: events::Input| {
-            if let Some(target) = event.target() {
-                if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
-                    let input_text = input.value();
-                    for cell_id_opt in [change_text_cell, text_cell] {
-                        if let Some(cell_id) = cell_id_opt {
-                            if cell_id >= template_cell_range.0 && cell_id < template_cell_range.1 {
-                                if let Some(ref ics) = ics {
-                                    ics.set_text(item_idx, cell_id, input_text.clone());
+            // Set up input change event listener.
+            if let Some(event_id) = change_event {
+                let inst = instance.clone();
+                let is_template = ctx.is_template_event(event_id);
+                let ics = ics_clone.clone();
+                let template_cell_range = ctx.template_cell_range;
+                raw_el.event_handler(move |event: events::Input| {
+                    if let Some(target) = event.target() {
+                        if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
+                            let input_text = input.value();
+                            for cell_id_opt in [change_text_cell, text_cell] {
+                                if let Some(cell_id) = cell_id_opt {
+                                    if cell_id >= template_cell_range.0 && cell_id < template_cell_range.1 {
+                                        if let Some(ref ics) = ics {
+                                            ics.set_text(item_idx, cell_id, input_text.clone());
+                                        }
+                                    } else {
+                                        inst.cell_store.set_cell_text(cell_id, input_text.clone());
+                                    }
                                 }
-                            } else {
-                                inst.cell_store.set_cell_text(cell_id, input_text.clone());
                             }
                         }
                     }
-                }
-            }
-            if is_template {
-                let _ = inst.call_on_item_event(item_idx, event_id.0);
-            } else {
-                let _ = inst.fire_event(event_id.0);
-            }
+                    if is_template {
+                        let _ = inst.call_on_item_event(item_idx, event_id.0);
+                    } else {
+                        let _ = inst.fire_event(event_id.0);
+                    }
+                })
+            } else { raw_el }
         })
-    } else { raw };
-
-    raw.into_raw_unchecked()
+        .into_raw_unchecked()
 }
 
 /// Build a per-item Checkbox element.
@@ -2458,9 +2448,12 @@ fn build_item_container(
     style: &IrExpr,
 ) -> RawElOrText {
     let child_el = build_item_element(program, instance, ctx, child);
-    let mut raw = RawHtmlEl::new("div").child(child_el);
-    raw = apply_styles_item(raw, style, program, instance, ctx);
-    raw.into_raw_unchecked()
+    El::new()
+        .update_raw_el(|raw_el| {
+            let raw_el = raw_el.child(child_el);
+            apply_styles_item(raw_el, style, program, instance, ctx)
+        })
+        .into_raw_unchecked()
 }
 
 /// Build a per-item Label element.
@@ -2487,9 +2480,12 @@ fn build_item_label(
             zoon::Text::new(text).unify()
         }
     };
-    let mut raw = RawHtmlEl::new("span").child(content);
-    raw = apply_styles_item(raw, style, program, instance, ctx);
-    raw.into_raw_unchecked()
+    Label::new()
+        .update_raw_el(|raw_el| {
+            let raw_el = raw_el.child(content);
+            apply_styles_item(raw_el, style, program, instance, ctx)
+        })
+        .into_raw_unchecked()
 }
 
 /// Build a per-item Stack element.
@@ -2501,10 +2497,12 @@ fn build_item_stack(
     style: &IrExpr,
 ) -> RawElOrText {
     let children = collect_item_stripe_children(program, instance, ctx, layers_cell);
-    let mut raw = RawHtmlEl::new("div").style("position", "relative");
-    raw = apply_styles_item(raw, style, program, instance, ctx);
-    raw = raw.children(children);
-    raw.into_raw_unchecked()
+    Stack::new()
+        .update_raw_el(|raw_el| {
+            let raw_el = raw_el.children(children);
+            apply_styles_item(raw_el, style, program, instance, ctx)
+        })
+        .into_raw_unchecked()
 }
 
 /// Build a per-item conditional element (WHEN/WHILE) with per-item signal routing.
@@ -2830,41 +2828,6 @@ fn extract_placeholder_styles_from_fields(fields: &[(String, IrExpr)], program: 
     styles
 }
 
-/// Generate a unique class name for placeholder styling.
-fn next_placeholder_class() -> String {
-    PLACEHOLDER_STYLE_COUNT.with(|c| {
-        let n = c.get();
-        c.set(n + 1);
-        format!("boon-ph-{}", n)
-    })
-}
-
-/// Inject a `<style>` rule for `::placeholder` and add the class to the element.
-fn apply_placeholder_style_rule(
-    raw: RawHtmlEl<web_sys::HtmlElement>,
-    class_name: &str,
-    styles: &[(String, String)],
-) -> RawHtmlEl<web_sys::HtmlElement> {
-    let css_props: String = styles.iter()
-        .map(|(k, v)| format!("{}: {};", k, v))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let rule = format!(".{} ::placeholder {{ {} }}", class_name, css_props);
-    // Also need the input-level ::placeholder (input itself has the class, not parent).
-    let rule_direct = format!(".{}::placeholder {{ {} }}", class_name, css_props);
-    let class_name_owned = class_name.to_string();
-    raw.after_insert(move |el: web_sys::HtmlElement| {
-        let _ = el.class_list().add_1(&class_name_owned);
-        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-            if let Ok(style) = doc.create_element("style") {
-                style.set_text_content(Some(&format!("{} {}", rule, rule_direct)));
-                if let Some(head) = doc.head() {
-                    let _ = head.append_child(&style);
-                }
-            }
-        }
-    })
-}
 
 /// Evaluate a static text expression to a String.
 fn eval_static_text(expr: &IrExpr) -> String {
@@ -2976,53 +2939,68 @@ fn resolve_expr_constant(program: &IrProgram, expr: &IrExpr, depth: u32) -> Opti
 // Style application
 // ---------------------------------------------------------------------------
 
-/// Apply Boon style properties as CSS to a RawHtmlEl.
-fn apply_styles(
-    el: RawHtmlEl<web_sys::HtmlElement>,
+/// Apply Boon style properties as CSS to any element implementing RawEl.
+fn apply_styles<T: RawEl>(
+    el: T,
     style: &IrExpr,
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T
+where
+    T::DomElement: AsRef<web_sys::HtmlElement>,
+{
     apply_styles_inner(el, style, program, instance, None, false)
 }
 
-fn apply_styles_row(
-    el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_styles_row<T: RawEl>(
+    el: T,
     style: &IrExpr,
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T
+where
+    T::DomElement: AsRef<web_sys::HtmlElement>,
+{
     apply_styles_inner(el, style, program, instance, None, true)
 }
 
-fn apply_styles_item(
-    el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_styles_item<T: RawEl>(
+    el: T,
     style: &IrExpr,
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     ctx: &ItemContext,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T
+where
+    T::DomElement: AsRef<web_sys::HtmlElement>,
+{
     apply_styles_inner(el, style, program, instance, Some(ctx), false)
 }
 
-fn apply_styles_item_row(
-    el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_styles_item_row<T: RawEl>(
+    el: T,
     style: &IrExpr,
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     ctx: &ItemContext,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T
+where
+    T::DomElement: AsRef<web_sys::HtmlElement>,
+{
     apply_styles_inner(el, style, program, instance, Some(ctx), true)
 }
 
-fn apply_styles_inner(
-    mut el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_styles_inner<T: RawEl>(
+    mut el: T,
     style: &IrExpr,
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     item_ctx: Option<&ItemContext>,
     is_row_direction: bool,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T
+where
+    T::DomElement: AsRef<web_sys::HtmlElement>,
+{
     // Style can be ObjectConstruct (direct) or CellRead (when nested objects
     // caused the lowerer to use the object-store pattern). For CellRead, we
     // reconstruct the field expressions from the IR node tree.
@@ -3096,7 +3074,8 @@ fn apply_styles_inner(
                         // Use raw DOM API because dominator's .style() auto-adds
                         // vendor prefixes, which creates invalid double-prefixed
                         // names like "-webkit--moz-osx-font-smoothing".
-                        el = el.after_insert(|element: web_sys::HtmlElement| {
+                        el = el.after_insert(|dom_el| {
+                            let element: &web_sys::HtmlElement = dom_el.as_ref();
                             let style = element.style();
                             let _ = style.set_property("-webkit-font-smoothing", "antialiased");
                             let _ = style.set_property("-moz-osx-font-smoothing", "grayscale");
@@ -3176,10 +3155,10 @@ fn dimension_to_css(expr: &IrExpr) -> Option<String> {
 }
 
 /// Apply padding from a Boon padding object.
-fn apply_padding(
-    mut el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_padding<T: RawEl>(
+    mut el: T,
     value: &IrExpr,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T {
     if let IrExpr::ObjectConstruct(fields) = value {
         let mut top = None;
         let mut bottom = None;
@@ -3212,13 +3191,13 @@ fn apply_padding(
 }
 
 /// Apply font properties.
-fn apply_font(
-    mut el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_font<T: RawEl>(
+    mut el: T,
     value: &IrExpr,
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     item_ctx: Option<&ItemContext>,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T {
     // Font value may be ObjectConstruct (direct) or CellRead (from object store).
     let reconstructed;
     let fields: &[(String, IrExpr)] = match value {
@@ -3315,13 +3294,13 @@ fn apply_font(
 }
 
 /// Apply font line properties (strikethrough, underline).
-fn apply_font_line(
-    mut el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_font_line<T: RawEl>(
+    mut el: T,
     value: &IrExpr,
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     item_ctx: Option<&ItemContext>,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T {
     // value is [strikethrough: Bool/CellRead]
     let reconstructed;
     let fields: &[(String, IrExpr)] = match value {
@@ -3429,13 +3408,16 @@ fn resolve_font_family(expr: &IrExpr, program: &IrProgram) -> Option<String> {
 }
 
 /// Apply background properties.
-fn apply_background(
-    mut el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_background<T: RawEl>(
+    mut el: T,
     value: &IrExpr,
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     item_ctx: Option<&ItemContext>,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T
+where
+    T::DomElement: AsRef<web_sys::HtmlElement>,
+{
     let reconstructed;
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(fields) => fields,
@@ -3481,13 +3463,16 @@ fn apply_background(
 /// Set up a reactive background-image from a WHEN/WHILE expression.
 /// Collects text for each arm statically, watches the source cell, and
 /// switches the CSS property when the source value changes.
-fn apply_reactive_background_url(
-    mut el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_reactive_background_url<T: RawEl>(
+    mut el: T,
     url_expr: &IrExpr,
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     item_ctx: Option<&ItemContext>,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T
+where
+    T::DomElement: AsRef<web_sys::HtmlElement>,
+{
     if let IrExpr::CellRead(cell) = url_expr {
         if let Some(node) = find_node_for_cell(program, *cell) {
             if let IrNode::When { source, arms, .. } | IrNode::While { source, arms, .. } = node {
@@ -3520,7 +3505,8 @@ fn apply_reactive_background_url(
                             }
                         }
                         let ics_clone = ics.clone();
-                        el = el.after_insert(move |element: web_sys::HtmlElement| {
+                        el = el.after_insert(move |dom_el| {
+                            let element: web_sys::HtmlElement = AsRef::<web_sys::HtmlElement>::as_ref(&dom_el).clone();
                             let handle = Task::start_droppable(
                                 ics_clone.get_signal(item_idx, source_id)
                                     .for_each_sync(move |val| {
@@ -3550,7 +3536,8 @@ fn apply_reactive_background_url(
                     }
                 }
                 let store = instance.cell_store.clone();
-                el = el.after_insert(move |element: web_sys::HtmlElement| {
+                el = el.after_insert(move |dom_el| {
+                    let element: web_sys::HtmlElement = AsRef::<web_sys::HtmlElement>::as_ref(&dom_el).clone();
                     let handle = Task::start_droppable(
                         store.get_cell_signal(source_id)
                             .for_each_sync(move |val| {
@@ -3579,12 +3566,12 @@ fn apply_reactive_background_url(
 /// CSS flexbox mapping depends on flex-direction:
 ///   Column: horizontal → align-items, vertical → justify-content
 ///   Row:    horizontal → justify-content, vertical → align-items
-fn apply_align(
-    mut el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_align<T: RawEl>(
+    mut el: T,
     value: &IrExpr,
     program: &IrProgram,
     is_row_direction: bool,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T {
     // The align value may be ObjectConstruct (direct) or CellRead (when the
     // style object went through lower_object_store). Reconstruct if needed.
     let reconstructed;
@@ -3632,10 +3619,10 @@ fn apply_align(
 }
 
 /// Apply border properties.
-fn apply_borders(
-    mut el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_borders<T: RawEl>(
+    mut el: T,
     value: &IrExpr,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T {
     if let IrExpr::ObjectConstruct(fields) = value {
         for (name, val) in fields {
             if let IrExpr::ObjectConstruct(border_fields) = val {
@@ -3662,11 +3649,11 @@ fn apply_borders(
 }
 
 /// Apply shadow properties.
-fn apply_shadows(
-    mut el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_shadows<T: RawEl>(
+    mut el: T,
     value: &IrExpr,
     program: &IrProgram,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T {
     // Shadows can be a ListConstruct directly, or a CellRead to a Derived
     // node holding a ListConstruct (when the style used the object-store pattern).
     let resolved;
@@ -3815,12 +3802,15 @@ fn collect_outline_arm_css(
     }
 }
 
-fn apply_outline(
-    mut el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_outline<T: RawEl>(
+    mut el: T,
     value: &IrExpr,
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T
+where
+    T::DomElement: AsRef<web_sys::HtmlElement>,
+{
     match value {
         IrExpr::CellRead(cell) => {
             if let Some(node) = find_node_for_cell(program, *cell) {
@@ -3846,7 +3836,8 @@ fn apply_outline(
                         // Watch all source cells and update outline reactively.
                         let store = instance.cell_store.clone();
                         let source_cells_clone = source_cells.clone();
-                        el = el.after_insert(move |element: web_sys::HtmlElement| {
+                        el = el.after_insert(move |dom_el| {
+                            let element: web_sys::HtmlElement = AsRef::<web_sys::HtmlElement>::as_ref(&dom_el).clone();
                             for source_cell in &source_cells_clone {
                                 let all_css = all_css.clone();
                                 let store2 = store.clone();
@@ -3902,11 +3893,11 @@ fn resolve_active_outline(
 }
 
 /// Apply CSS transform properties.
-fn apply_transform(
-    mut el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_transform<T: RawEl>(
+    mut el: T,
     value: &IrExpr,
     program: &IrProgram,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T {
     let reconstructed;
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(fields) => fields,
@@ -3977,14 +3968,14 @@ fn resolve_color_full(expr: &IrExpr) -> Option<String> {
 }
 
 /// Apply a reactive Oklch color as a style_signal. Handles Oklch with CellRead fields.
-fn apply_reactive_color(
-    el: RawHtmlEl<web_sys::HtmlElement>,
+fn apply_reactive_color<T: RawEl>(
+    el: T,
     css_prop: &'static str,
     expr: &IrExpr,
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     item_ctx: Option<&ItemContext>,
-) -> RawHtmlEl<web_sys::HtmlElement> {
+) -> T {
     // Case 1: TaggedObject with reactive CellRead fields (e.g., Oklch with reactive lightness).
     if let IrExpr::TaggedObject { tag, fields } = expr {
         if tag != "Oklch" {
