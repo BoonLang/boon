@@ -1,7 +1,7 @@
 //! DOM bridge — creates Zoon UI elements from the IR program and connects
 //! them to the WASM runtime instance.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
@@ -9,6 +9,10 @@ use zoon::*;
 
 use super::ir::*;
 use super::runtime::{CellStore, WasmInstance};
+
+thread_local! {
+    static PLACEHOLDER_STYLE_COUNT: Cell<u32> = Cell::new(0);
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -639,14 +643,21 @@ fn build_text_input(
 
     raw = apply_styles(raw, style, program, instance);
 
-    // Extract placeholder text — could be nested in an object with text field.
+    // Extract placeholder text and styling.
     let raw = if let Some(ph) = placeholder {
         let text = extract_placeholder_text(ph, program);
-        if !text.is_empty() {
+        let mut raw = if !text.is_empty() {
             raw.attr("placeholder", &text)
         } else {
             raw
+        };
+        // Apply placeholder styles (font-style, color) via ::placeholder CSS rule.
+        let ph_styles = extract_placeholder_styles(ph, program);
+        if !ph_styles.is_empty() {
+            let class_name = next_placeholder_class();
+            raw = apply_placeholder_style_rule(raw, &class_name, &ph_styles);
         }
+        raw
     } else {
         raw
     };
@@ -1316,15 +1327,8 @@ fn apply_conditional_display_toggle(
             }
             html_el
                 .after_insert(move |el: web_sys::HtmlElement| {
-                    // Save the element's original display (before any toggling).
-                    let original = el.style().get_property_value("display").unwrap_or_default();
-                    let orig = if original == "none" || original.is_empty() {
-                        String::new() // will use remove_property to restore default
-                    } else {
-                        original
-                    };
-                    let set_vis = move |el: &web_sys::HtmlElement, visible: bool| {
-                        set_conditional_visibility_with_orig(el, visible, &orig);
+                    let set_vis = |el: &web_sys::HtmlElement, visible: bool| {
+                        set_conditional_visibility(el, visible);
                     };
                     setup(&el, &set_vis);
                 })
@@ -1349,22 +1353,19 @@ fn apply_conditional_display_toggle(
     }
 }
 
-/// Set visibility on a conditional element, restoring its original display or hiding it.
+/// Set visibility on a conditional element.
+/// When showing, restores `display: inline-flex` for flex containers (detected via
+/// `flex-direction` in inline style), otherwise removes inline `display`.
 fn set_conditional_visibility(el: &web_sys::HtmlElement, visible: bool) {
     if visible {
-        let _ = el.style().remove_property("display");
-    } else {
-        let _ = el.style().set_property("display", "none");
-    }
-}
-
-/// Set visibility with a known original display value.
-fn set_conditional_visibility_with_orig(el: &web_sys::HtmlElement, visible: bool, orig: &str) {
-    if visible {
-        if orig.is_empty() {
-            let _ = el.style().remove_property("display");
+        // Check if this element is a flex container by looking for flex-direction.
+        // display:none doesn't remove other inline styles, so flex-direction persists.
+        let has_flex = !el.style().get_property_value("flex-direction")
+            .unwrap_or_default().is_empty();
+        if has_flex {
+            let _ = el.style().set_property("display", "inline-flex");
         } else {
-            let _ = el.style().set_property("display", orig);
+            let _ = el.style().remove_property("display");
         }
     } else {
         let _ = el.style().set_property("display", "none");
@@ -2244,6 +2245,11 @@ fn build_item_text_input(
     if let Some(ph) = placeholder {
         let text = extract_placeholder_text(ph, program);
         if !text.is_empty() { raw = raw.attr("placeholder", &text); }
+        let ph_styles = extract_placeholder_styles(ph, program);
+        if !ph_styles.is_empty() {
+            let class_name = next_placeholder_class();
+            raw = apply_placeholder_style_rule(raw, &class_name, &ph_styles);
+        }
     }
 
     let key_down_event = links.iter().find(|(name, _)| name == "key_down").map(|(_, eid)| *eid);
@@ -2756,6 +2762,110 @@ fn extract_placeholder_text(expr: &IrExpr, program: &IrProgram) -> String {
     }
 }
 
+/// Extract placeholder styling (font-style, color) as CSS property pairs.
+fn extract_placeholder_styles(expr: &IrExpr, program: &IrProgram) -> Vec<(String, String)> {
+    let fields = match expr {
+        IrExpr::ObjectConstruct(fields) => fields.as_slice(),
+        IrExpr::CellRead(cell) => {
+            let fields = reconstruct_object_fields(program, *cell);
+            return extract_placeholder_styles_from_fields(&fields, program);
+        }
+        _ => return Vec::new(),
+    };
+    extract_placeholder_styles_from_fields(
+        &fields.iter().map(|(n, v)| (n.clone(), v.clone())).collect::<Vec<_>>(),
+        program,
+    )
+}
+
+fn extract_placeholder_styles_from_fields(fields: &[(String, IrExpr)], program: &IrProgram) -> Vec<(String, String)> {
+    let mut styles = Vec::new();
+    for (name, val) in fields {
+        if name == "font" {
+            // Font object: [style: Italic, color: Oklch[...]]
+            let font_fields = match val {
+                IrExpr::ObjectConstruct(f) => f.as_slice(),
+                IrExpr::CellRead(cell) => {
+                    let f = reconstruct_object_fields(program, *cell);
+                    for (fname, fval) in &f {
+                        match fname.as_str() {
+                            "style" => {
+                                if let IrExpr::Constant(IrValue::Tag(t)) = fval {
+                                    if t == "Italic" {
+                                        styles.push(("font-style".into(), "italic".into()));
+                                    }
+                                }
+                            }
+                            "color" => {
+                                if let Some(css) = resolve_color(fval) {
+                                    styles.push(("color".into(), css));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            for (fname, fval) in font_fields {
+                match fname.as_str() {
+                    "style" => {
+                        if let IrExpr::Constant(IrValue::Tag(t)) = fval {
+                            if t == "Italic" {
+                                styles.push(("font-style".into(), "italic".into()));
+                            }
+                        }
+                    }
+                    "color" => {
+                        if let Some(css) = resolve_color(fval) {
+                            styles.push(("color".into(), css));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    styles
+}
+
+/// Generate a unique class name for placeholder styling.
+fn next_placeholder_class() -> String {
+    PLACEHOLDER_STYLE_COUNT.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        format!("boon-ph-{}", n)
+    })
+}
+
+/// Inject a `<style>` rule for `::placeholder` and add the class to the element.
+fn apply_placeholder_style_rule(
+    raw: RawHtmlEl<web_sys::HtmlElement>,
+    class_name: &str,
+    styles: &[(String, String)],
+) -> RawHtmlEl<web_sys::HtmlElement> {
+    let css_props: String = styles.iter()
+        .map(|(k, v)| format!("{}: {};", k, v))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rule = format!(".{} ::placeholder {{ {} }}", class_name, css_props);
+    // Also need the input-level ::placeholder (input itself has the class, not parent).
+    let rule_direct = format!(".{}::placeholder {{ {} }}", class_name, css_props);
+    let class_name_owned = class_name.to_string();
+    raw.after_insert(move |el: web_sys::HtmlElement| {
+        let _ = el.class_list().add_1(&class_name_owned);
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            if let Ok(style) = doc.create_element("style") {
+                style.set_text_content(Some(&format!("{} {}", rule, rule_direct)));
+                if let Some(head) = doc.head() {
+                    let _ = head.append_child(&style);
+                }
+            }
+        }
+    })
+}
+
 /// Evaluate a static text expression to a String.
 fn eval_static_text(expr: &IrExpr) -> String {
     match expr {
@@ -2933,18 +3043,28 @@ fn apply_styles_inner(
                 if let Some(css) = dimension_to_css(value) {
                     el = el.style("width", &css);
                 }
-                // Fill width also needs flex-grow for inline-flex parents.
                 if matches!(value, IrExpr::Constant(IrValue::Tag(t)) if t == "Fill") {
-                    el = el.style("flex-grow", "1");
+                    if is_row_direction {
+                        // In a row flex, filling width means growing on the main axis.
+                        el = el.style("flex-grow", "1");
+                    } else {
+                        // In a column flex, filling width means stretching on the cross axis.
+                        el = el.style("align-self", "stretch");
+                    }
                 }
             }
             "height" => {
                 if let Some(css) = dimension_to_css(value) {
                     el = el.style("height", &css);
                 }
-                // Fill height also needs flex-grow for inline-flex parents.
                 if matches!(value, IrExpr::Constant(IrValue::Tag(t)) if t == "Fill") {
-                    el = el.style("flex-grow", "1");
+                    if is_row_direction {
+                        // In a row flex, filling height means stretching on the cross axis.
+                        el = el.style("align-self", "stretch");
+                    } else {
+                        // In a column flex, filling height means growing on the main axis.
+                        el = el.style("flex-grow", "1");
+                    }
                 }
             }
             "size" => {
