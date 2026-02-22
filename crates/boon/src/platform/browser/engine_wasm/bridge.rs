@@ -552,7 +552,11 @@ fn build_stripe(
         }
     }
 
-    raw = apply_styles(raw, style, program, instance);
+    if is_column {
+        raw = apply_styles(raw, style, program, instance);
+    } else {
+        raw = apply_styles_row(raw, style, program, instance);
+    }
     raw = raw.children(children);
     raw.into_raw_unchecked()
 }
@@ -1086,8 +1090,8 @@ fn extract_padding(style: &IrExpr) -> Option<(f64, f64, f64, f64)> {
                             "bottom" => bottom = *n,
                             "left" => left = *n,
                             "right" => right = *n,
-                            "row" => { top = *n; bottom = *n; }
-                            "column" => { left = *n; right = *n; }
+                            "row" => { left = *n; right = *n; }
+                            "column" => { top = *n; bottom = *n; }
                             _ => {}
                         }
                     }
@@ -2061,7 +2065,11 @@ fn build_item_stripe(
         }
     }
 
-    raw = apply_styles_item(raw, style, program, instance, ctx);
+    if is_column {
+        raw = apply_styles_item(raw, style, program, instance, ctx);
+    } else {
+        raw = apply_styles_item_row(raw, style, program, instance, ctx);
+    }
     raw = raw.children(children);
     raw.into_raw_unchecked()
 }
@@ -2740,7 +2748,16 @@ fn apply_styles(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
 ) -> RawHtmlEl<web_sys::HtmlElement> {
-    apply_styles_inner(el, style, program, instance, None)
+    apply_styles_inner(el, style, program, instance, None, false)
+}
+
+fn apply_styles_row(
+    el: RawHtmlEl<web_sys::HtmlElement>,
+    style: &IrExpr,
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+) -> RawHtmlEl<web_sys::HtmlElement> {
+    apply_styles_inner(el, style, program, instance, None, true)
 }
 
 fn apply_styles_item(
@@ -2750,7 +2767,17 @@ fn apply_styles_item(
     instance: &Rc<WasmInstance>,
     ctx: &ItemContext,
 ) -> RawHtmlEl<web_sys::HtmlElement> {
-    apply_styles_inner(el, style, program, instance, Some(ctx))
+    apply_styles_inner(el, style, program, instance, Some(ctx), false)
+}
+
+fn apply_styles_item_row(
+    el: RawHtmlEl<web_sys::HtmlElement>,
+    style: &IrExpr,
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    ctx: &ItemContext,
+) -> RawHtmlEl<web_sys::HtmlElement> {
+    apply_styles_inner(el, style, program, instance, Some(ctx), true)
 }
 
 fn apply_styles_inner(
@@ -2759,6 +2786,7 @@ fn apply_styles_inner(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     item_ctx: Option<&ItemContext>,
+    is_row_direction: bool,
 ) -> RawHtmlEl<web_sys::HtmlElement> {
     // Style can be ObjectConstruct (direct) or CellRead (when nested objects
     // caused the lowerer to use the object-store pattern). For CellRead, we
@@ -2804,13 +2832,13 @@ fn apply_styles_inner(
                 el = apply_padding(el, value);
             }
             "font" => {
-                el = apply_font(el, value, program);
+                el = apply_font(el, value, program, instance, item_ctx);
             }
             "background" => {
                 el = apply_background(el, value, program, instance, item_ctx);
             }
             "align" => {
-                el = apply_align(el, value);
+                el = apply_align(el, value, program, is_row_direction);
             }
             "line_height" => {
                 if let IrExpr::Constant(IrValue::Number(n)) = value {
@@ -2920,8 +2948,8 @@ fn apply_padding(
                     "bottom" => bottom = Some(*n),
                     "left" => left = Some(*n),
                     "right" => right = Some(*n),
-                    "row" => { top = top.or(Some(*n)); bottom = bottom.or(Some(*n)); }
-                    "column" => { left = left.or(Some(*n)); right = right.or(Some(*n)); }
+                    "row" => { left = left.or(Some(*n)); right = right.or(Some(*n)); }
+                    "column" => { top = top.or(Some(*n)); bottom = bottom.or(Some(*n)); }
                     _ => {}
                 }
             }
@@ -2943,57 +2971,152 @@ fn apply_font(
     mut el: RawHtmlEl<web_sys::HtmlElement>,
     value: &IrExpr,
     program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    item_ctx: Option<&ItemContext>,
 ) -> RawHtmlEl<web_sys::HtmlElement> {
-    if let IrExpr::ObjectConstruct(fields) = value {
-        for (name, val) in fields {
-            match name.as_str() {
-                "size" => {
-                    if let IrExpr::Constant(IrValue::Number(n)) = val {
-                        el = el.style("font-size", &format!("{}px", n));
-                    }
+    // Font value may be ObjectConstruct (direct) or CellRead (from object store).
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match value {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
+        _ => return el,
+    };
+    for (name, val) in fields {
+        match name.as_str() {
+            "size" => {
+                if let IrExpr::Constant(IrValue::Number(n)) = val {
+                    el = el.style("font-size", &format!("{}px", n));
+                } else if let Some(ConstValue::Number(n)) = resolve_expr_constant(program, val, 0) {
+                    el = el.style("font-size", &format!("{}px", n));
                 }
-                "color" => {
-                    if let Some(css) = resolve_color(val) {
-                        el = el.style("color", &css);
-                    }
+            }
+            "color" => {
+                if let Some(css) = resolve_color(val) {
+                    el = el.style("color", &css);
+                } else {
+                    el = apply_reactive_color(el, "color", val, instance);
                 }
-                "weight" => {
-                    if let IrExpr::Constant(IrValue::Tag(t)) = val {
-                        let w = match t.as_str() {
-                            "ExtraLight" => "200",
-                            "Light" => "300",
-                            "Regular" | "Normal" => "400",
-                            "Medium" => "500",
-                            "SemiBold" => "600",
-                            "Bold" => "700",
-                            "ExtraBold" => "800",
-                            _ => "400",
-                        };
-                        el = el.style("font-weight", w);
-                    }
-                }
-                "family" => {
-                    if let Some(family) = resolve_font_family(val, program) {
-                        el = el.style("font-family", &family);
-                    }
-                }
-                "align" => {
-                    if let IrExpr::Constant(IrValue::Tag(t)) = val {
-                        let a = match t.as_str() {
-                            "Center" => "center",
-                            "Left" | "Start" => "left",
-                            "Right" | "End" => "right",
-                            _ => "left",
-                        };
-                        el = el.style("text-align", a);
-                    }
-                }
-                "style" => {
-                    if let IrExpr::Constant(IrValue::Tag(t)) = val {
-                        if t == "Italic" {
-                            el = el.style("font-style", "italic");
+            }
+            "weight" => {
+                let tag = match val {
+                    IrExpr::Constant(IrValue::Tag(t)) => Some(t.clone()),
+                    _ => {
+                        if let Some(ConstValue::Tag(t)) = resolve_expr_constant(program, val, 0) {
+                            Some(t)
+                        } else {
+                            None
                         }
                     }
+                };
+                if let Some(t) = tag {
+                    let w = match t.as_str() {
+                        "ExtraLight" => "200",
+                        "Light" => "300",
+                        "Regular" | "Normal" => "400",
+                        "Medium" => "500",
+                        "SemiBold" => "600",
+                        "Bold" => "700",
+                        "ExtraBold" => "800",
+                        _ => "400",
+                    };
+                    el = el.style("font-weight", w);
+                }
+            }
+            "family" => {
+                if let Some(family) = resolve_font_family(val, program) {
+                    el = el.style("font-family", &family);
+                }
+            }
+            "align" => {
+                let tag = match val {
+                    IrExpr::Constant(IrValue::Tag(t)) => Some(t.clone()),
+                    _ => {
+                        if let Some(ConstValue::Tag(t)) = resolve_expr_constant(program, val, 0) {
+                            Some(t)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(t) = tag {
+                    let a = match t.as_str() {
+                        "Center" => "center",
+                        "Left" | "Start" => "left",
+                        "Right" | "End" => "right",
+                        _ => "left",
+                    };
+                    el = el.style("text-align", a);
+                }
+            }
+            "style" => {
+                if let IrExpr::Constant(IrValue::Tag(t)) = val {
+                    if t == "Italic" {
+                        el = el.style("font-style", "italic");
+                    }
+                }
+            }
+            "line" => {
+                // line: [strikethrough: Bool/CellRead]
+                // Applies text-decoration: line-through when strikethrough is true.
+                el = apply_font_line(el, val, program, instance, item_ctx);
+            }
+            _ => {}
+        }
+    }
+    el
+}
+
+/// Apply font line properties (strikethrough, underline).
+fn apply_font_line(
+    mut el: RawHtmlEl<web_sys::HtmlElement>,
+    value: &IrExpr,
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    item_ctx: Option<&ItemContext>,
+) -> RawHtmlEl<web_sys::HtmlElement> {
+    // value is [strikethrough: Bool/CellRead]
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match value {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
+        _ => return el,
+    };
+    for (name, val) in fields {
+        if name == "strikethrough" {
+            match val {
+                IrExpr::Constant(IrValue::Bool(true)) => {
+                    el = el.style("text-decoration", "line-through");
+                }
+                IrExpr::Constant(IrValue::Bool(false)) => {}
+                IrExpr::CellRead(cell) => {
+                    // Reactive strikethrough — use style_signal.
+                    if let Some(ctx) = item_ctx {
+                        if ctx.is_template_cell(*cell) {
+                            if let Some(ref ics) = instance.item_cell_store {
+                                // Per-item cell — use item cell store signal.
+                                let cell_id = cell.0;
+                                let item_idx = ctx.item_idx;
+                                el = el.style_signal("text-decoration",
+                                    ics.get_signal(item_idx, cell_id)
+                                        .map(|v| if v != 0.0 { Some("line-through") } else { Some("none") })
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    // Global cell — use cell store.
+                    let store = instance.cell_store.clone();
+                    let cell_id = cell.0;
+                    el = el.style_signal("text-decoration",
+                        store.get_cell_signal(cell_id)
+                            .map(|v| if v != 0.0 { Some("line-through") } else { Some("none") })
+                    );
                 }
                 _ => {}
             }
@@ -3206,24 +3329,57 @@ fn apply_reactive_background_url(
 }
 
 /// Apply align properties (maps to flex alignment).
+///
+/// Boon's `align: [row: X]` = horizontal, `[column: X]` = vertical.
+/// CSS flexbox mapping depends on flex-direction:
+///   Column: horizontal → align-items, vertical → justify-content
+///   Row:    horizontal → justify-content, vertical → align-items
 fn apply_align(
     mut el: RawHtmlEl<web_sys::HtmlElement>,
     value: &IrExpr,
+    program: &IrProgram,
+    is_row_direction: bool,
 ) -> RawHtmlEl<web_sys::HtmlElement> {
-    if let IrExpr::ObjectConstruct(fields) = value {
-        for (name, val) in fields {
-            if let IrExpr::Constant(IrValue::Tag(t)) = val {
-                let css_val = match t.as_str() {
-                    "Center" => "center",
-                    "Start" | "Left" | "Top" => "flex-start",
-                    "End" | "Right" | "Bottom" => "flex-end",
-                    _ => "flex-start",
-                };
-                match name.as_str() {
-                    "row" => { el = el.style("align-items", css_val); }
-                    "column" => { el = el.style("justify-content", css_val); }
-                    _ => {}
+    // The align value may be ObjectConstruct (direct) or CellRead (when the
+    // style object went through lower_object_store). Reconstruct if needed.
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match value {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
+        _ => return el,
+    };
+
+    for (name, val) in fields {
+        // Resolve CellRead values through the IR chain to find the tag constant.
+        // Function parameters (like `align: End`) become CellRead cells after inlining.
+        let tag = match val {
+            IrExpr::Constant(IrValue::Tag(t)) => Some(t.clone()),
+            _ => {
+                if let Some(ConstValue::Tag(t)) = resolve_expr_constant(program, val, 0) {
+                    Some(t)
+                } else {
+                    None
                 }
+            }
+        };
+        if let Some(t) = tag {
+            let css_val = match t.as_str() {
+                "Center" => "center",
+                "Start" | "Left" | "Top" => "flex-start",
+                "End" | "Right" | "Bottom" => "flex-end",
+                _ => "flex-start",
+            };
+            match (name.as_str(), is_row_direction) {
+                // Column flex: row=cross(align-items), column=main(justify-content)
+                ("row", false) => { el = el.style("align-items", css_val); }
+                ("column", false) => { el = el.style("justify-content", css_val); }
+                // Row flex: row=main(justify-content), column=cross(align-items)
+                ("row", true) => { el = el.style("justify-content", css_val); }
+                ("column", true) => { el = el.style("align-items", css_val); }
+                _ => {}
             }
         }
     }
@@ -3549,14 +3705,20 @@ fn resolve_color_full(expr: &IrExpr) -> Option<String> {
             let mut hue = 0.0;
             let mut alpha = 1.0;
             for (name, value) in fields {
-                if let IrExpr::Constant(IrValue::Number(n)) = value {
-                    match name.as_str() {
-                        "lightness" => lightness = *n,
-                        "chroma" => chroma = *n,
-                        "hue" => hue = *n,
-                        "alpha" => alpha = *n,
-                        _ => {}
+                match value {
+                    IrExpr::Constant(IrValue::Number(n)) => {
+                        match name.as_str() {
+                            "lightness" => lightness = *n,
+                            "chroma" => chroma = *n,
+                            "hue" => hue = *n,
+                            "alpha" => alpha = *n,
+                            _ => {}
+                        }
                     }
+                    // If any field is reactive (CellRead, etc.), this color
+                    // can't be resolved statically — return None so the caller
+                    // falls through to apply_reactive_color.
+                    _ => return None,
                 }
             }
             if alpha < 1.0 {
@@ -3567,4 +3729,64 @@ fn resolve_color_full(expr: &IrExpr) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Apply a reactive Oklch color as a style_signal. Handles Oklch with CellRead fields.
+fn apply_reactive_color(
+    el: RawHtmlEl<web_sys::HtmlElement>,
+    css_prop: &'static str,
+    expr: &IrExpr,
+    instance: &Rc<WasmInstance>,
+) -> RawHtmlEl<web_sys::HtmlElement> {
+    if let IrExpr::TaggedObject { tag, fields } = expr {
+        if tag != "Oklch" {
+            return el;
+        }
+        // Extract static defaults and reactive cell IDs for each field.
+        let mut lightness_cell = None;
+        let mut chroma_cell = None;
+        let mut hue_cell = None;
+        let mut chroma_default = 0.0f64;
+        let mut hue_default = 0.0f64;
+        let mut alpha_val = 1.0f64;
+        for (name, value) in fields {
+            match name.as_str() {
+                "lightness" => match value {
+                    IrExpr::CellRead(cell) => lightness_cell = Some(cell.0),
+                    _ => {}
+                },
+                "chroma" => match value {
+                    IrExpr::Constant(IrValue::Number(n)) => chroma_default = *n,
+                    IrExpr::CellRead(cell) => chroma_cell = Some(cell.0),
+                    _ => {}
+                },
+                "hue" => match value {
+                    IrExpr::Constant(IrValue::Number(n)) => hue_default = *n,
+                    IrExpr::CellRead(cell) => hue_cell = Some(cell.0),
+                    _ => {}
+                },
+                "alpha" => {
+                    if let IrExpr::Constant(IrValue::Number(n)) = value {
+                        alpha_val = *n;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Use the first reactive cell as the signal source.
+        let store = instance.cell_store.clone();
+        if let Some(cell_id) = lightness_cell {
+            return el.style_signal(css_prop, store.get_cell_signal(cell_id).map(move |v| {
+                let l = v;
+                let c = chroma_cell.map_or(chroma_default, |cid| store.get_cell_value(cid));
+                let h = hue_cell.map_or(hue_default, |hid| store.get_cell_value(hid));
+                if alpha_val < 1.0 {
+                    Some(format!("oklch({} {} {} / {})", l, c, h, alpha_val))
+                } else {
+                    Some(format!("oklch({} {} {})", l, c, h))
+                }
+            }));
+        }
+    }
+    el
 }
