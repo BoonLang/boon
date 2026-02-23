@@ -336,10 +336,10 @@ fn build_element_node(
     // so attach_common_events doesn't duplicate them.
     let mut handled_events: &[&str] = &[];
 
+    // All typed element builders handle hover via .on_hovered_change() directly.
     let raw: RawElOrText = match kind {
         ElementKind::Button { label, style } => {
-            // Button handles "press" directly (mapped to Click event).
-            build_button(program, instance, label, style, links)
+            build_button(program, instance, label, style, links, hovered_cell)
         }
         ElementKind::Stripe {
             direction,
@@ -347,41 +347,40 @@ fn build_element_node(
             gap,
             style,
             ..
-        } => build_stripe(program, instance, direction, *items, gap, style),
+        } => build_stripe(program, instance, direction, *items, gap, style, hovered_cell),
         ElementKind::TextInput { placeholder, style, focus, .. } => {
-            build_text_input(program, instance, placeholder.as_ref(), style, links, *focus)
+            build_text_input(program, instance, placeholder.as_ref(), style, links, *focus, hovered_cell)
         }
         ElementKind::Checkbox { checked, style, icon } => {
-            // Checkbox handles click directly.
             handled_events = &["click"];
-            build_checkbox(program, instance, checked.as_ref(), style, links, icon.as_ref())
+            build_checkbox(program, instance, checked.as_ref(), style, links, icon.as_ref(), hovered_cell)
         }
         ElementKind::Container { child, style } => {
-            build_container(program, instance, *child, style)
+            build_container(program, instance, *child, style, hovered_cell)
         }
         ElementKind::Label { label, style } => {
-            build_label(program, instance, label, style, links)
+            build_label(program, instance, label, style, links, hovered_cell)
         }
         ElementKind::Stack { layers, style } => {
-            build_stack(program, instance, *layers, style)
+            build_stack(program, instance, *layers, style, hovered_cell)
         }
         ElementKind::Link { url, label, style } => {
-            build_link(program, instance, label, url, style, links)
+            build_link(program, instance, label, url, style, links, hovered_cell)
         }
         ElementKind::Paragraph { content, style } => {
-            build_paragraph(program, instance, content, style)
+            build_paragraph(program, instance, content, style, hovered_cell)
         }
     };
-    // Attach common event handlers (hovered, blur, focus, click, double_click).
-    // Filter out events already handled directly by the element builder.
+    // Attach remaining event handlers (blur, focus, click, double_click).
+    // Hover is handled by typed builders via .on_hovered_change().
     if handled_events.is_empty() {
-        attach_common_events(raw, instance, links, hovered_cell)
+        attach_common_events(raw, instance, links, None)
     } else {
         let filtered: Vec<_> = links.iter()
             .filter(|(name, _)| !handled_events.contains(&name.as_str()))
             .cloned()
             .collect();
-        attach_common_events(raw, instance, &filtered, hovered_cell)
+        attach_common_events(raw, instance, &filtered, None)
     }
 }
 
@@ -496,6 +495,7 @@ fn build_button(
     label: &IrExpr,
     style: &IrExpr,
     links: &[(String, EventId)],
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let press_event = links
         .iter()
@@ -503,19 +503,23 @@ fn build_button(
         .map(|(_, eid)| *eid);
 
     let label_child = build_label_child(program, instance, label);
-    let inst = instance.clone();
-    Button::new()
-        .update_raw_el(|raw_el| {
-            let raw_el = raw_el.child(label_child);
-            let raw_el = apply_styles(raw_el, style, program, instance);
+    let inst_press = instance.clone();
+    let mut btn = Button::new()
+        .label(label_child)
+        .on_press(move || {
             if let Some(event_id) = press_event {
-                raw_el.event_handler(move |_: events::Click| {
-                    let _ = inst.fire_event(event_id.0);
-                })
-            } else {
-                raw_el
+                let _ = inst_press.fire_event(event_id.0);
             }
-        })
+        });
+    btn = apply_typed_styles(btn, style, program, false);
+    if let Some(cell) = hovered_cell {
+        let inst = instance.clone();
+        btn = btn.on_hovered_change(move |hovered| {
+            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
+        });
+    }
+    btn
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
         .into_raw_unchecked()
 }
 
@@ -527,6 +531,7 @@ fn build_stripe(
     items_cell: CellId,
     gap: &IrExpr,
     style: &IrExpr,
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let children = collect_stripe_children(program, instance, items_cell);
 
@@ -535,28 +540,27 @@ fn build_stripe(
         _ => true,
     };
 
-    let stripe = if is_column {
+    let is_row = !is_column;
+    let mut stripe = if is_column {
         Stripe::new()
     } else {
         Stripe::new().direction(Direction::Row)
     };
-
+    stripe = apply_typed_styles(stripe, style, program, is_row);
+    if let IrExpr::Constant(IrValue::Number(n)) = gap {
+        if *n > 0.0 {
+            stripe = stripe.s(Gap::both(*n as u32));
+        }
+    }
+    if let Some(cell) = hovered_cell {
+        let inst = instance.clone();
+        stripe = stripe.on_hovered_change(move |hovered| {
+            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
+        });
+    }
     stripe
-        .update_raw_el(|raw_el| {
-            let mut raw_el = raw_el;
-            // Apply gap if specified.
-            if let IrExpr::Constant(IrValue::Number(n)) = gap {
-                if *n > 0.0 {
-                    raw_el = raw_el.style("gap", &format!("{}px", n));
-                }
-            }
-            raw_el = if is_column {
-                apply_styles(raw_el, style, program, instance)
-            } else {
-                apply_styles_row(raw_el, style, program, instance)
-            };
-            raw_el.children(children)
-        })
+        .items(children)
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, is_row))
         .into_raw_unchecked()
 }
 
@@ -617,6 +621,7 @@ fn build_text_input(
     style: &IrExpr,
     links: &[(String, EventId)],
     focus: bool,
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     // Find events from links.
     let key_down_event = links.iter()
@@ -631,7 +636,15 @@ fn build_text_input(
     let change_text_cell = find_data_cell_for_event(program, links, "change", "text");
     let text_cell = find_text_property_cell(program, links);
 
-    TextInput::new()
+    let mut ti = TextInput::new();
+    ti = apply_typed_styles(ti, style, program, false);
+    if let Some(cell) = hovered_cell {
+        let inst = instance.clone();
+        ti = ti.on_hovered_change(move |hovered| {
+            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
+        });
+    }
+    ti
         .update_raw_el(|raw_el| {
             let mut raw_el = raw_el
                 .style("box-sizing", "border-box")
@@ -647,7 +660,7 @@ fn build_text_input(
                 });
             }
 
-            raw_el = apply_styles(raw_el, style, program, instance);
+            raw_el = apply_raw_css(raw_el, style, program, instance, None, false);
 
             // Apply placeholder text and styles via Zoon's style_group
             // (replaces the old <style> injection hack).
@@ -820,13 +833,20 @@ fn build_container(
     instance: &Rc<WasmInstance>,
     child: CellId,
     style: &IrExpr,
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let child_el = build_cell_element(program, instance, child);
-    El::new()
-        .update_raw_el(|raw_el| {
-            let raw_el = raw_el.child(child_el);
-            apply_styles(raw_el, style, program, instance)
-        })
+    let mut el = El::new();
+    el = apply_typed_styles(el, style, program, false);
+    if let Some(cell) = hovered_cell {
+        let inst = instance.clone();
+        el = el.on_hovered_change(move |hovered| {
+            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
+        });
+    }
+    el
+        .child(child_el)
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
         .into_raw_unchecked()
 }
 
@@ -837,6 +857,7 @@ fn build_label(
     label: &IrExpr,
     style: &IrExpr,
     _links: &[(String, EventId)],
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let content: RawElOrText = match label {
         IrExpr::TextConcat(segments) => {
@@ -855,11 +876,17 @@ fn build_label(
             zoon::Text::new(text).unify()
         }
     };
-    Label::new()
-        .update_raw_el(|raw_el| {
-            let raw_el = raw_el.child(content);
-            apply_styles(raw_el, style, program, instance)
-        })
+    let mut lbl = Label::new();
+    lbl = apply_typed_styles(lbl, style, program, false);
+    if let Some(cell) = hovered_cell {
+        let inst = instance.clone();
+        lbl = lbl.on_hovered_change(move |hovered| {
+            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
+        });
+    }
+    lbl
+        .label(content)
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
         .into_raw_unchecked()
 }
 
@@ -869,13 +896,20 @@ fn build_stack(
     instance: &Rc<WasmInstance>,
     layers_cell: CellId,
     style: &IrExpr,
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let children = collect_stripe_children(program, instance, layers_cell);
-    Stack::new()
-        .update_raw_el(|raw_el| {
-            let raw_el = raw_el.children(children);
-            apply_styles(raw_el, style, program, instance)
-        })
+    let mut stk = Stack::new();
+    stk = apply_typed_styles(stk, style, program, false);
+    if let Some(cell) = hovered_cell {
+        let inst = instance.clone();
+        stk = stk.on_hovered_change(move |hovered| {
+            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
+        });
+    }
+    stk
+        .layers(children)
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
         .into_raw_unchecked()
 }
 
@@ -887,16 +921,21 @@ fn build_link(
     url: &IrExpr,
     style: &IrExpr,
     _links: &[(String, EventId)],
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let label_text = resolve_static_text(program, label);
     let url_text = resolve_static_text(program, url);
-    Link::new()
-        .to(&url_text)
-        .new_tab(NewTab::new())
-        .update_raw_el(|raw_el| {
-            let raw_el = raw_el.child(zoon::Text::new(label_text));
-            apply_styles(raw_el, style, program, instance)
-        })
+    let mut lnk = Link::new().to(&url_text).new_tab(NewTab::new());
+    lnk = apply_typed_styles(lnk, style, program, false);
+    if let Some(cell) = hovered_cell {
+        let inst = instance.clone();
+        lnk = lnk.on_hovered_change(move |hovered| {
+            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
+        });
+    }
+    lnk
+        .label(zoon::Text::new(label_text))
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
         .into_raw_unchecked()
 }
 
@@ -906,6 +945,7 @@ fn build_paragraph(
     instance: &Rc<WasmInstance>,
     content: &IrExpr,
     style: &IrExpr,
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     // Build children based on content type.
     let children: Vec<RawElOrText> = match content {
@@ -960,17 +1000,24 @@ fn build_paragraph(
             vec![zoon::Text::new(text).unify()]
         }
     };
-    Paragraph::new()
-        .update_raw_el(|raw_el| {
-            let raw_el = raw_el.children(children);
-            apply_styles(raw_el, style, program, instance)
-        })
+    let mut para = Paragraph::new();
+    para = apply_typed_styles(para, style, program, false);
+    if let Some(cell) = hovered_cell {
+        let inst = instance.clone();
+        para = para.on_hovered_change(move |hovered| {
+            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
+        });
+    }
+    para
+        .contents(children)
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
         .into_raw_unchecked()
 }
 
-/// Build a Checkbox element using Zoon's Checkbox component.
-/// This ensures proper DOM structure and event handling for real user clicks,
-/// matching the Actors engine's approach.
+/// Build a Checkbox element using Zoon's typed Checkbox.
+/// `.checked_signal()` drives visual state from the cell, `.on_change()` fires
+/// the WASM event. Zoon's built-in click handler toggles internal state
+/// momentarily, but the next signal update from the cell corrects it.
 fn build_checkbox(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
@@ -978,133 +1025,55 @@ fn build_checkbox(
     style: &IrExpr,
     links: &[(String, EventId)],
     icon: Option<&CellId>,
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let click_event = links.iter().find(|(n, _)| n == "click").map(|(_, e)| *e);
 
-    let mut raw = RawHtmlEl::new("div")
-        .attr("role", "checkbox")
-        .style("cursor", "pointer")
-        .style("display", "inline-flex")
-        .style("flex-direction", "column")
-        .style("justify-content", "center")
-        .style("align-items", "center");
-
-    // Reactively set aria-checked from the checked cell signal.
-    if let Some(&checked_cell) = checked {
-        let store = instance.cell_store.clone();
-        let cell_id = checked_cell.0;
-        raw = raw.attr_signal(
-            "aria-checked",
-            store.get_cell_signal(cell_id).map(|v| if v != 0.0 { "true" } else { "false" }),
-        );
-    }
-
-    // Add icon as child with pointer-events:none so real clicks pass through
-    // to the checkbox div (otherwise clicks land on icon children and
-    // dominator's event handler on the checkbox doesn't fire).
-    if let Some(&icon_cell) = icon {
-        let icon_el = build_cell_element(program, instance, icon_cell);
-        let icon_el = match icon_el {
+    // Build icon element upfront so we don't need to capture &IrProgram in the closure.
+    let icon_el: RawElOrText = if let Some(&icon_cell) = icon {
+        let el = build_cell_element(program, instance, icon_cell);
+        match el {
             RawElOrText::RawHtmlEl(el) => {
                 RawElOrText::RawHtmlEl(el.style("pointer-events", "none"))
             }
             other => other,
-        };
-        raw = raw.child(icon_el);
-    }
+        }
+    } else {
+        El::new().into_raw_unchecked()
+    };
 
-    raw = apply_styles(raw, style, program, instance);
+    // Drive checked state from cell signal.
+    let checked_signal: LocalBoxSignal<'static, bool> = if let Some(&checked_cell) = checked {
+        let store = instance.cell_store.clone();
+        let cell_id = checked_cell.0;
+        store.get_cell_signal(cell_id).map(move |v| v != 0.0).boxed_local()
+    } else {
+        always(false).boxed_local()
+    };
 
-    if let Some(event_id) = click_event {
+    // All type-state methods (.checked_signal, .icon, .on_change) must always be
+    // called because they change the Checkbox's type flags.
+    let inst_change = instance.clone();
+    let mut cb = Checkbox::new()
+        .label_hidden("toggle")
+        .checked_signal(checked_signal)
+        .icon(move |_checked| icon_el)
+        .on_change(move |_checked| {
+            if let Some(event_id) = click_event {
+                let _ = inst_change.fire_event(event_id.0);
+            }
+        });
+
+    cb = apply_typed_styles(cb, style, program, false);
+    if let Some(cell) = hovered_cell {
         let inst = instance.clone();
-        raw = raw.event_handler(move |_: events::Click| {
-            let _ = inst.fire_event(event_id.0);
+        cb = cb.on_hovered_change(move |hovered| {
+            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
         });
     }
-
-    raw.into_raw_unchecked()
-}
-
-/// Extracted dimension value.
-enum DimensionValue {
-    Px(f64),
-    Fill,
-}
-
-/// Extracted style fields for Zoon element construction.
-struct StyleFields {
-    width: Option<DimensionValue>,
-    height: Option<DimensionValue>,
-    align_column: Option<String>,
-}
-
-/// Extract simple style fields from an IrExpr for use with Zoon's style API.
-fn extract_style_fields(style: &IrExpr) -> StyleFields {
-    let mut result = StyleFields { width: None, height: None, align_column: None };
-    let fields = match style {
-        IrExpr::ObjectConstruct(fields) => fields.as_slice(),
-        _ => return result,
-    };
-    for (name, value) in fields {
-        match name.as_str() {
-            "width" => result.width = extract_dimension(value),
-            "height" => result.height = extract_dimension(value),
-            "align" => {
-                if let IrExpr::ObjectConstruct(align_fields) = value {
-                    for (aname, aval) in align_fields {
-                        if aname == "column" {
-                            if let IrExpr::Constant(IrValue::Tag(t)) = aval {
-                                result.align_column = Some(t.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    result
-}
-
-fn extract_dimension(expr: &IrExpr) -> Option<DimensionValue> {
-    match expr {
-        IrExpr::Constant(IrValue::Number(n)) => Some(DimensionValue::Px(*n)),
-        IrExpr::Constant(IrValue::Tag(t)) if t == "Fill" => Some(DimensionValue::Fill),
-        _ => None,
-    }
-}
-
-/// Extract padding values from a style IrExpr.
-fn extract_padding(style: &IrExpr) -> Option<(f64, f64, f64, f64)> {
-    let fields = match style {
-        IrExpr::ObjectConstruct(fields) => fields,
-        _ => return None,
-    };
-    for (name, value) in fields {
-        if name == "padding" {
-            if let IrExpr::ObjectConstruct(pad_fields) = value {
-                let mut top = 0.0;
-                let mut right = 0.0;
-                let mut bottom = 0.0;
-                let mut left = 0.0;
-                for (pname, pval) in pad_fields {
-                    if let IrExpr::Constant(IrValue::Number(n)) = pval {
-                        match pname.as_str() {
-                            "top" => top = *n,
-                            "bottom" => bottom = *n,
-                            "left" => left = *n,
-                            "right" => right = *n,
-                            "row" => { left = *n; right = *n; }
-                            "column" => { top = *n; bottom = *n; }
-                            _ => {}
-                        }
-                    }
-                }
-                return Some((top, right, bottom, left));
-            }
-        }
-    }
-    None
+    cb
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
+        .into_raw_unchecked()
 }
 
 /// Build a WHILE element — reactively switches child based on source cell value.
@@ -1925,48 +1894,54 @@ fn build_item_element_node(
     // so attach_item_events doesn't duplicate them.
     let mut handled_events: &[&str] = &[];
 
+    // Typed element builders handle hover via .on_hovered_change() directly.
+    // Only Checkbox (RawHtmlEl) still needs attach_item_events for hover.
+    let mut remaining_hovered_cell = None;
+
     let raw: RawElOrText = match kind {
         ElementKind::Button { label, style } => {
-            // Button handles "press" directly (mapped to Click event).
-            build_item_button(program, instance, ctx, label, style, links)
+            build_item_button(program, instance, ctx, label, style, links, hovered_cell)
         }
         ElementKind::Stripe { direction, items, gap, style, .. } => {
-            build_item_stripe(program, instance, ctx, direction, *items, gap, style)
+            build_item_stripe(program, instance, ctx, direction, *items, gap, style, hovered_cell)
         }
         ElementKind::TextInput { placeholder, style, focus, text_cell: reactive_text_cell } => {
-            build_item_text_input(program, instance, ctx, placeholder.as_ref(), style, links, *focus, *reactive_text_cell)
+            build_item_text_input(program, instance, ctx, placeholder.as_ref(), style, links, *focus, *reactive_text_cell, hovered_cell)
         }
         ElementKind::Checkbox { checked, style, icon } => {
-            // Checkbox handles click directly.
             handled_events = &["click"];
-            build_item_checkbox(program, instance, ctx, checked.as_ref(), style, links, icon.as_ref())
+            build_item_checkbox(program, instance, ctx, checked.as_ref(), style, links, icon.as_ref(), hovered_cell)
         }
         ElementKind::Container { child, style } => {
-            build_item_container(program, instance, ctx, *child, style)
+            build_item_container(program, instance, ctx, *child, style, hovered_cell)
         }
         ElementKind::Label { label, style } => {
-            build_item_label(program, instance, ctx, label, style, links)
+            build_item_label(program, instance, ctx, label, style, links, hovered_cell)
         }
         ElementKind::Stack { layers, style } => {
-            build_item_stack(program, instance, ctx, *layers, style)
+            build_item_stack(program, instance, ctx, *layers, style, hovered_cell)
         }
         ElementKind::Link { url, label, style } => {
-            build_link(program, instance, label, url, style, links)
+            // Per-item Link reuses global builder; hover handled here since Link has .on_hovered_change().
+            // But we need per-item routing — use apply_item_hover equivalent.
+            // For simplicity, pass None and let attach_item_events handle hover for Link/Paragraph.
+            remaining_hovered_cell = hovered_cell;
+            build_link(program, instance, label, url, style, links, None)
         }
         ElementKind::Paragraph { content, style } => {
-            build_paragraph(program, instance, content, style)
+            remaining_hovered_cell = hovered_cell;
+            build_paragraph(program, instance, content, style, None)
         }
     };
-    // Attach event handlers with per-item routing.
-    // Filter out events already handled directly by the element builder.
+    // Attach remaining event handlers (blur, focus, click, double_click, and hover for Checkbox/Link/Paragraph).
     if handled_events.is_empty() {
-        attach_item_events(raw, instance, ctx, links, hovered_cell)
+        attach_item_events(raw, instance, ctx, links, remaining_hovered_cell)
     } else {
         let filtered: Vec<_> = links.iter()
             .filter(|(name, _)| !handled_events.contains(&name.as_str()))
             .cloned()
             .collect();
-        attach_item_events(raw, instance, ctx, &filtered, hovered_cell)
+        attach_item_events(raw, instance, ctx, &filtered, remaining_hovered_cell)
     }
 }
 
@@ -2083,6 +2058,30 @@ fn attach_item_events(
     html_el.into_raw_unchecked()
 }
 
+/// Apply hover handling on a typed per-item element via `.on_hovered_change()`.
+/// Routes to ItemCellStore for template cells, WasmInstance for global cells.
+fn apply_item_hover<T: MouseEventAware>(
+    el: T,
+    instance: &Rc<WasmInstance>,
+    ctx: &ItemContext,
+    cell: CellId,
+) -> T {
+    let item_idx = ctx.item_idx;
+    if ctx.is_template_cell(cell) {
+        let ics = instance.item_cell_store.clone();
+        el.on_hovered_change(move |hovered| {
+            if let Some(ref ics) = ics {
+                ics.set_cell(item_idx, cell.0, if hovered { 1.0 } else { 0.0 });
+            }
+        })
+    } else {
+        let inst = instance.clone();
+        el.on_hovered_change(move |hovered| {
+            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
+        })
+    }
+}
+
 /// Build a per-item Button element.
 fn build_item_button(
     program: &IrProgram,
@@ -2091,6 +2090,7 @@ fn build_item_button(
     label: &IrExpr,
     style: &IrExpr,
     links: &[(String, EventId)],
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let label_text = resolve_static_text(program, label);
 
@@ -2098,25 +2098,28 @@ fn build_item_button(
         .find(|(name, _)| name == "press")
         .map(|(_, eid)| *eid);
 
-    let inst = instance.clone();
+    let inst_press = instance.clone();
     let item_idx = ctx.item_idx;
-    Button::new()
-        .update_raw_el(|raw_el| {
-            let raw_el = raw_el.child(zoon::Text::new(label_text));
-            let raw_el = apply_styles_item(raw_el, style, program, instance, ctx);
-            if let Some(event_id) = press_event {
-                let is_template = ctx.is_template_event(event_id);
-                raw_el.event_handler(move |_: events::Click| {
+    let mut btn = Button::new()
+        .on_press({
+            let is_template = press_event.map(|e| ctx.is_template_event(e)).unwrap_or(false);
+            move || {
+                if let Some(event_id) = press_event {
                     if is_template {
-                        let _ = inst.call_on_item_event(item_idx, event_id.0);
+                        let _ = inst_press.call_on_item_event(item_idx, event_id.0);
                     } else {
-                        let _ = inst.fire_event(event_id.0);
+                        let _ = inst_press.fire_event(event_id.0);
                     }
-                })
-            } else {
-                raw_el
+                }
             }
-        })
+        });
+    btn = apply_typed_styles(btn, style, program, false);
+    if let Some(cell) = hovered_cell {
+        btn = apply_item_hover(btn, instance, ctx, cell);
+    }
+    btn
+        .label(zoon::Text::new(label_text))
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), false))
         .into_raw_unchecked()
 }
 
@@ -2129,6 +2132,7 @@ fn build_item_stripe(
     items_cell: CellId,
     gap: &IrExpr,
     style: &IrExpr,
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let children = collect_item_stripe_children(program, instance, ctx, items_cell);
 
@@ -2137,28 +2141,24 @@ fn build_item_stripe(
         _ => true,
     };
 
-    let stripe = if is_column {
+    let is_row = !is_column;
+    let mut stripe = if is_column {
         Stripe::new()
     } else {
         Stripe::new().direction(Direction::Row)
     };
-
+    stripe = apply_typed_styles(stripe, style, program, is_row);
+    if let IrExpr::Constant(IrValue::Number(n)) = gap {
+        if *n > 0.0 {
+            stripe = stripe.s(Gap::both(*n as u32));
+        }
+    }
+    if let Some(cell) = hovered_cell {
+        stripe = apply_item_hover(stripe, instance, ctx, cell);
+    }
     stripe
-        .update_raw_el(|raw_el| {
-            let mut raw_el = raw_el;
-            // Apply gap if specified.
-            if let IrExpr::Constant(IrValue::Number(n)) = gap {
-                if *n > 0.0 {
-                    raw_el = raw_el.style("gap", &format!("{}px", n));
-                }
-            }
-            raw_el = if is_column {
-                apply_styles_item(raw_el, style, program, instance, ctx)
-            } else {
-                apply_styles_item_row(raw_el, style, program, instance, ctx)
-            };
-            raw_el.children(children)
-        })
+        .items(children)
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), is_row))
         .into_raw_unchecked()
 }
 
@@ -2215,6 +2215,7 @@ fn build_item_text_input(
     links: &[(String, EventId)],
     focus: bool,
     reactive_text_cell: Option<CellId>,
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let key_down_event = links.iter().find(|(name, _)| name == "key_down").map(|(_, eid)| *eid);
     let change_event = links.iter().find(|(name, _)| name == "change").map(|(_, eid)| *eid);
@@ -2250,7 +2251,12 @@ fn build_item_text_input(
         found_text
     };
 
-    TextInput::new()
+    let mut ti = TextInput::new();
+    ti = apply_typed_styles(ti, style, program, false);
+    if let Some(cell) = hovered_cell {
+        ti = apply_item_hover(ti, instance, ctx, cell);
+    }
+    ti
         .update_raw_el(|raw_el| {
             let mut raw_el = raw_el
                 .style("box-sizing", "border-box")
@@ -2259,7 +2265,7 @@ fn build_item_text_input(
                 .style("color", "inherit")
                 .style("background", "transparent");
 
-            raw_el = apply_styles_item(raw_el, style, program, instance, ctx);
+            raw_el = apply_raw_css(raw_el, style, program, instance, Some(ctx), false);
 
             // Apply placeholder text and styles via Zoon's style_group
             // (replaces the old <style> injection hack).
@@ -2375,8 +2381,7 @@ fn build_item_text_input(
         .into_raw_unchecked()
 }
 
-/// Build a per-item Checkbox element.
-/// Uses the same pattern as build_item_button: raw element + direct event_handler.
+/// Build a per-item Checkbox element using Zoon's typed Checkbox.
 fn build_item_checkbox(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
@@ -2385,58 +2390,61 @@ fn build_item_checkbox(
     style: &IrExpr,
     links: &[(String, EventId)],
     icon: Option<&CellId>,
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let click_event = links.iter().find(|(n, _)| n == "click").map(|(_, e)| *e);
     let item_idx = ctx.item_idx;
 
-    let mut raw = RawHtmlEl::new("div")
-        .attr("role", "checkbox")
-        .style("cursor", "pointer")
-        .style("display", "inline-flex")
-        .style("flex-direction", "column")
-        .style("justify-content", "center")
-        .style("align-items", "center");
-
-    // Reactively set aria-checked from the per-item cell store.
-    if let Some(&checked_cell) = checked {
-        if let Some(ref ics) = instance.item_cell_store {
-            let ics = ics.clone();
-            let cell_id = checked_cell.0;
-            raw = raw.attr_signal(
-                "aria-checked",
-                ics.get_signal(item_idx, cell_id).map(|v| if v != 0.0 { "true" } else { "false" }),
-            );
-        }
-    }
-
-    // Add icon as child with pointer-events:none so real clicks pass through
-    // to the checkbox div (see build_checkbox for explanation).
-    if let Some(&icon_cell) = icon {
-        let icon_el = build_item_element(program, instance, ctx, icon_cell);
-        let icon_el = match icon_el {
+    // Build icon element upfront so we don't need to capture &IrProgram in the closure.
+    let icon_el: RawElOrText = if let Some(&icon_cell) = icon {
+        let el = build_item_element(program, instance, ctx, icon_cell);
+        match el {
             RawElOrText::RawHtmlEl(el) => {
                 RawElOrText::RawHtmlEl(el.style("pointer-events", "none"))
             }
             other => other,
-        };
-        raw = raw.child(icon_el);
-    }
+        }
+    } else {
+        El::new().into_raw_unchecked()
+    };
 
-    raw = apply_styles_item(raw, style, program, instance, ctx);
+    // Drive checked state from per-item cell signal.
+    let checked_signal: LocalBoxSignal<'static, bool> = if let Some(&checked_cell) = checked {
+        if let Some(ref ics) = instance.item_cell_store {
+            let ics = ics.clone();
+            let cell_id = checked_cell.0;
+            ics.get_signal(item_idx, cell_id).map(move |v| v != 0.0).boxed_local()
+        } else {
+            always(false).boxed_local()
+        }
+    } else {
+        always(false).boxed_local()
+    };
 
-    if let Some(event_id) = click_event {
-        let inst = instance.clone();
-        let is_template = ctx.is_template_event(event_id);
-        raw = raw.event_handler(move |_: events::Click| {
-            if is_template {
-                let _ = inst.call_on_item_event(item_idx, event_id.0);
-            } else {
-                let _ = inst.fire_event(event_id.0);
+    // All type-state methods must always be called.
+    let inst_change = instance.clone();
+    let is_template = click_event.map(|e| ctx.is_template_event(e)).unwrap_or(false);
+    let mut cb = Checkbox::new()
+        .label_hidden("toggle")
+        .checked_signal(checked_signal)
+        .icon(move |_checked| icon_el)
+        .on_change(move |_checked| {
+            if let Some(event_id) = click_event {
+                if is_template {
+                    let _ = inst_change.call_on_item_event(item_idx, event_id.0);
+                } else {
+                    let _ = inst_change.fire_event(event_id.0);
+                }
             }
         });
-    }
 
-    raw.into_raw_unchecked()
+    cb = apply_typed_styles(cb, style, program, false);
+    if let Some(cell) = hovered_cell {
+        cb = apply_item_hover(cb, instance, ctx, cell);
+    }
+    cb
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), false))
+        .into_raw_unchecked()
 }
 
 /// Build a per-item Container element.
@@ -2446,13 +2454,17 @@ fn build_item_container(
     ctx: &ItemContext,
     child: CellId,
     style: &IrExpr,
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let child_el = build_item_element(program, instance, ctx, child);
-    El::new()
-        .update_raw_el(|raw_el| {
-            let raw_el = raw_el.child(child_el);
-            apply_styles_item(raw_el, style, program, instance, ctx)
-        })
+    let mut el = El::new();
+    el = apply_typed_styles(el, style, program, false);
+    if let Some(cell) = hovered_cell {
+        el = apply_item_hover(el, instance, ctx, cell);
+    }
+    el
+        .child(child_el)
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), false))
         .into_raw_unchecked()
 }
 
@@ -2464,6 +2476,7 @@ fn build_item_label(
     label: &IrExpr,
     style: &IrExpr,
     _links: &[(String, EventId)],
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let content: RawElOrText = match label {
         IrExpr::TextConcat(segments) => {
@@ -2480,11 +2493,14 @@ fn build_item_label(
             zoon::Text::new(text).unify()
         }
     };
-    Label::new()
-        .update_raw_el(|raw_el| {
-            let raw_el = raw_el.child(content);
-            apply_styles_item(raw_el, style, program, instance, ctx)
-        })
+    let mut lbl = Label::new();
+    lbl = apply_typed_styles(lbl, style, program, false);
+    if let Some(cell) = hovered_cell {
+        lbl = apply_item_hover(lbl, instance, ctx, cell);
+    }
+    lbl
+        .label(content)
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), false))
         .into_raw_unchecked()
 }
 
@@ -2495,13 +2511,17 @@ fn build_item_stack(
     ctx: &ItemContext,
     layers_cell: CellId,
     style: &IrExpr,
+    hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let children = collect_item_stripe_children(program, instance, ctx, layers_cell);
-    Stack::new()
-        .update_raw_el(|raw_el| {
-            let raw_el = raw_el.children(children);
-            apply_styles_item(raw_el, style, program, instance, ctx)
-        })
+    let mut stk = Stack::new();
+    stk = apply_typed_styles(stk, style, program, false);
+    if let Some(cell) = hovered_cell {
+        stk = apply_item_hover(stk, instance, ctx, cell);
+    }
+    stk
+        .layers(children)
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), false))
         .into_raw_unchecked()
 }
 
@@ -2936,74 +2956,508 @@ fn resolve_expr_constant(program: &IrProgram, expr: &IrExpr, depth: u32) -> Opti
 }
 
 // ---------------------------------------------------------------------------
-// Style application
+// ---------------------------------------------------------------------------
+// Typed Zoon style API
 // ---------------------------------------------------------------------------
 
-/// Apply Boon style properties as CSS to any element implementing RawEl.
-fn apply_styles<T: RawEl>(
-    el: T,
-    style: &IrExpr,
+/// Extract style fields from an IrExpr, handling both ObjectConstruct and
+/// CellRead (object-store pattern).
+fn extract_style_fields_vec<'a>(
+    style: &'a IrExpr,
     program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-) -> T
-where
-    T::DomElement: AsRef<web_sys::HtmlElement>,
-{
-    apply_styles_inner(el, style, program, instance, None, false)
+    reconstructed_buf: &'a mut Vec<(String, IrExpr)>,
+) -> &'a [(String, IrExpr)] {
+    match style {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            *reconstructed_buf = reconstruct_object_fields(program, *cell);
+            reconstructed_buf
+        }
+        IrExpr::Constant(IrValue::Void) => &[],
+        _ => &[],
+    }
 }
 
-fn apply_styles_row<T: RawEl>(
-    el: T,
-    style: &IrExpr,
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-) -> T
-where
-    T::DomElement: AsRef<web_sys::HtmlElement>,
-{
-    apply_styles_inner(el, style, program, instance, None, true)
+/// Build a typed Width style from an IR dimension expression.
+fn build_width(value: &IrExpr, is_row: bool) -> Option<Width<'static>> {
+    match value {
+        IrExpr::Constant(IrValue::Number(n)) => Some(Width::exact(*n as u32)),
+        IrExpr::Constant(IrValue::Tag(t)) if t == "Fill" => {
+            if is_row {
+                // In a row flex, fill width = grow on main axis
+                Some(Width::growable())
+            } else {
+                // In a column flex, fill width = stretch on cross axis (100%)
+                Some(Width::fill())
+            }
+        }
+        _ => None,
+    }
 }
 
-fn apply_styles_item<T: RawEl>(
-    el: T,
-    style: &IrExpr,
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    ctx: &ItemContext,
-) -> T
-where
-    T::DomElement: AsRef<web_sys::HtmlElement>,
-{
-    apply_styles_inner(el, style, program, instance, Some(ctx), false)
+/// Build a typed Height style from an IR dimension expression.
+fn build_height(value: &IrExpr, is_row: bool) -> Option<Height<'static>> {
+    match value {
+        IrExpr::Constant(IrValue::Number(n)) => Some(Height::exact(*n as u32)),
+        IrExpr::Constant(IrValue::Tag(t)) if t == "Fill" => {
+            if is_row {
+                // In a row flex, fill height = stretch on cross axis (100%)
+                Some(Height::fill())
+            } else {
+                // In a column flex, fill height = grow on main axis
+                Some(Height::growable())
+            }
+        }
+        _ => None,
+    }
 }
 
-fn apply_styles_item_row<T: RawEl>(
-    el: T,
-    style: &IrExpr,
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    ctx: &ItemContext,
-) -> T
-where
-    T::DomElement: AsRef<web_sys::HtmlElement>,
-{
-    apply_styles_inner(el, style, program, instance, Some(ctx), true)
+/// Build a typed Padding style from an IR padding object.
+fn build_padding(value: &IrExpr) -> Option<Padding<'static>> {
+    if let IrExpr::ObjectConstruct(fields) = value {
+        let mut top: Option<u32> = None;
+        let mut bottom: Option<u32> = None;
+        let mut left: Option<u32> = None;
+        let mut right: Option<u32> = None;
+
+        for (name, val) in fields {
+            if let IrExpr::Constant(IrValue::Number(n)) = val {
+                let px = *n as u32;
+                match name.as_str() {
+                    "top" => top = Some(px),
+                    "bottom" => bottom = Some(px),
+                    "left" => left = Some(px),
+                    "right" => right = Some(px),
+                    "row" => { left = left.or(Some(px)); right = right.or(Some(px)); }
+                    "column" => { top = top.or(Some(px)); bottom = bottom.or(Some(px)); }
+                    _ => {}
+                }
+            }
+        }
+
+        let t = top.unwrap_or(0);
+        let r = right.unwrap_or(0);
+        let b = bottom.unwrap_or(0);
+        let l = left.unwrap_or(0);
+        if t != 0 || r != 0 || b != 0 || l != 0 {
+            return Some(Padding::new().top(t).right(r).bottom(b).left(l));
+        }
+    }
+    None
 }
 
-fn apply_styles_inner<T: RawEl>(
+/// Build a typed Gap style from an IR gap expression.
+fn build_gap(value: &IrExpr) -> Option<Gap<'static>> {
+    if let IrExpr::Constant(IrValue::Number(n)) = value {
+        if *n > 0.0 {
+            return Some(Gap::both(*n as u32));
+        }
+    }
+    None
+}
+
+/// Build a typed RoundedCorners style.
+fn build_rounded_corners(value: &IrExpr) -> Option<RoundedCorners> {
+    if let IrExpr::Constant(IrValue::Number(n)) = value {
+        return Some(RoundedCorners::all(*n as u32));
+    }
+    None
+}
+
+/// Build a typed Font style (static parts only — size, weight, family, align, italic).
+/// Returns the Font and a flag indicating whether reactive styles (color, strikethrough)
+/// must be applied via raw CSS because they need signals.
+fn build_font_static(
+    value: &IrExpr,
+    program: &IrProgram,
+) -> Option<Font<'static>> {
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match value {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
+        _ => return None,
+    };
+
+    let mut font = Font::new();
+    let mut has_any = false;
+
+    for (name, val) in fields {
+        match name.as_str() {
+            "size" => {
+                if let IrExpr::Constant(IrValue::Number(n)) = val {
+                    font = font.size(*n as u32);
+                    has_any = true;
+                } else if let Some(ConstValue::Number(n)) = resolve_expr_constant(program, val, 0) {
+                    font = font.size(n as u32);
+                    has_any = true;
+                }
+            }
+            "color" => {
+                // Only apply static color here — reactive colors handled separately.
+                if let Some(css) = resolve_color(val) {
+                    font = font.color(css);
+                    has_any = true;
+                }
+                // else: reactive color, handled by apply_font_reactive
+            }
+            "weight" => {
+                let tag = match val {
+                    IrExpr::Constant(IrValue::Tag(t)) => Some(t.clone()),
+                    _ => {
+                        if let Some(ConstValue::Tag(t)) = resolve_expr_constant(program, val, 0) {
+                            Some(t)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(t) = tag {
+                    let w = match t.as_str() {
+                        "ExtraLight" => FontWeight::ExtraLight,
+                        "Light" => FontWeight::Light,
+                        "Regular" | "Normal" => FontWeight::Regular,
+                        "Medium" => FontWeight::Medium,
+                        "SemiBold" => FontWeight::SemiBold,
+                        "Bold" => FontWeight::Bold,
+                        "ExtraBold" => FontWeight::ExtraBold,
+                        _ => FontWeight::Regular,
+                    };
+                    font = font.weight(w);
+                    has_any = true;
+                }
+            }
+            "family" => {
+                if let Some(family_css) = resolve_font_family(val, program) {
+                    // Font::family takes FontFamily items. We need to pass raw CSS.
+                    // Use FontFamily::new() with the full pre-formatted string.
+                    // Actually, Zoon's FontFamily can be constructed with a string.
+                    // But family() expects an IntoIterator<Item=FontFamily>.
+                    // We can pass a single FontFamily::new(full_css) but that wraps in quotes.
+                    // Instead, use raw CSS for font-family to avoid double-quoting.
+                    // This is handled in apply_raw_font.
+                }
+            }
+            "align" => {
+                let tag = match val {
+                    IrExpr::Constant(IrValue::Tag(t)) => Some(t.clone()),
+                    _ => {
+                        if let Some(ConstValue::Tag(t)) = resolve_expr_constant(program, val, 0) {
+                            Some(t)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(t) = tag {
+                    font = match t.as_str() {
+                        "Center" => font.center(),
+                        "Left" | "Start" => font.left(),
+                        "Right" | "End" => font.right(),
+                        _ => font.left(),
+                    };
+                    has_any = true;
+                }
+            }
+            "style" => {
+                if let IrExpr::Constant(IrValue::Tag(t)) = val {
+                    if t == "Italic" {
+                        font = font.italic();
+                        has_any = true;
+                    }
+                }
+            }
+            "line" => {
+                // Static strikethrough only — reactive handled in apply_font_reactive.
+                let reconstructed_line;
+                let line_fields: &[(String, IrExpr)] = match val {
+                    IrExpr::ObjectConstruct(f) => f,
+                    IrExpr::CellRead(cell) => {
+                        reconstructed_line = reconstruct_object_fields(program, *cell);
+                        &reconstructed_line
+                    }
+                    _ => continue,
+                };
+                for (lname, lval) in line_fields {
+                    if lname == "strikethrough" {
+                        if let IrExpr::Constant(IrValue::Bool(true)) = lval {
+                            font = font.line(FontLine::new().strike());
+                            has_any = true;
+                        }
+                        // CellRead → reactive, handled in apply_font_reactive
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if has_any { Some(font) } else { None }
+}
+
+/// Build a typed Background style (static color + static URL only).
+fn build_background_static(
+    value: &IrExpr,
+    program: &IrProgram,
+) -> Option<Background<'static>> {
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match value {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
+        _ => return None,
+    };
+
+    let mut bg = Background::new();
+    let mut has_any = false;
+
+    for (name, val) in fields {
+        match name.as_str() {
+            "color" => {
+                if let Some(css) = resolve_color_full(val) {
+                    bg = bg.color(css);
+                    has_any = true;
+                }
+            }
+            "url" => {
+                let url = eval_static_text(val);
+                let url = if url.is_empty() { resolve_static_text(program, val) } else { url };
+                if !url.is_empty() {
+                    bg = bg.url(url).size(BackgroundSize::Contain);
+                    has_any = true;
+                }
+                // Reactive URL handled in apply_background_reactive
+            }
+            _ => {}
+        }
+    }
+    if has_any { Some(bg) } else { None }
+}
+
+/// Build a typed Borders style.
+fn build_borders(value: &IrExpr) -> Option<Borders<'static>> {
+    if let IrExpr::ObjectConstruct(fields) = value {
+        let mut borders = Borders::new();
+        let mut has_any = false;
+
+        for (name, val) in fields {
+            if let IrExpr::ObjectConstruct(border_fields) = val {
+                let color_css = border_fields.iter()
+                    .find(|(n, _)| n == "color")
+                    .and_then(|(_, v)| resolve_color_full(v))
+                    .unwrap_or_else(|| "currentColor".to_string());
+                let width = border_fields.iter()
+                    .find(|(n, _)| n == "width")
+                    .and_then(|(_, v)| if let IrExpr::Constant(IrValue::Number(n)) = v { Some(*n) } else { None })
+                    .unwrap_or(1.0);
+                let border = Border::new().width(width as u32).color(color_css);
+                match name.as_str() {
+                    "top" => { borders = borders.top(border); has_any = true; }
+                    "bottom" => { borders = borders.bottom(border); has_any = true; }
+                    "left" => { borders = borders.left(border); has_any = true; }
+                    "right" => { borders = borders.right(border); has_any = true; }
+                    _ => {}
+                }
+            }
+        }
+        if has_any { return Some(borders); }
+    }
+    None
+}
+
+/// Build a typed Shadows style.
+fn build_shadows(value: &IrExpr, program: &IrProgram) -> Option<Shadows<'static>> {
+    let resolved;
+    let items = match value {
+        IrExpr::ListConstruct(items) => items,
+        IrExpr::CellRead(cell) => {
+            if let Some(IrNode::Derived { expr: IrExpr::ListConstruct(items), .. }) = find_node_for_cell(program, *cell) {
+                resolved = items.clone();
+                &resolved
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    let mut shadow_vec = Vec::new();
+
+    for item in items {
+        let reconstructed;
+        let fields: &[(String, IrExpr)] = match item {
+            IrExpr::ObjectConstruct(f) => f,
+            IrExpr::CellRead(cell) => {
+                reconstructed = reconstruct_object_fields(program, *cell);
+                &reconstructed
+            }
+            _ => continue,
+        };
+
+        let mut x = 0i32;
+        let mut y = 0i32;
+        let mut blur = 0u32;
+        let mut spread = 0i32;
+        let mut color = "rgba(0,0,0,0.2)".to_string();
+        let mut inset = false;
+
+        for (name, val) in fields {
+            match name.as_str() {
+                "x" => if let IrExpr::Constant(IrValue::Number(n)) = val { x = *n as i32; },
+                "y" => if let IrExpr::Constant(IrValue::Number(n)) = val { y = *n as i32; },
+                "blur" => if let IrExpr::Constant(IrValue::Number(n)) = val { blur = *n as u32; },
+                "spread" => if let IrExpr::Constant(IrValue::Number(n)) = val { spread = *n as i32; },
+                "color" => { color = resolve_color_full(val).unwrap_or(color); },
+                "direction" => {
+                    if let IrExpr::Constant(IrValue::Tag(t)) = val {
+                        if t == "Inwards" { inset = true; }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut shadow = Shadow::new().x(x).y(y).blur(blur).spread(spread).color(color);
+        if inset {
+            shadow = shadow.inner();
+        }
+        shadow_vec.push(shadow);
+    }
+    if shadow_vec.is_empty() { None } else { Some(Shadows::new(shadow_vec)) }
+}
+
+/// Build a typed Transform style.
+fn build_transform(value: &IrExpr, program: &IrProgram) -> Option<Transform> {
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match value {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
+        _ => return None,
+    };
+
+    let mut transform = Transform::new();
+    let mut has_any = false;
+
+    for (name, val) in fields {
+        match name.as_str() {
+            "rotate" => {
+                if let IrExpr::Constant(IrValue::Number(n)) = val {
+                    transform = transform.rotate(*n as i32);
+                    has_any = true;
+                }
+            }
+            "scale" => {
+                if let IrExpr::Constant(IrValue::Number(n)) = val {
+                    transform = transform.scale(*n);
+                    has_any = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if has_any { Some(transform) } else { None }
+}
+
+/// Apply typed Zoon styles to a Styleable element.
+/// Returns the element with all typed styles applied.
+/// Reactive styles (color signals, strikethrough signals, reactive background URLs,
+/// outline) and raw CSS exceptions (line-height, font-smoothing) are applied
+/// via apply_raw_css in update_raw_el.
+fn apply_typed_styles<T: Styleable<'static>>(
+    mut el: T,
+    style: &IrExpr,
+    program: &IrProgram,
+    is_row: bool,
+) -> T {
+    let mut reconstructed_buf = Vec::new();
+    let fields = extract_style_fields_vec(style, program, &mut reconstructed_buf);
+
+    for (name, value) in fields {
+        match name.as_str() {
+            "width" => {
+                if let Some(w) = build_width(value, is_row) {
+                    el = el.s(w);
+                }
+            }
+            "height" => {
+                if let Some(h) = build_height(value, is_row) {
+                    el = el.s(h);
+                }
+            }
+            "size" => {
+                if let IrExpr::Constant(IrValue::Number(n)) = value {
+                    el = el.s(Width::exact(*n as u32));
+                    el = el.s(Height::exact(*n as u32));
+                }
+            }
+            "padding" => {
+                if let Some(p) = build_padding(value) {
+                    el = el.s(p);
+                }
+            }
+            "font" => {
+                if let Some(f) = build_font_static(value, program) {
+                    el = el.s(f);
+                }
+            }
+            "background" => {
+                if let Some(bg) = build_background_static(value, program) {
+                    el = el.s(bg);
+                }
+            }
+            "rounded_corners" => {
+                if let Some(rc) = build_rounded_corners(value) {
+                    el = el.s(rc);
+                }
+            }
+            "borders" => {
+                if let Some(b) = build_borders(value) {
+                    el = el.s(b);
+                }
+            }
+            "shadows" => {
+                if let Some(s) = build_shadows(value, program) {
+                    el = el.s(s);
+                }
+            }
+            "transform" => {
+                if let Some(t) = build_transform(value, program) {
+                    el = el.s(t);
+                }
+            }
+            // align, outline, line_height, font_smoothing, font reactive parts →
+            // handled by apply_raw_css in update_raw_el
+            _ => {}
+        }
+    }
+    el
+}
+
+/// Apply the raw CSS parts that typed Zoon API can't handle:
+/// - align (direction-aware flex alignment)
+/// - line-height (unitless multiplier)
+/// - font-smoothing (vendor prefixed)
+/// - outline (reactive WHEN/WHILE signals)
+/// - font reactive color/strikethrough
+/// - reactive background URL
+/// - font-family (pre-formatted CSS)
+fn apply_raw_css<T: RawEl>(
     mut el: T,
     style: &IrExpr,
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     item_ctx: Option<&ItemContext>,
-    is_row_direction: bool,
+    is_row: bool,
 ) -> T
 where
     T::DomElement: AsRef<web_sys::HtmlElement>,
 {
-    // Style can be ObjectConstruct (direct) or CellRead (when nested objects
-    // caused the lowerer to use the object-store pattern). For CellRead, we
-    // reconstruct the field expressions from the IR node tree.
     let reconstructed;
     let fields: &[(String, IrExpr)] = match style {
         IrExpr::ObjectConstruct(fields) => fields,
@@ -3017,51 +3471,8 @@ where
 
     for (name, value) in fields {
         match name.as_str() {
-            "width" => {
-                if let Some(css) = dimension_to_css(value) {
-                    el = el.style("width", &css);
-                }
-                if matches!(value, IrExpr::Constant(IrValue::Tag(t)) if t == "Fill") {
-                    if is_row_direction {
-                        // In a row flex, filling width means growing on the main axis.
-                        el = el.style("flex-grow", "1");
-                    } else {
-                        // In a column flex, filling width means stretching on the cross axis.
-                        el = el.style("align-self", "stretch");
-                    }
-                }
-            }
-            "height" => {
-                if let Some(css) = dimension_to_css(value) {
-                    el = el.style("height", &css);
-                }
-                if matches!(value, IrExpr::Constant(IrValue::Tag(t)) if t == "Fill") {
-                    if is_row_direction {
-                        // In a row flex, filling height means stretching on the cross axis.
-                        el = el.style("align-self", "stretch");
-                    } else {
-                        // In a column flex, filling height means growing on the main axis.
-                        el = el.style("flex-grow", "1");
-                    }
-                }
-            }
-            "size" => {
-                if let Some(css) = dimension_to_css(value) {
-                    el = el.style("width", &css);
-                    el = el.style("height", &css);
-                }
-            }
-            "padding" => {
-                el = apply_padding(el, value);
-            }
-            "font" => {
-                el = apply_font(el, value, program, instance, item_ctx);
-            }
-            "background" => {
-                el = apply_background(el, value, program, instance, item_ctx);
-            }
             "align" => {
-                el = apply_align(el, value, program, is_row_direction);
+                el = apply_align(el, value, program, is_row);
             }
             "line_height" => {
                 if let IrExpr::Constant(IrValue::Number(n)) = value {
@@ -3071,9 +3482,6 @@ where
             "font_smoothing" => {
                 if let IrExpr::Constant(IrValue::Tag(t)) = value {
                     if t == "Antialiased" {
-                        // Use raw DOM API because dominator's .style() auto-adds
-                        // vendor prefixes, which creates invalid double-prefixed
-                        // names like "-webkit--moz-osx-font-smoothing".
                         el = el.after_insert(|dom_el| {
                             let element: &web_sys::HtmlElement = dom_el.as_ref();
                             let style = element.style();
@@ -3083,24 +3491,92 @@ where
                     }
                 }
             }
-            "rounded_corners" => {
-                if let IrExpr::Constant(IrValue::Number(n)) = value {
-                    el = el.style("border-radius", &format!("{}px", n));
-                }
-            }
-            "borders" => {
-                el = apply_borders(el, value);
-            }
-            "shadows" => {
-                el = apply_shadows(el, value, program);
-            }
             "outline" => {
                 el = apply_outline(el, value, program, instance);
             }
-            "transform" => {
-                el = apply_transform(el, value, program);
+            "font" => {
+                // Apply reactive font parts (color signal, strikethrough signal).
+                el = apply_font_reactive(el, value, program, instance, item_ctx);
+            }
+            "background" => {
+                // Apply reactive background URL.
+                el = apply_background_reactive(el, value, program, instance, item_ctx);
             }
             _ => {}
+        }
+    }
+    el
+}
+
+/// Apply reactive font parts (color signal, strikethrough signal) — for use in update_raw_el.
+fn apply_font_reactive<T: RawEl>(
+    mut el: T,
+    value: &IrExpr,
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    item_ctx: Option<&ItemContext>,
+) -> T {
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match value {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
+        _ => return el,
+    };
+    for (name, val) in fields {
+        match name.as_str() {
+            "color" => {
+                // Only apply reactive color — static color is in build_font_static.
+                if resolve_color(val).is_none() {
+                    el = apply_reactive_color(el, "color", val, program, instance, item_ctx);
+                }
+            }
+            "family" => {
+                // Font family uses pre-formatted CSS strings that don't map
+                // cleanly to FontFamily items (would double-quote).
+                if let Some(family) = resolve_font_family(val, program) {
+                    el = el.style("font-family", &family);
+                }
+            }
+            "line" => {
+                el = apply_font_line(el, val, program, instance, item_ctx);
+            }
+            _ => {}
+        }
+    }
+    el
+}
+
+/// Apply reactive background URL — for use in update_raw_el.
+fn apply_background_reactive<T: RawEl>(
+    mut el: T,
+    value: &IrExpr,
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    item_ctx: Option<&ItemContext>,
+) -> T
+where
+    T::DomElement: AsRef<web_sys::HtmlElement>,
+{
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match value {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
+        _ => return el,
+    };
+    for (name, val) in fields {
+        if name == "url" {
+            let url = eval_static_text(val);
+            let url2 = if url.is_empty() { resolve_static_text(program, val) } else { url };
+            if url2.is_empty() {
+                // No static URL — must be reactive.
+                el = apply_reactive_background_url(el, val, program, instance, item_ctx);
+            }
         }
     }
     el
@@ -3143,154 +3619,6 @@ fn reconstruct_object_fields(program: &IrProgram, cell: CellId) -> Vec<(String, 
         }
     }
     fields
-}
-
-/// Convert a Boon dimension value to CSS.
-fn dimension_to_css(expr: &IrExpr) -> Option<String> {
-    match expr {
-        IrExpr::Constant(IrValue::Number(n)) => Some(format!("{}px", n)),
-        IrExpr::Constant(IrValue::Tag(t)) if t == "Fill" => Some("100%".to_string()),
-        _ => None,
-    }
-}
-
-/// Apply padding from a Boon padding object.
-fn apply_padding<T: RawEl>(
-    mut el: T,
-    value: &IrExpr,
-) -> T {
-    if let IrExpr::ObjectConstruct(fields) = value {
-        let mut top = None;
-        let mut bottom = None;
-        let mut left = None;
-        let mut right = None;
-
-        for (name, val) in fields {
-            if let IrExpr::Constant(IrValue::Number(n)) = val {
-                match name.as_str() {
-                    "top" => top = Some(*n),
-                    "bottom" => bottom = Some(*n),
-                    "left" => left = Some(*n),
-                    "right" => right = Some(*n),
-                    "row" => { left = left.or(Some(*n)); right = right.or(Some(*n)); }
-                    "column" => { top = top.or(Some(*n)); bottom = bottom.or(Some(*n)); }
-                    _ => {}
-                }
-            }
-        }
-
-        let t = top.unwrap_or(0.0);
-        let r = right.unwrap_or(0.0);
-        let b = bottom.unwrap_or(0.0);
-        let l = left.unwrap_or(0.0);
-        if t != 0.0 || r != 0.0 || b != 0.0 || l != 0.0 {
-            el = el.style("padding", &format!("{}px {}px {}px {}px", t, r, b, l));
-        }
-    }
-    el
-}
-
-/// Apply font properties.
-fn apply_font<T: RawEl>(
-    mut el: T,
-    value: &IrExpr,
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    item_ctx: Option<&ItemContext>,
-) -> T {
-    // Font value may be ObjectConstruct (direct) or CellRead (from object store).
-    let reconstructed;
-    let fields: &[(String, IrExpr)] = match value {
-        IrExpr::ObjectConstruct(fields) => fields,
-        IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
-            &reconstructed
-        }
-        _ => return el,
-    };
-    for (name, val) in fields {
-        match name.as_str() {
-            "size" => {
-                if let IrExpr::Constant(IrValue::Number(n)) = val {
-                    el = el.style("font-size", &format!("{}px", n));
-                } else if let Some(ConstValue::Number(n)) = resolve_expr_constant(program, val, 0) {
-                    el = el.style("font-size", &format!("{}px", n));
-                }
-            }
-            "color" => {
-                if let Some(css) = resolve_color(val) {
-                    el = el.style("color", &css);
-                } else {
-                    el = apply_reactive_color(el, "color", val, program, instance, item_ctx);
-                }
-            }
-            "weight" => {
-                let tag = match val {
-                    IrExpr::Constant(IrValue::Tag(t)) => Some(t.clone()),
-                    _ => {
-                        if let Some(ConstValue::Tag(t)) = resolve_expr_constant(program, val, 0) {
-                            Some(t)
-                        } else {
-                            None
-                        }
-                    }
-                };
-                if let Some(t) = tag {
-                    let w = match t.as_str() {
-                        "ExtraLight" => "200",
-                        "Light" => "300",
-                        "Regular" | "Normal" => "400",
-                        "Medium" => "500",
-                        "SemiBold" => "600",
-                        "Bold" => "700",
-                        "ExtraBold" => "800",
-                        _ => "400",
-                    };
-                    el = el.style("font-weight", w);
-                }
-            }
-            "family" => {
-                if let Some(family) = resolve_font_family(val, program) {
-                    el = el.style("font-family", &family);
-                }
-            }
-            "align" => {
-                let tag = match val {
-                    IrExpr::Constant(IrValue::Tag(t)) => Some(t.clone()),
-                    _ => {
-                        if let Some(ConstValue::Tag(t)) = resolve_expr_constant(program, val, 0) {
-                            Some(t)
-                        } else {
-                            None
-                        }
-                    }
-                };
-                if let Some(t) = tag {
-                    let a = match t.as_str() {
-                        "Center" => "center",
-                        "Left" | "Start" => "left",
-                        "Right" | "End" => "right",
-                        _ => "left",
-                    };
-                    el = el.style("text-align", a);
-                }
-            }
-            "style" => {
-                if let IrExpr::Constant(IrValue::Tag(t)) = val {
-                    if t == "Italic" {
-                        el = el.style("font-style", "italic");
-                    }
-                }
-            }
-            "line" => {
-                // line: [strikethrough: Bool/CellRead]
-                // Applies text-decoration: line-through when strikethrough is true.
-                el = apply_font_line(el, val, program, instance, item_ctx);
-            }
-            _ => {}
-        }
-    }
-    el
 }
 
 /// Apply font line properties (strikethrough, underline).
@@ -3405,59 +3733,6 @@ fn resolve_font_family(expr: &IrExpr, program: &IrProgram) -> Option<String> {
     }).collect();
 
     if families.is_empty() { None } else { Some(families.join(", ")) }
-}
-
-/// Apply background properties.
-fn apply_background<T: RawEl>(
-    mut el: T,
-    value: &IrExpr,
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    item_ctx: Option<&ItemContext>,
-) -> T
-where
-    T::DomElement: AsRef<web_sys::HtmlElement>,
-{
-    let reconstructed;
-    let fields: &[(String, IrExpr)] = match value {
-        IrExpr::ObjectConstruct(fields) => fields,
-        IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
-            &reconstructed
-        }
-        _ => return el,
-    };
-    for (name, val) in fields {
-        match name.as_str() {
-            "color" => {
-                if let Some(css) = resolve_color_full(val) {
-                    el = el.style("background-color", &css);
-                }
-            }
-            "url" => {
-                // Try static text first, then follow CellRead chains.
-                let url = eval_static_text(val);
-                if !url.is_empty() {
-                    el = el.style("background-image", &format!("url({})", url));
-                    el = el.style("background-size", "contain");
-                    el = el.style("background-repeat", "no-repeat");
-                } else {
-                    let url = resolve_static_text(program, val);
-                    if !url.is_empty() {
-                        el = el.style("background-image", &format!("url({})", url));
-                        el = el.style("background-size", "contain");
-                        el = el.style("background-repeat", "no-repeat");
-                    } else {
-                        // Reactive URL: the value is a CellRead to a WHEN/WHILE node
-                        // whose arms produce text (e.g. SVG data URIs for checkbox icons).
-                        el = apply_reactive_background_url(el, val, program, instance, item_ctx);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    el
 }
 
 /// Set up a reactive background-image from a WHEN/WHILE expression.
@@ -3614,104 +3889,6 @@ fn apply_align<T: RawEl>(
                 _ => {}
             }
         }
-    }
-    el
-}
-
-/// Apply border properties.
-fn apply_borders<T: RawEl>(
-    mut el: T,
-    value: &IrExpr,
-) -> T {
-    if let IrExpr::ObjectConstruct(fields) = value {
-        for (name, val) in fields {
-            if let IrExpr::ObjectConstruct(border_fields) = val {
-                let color = border_fields.iter()
-                    .find(|(n, _)| n == "color")
-                    .and_then(|(_, v)| resolve_color_full(v))
-                    .unwrap_or_else(|| "currentColor".to_string());
-                let width = border_fields.iter()
-                    .find(|(n, _)| n == "width")
-                    .and_then(|(_, v)| if let IrExpr::Constant(IrValue::Number(n)) = v { Some(*n) } else { None })
-                    .unwrap_or(1.0);
-                let border_css = format!("{}px solid {}", width, color);
-                match name.as_str() {
-                    "top" => { el = el.style("border-top", &border_css); }
-                    "bottom" => { el = el.style("border-bottom", &border_css); }
-                    "left" => { el = el.style("border-left", &border_css); }
-                    "right" => { el = el.style("border-right", &border_css); }
-                    _ => {}
-                }
-            }
-        }
-    }
-    el
-}
-
-/// Apply shadow properties.
-fn apply_shadows<T: RawEl>(
-    mut el: T,
-    value: &IrExpr,
-    program: &IrProgram,
-) -> T {
-    // Shadows can be a ListConstruct directly, or a CellRead to a Derived
-    // node holding a ListConstruct (when the style used the object-store pattern).
-    let resolved;
-    let items = match value {
-        IrExpr::ListConstruct(items) => items,
-        IrExpr::CellRead(cell) => {
-            if let Some(IrNode::Derived { expr: IrExpr::ListConstruct(items), .. }) = find_node_for_cell(program, *cell) {
-                resolved = items.clone();
-                &resolved
-            } else {
-                return el;
-            }
-        }
-        _ => return el,
-    };
-
-    let shadows: Vec<String> = items.iter().filter_map(|item| {
-        // Items may be ObjectConstruct (direct) or CellRead (when force_object_store
-        // was active during lowering). Handle both by reconstructing if needed.
-        let reconstructed;
-        let fields: &[(String, IrExpr)] = match item {
-            IrExpr::ObjectConstruct(f) => f,
-            IrExpr::CellRead(cell) => {
-                reconstructed = reconstruct_object_fields(program, *cell);
-                &reconstructed
-            }
-            _ => return None,
-        };
-
-        let mut x = 0.0f64;
-        let mut y = 0.0f64;
-        let mut blur = 0.0f64;
-        let mut spread = 0.0f64;
-        let mut color = "rgba(0,0,0,0.2)".to_string();
-        let mut inset = false;
-
-        for (name, val) in fields {
-            match name.as_str() {
-                "x" => if let IrExpr::Constant(IrValue::Number(n)) = val { x = *n; },
-                "y" => if let IrExpr::Constant(IrValue::Number(n)) = val { y = *n; },
-                "blur" => if let IrExpr::Constant(IrValue::Number(n)) = val { blur = *n; },
-                "spread" => if let IrExpr::Constant(IrValue::Number(n)) = val { spread = *n; },
-                "color" => { color = resolve_color_full(val).unwrap_or(color); },
-                "direction" => {
-                    if let IrExpr::Constant(IrValue::Tag(t)) = val {
-                        if t == "Inwards" { inset = true; }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let inset_str = if inset { "inset " } else { "" };
-        Some(format!("{}{}px {}px {}px {}px {}", inset_str, x, y, blur, spread, color))
-    }).collect();
-
-    if !shadows.is_empty() {
-        el = el.style("box-shadow", &shadows.join(", "));
     }
     el
 }
@@ -3890,43 +4067,6 @@ fn resolve_active_outline(
     }
     // Default: no outline
     Some(("none".to_string(), "none".to_string()))
-}
-
-/// Apply CSS transform properties.
-fn apply_transform<T: RawEl>(
-    mut el: T,
-    value: &IrExpr,
-    program: &IrProgram,
-) -> T {
-    let reconstructed;
-    let fields: &[(String, IrExpr)] = match value {
-        IrExpr::ObjectConstruct(fields) => fields,
-        IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
-            &reconstructed
-        }
-        _ => return el,
-    };
-    let mut transforms = Vec::new();
-    for (name, val) in fields {
-        match name.as_str() {
-            "rotate" => {
-                if let IrExpr::Constant(IrValue::Number(n)) = val {
-                    transforms.push(format!("rotate({}deg)", n));
-                }
-            }
-            "scale" => {
-                if let IrExpr::Constant(IrValue::Number(n)) = val {
-                    transforms.push(format!("scale({})", n));
-                }
-            }
-            _ => {}
-        }
-    }
-    if !transforms.is_empty() {
-        el = el.style("transform", &transforms.join(" "));
-    }
-    el
 }
 
 /// Full color resolver — handles Oklch with all parameters.
