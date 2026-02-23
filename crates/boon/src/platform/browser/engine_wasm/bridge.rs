@@ -1,7 +1,7 @@
 //! DOM bridge — creates Zoon UI elements from the IR program and connects
 //! them to the WASM runtime instance.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
@@ -480,12 +480,21 @@ fn build_label_child(
     instance: &Rc<WasmInstance>,
     label: &IrExpr,
 ) -> RawElOrText {
-    if let Some(segs) = resolve_label_segments(program, label) {
+    let el = if let Some(segs) = resolve_label_segments(program, label) {
         if segs.iter().any(|s| matches!(s, TextSegment::Expr(IrExpr::CellRead(_)))) {
             return build_text_from_segments(instance, segs);
         }
+        zoon::Text::new(resolve_static_text(program, label)).unify()
+    } else {
+        zoon::Text::new(resolve_static_text(program, label)).unify()
+    };
+    // pointer-events:none on label so clicks pass through to the button div.
+    // Without this, dominator's event handler doesn't fire for clicks that
+    // land on label children (same issue as checkbox icons).
+    match el {
+        RawElOrText::RawHtmlEl(el) => RawElOrText::RawHtmlEl(el.style("pointer-events", "none")),
+        other => other,
     }
-    zoon::Text::new(resolve_static_text(program, label)).unify()
 }
 
 /// Build a Button element.
@@ -1051,17 +1060,18 @@ fn build_checkbox(
         always(false).boxed_local()
     };
 
-    // All type-state methods (.checked_signal, .icon, .on_change) must always be
-    // called because they change the Checkbox's type flags.
+    // on_change must NOT fire events: Zoon's on_change triggers for BOTH user clicks
+    // AND programmatic checked_signal updates (they share internal Mutable<CheckState>).
+    // This creates an infinite oscillation: fire_event → cell update → checked_signal →
+    // on_change → fire_event. Instead, use a raw DOM click handler that only fires on
+    // actual user interaction.
     let inst_change = instance.clone();
     let mut cb = Checkbox::new()
         .label_hidden("toggle")
         .checked_signal(checked_signal)
         .icon(move |_checked| icon_el)
         .on_change(move |_checked| {
-            if let Some(event_id) = click_event {
-                let _ = inst_change.fire_event(event_id.0);
-            }
+            // No-op: event firing handled by raw click handler below.
         });
 
     cb = apply_typed_styles(cb, style, program, false);
@@ -1072,7 +1082,14 @@ fn build_checkbox(
         });
     }
     cb
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
+        .update_raw_el(|raw_el| {
+            let raw_el = raw_el.event_handler(move |_: events::Click| {
+                if let Some(event_id) = click_event {
+                    let _ = inst_change.fire_event(event_id.0);
+                }
+            });
+            apply_raw_css(raw_el, style, program, instance, None, false)
+        })
         .into_raw_unchecked()
 }
 
@@ -2117,8 +2134,15 @@ fn build_item_button(
     if let Some(cell) = hovered_cell {
         btn = apply_item_hover(btn, instance, ctx, cell);
     }
+    // pointer-events:none on label so clicks pass through to the button div.
+    // Without this, dominator's event handler doesn't fire for clicks that
+    // land on label children (same issue as checkbox icons).
+    let label = match zoon::Text::new(label_text).unify() {
+        RawElOrText::RawHtmlEl(el) => RawElOrText::RawHtmlEl(el.style("pointer-events", "none")),
+        other => other,
+    };
     btn
-        .label(zoon::Text::new(label_text))
+        .label(label)
         .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), false))
         .into_raw_unchecked()
 }
@@ -2421,7 +2445,8 @@ fn build_item_checkbox(
         always(false).boxed_local()
     };
 
-    // All type-state methods must always be called.
+    // on_change must NOT fire events — see build_checkbox comment for rationale.
+    // Use raw DOM click handler to avoid checked_signal → on_change feedback loop.
     let inst_change = instance.clone();
     let is_template = click_event.map(|e| ctx.is_template_event(e)).unwrap_or(false);
     let mut cb = Checkbox::new()
@@ -2429,13 +2454,7 @@ fn build_item_checkbox(
         .checked_signal(checked_signal)
         .icon(move |_checked| icon_el)
         .on_change(move |_checked| {
-            if let Some(event_id) = click_event {
-                if is_template {
-                    let _ = inst_change.call_on_item_event(item_idx, event_id.0);
-                } else {
-                    let _ = inst_change.fire_event(event_id.0);
-                }
-            }
+            // No-op: event firing handled by raw click handler below.
         });
 
     cb = apply_typed_styles(cb, style, program, false);
@@ -2443,7 +2462,18 @@ fn build_item_checkbox(
         cb = apply_item_hover(cb, instance, ctx, cell);
     }
     cb
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), false))
+        .update_raw_el(|raw_el| {
+            let raw_el = raw_el.event_handler(move |_: events::Click| {
+                if let Some(event_id) = click_event {
+                    if is_template {
+                        let _ = inst_change.call_on_item_event(item_idx, event_id.0);
+                    } else {
+                        let _ = inst_change.fire_event(event_id.0);
+                    }
+                }
+            });
+            apply_raw_css(raw_el, style, program, instance, Some(ctx), false)
+        })
         .into_raw_unchecked()
 }
 
@@ -2799,7 +2829,23 @@ fn extract_placeholder_styles(expr: &IrExpr, program: &IrProgram) -> Vec<(String
 fn extract_placeholder_styles_from_fields(fields: &[(String, IrExpr)], program: &IrProgram) -> Vec<(String, String)> {
     let mut styles = Vec::new();
     for (name, val) in fields {
-        if name == "font" {
+        if name == "style" {
+            // Placeholder structure: [style: [font: [...]], text: ...].
+            // Unwrap the "style" wrapper and recurse to find "font".
+            match val {
+                IrExpr::ObjectConstruct(f) => {
+                    styles.extend(extract_placeholder_styles_from_fields(
+                        &f.iter().map(|(n, v)| (n.clone(), v.clone())).collect::<Vec<_>>(),
+                        program,
+                    ));
+                }
+                IrExpr::CellRead(cell) => {
+                    let f = reconstruct_object_fields(program, *cell);
+                    styles.extend(extract_placeholder_styles_from_fields(&f, program));
+                }
+                _ => {}
+            }
+        } else if name == "font" {
             // Font object: [style: Italic, color: Oklch[...]]
             let font_fields = match val {
                 IrExpr::ObjectConstruct(f) => f.as_slice(),
@@ -3345,16 +3391,48 @@ fn build_transform(value: &IrExpr, program: &IrProgram) -> Option<Transform> {
     let mut has_any = false;
 
     for (name, val) in fields {
+        // Helper: extract f64 from Constant or resolve through CellRead chain.
+        let resolve_number = |v: &IrExpr| -> Option<f64> {
+            match v {
+                IrExpr::Constant(IrValue::Number(n)) => Some(*n),
+                _ => resolve_expr_constant(program, v, 0)
+                    .and_then(|c| if let ConstValue::Number(n) = c { Some(n) } else { None }),
+            }
+        };
         match name.as_str() {
             "rotate" => {
-                if let IrExpr::Constant(IrValue::Number(n)) = val {
-                    transform = transform.rotate(*n as i32);
+                if let Some(n) = resolve_number(val) {
+                    transform = transform.rotate(n as i32);
                     has_any = true;
                 }
             }
             "scale" => {
-                if let IrExpr::Constant(IrValue::Number(n)) = val {
-                    transform = transform.scale(*n);
+                if let Some(n) = resolve_number(val) {
+                    transform = transform.scale(n);
+                    has_any = true;
+                }
+            }
+            "move_right" => {
+                if let Some(n) = resolve_number(val) {
+                    transform = transform.move_right(n);
+                    has_any = true;
+                }
+            }
+            "move_down" => {
+                if let Some(n) = resolve_number(val) {
+                    transform = transform.move_down(n);
+                    has_any = true;
+                }
+            }
+            "move_left" => {
+                if let Some(n) = resolve_number(val) {
+                    transform = transform.move_left(n);
+                    has_any = true;
+                }
+            }
+            "move_up" => {
+                if let Some(n) = resolve_number(val) {
+                    transform = transform.move_up(n);
                     has_any = true;
                 }
             }
@@ -3431,6 +3509,19 @@ fn apply_typed_styles<T: Styleable<'static>>(
                     el = el.s(t);
                 }
             }
+            "visible" => {
+                match value {
+                    IrExpr::Constant(IrValue::Bool(b)) => {
+                        el = el.s(Visible::new(*b));
+                    }
+                    IrExpr::Constant(IrValue::Tag(t)) => {
+                        el = el.s(Visible::new(t != "False"));
+                    }
+                    _ => {
+                        // Reactive visibility handled by apply_raw_css
+                    }
+                }
+            }
             // align, outline, line_height, font_smoothing, font reactive parts →
             // handled by apply_raw_css in update_raw_el
             _ => {}
@@ -3499,8 +3590,14 @@ where
                 el = apply_font_reactive(el, value, program, instance, item_ctx);
             }
             "background" => {
-                // Apply reactive background URL.
+                // Apply reactive background URL and color.
                 el = apply_background_reactive(el, value, program, instance, item_ctx);
+            }
+            "visible" => {
+                // Reactive visibility — static handled in apply_typed_styles.
+                if !matches!(value, IrExpr::Constant(_)) {
+                    el = apply_reactive_visible(el, value, program, instance, item_ctx);
+                }
             }
             _ => {}
         }
@@ -3570,13 +3667,22 @@ where
         _ => return el,
     };
     for (name, val) in fields {
-        if name == "url" {
-            let url = eval_static_text(val);
-            let url2 = if url.is_empty() { resolve_static_text(program, val) } else { url };
-            if url2.is_empty() {
-                // No static URL — must be reactive.
-                el = apply_reactive_background_url(el, val, program, instance, item_ctx);
+        match name.as_str() {
+            "color" => {
+                // Only apply reactive color — static color is in build_background_static.
+                if resolve_color(val).is_none() {
+                    el = apply_reactive_color(el, "background-color", val, program, instance, item_ctx);
+                }
             }
+            "url" => {
+                let url = eval_static_text(val);
+                let url2 = if url.is_empty() { resolve_static_text(program, val) } else { url };
+                if url2.is_empty() {
+                    // No static URL — must be reactive.
+                    el = apply_reactive_background_url(el, val, program, instance, item_ctx);
+                }
+            }
+            _ => {}
         }
     }
     el
@@ -3733,6 +3839,39 @@ fn resolve_font_family(expr: &IrExpr, program: &IrProgram) -> Option<String> {
     }).collect();
 
     if families.is_empty() { None } else { Some(families.join(", ")) }
+}
+
+/// Apply reactive visibility via style_signal. Watches a cell and maps
+/// truthy (non-zero) to "visible", falsy (zero) to "hidden".
+fn apply_reactive_visible<T: RawEl>(
+    el: T,
+    value: &IrExpr,
+    _program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    item_ctx: Option<&ItemContext>,
+) -> T {
+    if let IrExpr::CellRead(cell) = value {
+        let cell_id = cell.0;
+        // Per-item template cell path.
+        if let Some(ctx) = item_ctx {
+            if ctx.is_template_cell(*cell) {
+                if let Some(ref ics) = instance.item_cell_store {
+                    let item_idx = ctx.item_idx;
+                    return el.style_signal("visibility",
+                        ics.get_signal(item_idx, cell_id)
+                            .map(|v| if v != 0.0 { "visible" } else { "hidden" })
+                    );
+                }
+            }
+        }
+        // Global cell path.
+        let store = instance.cell_store.clone();
+        return el.style_signal("visibility",
+            store.get_cell_signal(cell_id)
+                .map(|v| if v != 0.0 { "visible" } else { "hidden" })
+        );
+    }
+    el
 }
 
 /// Set up a reactive background-image from a WHEN/WHILE expression.
@@ -4116,7 +4255,7 @@ fn apply_reactive_color<T: RawEl>(
     instance: &Rc<WasmInstance>,
     item_ctx: Option<&ItemContext>,
 ) -> T {
-    // Case 1: TaggedObject with reactive CellRead fields (e.g., Oklch with reactive lightness).
+    // Case 1: TaggedObject with reactive CellRead fields (e.g., Oklch with reactive lightness/chroma/hue).
     if let IrExpr::TaggedObject { tag, fields } = expr {
         if tag != "Oklch" {
             return el;
@@ -4124,12 +4263,14 @@ fn apply_reactive_color<T: RawEl>(
         let mut lightness_cell = None;
         let mut chroma_cell = None;
         let mut hue_cell = None;
+        let mut lightness_default = 0.0f64;
         let mut chroma_default = 0.0f64;
         let mut hue_default = 0.0f64;
         let mut alpha_val = 1.0f64;
         for (name, value) in fields {
             match name.as_str() {
                 "lightness" => match value {
+                    IrExpr::Constant(IrValue::Number(n)) => lightness_default = *n,
                     IrExpr::CellRead(cell) => lightness_cell = Some(cell.0),
                     _ => {}
                 },
@@ -4151,10 +4292,12 @@ fn apply_reactive_color<T: RawEl>(
                 _ => {}
             }
         }
-        let store = instance.cell_store.clone();
-        if let Some(cell_id) = lightness_cell {
-            return el.style_signal(css_prop, store.get_cell_signal(cell_id).map(move |v| {
-                let l = v;
+        // Pick any reactive cell as signal driver, read the rest in the closure.
+        let driver_cell = lightness_cell.or(chroma_cell).or(hue_cell);
+        if let Some(cell_id) = driver_cell {
+            let store = instance.cell_store.clone();
+            return el.style_signal(css_prop, store.get_cell_signal(cell_id).map(move |_| {
+                let l = lightness_cell.map_or(lightness_default, |cid| store.get_cell_value(cid));
                 let c = chroma_cell.map_or(chroma_default, |cid| store.get_cell_value(cid));
                 let h = hue_cell.map_or(hue_default, |hid| store.get_cell_value(hid));
                 if alpha_val < 1.0 {

@@ -2832,9 +2832,14 @@ impl<'a> WasmEmitter<'a> {
                         func.instruction(&Instruction::I32GeS);
                         func.instruction(&Instruction::BrIf(1));
 
-                        // if (i != item_idx) → copy item
+                        // if (memory_index_of(i) != item_idx) → copy item
+                        // item_idx (local 0) is a MEMORY index, not a position index.
+                        // After removals/reindexing, position != memory index, so we
+                        // must look up the memory index for position i before comparing.
+                        func.instruction(&Instruction::I32Const(source.0 as i32));
                         func.instruction(&Instruction::LocalGet(local_i));
-                        func.instruction(&Instruction::LocalGet(0)); // item_idx
+                        func.instruction(&Instruction::Call(IMPORT_HOST_LIST_ITEM_MEMORY_INDEX));
+                        func.instruction(&Instruction::LocalGet(0)); // item_idx (memory index)
                         func.instruction(&Instruction::I32Ne);
                         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                         // host_list_copy_item(new_list_id, source_cell_id, i)

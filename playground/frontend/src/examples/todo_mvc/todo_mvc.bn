@@ -237,11 +237,9 @@ FUNCTION main_panel() {
                     }
                 ]
                 items: LIST {
-                    PASSED.store.todos |> List/is_empty() |> WHILE {
-                        True => NoElement
-                        False => toggle_all_checkbox()
-                            |> LINK { PASSED.store.elements.toggle_all_checkbox }
-                    }
+                    toggle_all_checkbox(
+                        is_visible: PASSED.store.todos |> List/is_empty() |> Bool/not()
+                    ) |> LINK { PASSED.store.elements.toggle_all_checkbox }
                     new_todo_title_text_input()
                         |> LINK { PASSED.store.elements.new_todo_title_text_input }
                 }
@@ -301,7 +299,7 @@ FUNCTION new_todo_title_text_input() {
             style: [
                 font: [
                     style: Italic
-                    color: Oklch[lightness: 0.925]
+                    color: Oklch[lightness: 0.68]
                 ]
             ]
             text: TEXT { What needs to be done? }
@@ -412,12 +410,12 @@ FUNCTION todos_element() {
     )
 }
 
-FUNCTION toggle_all_checkbox() {
+FUNCTION toggle_all_checkbox(is_visible) {
     BLOCK {
         all_completed: PASSED.store.all_completed
         Element/checkbox(
             element: [event: [click: LINK]]
-            style: [width: 45, height: Fill, padding: [left: 18, right: 12], align: [column: Center]]
+            style: [width: 45, height: Fill, padding: [left: 18, right: 12], align: [column: Center], visible: is_visible]
             label: Hidden[text: TEXT { Toggle all }]
             checked: all_completed
             icon: Element/container(

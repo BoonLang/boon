@@ -154,6 +154,34 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
     }
 }
 
+/// Create a reactive visible signal from a settings variable.
+/// Returns a signal that emits `Option<bool>` for the `visible` style property.
+fn visible_signal_from_settings(settings_variable: Arc<Variable>) -> impl Signal<Item = Option<bool>> + 'static {
+    signal::from_stream({
+        let style_stream = switch_map(
+            settings_variable.stream(),
+            |value| value.expect_object().expect_variable("style").stream()
+        );
+        switch_map(
+            style_stream,
+            |value| {
+                let obj = value.expect_object();
+                match obj.variable("visible") {
+                    Some(var) => var.stream().left_stream(),
+                    None => stream::empty().right_stream(),
+                }
+            }
+        )
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Tag(tag, _) => Some(tag.tag() == "True"),
+                Value::Number(n, _) => Some(n.number() != 0.0),
+                _ => None,
+            })
+        })
+    })
+}
+
 fn element_container(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
@@ -184,6 +212,8 @@ fn element_container(
     let sv_align = tagged_object.expect_variable("settings");
     let sv_bg_url = tagged_object.expect_variable("settings");
     let sv_size = tagged_object.expect_variable("settings");
+    let sv_visible = tagged_object.expect_variable("settings");
+    let visible_sig = visible_signal_from_settings(sv_visible);
 
     // Padding with directional support - produces tuple (top, right, bottom, left) as u32
     // Uses Zoon's Padding::*_signal APIs for typed styling
@@ -707,6 +737,7 @@ fn element_container(
             .bottom_signal(padding_bottom_signal)
             .left_signal(padding_left_signal))
         .s(Font::with_signal_self(align_font_signal))
+        .s(Visible::with_signal(visible_sig))
         .item_signal(signal::from_stream(child_stream))
         .after_remove(move |_| {
             drop(tagged_object);
@@ -823,6 +854,9 @@ fn element_stripe(
     });
 
     // Style property streams for element_stripe
+    let sv_visible = tagged_object.expect_variable("settings");
+    let visible_sig = visible_signal_from_settings(sv_visible);
+
     // Width - produces typed Width values with optional min/max constraints
     // Supports: Fill | number | [sizing: Fill, minimum: X, maximum: Y]
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
@@ -1791,6 +1825,7 @@ fn element_stripe(
         .s(Borders::new().top_signal(border_top_typed_signal))
         .s(Outline::with_signal_self(outline_signal.map(|opt| opt.flatten())))
         .s(AlignContent::with_signal_self(combined_content_align_signal))
+        .s(Visible::with_signal(visible_sig))
         // Raw CSS properties without Zoon typed equivalents
         .update_raw_el(move |raw_el| {
             raw_el
@@ -1833,6 +1868,8 @@ fn element_stack(
     let settings_variable_2 = tagged_object.expect_variable("settings");
     let settings_variable_3 = tagged_object.expect_variable("settings");
     let settings_variable_4 = tagged_object.expect_variable("settings");
+    let sv_visible = tagged_object.expect_variable("settings");
+    let visible_sig = visible_signal_from_settings(sv_visible);
 
     // Width - produces u32 for typed Width API
     let width_signal = signal::from_stream({
@@ -1914,6 +1951,7 @@ fn element_stack(
         .s(Width::exact_signal(width_signal))
         .s(Height::exact_signal(height_signal))
         .s(Background::new().color_signal(background_signal))
+        .s(Visible::with_signal(visible_sig))
         .layers_signal_vec(VecDiffStreamSignalVec(layers_vec_diff_stream).map_signal(
             move |value_actor| {
                 signal::from_stream(value_actor.stream().map({
@@ -2260,6 +2298,8 @@ fn element_button(
     });
 
     let settings_variable = tagged_object.expect_variable("settings");
+    let sv_visible = tagged_object.expect_variable("settings");
+    let visible_sig = visible_signal_from_settings(sv_visible);
 
     // CRITICAL: Use switch_map (not flat_map) because label variable stream is infinite.
     // When settings change, switch_map cancels the old label subscription.
@@ -2814,6 +2854,7 @@ fn element_button(
             .left_signal(padding_left_signal))
         .s(Font::with_signal_self(font_align_font_signal))
         .s(Align::with_signal_self(align_signal.map(|opt| opt.flatten())))
+        .s(Visible::with_signal(visible_sig))
         .after_remove(move |_| {
             drop(event_handler_loop);
             drop(tagged_object);
@@ -3122,6 +3163,8 @@ fn element_text_input(
     });
 
     let settings_variable = tagged_object.expect_variable("settings");
+    let sv_visible = tagged_object.expect_variable("settings");
+    let visible_sig = visible_signal_from_settings(sv_visible);
 
     // CRITICAL: Use switch_map (not flat_map) because text variable stream is infinite.
     let text_stream = switch_map(
@@ -3164,6 +3207,40 @@ fn element_text_input(
 
     // Placeholder signal for TextInput
     let placeholder_signal = signal::from_stream(placeholder_text_stream);
+
+    // Placeholder font color signal: placeholder → style → font → color → oklch CSS
+    let sv_ph_color = tagged_object.expect_variable("settings");
+    let placeholder_color_signal = signal::from_stream({
+        let ph_stream = switch_map(
+            sv_ph_color.stream(),
+            |value| value.expect_object().expect_variable("placeholder").stream()
+        );
+        let style_stream = switch_map(ph_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("style") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        switch_map(
+            switch_map(font_stream, |value| {
+                let obj = value.expect_object();
+                match obj.variable("color") {
+                    Some(var) => var.stream().left_stream(),
+                    None => stream::empty().right_stream(),
+                }
+            }),
+            |value| oklch_to_css_stream(value)
+        )
+        .boxed_local()
+    });
 
     // Width signal from style
     // Width signal - produces Width values for typed API (supports Fill and pixel values)
@@ -3369,7 +3446,7 @@ fn element_text_input(
     TextInput::new()
         .label_hidden("text input")
         .text_signal(signal::from_stream(text_stream).map(|t| t.unwrap_or_default()))
-        .placeholder(Placeholder::with_signal(placeholder_signal.map(|t| t.unwrap_or_default())).s(Font::new().italic()))
+        .placeholder(Placeholder::with_signal(placeholder_signal.map(|t| t.unwrap_or_default())).s(Font::new().italic().color_signal(placeholder_color_signal)))
         .on_change({
             let sender = change_event_sender.clone();
             move |text| {
@@ -3427,6 +3504,7 @@ fn element_text_input(
             .bottom_signal(padding_bottom_signal)
             .left_signal(padding_left_signal))
         .s(Width::with_signal_self(width_typed_signal))
+        .s(Visible::with_signal(visible_sig))
         .after_remove(move |_| {
             if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Element REMOVED - dropping event handlers"); }
             drop(event_handler_loop);
@@ -3513,6 +3591,8 @@ fn element_checkbox(
 
     let settings_variable = tagged_object.expect_variable("settings");
     let sv_padding = tagged_object.expect_variable("settings");
+    let sv_visible = tagged_object.expect_variable("settings");
+    let visible_sig = visible_signal_from_settings(sv_visible);
 
     // CRITICAL: Use switch_map (not flat_map) because variable streams are infinite.
     let checked_stream = switch_map(
@@ -3610,6 +3690,7 @@ fn element_checkbox(
         .icon(move |_checked_mutable| {
             El::new().child_signal(signal::from_stream(icon_stream))
         })
+        .s(Visible::with_signal(visible_sig))
         .s(Padding::new()
             .top_signal(padding_top_signal)
             .right_signal(padding_right_signal)
@@ -3725,6 +3806,8 @@ fn element_label(
     });
 
     // Create style streams
+    let sv_visible = tagged_object.expect_variable("settings");
+    let visible_sig = visible_signal_from_settings(sv_visible);
     let sv2 = tagged_object.expect_variable("settings");
     let sv3 = tagged_object.expect_variable("settings");
     let sv4 = tagged_object.expect_variable("settings");
@@ -3890,6 +3973,7 @@ fn element_label(
                 sender.send_or_drop(TimestampedEvent::now(()));
             }
         })
+        .s(Visible::with_signal(visible_sig))
         .after_remove(move |_| drop(event_handler_loop))
 }
 
@@ -3898,6 +3982,8 @@ fn element_paragraph(
     construct_context: ConstructContext,
 ) -> impl Element {
     let settings_variable = tagged_object.expect_variable("settings");
+    let sv_visible = tagged_object.expect_variable("settings");
+    let visible_sig = visible_signal_from_settings(sv_visible);
 
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let contents_stream = switch_map(
@@ -3919,6 +4005,7 @@ fn element_paragraph(
                 }))
             }),
         )
+        .s(Visible::with_signal(visible_sig))
 }
 
 fn element_link(
@@ -3982,6 +4069,8 @@ fn element_link(
     });
 
     let settings_variable = tagged_object.expect_variable("settings");
+    let sv_visible = tagged_object.expect_variable("settings");
+    let visible_sig = visible_signal_from_settings(sv_visible);
 
     // CRITICAL: Use switch_map (not flat_map) because label variable stream is infinite.
     // When settings change, switch_map cancels the old label subscription.
@@ -4063,6 +4152,7 @@ fn element_link(
             hovered_sender.send_or_drop(TimestampedEvent::now(is_hovered));
         })
         .s(Font::new().line(FontLine::new().underline_signal(underline_bool_signal.map(|opt| opt.unwrap_or(false)))))
+        .s(Visible::with_signal(visible_sig))
         .after_remove(move |_| {
             drop(event_handler_loop);
             drop(tagged_object);
