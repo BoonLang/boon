@@ -6,9 +6,9 @@
 
 This guide serves two related but distinct goals. Knowing which goal each resource serves helps you understand WHY you're reading it.
 
-**Goal A: Verification IN Boon** — Giving Boon users and AI the ability to prove their programs correct. This is a *language feature*: Boon's constructs, type system, and compiler work together so that correctness properties are either inferred automatically or stated as lightweight annotations. This is the primary goal and drives the reading order. (Phases 0-5, Intrinsic Verification Thesis)
+**Goal A: Verification IN Boon** — Giving Boon users and AI the ability to prove their programs correct. This is a *language feature*: Boon's constructs, type system, and compiler work together so that correctness properties are either inferred automatically or stated as lightweight annotations. This is the primary goal and drives the reading order. Most phases serve Goal A; each resource is tagged in the summary table.
 
-**Goal B: Verification OF Boon** — Proving that Boon's own implementation (Actors engine, DD engine, WASM engine, parser, evaluator) is correct. This uses external tools (K Framework, TLA+, Lean/Rocq) to verify that Boon itself does what it claims. Important, but secondary to the language design. (Phases 6-8)
+**Goal B: Verification OF Boon** — Proving that Boon's own implementation (Actors engine, DD engine, WASM engine, parser, evaluator) is correct. This uses external tools (K Framework, TLA+, Lean/Rocq) to verify that Boon itself does what it claims. Important, but secondary to the language design. Some resources (especially Phases 6 and 8) primarily serve Goal B; some serve both.
 
 Most resources serve Goal A. When a resource primarily serves Goal B, it's noted explicitly.
 
@@ -100,7 +100,9 @@ temperatures: sensor |> WHEN {
 
 The feedback loop is key: the compiler's proof failures are structured error messages that AI can act on — much better than "it crashed at runtime."
 
-**The cost problem that Boon's design solves:** Traditional verification is expensive. CompCert (a verified C compiler) is 42,000 lines of Coq — **76% of which is proof code**, with a 3:1 proof-to-program ratio and ~3 person-years of effort. This is why formal verification hasn't gone mainstream: the cost of writing proofs dwarfs the cost of writing code. Boon's intrinsic verification thesis (detailed at the end of this document) aims for a fundamentally different ratio: if the language constructs themselves encode verification properties, Layer 1 verification is essentially **free** — 0:1 proof-to-code ratio for many common properties. This changes the economics entirely, especially for AI generation where the AI doesn't need to generate separate proofs at all.
+**The cost problem:** Traditional verification is expensive. CompCert (a verified C compiler) is 42,000 lines of Coq — **76% of which is proof code**, with a 3:1 proof-to-program ratio and ~3 person-years of effort. This is why formal verification hasn't gone mainstream: the cost of writing proofs dwarfs the cost of writing code.
+
+**Boon's answer:** The intrinsic verification thesis (detailed at the end of this document) aims for a fundamentally different ratio. If the language constructs themselves encode verification properties, Layer 1 verification is essentially **free** — 0:1 proof-to-code ratio for many common properties. This changes the economics entirely, especially for AI generation where the AI doesn't need to generate separate proofs at all.
 
 ---
 
@@ -140,6 +142,8 @@ This paper grounds the entire reading journey in Boon's actual paradigm: reactiv
 
 ### Phase 2: Core Theory — "What Are Proofs in a Language?" (Weeks 1-6)
 
+Now that the Lustre paper has grounded you in dataflow verification, you need the vocabulary of verification itself — contracts, invariants, termination, induction. Dafny teaches this best, even though its examples are imperative. As you read, keep asking: "how would this concept look in a dataflow language like Boon?"
+
 **2a. [Program Proofs — K. Rustan M. Leino (MIT Press)](https://mitpress.mit.edu/9780262546232/program-proofs/)** — Book, 3-4 weeks
 
 **THE textbook. This is the single most important resource.** Leino invented Dafny to answer "what does it look like when proofs are part of a programming language?" Three parts: foundations (termination, induction), functional programs, imperative programs (with objects and dynamic frames). All in runnable Dafny code, not pseudocode.
@@ -154,7 +158,7 @@ Companion: [Dafny Getting Started Guide (CMU PDF)](https://www.andrew.cmu.edu/co
 
 Same ideas as Dafny but in a production language used in avionics, medical devices, and railway signaling. The critical design lesson is **graduated verification** — SPARK's Stone → Bronze → Silver → Gold → Platinum levels let teams choose how much to verify. Also covers information flow analysis (proving data only flows where it should), which maps directly to Boon's dataflow model.
 
-**Design takeaway for Boon:** Graduated verification levels. Boon could offer: "Level 1: no runtime errors" (automatic), "Level 2: stream type invariants" (light annotations), "Level 3: full functional correctness" (explicit proofs).
+**Design takeaway for Boon:** Graduated verification layers. Boon could offer: "Layer 0: runtime stream assertions" (monitor values), "Layer 1: no runtime errors + stream type invariants" (automatic inference), "Layer 2: full functional correctness" (explicit static assertions).
 
 Companion: [AdaCore learn.adacore.com SPARK Course](https://learn.adacore.com/courses/intro-to-spark/chapters/01_Overview.html) — Free, interactive, browser-based SPARK exercises.
 
@@ -166,7 +170,7 @@ Now that you understand proofs from the inside, see how AI does it.
 
 **3a. [AutoVerus: Automated Proof Generation for Rust Code](https://arxiv.org/abs/2409.13082)** — Paper, OOPSLA 2025
 
-Microsoft Research. LLM agents automatically generate Verus proofs for Rust code. Three-phase approach mimicking human experts: preliminary generation, refinement with tips, debugging with verification errors. **90%+ success rate** on 150 non-trivial tasks, most in <30 seconds. Used at Microsoft and Amazon.
+Microsoft Research. LLM agents automatically generate Verus proofs for Rust code. Three-phase approach mimicking human experts: preliminary generation, refinement with tips, debugging with verification errors. **90%+ success rate** on 150 non-trivial tasks, most in <30 seconds.
 
 **Why read this:** This is the closest existing system to what Boon's AI proof pipeline would look like. The three-phase architecture (generate → refine → debug) is the blueprint.
 
@@ -186,9 +190,9 @@ Now you know contracts (Dafny/SPARK) and how AI uses them. Explore the wider des
 
 Refinement types for Haskell. Types carry predicates (e.g., `{ x: Int | x > 0 }`), checked via SMT. 10,000+ lines of Haskell libraries verified. **The lightest-weight verification approach** — most natural for Boon's streams where values flow through typed pipelines.
 
-**Design takeaway for Boon:** Refinement types on streams could be Boon's "Level 2" verification — requiring minimal annotations while catching many real bugs. E.g., `temperatures: Stream { t: Number | t > -273.15 }`.
+**Design takeaway for Boon:** Refinement types on streams could be the core of Boon's Layer 1 verification — requiring minimal annotations while catching many real bugs. E.g., `temperatures: Stream { t: Number | t > -273.15 }`.
 
-**4b. F\*'s key insight (read the tutorial only if time permits)**
+**4b. F\*: key insight (read the tutorial only if time permits)**
 
 [F*](https://fstar-lang.org/) combines ALL three verification levels (contracts, refinement types, dependent types) with **monadic effects** and SMT automation. Built Project Everest (verified HTTPS stack). The full [F* tutorial](https://fstar-lang.org/tutorial/) is 1-2 weeks and may be overwhelming at this stage — but the key design insight is essential:
 
@@ -214,7 +218,7 @@ SMT-based verification for Rust. Proofs written in Rust syntax using "ghost code
 
 ### Phase 5: Verified Dataflow Tools — "Building Boon's Verifier" (Weeks 12-13)
 
-You read the Lustre paper in Phase 1c. Now dive deeper into the tools that verify dataflow programs — these are the direct templates for Boon's built-in verifier.
+Phase 4 taught you the design space (refinement types, SMT solvers, ghost code). Now bring that knowledge back to Boon's actual paradigm. You read the Lustre paper in Phase 1c — now dive deeper into the tools that verify dataflow programs. These are the direct templates for Boon's built-in verifier.
 
 **5a. [Vélus: Verified Lustre Compiler](https://velus.inria.fr/)** — Tool + papers, 1 day
 
@@ -222,7 +226,7 @@ A formally verified compiler from Lustre to assembly, built on CompCert and veri
 
 **5b. [Kind 2 Model Checker](https://kind2-mc.github.io/kind2/)** — Tool, 1 day
 
-Multi-engine SMT-based model checker for Lustre programs. Supports assume-guarantee contracts, BMC, k-induction, IC3. Used industrially (Rockwell-Collins). Takes Lustre + property annotations, proves them or finds counterexamples.
+Multi-engine SMT-based model checker for Lustre programs. Supports assume-guarantee contracts, BMC, k-induction, IC3. Used industrially (Collins Aerospace). Takes Lustre + property annotations, proves them or finds counterexamples.
 
 **Design takeaway for Boon:** Kind 2's contract syntax and temporal property verification for dataflow programs is the most direct template for Boon's built-in verifier. Its assume-guarantee contracts on stream nodes map to contracts on Boon functions. Its temporal property checking (safety, liveness) maps to properties about Boon's HOLD/WHEN/WHILE behavior over time.
 
@@ -430,7 +434,7 @@ These complement the critical path. Read them when you reach the relevant phase,
 | 5 | 5b | Kind 2 | Tool | 1 day | A | Model checker for dataflow |
 | 5 | 5c | BeepBeep Paper | Paper | 1 day | A | Stream pipeline verification |
 | 6 | 6 | K Framework | Framework | 2-3 wks | B | Boon's formal semantics |
-| 7 | 7a | Lean 4 Guide | Textbook | 3-4 wks | B | Ceiling: proofs as first-class |
+| 7 | 7a | Lean 4 Guide | Textbook | 3-4 wks | A+B | Ceiling: proofs as first-class |
 | 7 | 7b | Idris Book | Book | 2-3 wks | A | Practical dependent types |
 | 7 | 7c | Rocq/Software Foundations | Books | 3-4 wks | A+B | Verified algorithms & PL theory |
 | 8 | 8a | Learn TLA+ | Free book | 2-3 wks | B | Engine concurrency specs |
@@ -648,7 +652,7 @@ valid_temperatures: raw_sensor
     |> ASSERT { t => t > -273.15 AND t < 1000 }  -- checked at runtime
     |> WHEN { t WHERE t > 100 => Alert(TEXT { High: {t} }) }
 ```
-This is trivial to implement (add assertion checks to stream processing), immediately useful (catches bugs during development), and provides a smooth upgrade path: the same assertions later become static proof obligations when the static verifier is built. Lustre's Lesar and BeepBeep both support this pattern. **This could be Boon's first verification feature — shipped before any static analysis.**
+This is trivial to implement (add assertion checks to stream processing), immediately useful (catches bugs during development), and provides a smooth upgrade path: the same assertions later become static proof obligations when the static verifier is built. Lustre's [Lesar](https://www.di.ens.fr/~pouzet/cours/mpri/bib/lesar-rapport.pdf) (a BDD-based model checker for Lustre safety properties) and BeepBeep both support this pattern. **This could be Boon's first verification feature — shipped before any static analysis.**
 
 **Layer 1: Free (structural inference, no annotations)**
 
@@ -684,11 +688,9 @@ PROVE counter >= 0 BY INDUCTION {
 
 ### Why This Matters
 
-**Layer 1 is already huge.** In most languages, you get zero verification for free — everything must be annotated. But Boon's reactive constructs are so structured that the compiler can infer refinement types, state invariants, and data flow guarantees from the program itself. This is exactly what makes Boon ideal for AI generation: the AI writes natural Boon code, and most correctness properties are verified automatically. Layer 2 (lightweight assertions) handles the rest. Layer 3 (full proofs) is rarely needed.
+**Layer 1 is already huge.** In most languages, you get zero verification for free — everything must be annotated. But Boon's reactive constructs are so structured that the compiler can infer refinement types, state invariants, and data flow guarantees from the program itself. This is exactly what makes Boon ideal for AI generation: the AI writes natural Boon code, and most correctness properties are verified automatically. Layer 2 (static assertions) handles the rest. Layer 3 (full proofs) is rarely needed. And the smooth progression — Layer 0 → 1 → 2 → 3 — means each step delivers value independently.
 
-And Layer 0 (runtime monitoring) can ship immediately — before any static verifier is built — giving Boon users verification benefits from day one. The progression is smooth: Layer 0 runtime assertions → Layer 1 automatic inference → Layer 2 static assertions → Layer 3 explicit proofs.
-
-This is similar to how Lustre works — programs and properties in the same language — but Boon's richer construct set (HOLD, WHEN, WHILE, LATEST, LINK, pipes) gives the compiler even more structure to reason about. And it's similar to refinement type inference in Liquid Haskell, but arising from the language constructs rather than type annotations.
+This approach is similar to how Lustre works — programs and properties in the same language — but Boon's richer construct set (HOLD, WHEN, WHILE, LATEST, LINK, pipes) gives the compiler even more structure to reason about. And it's similar to refinement type inference in Liquid Haskell, but arising from the language constructs rather than type annotations.
 
 ---
 
