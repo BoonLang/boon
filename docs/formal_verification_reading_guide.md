@@ -61,7 +61,7 @@ The levels above describe *what kind* of proofs you can write. But there's an or
 
 These aren't naturally expressible as Hoare-logic contracts (pre/postconditions). They require **temporal logic** (LTL, CTL) and **model checking** (BMC, k-induction, IC3) — the same techniques from the ZipCPU blog post, but applied to software streams instead of hardware signals.
 
-This matters for Boon because its constructs are inherently temporal: `HOLD` is state over time, `THEN` is "when event arrives," `WHILE` is "during condition," `LATEST` is "whenever any input changes." The Lustre language and Kind 2 model checker (Phase 1c, Phase 5) show how temporal verification works for dataflow programs. Boon's built-in verifier will likely need both Hoare-logic contracts (for value properties) AND temporal model checking (for behavior-over-time properties).
+This matters for Boon because its constructs are inherently temporal: `HOLD` is state over time, `THEN` is "when event arrives," `WHILE` is "during condition," `LATEST` is "whenever any input changes." The Lustre language (Phase 1c) and Kind 2 model checker (Phase 5b) show how temporal verification works for dataflow programs. Boon's built-in verifier will likely need both Hoare-logic contracts (for value properties) AND temporal model checking (for behavior-over-time properties).
 
 ## What This Means for Boon Specifically
 
@@ -442,6 +442,8 @@ These complement the critical path. Read them when you reach the relevant phase,
 | 8 | 8c | Alloy 6 | Free book | 1-2 wks | B | Lightweight design modeling |
 | 9 | 9a | HW Verification (Springer) | Textbook | 3-4 wks | A | FPGA verification theory |
 | 9 | 9b | Reactive Systems (Schneider) | Textbook | 3-4 wks | A+B | Reactive system theory |
+| SupGen | — | SupGen gists + Interaction Calculus | Gists/Repo | ~4 hrs | A | Symbolic synthesis alternative to Z3 |
+| SupGen | — | Kind proof language | Repo | 1 hr | A | CoC+Self type theory for Layer 3 |
 
 ---
 
@@ -453,6 +455,8 @@ These complement the critical path. Read them when you reach the relevant phase,
 - **Lean model:** User writes proofs as code → compiler checks them. More powerful but harder for AI.
 - **Refinement type model** (Liquid Haskell/F*): Types carry predicates → compiler infers most proofs. Least annotation needed, but limited in what you can express.
 - **Lustre/Kind 2 model:** Programs and properties in the same language → model checker verifies automatically. No separate proof language needed.
+
+- **SupGen/NeoGen model** (HVM4/Bend2): Programmer writes partial code with holes → symbolic search fills them with proven-correct code. No proofs needed at all — the synthesized code is correct by construction. See the "Symbolic Program Synthesis" section for details.
 
 For AI generation, the sweet spot is probably **Dafny-style contracts + automatic discharge** (like SPARK's Bronze/Silver levels). The AI generates `ENSURES` and `REQUIRES` annotations, and Boon's compiler uses Z3 to verify them automatically. When automatic proving fails, the AI can fall back to writing explicit proof hints (like Dafny's `calc` blocks or Lean's tactics).
 
@@ -732,3 +736,282 @@ Turn runtime `ASSERT` into static proof obligations. The compiler generates veri
 **Step 6: Temporal properties — Kind 2-style model checking**
 
 Add temporal property checking for Boon programs, following Kind 2's approach: BMC + k-induction + IC3 over the dataflow graph. This enables safety and liveness properties ("the counter is always >= 0," "if button pressed, UI eventually updates").
+
+**Step 7: Symbolic synthesis — SupGen/NeoGen hole-filling** (optional, experimental)
+
+Integrate HVM4's superposition-based program synthesis as an alternative proof/code search engine. Where Z3 tries to *decide* whether a property holds, SupGen *searches* for a program (or proof term) that makes it hold. See the "Symbolic Program Synthesis" section below for the full picture.
+
+---
+
+## Symbolic Program Synthesis: HVM4, Bend2, SupGen, NeoGen
+
+This section describes a fundamentally different approach to verification and code generation — one based on **interaction nets and superpositions** rather than SMT solvers and type inference. It comes from [Victor Taelin](https://github.com/VictorTaelin) and [Higher Order Company](https://higherorderco.com/), creators of HVM, Bend, and Kind. Boon already has research on HVM as a compilation target (`docs/language/gpu/HVM_BEND_ANALYSIS.md`); this section adds the **verification and program synthesis** angle.
+
+### The Core Idea: Superposition-Based Search
+
+Traditional program synthesis tries candidates one-by-one. SupGen does something different: it merges ALL candidates into a single **superposed** term and evaluates them simultaneously, sharing computation across overlapping sub-expressions.
+
+The mechanism comes from the [Interaction Calculus](https://github.com/VictorTaelin/Interaction-Calculus), which extends lambda calculus with two primitives:
+
+- **SUP (superposition):** Combines multiple values into one location. `{10, 20}` is a superposition of 10 and 20.
+- **DUP (duplication):** Splits a superposition back into its components.
+
+When you apply a superposed function to an argument, HVM evaluates ALL branches simultaneously, sharing any identical sub-computations:
+
+```
+(+ {10, 20} 1) → {11, 21}     -- both additions share the same "add 1" step
+```
+
+This turns brute-force enumeration into shared evaluation. [In the ADD-CARRY benchmark](https://gist.github.com/VictorTaelin/d5c318348aaee7033eb3d18b0b0ace34), finding a 16-bit binary addition algorithm took ~262M interactions brute-force but only ~36K with superpositions — a **7,277× speedup**, with less than 1 interaction per candidate.
+
+### The Tools
+
+**[HVM4](https://x.com/VictorTaelin/status/1985320306001477783)** — The runtime. Now 100% C, compiles Interaction Calculus functions (including superpositions) to zero-overhead machine code. Has a [native type system running directly on interaction nets](https://x.com/VictorTaelin/status/1971591584916393984), making it a fast, parallel proof verifier. 130-160M interactions/sec on a single core. Taelin claims it could be "OOMs faster than Lean" for proof checking.
+
+**SupGen** — The synthesis engine, [now built into HVM4](https://x.com/VictorTaelin/status/1971591584916393984). A model-free (no neural network) program synthesizer. Given a type signature or input/output examples, it creates a superposition of all candidate programs, evaluates them against constraints, and collapses to the solutions. [Performance](https://news.ycombinator.com/item?id=42771885): up to 1000× faster than existing synthesizers for certain benchmarks. Can now [enumerate types as well as terms](https://x.com/VictorTaelin/status/1978536555460386879).
+
+**[NeoGen](https://x.com/VictorTaelin/status/1957775213053022614)** — The user-facing layer in [Bend2](https://x.com/VictorTaelin/status/1933621356408500461). A "program/proof miner" that lets you put a **hole** anywhere in your code, and the compiler fills it so all tests and proofs pass. Can be seen as ["denoising proofs with holes"](https://x.com/VictorTaelin/status/1946965897513439654): take a complete proof, remove sub-expressions, NeoGen recovers the lost bits. [Found every primitive recursive function tested instantly](https://x.com/VictorTaelin/status/1904727018899439853): equality in 0.0008s, DrawLine 0.001s, Insert 0.006s.
+
+**[Kind](https://github.com/HigherOrderCO/Kind)** — Taelin's proof language. A minimal proof checker based on CoC+Self (Calculus of Constructions + Self types). Dependent types and theorem proving, targeting HVM for execution. The type checker runs on interaction nets — parallel proof checking.
+
+**[Bend2](https://x.com/VictorTaelin/status/1933621356408500461)** — The next version of Bend. Not yet released, but planned: GPU compilation, lazy HVM compilation, JS/Python compilation, complete proof system (like Lean/Kind), NeoGen built-in, dependent types. [Raising $4M to complete it](https://wefunder.com/higher.order.co).
+
+### Three Connections to Boon
+
+#### 1. Execution Target (extends existing HVM research)
+
+Boon already explores HVM as a GPU compilation target (`docs/language/gpu/HVM_BEND_ANALYSIS.md`). HVM4 strengthens this: compiled mode with zero overhead, 100% C codebase, superposition support. The Actor Model → Interaction Net mapping is even more viable now.
+
+#### 2. Proof Verification Backend
+
+HVM4's native type system on interaction nets could serve as Boon's proof checker — an alternative (or complement) to Z3. Where Z3 works in the theory of first-order logic + arithmetic, HVM4 works in the theory of interaction combinators. Different strengths:
+
+| | Z3 (SMT) | HVM4 (Interaction Nets) |
+|---|---|---|
+| **Strengths** | Decidable theories (linear arithmetic, arrays, bitvectors), industrial maturity | Massive parallelism, optimal sharing, exponential speedups for structural proofs |
+| **Weaknesses** | Undecidable for general programs, sequential | Exponential for non-structural problems, immature |
+| **Best for** | Arithmetic invariants, refinement type checking | Inductive proofs, type-level reasoning, program synthesis |
+| **Maturity** | 15+ years, powers Dafny/SPARK/Verus | Experimental, HVM4 just released |
+
+For Boon, the practical path: **start with Z3** (proven, well-understood from Phases 2-4 of this guide), **explore HVM4 later** once its type system matures. But Kind's CoC+Self type theory is worth studying now as a model for Boon's Layer 3 dependent types.
+
+#### 3. Symbolic Program Synthesis (the new angle)
+
+This is where SupGen/NeoGen diverge from everything else in this guide. The standard approach from Phases 0-5 is:
+
+> Programmer (or AI) writes code + annotations → Compiler checks them via SMT → Feedback loop
+
+SupGen/NeoGen add a third strategy:
+
+> Programmer writes **partial code with holes** → SupGen searches for completions that satisfy constraints → Proven correct by construction
+
+This is orthogonal to both LLMs and SMT solvers:
+
+| | LLMs | SMT (Z3) | SupGen |
+|---|---|---|---|
+| **What it does** | Generates code from natural language | Checks whether a property holds | Searches for code/proofs that satisfy constraints |
+| **Guarantee** | Probabilistic (may be wrong) | Sound (if it says yes, it's true) | Sound (found programs satisfy all tests/types) |
+| **Scalability** | Works on large programs | Depends on theory decidability | Exponential, but huge constant-factor speedup |
+| **Best for** | Whole-program generation, boilerplate | Checking arithmetic invariants | Filling small holes, finding proofs, synthesizing predicates |
+
+### How This Could Look in Boon
+
+**Hole-filling for WHEN predicates:**
+
+```boon
+-- Developer writes the structure, leaves the predicate as a hole:
+valid_input: raw |> WHEN {
+    x WHERE ??? => x        -- ← hole: what predicate?
+    __ => SKIP
+}
+
+-- Given examples: raw=5 → valid_input=5, raw=-1 → valid_input=SKIP, raw=0 → valid_input=SKIP
+-- SupGen discovers: ??? = x > 0
+```
+
+**Hole-filling for HOLD transitions:**
+
+```boon
+counter: 0 |> HOLD counter {
+    button.event.press |> THEN { ??? }  -- ← hole: what transition?
+}
+
+-- Given: press,press,press → counter outputs 0,1,2,3
+-- SupGen discovers: ??? = counter + 1
+```
+
+**Proof search for invariants:**
+
+```boon
+counter: 0 |> HOLD counter {
+    LATEST {
+        inc.event.press |> THEN { counter + 1 }
+        dec.event.press |> THEN { counter - 1 }
+    }
+}
+ASSERT counter >= 0  -- Can SupGen find why this might fail?
+```
+
+Here SupGen could search for a **counterexample** (a sequence of events that violates the assertion) or a **proof** (an inductive argument that it holds). In this case, it would find the counterexample: press dec first → counter becomes -1. This is complementary to Z3, which could verify the same property but through a different mechanism.
+
+**Combined workflow: LLM + SupGen + Z3:**
+
+1. **LLM** generates the overall program structure (layout, data flow, HOLD/WHEN/WHILE skeleton)
+2. **SupGen** fills small holes (predicates, transition functions, helper logic) with guaranteed-correct code
+3. **Z3** verifies global properties (state invariants, temporal assertions) that span multiple constructs
+4. If Z3 fails, **SupGen** searches for proof terms; if SupGen times out, **LLM** generates proof hints
+
+This three-engine approach plays to each tool's strengths: LLMs for large-scale structure, SupGen for small-scale synthesis, Z3 for verification.
+
+### Honest Limitations
+
+1. **Boon is reactive/stateful, SupGen needs pure functions.** Superpositions require deterministic evaluation — same input, same output. Boon's streams, DOM events, and actor state can't be directly superposed. The practical approach: decompose Boon programs into pure functional cores (WHEN predicates, HOLD transitions, pipe transformations) + reactive wiring, and use SupGen only on the pure parts.
+
+2. **Exponential is still exponential.** Despite 7000× constant-factor speedups, the search space grows exponentially with program size. SupGen works brilliantly for small programs (primitive recursive functions in milliseconds) but won't synthesize an entire todo app. Sweet spot: individual WHEN predicates, HOLD transitions, and pipe transformations — exactly the "holes" in the examples above.
+
+3. **Bend2 and HVM4 are not yet production-ready.** Bend2 hasn't shipped. HVM4's type system is new. Building Boon's core verification on unreleased technology is risky. But the *ideas* (superposition search, hole-filling UX, proofs on interaction nets) can inform Boon's design now, with implementation following when the tools mature.
+
+4. **Different "Kind 2" projects — don't confuse them.** Phase 5b of this guide covers [Kind 2 the model checker](https://kind2-mc.github.io/kind2/) (University of Iowa, for Lustre programs). Taelin's [Kind](https://github.com/HigherOrderCO/Kind) is a completely separate project — a proof language. Both are relevant to Boon but for different reasons.
+
+### Reading Resources
+
+| Resource | Type | Time | Why Read It |
+|---|---|---|---|
+| [Fast Discrete Program Search with HVM Superpositions](https://gist.github.com/VictorTaelin/d5c318348aaee7033eb3d18b0b0ace34) | Technical gist | 30 min | Core mechanism: how SUP nodes give 7000× speedup. The ADD-CARRY example makes the idea concrete. |
+| [Accelerating DPS with SUP Nodes](https://gist.github.com/VictorTaelin/7fe49a99ebca42e5721aa1a3bb32e278) | Technical gist | 30 min | Deeper explanation with Haskell comparison and theoretical analysis. |
+| [Interaction Calculus (GitHub)](https://github.com/VictorTaelin/Interaction-Calculus) | Repo + README | 1 hour | Foundation: superpositions, duplications, optimal evaluation. Lambda Calculus + Interaction Combinators. |
+| [Kind proof language (GitHub)](https://github.com/HigherOrderCO/Kind) | Repo | 1 hour | Minimal proof checker on HVM (CoC+Self). Model for Boon's Layer 3 dependent types. |
+| [SupGen HN discussion](https://news.ycombinator.com/item?id=42771885) | Discussion | 20 min | Community analysis, limitations, comparisons to classical theorem provers. |
+| [HVM4 + SupGen + native types (tweet)](https://x.com/VictorTaelin/status/1971591584916393984) | Announcement | 5 min | Native type system on interaction nets, proof verification claims. |
+| [Bend2 recap: NeoGen + proof mining (tweet)](https://x.com/VictorTaelin/status/1957775213053022614) | Overview | 10 min | Hole-filling, dependent types, program/proof mining integrated. |
+| [NeoGen as denoising proofs (tweet)](https://x.com/VictorTaelin/status/1946965897513439654) | Insight | 5 min | The "denoising proofs with holes" mental model. |
+| [Boon's existing HVM research](docs/language/gpu/HVM_BEND_ANALYSIS.md) | Internal doc | 30 min | Review Boon's HVM compilation target analysis before reading HVM4 material. |
+
+**Suggested reading order:** Start with the Boon HVM research doc (you wrote it), then the two SupGen gists (they're the technical core), then the Interaction Calculus README (theory), then Kind (proof language), then the tweets and HN discussion (context). Total: ~4 hours.
+
+### Design Takeaway
+
+SupGen/NeoGen represent a **fifth verification strategy** orthogonal to the four layers described earlier. Where Layer 1 *infers* properties from structure and Layer 2 *checks* assertions via Z3, SupGen *searches* for code and proofs that satisfy constraints. This is particularly powerful for:
+
+- **Layer 1 acceleration:** Where the compiler needs to infer invariants from HOLD/WHEN/WHILE, SupGen could discover them by superposing all possible invariants and collapsing to the ones that hold.
+- **Layer 3 proof search:** Where explicit proofs are needed, SupGen could find proof terms automatically, avoiding the proof burden problem entirely.
+- **AI-assisted development:** Instead of LLMs generating whole programs (which need verification), SupGen fills verified holes in developer-written skeletons (which are correct by construction).
+
+Taelin's observation that ["LLMs are BAD at proving theorems"](https://x.com/VictorTaelin/status/1945497309573251320) aligns with this guide's emphasis on automated verification over manual proof. SupGen offers a third path: neither human-written proofs (expensive) nor LLM-generated proofs (unreliable), but **symbolically searched proofs** (sound, automated, but limited in scale).
+
+---
+
+## HVM/Bend as a Boon Engine
+
+Beyond verification and program synthesis, there's a deeper question: could HVM/Bend become a **full execution engine** for Boon — alongside the existing Actors, DD, and planned WASM engines?
+
+### Global Lambdas → Actors → An Erlang on Interaction Nets
+
+The Interaction Calculus has a unique feature: **global lambdas** (also called "unscopped lambdas" or "scopeless lambdas"). Unlike normal lambda calculus where variables are scoped to their lambda body, IC variables can appear anywhere in the program. In a [key tweet](https://x.com/VictorTaelin/status/1784215941045191065), Taelin explained how to **emulate Erlang's entire Actor Model on HVM-CUDA** with pure expressions:
+
+> "HVM has a feature that goes beyond the functional paradigm: unscopped lambdas. Or, more like: lambdas whose variables can occur outside their bodies. With these, we can essentially emulate channels and, thus, implement any concurrent algorithm. [...] By just implementing that as pure expressions, we'd be able to implement a full Erlang-like environment on GPUs, without ever touching a single lock or mutex."
+
+He demonstrated a ping-pong between two "threads" where each thread is a recursive function that handles a message and passes a channel (via unscopped lambda) to receive the response. The [full example code is on GitHub](https://gist.github.com/VictorTaelin/3124a19d340dad2f97f44353f74c6e41).
+
+Global lambdas unlock three capabilities that together form an actor model:
+
+**1. Pure mutable references.** A scopeless lambda `λ$count 0` creates a global "slot" `$count`. Applying `(λ$count (old_count + 1))(old_count)` atomically reads the old value and writes a new one — like `std::mem::replace` in Rust, but as an interaction net rewrite. See Taelin's gists on [pure mutable references](https://gist.github.com/VictorTaelin/fb798a5bd182f8c57dd302380f69777a) for the full mechanism.
+
+**2. Continuations.** Scopeless lambdas can capture execution contexts, giving you `call/cc` (call-with-current-continuation). This enables yield/resume, cooperative multitasking, and green threads — all within a pure functional runtime.
+
+**3. Actor-like processes.** Combine mutable references (for channels) with continuations (for message passing) and you get Erlang-style actors. Here's the actual HVM1 code from the tweet — a ping-pong between two "threads":
+
+```hvm
+(If 0 t f) = f
+(If x t f) = t
+
+// Actor handler for "PING" messages
+(Handle self (PING tick answer)) =
+
+  // Answers with another "PING"
+  // - sends a "channel" to get next response: λ$res
+  // - gets the other thread's name
+  let other = (answer (PING (- tick 1) λ$res(self)))
+
+  // Logs a message to console
+  (Log self ["got ping from", other, tick]
+
+  // If tick > 1...
+  (If (> tick 1)
+      // Handles the response
+      (Handle self $res)
+      // Otherwise, just quit
+      Done))
+
+(Main) =
+  // Initial message: B sends PING to A
+  let message  = (PING 4 λ$res("B"))
+
+  // Thread A handles the initial message
+  let thread_A = (Handle "A" message)
+
+  // Thread B handles the initial response
+  let thread_B = (Handle "B" $res)
+
+  // Create both threads in parallel
+  (Pair
+    (Thread "A" thread_A)
+    (Thread "B" thread_B))
+```
+
+The key mechanism: `λ$res` is an unscopped lambda — its variable `$res` appears *outside* its body (in `thread_B`). This creates a **channel**: when thread A calls `answer` with a new PING, the response flows into `$res`, which thread B is waiting on. No locks, no mutexes, no channels library — just interaction net rewiring. And it runs on GPUs via CUDA.
+
+The output shows interleaved messages between threads A and B, exactly like Erlang process communication:
+```
+Thread "A": got ping from "B", 4 → got ping from "B", 2 → got ping from "B", 0 → Done
+Thread "B": got ping from "A", 3 → got ping from "A", 1 → Done
+```
+
+**Why this works:** The `Main` function creates `(PING 4 λ$res("B"))` — where `λ$res` is an unscopped lambda. Then `thread_B = (Handle "B" $res)` uses `$res` *outside* that lambda's body. In normal lambda calculus this is illegal. In the Interaction Calculus, it creates a **communication channel**: `$res` becomes a "wire" in the interaction net that connects thread A's response to thread B's input. When HVM reduces the net, the `answer` call in `Handle` writes a value into `$res`, and `thread_B` reads it out — all through pure graph rewriting. This is why Taelin can claim "Erlang on GPUs without locks" — the interaction net's local rewrite rules guarantee that the channel connects exactly one writer to one reader, with ordering preserved by the recursion structure.
+
+**Mapping to Boon:** `HOLD` = actor state, `THEN`/`WHEN` = message handler, unscopped lambda = channel between actors. The compilation path would be Boon constructs → HVM interaction net nodes.
+
+### What This Means for Boon
+
+Boon already has extensive research on this topic: `docs/language/gpu/HVM_ACTORS_RESEARCH.md` (a 10-experiment research plan) and `docs/language/gpu/HVM_BEND_ANALYSIS.md` (compilation target analysis). The key question is: **when and how does this become a real engine?**
+
+**Current Boon engines and where HVM fits:**
+
+| Engine | Target | Strengths | Status |
+|---|---|---|---|
+| **Actors** | Browser/WASM | Reactive streams, DOM integration | Production |
+| **DD** | Browser/WASM | Incremental computation | Merged |
+| **WASM** | Browser/WASM | Direct compilation, no runtime overhead | Planned |
+| **HVM/Bend** | CPU/GPU (+ WASM via C→WASM?) | Massive parallelism, optimal evaluation, native proof verification, SupGen | Future research |
+
+**Three realistic paths for an HVM engine:**
+
+**Path A: HVM as compute backend (near-term).** Keep Actors/DD/WASM for browser UI. Use HVM for heavy computation: large list processing, data transformations, proof verification. Boon programs have two zones — reactive UI (browser engine) and pure compute (HVM engine). Communication via message passing across the boundary.
+
+**Path B: HVM as full non-browser engine (medium-term).** Boon AST → Interaction Calculus compilation. Scopeless lambdas for actors, continuation-based scheduler for reactivity. Targets CPU/GPU natively. This would be the "server-side Boon" or "GPU Boon" engine — not for browsers initially, but for backend services, data processing, and FPGA/RISC-V targets.
+
+**Path C: HVM-in-WASM (long-term, speculative).** HVM4 is 100% C, and C compiles to WASM. A Boon → IC → HVM4 → WASM pipeline could unify all targets under one engine. But this is the most complex path and depends on HVM4's WASM performance being competitive.
+
+**The verification connection makes this more compelling than "just another engine."** Without verification, an HVM engine is interesting but optional. With verification, the picture changes: HVM4's native type system + SupGen could make Boon the first language where **the same runtime that executes your program also verifies it** — not "compile, then verify, then run" but a single interaction net that evaluates code, checks types, and searches for proofs simultaneously.
+
+### What to Do Now
+
+**Revisit this after Bend2 is officially released.** Bend2 is still in development ([raising $4M to complete it](https://wefunder.com/higher.order.co)). The ideas are sound, but building a Boon engine on unreleased infrastructure would be premature. Once Bend2 ships with its proof system, NeoGen, and dependent types, we can:
+
+1. **Re-evaluate the compilation path.** Does Boon → Bend2 make sense, or should Boon target HVM4's IC directly?
+2. **Test scopeless lambda actors.** Run the experiments from `docs/language/gpu/HVM_ACTORS_RESEARCH.md` on HVM4 (not HVM2/3 which the doc targets). HVM4's compiled mode changes the performance picture.
+3. **Prototype the verification integration.** Try expressing Boon's HOLD/WHEN/WHILE invariants as Kind type-level proofs on HVM4.
+4. **Benchmark HVM4-WASM.** Compile HVM4's C to WASM and measure overhead vs Boon's native WASM engine.
+
+Until then, the existing Actors/DD/WASM engines remain the priority, and the HVM research docs capture the design space for future exploration.
+
+### Additional Reading for This Section
+
+| Resource | Type | Why Read It |
+|---|---|---|
+| [Taelin: How to Emulate Erlang on HVM-CUDA (tweet)](https://x.com/VictorTaelin/status/1784215941045191065) | Tweet | The original insight: unscopped lambdas → channels → full Erlang Actor Model on GPUs |
+| [Ping-pong actor example (gist)](https://gist.github.com/VictorTaelin/3124a19d340dad2f97f44353f74c6e41) | Code example | Working HVM1 code showing two "threads" communicating via unscopped lambda channels |
+| [Optimal Linear Context Passing (gist)](https://gist.github.com/VictorTaelin/fb798a5bd182f8c57dd302380f69777a) | Technical gist | How scopeless lambdas implement pure mutable references |
+| [Boon's HVM Actors Research](docs/language/gpu/HVM_ACTORS_RESEARCH.md) | Internal doc | 10-experiment plan for building actors on HVM |
+| [Boon's HVM/Bend Analysis](docs/language/gpu/HVM_BEND_ANALYSIS.md) | Internal doc | Compilation target analysis for Boon → HVM |
+| [Interaction Calculus (GitHub)](https://github.com/VictorTaelin/Interaction-Calculus) | Repo + README | Foundation: global lambdas, superpositions, affine variables |
