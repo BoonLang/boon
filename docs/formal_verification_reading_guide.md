@@ -2,6 +2,18 @@
 
 **Priority:** Boon language design — proofs as part of the language, AI code generation + verification.
 
+## Two Distinct Goals
+
+This guide serves two related but distinct goals. Knowing which goal each resource serves helps you understand WHY you're reading it.
+
+**Goal A: Verification IN Boon** — Giving Boon users and AI the ability to prove their programs correct. This is a *language feature*: Boon's constructs, type system, and compiler work together so that correctness properties are either inferred automatically or stated as lightweight annotations. This is the primary goal and drives the reading order. (Phases 0-5, Intrinsic Verification Thesis)
+
+**Goal B: Verification OF Boon** — Proving that Boon's own implementation (Actors engine, DD engine, WASM engine, parser, evaluator) is correct. This uses external tools (K Framework, TLA+, Lean/Rocq) to verify that Boon itself does what it claims. Important, but secondary to the language design. (Phases 6-8)
+
+Most resources serve Goal A. When a resource primarily serves Goal B, it's noted explicitly.
+
+---
+
 ## The Design Landscape for "Proofs in Boon"
 
 There are roughly 4 levels of how languages embed verification, from lightest to deepest:
@@ -37,6 +49,19 @@ Most powerful, but proofs can be complex. Lean 4 is both a programming language 
 
 ### Level 4: Full Formal Semantics (K Framework)
 You define the language's meaning mathematically, then reasoning about programs follows from the semantics. Most foundational, but users don't write proofs directly.
+
+### Cross-Cutting Dimension: Temporal Properties (LTL/CTL, Model Checking)
+
+The levels above describe *what kind* of proofs you can write. But there's an orthogonal dimension: *what kind of properties* you want to verify. For reactive dataflow languages like Boon, the most natural properties are **temporal**:
+
+- **Safety:** "The counter is *always* >= 0." (Invariant over time)
+- **Liveness:** "If a button is pressed, the counter *eventually* updates." (Progress guarantee)
+- **Reactivity:** "Whenever input changes, output *next* reflects it." (Response guarantee)
+- **Until:** "The loading spinner shows *until* data arrives." (Bounded waiting)
+
+These aren't naturally expressible as Hoare-logic contracts (pre/postconditions). They require **temporal logic** (LTL, CTL) and **model checking** (BMC, k-induction, IC3) — the same techniques from the ZipCPU blog post, but applied to software streams instead of hardware signals.
+
+This matters for Boon because its constructs are inherently temporal: `HOLD` is state over time, `THEN` is "when event arrives," `WHILE` is "during condition," `LATEST` is "whenever any input changes." The Lustre language and Kind 2 model checker (Phase 1c, Phase 5) show how temporal verification works for dataflow programs. Boon's built-in verifier will likely need both Hoare-logic contracts (for value properties) AND temporal model checking (for behavior-over-time properties).
 
 ## What This Means for Boon Specifically
 
@@ -75,6 +100,8 @@ temperatures: sensor |> WHEN {
 
 The feedback loop is key: the compiler's proof failures are structured error messages that AI can act on — much better than "it crashed at runtime."
 
+**The cost problem that Boon's design solves:** Traditional verification is expensive. CompCert (a verified C compiler) is 42,000 lines of Coq — **76% of which is proof code**, with a 3:1 proof-to-program ratio and ~3 person-years of effort. This is why formal verification hasn't gone mainstream: the cost of writing proofs dwarfs the cost of writing code. Boon's intrinsic verification thesis (detailed at the end of this document) aims for a fundamentally different ratio: if the language constructs themselves encode verification properties, Layer 1 verification is essentially **free** — 0:1 proof-to-code ratio for many common properties. This changes the economics entirely, especially for AI generation where the AI doesn't need to generate separate proofs at all.
+
 ---
 
 ## Critical Path: Reading Order
@@ -102,6 +129,12 @@ Gamified introduction to proofs. You prove 2+2=4, then commutativity of addition
 **1b. [AdaCore: Introduction to Formal Verification with SPARK (Video)](https://www.adacore.com/videos/introduction-to-formal-verification-with-spark)** — Webinar, ~1 hour
 
 Visual introduction to what "proofs in a production language" looks like. Real-world examples. Watch this before reading the SPARK book — it gives you the big picture.
+
+**1c. [The Synchronous Dataflow Programming Language LUSTRE (PDF)](https://homepage.cs.uiowa.edu/~tinelli/classes/181/Spring08/Papers/Halb91.pdf)** — Foundational paper, 1 day
+
+**Read this before diving into Dafny.** Lustre is the closest existing language to Boon's model — programs are compositions of infinite streams with temporal operators. The key insight that reframes everything you'll read afterward: **programs and their verification properties are written in the same language.** Lustre's temporal operators map to Boon's HOLD, LATEST, WHEN, WHILE. When you read Dafny next, you'll be thinking "how does this apply to dataflow?" instead of trying to translate imperative concepts later.
+
+This paper grounds the entire reading journey in Boon's actual paradigm: reactive dataflow, not imperative procedures.
 
 ---
 
@@ -155,11 +188,13 @@ Refinement types for Haskell. Types carry predicates (e.g., `{ x: Int | x > 0 }`
 
 **Design takeaway for Boon:** Refinement types on streams could be Boon's "Level 2" verification — requiring minimal annotations while catching many real bugs. E.g., `temperatures: Stream { t: Number | t > -273.15 }`.
 
-**4b. [F*: A Proof-Oriented Programming Language](https://fstar-lang.org/) + [Tutorial](https://fstar-lang.org/tutorial/)** — Language & tutorial, 1-2 weeks
+**4b. F\*'s key insight (read the tutorial only if time permits)**
 
-F* combines ALL three verification levels: contracts, refinement types, AND dependent types, with monadic effects and SMT automation. Compiles to OCaml, F#, C, WASM. Built Project Everest (verified HTTPS stack). This is the most technically complete "proofs in a language" — it shows the full design space in one system.
+[F*](https://fstar-lang.org/) combines ALL three verification levels (contracts, refinement types, dependent types) with **monadic effects** and SMT automation. Built Project Everest (verified HTTPS stack). The full [F* tutorial](https://fstar-lang.org/tutorial/) is 1-2 weeks and may be overwhelming at this stage — but the key design insight is essential:
 
-**Design takeaway for Boon:** F* shows how to handle **effects** (state, exceptions, divergence, I/O) in a verified language. Boon's streams and reactivity are effects — F*'s effect system could inform how Boon types and verifies reactive computations.
+**F* shows how to verify effectful code.** It uses monadic effect types to describe what a computation *does* (reads state, might fail, performs I/O) alongside what it *returns*. Boon's streams and reactivity are effects — a stream that emits values over time is fundamentally an effectful computation. F*'s approach could inform how Boon types and verifies reactive computations: a `HOLD` has a "state effect," a `THEN` has a "trigger effect," an external API call has an "I/O effect."
+
+If you have time, the full tutorial is in the supplementary section. If not, this paragraph captures the design takeaway.
 
 **4c. [Programming Z3 (Stanford)](https://theory.stanford.edu/~nikolaj/programmingz3.html)** — Online guide, 1-2 weeks
 
@@ -177,25 +212,23 @@ SMT-based verification for Rust. Proofs written in Rust syntax using "ghost code
 
 ---
 
-### Phase 5: Boon's Dataflow Relatives — "Verified Reactive Languages" (Weeks 12-13)
+### Phase 5: Verified Dataflow Tools — "Building Boon's Verifier" (Weeks 12-13)
 
-Boon is a reactive dataflow language. These are the verified languages closest to Boon's semantic model.
+You read the Lustre paper in Phase 1c. Now dive deeper into the tools that verify dataflow programs — these are the direct templates for Boon's built-in verifier.
 
-**5a. [The Synchronous Dataflow Programming Language LUSTRE (PDF)](https://homepage.cs.uiowa.edu/~tinelli/classes/181/Spring08/Papers/Halb91.pdf)** — Foundational paper, 1 day
+**5a. [Vélus: Verified Lustre Compiler](https://velus.inria.fr/)** — Tool + papers, 1 day
 
-Lustre is the closest existing language to Boon's model. Programs are compositions of infinite streams with temporal operators. The key insight: **programs and their verification properties are written in the same language**. Lustre's temporal operators map to Boon's HOLD, LATEST, WHEN, WHILE.
+A formally verified compiler from Lustre to assembly, built on CompCert and verified in Coq. End-to-end proof: dataflow semantics of source → traces of generated assembly. **This is what a verified Boon compiler would look like** (Goal B). But it's also relevant to Goal A: Vélus's semantic model of dataflow programs shows what Boon's internal verification engine needs to reason about.
 
-**Design takeaway for Boon:** Same-language specification. If Boon's constructs are expressive enough to describe both programs and their properties, you don't need a separate spec language.
-
-**5b. [Vélus: Verified Lustre Compiler](https://velus.inria.fr/)** — Tool + papers, 1 day
-
-A formally verified compiler from Lustre to assembly, built on CompCert and verified in Coq. End-to-end proof: dataflow semantics of source → traces of generated assembly. **This is what a verified Boon compiler would look like.**
-
-**5c. [Kind 2 Model Checker](https://kind2-mc.github.io/kind2/)** — Tool, 1 day
+**5b. [Kind 2 Model Checker](https://kind2-mc.github.io/kind2/)** — Tool, 1 day
 
 Multi-engine SMT-based model checker for Lustre programs. Supports assume-guarantee contracts, BMC, k-induction, IC3. Used industrially (Rockwell-Collins). Takes Lustre + property annotations, proves them or finds counterexamples.
 
-**Design takeaway for Boon:** Kind 2's contract syntax and verification approach for dataflow programs is a direct template for Boon's built-in verifier.
+**Design takeaway for Boon:** Kind 2's contract syntax and temporal property verification for dataflow programs is the most direct template for Boon's built-in verifier. Its assume-guarantee contracts on stream nodes map to contracts on Boon functions. Its temporal property checking (safety, liveness) maps to properties about Boon's HOLD/WHEN/WHILE behavior over time.
+
+**5c. [Formal Verification for Event Stream Processing (BeepBeep)](https://www.sciencedirect.com/science/article/pii/S0890540123000615)** — Paper, 1 day
+
+Shows how to export stream processing pipelines as Kripke structures for model checking with NuXmv. Relevant technique for verifying Boon's stream pipelines — an alternative to Kind 2's approach.
 
 ---
 
@@ -378,38 +411,39 @@ These complement the critical path. Read them when you reach the relevant phase,
 
 ## Summary Table: Critical Path Only
 
-| Phase | # | Resource | Format | Time | Boon Design Impact |
-|-------|---|----------|--------|------|--------------------|
-| 0 | 0a | Kleppmann: AI + FV | Blog | 15 min | Frames the vision |
-| 0 | 0b | ZipCPU Blog | Blog | 30 min | Motivation: FV finds real bugs |
-| 1 | 1a | Natural Number Game | Browser | 2-3 hrs | First proof experience |
-| 1 | 1b | SPARK Webinar Video | Video | 1 hr | Visual intro to verified language |
-| 2 | 2a | **Program Proofs (Dafny)** | Book | 3-4 wks | **Core: proof annotation syntax** |
-| 2 | 2b | SPARK Book | Book | 1-2 wks | Graduated verification levels |
-| 3 | 3a | AutoVerus Paper | Paper | 1 day | AI proof generation blueprint |
-| 3 | 3b | DafnyBench Paper | Paper | 1 day | AI verification benchmarking |
-| 4 | 4a | Liquid Haskell Tutorial | Book | 1 wk | Refinement types for streams |
-| 4 | 4b | F* Tutorial | Tutorial | 1-2 wks | Full design space (effects + proofs) |
-| 4 | 4c | Programming Z3 | Guide | 1-2 wks | The verification engine |
-| 4 | 4d | Verus Tutorial | Tutorial | 1-2 days | Verified systems language |
-| 5 | 5a | Lustre Paper | Paper | 1 day | Boon's closest relative |
-| 5 | 5b | Vélus Compiler | Tool | 1 day | Verified dataflow compiler |
-| 5 | 5c | Kind 2 | Tool | 1 day | Model checker for dataflow |
-| 6 | 6 | K Framework | Framework | 2-3 wks | Boon's formal semantics |
-| 7 | 7a | Lean 4 Guide | Textbook | 3-4 wks | Ceiling: proofs as first-class |
-| 7 | 7b | Idris Book | Book | 2-3 wks | Practical dependent types |
-| 7 | 7c | Rocq/Software Foundations | Books | 3-4 wks | Verified algorithms & PL theory |
-| 8 | 8a | Learn TLA+ | Free book | 2-3 wks | Engine concurrency specs |
-| 8 | 8b | TLA+ (Lamport) | Book | 3-4 wks | Comprehensive specification |
-| 8 | 8c | Alloy 6 | Free book | 1-2 wks | Lightweight design modeling |
-| 9 | 9a | HW Verification (Springer) | Textbook | 3-4 wks | FPGA verification theory |
-| 9 | 9b | Reactive Systems (Schneider) | Textbook | 3-4 wks | Reactive system theory |
+| Phase | # | Resource | Format | Time | Goal | Boon Design Impact |
+|-------|---|----------|--------|------|------|--------------------|
+| 0 | 0a | Kleppmann: AI + FV | Blog | 15 min | A | Frames the vision |
+| 0 | 0b | ZipCPU Blog | Blog | 30 min | A | Motivation: FV finds real bugs |
+| 1 | 1a | Natural Number Game | Browser | 2-3 hrs | A | First proof experience |
+| 1 | 1b | SPARK Webinar Video | Video | 1 hr | A | Visual intro to verified language |
+| 1 | 1c | **Lustre Paper** | Paper | 1 day | A | **Grounds everything in dataflow** |
+| 2 | 2a | **Program Proofs (Dafny)** | Book | 3-4 wks | A | **Core: proof annotation syntax** |
+| 2 | 2b | SPARK Book | Book | 1-2 wks | A | Graduated verification levels |
+| 3 | 3a | AutoVerus Paper | Paper | 1 day | A | AI proof generation blueprint |
+| 3 | 3b | DafnyBench Paper | Paper | 1 day | A | AI verification benchmarking |
+| 4 | 4a | Liquid Haskell Tutorial | Book | 1 wk | A | Refinement types for streams |
+| 4 | 4b | F* (key insight only) | Summary | 30 min | A | Effects + verification |
+| 4 | 4c | Programming Z3 | Guide | 1-2 wks | A | The verification engine |
+| 4 | 4d | Verus Tutorial | Tutorial | 1-2 days | A | Verified systems language |
+| 5 | 5a | Vélus Compiler | Tool | 1 day | A+B | Verified dataflow compiler |
+| 5 | 5b | Kind 2 | Tool | 1 day | A | Model checker for dataflow |
+| 5 | 5c | BeepBeep Paper | Paper | 1 day | A | Stream pipeline verification |
+| 6 | 6 | K Framework | Framework | 2-3 wks | B | Boon's formal semantics |
+| 7 | 7a | Lean 4 Guide | Textbook | 3-4 wks | B | Ceiling: proofs as first-class |
+| 7 | 7b | Idris Book | Book | 2-3 wks | A | Practical dependent types |
+| 7 | 7c | Rocq/Software Foundations | Books | 3-4 wks | A+B | Verified algorithms & PL theory |
+| 8 | 8a | Learn TLA+ | Free book | 2-3 wks | B | Engine concurrency specs |
+| 8 | 8b | TLA+ (Lamport) | Book | 3-4 wks | B | Comprehensive specification |
+| 8 | 8c | Alloy 6 | Free book | 1-2 wks | B | Lightweight design modeling |
+| 9 | 9a | HW Verification (Springer) | Textbook | 3-4 wks | A | FPGA verification theory |
+| 9 | 9b | Reactive Systems (Schneider) | Textbook | 3-4 wks | A+B | Reactive system theory |
 
 ---
 
-## Key Design Question for Boon
+## Key Design Questions for Boon
 
-How much proof burden falls on the user (or AI) vs. the compiler?
+### How much proof burden falls on the user (or AI) vs. the compiler?
 
 - **Dafny model:** User writes contracts → compiler proves them via SMT solver. AI-friendly because contracts are small annotations.
 - **Lean model:** User writes proofs as code → compiler checks them. More powerful but harder for AI.
@@ -418,6 +452,22 @@ How much proof burden falls on the user (or AI) vs. the compiler?
 
 For AI generation, the sweet spot is probably **Dafny-style contracts + automatic discharge** (like SPARK's Bronze/Silver levels). The AI generates `ENSURES` and `REQUIRES` annotations, and Boon's compiler uses Z3 to verify them automatically. When automatic proving fails, the AI can fall back to writing explicit proof hints (like Dafny's `calc` blocks or Lean's tactics).
 
+### What kind of properties matter most?
+
+- **Value properties** (Hoare logic): "This stream only produces positive values." Best served by contracts and refinement types.
+- **Temporal properties** (LTL/CTL): "If button pressed, UI eventually updates." "Counter is always >= 0." Best served by model checking (Kind 2 approach).
+- **Dataflow properties** (information flow): "User passwords never reach the logging module." Best served by SPARK-style flow analysis.
+
+Boon will likely need all three, but **temporal properties are the most natural fit** for a reactive language. The Lustre/Kind 2 model — same-language properties + model checking — should be the primary verification approach, with Hoare-logic contracts as a supplement for function-level specifications.
+
+### When does verification happen?
+
+The four-layer model provides a smooth adoption path:
+- **Layer 0 (runtime monitoring):** Ship first. Immediate value. No compiler changes needed beyond adding assertion checks to streams.
+- **Layer 1 (structural inference):** Ship with the type system. WHEN guards → refinement types, HOLD → state invariants. No user annotations needed.
+- **Layer 2 (static assertions):** Ship when Z3 integration is ready. `ASSERT` becomes a compile-time check.
+- **Layer 3 (explicit proofs):** Ship last. Only needed for critical properties where automatic proving fails.
+
 Boon's dataflow nature means many properties (like "this stream only produces positive values") could be checked by **refinement types on streams** — requiring zero explicit annotations. That's the dream: most code is verified automatically, contracts handle the rest, and explicit proofs are rare.
 
 The Lustre/Kind 2 insight adds another dimension: since Boon programs are dataflow compositions (like Lustre), Boon's own constructs may be expressive enough to state verification properties — no separate annotation language needed. A `WHEN` guard is already a precondition. A `HOLD` body already describes a state transition. The verification could emerge from the language itself. This idea is explored in depth below.
@@ -425,6 +475,8 @@ The Lustre/Kind 2 insight adds another dimension: since Boon programs are datafl
 ---
 
 ## Boon Constructs as Specifications: The Intrinsic Verification Thesis
+
+This section describes Boon's most distinctive verification idea. In the programming languages community, this approach is known as **"correct by construction"** or **"making illegal states unrepresentable"** — a principle championed by languages like Elm, Rust (ownership/borrowing prevents data races by construction), and typed functional languages (algebraic data types prevent impossible states). Boon extends this principle to reactive dataflow: the language constructs themselves encode verification properties, so many correctness guarantees emerge from the program structure without any annotations.
 
 Most verified languages have a **two-language problem**: you write your program in language A, then write specifications about it in language B (annotations, contracts, proof scripts). The specification language is always an afterthought — bolted on. But Boon's constructs already encode the *structure* of specifications: guards, state transitions, data flow constraints. The question is whether the compiler can *extract* verification properties from what's already written, rather than requiring the programmer to restate them as annotations.
 
@@ -584,9 +636,19 @@ store: [
 
 `doubled` is defined as `counter * 2`. This isn't just a computation — it's a **relational invariant**: `doubled == counter * 2` holds at all times. The compiler knows this by construction. If anything downstream depends on the relationship between `counter` and `doubled`, it's provable without annotations.
 
-### Three Layers of Verification
+### Four Layers of Verification
 
-These examples reveal three natural verification layers:
+These examples reveal four natural verification layers, from easiest to implement to most powerful:
+
+**Layer 0: Runtime monitoring (stream assertions at runtime)**
+
+Before any static analysis exists, Boon can check assertions on stream values as they flow at runtime:
+```boon
+valid_temperatures: raw_sensor
+    |> ASSERT { t => t > -273.15 AND t < 1000 }  -- checked at runtime
+    |> WHEN { t WHERE t > 100 => Alert(TEXT { High: {t} }) }
+```
+This is trivial to implement (add assertion checks to stream processing), immediately useful (catches bugs during development), and provides a smooth upgrade path: the same assertions later become static proof obligations when the static verifier is built. Lustre's Lesar and BeepBeep both support this pattern. **This could be Boon's first verification feature — shipped before any static analysis.**
 
 **Layer 1: Free (structural inference, no annotations)**
 
@@ -624,4 +686,47 @@ PROVE counter >= 0 BY INDUCTION {
 
 **Layer 1 is already huge.** In most languages, you get zero verification for free — everything must be annotated. But Boon's reactive constructs are so structured that the compiler can infer refinement types, state invariants, and data flow guarantees from the program itself. This is exactly what makes Boon ideal for AI generation: the AI writes natural Boon code, and most correctness properties are verified automatically. Layer 2 (lightweight assertions) handles the rest. Layer 3 (full proofs) is rarely needed.
 
+And Layer 0 (runtime monitoring) can ship immediately — before any static verifier is built — giving Boon users verification benefits from day one. The progression is smooth: Layer 0 runtime assertions → Layer 1 automatic inference → Layer 2 static assertions → Layer 3 explicit proofs.
+
 This is similar to how Lustre works — programs and properties in the same language — but Boon's richer construct set (HOLD, WHEN, WHILE, LATEST, LINK, pipes) gives the compiler even more structure to reason about. And it's similar to refinement type inference in Liquid Haskell, but arising from the language constructs rather than type annotations.
+
+---
+
+## What to Build First
+
+After reading through the resources, here's a suggested implementation order for bringing verification to Boon:
+
+**Step 1: Layer 0 — Runtime stream assertions** (implementable today)
+
+Add an `ASSERT` construct that monitors stream values at runtime:
+```boon
+counter: 0 |> HOLD counter {
+    increment_button.event.press |> THEN { counter + 1 }
+}
+ASSERT counter >= 0  -- fails loudly at runtime if violated
+```
+This requires no static analysis — just insert checks into the stream processing pipeline. Immediate value for debugging and for AI-assisted development (the AI adds assertions, you run the program, violations give feedback).
+
+**Step 2: Layer 1 proof of concept — WHEN guard refinement inference**
+
+Implement flow-sensitive type narrowing for WHEN guards in the compiler. After:
+```boon
+valid: input |> WHEN { x WHERE x > 0 => x }
+```
+The compiler tracks that `valid` has type `{ x | x > 0 }`. Downstream consumers can rely on this. This is the core of the intrinsic verification thesis and doesn't require SMT — just dataflow analysis.
+
+**Step 3: Semantic foundation — Define core constructs in K Framework**
+
+Formally define HOLD, WHEN, WHILE, LATEST, THEN, LINK in K. This gives a reference semantics and a deductive verifier. Use it to verify that the Actors, DD, and WASM engines all produce the same results for the same programs (Goal B).
+
+**Step 4: Layer 1 full — HOLD invariant inference**
+
+Extend the compiler to infer state invariants for HOLD constructs using the initial value + guarded transitions pattern. Back this with Z3 for automatic proof discharge.
+
+**Step 5: Layer 2 — Static ASSERT with Z3**
+
+Turn runtime `ASSERT` into static proof obligations. The compiler generates verification conditions from assertions and sends them to Z3. Assertions that Z3 can discharge are verified at compile time; others remain as runtime checks (graceful degradation).
+
+**Step 6: Temporal properties — Kind 2-style model checking**
+
+Add temporal property checking for Boon programs, following Kind 2's approach: BMC + k-induction + IC3 over the dataflow graph. This enables safety and liveness properties ("the counter is always >= 0," "if button pressed, UI eventually updates").
