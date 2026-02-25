@@ -10,7 +10,6 @@ pub mod runtime;
 pub mod bridge;
 mod persistence;
 
-use std::cell::Cell;
 use std::rc::Rc;
 
 use zoon::*;
@@ -22,22 +21,10 @@ use crate::parser::{
 
 pub use persistence::clear_wasm_persisted_states;
 
-// Track whether this is the first run after page load (= page refresh).
-// On page refresh, WASM module reloads and this resets to true.
-// Only the first run should load persisted state; subsequent re-runs start fresh.
-thread_local! {
-    static FIRST_RUN: Cell<bool> = const { Cell::new(true) };
-}
-
 /// Run the WASM engine: compile source → generate WASM → instantiate → build UI.
 /// Returns a Zoon element tree.
 pub fn run_wasm(source: &str) -> RawElOrText {
-    let is_page_refresh = FIRST_RUN.with(|f| {
-        let first = f.get();
-        f.set(false);
-        first
-    });
-    match compile_and_run(source, is_page_refresh) {
+    match compile_and_run(source, true) {
         Ok(element) => element,
         Err(msg) => {
             El::new()

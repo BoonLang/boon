@@ -10,7 +10,6 @@ use zoon::*;
 use super::ir::*;
 use super::runtime::{CellStore, WasmInstance};
 
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -118,52 +117,86 @@ pub fn setup_router(program: &IrProgram, instance: &Rc<WasmInstance>) {
 // ---------------------------------------------------------------------------
 
 fn build_cell_element(program: &IrProgram, instance: &Rc<WasmInstance>, cell: CellId) -> RawElOrText {
+    build_element(program, instance, &BuildContext::Global, cell)
+}
+
+fn build_element(program: &IrProgram, instance: &Rc<WasmInstance>, ctx: &BuildContext, cell: CellId) -> RawElOrText {
     if let Some(node) = find_node_for_cell(program, cell) {
         match node {
             IrNode::Element { kind, links, hovered_cell, .. } => {
-                build_element_node(program, instance, kind, links, *hovered_cell)
+                match ctx {
+                    BuildContext::Item(item_ctx) => {
+                        build_item_element_node(program, instance, item_ctx, kind, links, *hovered_cell)
+                    }
+                    BuildContext::Global => {
+                        build_element_node(program, instance, kind, links, *hovered_cell)
+                    }
+                }
             }
             IrNode::Derived { expr, .. } => {
-                build_expr_element(program, instance, expr, cell)
+                match expr {
+                    IrExpr::CellRead(source) => build_element(program, instance, ctx, *source),
+                    IrExpr::Constant(IrValue::Text(t)) => zoon::Text::new(t.clone()).unify(),
+                    IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => {
+                        El::new().unify()
+                    }
+                    IrExpr::Constant(IrValue::Tag(t)) => zoon::Text::new(t.clone()).unify(),
+                    IrExpr::Constant(IrValue::Number(n)) => zoon::Text::new(format_number(*n)).unify(),
+                    IrExpr::TextConcat(segments) => {
+                        match ctx {
+                            BuildContext::Item(item_ctx) => build_item_text_from_segments(instance, item_ctx, segments),
+                            BuildContext::Global => build_text_from_segments(instance, segments),
+                        }
+                    }
+                    _ => build_reactive_text_ctx(instance, ctx, cell),
+                }
             }
             IrNode::TextInterpolation { parts, .. } => {
-                build_text_interpolation(instance, parts)
+                match ctx {
+                    BuildContext::Item(item_ctx) => build_item_text_from_segments(instance, item_ctx, parts),
+                    BuildContext::Global => build_text_interpolation(instance, parts),
+                }
             }
             IrNode::PipeThrough { source, .. } => {
-                build_cell_element(program, instance, *source)
+                build_element(program, instance, ctx, *source)
             }
             IrNode::While { source, arms, .. } => {
-                build_while_element(program, instance, cell, *source, arms)
+                if has_element_arms(program, arms) {
+                    build_conditional_element(program, instance, ctx, *source, arms)
+                } else {
+                    build_reactive_text_ctx(instance, ctx, cell)
+                }
             }
             IrNode::When { source, arms, .. } => {
-                build_when_element(program, instance, cell, *source, arms)
+                if has_element_arms(program, arms) {
+                    build_conditional_element(program, instance, ctx, *source, arms)
+                } else {
+                    build_reactive_text_ctx(instance, ctx, cell)
+                }
             }
             IrNode::Latest { .. }
             | IrNode::MathSum { .. }
             | IrNode::Hold { .. }
             | IrNode::Then { .. }
             | IrNode::ListCount { .. }
-            | IrNode::HoldLoop { .. } => {
-                build_reactive_text(instance, cell)
+            | IrNode::HoldLoop { .. }
+            | IrNode::ListIsEmpty { .. }
+            | IrNode::TextTrim { .. }
+            | IrNode::TextIsNotEmpty { .. } => {
+                build_reactive_text_ctx(instance, ctx, cell)
             }
             IrNode::ListAppend { source, .. }
             | IrNode::ListClear { source, .. }
             | IrNode::ListRemove { source, .. }
             | IrNode::ListRetain { source, .. }
             | IrNode::RouterGoTo { source, .. } => {
-                // These operations pass through to source for rendering.
-                build_cell_element(program, instance, *source)
-            }
-            IrNode::ListIsEmpty { .. }
-            | IrNode::TextTrim { .. }
-            | IrNode::TextIsNotEmpty { .. } => {
-                build_reactive_text(instance, cell)
+                build_element(program, instance, ctx, *source)
             }
             IrNode::ListMap { source, item_name, item_cell, template, template_cell_range, template_event_range, .. } => {
                 build_list_map(program, instance, cell, *source, *item_cell, item_name, template, *template_cell_range, *template_event_range)
             }
             IrNode::Document { root } => {
-                build_cell_element(program, instance, *root)
+                build_element(program, instance, ctx, *root)
             }
             IrNode::CustomCall { path, .. } => {
                 let path_str = path.join("/");
@@ -172,7 +205,17 @@ fn build_cell_element(program: &IrProgram, instance: &Rc<WasmInstance>, cell: Ce
             _ => zoon::Text::new("?").unify(),
         }
     } else {
-        build_reactive_text(instance, cell)
+        build_reactive_text_ctx(instance, ctx, cell)
+    }
+}
+
+/// Build reactive text that routes to per-item or global cell store based on context.
+fn build_reactive_text_ctx(instance: &Rc<WasmInstance>, ctx: &BuildContext, cell: CellId) -> RawElOrText {
+    match ctx {
+        BuildContext::Item(item_ctx) if item_ctx.is_template_cell(cell) => {
+            build_item_reactive_text(instance, item_ctx, cell)
+        }
+        _ => build_reactive_text(instance, cell),
     }
 }
 
@@ -205,37 +248,6 @@ fn format_cell_value(store: &super::runtime::CellStore, cell_id: u32) -> String 
         text
     } else {
         format_number(store.get_cell_value(cell_id))
-    }
-}
-
-/// Build element from an IrExpr (for Derived nodes).
-fn build_expr_element(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    expr: &IrExpr,
-    cell: CellId,
-) -> RawElOrText {
-    match expr {
-        IrExpr::CellRead(source) => build_cell_element(program, instance, *source),
-        IrExpr::Constant(IrValue::Number(n)) => {
-            zoon::Text::new(format_number(*n)).unify()
-        }
-        IrExpr::Constant(IrValue::Text(t)) => {
-            zoon::Text::new(t.clone()).unify()
-        }
-        IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => {
-            // NoElement renders as nothing — empty hidden span.
-            RawHtmlEl::new("span").style("display", "none").into_raw_unchecked()
-        }
-        IrExpr::Constant(IrValue::Tag(t)) => {
-            zoon::Text::new(t.clone()).unify()
-        }
-        IrExpr::TextConcat(segments) => {
-            build_text_from_segments(instance, segments)
-        }
-        _ => {
-            build_reactive_text(instance, cell)
-        }
     }
 }
 
@@ -339,7 +351,7 @@ fn build_element_node(
     // All typed element builders handle hover via .on_hovered_change() directly.
     let raw: RawElOrText = match kind {
         ElementKind::Button { label, style } => {
-            build_button(program, instance, label, style, links, hovered_cell)
+            build_button(program, instance, &BuildContext::Global, label, style, links, hovered_cell)
         }
         ElementKind::Stripe {
             direction,
@@ -347,7 +359,7 @@ fn build_element_node(
             gap,
             style,
             ..
-        } => build_stripe(program, instance, direction, *items, gap, style, hovered_cell),
+        } => build_stripe(program, instance, &BuildContext::Global, direction, *items, gap, style, hovered_cell),
         ElementKind::TextInput { placeholder, style, focus, .. } => {
             build_text_input(program, instance, placeholder.as_ref(), style, links, *focus, hovered_cell)
         }
@@ -356,13 +368,13 @@ fn build_element_node(
             build_checkbox(program, instance, checked.as_ref(), style, links, icon.as_ref(), hovered_cell)
         }
         ElementKind::Container { child, style } => {
-            build_container(program, instance, *child, style, hovered_cell)
+            build_container(program, instance, &BuildContext::Global, *child, style, hovered_cell)
         }
         ElementKind::Label { label, style } => {
-            build_label(program, instance, label, style, links, hovered_cell)
+            build_label(program, instance, &BuildContext::Global, label, style, links, hovered_cell)
         }
         ElementKind::Stack { layers, style } => {
-            build_stack(program, instance, *layers, style, hovered_cell)
+            build_stack(program, instance, &BuildContext::Global, *layers, style, hovered_cell)
         }
         ElementKind::Link { url, label, style } => {
             build_link(program, instance, label, url, style, links, hovered_cell)
@@ -497,10 +509,11 @@ fn build_label_child(
     }
 }
 
-/// Build a Button element.
+/// Build a Button element (works for both global and per-item contexts).
 fn build_button(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
     label: &IrExpr,
     style: &IrExpr,
     links: &[(String, EventId)],
@@ -513,36 +526,67 @@ fn build_button(
 
     let label_child = build_label_child(program, instance, label);
     let inst_press = instance.clone();
+    let is_template_event = press_event.map(|e| ctx.is_template_event(e)).unwrap_or(false);
+    let item_idx = ctx.item_ctx().map(|c| c.item_idx);
     let mut btn = Button::new()
         .label(label_child)
         .on_press(move || {
             if let Some(event_id) = press_event {
-                let _ = inst_press.fire_event(event_id.0);
+                if is_template_event {
+                    let _ = inst_press.call_on_item_event(item_idx.unwrap(), event_id.0);
+                } else {
+                    let _ = inst_press.fire_event(event_id.0);
+                }
             }
         });
     btn = apply_typed_styles(btn, style, program, false);
     if let Some(cell) = hovered_cell {
-        let inst = instance.clone();
-        btn = btn.on_hovered_change(move |hovered| {
-            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
-        });
+        btn = apply_hover(btn, instance, ctx.item_ctx(), cell);
     }
     btn
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false))
         .into_raw_unchecked()
 }
 
-/// Build a Stripe (row/column) element.
+/// A child slot for Stripe elements — either a static element or a reactive signal.
+enum ChildSlot {
+    Static(RawElOrText),
+    Signal(Box<dyn Signal<Item = Option<RawElOrText>> + Unpin>),
+}
+
+/// Follow CellRead/Derived/PipeThrough chains to find if this cell resolves to a
+/// WHEN/WHILE node with element arms. Returns (source, arms) if found.
+fn resolve_to_conditional(program: &IrProgram, cell: CellId) -> Option<(CellId, &[(IrPattern, IrExpr)])> {
+    match find_node_for_cell(program, cell) {
+        Some(IrNode::When { source, arms, .. }) | Some(IrNode::While { source, arms, .. }) => {
+            if has_element_arms(program, arms) {
+                Some((*source, arms))
+            } else {
+                None
+            }
+        }
+        Some(IrNode::Derived { expr: IrExpr::CellRead(inner), .. }) => {
+            resolve_to_conditional(program, *inner)
+        }
+        Some(IrNode::PipeThrough { source, .. }) => {
+            resolve_to_conditional(program, *source)
+        }
+        _ => None,
+    }
+}
+
+/// Build a Stripe (row/column) element (works for both global and per-item contexts).
 fn build_stripe(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
     direction: &IrExpr,
     items_cell: CellId,
     gap: &IrExpr,
     style: &IrExpr,
     hovered_cell: Option<CellId>,
 ) -> RawElOrText {
-    let children = collect_stripe_children(program, instance, items_cell);
+    let children = collect_stripe_children(program, instance, ctx, items_cell);
 
     let is_column = match direction {
         IrExpr::Constant(IrValue::Tag(t)) => t == "Column",
@@ -562,61 +606,81 @@ fn build_stripe(
         }
     }
     if let Some(cell) = hovered_cell {
-        let inst = instance.clone();
-        stripe = stripe.on_hovered_change(move |hovered| {
-            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
-        });
+        stripe = apply_hover(stripe, instance, ctx.item_ctx(), cell);
     }
     stripe
-        .items(children)
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, is_row))
+        .update_raw_el(|raw_el| {
+            let mut raw_el = raw_el;
+            for slot in children {
+                match slot {
+                    ChildSlot::Static(el) => { raw_el = raw_el.child(el); }
+                    ChildSlot::Signal(sig) => { raw_el = raw_el.child_signal(sig); }
+                }
+            }
+            apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), is_row)
+        })
         .into_raw_unchecked()
 }
 
-/// Collect children for a stripe element.
+/// Collect children for a stripe element (works for both global and per-item contexts).
 fn collect_stripe_children(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
     items_cell: CellId,
-) -> Vec<RawElOrText> {
+) -> Vec<ChildSlot> {
     match find_node_for_cell(program, items_cell) {
         Some(IrNode::Derived { expr, .. }) => {
             match expr {
                 IrExpr::ListConstruct(items) => {
-                    items
-                        .iter()
-                        .filter_map(|item| {
-                            match item {
-                                IrExpr::CellRead(child_cell) => {
-                                    Some(build_cell_element(program, instance, *child_cell))
-                                }
-                                IrExpr::Constant(IrValue::Text(t)) => {
-                                    Some(zoon::Text::new(t.clone()).unify())
-                                }
-                                IrExpr::Constant(IrValue::Tag(t)) => {
-                                    if t == "NoElement" {
-                                        None
+                    let mut children = Vec::new();
+                    for item in items {
+                        match item {
+                            IrExpr::CellRead(child_cell) => {
+                                if let Some((source, arms)) = resolve_to_conditional(program, *child_cell) {
+                                    if let (BuildContext::Item(item_ctx), true) = (ctx, has_no_element_arm(program, arms)) {
+                                        // Per-item + NoElement (e.g., hover X button):
+                                        // pre-build with opacity toggle to prevent hover oscillation.
+                                        for el in build_item_opacity_children(program, instance, item_ctx, source, arms) {
+                                            children.push(ChildSlot::Static(el));
+                                        }
                                     } else {
-                                        Some(zoon::Text::new(t.clone()).unify())
+                                        // All other conditionals: use child_signal.
+                                        children.push(ChildSlot::Signal(
+                                            build_conditional_signal(program, instance, ctx, source, arms)
+                                        ));
                                     }
+                                } else {
+                                    children.push(ChildSlot::Static(build_element(program, instance, ctx, *child_cell)));
                                 }
-                                IrExpr::TextConcat(segments) => {
-                                    Some(build_text_from_segments(instance, segments))
-                                }
-                                _ => None,
                             }
-                        })
-                        .collect()
+                            IrExpr::Constant(IrValue::Text(t)) => {
+                                children.push(ChildSlot::Static(zoon::Text::new(t.clone()).unify()));
+                            }
+                            IrExpr::Constant(IrValue::Tag(t)) => {
+                                if t != "NoElement" {
+                                    children.push(ChildSlot::Static(zoon::Text::new(t.clone()).unify()));
+                                }
+                            }
+                            IrExpr::TextConcat(segments) => {
+                                match ctx {
+                                    BuildContext::Item(item_ctx) => children.push(ChildSlot::Static(build_item_text_from_segments(instance, item_ctx, segments))),
+                                    BuildContext::Global => children.push(ChildSlot::Static(build_text_from_segments(instance, segments))),
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    children
                 }
                 IrExpr::CellRead(source) => {
-                    collect_stripe_children(program, instance, *source)
+                    collect_stripe_children(program, instance, ctx, *source)
                 }
                 _ => Vec::new(),
             }
         }
         Some(_) => {
-            // Non-Derived node (e.g., ListMap) — render it as a single child element.
-            vec![build_cell_element(program, instance, items_cell)]
+            vec![ChildSlot::Static(build_element(program, instance, ctx, items_cell))]
         }
         None => Vec::new(),
     }
@@ -648,12 +712,11 @@ fn build_text_input(
     let mut ti = TextInput::new();
     ti = apply_typed_styles(ti, style, program, false);
     if let Some(cell) = hovered_cell {
-        let inst = instance.clone();
-        ti = ti.on_hovered_change(move |hovered| {
-            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
-        });
+        ti = apply_hover(ti, instance, None, cell);
     }
-    ti
+    // Apply placeholder via Zoon's typed Placeholder API.
+    let ph_el = build_placeholder(placeholder, program);
+    ti.placeholder(ph_el)
         .update_raw_el(|raw_el| {
             let mut raw_el = raw_el
                 .style("box-sizing", "border-box")
@@ -670,27 +733,6 @@ fn build_text_input(
             }
 
             raw_el = apply_raw_css(raw_el, style, program, instance, None, false);
-
-            // Apply placeholder text and styles via Zoon's style_group
-            // (replaces the old <style> injection hack).
-            if let Some(ph) = placeholder {
-                let text = extract_placeholder_text(ph, program);
-                if !text.is_empty() {
-                    raw_el = raw_el.attr("placeholder", &text);
-                }
-                let ph_styles = extract_placeholder_styles(ph, program);
-                if !ph_styles.is_empty() {
-                    let mut group = StyleGroup::new("::placeholder");
-                    for (prop, val) in &ph_styles {
-                        match prop.as_str() {
-                            "font-style" => { group = group.style("font-style", val.clone()); }
-                            "color" => { group = group.style("color", val.clone()); }
-                            _ => {}
-                        }
-                    }
-                    raw_el = raw_el.style_group(group);
-                }
-            }
 
             // Set up keydown event listener.
             let raw_el = if let Some(event_id) = key_down_event {
@@ -840,22 +882,20 @@ fn find_text_property_cell_in_range(
 fn build_container(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
     child: CellId,
     style: &IrExpr,
     hovered_cell: Option<CellId>,
 ) -> RawElOrText {
-    let child_el = build_cell_element(program, instance, child);
+    let child_el = build_element(program, instance, ctx, child);
     let mut el = El::new();
     el = apply_typed_styles(el, style, program, false);
     if let Some(cell) = hovered_cell {
-        let inst = instance.clone();
-        el = el.on_hovered_change(move |hovered| {
-            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
-        });
+        el = apply_hover(el, instance, ctx.item_ctx(), cell);
     }
     el
         .child(child_el)
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false))
         .into_raw_unchecked()
 }
 
@@ -863,6 +903,7 @@ fn build_container(
 fn build_label(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
     label: &IrExpr,
     style: &IrExpr,
     _links: &[(String, EventId)],
@@ -870,15 +911,16 @@ fn build_label(
 ) -> RawElOrText {
     let content: RawElOrText = match label {
         IrExpr::TextConcat(segments) => {
-            build_text_from_segments(instance, segments)
+            match ctx {
+                BuildContext::Item(item_ctx) => build_item_text_from_segments(instance, item_ctx, segments),
+                BuildContext::Global => build_text_from_segments(instance, segments),
+            }
         }
         IrExpr::Constant(IrValue::Text(t)) => {
             zoon::Text::new(t.clone()).unify()
         }
         IrExpr::CellRead(cell) => {
-            // Follow through to the cell's node (e.g., TextInterpolation)
-            // instead of showing raw f64 value.
-            build_cell_element(program, instance, *cell)
+            build_element(program, instance, ctx, *cell)
         }
         _ => {
             let text = eval_static_text(label);
@@ -888,14 +930,11 @@ fn build_label(
     let mut lbl = Label::new();
     lbl = apply_typed_styles(lbl, style, program, false);
     if let Some(cell) = hovered_cell {
-        let inst = instance.clone();
-        lbl = lbl.on_hovered_change(move |hovered| {
-            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
-        });
+        lbl = apply_hover(lbl, instance, ctx.item_ctx(), cell);
     }
     lbl
         .label(content)
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
+        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false))
         .into_raw_unchecked()
 }
 
@@ -903,22 +942,28 @@ fn build_label(
 fn build_stack(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
     layers_cell: CellId,
     style: &IrExpr,
     hovered_cell: Option<CellId>,
 ) -> RawElOrText {
-    let children = collect_stripe_children(program, instance, layers_cell);
+    let children = collect_stripe_children(program, instance, ctx, layers_cell);
     let mut stk = Stack::new();
     stk = apply_typed_styles(stk, style, program, false);
     if let Some(cell) = hovered_cell {
-        let inst = instance.clone();
-        stk = stk.on_hovered_change(move |hovered| {
-            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
-        });
+        stk = apply_hover(stk, instance, ctx.item_ctx(), cell);
     }
     stk
-        .layers(children)
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
+        .update_raw_el(|raw_el| {
+            let mut raw_el = raw_el;
+            for slot in children {
+                match slot {
+                    ChildSlot::Static(el) => { raw_el = raw_el.child(el); }
+                    ChildSlot::Signal(sig) => { raw_el = raw_el.child_signal(sig); }
+                }
+            }
+            apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false)
+        })
         .into_raw_unchecked()
 }
 
@@ -937,10 +982,7 @@ fn build_link(
     let mut lnk = Link::new().to(&url_text).new_tab(NewTab::new());
     lnk = apply_typed_styles(lnk, style, program, false);
     if let Some(cell) = hovered_cell {
-        let inst = instance.clone();
-        lnk = lnk.on_hovered_change(move |hovered| {
-            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
-        });
+        lnk = apply_hover(lnk, instance, None, cell);
     }
     lnk
         .label(zoon::Text::new(label_text))
@@ -1012,10 +1054,7 @@ fn build_paragraph(
     let mut para = Paragraph::new();
     para = apply_typed_styles(para, style, program, false);
     if let Some(cell) = hovered_cell {
-        let inst = instance.clone();
-        para = para.on_hovered_change(move |hovered| {
-            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
-        });
+        para = apply_hover(para, instance, None, cell);
     }
     para
         .contents(children)
@@ -1076,10 +1115,7 @@ fn build_checkbox(
 
     cb = apply_typed_styles(cb, style, program, false);
     if let Some(cell) = hovered_cell {
-        let inst = instance.clone();
-        cb = cb.on_hovered_change(move |hovered| {
-            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
-        });
+        cb = apply_hover(cb, instance, None, cell);
     }
     cb
         .update_raw_el(|raw_el| {
@@ -1094,35 +1130,6 @@ fn build_checkbox(
 }
 
 /// Build a WHILE element — reactively switches child based on source cell value.
-fn build_while_element(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    cell: CellId,
-    source: CellId,
-    arms: &[(IrPattern, IrExpr)],
-) -> RawElOrText {
-    if has_element_arms(program, arms) {
-        build_conditional_element(program, instance, source, arms)
-    } else {
-        build_reactive_text(instance, cell)
-    }
-}
-
-/// Build a WHEN element — same bridge behavior as WHILE.
-fn build_when_element(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    cell: CellId,
-    source: CellId,
-    arms: &[(IrPattern, IrExpr)],
-) -> RawElOrText {
-    if has_element_arms(program, arms) {
-        build_conditional_element(program, instance, source, arms)
-    } else {
-        build_reactive_text(instance, cell)
-    }
-}
-
 /// Check if any arm body produces an element (vs a text/number value).
 /// Element-producing arms use build_conditional_element for visibility toggling.
 /// Value-producing arms use build_reactive_text to show the WHEN/WHILE target cell.
@@ -1150,201 +1157,181 @@ fn is_element_body(program: &IrProgram, body: &IrExpr) -> bool {
     }
 }
 
-/// Shared implementation for WHEN/WHILE conditional element rendering.
-/// Matches the source cell's current value against arm patterns and renders
-/// the matching arm's body as an element.
-///
-/// Strategy: wrap each arm's element in a div, set initial display based on
-/// current value, then use after_insert + Task to watch the signal and toggle
-/// display via raw DOM API.
-/// When a WHILE conditional arm becomes visible, focus any child input
-/// with the `autofocus` attribute. This is needed because `after_insert`
-/// fires at mount time when the element may be hidden (`display:none`),
-/// and calling `.focus()` on a hidden element has no effect.
-fn focus_autofocus_child(el: &web_sys::HtmlElement) {
-    if let Ok(Some(input)) = el.query_selector("input[autofocus]") {
-        if let Ok(html_el) = input.dyn_into::<web_sys::HtmlElement>() {
-            let _ = html_el.focus();
+/// Build an element from a WHEN/WHILE arm body expression.
+/// Returns `None` for NoElement arms (element should be removed from DOM).
+fn build_arm_body_element(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
+    body: &IrExpr,
+    source: CellId,
+) -> Option<RawElOrText> {
+    match body {
+        IrExpr::CellRead(cell) => {
+            if is_no_element(program, *cell) {
+                None
+            } else {
+                Some(build_element(program, instance, ctx, *cell))
+            }
+        }
+        IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => None,
+        IrExpr::TextConcat(segments) => {
+            match ctx {
+                BuildContext::Item(item_ctx) => Some(build_item_text_from_segments(instance, item_ctx, segments)),
+                BuildContext::Global => Some(build_text_from_segments(instance, segments)),
+            }
+        }
+        _ => {
+            let text = eval_static_text(body);
+            if text.is_empty() {
+                Some(build_reactive_text_ctx(instance, ctx, source))
+            } else {
+                Some(zoon::Text::new(text).unify())
+            }
         }
     }
 }
 
+/// Build a conditional element (WHEN/WHILE) for non-Stripe contexts.
+/// Uses `El` with `child_signal` to reactively swap content.
 fn build_conditional_element(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
     source: CellId,
     arms: &[(IrPattern, IrExpr)],
 ) -> RawElOrText {
+    // Single arm optimization: build directly, no signal needed.
+    if arms.len() == 1 {
+        return build_arm_body_element(program, instance, ctx, &arms[0].1, source)
+            .unwrap_or_else(|| El::new().unify());
+    }
+    El::new()
+        .child_signal(build_conditional_signal(program, instance, ctx, source, arms))
+        .unify()
+}
+
+/// Build a reactive signal for a WHEN/WHILE conditional.
+/// Produces `Some(element)` for matched arms or `None` for NoElement/unmatched.
+fn build_conditional_signal(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
+    source: CellId,
+    arms: &[(IrPattern, IrExpr)],
+) -> Box<dyn Signal<Item = Option<RawElOrText>> + Unpin> {
     let tag_table = &program.tag_table;
+    let matchers: Vec<ArmMatcher> = arms.iter().map(|(p, _)| pattern_to_matcher(p, tag_table)).collect();
+    let arm_bodies: Vec<IrExpr> = arms.iter().map(|(_, body)| body.clone()).collect();
+    let inst = instance.clone();
+    let source_id = source.0;
 
-    // Build arm elements, marking NoElement arms as None.
-    // Skipping NoElement arms avoids creating a `display: contents` wrapper div,
-    // which breaks CDP's Input.dispatchMouseEvent — dominator event handlers on
-    // elements inside `display: contents` wrappers don't fire for real CDP clicks.
-    let arm_elements: Vec<(ArmMatcher, Option<RawElOrText>)> = arms
-        .iter()
-        .map(|(pattern, body)| {
-            let matcher = pattern_to_matcher(pattern, tag_table);
-            let element = match body {
-                IrExpr::CellRead(cell) => {
-                    if is_no_element(program, *cell) {
-                        None
-                    } else {
-                        Some(build_cell_element(program, instance, *cell))
-                    }
-                }
-                IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => {
-                    None
-                }
-                IrExpr::TextConcat(segments) => {
-                    Some(build_text_from_segments(instance, segments))
-                }
-                _ => {
-                    let text = eval_static_text(body);
-                    if text.is_empty() {
-                        Some(build_reactive_text(instance, source))
-                    } else {
-                        Some(zoon::Text::new(text).unify())
-                    }
-                }
+    match ctx {
+        BuildContext::Global => {
+            let store = instance.cell_store.clone();
+            Box::new(store.get_cell_signal(source_id).map(move |_val| {
+                let val = store.get_cell_value(source_id);
+                let text = store.get_cell_text(source_id);
+                find_matching_arm_idx(&matchers, val, &text).and_then(|idx| {
+                    build_arm_body_element(&inst.program, &inst, &BuildContext::Global, &arm_bodies[idx], CellId(source_id))
+                })
+            }))
+        }
+        BuildContext::Item(item_ctx) => {
+            let ctx_owned = item_ctx.clone();
+            let is_item_source = item_ctx.is_template_cell(source);
+            let store = instance.cell_store.clone();
+            let item_cell_store = instance.item_cell_store.clone();
+
+            let signal: Box<dyn Signal<Item = f64> + Unpin> = if is_item_source {
+                let ics = instance.item_cell_store.clone().unwrap();
+                Box::new(ics.get_signal(item_ctx.item_idx, source_id))
+            } else {
+                Box::new(instance.cell_store.get_cell_signal(source_id))
             };
-            (matcher, element)
-        })
-        .collect();
 
-    // Single arm with element — return directly, no switching needed.
-    if arm_elements.len() == 1 {
-        if let Some(el) = arm_elements.into_iter().next().unwrap().1 {
-            return el;
-        } else {
-            return RawHtmlEl::new("span").style("display", "none").into_raw_unchecked();
+            Box::new(signal.map(move |_val| {
+                let (val, text) = if is_item_source {
+                    if let Some(ref ics) = item_cell_store {
+                        (ics.get_value(ctx_owned.item_idx, source_id), ics.get_text(ctx_owned.item_idx, source_id))
+                    } else {
+                        (store.get_cell_value(source_id), store.get_cell_text(source_id))
+                    }
+                } else {
+                    (store.get_cell_value(source_id), store.get_cell_text(source_id))
+                };
+                find_matching_arm_idx(&matchers, val, &text).and_then(|idx| {
+                    let build_ctx = BuildContext::Item(&ctx_owned);
+                    build_arm_body_element(&inst.program, &inst, &build_ctx, &arm_bodies[idx], CellId(source_id))
+                })
+            }))
         }
     }
+}
 
-    let matchers: Vec<ArmMatcher> = arm_elements.iter().map(|(m, _)| m.clone()).collect();
-    let elements: Vec<Option<RawElOrText>> = arm_elements.into_iter().map(|(_, e)| e).collect();
-
-    // Apply display toggling directly to elements (no wrapper divs).
-    let store = instance.cell_store.clone();
+/// Build per-item conditional children with opacity toggling.
+/// Elements are always in the DOM — only opacity changes. This prevents hover
+/// oscillation caused by DOM structural changes (child_signal's removeChild/insertBefore).
+fn build_item_opacity_children(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    ctx: &ItemContext,
+    source: CellId,
+    arms: &[(IrPattern, IrExpr)],
+) -> Vec<RawElOrText> {
+    let tag_table = &program.tag_table;
+    let matchers: Vec<ArmMatcher> = arms.iter().map(|(p, _)| pattern_to_matcher(p, tag_table)).collect();
     let source_id = source.0;
-    let mut result_children: Vec<RawElOrText> = Vec::new();
-    for (i, element) in elements.into_iter().enumerate() {
-        // Skip NoElement arms — they're always hidden and redundant.
-        let element = match element {
+    let is_item_source = ctx.is_template_cell(source);
+    let item_idx = ctx.item_idx;
+
+    let mut result = Vec::new();
+    for (arm_idx, (_, body)) in arms.iter().enumerate() {
+        let el = match build_arm_body_element(program, instance, &BuildContext::Item(ctx), body, source) {
             Some(el) => el,
             None => continue,
         };
-        let matchers_clone = matchers.clone();
-        let store_clone = store.clone();
-        // Set initial display based on current cell value.
-        let initial_val = store.get_cell_value(source_id);
-        let initial_text = store.get_cell_text(source_id);
-        let initial_matched = find_matching_arm_idx(&matchers, initial_val, &initial_text);
-        let initially_visible = initial_matched == Some(i);
 
-        let toggled = apply_conditional_display_toggle(
-            element, initially_visible,
-            move |el: &web_sys::HtmlElement, set_vis: &dyn Fn(&web_sys::HtmlElement, bool)| {
-                // Re-set display in case value changed between build and mount.
-                let val = store_clone.get_cell_value(source_id);
-                let cell_text = store_clone.get_cell_text(source_id);
-                let matched = find_matching_arm_idx(&matchers_clone, val, &cell_text);
-                set_vis(el, matched == Some(i));
+        let matchers = matchers.clone();
+        let store = instance.cell_store.clone();
+        let ics = instance.item_cell_store.clone();
 
-                // Watch for changes.
-                let matchers_inner = matchers_clone.clone();
-                let store_inner = store_clone.clone();
-                let el_clone = el.clone();
-                let handle = Task::start_droppable(
-                    store_clone.get_cell_signal(source_id)
-                        .for_each_sync(move |val| {
-                            let cell_text = store_inner.get_cell_text(source_id);
-                            let matched = find_matching_arm_idx(&matchers_inner, val, &cell_text);
-                            let visible = matched == Some(i);
-                            set_conditional_visibility(&el_clone, visible);
-                            if visible {
-                                focus_autofocus_child(&el_clone);
-                            }
-                        })
-                );
-                std::mem::forget(handle);
-            },
-        );
-        result_children.push(toggled);
-    }
-
-    if result_children.len() == 1 {
-        result_children.into_iter().next().unwrap()
-    } else {
-        RawHtmlEl::new("div")
-            .style("display", "contents")
-            .children(result_children)
-            .into_raw_unchecked()
-    }
-}
-
-/// Apply conditional display toggling directly to an element (avoiding wrapper divs).
-///
-/// For `RawHtmlEl` elements, saves the original display value and toggles between
-/// it and `display: none`. For text nodes, wraps in a minimal `<span>`.
-///
-/// This avoids `display: contents` wrappers which break CDP's `Input.dispatchMouseEvent`
-/// hit-testing — clicks miss elements inside conditionals.
-fn apply_conditional_display_toggle(
-    element: RawElOrText,
-    initially_visible: bool,
-    setup: impl FnOnce(&web_sys::HtmlElement, &dyn Fn(&web_sys::HtmlElement, bool)) + 'static,
-) -> RawElOrText {
-    match element {
-        RawElOrText::RawHtmlEl(mut html_el) => {
-            if !initially_visible {
-                html_el = html_el.style("display", "none");
-            }
-            html_el
-                .after_insert(move |el: web_sys::HtmlElement| {
-                    let set_vis = |el: &web_sys::HtmlElement, visible: bool| {
-                        set_conditional_visibility(el, visible);
-                    };
-                    setup(&el, &set_vis);
-                })
-                .into_raw_unchecked()
-        }
-        other => {
-            // Text nodes can't have display toggled directly — use a minimal span wrapper.
-            let mut wrapper = RawHtmlEl::new("span");
-            if !initially_visible {
-                wrapper = wrapper.style("display", "none");
-            }
-            wrapper
-                .child(other)
-                .after_insert(move |el: web_sys::HtmlElement| {
-                    let set_vis = |el: &web_sys::HtmlElement, visible: bool| {
-                        set_conditional_visibility(el, visible);
-                    };
-                    setup(&el, &set_vis);
-                })
-                .into_raw_unchecked()
-        }
-    }
-}
-
-/// Set visibility on a conditional element.
-/// When showing, restores `display: inline-flex` for flex containers (detected via
-/// `flex-direction` in inline style), otherwise removes inline `display`.
-fn set_conditional_visibility(el: &web_sys::HtmlElement, visible: bool) {
-    if visible {
-        // Check if this element is a flex container by looking for flex-direction.
-        // display:none doesn't remove other inline styles, so flex-direction persists.
-        let has_flex = !el.style().get_property_value("flex-direction")
-            .unwrap_or_default().is_empty();
-        if has_flex {
-            let _ = el.style().set_property("display", "inline-flex");
+        let signal: Box<dyn Signal<Item = f64> + Unpin> = if is_item_source {
+            Box::new(instance.item_cell_store.clone().unwrap().get_signal(item_idx, source_id))
         } else {
-            let _ = el.style().remove_property("display");
-        }
-    } else {
-        let _ = el.style().set_property("display", "none");
+            Box::new(instance.cell_store.get_cell_signal(source_id))
+        };
+
+        let opacity_signal = signal.map(move |_| {
+            let (val, text) = if is_item_source {
+                if let Some(ref ics) = ics {
+                    (ics.get_value(item_idx, source_id), ics.get_text(item_idx, source_id))
+                } else {
+                    (store.get_cell_value(source_id), store.get_cell_text(source_id))
+                }
+            } else {
+                (store.get_cell_value(source_id), store.get_cell_text(source_id))
+            };
+            if find_matching_arm_idx(&matchers, val, &text) == Some(arm_idx) { "1" } else { "0" }
+        });
+
+        result.push(
+            El::new()
+                .child(el)
+                .update_raw_el(|raw_el| raw_el.style("opacity", "0").style_signal("opacity", opacity_signal))
+                .unify()
+        );
     }
+    result
+}
+
+/// Check if any arm in a conditional is NoElement.
+fn has_no_element_arm(program: &IrProgram, arms: &[(IrPattern, IrExpr)]) -> bool {
+    arms.iter().any(|(_, body)| match body {
+        IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => true,
+        IrExpr::CellRead(cell) => is_no_element(program, *cell),
+        _ => false,
+    })
 }
 
 /// Check if a cell resolves to the NoElement tag.
@@ -1446,6 +1433,36 @@ impl ItemContext {
 
     fn is_template_event(&self, event: EventId) -> bool {
         event.0 >= self.template_event_range.0 && event.0 < self.template_event_range.1
+    }
+}
+
+/// Context for building elements — Global (top-level) or Item (per-list-item).
+#[derive(Clone)]
+enum BuildContext<'a> {
+    Global,
+    Item(&'a ItemContext),
+}
+
+impl<'a> BuildContext<'a> {
+    fn item_ctx(&self) -> Option<&ItemContext> {
+        match self { BuildContext::Item(ctx) => Some(ctx), _ => None }
+    }
+
+    fn is_template_cell(&self, cell: CellId) -> bool {
+        match self { BuildContext::Item(ctx) => ctx.is_template_cell(cell), _ => false }
+    }
+
+    fn is_template_event(&self, event: EventId) -> bool {
+        match self { BuildContext::Item(ctx) => ctx.is_template_event(event), _ => false }
+    }
+
+    fn fire_event(&self, instance: &Rc<WasmInstance>, event: EventId) {
+        match self {
+            BuildContext::Item(ctx) if ctx.is_template_event(event) => {
+                let _ = instance.call_on_item_event(ctx.item_idx, event.0);
+            }
+            _ => { let _ = instance.fire_event(event.0); }
+        }
     }
 }
 
@@ -1607,7 +1624,7 @@ fn build_list_map(
                 };
 
                 if let Some(root_cell) = template_root_cell {
-                    build_item_element(program, &inst, &ctx, root_cell)
+                    build_element(program, &inst, &BuildContext::Item(&ctx), root_cell)
                 } else {
                     // Fallback: render item text directly.
                     if i < text_items.len() {
@@ -1684,106 +1701,6 @@ fn collect_cross_scope_events(
     result
 }
 
-/// Build an element for a per-item cell.
-/// For template-scoped cells, reads signals from ItemCellStore.
-/// For global cells, reads from the global CellStore (same as build_cell_element).
-fn build_item_element(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    ctx: &ItemContext,
-    cell: CellId,
-) -> RawElOrText {
-    if let Some(node) = find_node_for_cell(program, cell) {
-        match node {
-            IrNode::Element { kind, links, hovered_cell, .. } => {
-                build_item_element_node(program, instance, ctx, kind, links, *hovered_cell)
-            }
-            IrNode::Derived { expr, .. } => {
-                match expr {
-                    IrExpr::CellRead(source) => build_item_element(program, instance, ctx, *source),
-                    IrExpr::Constant(IrValue::Text(t)) => zoon::Text::new(t.clone()).unify(),
-                    IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => {
-                        RawHtmlEl::new("span").style("display", "none").into_raw_unchecked()
-                    }
-                    IrExpr::Constant(IrValue::Tag(t)) => zoon::Text::new(t.clone()).unify(),
-                    IrExpr::Constant(IrValue::Number(n)) => zoon::Text::new(format_number(*n)).unify(),
-                    IrExpr::TextConcat(segments) => {
-                        build_item_text_from_segments(instance, ctx, segments)
-                    }
-                    _ => {
-                        if ctx.is_template_cell(cell) {
-                            build_item_reactive_text(instance, ctx, cell)
-                        } else {
-                            build_reactive_text(instance, cell)
-                        }
-                    }
-                }
-            }
-            IrNode::TextInterpolation { parts, .. } => {
-                build_item_text_from_segments(instance, ctx, parts)
-            }
-            IrNode::PipeThrough { source, .. } => {
-                build_item_element(program, instance, ctx, *source)
-            }
-            IrNode::While { source, arms, .. } => {
-                if has_element_arms(program, arms) {
-                    build_item_conditional_element(program, instance, ctx, *source, arms)
-                } else if ctx.is_template_cell(cell) {
-                    build_item_reactive_text(instance, ctx, cell)
-                } else {
-                    build_reactive_text(instance, cell)
-                }
-            }
-            IrNode::When { source, arms, .. } => {
-                if has_element_arms(program, arms) {
-                    build_item_conditional_element(program, instance, ctx, *source, arms)
-                } else if ctx.is_template_cell(cell) {
-                    build_item_reactive_text(instance, ctx, cell)
-                } else {
-                    build_reactive_text(instance, cell)
-                }
-            }
-            IrNode::Latest { .. }
-            | IrNode::MathSum { .. }
-            | IrNode::Hold { .. }
-            | IrNode::Then { .. }
-            | IrNode::ListCount { .. }
-            | IrNode::HoldLoop { .. }
-            | IrNode::ListIsEmpty { .. }
-            | IrNode::TextTrim { .. }
-            | IrNode::TextIsNotEmpty { .. } => {
-                if ctx.is_template_cell(cell) {
-                    build_item_reactive_text(instance, ctx, cell)
-                } else {
-                    build_reactive_text(instance, cell)
-                }
-            }
-            IrNode::ListAppend { source, .. }
-            | IrNode::ListClear { source, .. }
-            | IrNode::ListRemove { source, .. }
-            | IrNode::ListRetain { source, .. }
-            | IrNode::RouterGoTo { source, .. } => {
-                build_item_element(program, instance, ctx, *source)
-            }
-            IrNode::ListMap { source, item_name, item_cell, template, template_cell_range, template_event_range, .. } => {
-                // Nested list maps — use normal build_list_map.
-                build_list_map(program, instance, cell, *source, *item_cell, item_name, template, *template_cell_range, *template_event_range)
-            }
-            IrNode::Document { root } => {
-                build_item_element(program, instance, ctx, *root)
-            }
-            _ => zoon::Text::new("?").unify(),
-        }
-    } else {
-        // No node found — check if it's a per-item cell.
-        if ctx.is_template_cell(cell) {
-            build_item_reactive_text(instance, ctx, cell)
-        } else {
-            build_reactive_text(instance, cell)
-        }
-    }
-}
-
 /// Build reactive text that reads from per-item cell store.
 fn build_item_reactive_text(
     instance: &Rc<WasmInstance>,
@@ -1799,10 +1716,10 @@ fn build_item_reactive_text(
     let signal = ics.get_signal(item_idx, cell_id);
     zoon::Text::with_signal(signal.map(move |_sig_val| {
         let text = ics.get_text(item_idx, cell_id);
+        let val = ics.get_value(item_idx, cell_id);
         if !text.is_empty() {
             text
         } else {
-            let val = ics.get_value(item_idx, cell_id);
             format_number(val)
         }
     })).unify()
@@ -1917,10 +1834,10 @@ fn build_item_element_node(
 
     let raw: RawElOrText = match kind {
         ElementKind::Button { label, style } => {
-            build_item_button(program, instance, ctx, label, style, links, hovered_cell)
+            build_button(program, instance, &BuildContext::Item(ctx), label, style, links, hovered_cell)
         }
         ElementKind::Stripe { direction, items, gap, style, .. } => {
-            build_item_stripe(program, instance, ctx, direction, *items, gap, style, hovered_cell)
+            build_stripe(program, instance, &BuildContext::Item(ctx), direction, *items, gap, style, hovered_cell)
         }
         ElementKind::TextInput { placeholder, style, focus, text_cell: reactive_text_cell } => {
             build_item_text_input(program, instance, ctx, placeholder.as_ref(), style, links, *focus, *reactive_text_cell, hovered_cell)
@@ -1930,18 +1847,16 @@ fn build_item_element_node(
             build_item_checkbox(program, instance, ctx, checked.as_ref(), style, links, icon.as_ref(), hovered_cell)
         }
         ElementKind::Container { child, style } => {
-            build_item_container(program, instance, ctx, *child, style, hovered_cell)
+            build_container(program, instance, &BuildContext::Item(ctx), *child, style, hovered_cell)
         }
         ElementKind::Label { label, style } => {
-            build_item_label(program, instance, ctx, label, style, links, hovered_cell)
+            build_label(program, instance, &BuildContext::Item(ctx), label, style, links, hovered_cell)
         }
         ElementKind::Stack { layers, style } => {
-            build_item_stack(program, instance, ctx, *layers, style, hovered_cell)
+            build_stack(program, instance, &BuildContext::Item(ctx), *layers, style, hovered_cell)
         }
         ElementKind::Link { url, label, style } => {
-            // Per-item Link reuses global builder; hover handled here since Link has .on_hovered_change().
-            // But we need per-item routing — use apply_item_hover equivalent.
-            // For simplicity, pass None and let attach_item_events handle hover for Link/Paragraph.
+            // Per-item Link reuses global builder; hover is deferred to attach_item_events.
             remaining_hovered_cell = hovered_cell;
             build_link(program, instance, label, url, style, links, None)
         }
@@ -2075,159 +1990,34 @@ fn attach_item_events(
     html_el.into_raw_unchecked()
 }
 
-/// Apply hover handling on a typed per-item element via `.on_hovered_change()`.
+/// Apply hover handling on a typed element via `.on_hovered_change()`.
 /// Routes to ItemCellStore for template cells, WasmInstance for global cells.
-fn apply_item_hover<T: MouseEventAware>(
+fn apply_hover<T: MouseEventAware>(
     el: T,
     instance: &Rc<WasmInstance>,
-    ctx: &ItemContext,
+    item_ctx: Option<&ItemContext>,
     cell: CellId,
 ) -> T {
-    let item_idx = ctx.item_idx;
-    if ctx.is_template_cell(cell) {
-        let ics = instance.item_cell_store.clone();
-        el.on_hovered_change(move |hovered| {
-            if let Some(ref ics) = ics {
-                ics.set_cell(item_idx, cell.0, if hovered { 1.0 } else { 0.0 });
-            }
-        })
-    } else {
-        let inst = instance.clone();
-        el.on_hovered_change(move |hovered| {
-            inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
-        })
-    }
-}
-
-/// Build a per-item Button element.
-fn build_item_button(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    ctx: &ItemContext,
-    label: &IrExpr,
-    style: &IrExpr,
-    links: &[(String, EventId)],
-    hovered_cell: Option<CellId>,
-) -> RawElOrText {
-    let label_text = resolve_static_text(program, label);
-
-    let press_event = links.iter()
-        .find(|(name, _)| name == "press")
-        .map(|(_, eid)| *eid);
-
-    let inst_press = instance.clone();
-    let item_idx = ctx.item_idx;
-    let mut btn = Button::new()
-        .on_press({
-            let is_template = press_event.map(|e| ctx.is_template_event(e)).unwrap_or(false);
-            move || {
-                if let Some(event_id) = press_event {
-                    if is_template {
-                        let _ = inst_press.call_on_item_event(item_idx, event_id.0);
-                    } else {
-                        let _ = inst_press.fire_event(event_id.0);
-                    }
+    match item_ctx {
+        Some(ctx) if ctx.is_template_cell(cell) => {
+            let ics = instance.item_cell_store.clone();
+            let item_idx = ctx.item_idx;
+            el.on_hovered_change(move |hovered| {
+                if let Some(ref ics) = ics {
+                    ics.set_cell(item_idx, cell.0, if hovered { 1.0 } else { 0.0 });
                 }
-            }
-        });
-    btn = apply_typed_styles(btn, style, program, false);
-    if let Some(cell) = hovered_cell {
-        btn = apply_item_hover(btn, instance, ctx, cell);
-    }
-    // pointer-events:none on label so clicks pass through to the button div.
-    // Without this, dominator's event handler doesn't fire for clicks that
-    // land on label children (same issue as checkbox icons).
-    let label = match zoon::Text::new(label_text).unify() {
-        RawElOrText::RawHtmlEl(el) => RawElOrText::RawHtmlEl(el.style("pointer-events", "none")),
-        other => other,
-    };
-    btn
-        .label(label)
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), false))
-        .into_raw_unchecked()
-}
-
-/// Build a per-item Stripe element.
-fn build_item_stripe(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    ctx: &ItemContext,
-    direction: &IrExpr,
-    items_cell: CellId,
-    gap: &IrExpr,
-    style: &IrExpr,
-    hovered_cell: Option<CellId>,
-) -> RawElOrText {
-    let children = collect_item_stripe_children(program, instance, ctx, items_cell);
-
-    let is_column = match direction {
-        IrExpr::Constant(IrValue::Tag(t)) => t == "Column",
-        _ => true,
-    };
-
-    let is_row = !is_column;
-    let mut stripe = if is_column {
-        Stripe::new()
-    } else {
-        Stripe::new().direction(Direction::Row)
-    };
-    stripe = apply_typed_styles(stripe, style, program, is_row);
-    if let IrExpr::Constant(IrValue::Number(n)) = gap {
-        if *n > 0.0 {
-            stripe = stripe.s(Gap::both(*n as u32));
+            })
+        }
+        _ => {
+            let inst = instance.clone();
+            el.on_hovered_change(move |hovered| {
+                inst.set_cell_value(cell.0, if hovered { 1.0 } else { 0.0 });
+            })
         }
     }
-    if let Some(cell) = hovered_cell {
-        stripe = apply_item_hover(stripe, instance, ctx, cell);
-    }
-    stripe
-        .items(children)
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), is_row))
-        .into_raw_unchecked()
 }
 
-/// Collect children for a per-item stripe element.
-fn collect_item_stripe_children(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    ctx: &ItemContext,
-    items_cell: CellId,
-) -> Vec<RawElOrText> {
-    match find_node_for_cell(program, items_cell) {
-        Some(IrNode::Derived { expr, .. }) => {
-            match expr {
-                IrExpr::ListConstruct(items) => {
-                    items.iter().filter_map(|item| {
-                        match item {
-                            IrExpr::CellRead(child_cell) => {
-                                Some(build_item_element(program, instance, ctx, *child_cell))
-                            }
-                            IrExpr::Constant(IrValue::Text(t)) => {
-                                Some(zoon::Text::new(t.clone()).unify())
-                            }
-                            IrExpr::Constant(IrValue::Tag(t)) => {
-                                if t == "NoElement" { None }
-                                else { Some(zoon::Text::new(t.clone()).unify()) }
-                            }
-                            IrExpr::TextConcat(segments) => {
-                                Some(build_item_text_from_segments(instance, ctx, segments))
-                            }
-                            _ => None,
-                        }
-                    }).collect()
-                }
-                IrExpr::CellRead(source) => {
-                    collect_item_stripe_children(program, instance, ctx, *source)
-                }
-                _ => Vec::new(),
-            }
-        }
-        Some(_) => {
-            vec![build_item_element(program, instance, ctx, items_cell)]
-        }
-        None => Vec::new(),
-    }
-}
+
 
 /// Build a per-item TextInput element.
 fn build_item_text_input(
@@ -2278,9 +2068,11 @@ fn build_item_text_input(
     let mut ti = TextInput::new();
     ti = apply_typed_styles(ti, style, program, false);
     if let Some(cell) = hovered_cell {
-        ti = apply_item_hover(ti, instance, ctx, cell);
+        ti = apply_hover(ti, instance, Some(ctx), cell);
     }
-    ti
+    // Apply placeholder via Zoon's typed Placeholder API.
+    let ph_el = build_placeholder(placeholder, program);
+    ti.placeholder(ph_el)
         .update_raw_el(|raw_el| {
             let mut raw_el = raw_el
                 .style("box-sizing", "border-box")
@@ -2290,27 +2082,6 @@ fn build_item_text_input(
                 .style("background", "transparent");
 
             raw_el = apply_raw_css(raw_el, style, program, instance, Some(ctx), false);
-
-            // Apply placeholder text and styles via Zoon's style_group
-            // (replaces the old <style> injection hack).
-            if let Some(ph) = placeholder {
-                let text = extract_placeholder_text(ph, program);
-                if !text.is_empty() {
-                    raw_el = raw_el.attr("placeholder", &text);
-                }
-                let ph_styles = extract_placeholder_styles(ph, program);
-                if !ph_styles.is_empty() {
-                    let mut group = StyleGroup::new("::placeholder");
-                    for (prop, val) in &ph_styles {
-                        match prop.as_str() {
-                            "font-style" => { group = group.style("font-style", val.clone()); }
-                            "color" => { group = group.style("color", val.clone()); }
-                            _ => {}
-                        }
-                    }
-                    raw_el = raw_el.style_group(group);
-                }
-            }
 
             // Set initial value and/or focus via after_insert.
             if focus || initial_text_for_insert.is_some() {
@@ -2421,7 +2192,7 @@ fn build_item_checkbox(
 
     // Build icon element upfront so we don't need to capture &IrProgram in the closure.
     let icon_el: RawElOrText = if let Some(&icon_cell) = icon {
-        let el = build_item_element(program, instance, ctx, icon_cell);
+        let el = build_element(program, instance, &BuildContext::Item(ctx), icon_cell);
         match el {
             RawElOrText::RawHtmlEl(el) => {
                 RawElOrText::RawHtmlEl(el.style("pointer-events", "none"))
@@ -2459,7 +2230,7 @@ fn build_item_checkbox(
 
     cb = apply_typed_styles(cb, style, program, false);
     if let Some(cell) = hovered_cell {
-        cb = apply_item_hover(cb, instance, ctx, cell);
+        cb = apply_hover(cb, instance, Some(ctx), cell);
     }
     cb
         .update_raw_el(|raw_el| {
@@ -2477,245 +2248,8 @@ fn build_item_checkbox(
         .into_raw_unchecked()
 }
 
-/// Build a per-item Container element.
-fn build_item_container(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    ctx: &ItemContext,
-    child: CellId,
-    style: &IrExpr,
-    hovered_cell: Option<CellId>,
-) -> RawElOrText {
-    let child_el = build_item_element(program, instance, ctx, child);
-    let mut el = El::new();
-    el = apply_typed_styles(el, style, program, false);
-    if let Some(cell) = hovered_cell {
-        el = apply_item_hover(el, instance, ctx, cell);
-    }
-    el
-        .child(child_el)
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), false))
-        .into_raw_unchecked()
-}
-
-/// Build a per-item Label element.
-fn build_item_label(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    ctx: &ItemContext,
-    label: &IrExpr,
-    style: &IrExpr,
-    _links: &[(String, EventId)],
-    hovered_cell: Option<CellId>,
-) -> RawElOrText {
-    let content: RawElOrText = match label {
-        IrExpr::TextConcat(segments) => {
-            build_item_text_from_segments(instance, ctx, segments)
-        }
-        IrExpr::Constant(IrValue::Text(t)) => {
-            zoon::Text::new(t.clone()).unify()
-        }
-        IrExpr::CellRead(cell) => {
-            build_item_element(program, instance, ctx, *cell)
-        }
-        _ => {
-            let text = eval_static_text(label);
-            zoon::Text::new(text).unify()
-        }
-    };
-    let mut lbl = Label::new();
-    lbl = apply_typed_styles(lbl, style, program, false);
-    if let Some(cell) = hovered_cell {
-        lbl = apply_item_hover(lbl, instance, ctx, cell);
-    }
-    lbl
-        .label(content)
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), false))
-        .into_raw_unchecked()
-}
-
-/// Build a per-item Stack element.
-fn build_item_stack(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    ctx: &ItemContext,
-    layers_cell: CellId,
-    style: &IrExpr,
-    hovered_cell: Option<CellId>,
-) -> RawElOrText {
-    let children = collect_item_stripe_children(program, instance, ctx, layers_cell);
-    let mut stk = Stack::new();
-    stk = apply_typed_styles(stk, style, program, false);
-    if let Some(cell) = hovered_cell {
-        stk = apply_item_hover(stk, instance, ctx, cell);
-    }
-    stk
-        .layers(children)
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, Some(ctx), false))
-        .into_raw_unchecked()
-}
-
-/// Build a per-item conditional element (WHEN/WHILE) with per-item signal routing.
-fn build_item_conditional_element(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    ctx: &ItemContext,
-    source: CellId,
-    arms: &[(IrPattern, IrExpr)],
-) -> RawElOrText {
-    let tag_table = &program.tag_table;
-    // Build arm elements, marking NoElement arms as None.
-    // NoElement arms produce always-hidden spans that are redundant when other arms
-    // handle their own display toggling via apply_conditional_display_toggle.
-    // Skipping them avoids creating a `display: contents` wrapper div, which breaks
-    // CDP's Input.dispatchMouseEvent — dominator event handlers on elements inside
-    // `display: contents` wrappers don't fire for real CDP clicks.
-    let arm_elements: Vec<(ArmMatcher, Option<RawElOrText>)> = arms.iter().map(|(pattern, body)| {
-        let matcher = pattern_to_matcher(pattern, tag_table);
-        let element = match body {
-            IrExpr::CellRead(cell) => {
-                if is_no_element(program, *cell) {
-                    None
-                } else {
-                    Some(build_item_element(program, instance, ctx, *cell))
-                }
-            }
-            IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => {
-                None
-            }
-            IrExpr::TextConcat(segments) => {
-                Some(build_item_text_from_segments(instance, ctx, segments))
-            }
-            _ => {
-                let text = eval_static_text(body);
-                if text.is_empty() {
-                    if ctx.is_template_cell(source) {
-                        Some(build_item_reactive_text(instance, ctx, source))
-                    } else {
-                        Some(build_reactive_text(instance, source))
-                    }
-                } else {
-                    Some(zoon::Text::new(text).unify())
-                }
-            }
-        };
-        (matcher, element)
-    }).collect();
-
-    // Single arm with element — return directly, no switching needed.
-    if arm_elements.len() == 1 {
-        if let Some(el) = arm_elements.into_iter().next().unwrap().1 {
-            return el;
-        } else {
-            return RawHtmlEl::new("span").style("display", "none").into_raw_unchecked();
-        }
-    }
-
-    let matchers: Vec<ArmMatcher> = arm_elements.iter().map(|(m, _)| m.clone()).collect();
-    let elements: Vec<Option<RawElOrText>> = arm_elements.into_iter().map(|(_, e)| e).collect();
-
-    // Use per-item signal if source is template-scoped, otherwise global.
-    let is_item_source = ctx.is_template_cell(source);
-    let source_id = source.0;
-
-    let mut result_children: Vec<RawElOrText> = Vec::new();
-    for (i, element) in elements.into_iter().enumerate() {
-        // Skip NoElement arms — they're always hidden and redundant.
-        let element = match element {
-            Some(el) => el,
-            None => continue,
-        };
-        let matchers_clone = matchers.clone();
-
-        // Determine initial visibility.
-        let (initial_val, initial_text) = if is_item_source {
-            if let Some(ref ics) = instance.item_cell_store {
-                (ics.get_value(ctx.item_idx, source_id), ics.get_text(ctx.item_idx, source_id))
-            } else {
-                (instance.cell_store.get_cell_value(source_id), instance.cell_store.get_cell_text(source_id))
-            }
-        } else {
-            (instance.cell_store.get_cell_value(source_id), instance.cell_store.get_cell_text(source_id))
-        };
-        let initial_matched = find_matching_arm_idx(&matchers, initial_val, &initial_text);
-        let initially_visible = initial_matched == Some(i);
-
-        if is_item_source {
-            let ics = instance.item_cell_store.clone().unwrap();
-            let item_idx = ctx.item_idx;
-            let matchers_inner = matchers_clone.clone();
-            let toggled = apply_conditional_display_toggle(
-                element, initially_visible,
-                move |el: &web_sys::HtmlElement, set_vis: &dyn Fn(&web_sys::HtmlElement, bool)| {
-                    let val = ics.get_value(item_idx, source_id);
-                    let cell_text = ics.get_text(item_idx, source_id);
-                    let matched = find_matching_arm_idx(&matchers_inner, val, &cell_text);
-                    set_vis(el, matched == Some(i));
-
-                    let ics_inner = ics.clone();
-                    let matchers_watch = matchers_inner.clone();
-                    let el_clone = el.clone();
-                    let handle = Task::start_droppable(
-                        ics.get_signal(item_idx, source_id)
-                            .for_each_sync(move |_val| {
-                                let cell_text = ics_inner.get_text(item_idx, source_id);
-                                let val = ics_inner.get_value(item_idx, source_id);
-                                let matched = find_matching_arm_idx(&matchers_watch, val, &cell_text);
-                                let visible = matched == Some(i);
-                                set_conditional_visibility(&el_clone, visible);
-                                if visible {
-                                    focus_autofocus_child(&el_clone);
-                                }
-                            })
-                    );
-                    std::mem::forget(handle);
-                },
-            );
-            result_children.push(toggled);
-        } else {
-            // Global source — same as build_conditional_element.
-            let store = instance.cell_store.clone();
-            let matchers_inner = matchers_clone;
-            let toggled = apply_conditional_display_toggle(
-                element, initially_visible,
-                move |el: &web_sys::HtmlElement, set_vis: &dyn Fn(&web_sys::HtmlElement, bool)| {
-                    let val = store.get_cell_value(source_id);
-                    let cell_text = store.get_cell_text(source_id);
-                    let matched = find_matching_arm_idx(&matchers_inner, val, &cell_text);
-                    set_vis(el, matched == Some(i));
-
-                    let store_inner = store.clone();
-                    let matchers_watch = matchers_inner.clone();
-                    let el_clone = el.clone();
-                    let handle = Task::start_droppable(
-                        store.get_cell_signal(source_id)
-                            .for_each_sync(move |val| {
-                                let cell_text = store_inner.get_cell_text(source_id);
-                                let matched = find_matching_arm_idx(&matchers_watch, val, &cell_text);
-                                let visible = matched == Some(i);
-                                set_conditional_visibility(&el_clone, visible);
-                                if visible {
-                                    focus_autofocus_child(&el_clone);
-                                }
-                            })
-                    );
-                    std::mem::forget(handle);
-                },
-            );
-            result_children.push(toggled);
-        }
-    }
-
-    if result_children.len() == 1 {
-        result_children.into_iter().next().unwrap()
-    } else {
-        RawHtmlEl::new("div")
-            .style("display", "contents")
-            .children(result_children)
-            .into_raw_unchecked()
-    }
-}
-
+/// Build a per-item conditional element (WHEN/WHILE) using `child_signal`.
+/// Elements are reactively inserted/removed from the DOM based on the source cell value.
 /// Resolve a color expression to a CSS color string.
 fn resolve_color(expr: &IrExpr) -> Option<String> {
     resolve_color_full(expr)
@@ -2810,88 +2344,67 @@ fn extract_placeholder_text(expr: &IrExpr, program: &IrProgram) -> String {
     }
 }
 
-/// Extract placeholder styling (font-style, color) as CSS property pairs.
-fn extract_placeholder_styles(expr: &IrExpr, program: &IrProgram) -> Vec<(String, String)> {
-    let fields = match expr {
-        IrExpr::ObjectConstruct(fields) => fields.as_slice(),
-        IrExpr::CellRead(cell) => {
-            let fields = reconstruct_object_fields(program, *cell);
-            return extract_placeholder_styles_from_fields(&fields, program);
-        }
-        _ => return Vec::new(),
+/// Build a Placeholder for a TextInput. Always returns a Placeholder (empty if no text).
+fn build_placeholder<'a>(placeholder: Option<&IrExpr>, program: &IrProgram) -> Placeholder<'a> {
+    let Some(ph) = placeholder else {
+        return Placeholder::new("");
     };
-    extract_placeholder_styles_from_fields(
-        &fields.iter().map(|(n, v)| (n.clone(), v.clone())).collect::<Vec<_>>(),
-        program,
-    )
+    let text = extract_placeholder_text(ph, program);
+    let mut ph_el = Placeholder::new(text);
+    if let Some((is_italic, color_css)) = extract_placeholder_font(ph, program) {
+        let mut font = Font::new();
+        if is_italic { font = font.italic(); }
+        if let Some(css) = color_css { font = font.color(css); }
+        ph_el = ph_el.s(font);
+    }
+    ph_el
 }
 
-fn extract_placeholder_styles_from_fields(fields: &[(String, IrExpr)], program: &IrProgram) -> Vec<(String, String)> {
-    let mut styles = Vec::new();
+/// Extract placeholder font properties: (is_italic, optional_color_css).
+/// Navigates through the placeholder object (possibly nested under "style")
+/// to find font style and color.
+fn extract_placeholder_font(expr: &IrExpr, program: &IrProgram) -> Option<(bool, Option<String>)> {
+    let fields: Vec<(String, IrExpr)> = match expr {
+        IrExpr::ObjectConstruct(fields) => fields.iter().map(|(n, v)| (n.clone(), v.clone())).collect(),
+        IrExpr::CellRead(cell) => reconstruct_object_fields(program, *cell),
+        _ => return None,
+    };
+    extract_font_from_fields(&fields, program)
+}
+
+fn extract_font_from_fields(fields: &[(String, IrExpr)], program: &IrProgram) -> Option<(bool, Option<String>)> {
     for (name, val) in fields {
         if name == "style" {
-            // Placeholder structure: [style: [font: [...]], text: ...].
-            // Unwrap the "style" wrapper and recurse to find "font".
-            match val {
-                IrExpr::ObjectConstruct(f) => {
-                    styles.extend(extract_placeholder_styles_from_fields(
-                        &f.iter().map(|(n, v)| (n.clone(), v.clone())).collect::<Vec<_>>(),
-                        program,
-                    ));
-                }
-                IrExpr::CellRead(cell) => {
-                    let f = reconstruct_object_fields(program, *cell);
-                    styles.extend(extract_placeholder_styles_from_fields(&f, program));
-                }
-                _ => {}
-            }
-        } else if name == "font" {
-            // Font object: [style: Italic, color: Oklch[...]]
-            let font_fields = match val {
-                IrExpr::ObjectConstruct(f) => f.as_slice(),
-                IrExpr::CellRead(cell) => {
-                    let f = reconstruct_object_fields(program, *cell);
-                    for (fname, fval) in &f {
-                        match fname.as_str() {
-                            "style" => {
-                                if let IrExpr::Constant(IrValue::Tag(t)) = fval {
-                                    if t == "Italic" {
-                                        styles.push(("font-style".into(), "italic".into()));
-                                    }
-                                }
-                            }
-                            "color" => {
-                                if let Some(css) = resolve_color(fval) {
-                                    styles.push(("color".into(), css));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    continue;
-                }
+            // Unwrap "style" wrapper and recurse.
+            let inner = match val {
+                IrExpr::ObjectConstruct(f) => f.iter().map(|(n, v)| (n.clone(), v.clone())).collect(),
+                IrExpr::CellRead(cell) => reconstruct_object_fields(program, *cell),
                 _ => continue,
             };
-            for (fname, fval) in font_fields {
+            return extract_font_from_fields(&inner, program);
+        } else if name == "font" {
+            let font_fields: Vec<(String, IrExpr)> = match val {
+                IrExpr::ObjectConstruct(f) => f.iter().map(|(n, v)| (n.clone(), v.clone())).collect(),
+                IrExpr::CellRead(cell) => reconstruct_object_fields(program, *cell),
+                _ => continue,
+            };
+            let mut is_italic = false;
+            let mut color_css = None;
+            for (fname, fval) in &font_fields {
                 match fname.as_str() {
                     "style" => {
                         if let IrExpr::Constant(IrValue::Tag(t)) = fval {
-                            if t == "Italic" {
-                                styles.push(("font-style".into(), "italic".into()));
-                            }
+                            if t == "Italic" { is_italic = true; }
                         }
                     }
-                    "color" => {
-                        if let Some(css) = resolve_color(fval) {
-                            styles.push(("color".into(), css));
-                        }
-                    }
+                    "color" => { color_css = resolve_color(fval); }
                     _ => {}
                 }
             }
+            return Some((is_italic, color_css));
         }
     }
-    styles
+    None
 }
 
 

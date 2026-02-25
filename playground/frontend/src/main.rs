@@ -1142,76 +1142,63 @@ impl Playground {
                     .s(Font::new().size(12).color(color!("rgba(255, 255, 255, 0.5)")))
                     .child("F12 → dev tools for logs & errors")
             )
-            .item(self.engine_indicator())
+            .item(self.engine_button_group())
             .item(El::new().s(Align::new().center_x()).child(self.run_button()))
             .item(self.force_size_controls())
             .item(El::new().s(Align::new().right()).child(self.clear_saved_states_button()))
     }
 
-    /// Display the current engine type with tooltip.
-    /// When engine-both feature is enabled, this becomes a clickable toggle.
-    fn engine_indicator(&self) -> impl Element + use<> {
-        let engine_type = self.engine_type.clone();
-        let run_command = self.run_command.clone();
+    /// Engine selector button group — one button per available engine.
+    fn engine_button_group(&self) -> impl Element + use<> {
+        let engines = available_engines();
+        Row::new()
+            .s(RoundedCorners::all(22))
+            .s(Background::new().color(color!("rgba(26, 36, 58, 0.32)")))
+            .s(Shadows::new([
+                Shadow::new()
+                    .color(color!("rgba(8, 13, 28, 0.26)"))
+                    .y(12)
+                    .blur(22)
+                    .spread(-8),
+            ]))
+            .s(Padding::all(3))
+            .items(engines.into_iter().map(|engine| self.engine_segment(engine)))
+    }
+
+    fn engine_segment(&self, engine: EngineType) -> impl Element + use<> {
         let hovered = Mutable::new(false);
-
-        // Check if engine switching is available (engine-both feature)
-        let is_switchable = boon::platform::browser::common::is_engine_switchable();
-
-        El::new()
-            .s(Font::new().size(12).color_signal(
-                hovered.signal().map(move |h| {
-                    if h && is_switchable {
-                        color!("rgba(100, 200, 255, 1.0)")
-                    } else {
-                        color!("rgba(100, 200, 255, 0.8)")
-                    }
-                })
-            ))
-            .s(Padding::new().x(8).y(4))
-            .s(Background::new().color_signal(
-                hovered.signal().map(move |h| {
-                    if h && is_switchable {
-                        color!("rgba(100, 200, 255, 0.2)")
-                    } else {
-                        color!("rgba(100, 200, 255, 0.1)")
-                    }
-                })
-            ))
-            .s(RoundedCorners::all(4))
-            .s(Cursor::new(if is_switchable { CursorIcon::Pointer } else { CursorIcon::Default }))
-            .update_raw_el({
-                let engine_type = engine_type.clone();
-                move |raw_el| {
-                    raw_el.attr_signal("title", engine_type.signal().map(move |engine| {
-                        if is_switchable {
-                            format!("{} (click to switch)", engine.full_name())
-                        } else {
-                            engine.full_name().to_string()
-                        }
-                    }))
-                }
-            })
-            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
-            .on_click_event({
-                let engine_type = engine_type.clone();
-                let run_command = run_command.clone();
-                move |_| {
-                    if is_switchable {
-                        // Cycle to next available engine
-                        let engines = available_engines();
-                        let current = engine_type.get();
-                        let current_idx = engines.iter().position(|e| *e == current).unwrap_or(0);
-                        let next_idx = (current_idx + 1) % engines.len();
-                        engine_type.set(engines[next_idx]);
-                        // Trigger re-run with new engine
-                        run_command.set(Some(RunCommand { filename: None }));
+        let hovered_for_signal = hovered.clone();
+        Button::new()
+            .s(Padding::new().x(10).y(5))
+            .s(RoundedCorners::all(18))
+            .s(Font::new().size(13).color(primary_text_color()))
+            .s(Background::new().color_signal(map_ref! {
+                let current = self.engine_type.signal(),
+                let hovered = hovered_for_signal.signal() =>
+                {
+                    let is_active = *current == engine;
+                    match (is_active, *hovered) {
+                        (true, true) => color!("rgba(70, 104, 178, 0.7)"),
+                        (true, false) => color!("rgba(60, 94, 168, 0.6)"),
+                        (false, true) => color!("rgba(50, 68, 108, 0.5)"),
+                        (false, false) => color!("transparent"),
                     }
                 }
-            })
-            .child_signal(engine_type.signal().map(|engine| {
-                format!("Engine: {}", engine.short_name())
             }))
+            .label(
+                El::new()
+                    .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
+                    .child(engine.short_name()),
+            )
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+            .on_press({
+                let engine_type = self.engine_type.clone();
+                let run_command = self.run_command.clone();
+                move || {
+                    engine_type.set(engine);
+                    run_command.set(Some(RunCommand { filename: None }));
+                }
+            })
     }
 
     fn primary_panel<T: Element>(&self, content: T) -> impl Element + use<T> {

@@ -407,13 +407,15 @@ check_not_visible "Buy groceries" "Cleared item 'Buy groceries' not visible" "M9
 
 echo ""
 echo "[5.3] Toggle all + clear → empty list"
-rerun
+reset_state
 bt click-checkbox 0 >/dev/null 2>&1 || true
 sleep 1
 bt click-text "Clear completed" >/dev/null 2>&1 || true
 sleep 1
 PREVIEW=$(bt preview)
-check_contains "$PREVIEW" "0 items left" "Counter '0 items left' after clearing all"
+# After clearing all items, the footer (counter/filters) disappears — items_left not in DOM.
+check_not_contains "$PREVIEW" "Buy groceries" "No items remain after clearing all"
+check_not_contains "$PREVIEW" "Clean room" "Second item also cleared"
 
 # ══════════════════════════════════════════════
 # SECTION 6: ADD NEW ITEMS
@@ -421,7 +423,7 @@ check_contains "$PREVIEW" "0 items left" "Counter '0 items left' after clearing 
 echo ""
 echo "━━━ Section 6: Add New Items ━━━"
 
-rerun
+reset_state
 
 echo ""
 echo "[6.1] Add 'Learn Boon'"
@@ -498,7 +500,7 @@ check_not_visible "Buy groceries" "'Buy groceries' removed by clear" "M9"
 echo ""
 echo "━━━ Section 8: Per-Item Remove Button ━━━"
 
-rerun
+reset_state
 
 echo ""
 echo "[8.1] Hover item reveals × button"
@@ -528,7 +530,7 @@ fi
 echo ""
 echo "━━━ Section 9: Per-Item Double-Click Edit ━━━"
 
-rerun
+reset_state
 
 echo ""
 echo "[9.1] Double-click item enters edit mode"
@@ -594,7 +596,7 @@ fi
 echo ""
 echo "━━━ Section 11: Singular/Plural Counter ━━━"
 
-rerun
+reset_state
 
 echo ""
 echo "[11.1] Singular: '1 item left'"
@@ -632,7 +634,7 @@ sleep 0.5
 echo ""
 echo "━━━ Section 12: Dynamic Todo Checkbox Isolation ━━━"
 
-rerun
+reset_state
 
 echo ""
 echo "[12.1] Add 'Test todo'"
@@ -666,7 +668,7 @@ check_checkbox_unchecked 3 "Dynamic item checkbox is unchecked"
 echo ""
 echo "━━━ Section 13: Clear Completed + Re-Add + Re-Check ━━━"
 
-rerun
+reset_state
 
 echo ""
 echo "[13.1] Toggle all → 0 items left"
@@ -738,7 +740,7 @@ fi
 echo ""
 echo "━━━ Section 15: Complex Clear Completed ━━━"
 
-rerun
+reset_state
 
 echo ""
 echo "[15.1] Add 'Todo to complete' and 'Todo to keep'"
@@ -813,7 +815,7 @@ fi
 echo ""
 echo "━━━ Section 17: Route Navigation ━━━"
 
-rerun
+reset_state
 
 echo ""
 echo "[17.1] Navigate to /"
@@ -845,7 +847,7 @@ check_button_outline "All" "Route / back to 'All' filter" "M11"
 echo ""
 echo "━━━ Section 18: Toggle All Semantics ━━━"
 
-rerun
+reset_state
 
 echo ""
 echo "[18.1] Partial check + toggle all → all completed"
@@ -869,7 +871,7 @@ check_contains "$PREVIEW" "2 items left" "Toggle-all again: all active"
 echo ""
 echo "━━━ Section 19: Clear Completed Button Visibility ━━━"
 
-rerun
+reset_state
 
 echo ""
 echo "[19.1] No completed items → 'Clear completed' not visible"
@@ -925,7 +927,7 @@ check_contains "$PREVIEW" "Part of TodoMVC" "Footer: 'Part of TodoMVC' present"
 echo ""
 echo "━━━ Section 21: Empty List State ━━━"
 
-rerun
+reset_state
 
 echo ""
 echo "[21.1] Clear all items"

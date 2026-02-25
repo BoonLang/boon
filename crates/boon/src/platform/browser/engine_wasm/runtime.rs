@@ -857,6 +857,17 @@ impl WasmInstance {
             };
             if let (Some(item_idx), Some(ics)) = (item_ctx, &ics_clone) {
                 if ics.is_template_cell(dest_cell as u32) {
+                    // Don't overwrite non-empty text with empty during per-item
+                    // re-evaluations. HOLD body re-evaluations copy text through
+                    // intermediate cells that may not have text set. The bridge
+                    // sets per-item text before init_item, and re-evaluations
+                    // should preserve it unless the source has actual text.
+                    if src_text.is_empty() {
+                        let existing = ics.get_text(item_idx, dest_cell as u32);
+                        if !existing.is_empty() {
+                            return;
+                        }
+                    }
                     ics.set_text(item_idx, dest_cell as u32, src_text);
                     return;
                 }

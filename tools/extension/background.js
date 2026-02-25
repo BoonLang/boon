@@ -184,7 +184,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 async function cdpClickAtViewport(tabId, viewportX, viewportY) {
   await attachDebugger(tabId);
 
-  // Move mouse to position first (generates mouseover/mouseenter)
+  // Move mouse to position first (compositor-level only — does NOT generate JS mouseenter/mouseleave)
   await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
     type: 'mouseMoved', x: viewportX, y: viewportY, button: 'none'
   });
