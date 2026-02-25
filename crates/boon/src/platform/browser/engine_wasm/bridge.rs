@@ -1220,52 +1220,65 @@ fn build_conditional_signal(
     source: CellId,
     arms: &[(IrPattern, IrExpr)],
 ) -> Box<dyn Signal<Item = Option<RawElOrText>> + Unpin> {
+    // Extract item context as owned data, then delegate to the inner function
+    // which has no BuildContext<'a> parameter. This prevents the compiler from
+    // thinking the returned Box<dyn Signal> captures BuildContext's lifetime.
+    let item_ctx: Option<ItemContext> = match *ctx {
+        BuildContext::Global => None,
+        BuildContext::Item(ic) => Some(ic.clone()),
+    };
+    build_conditional_signal_impl(program, instance, item_ctx, source, arms)
+}
+
+fn build_conditional_signal_impl(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    item_ctx: Option<ItemContext>,
+    source: CellId,
+    arms: &[(IrPattern, IrExpr)],
+) -> Box<dyn Signal<Item = Option<RawElOrText>> + Unpin> {
     let tag_table = &program.tag_table;
     let matchers: Vec<ArmMatcher> = arms.iter().map(|(p, _)| pattern_to_matcher(p, tag_table)).collect();
     let arm_bodies: Vec<IrExpr> = arms.iter().map(|(_, body)| body.clone()).collect();
     let inst = instance.clone();
     let source_id = source.0;
 
-    match ctx {
-        BuildContext::Global => {
-            let store = instance.cell_store.clone();
-            Box::new(store.get_cell_signal(source_id).map(move |_val| {
-                let val = store.get_cell_value(source_id);
-                let text = store.get_cell_text(source_id);
-                find_matching_arm_idx(&matchers, val, &text).and_then(|idx| {
-                    build_arm_body_element(&inst.program, &inst, &BuildContext::Global, &arm_bodies[idx], CellId(source_id))
-                })
-            }))
-        }
-        BuildContext::Item(item_ctx) => {
-            let ctx_owned = item_ctx.clone();
-            let is_item_source = item_ctx.is_template_cell(source);
-            let store = instance.cell_store.clone();
-            let item_cell_store = instance.item_cell_store.clone();
+    if let Some(item_ctx) = item_ctx {
+        let is_item_source = item_ctx.is_template_cell(source);
+        let store = instance.cell_store.clone();
+        let item_cell_store = instance.item_cell_store.clone();
 
-            let signal: Box<dyn Signal<Item = f64> + Unpin> = if is_item_source {
-                let ics = instance.item_cell_store.clone().unwrap();
-                Box::new(ics.get_signal(item_ctx.item_idx, source_id))
-            } else {
-                Box::new(instance.cell_store.get_cell_signal(source_id))
-            };
+        let signal: Box<dyn Signal<Item = f64> + Unpin> = if is_item_source {
+            let ics = instance.item_cell_store.clone().unwrap();
+            Box::new(ics.get_signal(item_ctx.item_idx, source_id))
+        } else {
+            Box::new(instance.cell_store.get_cell_signal(source_id))
+        };
 
-            Box::new(signal.map(move |_val| {
-                let (val, text) = if is_item_source {
-                    if let Some(ref ics) = item_cell_store {
-                        (ics.get_value(ctx_owned.item_idx, source_id), ics.get_text(ctx_owned.item_idx, source_id))
-                    } else {
-                        (store.get_cell_value(source_id), store.get_cell_text(source_id))
-                    }
+        Box::new(signal.map(move |_val| {
+            let (val, text) = if is_item_source {
+                if let Some(ref ics) = item_cell_store {
+                    (ics.get_value(item_ctx.item_idx, source_id), ics.get_text(item_ctx.item_idx, source_id))
                 } else {
                     (store.get_cell_value(source_id), store.get_cell_text(source_id))
-                };
-                find_matching_arm_idx(&matchers, val, &text).and_then(|idx| {
-                    let build_ctx = BuildContext::Item(&ctx_owned);
-                    build_arm_body_element(&inst.program, &inst, &build_ctx, &arm_bodies[idx], CellId(source_id))
-                })
-            }))
-        }
+                }
+            } else {
+                (store.get_cell_value(source_id), store.get_cell_text(source_id))
+            };
+            find_matching_arm_idx(&matchers, val, &text).and_then(|idx| {
+                let build_ctx = BuildContext::Item(&item_ctx);
+                build_arm_body_element(&inst.program, &inst, &build_ctx, &arm_bodies[idx], CellId(source_id))
+            })
+        }))
+    } else {
+        let store = instance.cell_store.clone();
+        Box::new(store.get_cell_signal(source_id).map(move |_val| {
+            let val = store.get_cell_value(source_id);
+            let text = store.get_cell_text(source_id);
+            find_matching_arm_idx(&matchers, val, &text).and_then(|idx| {
+                build_arm_body_element(&inst.program, &inst, &BuildContext::Global, &arm_bodies[idx], CellId(source_id))
+            })
+        }))
     }
 }
 
