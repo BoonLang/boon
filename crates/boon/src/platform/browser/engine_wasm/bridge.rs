@@ -62,8 +62,13 @@ pub fn setup_router(program: &IrProgram, instance: &Rc<WasmInstance>) {
     // This must happen BEFORE call_init() so WHEN/WHILE arms see the correct route.
     // Set f64 to 0.0 so subsequent bumps produce real numbers (not NaN + 1 = NaN).
     let window = web_sys::window().unwrap();
-    let path = window.location().pathname().unwrap_or_else(|_| "/".to_string());
-    instance.cell_store.set_cell_text(route_cell.0, path.clone());
+    let path = window
+        .location()
+        .pathname()
+        .unwrap_or_else(|_| "/".to_string());
+    instance
+        .cell_store
+        .set_cell_text(route_cell.0, path.clone());
     instance.cell_store.set_cell_f64(route_cell.0, 0.0);
 
     // Find all RouterGoTo nodes and set up watchers on their source cells.
@@ -74,9 +79,9 @@ pub fn setup_router(program: &IrProgram, instance: &Rc<WasmInstance>) {
             let rc = route_cell;
             let re = route_event;
             // Watch the goto source cell for changes → update route cell + push history.
-            let handle = Task::start_droppable(
-                inst.cell_store.get_cell_signal(source_id)
-                    .for_each_sync(move |_val| {
+            let handle =
+                Task::start_droppable(inst.cell_store.get_cell_signal(source_id).for_each_sync(
+                    move |_val| {
                         let new_path = inst.cell_store.get_cell_text(source_id);
                         if new_path.is_empty() {
                             return;
@@ -93,8 +98,8 @@ pub fn setup_router(program: &IrProgram, instance: &Rc<WasmInstance>) {
                         inst.cell_store.set_cell_text(rc.0, new_path);
                         inst.set_cell_value(rc.0, inst.cell_store.get_cell_value(rc.0) + 1.0);
                         let _ = inst.fire_event(re.0);
-                    })
-            );
+                    },
+                ));
             std::mem::forget(handle);
         }
     }
@@ -103,9 +108,15 @@ pub fn setup_router(program: &IrProgram, instance: &Rc<WasmInstance>) {
     let inst = instance.clone();
     let cb = wasm_bindgen::closure::Closure::wrap(Box::new(move |_event: web_sys::Event| {
         let window = web_sys::window().unwrap();
-        let path = window.location().pathname().unwrap_or_else(|_| "/".to_string());
+        let path = window
+            .location()
+            .pathname()
+            .unwrap_or_else(|_| "/".to_string());
         inst.cell_store.set_cell_text(route_cell.0, path);
-        inst.set_cell_value(route_cell.0, inst.cell_store.get_cell_value(route_cell.0) + 1.0);
+        inst.set_cell_value(
+            route_cell.0,
+            inst.cell_store.get_cell_value(route_cell.0) + 1.0,
+        );
         let _ = inst.fire_event(route_event.0);
     }) as Box<dyn FnMut(web_sys::Event)>);
     let window = web_sys::window().unwrap();
@@ -117,50 +128,56 @@ pub fn setup_router(program: &IrProgram, instance: &Rc<WasmInstance>) {
 // Element builders
 // ---------------------------------------------------------------------------
 
-fn build_cell_element(program: &IrProgram, instance: &Rc<WasmInstance>, cell: CellId) -> RawElOrText {
+fn build_cell_element(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    cell: CellId,
+) -> RawElOrText {
     build_element(program, instance, &BuildContext::Global, cell)
 }
 
-fn build_element(program: &IrProgram, instance: &Rc<WasmInstance>, ctx: &BuildContext, cell: CellId) -> RawElOrText {
+fn build_element(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
+    cell: CellId,
+) -> RawElOrText {
     if let Some(node) = find_node_for_cell(program, cell) {
         match node {
-            IrNode::Element { kind, links, hovered_cell, .. } => {
-                match ctx {
+            IrNode::Element {
+                kind,
+                links,
+                hovered_cell,
+                ..
+            } => match ctx {
+                BuildContext::Item(item_ctx) => {
+                    build_item_element_node(program, instance, item_ctx, kind, links, *hovered_cell)
+                }
+                BuildContext::Global => {
+                    build_element_node(program, instance, kind, links, *hovered_cell)
+                }
+            },
+            IrNode::Derived { expr, .. } => match expr {
+                IrExpr::CellRead(source) => build_element(program, instance, ctx, *source),
+                IrExpr::Constant(IrValue::Text(t)) => zoon::Text::new(t.clone()).unify(),
+                IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => El::new().unify(),
+                IrExpr::Constant(IrValue::Tag(t)) => zoon::Text::new(t.clone()).unify(),
+                IrExpr::Constant(IrValue::Number(n)) => zoon::Text::new(format_number(*n)).unify(),
+                IrExpr::TextConcat(segments) => match ctx {
                     BuildContext::Item(item_ctx) => {
-                        build_item_element_node(program, instance, item_ctx, kind, links, *hovered_cell)
+                        build_item_text_from_segments(instance, item_ctx, segments)
                     }
-                    BuildContext::Global => {
-                        build_element_node(program, instance, kind, links, *hovered_cell)
-                    }
+                    BuildContext::Global => build_text_from_segments(instance, segments),
+                },
+                _ => build_reactive_text_ctx(instance, ctx, cell),
+            },
+            IrNode::TextInterpolation { parts, .. } => match ctx {
+                BuildContext::Item(item_ctx) => {
+                    build_item_text_from_segments(instance, item_ctx, parts)
                 }
-            }
-            IrNode::Derived { expr, .. } => {
-                match expr {
-                    IrExpr::CellRead(source) => build_element(program, instance, ctx, *source),
-                    IrExpr::Constant(IrValue::Text(t)) => zoon::Text::new(t.clone()).unify(),
-                    IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => {
-                        El::new().unify()
-                    }
-                    IrExpr::Constant(IrValue::Tag(t)) => zoon::Text::new(t.clone()).unify(),
-                    IrExpr::Constant(IrValue::Number(n)) => zoon::Text::new(format_number(*n)).unify(),
-                    IrExpr::TextConcat(segments) => {
-                        match ctx {
-                            BuildContext::Item(item_ctx) => build_item_text_from_segments(instance, item_ctx, segments),
-                            BuildContext::Global => build_text_from_segments(instance, segments),
-                        }
-                    }
-                    _ => build_reactive_text_ctx(instance, ctx, cell),
-                }
-            }
-            IrNode::TextInterpolation { parts, .. } => {
-                match ctx {
-                    BuildContext::Item(item_ctx) => build_item_text_from_segments(instance, item_ctx, parts),
-                    BuildContext::Global => build_text_interpolation(instance, parts),
-                }
-            }
-            IrNode::PipeThrough { source, .. } => {
-                build_element(program, instance, ctx, *source)
-            }
+                BuildContext::Global => build_text_interpolation(instance, parts),
+            },
+            IrNode::PipeThrough { source, .. } => build_element(program, instance, ctx, *source),
             IrNode::While { source, arms, .. } => {
                 if has_element_arms(program, arms) {
                     build_conditional_element(program, instance, ctx, *source, arms)
@@ -183,22 +200,32 @@ fn build_element(program: &IrProgram, instance: &Rc<WasmInstance>, ctx: &BuildCo
             | IrNode::HoldLoop { .. }
             | IrNode::ListIsEmpty { .. }
             | IrNode::TextTrim { .. }
-            | IrNode::TextIsNotEmpty { .. } => {
-                build_reactive_text_ctx(instance, ctx, cell)
-            }
+            | IrNode::TextIsNotEmpty { .. } => build_reactive_text_ctx(instance, ctx, cell),
             IrNode::ListAppend { source, .. }
             | IrNode::ListClear { source, .. }
             | IrNode::ListRemove { source, .. }
             | IrNode::ListRetain { source, .. }
-            | IrNode::RouterGoTo { source, .. } => {
-                build_element(program, instance, ctx, *source)
-            }
-            IrNode::ListMap { source, item_name, item_cell, template, template_cell_range, template_event_range, .. } => {
-                build_list_map(program, instance, cell, *source, *item_cell, item_name, template, *template_cell_range, *template_event_range)
-            }
-            IrNode::Document { root } => {
-                build_element(program, instance, ctx, *root)
-            }
+            | IrNode::RouterGoTo { source, .. } => build_element(program, instance, ctx, *source),
+            IrNode::ListMap {
+                source,
+                item_name,
+                item_cell,
+                template,
+                template_cell_range,
+                template_event_range,
+                ..
+            } => build_list_map(
+                program,
+                instance,
+                cell,
+                *source,
+                *item_cell,
+                item_name,
+                template,
+                *template_cell_range,
+                *template_event_range,
+            ),
+            IrNode::Document { root } => build_element(program, instance, ctx, *root),
             IrNode::CustomCall { path, .. } => {
                 let path_str = path.join("/");
                 zoon::Text::new(format!("[{}]", path_str)).unify()
@@ -211,7 +238,11 @@ fn build_element(program: &IrProgram, instance: &Rc<WasmInstance>, ctx: &BuildCo
 }
 
 /// Build reactive text that routes to per-item or global cell store based on context.
-fn build_reactive_text_ctx(instance: &Rc<WasmInstance>, ctx: &BuildContext, cell: CellId) -> RawElOrText {
+fn build_reactive_text_ctx(
+    instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
+    cell: CellId,
+) -> RawElOrText {
     match ctx {
         BuildContext::Item(item_ctx) if item_ctx.is_template_cell(cell) => {
             build_item_reactive_text(instance, item_ctx, cell)
@@ -253,19 +284,15 @@ fn format_cell_value(store: &super::runtime::CellStore, cell_id: u32) -> String 
 }
 
 /// Build text from TextSegment list.
-fn build_text_interpolation(
-    instance: &Rc<WasmInstance>,
-    parts: &[TextSegment],
-) -> RawElOrText {
+fn build_text_interpolation(instance: &Rc<WasmInstance>, parts: &[TextSegment]) -> RawElOrText {
     build_text_from_segments(instance, parts)
 }
 
-fn build_text_from_segments(
-    instance: &Rc<WasmInstance>,
-    segments: &[TextSegment],
-) -> RawElOrText {
+fn build_text_from_segments(instance: &Rc<WasmInstance>, segments: &[TextSegment]) -> RawElOrText {
     // Check if any segments are reactive (CellRead).
-    let has_reactive = segments.iter().any(|seg| matches!(seg, TextSegment::Expr(IrExpr::CellRead(_))));
+    let has_reactive = segments
+        .iter()
+        .any(|seg| matches!(seg, TextSegment::Expr(IrExpr::CellRead(_))));
 
     if !has_reactive {
         // Pure static text.
@@ -311,22 +338,30 @@ fn build_text_from_segments(
         // Single reactive cell — use its signal directly.
         let signal = store.get_cell_signal(cell_ids[0]);
         zoon::Text::with_signal(signal.map(move |_| {
-            seg_desc.iter().map(|s| match s {
-                SegDesc::Lit(t) => t.clone(),
-                SegDesc::Cell(id) => format_cell_value(&store, *id),
-            }).collect::<String>()
-        })).unify()
+            seg_desc
+                .iter()
+                .map(|s| match s {
+                    SegDesc::Lit(t) => t.clone(),
+                    SegDesc::Cell(id) => format_cell_value(&store, *id),
+                })
+                .collect::<String>()
+        }))
+        .unify()
     } else {
         // Multiple reactive cells — combine signals.
         // Use first cell as primary trigger, poll others from store.
         // This is correct because all signals update atomically per event.
         let primary = store.get_cell_signal(cell_ids[0]);
         zoon::Text::with_signal(primary.map(move |_| {
-            seg_desc.iter().map(|s| match s {
-                SegDesc::Lit(t) => t.clone(),
-                SegDesc::Cell(id) => format_cell_value(&store, *id),
-            }).collect::<String>()
-        })).unify()
+            seg_desc
+                .iter()
+                .map(|s| match s {
+                    SegDesc::Lit(t) => t.clone(),
+                    SegDesc::Cell(id) => format_cell_value(&store, *id),
+                })
+                .collect::<String>()
+        }))
+        .unify()
     }
 }
 
@@ -351,32 +386,86 @@ fn build_element_node(
 
     // All typed element builders handle hover via .on_hovered_change() directly.
     let raw: RawElOrText = match kind {
-        ElementKind::Button { label, style } => {
-            build_button(program, instance, &BuildContext::Global, label, style, links, hovered_cell)
-        }
+        ElementKind::Button { label, style } => build_button(
+            program,
+            instance,
+            &BuildContext::Global,
+            label,
+            style,
+            links,
+            hovered_cell,
+        ),
         ElementKind::Stripe {
             direction,
             items,
             gap,
             style,
             ..
-        } => build_stripe(program, instance, &BuildContext::Global, direction, *items, gap, style, hovered_cell),
-        ElementKind::TextInput { placeholder, style, focus, .. } => {
-            build_text_input(program, instance, placeholder.as_ref(), style, links, *focus, hovered_cell)
-        }
-        ElementKind::Checkbox { checked, style, icon } => {
+        } => build_stripe(
+            program,
+            instance,
+            &BuildContext::Global,
+            direction,
+            *items,
+            gap,
+            style,
+            hovered_cell,
+        ),
+        ElementKind::TextInput {
+            placeholder,
+            style,
+            focus,
+            ..
+        } => build_text_input(
+            program,
+            instance,
+            placeholder.as_ref(),
+            style,
+            links,
+            *focus,
+            hovered_cell,
+        ),
+        ElementKind::Checkbox {
+            checked,
+            style,
+            icon,
+        } => {
             handled_events = &["click"];
-            build_checkbox(program, instance, checked.as_ref(), style, links, icon.as_ref(), hovered_cell)
+            build_checkbox(
+                program,
+                instance,
+                checked.as_ref(),
+                style,
+                links,
+                icon.as_ref(),
+                hovered_cell,
+            )
         }
-        ElementKind::Container { child, style } => {
-            build_container(program, instance, &BuildContext::Global, *child, style, hovered_cell)
-        }
-        ElementKind::Label { label, style } => {
-            build_label(program, instance, &BuildContext::Global, label, style, links, hovered_cell)
-        }
-        ElementKind::Stack { layers, style } => {
-            build_stack(program, instance, &BuildContext::Global, *layers, style, hovered_cell)
-        }
+        ElementKind::Container { child, style } => build_container(
+            program,
+            instance,
+            &BuildContext::Global,
+            *child,
+            style,
+            hovered_cell,
+        ),
+        ElementKind::Label { label, style } => build_label(
+            program,
+            instance,
+            &BuildContext::Global,
+            label,
+            style,
+            links,
+            hovered_cell,
+        ),
+        ElementKind::Stack { layers, style } => build_stack(
+            program,
+            instance,
+            &BuildContext::Global,
+            *layers,
+            style,
+            hovered_cell,
+        ),
         ElementKind::Link { url, label, style } => {
             build_link(program, instance, label, url, style, links, hovered_cell)
         }
@@ -389,7 +478,8 @@ fn build_element_node(
     if handled_events.is_empty() {
         attach_common_events(raw, instance, links, None)
     } else {
-        let filtered: Vec<_> = links.iter()
+        let filtered: Vec<_> = links
+            .iter()
             .filter(|(name, _)| !handled_events.contains(&name.as_str()))
             .cloned()
             .collect();
@@ -411,10 +501,16 @@ fn attach_common_events(
     let blur_event = links.iter().find(|(n, _)| n == "blur").map(|(_, e)| *e);
     let focus_event = links.iter().find(|(n, _)| n == "focus").map(|(_, e)| *e);
     let click_event = links.iter().find(|(n, _)| n == "click").map(|(_, e)| *e);
-    let double_click_event = links.iter().find(|(n, _)| n == "double_click").map(|(_, e)| *e);
+    let double_click_event = links
+        .iter()
+        .find(|(n, _)| n == "double_click")
+        .map(|(_, e)| *e);
 
-    if !has_hover && blur_event.is_none() && focus_event.is_none()
-        && click_event.is_none() && double_click_event.is_none()
+    if !has_hover
+        && blur_event.is_none()
+        && focus_event.is_none()
+        && click_event.is_none()
+        && double_click_event.is_none()
     {
         return el;
     }
@@ -473,11 +569,18 @@ fn attach_common_events(
 }
 
 /// Resolve a label expression to TextConcat segments (following CellRead chains).
-fn resolve_label_segments<'a>(program: &'a IrProgram, label: &'a IrExpr) -> Option<&'a [TextSegment]> {
+fn resolve_label_segments<'a>(
+    program: &'a IrProgram,
+    label: &'a IrExpr,
+) -> Option<&'a [TextSegment]> {
     match label {
         IrExpr::TextConcat(segs) => Some(segs),
         IrExpr::CellRead(cell) => {
-            if let Some(IrNode::Derived { expr: IrExpr::TextConcat(segs), .. }) = find_node_for_cell(program, *cell) {
+            if let Some(IrNode::Derived {
+                expr: IrExpr::TextConcat(segs),
+                ..
+            }) = find_node_for_cell(program, *cell)
+            {
                 Some(segs)
             } else {
                 None
@@ -494,7 +597,10 @@ fn build_label_child(
     label: &IrExpr,
 ) -> RawElOrText {
     let el = if let Some(segs) = resolve_label_segments(program, label) {
-        if segs.iter().any(|s| matches!(s, TextSegment::Expr(IrExpr::CellRead(_)))) {
+        if segs
+            .iter()
+            .any(|s| matches!(s, TextSegment::Expr(IrExpr::CellRead(_))))
+        {
             return build_text_from_segments(instance, segs);
         }
         zoon::Text::new(resolve_static_text(program, label)).unify()
@@ -527,26 +633,27 @@ fn build_button(
 
     let label_child = build_label_child(program, instance, label);
     let inst_press = instance.clone();
-    let is_template_event = press_event.map(|e| ctx.is_template_event(e)).unwrap_or(false);
+    let is_template_event = press_event
+        .map(|e| ctx.is_template_event(e))
+        .unwrap_or(false);
     let item_idx = ctx.item_ctx().map(|c| c.item_idx);
-    let mut btn = Button::new()
-        .label(label_child)
-        .on_press(move || {
-            if let Some(event_id) = press_event {
-                if is_template_event {
-                    let _ = inst_press.call_on_item_event(item_idx.unwrap(), event_id.0);
-                } else {
-                    let _ = inst_press.fire_event(event_id.0);
-                }
+    let mut btn = Button::new().label(label_child).on_press(move || {
+        if let Some(event_id) = press_event {
+            if is_template_event {
+                let _ = inst_press.call_on_item_event(item_idx.unwrap(), event_id.0);
+            } else {
+                let _ = inst_press.fire_event(event_id.0);
             }
-        });
+        }
+    });
     btn = apply_typed_styles(btn, style, program, false);
     if let Some(cell) = hovered_cell {
         btn = apply_hover(btn, instance, ctx.item_ctx(), cell);
     }
-    btn
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false))
-        .into_raw_unchecked()
+    btn.update_raw_el(|raw_el| {
+        apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false)
+    })
+    .into_raw_unchecked()
 }
 
 /// A child slot for Stripe elements — either a static element or a reactive signal.
@@ -557,7 +664,10 @@ enum ChildSlot {
 
 /// Follow CellRead/Derived/PipeThrough chains to find if this cell resolves to a
 /// WHEN/WHILE node with element arms. Returns (source, arms) if found.
-fn resolve_to_conditional(program: &IrProgram, cell: CellId) -> Option<(CellId, &[(IrPattern, IrExpr)])> {
+fn resolve_to_conditional(
+    program: &IrProgram,
+    cell: CellId,
+) -> Option<(CellId, &[(IrPattern, IrExpr)])> {
     match find_node_for_cell(program, cell) {
         Some(IrNode::When { source, arms, .. }) | Some(IrNode::While { source, arms, .. }) => {
             if has_element_arms(program, arms) {
@@ -566,12 +676,11 @@ fn resolve_to_conditional(program: &IrProgram, cell: CellId) -> Option<(CellId, 
                 None
             }
         }
-        Some(IrNode::Derived { expr: IrExpr::CellRead(inner), .. }) => {
-            resolve_to_conditional(program, *inner)
-        }
-        Some(IrNode::PipeThrough { source, .. }) => {
-            resolve_to_conditional(program, *source)
-        }
+        Some(IrNode::Derived {
+            expr: IrExpr::CellRead(inner),
+            ..
+        }) => resolve_to_conditional(program, *inner),
+        Some(IrNode::PipeThrough { source, .. }) => resolve_to_conditional(program, *source),
         _ => None,
     }
 }
@@ -614,8 +723,12 @@ fn build_stripe(
             let mut raw_el = raw_el;
             for slot in children {
                 match slot {
-                    ChildSlot::Static(el) => { raw_el = raw_el.child(el); }
-                    ChildSlot::Signal(sig) => { raw_el = raw_el.child_signal(sig); }
+                    ChildSlot::Static(el) => {
+                        raw_el = raw_el.child(el);
+                    }
+                    ChildSlot::Signal(sig) => {
+                        raw_el = raw_el.child_signal(sig);
+                    }
                 }
             }
             apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), is_row)
@@ -638,40 +751,56 @@ fn collect_stripe_children(
                     for item in items {
                         match item {
                             IrExpr::CellRead(child_cell) => {
-                                if let Some((source, arms)) = resolve_to_conditional(program, *child_cell) {
-                                    if let (BuildContext::Item(item_ctx), true) = (ctx, has_no_element_arm(program, arms)) {
+                                if let Some((source, arms)) =
+                                    resolve_to_conditional(program, *child_cell)
+                                {
+                                    if let (BuildContext::Item(item_ctx), true) =
+                                        (ctx, has_no_element_arm(program, arms))
+                                    {
                                         // Per-item + NoElement (e.g., hover X button):
                                         // Pre-build with visibility toggle to keep elements in DOM.
                                         // Using visibility:hidden prevents pointer-event interference
                                         // while avoiding DOM insertion/removal that causes hover
                                         // oscillation from child_signal.
-                                        for el in build_item_visibility_children(program, instance, item_ctx, source, arms) {
+                                        for el in build_item_visibility_children(
+                                            program, instance, item_ctx, source, arms,
+                                        ) {
                                             children.push(ChildSlot::Static(el));
                                         }
                                     } else {
                                         // All other conditionals: use child_signal.
-                                        children.push(ChildSlot::Signal(
-                                            build_conditional_signal(program, instance, ctx, source, arms)
-                                        ));
+                                        children.push(ChildSlot::Signal(build_conditional_signal(
+                                            program, instance, ctx, source, arms,
+                                        )));
                                     }
                                 } else {
-                                    children.push(ChildSlot::Static(build_element(program, instance, ctx, *child_cell)));
+                                    children.push(ChildSlot::Static(build_element(
+                                        program,
+                                        instance,
+                                        ctx,
+                                        *child_cell,
+                                    )));
                                 }
                             }
                             IrExpr::Constant(IrValue::Text(t)) => {
-                                children.push(ChildSlot::Static(zoon::Text::new(t.clone()).unify()));
+                                children
+                                    .push(ChildSlot::Static(zoon::Text::new(t.clone()).unify()));
                             }
                             IrExpr::Constant(IrValue::Tag(t)) => {
                                 if t != "NoElement" {
-                                    children.push(ChildSlot::Static(zoon::Text::new(t.clone()).unify()));
+                                    children.push(ChildSlot::Static(
+                                        zoon::Text::new(t.clone()).unify(),
+                                    ));
                                 }
                             }
-                            IrExpr::TextConcat(segments) => {
-                                match ctx {
-                                    BuildContext::Item(item_ctx) => children.push(ChildSlot::Static(build_item_text_from_segments(instance, item_ctx, segments))),
-                                    BuildContext::Global => children.push(ChildSlot::Static(build_text_from_segments(instance, segments))),
-                                }
-                            }
+                            IrExpr::TextConcat(segments) => match ctx {
+                                BuildContext::Item(item_ctx) => children.push(ChildSlot::Static(
+                                    build_item_text_from_segments(instance, item_ctx, segments),
+                                )),
+                                BuildContext::Global => children.push(ChildSlot::Static(
+                                    build_text_from_segments(instance, segments),
+                                )),
+                            },
                             _ => {}
                         }
                     }
@@ -684,7 +813,9 @@ fn collect_stripe_children(
             }
         }
         Some(_) => {
-            vec![ChildSlot::Static(build_element(program, instance, ctx, items_cell))]
+            vec![ChildSlot::Static(build_element(
+                program, instance, ctx, items_cell,
+            ))]
         }
         None => Vec::new(),
     }
@@ -701,10 +832,12 @@ fn build_text_input(
     hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     // Find events from links.
-    let key_down_event = links.iter()
+    let key_down_event = links
+        .iter()
         .find(|(name, _)| name == "key_down")
         .map(|(_, eid)| *eid);
-    let change_event = links.iter()
+    let change_event = links
+        .iter()
         .find(|(name, _)| name == "change")
         .map(|(_, eid)| *eid);
 
@@ -817,7 +950,8 @@ fn find_data_cell_for_event_in_range(
     template_range: Option<(u32, u32)>,
 ) -> Option<u32> {
     // Find the event to get its name (which contains the element path).
-    let event_id = links.iter()
+    let event_id = links
+        .iter()
         .find(|(name, _)| name == event_name)
         .map(|(_, eid)| *eid)?;
     // The event's name is "{element_path}.{event_name}".
@@ -828,7 +962,10 @@ fn find_data_cell_for_event_in_range(
     let data_cell_name = format!("{}.event.{}.{}", element_path, event_name, field_name);
     // If a template range is given, prefer cells within that range.
     if let Some((start, end)) = template_range {
-        let template_match = program.cells.iter().enumerate()
+        let template_match = program
+            .cells
+            .iter()
+            .enumerate()
             .find(|(idx, info)| {
                 let id = *idx as u32;
                 id >= start && id < end && info.name == data_cell_name
@@ -838,16 +975,16 @@ fn find_data_cell_for_event_in_range(
             return template_match;
         }
     }
-    program.cells.iter().enumerate()
+    program
+        .cells
+        .iter()
+        .enumerate()
         .find(|(_, info)| info.name == data_cell_name)
         .map(|(idx, _)| idx as u32)
 }
 
 /// Find the .text property cell for a text input element.
-fn find_text_property_cell(
-    program: &IrProgram,
-    links: &[(String, EventId)],
-) -> Option<u32> {
+fn find_text_property_cell(program: &IrProgram, links: &[(String, EventId)]) -> Option<u32> {
     find_text_property_cell_in_range(program, links, None)
 }
 
@@ -867,7 +1004,10 @@ fn find_text_property_cell_in_range(
     let text_cell_name = format!("{}.text", element_path);
     // If a template range is given, prefer cells within that range.
     if let Some((start, end)) = template_range {
-        let template_match = program.cells.iter().enumerate()
+        let template_match = program
+            .cells
+            .iter()
+            .enumerate()
             .find(|(idx, info)| {
                 let id = *idx as u32;
                 id >= start && id < end && info.name == text_cell_name
@@ -877,7 +1017,10 @@ fn find_text_property_cell_in_range(
             return template_match;
         }
     }
-    program.cells.iter().enumerate()
+    program
+        .cells
+        .iter()
+        .enumerate()
         .find(|(_, info)| info.name == text_cell_name)
         .map(|(idx, _)| idx as u32)
 }
@@ -897,9 +1040,10 @@ fn build_container(
     if let Some(cell) = hovered_cell {
         el = apply_hover(el, instance, ctx.item_ctx(), cell);
     }
-    el
-        .child(child_el)
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false))
+    el.child(child_el)
+        .update_raw_el(|raw_el| {
+            apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false)
+        })
         .into_raw_unchecked()
 }
 
@@ -914,18 +1058,14 @@ fn build_label(
     hovered_cell: Option<CellId>,
 ) -> RawElOrText {
     let content: RawElOrText = match label {
-        IrExpr::TextConcat(segments) => {
-            match ctx {
-                BuildContext::Item(item_ctx) => build_item_text_from_segments(instance, item_ctx, segments),
-                BuildContext::Global => build_text_from_segments(instance, segments),
+        IrExpr::TextConcat(segments) => match ctx {
+            BuildContext::Item(item_ctx) => {
+                build_item_text_from_segments(instance, item_ctx, segments)
             }
-        }
-        IrExpr::Constant(IrValue::Text(t)) => {
-            zoon::Text::new(t.clone()).unify()
-        }
-        IrExpr::CellRead(cell) => {
-            build_element(program, instance, ctx, *cell)
-        }
+            BuildContext::Global => build_text_from_segments(instance, segments),
+        },
+        IrExpr::Constant(IrValue::Text(t)) => zoon::Text::new(t.clone()).unify(),
+        IrExpr::CellRead(cell) => build_element(program, instance, ctx, *cell),
         _ => {
             let text = eval_static_text(label);
             zoon::Text::new(text).unify()
@@ -936,9 +1076,10 @@ fn build_label(
     if let Some(cell) = hovered_cell {
         lbl = apply_hover(lbl, instance, ctx.item_ctx(), cell);
     }
-    lbl
-        .label(content)
-        .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false))
+    lbl.label(content)
+        .update_raw_el(|raw_el| {
+            apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false)
+        })
         .into_raw_unchecked()
 }
 
@@ -957,18 +1098,21 @@ fn build_stack(
     if let Some(cell) = hovered_cell {
         stk = apply_hover(stk, instance, ctx.item_ctx(), cell);
     }
-    stk
-        .update_raw_el(|raw_el| {
-            let mut raw_el = raw_el;
-            for slot in children {
-                match slot {
-                    ChildSlot::Static(el) => { raw_el = raw_el.child(el); }
-                    ChildSlot::Signal(sig) => { raw_el = raw_el.child_signal(sig); }
+    stk.update_raw_el(|raw_el| {
+        let mut raw_el = raw_el;
+        for slot in children {
+            match slot {
+                ChildSlot::Static(el) => {
+                    raw_el = raw_el.child(el);
+                }
+                ChildSlot::Signal(sig) => {
+                    raw_el = raw_el.child_signal(sig);
                 }
             }
-            apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false)
-        })
-        .into_raw_unchecked()
+        }
+        apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false)
+    })
+    .into_raw_unchecked()
 }
 
 /// Build a Link element.
@@ -988,8 +1132,7 @@ fn build_link(
     if let Some(cell) = hovered_cell {
         lnk = apply_hover(lnk, instance, None, cell);
     }
-    lnk
-        .label(zoon::Text::new(label_text))
+    lnk.label(zoon::Text::new(label_text))
         .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
         .into_raw_unchecked()
 }
@@ -1010,22 +1153,24 @@ fn build_paragraph(
         IrExpr::CellRead(cell) => {
             if let Some(node) = find_node_for_cell(program, *cell) {
                 match node {
-                    IrNode::Derived { expr: IrExpr::ListConstruct(items), .. } => {
-                        items.iter().map(|item| {
-                            match item {
-                                IrExpr::CellRead(child_cell) => {
-                                    build_cell_element(program, instance, *child_cell)
-                                }
-                                IrExpr::Constant(IrValue::Text(t)) => {
-                                    zoon::Text::new(t.clone()).unify()
-                                }
-                                _ => {
-                                    let t = eval_static_text(item);
-                                    zoon::Text::new(t).unify()
-                                }
+                    IrNode::Derived {
+                        expr: IrExpr::ListConstruct(items),
+                        ..
+                    } => items
+                        .iter()
+                        .map(|item| match item {
+                            IrExpr::CellRead(child_cell) => {
+                                build_cell_element(program, instance, *child_cell)
                             }
-                        }).collect()
-                    }
+                            IrExpr::Constant(IrValue::Text(t)) => {
+                                zoon::Text::new(t.clone()).unify()
+                            }
+                            _ => {
+                                let t = eval_static_text(item);
+                                zoon::Text::new(t).unify()
+                            }
+                        })
+                        .collect(),
                     _ => {
                         vec![build_cell_element(program, instance, *cell)]
                     }
@@ -1034,22 +1179,17 @@ fn build_paragraph(
                 vec![build_reactive_text(instance, *cell)]
             }
         }
-        IrExpr::ListConstruct(items) => {
-            items.iter().map(|item| {
-                match item {
-                    IrExpr::CellRead(child_cell) => {
-                        build_cell_element(program, instance, *child_cell)
-                    }
-                    IrExpr::Constant(IrValue::Text(t)) => {
-                        zoon::Text::new(t.clone()).unify()
-                    }
-                    _ => {
-                        let t = eval_static_text(item);
-                        zoon::Text::new(t).unify()
-                    }
+        IrExpr::ListConstruct(items) => items
+            .iter()
+            .map(|item| match item {
+                IrExpr::CellRead(child_cell) => build_cell_element(program, instance, *child_cell),
+                IrExpr::Constant(IrValue::Text(t)) => zoon::Text::new(t.clone()).unify(),
+                _ => {
+                    let t = eval_static_text(item);
+                    zoon::Text::new(t).unify()
                 }
-            }).collect()
-        }
+            })
+            .collect(),
         _ => {
             let text = eval_static_text(content);
             vec![zoon::Text::new(text).unify()]
@@ -1060,8 +1200,7 @@ fn build_paragraph(
     if let Some(cell) = hovered_cell {
         para = apply_hover(para, instance, None, cell);
     }
-    para
-        .contents(children)
+    para.contents(children)
         .update_raw_el(|raw_el| apply_raw_css(raw_el, style, program, instance, None, false))
         .into_raw_unchecked()
 }
@@ -1098,7 +1237,10 @@ fn build_checkbox(
     let checked_signal: LocalBoxSignal<'static, bool> = if let Some(&checked_cell) = checked {
         let store = instance.cell_store.clone();
         let cell_id = checked_cell.0;
-        store.get_cell_signal(cell_id).map(move |v| v != 0.0).boxed_local()
+        store
+            .get_cell_signal(cell_id)
+            .map(move |v| v != 0.0)
+            .boxed_local()
     } else {
         always(false).boxed_local()
     };
@@ -1121,16 +1263,15 @@ fn build_checkbox(
     if let Some(cell) = hovered_cell {
         cb = apply_hover(cb, instance, None, cell);
     }
-    cb
-        .update_raw_el(|raw_el| {
-            let raw_el = raw_el.event_handler(move |_: events::Click| {
-                if let Some(event_id) = click_event {
-                    let _ = inst_change.fire_event(event_id.0);
-                }
-            });
-            apply_raw_css(raw_el, style, program, instance, None, false)
-        })
-        .into_raw_unchecked()
+    cb.update_raw_el(|raw_el| {
+        let raw_el = raw_el.event_handler(move |_: events::Click| {
+            if let Some(event_id) = click_event {
+                let _ = inst_change.fire_event(event_id.0);
+            }
+        });
+        apply_raw_css(raw_el, style, program, instance, None, false)
+    })
+    .into_raw_unchecked()
 }
 
 /// Build a WHILE element — reactively switches child based on source cell value.
@@ -1145,12 +1286,13 @@ fn is_element_body(program: &IrProgram, body: &IrExpr) -> bool {
     match body {
         IrExpr::CellRead(cell) => {
             if let Some(node) = find_node_for_cell(program, *cell) {
-                matches!(node,
+                matches!(
+                    node,
                     IrNode::Element { .. }
-                    | IrNode::When { .. }
-                    | IrNode::While { .. }
-                    | IrNode::PipeThrough { .. }
-                    | IrNode::ListMap { .. }
+                        | IrNode::When { .. }
+                        | IrNode::While { .. }
+                        | IrNode::PipeThrough { .. }
+                        | IrNode::ListMap { .. }
                 )
             } else {
                 false
@@ -1179,12 +1321,12 @@ fn build_arm_body_element(
             }
         }
         IrExpr::Constant(IrValue::Tag(t)) if t == "NoElement" => None,
-        IrExpr::TextConcat(segments) => {
-            match ctx {
-                BuildContext::Item(item_ctx) => Some(build_item_text_from_segments(instance, item_ctx, segments)),
-                BuildContext::Global => Some(build_text_from_segments(instance, segments)),
+        IrExpr::TextConcat(segments) => match ctx {
+            BuildContext::Item(item_ctx) => {
+                Some(build_item_text_from_segments(instance, item_ctx, segments))
             }
-        }
+            BuildContext::Global => Some(build_text_from_segments(instance, segments)),
+        },
         _ => {
             let text = eval_static_text(body);
             if text.is_empty() {
@@ -1211,7 +1353,9 @@ fn build_conditional_element(
             .unwrap_or_else(|| El::new().unify());
     }
     El::new()
-        .child_signal(build_conditional_signal(program, instance, ctx, source, arms))
+        .child_signal(build_conditional_signal(
+            program, instance, ctx, source, arms,
+        ))
         .unify()
 }
 
@@ -1242,7 +1386,10 @@ fn build_conditional_signal_impl(
     arms: &[(IrPattern, IrExpr)],
 ) -> Box<dyn Signal<Item = Option<RawElOrText>> + Unpin> {
     let tag_table = &program.tag_table;
-    let matchers: Vec<ArmMatcher> = arms.iter().map(|(p, _)| pattern_to_matcher(p, tag_table)).collect();
+    let matchers: Vec<ArmMatcher> = arms
+        .iter()
+        .map(|(p, _)| pattern_to_matcher(p, tag_table))
+        .collect();
     let arm_bodies: Vec<IrExpr> = arms.iter().map(|(_, body)| body.clone()).collect();
     let inst = instance.clone();
     let source_id = source.0;
@@ -1262,16 +1409,31 @@ fn build_conditional_signal_impl(
         Box::new(signal.map(move |_val| {
             let (val, text) = if is_item_source {
                 if let Some(ref ics) = item_cell_store {
-                    (ics.get_value(item_ctx.item_idx, source_id), ics.get_text(item_ctx.item_idx, source_id))
+                    (
+                        ics.get_value(item_ctx.item_idx, source_id),
+                        ics.get_text(item_ctx.item_idx, source_id),
+                    )
                 } else {
-                    (store.get_cell_value(source_id), store.get_cell_text(source_id))
+                    (
+                        store.get_cell_value(source_id),
+                        store.get_cell_text(source_id),
+                    )
                 }
             } else {
-                (store.get_cell_value(source_id), store.get_cell_text(source_id))
+                (
+                    store.get_cell_value(source_id),
+                    store.get_cell_text(source_id),
+                )
             };
             find_matching_arm_idx(&matchers, val, &text).and_then(|idx| {
                 let build_ctx = BuildContext::Item(&item_ctx);
-                build_arm_body_element(&inst.program, &inst, &build_ctx, &arm_bodies[idx], CellId(source_id))
+                build_arm_body_element(
+                    &inst.program,
+                    &inst,
+                    &build_ctx,
+                    &arm_bodies[idx],
+                    CellId(source_id),
+                )
             })
         }))
     } else {
@@ -1280,12 +1442,17 @@ fn build_conditional_signal_impl(
             let val = store.get_cell_value(source_id);
             let text = store.get_cell_text(source_id);
             find_matching_arm_idx(&matchers, val, &text).and_then(|idx| {
-                build_arm_body_element(&inst.program, &inst, &BuildContext::Global, &arm_bodies[idx], CellId(source_id))
+                build_arm_body_element(
+                    &inst.program,
+                    &inst,
+                    &BuildContext::Global,
+                    &arm_bodies[idx],
+                    CellId(source_id),
+                )
             })
         }))
     }
 }
-
 
 /// Build per-item conditional children with visibility toggling.
 /// Elements are always in the DOM — only visibility changes. This prevents hover
@@ -1300,17 +1467,22 @@ fn build_item_visibility_children(
     arms: &[(IrPattern, IrExpr)],
 ) -> Vec<RawElOrText> {
     let tag_table = &program.tag_table;
-    let matchers: Vec<ArmMatcher> = arms.iter().map(|(p, _)| pattern_to_matcher(p, tag_table)).collect();
+    let matchers: Vec<ArmMatcher> = arms
+        .iter()
+        .map(|(p, _)| pattern_to_matcher(p, tag_table))
+        .collect();
     let source_id = source.0;
     let is_item_source = ctx.is_template_cell(source);
     let item_idx = ctx.item_idx;
 
     let mut result = Vec::new();
     for (arm_idx, (_, body)) in arms.iter().enumerate() {
-        let el = match build_arm_body_element(program, instance, &BuildContext::Item(ctx), body, source) {
-            Some(el) => el,
-            None => continue,
-        };
+        let el =
+            match build_arm_body_element(program, instance, &BuildContext::Item(ctx), body, source)
+            {
+                Some(el) => el,
+                None => continue,
+            };
 
         // Apply visibility directly on the element (no wrapper div).
         let html_el = match el {
@@ -1326,7 +1498,13 @@ fn build_item_visibility_children(
         let ics = instance.item_cell_store.clone();
 
         let signal: Box<dyn Signal<Item = f64> + Unpin> = if is_item_source {
-            Box::new(instance.item_cell_store.clone().unwrap().get_signal(item_idx, source_id))
+            Box::new(
+                instance
+                    .item_cell_store
+                    .clone()
+                    .unwrap()
+                    .get_signal(item_idx, source_id),
+            )
         } else {
             Box::new(instance.cell_store.get_cell_signal(source_id))
         };
@@ -1334,21 +1512,34 @@ fn build_item_visibility_children(
         let visibility_signal = signal.map(move |_| {
             let (val, text) = if is_item_source {
                 if let Some(ref ics) = ics {
-                    (ics.get_value(item_idx, source_id), ics.get_text(item_idx, source_id))
+                    (
+                        ics.get_value(item_idx, source_id),
+                        ics.get_text(item_idx, source_id),
+                    )
                 } else {
-                    (store.get_cell_value(source_id), store.get_cell_text(source_id))
+                    (
+                        store.get_cell_value(source_id),
+                        store.get_cell_text(source_id),
+                    )
                 }
             } else {
-                (store.get_cell_value(source_id), store.get_cell_text(source_id))
+                (
+                    store.get_cell_value(source_id),
+                    store.get_cell_text(source_id),
+                )
             };
-            if find_matching_arm_idx(&matchers, val, &text) == Some(arm_idx) { "visible" } else { "hidden" }
+            if find_matching_arm_idx(&matchers, val, &text) == Some(arm_idx) {
+                "visible"
+            } else {
+                "hidden"
+            }
         });
 
         result.push(
             html_el
                 .style("visibility", "hidden")
                 .style_signal("visibility", visibility_signal)
-                .into_raw_unchecked()
+                .into_raw_unchecked(),
         );
     }
     result
@@ -1366,11 +1557,11 @@ fn has_no_element_arm(program: &IrProgram, arms: &[(IrPattern, IrExpr)]) -> bool
 /// Pattern matcher for arm selection.
 #[derive(Clone, Debug)]
 enum ArmMatcher {
-    Tag(f64),       // Match encoded tag value
-    Number(f64),    // Match exact number
-    Bool(f64),      // Match 0.0 or 1.0
-    Text(String),   // Match cell text value
-    Wildcard,       // Match anything
+    Tag(f64),     // Match encoded tag value
+    Number(f64),  // Match exact number
+    Bool(f64),    // Match 0.0 or 1.0
+    Text(String), // Match cell text value
+    Wildcard,     // Match anything
 }
 
 fn pattern_to_matcher(pattern: &IrPattern, tag_table: &[String]) -> ArmMatcher {
@@ -1394,7 +1585,11 @@ fn pattern_to_matcher(pattern: &IrPattern, tag_table: &[String]) -> ArmMatcher {
 }
 
 fn find_matching_arm<T>(arms: &[(ArmMatcher, T)], value: f64, cell_text: &str) -> Option<usize> {
-    find_matching_arm_idx(&arms.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(), value, cell_text)
+    find_matching_arm_idx(
+        &arms.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
+        value,
+        cell_text,
+    )
 }
 
 fn find_matching_arm_idx(matchers: &[ArmMatcher], value: f64, cell_text: &str) -> Option<usize> {
@@ -1461,15 +1656,24 @@ enum BuildContext<'a> {
 
 impl<'a> BuildContext<'a> {
     fn item_ctx(&self) -> Option<&ItemContext> {
-        match self { BuildContext::Item(ctx) => Some(ctx), _ => None }
+        match self {
+            BuildContext::Item(ctx) => Some(ctx),
+            _ => None,
+        }
     }
 
     fn is_template_cell(&self, cell: CellId) -> bool {
-        match self { BuildContext::Item(ctx) => ctx.is_template_cell(cell), _ => false }
+        match self {
+            BuildContext::Item(ctx) => ctx.is_template_cell(cell),
+            _ => false,
+        }
     }
 
     fn is_template_event(&self, event: EventId) -> bool {
-        match self { BuildContext::Item(ctx) => ctx.is_template_event(event), _ => false }
+        match self {
+            BuildContext::Item(ctx) => ctx.is_template_event(event),
+            _ => false,
+        }
     }
 
     fn fire_event(&self, instance: &Rc<WasmInstance>, event: EventId) {
@@ -1477,7 +1681,9 @@ impl<'a> BuildContext<'a> {
             BuildContext::Item(ctx) if ctx.is_template_event(event) => {
                 let _ = instance.call_on_item_event(ctx.item_idx, event.0);
             }
-            _ => { let _ = instance.fire_event(event.0); }
+            _ => {
+                let _ = instance.fire_event(event.0);
+            }
         }
     }
 }
@@ -1496,19 +1702,22 @@ fn build_list_map(
 ) -> RawElOrText {
     let store = instance.cell_store.clone();
 
-
     // Get the version signal from the map cell to trigger re-renders.
     let version_signal = store.get_cell_signal(map_cell.0);
 
     // Determine the template cell to follow into the per-item element tree.
     let template_root_cell = match template {
-        IrNode::Derived { expr: IrExpr::CellRead(cell), .. } => Some(*cell),
+        IrNode::Derived {
+            expr: IrExpr::CellRead(cell),
+            ..
+        } => Some(*cell),
         _ => None,
     };
 
     // Collect cross-scope event IDs (global events that trigger template-scoped nodes).
     // These need to be forwarded to all live items when the global event fires.
-    let cross_scope_events = collect_cross_scope_events(program, template_cell_range, template_event_range);
+    let cross_scope_events =
+        collect_cross_scope_events(program, template_cell_range, template_event_range);
 
     let inst = instance.clone();
 
@@ -1553,7 +1762,11 @@ fn build_list_map(
         let current_list_id = inst_dedup.cell_store.get_cell_value(source.0);
         let text_items = inst_dedup.list_store.items_text(current_list_id);
         let f64_items = inst_dedup.list_store.items(current_list_id);
-        let item_count = if !text_items.is_empty() { text_items.len() } else { f64_items.len() };
+        let item_count = if !text_items.is_empty() {
+            text_items.len()
+        } else {
+            f64_items.len()
+        };
         let current: Vec<u32> = (0..item_count)
             .map(|i| inst_dedup.list_store.item_memory_index(current_list_id, i) as u32)
             .collect();
@@ -1575,7 +1788,11 @@ fn build_list_map(
             let current_list_id = inst.cell_store.get_cell_value(source.0);
             let text_items = inst.list_store.items_text(current_list_id);
             let f64_items = inst.list_store.items(current_list_id);
-            let item_count = if !text_items.is_empty() { text_items.len() } else { f64_items.len() };
+            let item_count = if !text_items.is_empty() {
+                text_items.len()
+            } else {
+                f64_items.len()
+            };
             if item_count == 0 {
                 *live_items_for_closure.borrow_mut() = 0;
                 // Reset initialized indices so all items re-initialize on next render.
@@ -1587,68 +1804,71 @@ fn build_list_map(
 
             let program = &inst.program;
 
-            let children: Vec<RawElOrText> = (0..item_count).map(|i| {
-                // Use item_memory_index to correctly map position → memory index.
-                // For index-based lists (after ListRetain/ListRemove), f64 values
-                // are original memory indices. For regular lists, use sequential index.
-                let item_idx = inst.list_store.item_memory_index(current_list_id, i) as u32;
+            let children: Vec<RawElOrText> = (0..item_count)
+                .map(|i| {
+                    // Use item_memory_index to correctly map position → memory index.
+                    // For index-based lists (after ListRetain/ListRemove), f64 values
+                    // are original memory indices. For regular lists, use sequential index.
+                    let item_idx = inst.list_store.item_memory_index(current_list_id, i) as u32;
 
-                // Set per-item text on item_cell from ListStore item data.
-                if let Some(ref ics) = inst.item_cell_store {
-                    ics.ensure_item(item_idx);
-                    if i < text_items.len() {
-                        ics.set_text(item_idx, item_cell.0, text_items[i].clone());
-                    } else if i < f64_items.len() {
-                        // Numeric list items: format value as text for label display.
-                        ics.set_text(item_idx, item_cell.0, format_number(f64_items[i]));
+                    // Set per-item text on item_cell from ListStore item data.
+                    if let Some(ref ics) = inst.item_cell_store {
+                        ics.ensure_item(item_idx);
+                        if i < text_items.len() {
+                            ics.set_text(item_idx, item_cell.0, text_items[i].clone());
+                        } else if i < f64_items.len() {
+                            // Numeric list items: format value as text for label display.
+                            ics.set_text(item_idx, item_cell.0, format_number(f64_items[i]));
+                        }
                     }
-                }
 
-                // Initialize per-item template cells in WASM memory.
-                // Only init NEW items — existing items keep their HOLD state
-                // (e.g. completed toggle) across re-renders.
-                if !initialized_indices.borrow().contains(&item_idx) {
-                    let _ = inst.call_init_item(item_idx);
-                    initialized_indices.borrow_mut().insert(item_idx);
-                }
+                    // Initialize per-item template cells in WASM memory.
+                    // Only init NEW items — existing items keep their HOLD state
+                    // (e.g. completed toggle) across re-renders.
+                    if !initialized_indices.borrow().contains(&item_idx) {
+                        let _ = inst.call_init_item(item_idx);
+                        initialized_indices.borrow_mut().insert(item_idx);
+                    }
 
-                // Copy item text to template-local namespace field cells.
-                if let Some(ref ics) = inst.item_cell_store {
-                    if let Some(fields) = program.cell_field_cells.get(&item_cell) {
-                        let item_text = ics.get_text(item_idx, item_cell.0);
-                        if !item_text.is_empty() {
-                            for (name, field_cell) in fields {
-                                let in_range = field_cell.0 >= template_cell_range.0
-                                    && field_cell.0 < template_cell_range.1;
-                                let is_namespace = program.cell_field_cells.contains_key(field_cell);
-                                if in_range && !is_namespace {
-                                    ics.set_text(item_idx, field_cell.0, item_text.clone());
+                    // Copy item text to template-local namespace field cells.
+                    if let Some(ref ics) = inst.item_cell_store {
+                        if let Some(fields) = program.cell_field_cells.get(&item_cell) {
+                            let item_text = ics.get_text(item_idx, item_cell.0);
+                            if !item_text.is_empty() {
+                                for (name, field_cell) in fields {
+                                    let in_range = field_cell.0 >= template_cell_range.0
+                                        && field_cell.0 < template_cell_range.1;
+                                    let is_namespace =
+                                        program.cell_field_cells.contains_key(field_cell);
+                                    if in_range && !is_namespace {
+                                        ics.set_text(item_idx, field_cell.0, item_text.clone());
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // Build per-item element tree.
-                let ctx = ItemContext {
-                    item_idx,
-                    template_cell_range,
-                    template_event_range,
-                };
+                    // Build per-item element tree.
+                    let ctx = ItemContext {
+                        item_idx,
+                        template_cell_range,
+                        template_event_range,
+                    };
 
-                if let Some(root_cell) = template_root_cell {
-                    build_element(program, &inst, &BuildContext::Item(&ctx), root_cell)
-                } else {
-                    // Fallback: render item text directly.
-                    if i < text_items.len() {
-                        zoon::Text::new(text_items[i].clone()).unify()
-                    } else if i < f64_items.len() {
-                        zoon::Text::new(format_number(f64_items[i])).unify()
+                    if let Some(root_cell) = template_root_cell {
+                        build_element(program, &inst, &BuildContext::Item(&ctx), root_cell)
                     } else {
-                        zoon::Text::new("?").unify()
+                        // Fallback: render item text directly.
+                        if i < text_items.len() {
+                            zoon::Text::new(text_items[i].clone()).unify()
+                        } else if i < f64_items.len() {
+                            zoon::Text::new(format_number(f64_items[i])).unify()
+                        } else {
+                            zoon::Text::new("?").unify()
+                        }
                     }
-                }
-            }).collect();
+                })
+                .collect();
 
             // Finalize snapshot restore: re-derive global values from
             // restored per-item WASM memory and re-apply global cells.
@@ -1681,20 +1901,20 @@ fn collect_cross_scope_events(
 
     for node in &program.nodes {
         let triggers: Vec<u32> = match node {
-            IrNode::Hold { cell, trigger_bodies, .. }
-                if cell.0 >= cell_start && cell.0 < cell_end =>
-            {
+            IrNode::Hold {
+                cell,
+                trigger_bodies,
+                ..
+            } if cell.0 >= cell_start && cell.0 < cell_end => {
                 trigger_bodies.iter().map(|(t, _)| t.0).collect()
             }
-            IrNode::Then { cell, trigger, .. }
-                if cell.0 >= cell_start && cell.0 < cell_end =>
-            {
+            IrNode::Then { cell, trigger, .. } if cell.0 >= cell_start && cell.0 < cell_end => {
                 vec![trigger.0]
             }
-            IrNode::Latest { target, arms }
-                if target.0 >= cell_start && target.0 < cell_end =>
-            {
-                arms.iter().filter_map(|arm| arm.trigger.map(|t| t.0)).collect()
+            IrNode::Latest { target, arms } if target.0 >= cell_start && target.0 < cell_end => {
+                arms.iter()
+                    .filter_map(|arm| arm.trigger.map(|t| t.0))
+                    .collect()
             }
             _ => continue,
         };
@@ -1732,7 +1952,8 @@ fn build_item_reactive_text(
         } else {
             format_number(val)
         }
-    })).unify()
+    }))
+    .unify()
 }
 
 /// Build text from segments with per-item cell support.
@@ -1764,17 +1985,20 @@ fn build_item_text_from_segments(
     let item_idx = ctx.item_idx;
 
     // Build segment descriptions for the closure.
-    let seg_desc: Vec<ItemSegDesc> = segments.iter().map(|seg| match seg {
-        TextSegment::Literal(t) => ItemSegDesc::Lit(t.clone()),
-        TextSegment::Expr(IrExpr::CellRead(cell)) => {
-            if ctx.is_template_cell(*cell) {
-                ItemSegDesc::ItemCell(cell.0)
-            } else {
-                ItemSegDesc::GlobalCell(cell.0)
+    let seg_desc: Vec<ItemSegDesc> = segments
+        .iter()
+        .map(|seg| match seg {
+            TextSegment::Literal(t) => ItemSegDesc::Lit(t.clone()),
+            TextSegment::Expr(IrExpr::CellRead(cell)) => {
+                if ctx.is_template_cell(*cell) {
+                    ItemSegDesc::ItemCell(cell.0)
+                } else {
+                    ItemSegDesc::GlobalCell(cell.0)
+                }
             }
-        }
-        _ => ItemSegDesc::Lit(String::new()),
-    }).collect();
+            _ => ItemSegDesc::Lit(String::new()),
+        })
+        .collect();
 
     // Find a cell to use as signal trigger. Prefer item cells.
     let trigger_cell = segments.iter().find_map(|seg| {
@@ -1793,27 +2017,43 @@ fn build_item_text_from_segments(
     if ctx.is_template_cell(trigger_cell) {
         let signal = ics.get_signal(item_idx, trigger_cell.0);
         zoon::Text::with_signal(signal.map(move |_| {
-            seg_desc.iter().map(|s| match s {
-                ItemSegDesc::Lit(t) => t.clone(),
-                ItemSegDesc::ItemCell(id) => {
-                    let text = ics.get_text(item_idx, *id);
-                    if !text.is_empty() { text } else { format_number(ics.get_value(item_idx, *id)) }
-                }
-                ItemSegDesc::GlobalCell(id) => format_cell_value(&store, *id),
-            }).collect::<String>()
-        })).unify()
+            seg_desc
+                .iter()
+                .map(|s| match s {
+                    ItemSegDesc::Lit(t) => t.clone(),
+                    ItemSegDesc::ItemCell(id) => {
+                        let text = ics.get_text(item_idx, *id);
+                        if !text.is_empty() {
+                            text
+                        } else {
+                            format_number(ics.get_value(item_idx, *id))
+                        }
+                    }
+                    ItemSegDesc::GlobalCell(id) => format_cell_value(&store, *id),
+                })
+                .collect::<String>()
+        }))
+        .unify()
     } else {
         let signal = store.get_cell_signal(trigger_cell.0);
         zoon::Text::with_signal(signal.map(move |_| {
-            seg_desc.iter().map(|s| match s {
-                ItemSegDesc::Lit(t) => t.clone(),
-                ItemSegDesc::ItemCell(id) => {
-                    let text = ics.get_text(item_idx, *id);
-                    if !text.is_empty() { text } else { format_number(ics.get_value(item_idx, *id)) }
-                }
-                ItemSegDesc::GlobalCell(id) => format_cell_value(&store, *id),
-            }).collect::<String>()
-        })).unify()
+            seg_desc
+                .iter()
+                .map(|s| match s {
+                    ItemSegDesc::Lit(t) => t.clone(),
+                    ItemSegDesc::ItemCell(id) => {
+                        let text = ics.get_text(item_idx, *id);
+                        if !text.is_empty() {
+                            text
+                        } else {
+                            format_number(ics.get_value(item_idx, *id))
+                        }
+                    }
+                    ItemSegDesc::GlobalCell(id) => format_cell_value(&store, *id),
+                })
+                .collect::<String>()
+        }))
+        .unify()
     }
 }
 
@@ -1843,28 +2083,89 @@ fn build_item_element_node(
     let mut remaining_hovered_cell = None;
 
     let raw: RawElOrText = match kind {
-        ElementKind::Button { label, style } => {
-            build_button(program, instance, &BuildContext::Item(ctx), label, style, links, hovered_cell)
-        }
-        ElementKind::Stripe { direction, items, gap, style, .. } => {
-            build_stripe(program, instance, &BuildContext::Item(ctx), direction, *items, gap, style, hovered_cell)
-        }
-        ElementKind::TextInput { placeholder, style, focus, text_cell: reactive_text_cell } => {
-            build_item_text_input(program, instance, ctx, placeholder.as_ref(), style, links, *focus, *reactive_text_cell, hovered_cell)
-        }
-        ElementKind::Checkbox { checked, style, icon } => {
+        ElementKind::Button { label, style } => build_button(
+            program,
+            instance,
+            &BuildContext::Item(ctx),
+            label,
+            style,
+            links,
+            hovered_cell,
+        ),
+        ElementKind::Stripe {
+            direction,
+            items,
+            gap,
+            style,
+            ..
+        } => build_stripe(
+            program,
+            instance,
+            &BuildContext::Item(ctx),
+            direction,
+            *items,
+            gap,
+            style,
+            hovered_cell,
+        ),
+        ElementKind::TextInput {
+            placeholder,
+            style,
+            focus,
+            text_cell: reactive_text_cell,
+        } => build_item_text_input(
+            program,
+            instance,
+            ctx,
+            placeholder.as_ref(),
+            style,
+            links,
+            *focus,
+            *reactive_text_cell,
+            hovered_cell,
+        ),
+        ElementKind::Checkbox {
+            checked,
+            style,
+            icon,
+        } => {
             handled_events = &["click"];
-            build_item_checkbox(program, instance, ctx, checked.as_ref(), style, links, icon.as_ref(), hovered_cell)
+            build_item_checkbox(
+                program,
+                instance,
+                ctx,
+                checked.as_ref(),
+                style,
+                links,
+                icon.as_ref(),
+                hovered_cell,
+            )
         }
-        ElementKind::Container { child, style } => {
-            build_container(program, instance, &BuildContext::Item(ctx), *child, style, hovered_cell)
-        }
-        ElementKind::Label { label, style } => {
-            build_label(program, instance, &BuildContext::Item(ctx), label, style, links, hovered_cell)
-        }
-        ElementKind::Stack { layers, style } => {
-            build_stack(program, instance, &BuildContext::Item(ctx), *layers, style, hovered_cell)
-        }
+        ElementKind::Container { child, style } => build_container(
+            program,
+            instance,
+            &BuildContext::Item(ctx),
+            *child,
+            style,
+            hovered_cell,
+        ),
+        ElementKind::Label { label, style } => build_label(
+            program,
+            instance,
+            &BuildContext::Item(ctx),
+            label,
+            style,
+            links,
+            hovered_cell,
+        ),
+        ElementKind::Stack { layers, style } => build_stack(
+            program,
+            instance,
+            &BuildContext::Item(ctx),
+            *layers,
+            style,
+            hovered_cell,
+        ),
         ElementKind::Link { url, label, style } => {
             // Per-item Link reuses global builder; hover is deferred to attach_item_events.
             remaining_hovered_cell = hovered_cell;
@@ -1879,7 +2180,8 @@ fn build_item_element_node(
     if handled_events.is_empty() {
         attach_item_events(raw, instance, ctx, links, remaining_hovered_cell)
     } else {
-        let filtered: Vec<_> = links.iter()
+        let filtered: Vec<_> = links
+            .iter()
             .filter(|(name, _)| !handled_events.contains(&name.as_str()))
             .cloned()
             .collect();
@@ -1902,10 +2204,16 @@ fn attach_item_events(
     let blur_event = links.iter().find(|(n, _)| n == "blur").map(|(_, e)| *e);
     let focus_event = links.iter().find(|(n, _)| n == "focus").map(|(_, e)| *e);
     let click_event = links.iter().find(|(n, _)| n == "click").map(|(_, e)| *e);
-    let double_click_event = links.iter().find(|(n, _)| n == "double_click").map(|(_, e)| *e);
+    let double_click_event = links
+        .iter()
+        .find(|(n, _)| n == "double_click")
+        .map(|(_, e)| *e);
 
-    if !has_hover && blur_event.is_none() && focus_event.is_none()
-        && click_event.is_none() && double_click_event.is_none()
+    if !has_hover
+        && blur_event.is_none()
+        && focus_event.is_none()
+        && click_event.is_none()
+        && double_click_event.is_none()
     {
         return el;
     }
@@ -2027,8 +2335,6 @@ fn apply_hover<T: MouseEventAware>(
     }
 }
 
-
-
 /// Build a per-item TextInput element.
 fn build_item_text_input(
     program: &IrProgram,
@@ -2041,11 +2347,19 @@ fn build_item_text_input(
     reactive_text_cell: Option<CellId>,
     hovered_cell: Option<CellId>,
 ) -> RawElOrText {
-    let key_down_event = links.iter().find(|(name, _)| name == "key_down").map(|(_, eid)| *eid);
-    let change_event = links.iter().find(|(name, _)| name == "change").map(|(_, eid)| *eid);
+    let key_down_event = links
+        .iter()
+        .find(|(name, _)| name == "key_down")
+        .map(|(_, eid)| *eid);
+    let change_event = links
+        .iter()
+        .find(|(name, _)| name == "change")
+        .map(|(_, eid)| *eid);
     let tmpl_range = Some(ctx.template_cell_range);
-    let key_data_cell = find_data_cell_for_event_in_range(program, links, "key_down", "key", tmpl_range);
-    let change_text_cell = find_data_cell_for_event_in_range(program, links, "change", "text", tmpl_range);
+    let key_data_cell =
+        find_data_cell_for_event_in_range(program, links, "key_down", "key", tmpl_range);
+    let change_text_cell =
+        find_data_cell_for_event_in_range(program, links, "change", "text", tmpl_range);
     let text_cell = find_text_property_cell_in_range(program, links, tmpl_range);
 
     let item_idx = ctx.item_idx;
@@ -2055,18 +2369,23 @@ fn build_item_text_input(
     // or the .text property cell. For edit inputs, this pre-fills the input
     // with the current title.
     let initial_text_for_insert = {
-        let cells_to_try: Vec<u32> = reactive_text_cell.iter().map(|c| c.0)
+        let cells_to_try: Vec<u32> = reactive_text_cell
+            .iter()
+            .map(|c| c.0)
             .chain(text_cell.iter().copied())
             .collect();
         let mut found_text: Option<String> = None;
         for cell_id in cells_to_try {
-            let text = if cell_id >= ctx.template_cell_range.0 && cell_id < ctx.template_cell_range.1 {
-                instance.item_cell_store.as_ref()
-                    .map(|ics| ics.get_text(item_idx, cell_id))
-                    .unwrap_or_default()
-            } else {
-                instance.cell_store.get_cell_text(cell_id)
-            };
+            let text =
+                if cell_id >= ctx.template_cell_range.0 && cell_id < ctx.template_cell_range.1 {
+                    instance
+                        .item_cell_store
+                        .as_ref()
+                        .map(|ics| ics.get_text(item_idx, cell_id))
+                        .unwrap_or_default()
+                } else {
+                    instance.cell_store.get_cell_text(cell_id)
+                };
             if !text.is_empty() {
                 found_text = Some(text);
                 break;
@@ -2126,7 +2445,9 @@ fn build_item_text_input(
                             let input_text = input.value();
                             for cell_id_opt in [change_text_cell, text_cell] {
                                 if let Some(cell_id) = cell_id_opt {
-                                    if cell_id >= template_cell_range.0 && cell_id < template_cell_range.1 {
+                                    if cell_id >= template_cell_range.0
+                                        && cell_id < template_cell_range.1
+                                    {
                                         if let Some(ref ics) = ics {
                                             ics.set_text(item_idx, cell_id, input_text.clone());
                                         }
@@ -2150,7 +2471,9 @@ fn build_item_text_input(
                         let _ = inst.fire_event(event_id.0);
                     }
                 })
-            } else { raw_el };
+            } else {
+                raw_el
+            };
 
             // Set up input change event listener.
             if let Some(event_id) = change_event {
@@ -2164,7 +2487,9 @@ fn build_item_text_input(
                             let input_text = input.value();
                             for cell_id_opt in [change_text_cell, text_cell] {
                                 if let Some(cell_id) = cell_id_opt {
-                                    if cell_id >= template_cell_range.0 && cell_id < template_cell_range.1 {
+                                    if cell_id >= template_cell_range.0
+                                        && cell_id < template_cell_range.1
+                                    {
                                         if let Some(ref ics) = ics {
                                             ics.set_text(item_idx, cell_id, input_text.clone());
                                         }
@@ -2181,7 +2506,9 @@ fn build_item_text_input(
                         let _ = inst.fire_event(event_id.0);
                     }
                 })
-            } else { raw_el }
+            } else {
+                raw_el
+            }
         })
         .into_raw_unchecked()
 }
@@ -2218,7 +2545,9 @@ fn build_item_checkbox(
         if let Some(ref ics) = instance.item_cell_store {
             let ics = ics.clone();
             let cell_id = checked_cell.0;
-            ics.get_signal(item_idx, cell_id).map(move |v| v != 0.0).boxed_local()
+            ics.get_signal(item_idx, cell_id)
+                .map(move |v| v != 0.0)
+                .boxed_local()
         } else {
             always(false).boxed_local()
         }
@@ -2229,7 +2558,9 @@ fn build_item_checkbox(
     // on_change must NOT fire events — see build_checkbox comment for rationale.
     // Use raw DOM click handler to avoid checked_signal → on_change feedback loop.
     let inst_change = instance.clone();
-    let is_template = click_event.map(|e| ctx.is_template_event(e)).unwrap_or(false);
+    let is_template = click_event
+        .map(|e| ctx.is_template_event(e))
+        .unwrap_or(false);
     let mut cb = Checkbox::new()
         .label_hidden("toggle")
         .checked_signal(checked_signal)
@@ -2242,20 +2573,19 @@ fn build_item_checkbox(
     if let Some(cell) = hovered_cell {
         cb = apply_hover(cb, instance, Some(ctx), cell);
     }
-    cb
-        .update_raw_el(|raw_el| {
-            let raw_el = raw_el.event_handler(move |_: events::Click| {
-                if let Some(event_id) = click_event {
-                    if is_template {
-                        let _ = inst_change.call_on_item_event(item_idx, event_id.0);
-                    } else {
-                        let _ = inst_change.fire_event(event_id.0);
-                    }
+    cb.update_raw_el(|raw_el| {
+        let raw_el = raw_el.event_handler(move |_: events::Click| {
+            if let Some(event_id) = click_event {
+                if is_template {
+                    let _ = inst_change.call_on_item_event(item_idx, event_id.0);
+                } else {
+                    let _ = inst_change.fire_event(event_id.0);
                 }
-            });
-            apply_raw_css(raw_el, style, program, instance, Some(ctx), false)
-        })
-        .into_raw_unchecked()
+            }
+        });
+        apply_raw_css(raw_el, style, program, instance, Some(ctx), false)
+    })
+    .into_raw_unchecked()
 }
 
 /// Build a per-item conditional element (WHEN/WHILE) using `child_signal`.
@@ -2324,8 +2654,14 @@ fn find_node_for_cell(program: &IrProgram, cell: CellId) -> Option<&IrNode> {
 fn is_no_element(program: &IrProgram, cell: CellId) -> bool {
     if let Some(node) = find_node_for_cell(program, cell) {
         match node {
-            IrNode::Derived { expr: IrExpr::Constant(IrValue::Tag(t)), .. } => t == "NoElement",
-            IrNode::Derived { expr: IrExpr::CellRead(inner), .. } => is_no_element(program, *inner),
+            IrNode::Derived {
+                expr: IrExpr::Constant(IrValue::Tag(t)),
+                ..
+            } => t == "NoElement",
+            IrNode::Derived {
+                expr: IrExpr::CellRead(inner),
+                ..
+            } => is_no_element(program, *inner),
             _ => false,
         }
     } else {
@@ -2338,12 +2674,13 @@ fn is_no_element(program: &IrProgram, cell: CellId) -> bool {
 fn extract_placeholder_text(expr: &IrExpr, program: &IrProgram) -> String {
     match expr {
         IrExpr::Constant(IrValue::Text(t)) => t.clone(),
-        IrExpr::TextConcat(segs) => {
-            segs.iter().map(|s| match s {
+        IrExpr::TextConcat(segs) => segs
+            .iter()
+            .map(|s| match s {
                 TextSegment::Literal(t) => t.clone(),
                 _ => String::new(),
-            }).collect()
-        }
+            })
+            .collect(),
         IrExpr::ObjectConstruct(fields) => {
             // Look for a "text" field in the object.
             for (name, val) in fields {
@@ -2376,8 +2713,12 @@ fn build_placeholder<'a>(placeholder: Option<&IrExpr>, program: &IrProgram) -> P
     let mut ph_el = Placeholder::new(text);
     if let Some((is_italic, color_css)) = extract_placeholder_font(ph, program) {
         let mut font = Font::new();
-        if is_italic { font = font.italic(); }
-        if let Some(css) = color_css { font = font.color(css); }
+        if is_italic {
+            font = font.italic();
+        }
+        if let Some(css) = color_css {
+            font = font.color(css);
+        }
         ph_el = ph_el.s(font);
     }
     ph_el
@@ -2388,26 +2729,35 @@ fn build_placeholder<'a>(placeholder: Option<&IrExpr>, program: &IrProgram) -> P
 /// to find font style and color.
 fn extract_placeholder_font(expr: &IrExpr, program: &IrProgram) -> Option<(bool, Option<String>)> {
     let fields: Vec<(String, IrExpr)> = match expr {
-        IrExpr::ObjectConstruct(fields) => fields.iter().map(|(n, v)| (n.clone(), v.clone())).collect(),
+        IrExpr::ObjectConstruct(fields) => {
+            fields.iter().map(|(n, v)| (n.clone(), v.clone())).collect()
+        }
         IrExpr::CellRead(cell) => reconstruct_object_fields(program, *cell),
         _ => return None,
     };
     extract_font_from_fields(&fields, program)
 }
 
-fn extract_font_from_fields(fields: &[(String, IrExpr)], program: &IrProgram) -> Option<(bool, Option<String>)> {
+fn extract_font_from_fields(
+    fields: &[(String, IrExpr)],
+    program: &IrProgram,
+) -> Option<(bool, Option<String>)> {
     for (name, val) in fields {
         if name == "style" {
             // Unwrap "style" wrapper and recurse.
             let inner = match val {
-                IrExpr::ObjectConstruct(f) => f.iter().map(|(n, v)| (n.clone(), v.clone())).collect(),
+                IrExpr::ObjectConstruct(f) => {
+                    f.iter().map(|(n, v)| (n.clone(), v.clone())).collect()
+                }
                 IrExpr::CellRead(cell) => reconstruct_object_fields(program, *cell),
                 _ => continue,
             };
             return extract_font_from_fields(&inner, program);
         } else if name == "font" {
             let font_fields: Vec<(String, IrExpr)> = match val {
-                IrExpr::ObjectConstruct(f) => f.iter().map(|(n, v)| (n.clone(), v.clone())).collect(),
+                IrExpr::ObjectConstruct(f) => {
+                    f.iter().map(|(n, v)| (n.clone(), v.clone())).collect()
+                }
                 IrExpr::CellRead(cell) => reconstruct_object_fields(program, *cell),
                 _ => continue,
             };
@@ -2417,10 +2767,14 @@ fn extract_font_from_fields(fields: &[(String, IrExpr)], program: &IrProgram) ->
                 match fname.as_str() {
                     "style" => {
                         if let IrExpr::Constant(IrValue::Tag(t)) = fval {
-                            if t == "Italic" { is_italic = true; }
+                            if t == "Italic" {
+                                is_italic = true;
+                            }
                         }
                     }
-                    "color" => { color_css = resolve_color(fval); }
+                    "color" => {
+                        color_css = resolve_color(fval);
+                    }
                     _ => {}
                 }
             }
@@ -2430,21 +2784,19 @@ fn extract_font_from_fields(fields: &[(String, IrExpr)], program: &IrProgram) ->
     None
 }
 
-
 /// Evaluate a static text expression to a String.
 fn eval_static_text(expr: &IrExpr) -> String {
     match expr {
         IrExpr::Constant(IrValue::Text(t)) => t.clone(),
         IrExpr::Constant(IrValue::Number(n)) => format_number(*n),
         IrExpr::Constant(IrValue::Tag(t)) => t.clone(),
-        IrExpr::TextConcat(segs) => {
-            segs.iter()
-                .map(|s| match s {
-                    TextSegment::Literal(t) => t.clone(),
-                    _ => String::new(),
-                })
-                .collect()
-        }
+        IrExpr::TextConcat(segs) => segs
+            .iter()
+            .map(|s| match s {
+                TextSegment::Literal(t) => t.clone(),
+                _ => String::new(),
+            })
+            .collect(),
         _ => String::new(),
     }
 }
@@ -2457,19 +2809,24 @@ fn resolve_static_text(program: &IrProgram, expr: &IrExpr) -> String {
 }
 
 fn resolve_static_text_depth(program: &IrProgram, expr: &IrExpr, depth: u32) -> String {
-    if depth > 20 { return String::new(); }
+    if depth > 20 {
+        return String::new();
+    }
     match expr {
         IrExpr::CellRead(cell) => {
             // Find the node for this cell and extract its expression.
             if let Some(node) = find_node_for_cell(program, *cell) {
                 match node {
-                    IrNode::Derived { expr: inner, .. } => resolve_static_text_depth(program, inner, depth + 1),
-                    IrNode::TextInterpolation { parts, .. } => {
-                        parts.iter().map(|seg| match seg {
+                    IrNode::Derived { expr: inner, .. } => {
+                        resolve_static_text_depth(program, inner, depth + 1)
+                    }
+                    IrNode::TextInterpolation { parts, .. } => parts
+                        .iter()
+                        .map(|seg| match seg {
                             TextSegment::Literal(t) => t.clone(),
                             _ => String::new(),
-                        }).collect()
-                    }
+                        })
+                        .collect(),
                     IrNode::When { source, arms, .. } | IrNode::While { source, arms, .. } => {
                         resolve_when_text_statically(program, *source, arms, depth + 1)
                     }
@@ -2493,7 +2850,9 @@ fn resolve_when_text_statically(
     arms: &[(IrPattern, IrExpr)],
     depth: u32,
 ) -> String {
-    if depth > 20 { return String::new(); }
+    if depth > 20 {
+        return String::new();
+    }
     let source_value = resolve_cell_constant(program, source, depth + 1);
 
     for (pattern, body) in arms {
@@ -2518,7 +2877,9 @@ enum ConstValue {
 
 /// Resolve a cell to its constant value (if it has one).
 fn resolve_cell_constant(program: &IrProgram, cell: CellId, depth: u32) -> Option<ConstValue> {
-    if depth > 20 { return None; }
+    if depth > 20 {
+        return None;
+    }
     let node = find_node_for_cell(program, cell)?;
     match node {
         IrNode::Derived { expr, .. } => resolve_expr_constant(program, expr, depth + 1),
@@ -2527,7 +2888,9 @@ fn resolve_cell_constant(program: &IrProgram, cell: CellId, depth: u32) -> Optio
 }
 
 fn resolve_expr_constant(program: &IrProgram, expr: &IrExpr, depth: u32) -> Option<ConstValue> {
-    if depth > 20 { return None; }
+    if depth > 20 {
+        return None;
+    }
     match expr {
         IrExpr::Constant(IrValue::Tag(t)) => Some(ConstValue::Tag(t.clone())),
         IrExpr::Constant(IrValue::Number(n)) => Some(ConstValue::Number(*n)),
@@ -2561,35 +2924,19 @@ fn extract_style_fields_vec<'a>(
 }
 
 /// Build a typed Width style from an IR dimension expression.
-fn build_width(value: &IrExpr, is_row: bool) -> Option<Width<'static>> {
+fn build_width(value: &IrExpr) -> Option<Width<'static>> {
     match value {
         IrExpr::Constant(IrValue::Number(n)) => Some(Width::exact(*n as u32)),
-        IrExpr::Constant(IrValue::Tag(t)) if t == "Fill" => {
-            if is_row {
-                // In a row flex, fill width = grow on main axis
-                Some(Width::growable())
-            } else {
-                // In a column flex, fill width = stretch on cross axis (100%)
-                Some(Width::fill())
-            }
-        }
+        IrExpr::Constant(IrValue::Tag(t)) if t == "Fill" => Some(Width::fill()),
         _ => None,
     }
 }
 
 /// Build a typed Height style from an IR dimension expression.
-fn build_height(value: &IrExpr, is_row: bool) -> Option<Height<'static>> {
+fn build_height(value: &IrExpr) -> Option<Height<'static>> {
     match value {
         IrExpr::Constant(IrValue::Number(n)) => Some(Height::exact(*n as u32)),
-        IrExpr::Constant(IrValue::Tag(t)) if t == "Fill" => {
-            if is_row {
-                // In a row flex, fill height = stretch on cross axis (100%)
-                Some(Height::fill())
-            } else {
-                // In a column flex, fill height = grow on main axis
-                Some(Height::growable())
-            }
-        }
+        IrExpr::Constant(IrValue::Tag(t)) if t == "Fill" => Some(Height::fill()),
         _ => None,
     }
 }
@@ -2610,8 +2957,14 @@ fn build_padding(value: &IrExpr) -> Option<Padding<'static>> {
                     "bottom" => bottom = Some(px),
                     "left" => left = Some(px),
                     "right" => right = Some(px),
-                    "row" => { left = left.or(Some(px)); right = right.or(Some(px)); }
-                    "column" => { top = top.or(Some(px)); bottom = bottom.or(Some(px)); }
+                    "row" => {
+                        left = left.or(Some(px));
+                        right = right.or(Some(px));
+                    }
+                    "column" => {
+                        top = top.or(Some(px));
+                        bottom = bottom.or(Some(px));
+                    }
                     _ => {}
                 }
             }
@@ -2649,10 +3002,7 @@ fn build_rounded_corners(value: &IrExpr) -> Option<RoundedCorners> {
 /// Build a typed Font style (static parts only — size, weight, family, align, italic).
 /// Returns the Font and a flag indicating whether reactive styles (color, strikethrough)
 /// must be applied via raw CSS because they need signals.
-fn build_font_static(
-    value: &IrExpr,
-    program: &IrProgram,
-) -> Option<Font<'static>> {
+fn build_font_static(value: &IrExpr, program: &IrProgram) -> Option<Font<'static>> {
     let reconstructed;
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(fields) => fields,
@@ -2775,14 +3125,15 @@ fn build_font_static(
             _ => {}
         }
     }
-    if has_any { Some(font) } else { None }
+    if has_any {
+        Some(font)
+    } else {
+        None
+    }
 }
 
 /// Build a typed Background style (static color + static URL only).
-fn build_background_static(
-    value: &IrExpr,
-    program: &IrProgram,
-) -> Option<Background<'static>> {
+fn build_background_static(value: &IrExpr, program: &IrProgram) -> Option<Background<'static>> {
     let reconstructed;
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(fields) => fields,
@@ -2806,7 +3157,11 @@ fn build_background_static(
             }
             "url" => {
                 let url = eval_static_text(val);
-                let url = if url.is_empty() { resolve_static_text(program, val) } else { url };
+                let url = if url.is_empty() {
+                    resolve_static_text(program, val)
+                } else {
+                    url
+                };
                 if !url.is_empty() {
                     bg = bg.url(url).size(BackgroundSize::Contain);
                     has_any = true;
@@ -2816,7 +3171,11 @@ fn build_background_static(
             _ => {}
         }
     }
-    if has_any { Some(bg) } else { None }
+    if has_any {
+        Some(bg)
+    } else {
+        None
+    }
 }
 
 /// Build a typed Borders style.
@@ -2827,25 +3186,47 @@ fn build_borders(value: &IrExpr) -> Option<Borders<'static>> {
 
         for (name, val) in fields {
             if let IrExpr::ObjectConstruct(border_fields) = val {
-                let color_css = border_fields.iter()
+                let color_css = border_fields
+                    .iter()
                     .find(|(n, _)| n == "color")
                     .and_then(|(_, v)| resolve_color_full(v))
                     .unwrap_or_else(|| "currentColor".to_string());
-                let width = border_fields.iter()
+                let width = border_fields
+                    .iter()
                     .find(|(n, _)| n == "width")
-                    .and_then(|(_, v)| if let IrExpr::Constant(IrValue::Number(n)) = v { Some(*n) } else { None })
+                    .and_then(|(_, v)| {
+                        if let IrExpr::Constant(IrValue::Number(n)) = v {
+                            Some(*n)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(1.0);
                 let border = Border::new().width(width as u32).color(color_css);
                 match name.as_str() {
-                    "top" => { borders = borders.top(border); has_any = true; }
-                    "bottom" => { borders = borders.bottom(border); has_any = true; }
-                    "left" => { borders = borders.left(border); has_any = true; }
-                    "right" => { borders = borders.right(border); has_any = true; }
+                    "top" => {
+                        borders = borders.top(border);
+                        has_any = true;
+                    }
+                    "bottom" => {
+                        borders = borders.bottom(border);
+                        has_any = true;
+                    }
+                    "left" => {
+                        borders = borders.left(border);
+                        has_any = true;
+                    }
+                    "right" => {
+                        borders = borders.right(border);
+                        has_any = true;
+                    }
                     _ => {}
                 }
             }
         }
-        if has_any { return Some(borders); }
+        if has_any {
+            return Some(borders);
+        }
     }
     None
 }
@@ -2856,7 +3237,11 @@ fn build_shadows(value: &IrExpr, program: &IrProgram) -> Option<Shadows<'static>
     let items = match value {
         IrExpr::ListConstruct(items) => items,
         IrExpr::CellRead(cell) => {
-            if let Some(IrNode::Derived { expr: IrExpr::ListConstruct(items), .. }) = find_node_for_cell(program, *cell) {
+            if let Some(IrNode::Derived {
+                expr: IrExpr::ListConstruct(items),
+                ..
+            }) = find_node_for_cell(program, *cell)
+            {
                 resolved = items.clone();
                 &resolved
             } else {
@@ -2888,27 +3273,56 @@ fn build_shadows(value: &IrExpr, program: &IrProgram) -> Option<Shadows<'static>
 
         for (name, val) in fields {
             match name.as_str() {
-                "x" => if let IrExpr::Constant(IrValue::Number(n)) = val { x = *n as i32; },
-                "y" => if let IrExpr::Constant(IrValue::Number(n)) = val { y = *n as i32; },
-                "blur" => if let IrExpr::Constant(IrValue::Number(n)) = val { blur = *n as u32; },
-                "spread" => if let IrExpr::Constant(IrValue::Number(n)) = val { spread = *n as i32; },
-                "color" => { color = resolve_color_full(val).unwrap_or(color); },
+                "x" => {
+                    if let IrExpr::Constant(IrValue::Number(n)) = val {
+                        x = *n as i32;
+                    }
+                }
+                "y" => {
+                    if let IrExpr::Constant(IrValue::Number(n)) = val {
+                        y = *n as i32;
+                    }
+                }
+                "blur" => {
+                    if let IrExpr::Constant(IrValue::Number(n)) = val {
+                        blur = *n as u32;
+                    }
+                }
+                "spread" => {
+                    if let IrExpr::Constant(IrValue::Number(n)) = val {
+                        spread = *n as i32;
+                    }
+                }
+                "color" => {
+                    color = resolve_color_full(val).unwrap_or(color);
+                }
                 "direction" => {
                     if let IrExpr::Constant(IrValue::Tag(t)) = val {
-                        if t == "Inwards" { inset = true; }
+                        if t == "Inwards" {
+                            inset = true;
+                        }
                     }
                 }
                 _ => {}
             }
         }
 
-        let mut shadow = Shadow::new().x(x).y(y).blur(blur).spread(spread).color(color);
+        let mut shadow = Shadow::new()
+            .x(x)
+            .y(y)
+            .blur(blur)
+            .spread(spread)
+            .color(color);
         if inset {
             shadow = shadow.inner();
         }
         shadow_vec.push(shadow);
     }
-    if shadow_vec.is_empty() { None } else { Some(Shadows::new(shadow_vec)) }
+    if shadow_vec.is_empty() {
+        None
+    } else {
+        Some(Shadows::new(shadow_vec))
+    }
 }
 
 /// Build a typed Transform style.
@@ -2931,8 +3345,13 @@ fn build_transform(value: &IrExpr, program: &IrProgram) -> Option<Transform> {
         let resolve_number = |v: &IrExpr| -> Option<f64> {
             match v {
                 IrExpr::Constant(IrValue::Number(n)) => Some(*n),
-                _ => resolve_expr_constant(program, v, 0)
-                    .and_then(|c| if let ConstValue::Number(n) = c { Some(n) } else { None }),
+                _ => resolve_expr_constant(program, v, 0).and_then(|c| {
+                    if let ConstValue::Number(n) = c {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                }),
             }
         };
         match name.as_str() {
@@ -2975,7 +3394,11 @@ fn build_transform(value: &IrExpr, program: &IrProgram) -> Option<Transform> {
             _ => {}
         }
     }
-    if has_any { Some(transform) } else { None }
+    if has_any {
+        Some(transform)
+    } else {
+        None
+    }
 }
 
 /// Apply typed Zoon styles to a Styleable element.
@@ -2995,12 +3418,12 @@ fn apply_typed_styles<T: Styleable<'static>>(
     for (name, value) in fields {
         match name.as_str() {
             "width" => {
-                if let Some(w) = build_width(value, is_row) {
+                if let Some(w) = build_width(value) {
                     el = el.s(w);
                 }
             }
             "height" => {
-                if let Some(h) = build_height(value, is_row) {
+                if let Some(h) = build_height(value) {
                     el = el.s(h);
                 }
             }
@@ -3207,12 +3630,23 @@ where
             "color" => {
                 // Only apply reactive color — static color is in build_background_static.
                 if resolve_color(val).is_none() {
-                    el = apply_reactive_color(el, "background-color", val, program, instance, item_ctx);
+                    el = apply_reactive_color(
+                        el,
+                        "background-color",
+                        val,
+                        program,
+                        instance,
+                        item_ctx,
+                    );
                 }
             }
             "url" => {
                 let url = eval_static_text(val);
-                let url2 = if url.is_empty() { resolve_static_text(program, val) } else { url };
+                let url2 = if url.is_empty() {
+                    resolve_static_text(program, val)
+                } else {
+                    url
+                };
                 if url2.is_empty() {
                     // No static URL — must be reactive.
                     el = apply_reactive_background_url(el, val, program, instance, item_ctx);
@@ -3296,9 +3730,15 @@ fn apply_font_line<T: RawEl>(
                                 // Per-item cell — use item cell store signal.
                                 let cell_id = cell.0;
                                 let item_idx = ctx.item_idx;
-                                el = el.style_signal("text-decoration",
-                                    ics.get_signal(item_idx, cell_id)
-                                        .map(|v| if v != 0.0 { Some("line-through") } else { Some("none") })
+                                el = el.style_signal(
+                                    "text-decoration",
+                                    ics.get_signal(item_idx, cell_id).map(|v| {
+                                        if v != 0.0 {
+                                            Some("line-through")
+                                        } else {
+                                            Some("none")
+                                        }
+                                    }),
                                 );
                                 continue;
                             }
@@ -3307,9 +3747,15 @@ fn apply_font_line<T: RawEl>(
                     // Global cell — use cell store.
                     let store = instance.cell_store.clone();
                     let cell_id = cell.0;
-                    el = el.style_signal("text-decoration",
-                        store.get_cell_signal(cell_id)
-                            .map(|v| if v != 0.0 { Some("line-through") } else { Some("none") })
+                    el = el.style_signal(
+                        "text-decoration",
+                        store.get_cell_signal(cell_id).map(|v| {
+                            if v != 0.0 {
+                                Some("line-through")
+                            } else {
+                                Some("none")
+                            }
+                        }),
                     );
                 }
                 _ => {}
@@ -3325,7 +3771,11 @@ fn resolve_font_family(expr: &IrExpr, program: &IrProgram) -> Option<String> {
     let items = match expr {
         IrExpr::ListConstruct(items) => items.clone(),
         IrExpr::CellRead(cell) => {
-            if let Some(IrNode::Derived { expr: IrExpr::ListConstruct(items), .. }) = find_node_for_cell(program, *cell) {
+            if let Some(IrNode::Derived {
+                expr: IrExpr::ListConstruct(items),
+                ..
+            }) = find_node_for_cell(program, *cell)
+            {
                 items.clone()
             } else {
                 return None;
@@ -3334,36 +3784,48 @@ fn resolve_font_family(expr: &IrExpr, program: &IrProgram) -> Option<String> {
         _ => return None,
     };
 
-    let families: Vec<String> = items.iter().filter_map(|item| {
-        match item {
+    let families: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
             IrExpr::Constant(IrValue::Text(t)) => Some(format!("\"{}\"", t)),
-            IrExpr::Constant(IrValue::Tag(t)) => {
-                match t.as_str() {
-                    "SansSerif" => Some("sans-serif".to_string()),
-                    "Serif" => Some("serif".to_string()),
-                    "Monospace" => Some("monospace".to_string()),
-                    _ => Some(t.clone()),
-                }
-            }
+            IrExpr::Constant(IrValue::Tag(t)) => match t.as_str() {
+                "SansSerif" => Some("sans-serif".to_string()),
+                "Serif" => Some("serif".to_string()),
+                "Monospace" => Some("monospace".to_string()),
+                _ => Some(t.clone()),
+            },
             IrExpr::CellRead(cell) => {
                 if let Some(node) = find_node_for_cell(program, *cell) {
                     match node {
-                        IrNode::TextInterpolation { parts, .. } | IrNode::Derived { expr: IrExpr::TextConcat(parts), .. } => {
-                            let text: String = parts.iter().map(|p| match p {
-                                TextSegment::Literal(s) => s.clone(),
-                                _ => String::new(),
-                            }).collect();
-                            if text.is_empty() { None } else { Some(format!("\"{}\"", text)) }
-                        }
-                        IrNode::Derived { expr: IrExpr::Constant(IrValue::Text(t)), .. } => {
-                            Some(format!("\"{}\"", t))
-                        }
-                        IrNode::Derived { expr: IrExpr::Constant(IrValue::Tag(t)), .. } => {
-                            match t.as_str() {
-                                "SansSerif" => Some("sans-serif".to_string()),
-                                _ => Some(t.clone()),
+                        IrNode::TextInterpolation { parts, .. }
+                        | IrNode::Derived {
+                            expr: IrExpr::TextConcat(parts),
+                            ..
+                        } => {
+                            let text: String = parts
+                                .iter()
+                                .map(|p| match p {
+                                    TextSegment::Literal(s) => s.clone(),
+                                    _ => String::new(),
+                                })
+                                .collect();
+                            if text.is_empty() {
+                                None
+                            } else {
+                                Some(format!("\"{}\"", text))
                             }
                         }
+                        IrNode::Derived {
+                            expr: IrExpr::Constant(IrValue::Text(t)),
+                            ..
+                        } => Some(format!("\"{}\"", t)),
+                        IrNode::Derived {
+                            expr: IrExpr::Constant(IrValue::Tag(t)),
+                            ..
+                        } => match t.as_str() {
+                            "SansSerif" => Some("sans-serif".to_string()),
+                            _ => Some(t.clone()),
+                        },
                         _ => None,
                     }
                 } else {
@@ -3371,10 +3833,14 @@ fn resolve_font_family(expr: &IrExpr, program: &IrProgram) -> Option<String> {
                 }
             }
             _ => None,
-        }
-    }).collect();
+        })
+        .collect();
 
-    if families.is_empty() { None } else { Some(families.join(", ")) }
+    if families.is_empty() {
+        None
+    } else {
+        Some(families.join(", "))
+    }
 }
 
 /// Apply reactive visibility via style_signal. Watches a cell and maps
@@ -3393,18 +3859,26 @@ fn apply_reactive_visible<T: RawEl>(
             if ctx.is_template_cell(*cell) {
                 if let Some(ref ics) = instance.item_cell_store {
                     let item_idx = ctx.item_idx;
-                    return el.style_signal("visibility",
-                        ics.get_signal(item_idx, cell_id)
-                            .map(|v| if v != 0.0 { "visible" } else { "hidden" })
+                    return el.style_signal(
+                        "visibility",
+                        ics.get_signal(item_idx, cell_id).map(|v| {
+                            if v != 0.0 {
+                                "visible"
+                            } else {
+                                "hidden"
+                            }
+                        }),
                     );
                 }
             }
         }
         // Global cell path.
         let store = instance.cell_store.clone();
-        return el.style_signal("visibility",
-            store.get_cell_signal(cell_id)
-                .map(|v| if v != 0.0 { "visible" } else { "hidden" })
+        return el.style_signal(
+            "visibility",
+            store
+                .get_cell_signal(cell_id)
+                .map(|v| if v != 0.0 { "visible" } else { "hidden" }),
         );
     }
     el
@@ -3456,10 +3930,11 @@ where
                         }
                         let ics_clone = ics.clone();
                         el = el.after_insert(move |dom_el| {
-                            let element: web_sys::HtmlElement = AsRef::<web_sys::HtmlElement>::as_ref(&dom_el).clone();
+                            let element: web_sys::HtmlElement =
+                                AsRef::<web_sys::HtmlElement>::as_ref(&dom_el).clone();
                             let handle = Task::start_droppable(
-                                ics_clone.get_signal(item_idx, source_id)
-                                    .for_each_sync(move |val| {
+                                ics_clone.get_signal(item_idx, source_id).for_each_sync(
+                                    move |val| {
                                         for (pat_val, url) in &arm_urls {
                                             if val == *pat_val {
                                                 let _ = element.style().set_property(
@@ -3469,7 +3944,8 @@ where
                                                 break;
                                             }
                                         }
-                                    })
+                                    },
+                                ),
                             );
                             std::mem::forget(handle);
                         });
@@ -3487,20 +3963,19 @@ where
                 }
                 let store = instance.cell_store.clone();
                 el = el.after_insert(move |dom_el| {
-                    let element: web_sys::HtmlElement = AsRef::<web_sys::HtmlElement>::as_ref(&dom_el).clone();
+                    let element: web_sys::HtmlElement =
+                        AsRef::<web_sys::HtmlElement>::as_ref(&dom_el).clone();
                     let handle = Task::start_droppable(
-                        store.get_cell_signal(source_id)
-                            .for_each_sync(move |val| {
-                                for (pat_val, url) in &arm_urls {
-                                    if val == *pat_val {
-                                        let _ = element.style().set_property(
-                                            "background-image",
-                                            &format!("url({})", url),
-                                        );
-                                        break;
-                                    }
+                        store.get_cell_signal(source_id).for_each_sync(move |val| {
+                            for (pat_val, url) in &arm_urls {
+                                if val == *pat_val {
+                                    let _ = element
+                                        .style()
+                                        .set_property("background-image", &format!("url({})", url));
+                                    break;
                                 }
-                            })
+                            }
+                        }),
                     );
                     std::mem::forget(handle);
                 });
@@ -3556,11 +4031,19 @@ fn apply_align<T: RawEl>(
             };
             match (name.as_str(), is_row_direction) {
                 // Column flex: row=cross(align-items), column=main(justify-content)
-                ("row", false) => { el = el.style("align-items", css_val); }
-                ("column", false) => { el = el.style("justify-content", css_val); }
+                ("row", false) => {
+                    el = el.style("align-items", css_val);
+                }
+                ("column", false) => {
+                    el = el.style("justify-content", css_val);
+                }
                 // Row flex: row=main(justify-content), column=cross(align-items)
-                ("row", true) => { el = el.style("justify-content", css_val); }
-                ("column", true) => { el = el.style("align-items", css_val); }
+                ("row", true) => {
+                    el = el.style("justify-content", css_val);
+                }
+                ("column", true) => {
+                    el = el.style("align-items", css_val);
+                }
                 _ => {}
             }
         }
@@ -3572,12 +4055,12 @@ fn apply_align<T: RawEl>(
 fn pattern_to_f64(pat: &IrPattern, program: &IrProgram) -> f64 {
     match pat {
         IrPattern::Number(n) => *n,
-        IrPattern::Tag(tag) => {
-            program.tag_table.iter()
-                .position(|t| t == tag)
-                .map(|i| (i + 1) as f64)
-                .unwrap_or(0.0)
-        }
+        IrPattern::Tag(tag) => program
+            .tag_table
+            .iter()
+            .position(|t| t == tag)
+            .map(|i| (i + 1) as f64)
+            .unwrap_or(0.0),
         IrPattern::Text(_) | IrPattern::Wildcard | IrPattern::Binding(_) => 0.0,
     }
 }
@@ -3589,13 +4072,18 @@ fn resolve_outline_css(value: &IrExpr) -> (String, String) {
             ("none".to_string(), "none".to_string())
         }
         IrExpr::ObjectConstruct(fields) => {
-            let color = fields.iter()
+            let color = fields
+                .iter()
                 .find(|(n, _)| n == "color")
                 .and_then(|(_, v)| resolve_color_full(v))
                 .unwrap_or_else(|| "currentColor".to_string());
-            let side = fields.iter()
-                .find(|(n, _)| n == "side")
-                .and_then(|(_, v)| if let IrExpr::Constant(IrValue::Tag(t)) = v { Some(t.as_str()) } else { None });
+            let side = fields.iter().find(|(n, _)| n == "side").and_then(|(_, v)| {
+                if let IrExpr::Constant(IrValue::Tag(t)) = v {
+                    Some(t.as_str())
+                } else {
+                    None
+                }
+            });
             if side == Some("Inner") {
                 ("none".to_string(), format!("inset 0 0 0 1px {}", color))
             } else {
@@ -3623,9 +4111,23 @@ fn collect_outline_arm_css(
                 // Nested WHILE/WHEN — recurse.
                 if let Some(node) = find_node_for_cell(program, *inner_cell) {
                     match node {
-                        IrNode::While { source: inner_source, arms: inner_arms, .. }
-                        | IrNode::When { source: inner_source, arms: inner_arms, .. } => {
-                            collect_outline_arm_css(program, instance, inner_arms, *inner_source, result);
+                        IrNode::While {
+                            source: inner_source,
+                            arms: inner_arms,
+                            ..
+                        }
+                        | IrNode::When {
+                            source: inner_source,
+                            arms: inner_arms,
+                            ..
+                        } => {
+                            collect_outline_arm_css(
+                                program,
+                                instance,
+                                inner_arms,
+                                *inner_source,
+                                result,
+                            );
                         }
                         IrNode::Derived { expr, .. } => {
                             // Check if this is a namespace cell (Void + cell_field_cells)
@@ -3674,35 +4176,44 @@ where
                         collect_outline_arm_css(program, instance, arms, *source, &mut all_css);
 
                         // Collect unique source cells to watch.
-                        let mut source_cells: Vec<CellId> = all_css.iter().map(|(s, _, _, _)| *s).collect();
+                        let mut source_cells: Vec<CellId> =
+                            all_css.iter().map(|(s, _, _, _)| *s).collect();
                         source_cells.sort_by_key(|c| c.0);
                         source_cells.dedup();
 
                         // Set initial outline from current cell values.
                         let initial_css = resolve_active_outline(&all_css, &instance.cell_store);
                         if let Some((outline, shadow)) = initial_css {
-                            if !outline.is_empty() { el = el.style("outline", &outline); }
-                            if !shadow.is_empty() { el = el.style("box-shadow", &shadow); }
+                            if !outline.is_empty() {
+                                el = el.style("outline", &outline);
+                            }
+                            if !shadow.is_empty() {
+                                el = el.style("box-shadow", &shadow);
+                            }
                         }
 
                         // Watch all source cells and update outline reactively.
                         let store = instance.cell_store.clone();
                         let source_cells_clone = source_cells.clone();
                         el = el.after_insert(move |dom_el| {
-                            let element: web_sys::HtmlElement = AsRef::<web_sys::HtmlElement>::as_ref(&dom_el).clone();
+                            let element: web_sys::HtmlElement =
+                                AsRef::<web_sys::HtmlElement>::as_ref(&dom_el).clone();
                             for source_cell in &source_cells_clone {
                                 let all_css = all_css.clone();
                                 let store2 = store.clone();
                                 let el2 = element.clone();
                                 let handle = Task::start_droppable(
-                                    store.get_cell_signal(source_cell.0)
-                                        .for_each_sync(move |_val| {
-                                            if let Some((outline, shadow)) = resolve_active_outline(&all_css, &store2) {
+                                    store.get_cell_signal(source_cell.0).for_each_sync(
+                                        move |_val| {
+                                            if let Some((outline, shadow)) =
+                                                resolve_active_outline(&all_css, &store2)
+                                            {
                                                 let style = el2.style();
                                                 let _ = style.set_property("outline", &outline);
                                                 let _ = style.set_property("box-shadow", &shadow);
                                             }
-                                        })
+                                        },
+                                    ),
                                 );
                                 std::mem::forget(handle);
                             }
@@ -3710,8 +4221,12 @@ where
                     }
                     IrNode::Derived { expr, .. } => {
                         let (outline, shadow) = resolve_outline_css(expr);
-                        if !outline.is_empty() { el = el.style("outline", &outline); }
-                        if !shadow.is_empty() { el = el.style("box-shadow", &shadow); }
+                        if !outline.is_empty() {
+                            el = el.style("outline", &outline);
+                        }
+                        if !shadow.is_empty() {
+                            el = el.style("box-shadow", &shadow);
+                        }
                     }
                     _ => {}
                 }
@@ -3719,8 +4234,12 @@ where
         }
         other => {
             let (outline, shadow) = resolve_outline_css(other);
-            if !outline.is_empty() { el = el.style("outline", &outline); }
-            if !shadow.is_empty() { el = el.style("box-shadow", &shadow); }
+            if !outline.is_empty() {
+                el = el.style("outline", &outline);
+            }
+            if !shadow.is_empty() {
+                el = el.style("box-shadow", &shadow);
+            }
         }
     }
     el
@@ -3747,9 +4266,7 @@ fn resolve_active_outline(
 /// Full color resolver — handles Oklch with all parameters.
 fn resolve_color_full(expr: &IrExpr) -> Option<String> {
     match expr {
-        IrExpr::Constant(IrValue::Tag(tag)) => {
-            Some(tag.to_lowercase())
-        }
+        IrExpr::Constant(IrValue::Tag(tag)) => Some(tag.to_lowercase()),
         IrExpr::TaggedObject { tag, fields } if tag == "Oklch" => {
             let mut lightness = 0.0;
             let mut chroma = 0.0;
@@ -3757,15 +4274,13 @@ fn resolve_color_full(expr: &IrExpr) -> Option<String> {
             let mut alpha = 1.0;
             for (name, value) in fields {
                 match value {
-                    IrExpr::Constant(IrValue::Number(n)) => {
-                        match name.as_str() {
-                            "lightness" => lightness = *n,
-                            "chroma" => chroma = *n,
-                            "hue" => hue = *n,
-                            "alpha" => alpha = *n,
-                            _ => {}
-                        }
-                    }
+                    IrExpr::Constant(IrValue::Number(n)) => match name.as_str() {
+                        "lightness" => lightness = *n,
+                        "chroma" => chroma = *n,
+                        "hue" => hue = *n,
+                        "alpha" => alpha = *n,
+                        _ => {}
+                    },
                     // If any field is reactive (CellRead, etc.), this color
                     // can't be resolved statically — return None so the caller
                     // falls through to apply_reactive_color.
@@ -3773,7 +4288,10 @@ fn resolve_color_full(expr: &IrExpr) -> Option<String> {
                 }
             }
             if alpha < 1.0 {
-                Some(format!("oklch({} {} {} / {})", lightness, chroma, hue, alpha))
+                Some(format!(
+                    "oklch({} {} {} / {})",
+                    lightness, chroma, hue, alpha
+                ))
             } else {
                 Some(format!("oklch({} {} {})", lightness, chroma, hue))
             }
@@ -3832,16 +4350,20 @@ fn apply_reactive_color<T: RawEl>(
         let driver_cell = lightness_cell.or(chroma_cell).or(hue_cell);
         if let Some(cell_id) = driver_cell {
             let store = instance.cell_store.clone();
-            return el.style_signal(css_prop, store.get_cell_signal(cell_id).map(move |_| {
-                let l = lightness_cell.map_or(lightness_default, |cid| store.get_cell_value(cid));
-                let c = chroma_cell.map_or(chroma_default, |cid| store.get_cell_value(cid));
-                let h = hue_cell.map_or(hue_default, |hid| store.get_cell_value(hid));
-                if alpha_val < 1.0 {
-                    Some(format!("oklch({} {} {} / {})", l, c, h, alpha_val))
-                } else {
-                    Some(format!("oklch({} {} {})", l, c, h))
-                }
-            }));
+            return el.style_signal(
+                css_prop,
+                store.get_cell_signal(cell_id).map(move |_| {
+                    let l =
+                        lightness_cell.map_or(lightness_default, |cid| store.get_cell_value(cid));
+                    let c = chroma_cell.map_or(chroma_default, |cid| store.get_cell_value(cid));
+                    let h = hue_cell.map_or(hue_default, |hid| store.get_cell_value(hid));
+                    if alpha_val < 1.0 {
+                        Some(format!("oklch({} {} {} / {})", l, c, h, alpha_val))
+                    } else {
+                        Some(format!("oklch({} {} {})", l, c, h))
+                    }
+                }),
+            );
         }
     }
     // Case 2: CellRead pointing to a PatternMatch node whose arms produce constant Oklch values.
@@ -3851,33 +4373,40 @@ fn apply_reactive_color<T: RawEl>(
         if let Some(color_mapping) = resolve_pattern_match_colors(program, *cell) {
             // color_mapping: (source_cell, vec of (pattern_value, css_color), default_css)
             let (source_cell, arms, default_css) = color_mapping;
-            let is_template = item_ctx.map_or(false, |ctx|
-                source_cell.0 >= ctx.template_cell_range.0 && source_cell.0 < ctx.template_cell_range.1
-            );
+            let is_template = item_ctx.map_or(false, |ctx| {
+                source_cell.0 >= ctx.template_cell_range.0
+                    && source_cell.0 < ctx.template_cell_range.1
+            });
             if is_template {
                 if let Some(ctx) = item_ctx {
                     if let Some(ref ics) = instance.item_cell_store {
                         let signal = ics.get_signal(ctx.item_idx, source_cell.0);
-                        return el.style_signal(css_prop, signal.map(move |v| {
-                            for (pattern_val, css) in &arms {
-                                if v.to_bits() == pattern_val.to_bits() {
-                                    return Some(css.clone());
+                        return el.style_signal(
+                            css_prop,
+                            signal.map(move |v| {
+                                for (pattern_val, css) in &arms {
+                                    if v.to_bits() == pattern_val.to_bits() {
+                                        return Some(css.clone());
+                                    }
                                 }
-                            }
-                            Some(default_css.clone())
-                        }));
+                                Some(default_css.clone())
+                            }),
+                        );
                     }
                 }
             } else {
                 let store = instance.cell_store.clone();
-                return el.style_signal(css_prop, store.get_cell_signal(source_cell.0).map(move |v| {
-                    for (pattern_val, css) in &arms {
-                        if v.to_bits() == pattern_val.to_bits() {
-                            return Some(css.clone());
+                return el.style_signal(
+                    css_prop,
+                    store.get_cell_signal(source_cell.0).map(move |v| {
+                        for (pattern_val, css) in &arms {
+                            if v.to_bits() == pattern_val.to_bits() {
+                                return Some(css.clone());
+                            }
                         }
-                    }
-                    Some(default_css.clone())
-                }));
+                        Some(default_css.clone())
+                    }),
+                );
             }
         }
     }
@@ -3894,8 +4423,17 @@ fn resolve_pattern_match_colors(
     for node in &program.nodes {
         // Extract source and arms from When or While nodes.
         let (source, arms) = match node {
-            IrNode::When { cell: c, source, arms } if *c == cell => (source, arms),
-            IrNode::While { cell: c, source, arms, .. } if *c == cell => (source, arms),
+            IrNode::When {
+                cell: c,
+                source,
+                arms,
+            } if *c == cell => (source, arms),
+            IrNode::While {
+                cell: c,
+                source,
+                arms,
+                ..
+            } if *c == cell => (source, arms),
             _ => continue,
         };
         let mut color_arms: Vec<(f64, String)> = Vec::new();
@@ -3923,9 +4461,10 @@ fn resolve_pattern_match_colors(
 fn pattern_to_f64_opt(pattern: &IrPattern, tag_table: &[String]) -> Option<f64> {
     match pattern {
         IrPattern::Number(n) => Some(*n),
-        IrPattern::Tag(t) => {
-            tag_table.iter().position(|s| s == t).map(|i| (i + 1) as f64)
-        }
+        IrPattern::Tag(t) => tag_table
+            .iter()
+            .position(|s| s == t)
+            .map(|i| (i + 1) as f64),
         IrPattern::Wildcard => Some(f64::NAN),
         _ => None,
     }
@@ -3934,7 +4473,11 @@ fn pattern_to_f64_opt(pattern: &IrPattern, tag_table: &[String]) -> Option<f64> 
 /// Follow a CellRead chain through Derived { expr: CellRead } nodes.
 fn follow_cell_read(program: &IrProgram, cell: CellId) -> CellId {
     for node in &program.nodes {
-        if let IrNode::Derived { cell: c, expr: IrExpr::CellRead(source) } = node {
+        if let IrNode::Derived {
+            cell: c,
+            expr: IrExpr::CellRead(source),
+        } = node
+        {
             if *c == cell {
                 return follow_cell_read(program, *source);
             }
