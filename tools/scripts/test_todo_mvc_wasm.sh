@@ -961,6 +961,21 @@ sleep 1
 PREVIEW=$(bt preview)
 check_contains "$PREVIEW" "2 items left" "Toggle-all again: all active"
 
+echo ""
+echo "[18.3] Toggle all works when items are hidden by filter"
+reset_state
+bt click-text "Completed" >/dev/null 2>&1 || true
+sleep 1
+PREVIEW=$(bt preview)
+check_not_visible "Buy groceries" "Completed filter hides active 'Buy groceries' before toggle-all"
+check_not_visible "Clean room" "Completed filter hides active 'Clean room' before toggle-all"
+bt click-checkbox 0 >/dev/null 2>&1 || true
+sleep 1
+PREVIEW=$(bt preview)
+check_contains "$PREVIEW" "0 items left" "Toggle-all works from Completed filter with hidden todos"
+check_contains "$PREVIEW" "Buy groceries" "Completed filter shows 'Buy groceries' after toggle-all"
+check_contains "$PREVIEW" "Clean room" "Completed filter shows 'Clean room' after toggle-all"
+
 # ══════════════════════════════════════════════
 # SECTION 19: CLEAR COMPLETED BUTTON VISIBILITY
 # ══════════════════════════════════════════════

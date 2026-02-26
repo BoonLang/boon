@@ -1746,37 +1746,58 @@ fn build_list_map(
     };
 
     // Collect cross-scope event IDs (global events that trigger template-scoped nodes).
-    // These need to be forwarded to all live items when the global event fires.
+    // These need to be forwarded to all relevant items when the global event fires.
     let cross_scope_events =
         collect_cross_scope_events(program, template_cell_range, template_event_range);
 
+    // For fanout, prefer the backing (unfiltered) source list. This keeps
+    // cross-scope item updates (e.g. toggle-all) working even when the map's
+    // visible source is filtered to zero items.
+    let fanout_source = resolve_cross_scope_fanout_source(program, source);
+
     let inst = instance.clone();
-
-    // Track live item count for cross-scope event forwarding.
-    let live_items: Rc<RefCell<u32>> = Rc::new(RefCell::new(0));
-    let live_items_for_closure = live_items.clone();
-
-    // Set up cross-scope event forwarding: when a global event fires,
-    // forward it to all live items via on_item_event.
-    if !cross_scope_events.is_empty() {
-        let cross_events = cross_scope_events.clone();
-        let live_ref = live_items.clone();
-        let inst_hook = inst.clone();
-        inst.add_post_event_hook(Box::new(move |event_id| {
-            if cross_events.contains(&event_id) {
-                let count = *live_ref.borrow();
-                for i in 0..count {
-                    // Use batch version — fire_event calls rerun_retain_filters once at end.
-                    let _ = inst_hook.call_on_item_event_batch(i, event_id);
-                }
-            }
-        }));
-    }
 
     // Track which items have been initialized by their stable memory index.
     // On re-renders (e.g. filter changes), existing items keep their HOLD state;
     // only items not yet seen get init_item called.
     let initialized_indices: Rc<RefCell<HashSet<u32>>> = Rc::new(RefCell::new(HashSet::new()));
+
+    // Set up cross-scope event forwarding: when a global event fires,
+    // forward it to all backing-list items via on_item_event.
+    if !cross_scope_events.is_empty() {
+        let cross_events = cross_scope_events.clone();
+        let inst_hook = inst.clone();
+        let initialized_for_hook = initialized_indices.clone();
+        inst.add_post_event_hook(Box::new(move |event_id| {
+            if cross_events.contains(&event_id) {
+                let list_id = inst_hook.cell_store.get_cell_value(fanout_source.0);
+                let text_items = inst_hook.list_store.items_text(list_id);
+                let f64_items = inst_hook.list_store.items(list_id);
+                let item_count = if !text_items.is_empty() {
+                    text_items.len()
+                } else {
+                    f64_items.len()
+                };
+
+                for pos in 0..item_count {
+                    let item_idx = inst_hook.list_store.item_memory_index(list_id, pos) as u32;
+                    if let Some(ref ics) = inst_hook.item_cell_store {
+                        ics.ensure_item(item_idx);
+                    }
+                    let should_init = {
+                        let initialized = initialized_for_hook.borrow();
+                        !initialized.contains(&item_idx)
+                    };
+                    if should_init {
+                        let _ = inst_hook.call_init_item(item_idx);
+                        initialized_for_hook.borrow_mut().insert(item_idx);
+                    }
+                    // Use batch version — fire_event calls rerun_retain_filters once at end.
+                    let _ = inst_hook.call_on_item_event_batch(item_idx, event_id);
+                }
+            }
+        }));
+    }
 
     // Deduplicate the version signal: rerun_retain_filters bumps the version
     // even when the filter result hasn't changed (e.g. on change events that
@@ -1825,13 +1846,22 @@ fn build_list_map(
                 f64_items.len()
             };
             if item_count == 0 {
-                *live_items_for_closure.borrow_mut() = 0;
-                // Reset initialized indices so all items re-initialize on next render.
-                initialized_indices.borrow_mut().clear();
+                // Only reset initialized indices when the backing list is truly
+                // empty. A filtered view can be empty while backing items still
+                // exist and must keep their per-item state.
+                let backing_list_id = inst.cell_store.get_cell_value(fanout_source.0);
+                let backing_text_items = inst.list_store.items_text(backing_list_id);
+                let backing_f64_items = inst.list_store.items(backing_list_id);
+                let backing_count = if !backing_text_items.is_empty() {
+                    backing_text_items.len()
+                } else {
+                    backing_f64_items.len()
+                };
+                if backing_count == 0 {
+                    initialized_indices.borrow_mut().clear();
+                }
                 return None;
             }
-
-            *live_items_for_closure.borrow_mut() = item_count as u32;
 
             let program = &inst.program;
             let has_pending_snapshot = inst.has_pending_snapshot();
@@ -1931,6 +1961,38 @@ fn build_list_map(
             )
         }))
         .into_raw_unchecked()
+}
+
+/// Resolve the list cell to use for cross-scope per-item event fanout.
+///
+/// For filtered views (`ListRetain -> ListMap`), use the retain's source so
+/// hidden items still receive global events (e.g. toggle-all in TodoMVC).
+/// We unwrap at most one retain layer plus pass-through wrappers.
+fn resolve_cross_scope_fanout_source(program: &IrProgram, source: CellId) -> CellId {
+    let mut current = source;
+    let mut seen = HashSet::new();
+    let mut unwrapped_retain = false;
+
+    while seen.insert(current) {
+        match find_node_for_cell(program, current) {
+            Some(IrNode::Derived {
+                expr: IrExpr::CellRead(next),
+                ..
+            }) => {
+                current = *next;
+            }
+            Some(IrNode::PipeThrough { source: next, .. }) => {
+                current = *next;
+            }
+            Some(IrNode::ListRetain { source: next, .. }) if !unwrapped_retain => {
+                current = *next;
+                unwrapped_retain = true;
+            }
+            _ => break,
+        }
+    }
+
+    current
 }
 
 /// Collect global event IDs that trigger template-scoped nodes (cross-scope events).
