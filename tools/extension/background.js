@@ -2780,8 +2780,8 @@ async function handleCommand(id, command) {
         // Set the engine type and trigger re-run
         try {
           const engineToSet = command.engine;
-          if (engineToSet !== 'Actors' && engineToSet !== 'DD') {
-            return { type: 'error', message: `Invalid engine '${engineToSet}'. Must be 'Actors' or 'DD'` };
+          if (engineToSet !== 'Actors' && engineToSet !== 'DD' && engineToSet !== 'Wasm') {
+            return { type: 'error', message: `Invalid engine '${engineToSet}'. Must be 'Actors', 'DD', or 'Wasm'` };
           }
           const result = await cdpEvaluate(tab.id, `
             (function() {

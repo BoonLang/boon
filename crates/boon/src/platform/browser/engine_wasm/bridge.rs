@@ -2,6 +2,7 @@
 //! them to the WASM runtime instance.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
@@ -640,8 +641,11 @@ fn collect_stripe_children(
                                 if let Some((source, arms)) = resolve_to_conditional(program, *child_cell) {
                                     if let (BuildContext::Item(item_ctx), true) = (ctx, has_no_element_arm(program, arms)) {
                                         // Per-item + NoElement (e.g., hover X button):
-                                        // pre-build with opacity toggle to prevent hover oscillation.
-                                        for el in build_item_opacity_children(program, instance, item_ctx, source, arms) {
+                                        // Pre-build with visibility toggle to keep elements in DOM.
+                                        // Using visibility:hidden prevents pointer-event interference
+                                        // while avoiding DOM insertion/removal that causes hover
+                                        // oscillation from child_signal.
+                                        for el in build_item_visibility_children(program, instance, item_ctx, source, arms) {
                                             children.push(ChildSlot::Static(el));
                                         }
                                     } else {
@@ -1282,10 +1286,13 @@ fn build_conditional_signal_impl(
     }
 }
 
-/// Build per-item conditional children with opacity toggling.
-/// Elements are always in the DOM — only opacity changes. This prevents hover
+
+/// Build per-item conditional children with visibility toggling.
+/// Elements are always in the DOM — only visibility changes. This prevents hover
 /// oscillation caused by DOM structural changes (child_signal's removeChild/insertBefore).
-fn build_item_opacity_children(
+/// Unlike the old opacity approach, `visibility: hidden` also disables pointer events,
+/// so hidden elements don't interfere with hover detection on siblings.
+fn build_item_visibility_children(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     ctx: &ItemContext,
@@ -1305,6 +1312,15 @@ fn build_item_opacity_children(
             None => continue,
         };
 
+        // Apply visibility directly on the element (no wrapper div).
+        let html_el = match el {
+            RawElOrText::RawHtmlEl(html_el) => html_el,
+            other => {
+                result.push(other);
+                continue;
+            }
+        };
+
         let matchers = matchers.clone();
         let store = instance.cell_store.clone();
         let ics = instance.item_cell_store.clone();
@@ -1315,7 +1331,7 @@ fn build_item_opacity_children(
             Box::new(instance.cell_store.get_cell_signal(source_id))
         };
 
-        let opacity_signal = signal.map(move |_| {
+        let visibility_signal = signal.map(move |_| {
             let (val, text) = if is_item_source {
                 if let Some(ref ics) = ics {
                     (ics.get_value(item_idx, source_id), ics.get_text(item_idx, source_id))
@@ -1325,14 +1341,14 @@ fn build_item_opacity_children(
             } else {
                 (store.get_cell_value(source_id), store.get_cell_text(source_id))
             };
-            if find_matching_arm_idx(&matchers, val, &text) == Some(arm_idx) { "1" } else { "0" }
+            if find_matching_arm_idx(&matchers, val, &text) == Some(arm_idx) { "visible" } else { "hidden" }
         });
 
         result.push(
-            El::new()
-                .child(el)
-                .update_raw_el(|raw_el| raw_el.style("opacity", "0").style_signal("opacity", opacity_signal))
-                .unify()
+            html_el
+                .style("visibility", "hidden")
+                .style_signal("visibility", visibility_signal)
+                .into_raw_unchecked()
         );
     }
     result
@@ -1345,19 +1361,6 @@ fn has_no_element_arm(program: &IrProgram, arms: &[(IrPattern, IrExpr)]) -> bool
         IrExpr::CellRead(cell) => is_no_element(program, *cell),
         _ => false,
     })
-}
-
-/// Check if a cell resolves to the NoElement tag.
-fn is_no_element(program: &IrProgram, cell: CellId) -> bool {
-    if let Some(node) = find_node_for_cell(program, cell) {
-        match node {
-            IrNode::Derived { expr: IrExpr::Constant(IrValue::Tag(t)), .. } => t == "NoElement",
-            IrNode::Derived { expr: IrExpr::CellRead(inner), .. } => is_no_element(program, *inner),
-            _ => false,
-        }
-    } else {
-        false
-    }
 }
 
 /// Pattern matcher for arm selection.
@@ -1530,10 +1533,10 @@ fn build_list_map(
         }));
     }
 
-    // Track the number of items that have been initialized.
+    // Track which items have been initialized by their stable memory index.
     // On re-renders (e.g. filter changes), existing items keep their HOLD state;
-    // only newly appended items get init_item called.
-    let initialized_count: Rc<std::cell::Cell<usize>> = Rc::new(std::cell::Cell::new(0));
+    // only items not yet seen get init_item called.
+    let initialized_indices: Rc<RefCell<HashSet<u32>>> = Rc::new(RefCell::new(HashSet::new()));
 
     // Deduplicate the version signal: rerun_retain_filters bumps the version
     // even when the filter result hasn't changed (e.g. on change events that
@@ -1575,18 +1578,14 @@ fn build_list_map(
             let item_count = if !text_items.is_empty() { text_items.len() } else { f64_items.len() };
             if item_count == 0 {
                 *live_items_for_closure.borrow_mut() = 0;
-                // Reset initialized count so all items re-initialize on next render.
-                initialized_count.set(0);
+                // Reset initialized indices so all items re-initialize on next render.
+                initialized_indices.borrow_mut().clear();
                 return None;
             }
 
             *live_items_for_closure.borrow_mut() = item_count as u32;
 
             let program = &inst.program;
-            let prev_init = initialized_count.get();
-            // If the list shrank (items were removed), reset init tracking
-            // so re-added items at reused positions get init_item called.
-            let prev_init = if item_count < prev_init { 0 } else { prev_init };
 
             let children: Vec<RawElOrText> = (0..item_count).map(|i| {
                 // Use item_memory_index to correctly map position → memory index.
@@ -1608,8 +1607,9 @@ fn build_list_map(
                 // Initialize per-item template cells in WASM memory.
                 // Only init NEW items — existing items keep their HOLD state
                 // (e.g. completed toggle) across re-renders.
-                if i >= prev_init {
+                if !initialized_indices.borrow().contains(&item_idx) {
                     let _ = inst.call_init_item(item_idx);
+                    initialized_indices.borrow_mut().insert(item_idx);
                 }
 
                 // Copy item text to template-local namespace field cells.
@@ -1649,9 +1649,6 @@ fn build_list_map(
                     }
                 }
             }).collect();
-
-            // Update initialized count so future re-renders don't re-init existing items.
-            initialized_count.set(item_count);
 
             // Finalize snapshot restore: re-derive global values from
             // restored per-item WASM memory and re-apply global cells.
@@ -2321,6 +2318,19 @@ fn find_node_for_cell(program: &IrProgram, cell: CellId) -> Option<&IrNode> {
         }
     }
     None
+}
+
+/// Check if a cell resolves to the NoElement tag.
+fn is_no_element(program: &IrProgram, cell: CellId) -> bool {
+    if let Some(node) = find_node_for_cell(program, cell) {
+        match node {
+            IrNode::Derived { expr: IrExpr::Constant(IrValue::Tag(t)), .. } => t == "NoElement",
+            IrNode::Derived { expr: IrExpr::CellRead(inner), .. } => is_no_element(program, *inner),
+            _ => false,
+        }
+    } else {
+        false
+    }
 }
 
 /// Extract placeholder text from a placeholder expression.

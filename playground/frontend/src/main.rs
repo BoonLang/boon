@@ -1190,6 +1190,7 @@ impl Playground {
                     .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
                     .child(engine.short_name()),
             )
+            .update_raw_el(|raw_el| raw_el.attr("title", engine.description()))
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press({
                 let engine_type = self.engine_type.clone();
