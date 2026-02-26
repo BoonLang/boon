@@ -1339,6 +1339,24 @@ impl<'a> WasmEmitter<'a> {
             IrNode::Hold { init, .. } => {
                 self.resolve_expr_text_statically_depth(init, depth + 1)
             }
+            IrNode::Latest { arms, .. } => {
+                // Prefer non-triggered arms for initial static text resolution.
+                // Event-driven arms are not available before events fire.
+                for arm in arms {
+                    if arm.trigger.is_none() {
+                        if let Some(text) = self.resolve_expr_text_statically_depth(&arm.body, depth + 1) {
+                            return Some(text);
+                        }
+                    }
+                }
+                // Fallback: try all arms in declaration order.
+                for arm in arms {
+                    if let Some(text) = self.resolve_expr_text_statically_depth(&arm.body, depth + 1) {
+                        return Some(text);
+                    }
+                }
+                None
+            }
             IrNode::Derived { expr, .. } => {
                 self.resolve_expr_text_statically_depth(expr, depth + 1)
             }
