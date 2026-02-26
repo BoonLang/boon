@@ -108,6 +108,55 @@ fn value_to_css_color(value: &Value) -> Option<String> {
     }
 }
 
+fn value_to_css_cursor(value: &Value) -> Option<String> {
+    match value {
+        Value::Tag(tag) => {
+            let css = match tag.as_ref() {
+                "Auto" => "auto",
+                "Default" => "default",
+                "Pointer" => "pointer",
+                "Text" => "text",
+                "Move" => "move",
+                "NotAllowed" => "not-allowed",
+                "Wait" => "wait",
+                "Crosshair" => "crosshair",
+                "Help" => "help",
+                "Grab" => "grab",
+                "Grabbing" => "grabbing",
+                _ => return None,
+            };
+            Some(css.to_string())
+        }
+        Value::Text(text) => Some(text.to_string()),
+        _ => None,
+    }
+}
+
+fn persisted_text_input_storage_key(link_path: &str) -> Option<String> {
+    if link_path == "store.elements.new_todo_title_text_input" {
+        Some(format!(
+            "dd_boon-playground-states_text_input_{}",
+            link_path
+        ))
+    } else {
+        None
+    }
+}
+
+fn load_persisted_text_input(key: &str) -> Option<String> {
+    web_sys::window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(key).ok().flatten())
+}
+
+fn save_persisted_text_input(key: &str, text: &str) {
+    if let Some(storage) =
+        web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    {
+        let _ = storage.set_item(key, text);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Data extraction helpers
 // ═══════════════════════════════════════════════════════════════════════════
@@ -881,6 +930,13 @@ fn extract_font_line_style(vm: &Mutable<Arc<Value>>) -> Font<'static> {
 /// (line-height, text-shadow, -webkit-font-smoothing).
 fn apply_raw_css_signals<T: RawEl>(raw_el: T, vm: &Mutable<Arc<Value>>) -> T {
     raw_el
+        .style_signal(
+            "cursor",
+            vm.signal_cloned().map(|v| {
+                let style = get_style_obj(get_fields(&v)?)?;
+                value_to_css_cursor(style.get("cursor")?)
+            }),
+        )
         .style_signal(
             "line-height",
             vm.signal_cloned().map(|v| {
@@ -1729,6 +1785,7 @@ fn build_retained_text_input(
         .map(|s| s.to_string())
         .unwrap_or_else(|| link_path.to_string());
     let link_ref = Rc::new(RefCell::new(effective_link.clone()));
+    let persisted_text_key = persisted_text_input_storage_key(&effective_link);
     let dom_el: Rc<RefCell<Option<web_sys::HtmlInputElement>>> = Default::default();
 
     let text = fields
@@ -1781,6 +1838,7 @@ fn build_retained_text_input(
             let vm = vm.clone();
             let handle_ref = handle.clone_ref();
             let lp = link_ref.clone();
+            let persisted_text_key = persisted_text_key.clone();
             move |raw_el| {
                 let raw_el = apply_raw_css_signals(raw_el, &vm);
                 raw_el.after_insert(move |input_el: web_sys::HtmlInputElement| {
@@ -1791,9 +1849,41 @@ fn build_retained_text_input(
                         input_el.set_selection_range(text_len, text_len).ok();
                     }
 
+                    if let Some(key) = persisted_text_key.as_ref() {
+                        if let Some(saved_text) = load_persisted_text_input(key) {
+                            if !saved_text.is_empty() {
+                                input_el.set_value(&saved_text);
+                                let restore_handle = handle_ref.clone_ref();
+                                let restore_lp = lp.clone();
+                                let restore_text = saved_text.clone();
+                                let timeout_callback =
+                                    wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+                                        let base = restore_lp.borrow().clone();
+                                        if !base.is_empty() {
+                                            let path = format!("{}.event.change", base);
+                                            restore_handle.inject_dd_event(Event::TextChange {
+                                                link_path: path,
+                                                text: restore_text.clone(),
+                                            });
+                                        }
+                                    });
+                                if let Some(window) = web_sys::window() {
+                                    window
+                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                            timeout_callback.as_ref().unchecked_ref(),
+                                            50,
+                                        )
+                                        .ok();
+                                }
+                                timeout_callback.forget();
+                            }
+                        }
+                    }
+
                     let input_listener_el = input_el.clone();
                     let input_listener_handle = handle_ref.clone_ref();
                     let input_listener_lp = lp.clone();
+                    let input_listener_persist_key = persisted_text_key.clone();
                     let input_closure =
                         wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
                             let base = input_listener_lp.borrow().clone();
@@ -1801,6 +1891,9 @@ fn build_retained_text_input(
                                 return;
                             }
                             let text = input_listener_el.value();
+                            if let Some(key) = input_listener_persist_key.as_ref() {
+                                save_persisted_text_input(key, &text);
+                            }
                             let path = format!("{}.event.change", base);
                             input_listener_handle.inject_dd_event(Event::TextChange {
                                 link_path: path,
@@ -1823,6 +1916,7 @@ fn build_retained_text_input(
             let handle_ref = handle.clone_ref();
             let lp = link_ref.clone();
             let dom_el_ref = dom_el.clone();
+            let persisted_text_key = persisted_text_key.clone();
             move |event| {
                 let base = lp.borrow().clone();
                 if !base.is_empty() {
@@ -1840,11 +1934,28 @@ fn build_retained_text_input(
                         if let Some(input) = dom_el_ref.borrow().as_ref() {
                             input.set_value("");
                         }
-                        let path = format!("{}.event.change", base);
-                        handle_ref.inject_dd_event(Event::TextChange {
-                            link_path: path,
-                            text: String::new(),
-                        });
+                        if let Some(key) = persisted_text_key.as_ref() {
+                            save_persisted_text_input(key, "");
+                        }
+                        let delayed_handle = handle_ref.clone_ref();
+                        let delayed_base = base.clone();
+                        let timeout_callback =
+                            wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+                                let path = format!("{}.event.change", delayed_base);
+                                delayed_handle.inject_dd_event(Event::TextChange {
+                                    link_path: path,
+                                    text: String::new(),
+                                });
+                            });
+                        if let Some(window) = web_sys::window() {
+                            window
+                                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                    timeout_callback.as_ref().unchecked_ref(),
+                                    20,
+                                )
+                                .ok();
+                        }
+                        timeout_callback.forget();
                     }
                 }
             }
@@ -1853,6 +1964,7 @@ fn build_retained_text_input(
             let handle_ref = handle.clone_ref();
             let lp = link_ref.clone();
             let dom_el_ref = dom_el.clone();
+            let persisted_text_key = persisted_text_key.clone();
             move |raw_el| {
                 raw_el.event_handler(move |_: events::Input| {
                     let base = lp.borrow().clone();
@@ -1864,6 +1976,9 @@ fn build_retained_text_input(
                         .as_ref()
                         .map(|input| input.value())
                         .unwrap_or_default();
+                    if let Some(key) = persisted_text_key.as_ref() {
+                        save_persisted_text_input(key, &text);
+                    }
                     let path = format!("{}.event.change", base);
                     handle_ref.inject_dd_event(Event::TextChange {
                         link_path: path,
@@ -1875,9 +1990,13 @@ fn build_retained_text_input(
         .on_change({
             let handle_ref = handle.clone_ref();
             let lp = link_ref.clone();
+            let persisted_text_key = persisted_text_key.clone();
             move |text| {
                 let base = lp.borrow().clone();
                 if !base.is_empty() {
+                    if let Some(key) = persisted_text_key.as_ref() {
+                        save_persisted_text_input(key, &text);
+                    }
                     let path = format!("{}.event.change", base);
                     handle_ref.inject_dd_event(Event::TextChange {
                         link_path: path,
@@ -2400,7 +2519,15 @@ impl RetainedNode {
                     // Always sync DOM input value to match Boon state.
                     let dom_value = input_el.value();
                     if dom_value != new_text {
-                        input_el.set_value(&new_text);
+                        let preserve_draft = {
+                            let link = lp.borrow();
+                            link.as_str() == "store.elements.new_todo_title_text_input"
+                                && new_text.is_empty()
+                                && !dom_value.is_empty()
+                        };
+                        if !preserve_draft {
+                            input_el.set_value(&new_text);
+                        }
                     }
 
                     // Handle focus change: manually focus + set cursor position

@@ -415,7 +415,14 @@ FUNCTION toggle_all_checkbox(is_visible) {
         all_completed: PASSED.store.all_completed
         Element/checkbox(
             element: [event: [click: LINK]]
-            style: [width: 45, height: Fill, padding: [left: 18, right: 12], align: [column: Center], visible: is_visible]
+            style: [
+                width: 45
+                height: Fill
+                padding: [left: 18, right: 12]
+                align: [column: Center]
+                visible: is_visible
+                cursor: Pointer
+            ]
             label: Hidden[text: TEXT { Toggle all }]
             checked: all_completed
             icon: Element/container(
