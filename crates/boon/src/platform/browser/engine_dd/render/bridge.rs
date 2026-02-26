@@ -12,7 +12,7 @@
 //! - **Worker** (SingleHold/LatestSum): Full rebuild per state change (simple programs).
 //! - **Static**: Single render, no signals needed.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -24,7 +24,7 @@ use futures_channel::mpsc;
 use pin_project::pin_project;
 use zoon::*;
 
-use super::super::core::types::{KeyedDiff, LIST_TAG, LINK_PATH_FIELD, HOVER_PATH_FIELD};
+use super::super::core::types::{KeyedDiff, HOVER_PATH_FIELD, LINK_PATH_FIELD, LIST_TAG};
 use super::super::core::value::Value;
 use super::super::io::worker::{DdWorkerHandle, Event};
 
@@ -61,15 +61,15 @@ where
 
 /// Convert an Oklch tagged value to a CSS `oklch()` string.
 fn oklch_to_css(fields: &Fields) -> Option<String> {
-    let l = fields.get("lightness").and_then(|v| v.as_number()).unwrap_or(0.0);
+    let l = fields
+        .get("lightness")
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
     let c = fields
         .get("chroma")
         .and_then(|v| v.as_number())
         .unwrap_or(0.0);
-    let h = fields
-        .get("hue")
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0);
+    let h = fields.get("hue").and_then(|v| v.as_number()).unwrap_or(0.0);
     let a = fields.get("alpha").and_then(|v| v.as_number());
 
     if let Some(alpha) = a {
@@ -144,7 +144,6 @@ fn extract_sorted_list_items(fields: &Fields, field_name: &str) -> Vec<Value> {
     Vec::new()
 }
 
-
 /// Extract effective link path for event handlers.
 fn extract_effective_link(fields: &Fields, parent_link_path: &str) -> String {
     fields
@@ -163,19 +162,13 @@ fn extract_effective_link(fields: &Fields, parent_link_path: &str) -> String {
 /// Extract hover link path from element's `element: [hovered: LINK]` field.
 fn extract_hover_link_path(fields: &Fields, parent_link_path: &str) -> Option<String> {
     // First check __hover_path__ (injected by DD compiler for per-item hover)
-    if let Some(path) = fields
-        .get(HOVER_PATH_FIELD)
-        .and_then(|v| v.as_text())
-    {
+    if let Some(path) = fields.get(HOVER_PATH_FIELD).and_then(|v| v.as_text()) {
         if !path.is_empty() {
             return Some(path.to_string());
         }
     }
     // Then check __link_path__ (set by |> LINK { alias } pipe)
-    if let Some(path) = fields
-        .get(LINK_PATH_FIELD)
-        .and_then(|v| v.as_text())
-    {
+    if let Some(path) = fields.get(LINK_PATH_FIELD).and_then(|v| v.as_text()) {
         if !path.is_empty() {
             return Some(path.to_string());
         }
@@ -192,10 +185,7 @@ fn extract_hover_link_path(fields: &Fields, parent_link_path: &str) -> Option<St
         }) = hovered_val
         {
             if tag.as_ref() == "LINK" {
-                if let Some(path) = link_fields
-                    .get("__path__")
-                    .and_then(|v| v.as_text())
-                {
+                if let Some(path) = link_fields.get("__path__").and_then(|v| v.as_text()) {
                     if !path.is_empty() {
                         // Strip ".hovered" suffix — the interpreter stores hover state
                         // under the base element prefix, not the field-qualified path
@@ -304,8 +294,12 @@ fn extract_font_from_fields(fields: &Fields) -> Option<Font<'static>> {
             .unwrap_or(false);
         if strike || underline {
             let mut fl = FontLine::new();
-            if strike { fl = fl.strike(); }
-            if underline { fl = fl.underline(); }
+            if strike {
+                fl = fl.strike();
+            }
+            if underline {
+                fl = fl.underline();
+            }
             font = font.line(fl);
         }
     }
@@ -409,7 +403,13 @@ fn extract_padding_from_fields(fields: &Fields) -> Option<Padding<'static>> {
                 .get("right")
                 .and_then(|v| v.as_number())
                 .unwrap_or(row) as u32;
-            Some(Padding::new().top(top).right(right).bottom(bottom).left(left))
+            Some(
+                Padding::new()
+                    .top(top)
+                    .right(right)
+                    .bottom(bottom)
+                    .left(left),
+            )
         }
         _ => None,
     }
@@ -458,7 +458,9 @@ fn extract_bg_url(value: &Value) -> Option<String> {
         Some(Value::Object(bg)) => bg,
         _ => return None,
     };
-    bg.get("url").and_then(|v| v.as_text()).map(|s| s.to_string())
+    bg.get("url")
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
 }
 
 /// Extract RoundedCorners from element fields' style.
@@ -497,8 +499,11 @@ fn extract_transform_from_fields(fields: &Fields) -> Option<Transform> {
         .get("rotate")
         .and_then(|v| v.as_number())
         .unwrap_or(0.0);
-    let has_transform =
-        move_right != 0.0 || move_down != 0.0 || move_left != 0.0 || move_up != 0.0 || rotate != 0.0;
+    let has_transform = move_right != 0.0
+        || move_down != 0.0
+        || move_left != 0.0
+        || move_up != 0.0
+        || rotate != 0.0;
     if !has_transform {
         return None;
     }
@@ -533,10 +538,7 @@ fn extract_outline_from_fields(fields: &Fields) -> Option<Outline> {
         Value::Tag(t) if t.as_ref() == "NoOutline" => None,
         Value::Object(obj) => {
             let color_css = obj.get("color").and_then(value_to_css_color)?;
-            let side = obj
-                .get("side")
-                .and_then(|v| v.as_tag())
-                .unwrap_or("Outer");
+            let side = obj.get("side").and_then(|v| v.as_tag()).unwrap_or("Outer");
             let mut o = if side == "Inner" {
                 Outline::inner()
             } else {
@@ -564,10 +566,7 @@ fn extract_outline_from_style(style_value: &Value) -> Option<Outline> {
         Value::Tag(t) if t.as_ref() == "NoOutline" => None,
         Value::Object(obj) => {
             let color_css = obj.get("color").and_then(value_to_css_color)?;
-            let side = obj
-                .get("side")
-                .and_then(|v| v.as_tag())
-                .unwrap_or("Outer");
+            let side = obj.get("side").and_then(|v| v.as_tag()).unwrap_or("Outer");
             let mut o = if side == "Inner" {
                 Outline::inner()
             } else {
@@ -697,12 +696,30 @@ fn extract_padding_style(vm: &Mutable<Arc<Value>>) -> Padding<'static> {
                 Some((px, px, px, px))
             }
             Value::Object(padding) => {
-                let row = padding.get("row").and_then(|v| v.as_number()).unwrap_or(0.0);
-                let col = padding.get("column").and_then(|v| v.as_number()).unwrap_or(0.0);
-                let top = padding.get("top").and_then(|v| v.as_number()).unwrap_or(col) as u32;
-                let bottom = padding.get("bottom").and_then(|v| v.as_number()).unwrap_or(col) as u32;
-                let left = padding.get("left").and_then(|v| v.as_number()).unwrap_or(row) as u32;
-                let right = padding.get("right").and_then(|v| v.as_number()).unwrap_or(row) as u32;
+                let row = padding
+                    .get("row")
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0);
+                let col = padding
+                    .get("column")
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0);
+                let top = padding
+                    .get("top")
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(col) as u32;
+                let bottom = padding
+                    .get("bottom")
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(col) as u32;
+                let left = padding
+                    .get("left")
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(row) as u32;
+                let right = padding
+                    .get("right")
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(row) as u32;
                 Some((top, right, bottom, left))
             }
             _ => None,
@@ -724,18 +741,46 @@ fn extract_shadows_from_value(v: &Value) -> Vec<Shadow> {
         Some(s) => s,
         None => return Vec::new(),
     };
-    if let Some(Value::Tagged { tag, fields: list_fields }) = style.get("shadows") {
+    if let Some(Value::Tagged {
+        tag,
+        fields: list_fields,
+    }) = style.get("shadows")
+    {
         if tag.as_ref() == LIST_TAG {
             let mut shadows = Vec::new();
             for item in list_fields.values() {
                 if let Value::Object(shadow_obj) = item {
-                    let x = shadow_obj.get("x").and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                    let y = shadow_obj.get("y").and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                    let blur = shadow_obj.get("blur").and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
-                    let spread = shadow_obj.get("spread").and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-                    let inset = shadow_obj.get("direction").and_then(|v| v.as_tag()).map(|t| t == "Inwards").unwrap_or(false);
-                    let color_css = shadow_obj.get("color").and_then(value_to_css_color).unwrap_or_else(|| "rgba(0,0,0,0.5)".to_string());
-                    let mut shadow = Shadow::new().x(x).y(y).blur(blur).spread(spread).color(color_css);
+                    let x = shadow_obj
+                        .get("x")
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(0.0) as i32;
+                    let y = shadow_obj
+                        .get("y")
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(0.0) as i32;
+                    let blur = shadow_obj
+                        .get("blur")
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(0.0) as u32;
+                    let spread = shadow_obj
+                        .get("spread")
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(0.0) as i32;
+                    let inset = shadow_obj
+                        .get("direction")
+                        .and_then(|v| v.as_tag())
+                        .map(|t| t == "Inwards")
+                        .unwrap_or(false);
+                    let color_css = shadow_obj
+                        .get("color")
+                        .and_then(value_to_css_color)
+                        .unwrap_or_else(|| "rgba(0,0,0,0.5)".to_string());
+                    let mut shadow = Shadow::new()
+                        .x(x)
+                        .y(y)
+                        .blur(blur)
+                        .spread(spread)
+                        .color(color_css);
                     if inset {
                         shadow = shadow.inner();
                     }
@@ -773,10 +818,22 @@ fn extract_borders_style(vm: &Mutable<Arc<Value>>) -> Borders<'static> {
     let vm3 = vm.clone();
     let vm4 = vm.clone();
     Borders::new()
-        .top_signal(vm.signal_cloned().map(|v| extract_border_from_value(&v, "top")))
-        .bottom_signal(vm2.signal_cloned().map(|v| extract_border_from_value(&v, "bottom")))
-        .left_signal(vm3.signal_cloned().map(|v| extract_border_from_value(&v, "left")))
-        .right_signal(vm4.signal_cloned().map(|v| extract_border_from_value(&v, "right")))
+        .top_signal(
+            vm.signal_cloned()
+                .map(|v| extract_border_from_value(&v, "top")),
+        )
+        .bottom_signal(
+            vm2.signal_cloned()
+                .map(|v| extract_border_from_value(&v, "bottom")),
+        )
+        .left_signal(
+            vm3.signal_cloned()
+                .map(|v| extract_border_from_value(&v, "left")),
+        )
+        .right_signal(
+            vm4.signal_cloned()
+                .map(|v| extract_border_from_value(&v, "right")),
+        )
 }
 
 /// Extract typed FontLine (strikethrough/underline) from a Value.
@@ -791,8 +848,14 @@ fn extract_font_line_from_value(v: &Value) -> Option<FontLine<'static>> {
         Value::Object(l) => l.as_ref(),
         _ => return None,
     };
-    let strike = line.get("strikethrough").and_then(|v| v.as_bool()).unwrap_or(false);
-    let underline = line.get("underline").and_then(|v| v.as_bool()).unwrap_or(false);
+    let strike = line
+        .get("strikethrough")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let underline = line
+        .get("underline")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !strike && !underline {
         return None;
     }
@@ -808,47 +871,57 @@ fn extract_font_line_from_value(v: &Value) -> Option<FontLine<'static>> {
 
 /// Extract typed Font with FontLine from a Mutable<Value> signal.
 fn extract_font_line_style(vm: &Mutable<Arc<Value>>) -> Font<'static> {
-    Font::with_signal_self(vm.signal_cloned().map(|v| {
-        extract_font_line_from_value(&v).map(|fl| Font::new().line(fl))
-    }))
+    Font::with_signal_self(
+        vm.signal_cloned()
+            .map(|v| extract_font_line_from_value(&v).map(|fl| Font::new().line(fl))),
+    )
 }
 
 /// Apply raw CSS properties that have no Zoon typed equivalent
 /// (line-height, text-shadow, -webkit-font-smoothing).
-fn apply_raw_css_signals<T: RawEl>(
-    raw_el: T,
-    vm: &Mutable<Arc<Value>>,
-) -> T {
+fn apply_raw_css_signals<T: RawEl>(raw_el: T, vm: &Mutable<Arc<Value>>) -> T {
     raw_el
-        .style_signal("line-height", vm.signal_cloned().map(|v| {
-            let style = get_style_obj(get_fields(&v)?)?;
-            let lh = style.get("line_height")?.as_number()?;
-            Some(format!("{}", lh))
-        }))
-        .style_signal("text-shadow", vm.signal_cloned().map(|v| {
-            let style = get_style_obj(get_fields(&v)?)?;
-            let shadow = match style.get("text_shadow")? {
-                Value::Object(obj) => obj,
-                _ => return None,
-            };
-            let x = shadow.get("x").and_then(|v| v.as_number()).unwrap_or(0.0);
-            let y = shadow.get("y").and_then(|v| v.as_number()).unwrap_or(0.0);
-            let blur = shadow.get("blur").and_then(|v| v.as_number()).unwrap_or(0.0);
-            let color_css = shadow.get("color")
-                .and_then(value_to_css_color)
-                .unwrap_or_else(|| "rgba(0,0,0,0.5)".to_string());
-            Some(format!("{}px {}px {}px {}", x, y, blur, color_css))
-        }))
-        .style_signal("-webkit-font-smoothing", vm.signal_cloned().map(|v| {
-            let style = get_style_obj(get_fields(&v)?)?;
-            let val = style.get("font_smoothing")?;
-            match val.as_tag()? {
-                "Antialiased" => Some("antialiased".to_string()),
-                _ => None,
-            }
-        }))
+        .style_signal(
+            "line-height",
+            vm.signal_cloned().map(|v| {
+                let style = get_style_obj(get_fields(&v)?)?;
+                let lh = style.get("line_height")?.as_number()?;
+                Some(format!("{}", lh))
+            }),
+        )
+        .style_signal(
+            "text-shadow",
+            vm.signal_cloned().map(|v| {
+                let style = get_style_obj(get_fields(&v)?)?;
+                let shadow = match style.get("text_shadow")? {
+                    Value::Object(obj) => obj,
+                    _ => return None,
+                };
+                let x = shadow.get("x").and_then(|v| v.as_number()).unwrap_or(0.0);
+                let y = shadow.get("y").and_then(|v| v.as_number()).unwrap_or(0.0);
+                let blur = shadow
+                    .get("blur")
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0);
+                let color_css = shadow
+                    .get("color")
+                    .and_then(value_to_css_color)
+                    .unwrap_or_else(|| "rgba(0,0,0,0.5)".to_string());
+                Some(format!("{}px {}px {}px {}", x, y, blur, color_css))
+            }),
+        )
+        .style_signal(
+            "-webkit-font-smoothing",
+            vm.signal_cloned().map(|v| {
+                let style = get_style_obj(get_fields(&v)?)?;
+                let val = style.get("font_smoothing")?;
+                match val.as_tag()? {
+                    "Antialiased" => Some("antialiased".to_string()),
+                    _ => None,
+                }
+            }),
+        )
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Retained tree types
@@ -879,8 +952,41 @@ impl KeyedItems {
         handle: &DdWorkerHandle,
         stripe_link_path: &str,
     ) {
-        for diff in diffs {
-            match diff {
+        let mut i = 0usize;
+        while i < diffs.len() {
+            match &diffs[i] {
+                // Differential updates often arrive as Remove(key) + Upsert(key, new_value)
+                // in the same batch. Collapse this into an in-place update to preserve
+                // focused DOM nodes (e.g., active text inputs in edit mode).
+                KeyedDiff::Remove { key }
+                    if matches!(
+                        diffs.get(i + 1),
+                        Some(KeyedDiff::Upsert { key: next_key, .. }) if next_key.0 == key.0
+                    ) =>
+                {
+                    let key_str = key.0.clone();
+                    if let Some(KeyedDiff::Upsert { value, .. }) = diffs.get(i + 1) {
+                        if let Some(node) = self.items.get_mut(&key_str) {
+                            let child_lp = Self::child_link_path(value, stripe_link_path, &key_str);
+                            node.update(value, handle, &child_lp);
+                        } else {
+                            let insert_pos = self
+                                .items
+                                .keys()
+                                .position(|k| k.as_ref() > key_str.as_ref())
+                                .unwrap_or(self.items.len());
+                            let child_lp = Self::child_link_path(value, stripe_link_path, &key_str);
+                            let (el, node) = build_retained_node(value, handle, &child_lp);
+                            self.items.shift_insert(insert_pos, key_str, node);
+                            tx.unbounded_send(VecDiff::InsertAt {
+                                index: insert_pos,
+                                value: el,
+                            })
+                            .ok();
+                        }
+                    }
+                    i += 2;
+                }
                 KeyedDiff::Upsert { key, value } => {
                     let key_str = key.0.clone();
                     if let Some(node) = self.items.get_mut(&key_str) {
@@ -889,7 +995,9 @@ impl KeyedItems {
                         node.update(value, handle, &child_lp);
                     } else {
                         // New item — find sorted insertion position via binary search on keys
-                        let insert_pos = self.items.keys()
+                        let insert_pos = self
+                            .items
+                            .keys()
                             .position(|k| k.as_ref() > key_str.as_ref())
                             .unwrap_or(self.items.len());
                         let child_lp = Self::child_link_path(value, stripe_link_path, &key_str);
@@ -898,8 +1006,10 @@ impl KeyedItems {
                         tx.unbounded_send(VecDiff::InsertAt {
                             index: insert_pos,
                             value: el,
-                        }).ok();
+                        })
+                        .ok();
                     }
+                    i += 1;
                 }
                 KeyedDiff::Remove { key } => {
                     let key_str = key.0.clone();
@@ -907,6 +1017,7 @@ impl KeyedItems {
                         self.items.shift_remove_index(idx);
                         tx.unbounded_send(VecDiff::RemoveAt { index: idx }).ok();
                     }
+                    i += 1;
                 }
             }
         }
@@ -961,6 +1072,7 @@ enum RetainedNode {
         value: Mutable<Arc<Value>>,
         link_path: Rc<RefCell<String>>,
         dom_element: Rc<RefCell<Option<web_sys::HtmlInputElement>>>,
+        last_focus: Rc<Cell<bool>>,
     },
     Checkbox {
         value: Mutable<Arc<Value>>,
@@ -1020,9 +1132,7 @@ impl RetainedNode {
             (RetainedNode::Paragraph { .. }, Value::Tagged { tag, .. }) => {
                 tag.as_ref() == "ElementParagraph"
             }
-            (RetainedNode::Link { .. }, Value::Tagged { tag, .. }) => {
-                tag.as_ref() == "ElementLink"
-            }
+            (RetainedNode::Link { .. }, Value::Tagged { tag, .. }) => tag.as_ref() == "ElementLink",
             (RetainedNode::Document { .. }, Value::Tagged { tag, .. }) => {
                 tag.as_ref() == "DocumentNew"
             }
@@ -1093,15 +1203,16 @@ fn build_retained_tagged(
         "ElementLink" => build_retained_link(fields, full_value, handle, link_path),
         "DocumentNew" => {
             let (child_tx, child_rx) = mpsc::unbounded();
-            let (child_opt, initial_elements) =
-                if let Some(root) = fields.get("root") {
-                    let (el, child) = build_retained_node(root, handle, link_path);
-                    (Some(Box::new(child)), vec![el])
-                } else {
-                    (None, vec![])
-                };
+            let (child_opt, initial_elements) = if let Some(root) = fields.get("root") {
+                let (el, child) = build_retained_node(root, handle, link_path);
+                (Some(Box::new(child)), vec![el])
+            } else {
+                (None, vec![])
+            };
             child_tx
-                .unbounded_send(VecDiff::Replace { values: initial_elements })
+                .unbounded_send(VecDiff::Replace {
+                    values: initial_elements,
+                })
                 .ok();
             let el = El::new()
                 .s(Width::fill())
@@ -1109,7 +1220,13 @@ fn build_retained_tagged(
                 .update_raw_el(|raw_el| {
                     raw_el.children_signal_vec(VecDiffStreamSignalVec(child_rx))
                 });
-            (el.unify(), RetainedNode::Document { child: child_opt, child_tx })
+            (
+                el.unify(),
+                RetainedNode::Document {
+                    child: child_opt,
+                    child_tx,
+                },
+            )
         }
         _ => build_retained_primitive(&Value::text(format!("{}[...]", tag))),
     }
@@ -1120,7 +1237,10 @@ fn make_hover_handler(handle_ref: DdWorkerHandle, hover_link: Option<String>) ->
     move |hovered| {
         if let Some(ref path) = hover_link {
             if !path.is_empty() {
-                handle_ref.inject_dd_event(Event::HoverChange { link_path: path.clone(), hovered });
+                handle_ref.inject_dd_event(Event::HoverChange {
+                    link_path: path.clone(),
+                    hovered,
+                });
             }
         }
     }
@@ -1149,11 +1269,21 @@ fn build_retained_button(
                 .map(|l| l.to_display_string())
                 .unwrap_or_default()
         }))
-        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
-        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
-        .s(Align::with_signal_self(vm.signal_cloned().map(|v| extract_self_align(&v))))
-        .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
-        .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
+        .s(Font::with_signal_self(
+            vm.signal_cloned().map(|v| extract_font(&v)),
+        ))
+        .s(Font::with_signal_self(
+            vm.signal_cloned().map(|v| extract_align_font(&v)),
+        ))
+        .s(Align::with_signal_self(
+            vm.signal_cloned().map(|v| extract_self_align(&v)),
+        ))
+        .s(Width::with_signal_self(
+            vm.signal_cloned().map(|v| extract_width(&v)),
+        ))
+        .s(Height::with_signal_self(
+            vm.signal_cloned().map(|v| extract_height(&v)),
+        ))
         .s(Background::new()
             .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v)))
             .url_signal(vm.signal_cloned().map(|v| extract_bg_url(&v))))
@@ -1164,7 +1294,9 @@ fn build_retained_button(
                 .and_then(|v| v.as_number())
                 .map(|n| n as u32)
         })))
-        .s(Transform::with_signal_self(vm.signal_cloned().map(|v| extract_transform(&v))))
+        .s(Transform::with_signal_self(
+            vm.signal_cloned().map(|v| extract_transform(&v)),
+        ))
         .s(Outline::with_signal_self(if has_hover_style {
             // Combine DD value signal with local hover state for reactive outline.
             let hs = hover_state.clone();
@@ -1186,7 +1318,9 @@ fn build_retained_button(
             Box::pin(vm.signal_cloned().map(|v| extract_outline(&v)))
                 as Pin<Box<dyn Signal<Item = Option<Outline>>>>
         }))
-        .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
+        .s(AlignContent::with_signal_self(
+            vm.signal_cloned().map(|v| extract_align_content(&v)),
+        ))
         .s(extract_padding_style(&vm))
         .s(extract_shadows_style(&vm))
         .s(extract_borders_style(&vm))
@@ -1212,7 +1346,10 @@ fn build_retained_button(
             move |hovered| {
                 hs.set_neq(hovered);
                 if let Some(ref path) = hover_link_clone {
-                    handle_ref.inject_dd_event(Event::HoverChange { link_path: path.clone(), hovered });
+                    handle_ref.inject_dd_event(Event::HoverChange {
+                        link_path: path.clone(),
+                        hovered,
+                    });
                 }
             }
         });
@@ -1242,7 +1379,8 @@ fn build_retained_stripe(
 
     // Detect keyed Stripe by matching element tag from compiler.
     let keyed_mode = if let Some(keyed_tag) = handle.keyed_stripe_element_tag() {
-        let el_tag = fields.get("element")
+        let el_tag = fields
+            .get("element")
             .and_then(|e| e.get_field("tag"))
             .and_then(|t| t.as_tag());
         el_tag == Some(keyed_tag)
@@ -1291,10 +1429,18 @@ fn build_retained_stripe(
                 .filter(|g| *g > 0.0)
                 .map(|g| g as u32)
         })))
-        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
-        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
-        .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
-        .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
+        .s(Font::with_signal_self(
+            vm.signal_cloned().map(|v| extract_font(&v)),
+        ))
+        .s(Font::with_signal_self(
+            vm.signal_cloned().map(|v| extract_align_font(&v)),
+        ))
+        .s(Width::with_signal_self(
+            vm.signal_cloned().map(|v| extract_width(&v)),
+        ))
+        .s(Height::with_signal_self(
+            vm.signal_cloned().map(|v| extract_height(&v)),
+        ))
         .s(Background::new()
             .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v)))
             .url_signal(vm.signal_cloned().map(|v| extract_bg_url(&v))))
@@ -1305,9 +1451,15 @@ fn build_retained_stripe(
                 .and_then(|v| v.as_number())
                 .map(|n| n as u32)
         })))
-        .s(Transform::with_signal_self(vm.signal_cloned().map(|v| extract_transform(&v))))
-        .s(Outline::with_signal_self(vm.signal_cloned().map(|v| extract_outline(&v))))
-        .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
+        .s(Transform::with_signal_self(
+            vm.signal_cloned().map(|v| extract_transform(&v)),
+        ))
+        .s(Outline::with_signal_self(
+            vm.signal_cloned().map(|v| extract_outline(&v)),
+        ))
+        .s(AlignContent::with_signal_self(
+            vm.signal_cloned().map(|v| extract_align_content(&v)),
+        ))
         .s(extract_padding_style(&vm))
         .s(extract_shadows_style(&vm))
         .s(extract_borders_style(&vm))
@@ -1329,13 +1481,12 @@ fn build_retained_stripe(
             raw_el.after_insert(move |el: web_sys::HtmlElement| {
                 let link_in = link_hover_in.clone();
                 let handle_in = handle_hover_in.clone_ref();
-                let enter_closure =
-                    wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                        handle_in.inject_dd_event(Event::HoverChange {
-                            link_path: link_in.clone(),
-                            hovered: true,
-                        });
+                let enter_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    handle_in.inject_dd_event(Event::HoverChange {
+                        link_path: link_in.clone(),
+                        hovered: true,
                     });
+                });
                 el.add_event_listener_with_callback(
                     "mouseenter",
                     enter_closure.as_ref().unchecked_ref(),
@@ -1345,13 +1496,12 @@ fn build_retained_stripe(
 
                 let link_out = link_hover_out.clone();
                 let handle_out = handle_hover_out.clone_ref();
-                let leave_closure =
-                    wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                        handle_out.inject_dd_event(Event::HoverChange {
-                            link_path: link_out.clone(),
-                            hovered: false,
-                        });
+                let leave_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    handle_out.inject_dd_event(Event::HoverChange {
+                        link_path: link_out.clone(),
+                        hovered: false,
                     });
+                });
                 el.add_event_listener_with_callback(
                     "mouseleave",
                     leave_closure.as_ref().unchecked_ref(),
@@ -1403,10 +1553,13 @@ fn build_retained_stack(
         .ok();
 
     let el = Stack::new()
-        .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
-        .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
-        .s(Background::new()
-            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
+        .s(Width::with_signal_self(
+            vm.signal_cloned().map(|v| extract_width(&v)),
+        ))
+        .s(Height::with_signal_self(
+            vm.signal_cloned().map(|v| extract_height(&v)),
+        ))
+        .s(Background::new().color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
         .layers_signal_vec(VecDiffStreamSignalVec(layers_rx));
 
     (
@@ -1444,12 +1597,19 @@ fn build_retained_container(
         .ok();
 
     let el = El::new()
-        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
-        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
-        .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
-        .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
-        .s(Background::new()
-            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
+        .s(Font::with_signal_self(
+            vm.signal_cloned().map(|v| extract_font(&v)),
+        ))
+        .s(Font::with_signal_self(
+            vm.signal_cloned().map(|v| extract_align_font(&v)),
+        ))
+        .s(Width::with_signal_self(
+            vm.signal_cloned().map(|v| extract_width(&v)),
+        ))
+        .s(Height::with_signal_self(
+            vm.signal_cloned().map(|v| extract_height(&v)),
+        ))
+        .s(Background::new().color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
         .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
                 .and_then(|f| get_style_obj(f))
@@ -1457,9 +1617,15 @@ fn build_retained_container(
                 .and_then(|v| v.as_number())
                 .map(|n| n as u32)
         })))
-        .s(Transform::with_signal_self(vm.signal_cloned().map(|v| extract_transform(&v))))
-        .s(Outline::with_signal_self(vm.signal_cloned().map(|v| extract_outline(&v))))
-        .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
+        .s(Transform::with_signal_self(
+            vm.signal_cloned().map(|v| extract_transform(&v)),
+        ))
+        .s(Outline::with_signal_self(
+            vm.signal_cloned().map(|v| extract_outline(&v)),
+        ))
+        .s(AlignContent::with_signal_self(
+            vm.signal_cloned().map(|v| extract_align_content(&v)),
+        ))
         .s(extract_padding_style(&vm))
         .s(extract_shadows_style(&vm))
         .s(extract_borders_style(&vm))
@@ -1515,8 +1681,12 @@ fn build_retained_label(
                 el
             }
         }))
-        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
-        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
+        .s(Font::with_signal_self(
+            vm.signal_cloned().map(|v| extract_font(&v)),
+        ))
+        .s(Font::with_signal_self(
+            vm.signal_cloned().map(|v| extract_align_font(&v)),
+        ))
         .s(extract_padding_style(&vm))
         .s(extract_shadows_style(&vm))
         .s(extract_borders_style(&vm))
@@ -1571,15 +1741,10 @@ fn build_retained_text_input(
         .get("focus")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let last_focus = Rc::new(Cell::new(focus));
 
     let input = TextInput::new()
         .label_hidden("text input")
-        .focus_signal(vm.signal_cloned().map(|v| {
-            get_fields(&v)
-                .and_then(|f| f.get("focus"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        }))
         .text_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
                 .and_then(|f| f.get("text"))
@@ -1587,18 +1752,24 @@ fn build_retained_text_input(
                 .map(|s| s.to_string())
                 .unwrap_or_default()
         }))
-        .placeholder(Placeholder::with_signal(vm.signal_cloned().map(|v| {
-            get_fields(&v)
-                .and_then(|f| f.get("placeholder"))
-                .and_then(|v| v.get_field("text"))
-                .and_then(|v| v.as_text())
-                .map(|s| s.to_string())
-                .unwrap_or_default()
-        })).s(Font::new().italic()))
-        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
-        .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
-        .s(Background::new()
-            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
+        .placeholder(
+            Placeholder::with_signal(vm.signal_cloned().map(|v| {
+                get_fields(&v)
+                    .and_then(|f| f.get("placeholder"))
+                    .and_then(|v| v.get_field("text"))
+                    .and_then(|v| v.as_text())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            }))
+            .s(Font::new().italic()),
+        )
+        .s(Font::with_signal_self(
+            vm.signal_cloned().map(|v| extract_font(&v)),
+        ))
+        .s(Width::with_signal_self(
+            vm.signal_cloned().map(|v| extract_width(&v)),
+        ))
+        .s(Background::new().color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
         .s(extract_padding_style(&vm))
         .s(extract_shadows_style(&vm))
         .s(extract_borders_style(&vm))
@@ -1608,14 +1779,42 @@ fn build_retained_text_input(
             let initial_text = text.clone();
             let initial_focus = focus;
             let vm = vm.clone();
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
             move |raw_el| {
                 let raw_el = apply_raw_css_signals(raw_el, &vm);
                 raw_el.after_insert(move |input_el: web_sys::HtmlInputElement| {
                     if initial_focus {
+                        input_el.focus().ok();
                         input_el.set_value(&initial_text);
                         let text_len: u32 = initial_text.len().try_into().unwrap_or(0);
                         input_el.set_selection_range(text_len, text_len).ok();
                     }
+
+                    let input_listener_el = input_el.clone();
+                    let input_listener_handle = handle_ref.clone_ref();
+                    let input_listener_lp = lp.clone();
+                    let input_closure =
+                        wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                            let base = input_listener_lp.borrow().clone();
+                            if base.is_empty() {
+                                return;
+                            }
+                            let text = input_listener_el.value();
+                            let path = format!("{}.event.change", base);
+                            input_listener_handle.inject_dd_event(Event::TextChange {
+                                link_path: path,
+                                text,
+                            });
+                        });
+                    input_el
+                        .add_event_listener_with_callback(
+                            "input",
+                            input_closure.as_ref().unchecked_ref(),
+                        )
+                        .ok();
+                    input_closure.forget();
+
                     *dom_el_ref.borrow_mut() = Some(input_el);
                 })
             }
@@ -1623,6 +1822,7 @@ fn build_retained_text_input(
         .on_key_down_event({
             let handle_ref = handle.clone_ref();
             let lp = link_ref.clone();
+            let dom_el_ref = dom_el.clone();
             move |event| {
                 let base = lp.borrow().clone();
                 if !base.is_empty() {
@@ -1632,8 +1832,44 @@ fn build_retained_text_input(
                         Key::Other(k) => k.clone(),
                     };
                     let path = format!("{}.event.key_down", base);
-                    handle_ref.inject_dd_event(Event::KeyDown { link_path: path, key });
+                    handle_ref.inject_dd_event(Event::KeyDown {
+                        link_path: path,
+                        key,
+                    });
+                    if matches!(event.key(), Key::Enter) {
+                        if let Some(input) = dom_el_ref.borrow().as_ref() {
+                            input.set_value("");
+                        }
+                        let path = format!("{}.event.change", base);
+                        handle_ref.inject_dd_event(Event::TextChange {
+                            link_path: path,
+                            text: String::new(),
+                        });
+                    }
                 }
+            }
+        })
+        .update_raw_el({
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
+            let dom_el_ref = dom_el.clone();
+            move |raw_el| {
+                raw_el.event_handler(move |_: events::Input| {
+                    let base = lp.borrow().clone();
+                    if base.is_empty() {
+                        return;
+                    }
+                    let text = dom_el_ref
+                        .borrow()
+                        .as_ref()
+                        .map(|input| input.value())
+                        .unwrap_or_default();
+                    let path = format!("{}.event.change", base);
+                    handle_ref.inject_dd_event(Event::TextChange {
+                        link_path: path,
+                        text,
+                    });
+                })
             }
         })
         .on_change({
@@ -1643,19 +1879,60 @@ fn build_retained_text_input(
                 let base = lp.borrow().clone();
                 if !base.is_empty() {
                     let path = format!("{}.event.change", base);
-                    handle_ref.inject_dd_event(Event::TextChange { link_path: path, text });
+                    handle_ref.inject_dd_event(Event::TextChange {
+                        link_path: path,
+                        text,
+                    });
                 }
             }
         })
         .on_blur({
             let handle_ref = handle.clone_ref();
             let lp = link_ref.clone();
+            let dom_el_ref = dom_el.clone();
             move || {
                 let base = lp.borrow().clone();
-                if !base.is_empty() {
-                    let path = format!("{}.event.blur", base);
-                    handle_ref.inject_dd_event(Event::Blur { link_path: path });
+                if base.is_empty() {
+                    return;
                 }
+
+                let handle_delayed = handle_ref.clone_ref();
+                let dom_el_delayed = dom_el_ref.clone();
+                let path = format!("{}.event.blur", base);
+
+                let timeout_callback =
+                    wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+                        let still_focused = dom_el_delayed
+                            .borrow()
+                            .as_ref()
+                            .and_then(|input| {
+                                web_sys::window()
+                                    .and_then(|w| w.document())
+                                    .and_then(|d| d.active_element())
+                                    .map(|active| {
+                                        let input_el: web_sys::Element =
+                                            input.clone().unchecked_into();
+                                        active == input_el
+                                    })
+                            })
+                            .unwrap_or(false);
+
+                        if !still_focused {
+                            handle_delayed.inject_dd_event(Event::Blur {
+                                link_path: path.clone(),
+                            });
+                        }
+                    });
+
+                if let Some(window) = web_sys::window() {
+                    window
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                            timeout_callback.as_ref().unchecked_ref(),
+                            0,
+                        )
+                        .ok();
+                }
+                timeout_callback.forget();
             }
         })
         .update_raw_el({
@@ -1678,6 +1955,7 @@ fn build_retained_text_input(
             value: vm,
             link_path: link_ref,
             dom_element: dom_el,
+            last_focus,
         },
     )
 }
@@ -1731,9 +2009,15 @@ fn build_retained_checkbox(
             }));
 
         let el = el
-            .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
-            .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
-            .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
+            .s(Font::with_signal_self(
+                vm.signal_cloned().map(|v| extract_font(&v)),
+            ))
+            .s(Width::with_signal_self(
+                vm.signal_cloned().map(|v| extract_width(&v)),
+            ))
+            .s(Height::with_signal_self(
+                vm.signal_cloned().map(|v| extract_height(&v)),
+            ))
             .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
                 get_fields(&v)
                     .and_then(|f| get_style_obj(f))
@@ -1741,9 +2025,15 @@ fn build_retained_checkbox(
                     .and_then(|v| v.as_number())
                     .map(|n| n as u32)
             })))
-            .s(Transform::with_signal_self(vm.signal_cloned().map(|v| extract_transform(&v))))
-            .s(Outline::with_signal_self(vm.signal_cloned().map(|v| extract_outline(&v))))
-            .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
+            .s(Transform::with_signal_self(
+                vm.signal_cloned().map(|v| extract_transform(&v)),
+            ))
+            .s(Outline::with_signal_self(
+                vm.signal_cloned().map(|v| extract_outline(&v)),
+            ))
+            .s(AlignContent::with_signal_self(
+                vm.signal_cloned().map(|v| extract_align_content(&v)),
+            ))
             .s(extract_padding_style(&vm))
             .s(extract_shadows_style(&vm))
             .s(extract_borders_style(&vm))
@@ -1763,13 +2053,12 @@ fn build_retained_checkbox(
                             link_path: lp.borrow().clone(),
                         });
                     });
-                    el.add_event_listener_with_callback(
-                        "click",
-                        closure.as_ref().unchecked_ref(),
-                    ).ok();
+                    el.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
+                        .ok();
                     closure.forget();
                 })
-            }).unify()
+            })
+            .unify()
         } else {
             el.unify()
         }
@@ -1788,20 +2077,23 @@ fn build_retained_checkbox(
         if !effective_link.is_empty() {
             let handle_ref = handle.clone_ref();
             let lp = link_ref.clone();
-            checkbox.update_raw_el(move |raw_el| {
-                raw_el.after_insert(move |el: web_sys::HtmlDivElement| {
-                    let closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                        handle_ref.inject_dd_event(Event::LinkClick {
-                            link_path: lp.borrow().clone(),
+            checkbox
+                .update_raw_el(move |raw_el| {
+                    raw_el.after_insert(move |el: web_sys::HtmlDivElement| {
+                        let closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                            handle_ref.inject_dd_event(Event::LinkClick {
+                                link_path: lp.borrow().clone(),
+                            });
                         });
-                    });
-                    el.add_event_listener_with_callback(
-                        "click",
-                        closure.as_ref().unchecked_ref(),
-                    ).ok();
-                    closure.forget();
+                        el.add_event_listener_with_callback(
+                            "click",
+                            closure.as_ref().unchecked_ref(),
+                        )
+                        .ok();
+                        closure.forget();
+                    })
                 })
-            }).unify()
+                .unify()
         } else {
             checkbox.unify()
         }
@@ -1843,8 +2135,12 @@ fn build_retained_paragraph(
         .ok();
 
     let el = Paragraph::new()
-        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
-        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
+        .s(Font::with_signal_self(
+            vm.signal_cloned().map(|v| extract_font(&v)),
+        ))
+        .s(Font::with_signal_self(
+            vm.signal_cloned().map(|v| extract_align_font(&v)),
+        ))
         .s(extract_padding_style(&vm))
         .s(extract_shadows_style(&vm))
         .s(extract_borders_style(&vm))
@@ -1891,7 +2187,9 @@ fn build_retained_link(
                 .unwrap_or_default()
         }))
         .new_tab(NewTab::new())
-        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
+        .s(Font::with_signal_self(
+            vm.signal_cloned().map(|v| extract_font(&v)),
+        ))
         .s(extract_padding_style(&vm))
         .s(extract_shadows_style(&vm))
         .s(extract_borders_style(&vm))
@@ -1912,13 +2210,12 @@ fn build_retained_link(
             raw_el.after_insert(move |el: web_sys::HtmlAnchorElement| {
                 let link_in = link_hover_in.clone();
                 let handle_in = handle_hover_in.clone_ref();
-                let enter_closure =
-                    wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                        handle_in.inject_dd_event(Event::HoverChange {
-                            link_path: link_in.clone(),
-                            hovered: true,
-                        });
+                let enter_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    handle_in.inject_dd_event(Event::HoverChange {
+                        link_path: link_in.clone(),
+                        hovered: true,
                     });
+                });
                 el.add_event_listener_with_callback(
                     "mouseenter",
                     enter_closure.as_ref().unchecked_ref(),
@@ -1928,13 +2225,12 @@ fn build_retained_link(
 
                 let link_out = link_hover_out.clone();
                 let handle_out = handle_hover_out.clone_ref();
-                let leave_closure =
-                    wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                        handle_out.inject_dd_event(Event::HoverChange {
-                            link_path: link_out.clone(),
-                            hovered: false,
-                        });
+                let leave_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    handle_out.inject_dd_event(Event::HoverChange {
+                        link_path: link_out.clone(),
+                        hovered: false,
                     });
+                });
                 el.add_event_listener_with_callback(
                     "mouseleave",
                     leave_closure.as_ref().unchecked_ref(),
@@ -1947,7 +2243,13 @@ fn build_retained_link(
         el
     };
 
-    (el.unify(), RetainedNode::Link { value: vm, link_path: link_ref })
+    (
+        el.unify(),
+        RetainedNode::Link {
+            value: vm,
+            link_path: link_ref,
+        },
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1981,7 +2283,10 @@ impl RetainedNode {
                 text.set_neq(new_text);
             }
 
-            RetainedNode::Button { value, link_path: lp } => {
+            RetainedNode::Button {
+                value,
+                link_path: lp,
+            } => {
                 // Preserve __style_hovered__ from old value (set by compiler, not DD runtime).
                 let mut updated = new_value.clone();
                 if let Some(old_fields) = get_fields(&value.get_cloned()) {
@@ -2039,8 +2344,7 @@ impl RetainedNode {
                             if existing.matches_value_type(new_val) {
                                 existing.update(new_val, handle, link_path);
                             } else {
-                                let (el, node) =
-                                    build_retained_node(new_val, handle, link_path);
+                                let (el, node) = build_retained_node(new_val, handle, link_path);
                                 *child = Some(Box::new(node));
                                 child_tx.unbounded_send(VecDiff::RemoveAt { index: 0 }).ok();
                                 child_tx
@@ -2069,12 +2373,8 @@ impl RetainedNode {
                 value,
                 link_path: lp,
                 dom_element,
+                last_focus,
             } => {
-                // Detect focus change for manual focus handling
-                let old_focus = get_fields(&value.get_cloned())
-                    .and_then(|f| f.get("focus"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
                 let new_focus = get_fields(new_value)
                     .and_then(|f| f.get("focus"))
                     .and_then(|v| v.as_bool())
@@ -2104,12 +2404,13 @@ impl RetainedNode {
                     }
 
                     // Handle focus change: manually focus + set cursor position
-                    if !old_focus && new_focus {
+                    if !last_focus.get() && new_focus {
                         let text_len: u32 = new_text.len().try_into().unwrap_or(0);
                         input_el.set_selection_range(text_len, text_len).ok();
                         input_el.focus().ok();
                     }
                 }
+                last_focus.set(new_focus);
             }
 
             RetainedNode::Checkbox {
@@ -2159,7 +2460,10 @@ impl RetainedNode {
                 }
             }
 
-            RetainedNode::Link { value, link_path: lp } => {
+            RetainedNode::Link {
+                value,
+                link_path: lp,
+            } => {
                 value.set_neq(Arc::new(new_value.clone()));
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = extract_effective_link(fields, link_path);
@@ -2219,7 +2523,11 @@ impl RetainedNode {
             RetainedNode::Container { child: Some(c), .. } => {
                 c.apply_keyed_diffs(diffs, handle);
             }
-            RetainedNode::Stripe { items, keyed_items: None, .. } => {
+            RetainedNode::Stripe {
+                items,
+                keyed_items: None,
+                ..
+            } => {
                 for item in items {
                     item.apply_keyed_diffs(diffs, handle);
                 }
@@ -2260,8 +2568,11 @@ fn diff_children(
             let (el, node) = build_retained_node(&new_items[i], handle, &child_lp);
             retained[i] = node;
             tx.unbounded_send(VecDiff::RemoveAt { index: i }).ok();
-            tx.unbounded_send(VecDiff::InsertAt { index: i, value: el })
-                .ok();
+            tx.unbounded_send(VecDiff::InsertAt {
+                index: i,
+                value: el,
+            })
+            .ok();
         }
     }
 
@@ -2309,10 +2620,7 @@ pub fn render_value_static(value: &Value) -> RawElOrText {
     }
 }
 
-fn render_tagged_static(
-    tag: &str,
-    fields: &Arc<Fields>,
-) -> RawElOrText {
+fn render_tagged_static(tag: &str, fields: &Arc<Fields>) -> RawElOrText {
     match tag {
         "ElementButton" => {
             let label = fields
@@ -2322,16 +2630,36 @@ fn render_tagged_static(
             let mut el = Button::new()
                 .update_raw_el(|raw_el| raw_el.attr("role", "button"))
                 .label(El::new().child(label));
-            if let Some(font) = extract_font_from_fields(fields) { el = el.s(font); }
-            if let Some(width) = extract_width_from_fields(fields) { el = el.s(width); }
-            if let Some(height) = extract_height_from_fields(fields) { el = el.s(height); }
-            if let Some(padding) = extract_padding_from_fields(fields) { el = el.s(padding); }
-            if let Some(background) = extract_background_from_fields(fields) { el = el.s(background); }
-            if let Some(rc) = extract_rounded_corners_from_fields(fields) { el = el.s(rc); }
-            if let Some(transform) = extract_transform_from_fields(fields) { el = el.s(transform); }
-            if let Some(outline) = extract_outline_from_fields(fields) { el = el.s(outline); }
-            if let Some(borders) = extract_borders_from_fields(fields) { el = el.s(borders); }
-            if let Some(align) = extract_align_content_from_fields(fields) { el = el.s(align); }
+            if let Some(font) = extract_font_from_fields(fields) {
+                el = el.s(font);
+            }
+            if let Some(width) = extract_width_from_fields(fields) {
+                el = el.s(width);
+            }
+            if let Some(height) = extract_height_from_fields(fields) {
+                el = el.s(height);
+            }
+            if let Some(padding) = extract_padding_from_fields(fields) {
+                el = el.s(padding);
+            }
+            if let Some(background) = extract_background_from_fields(fields) {
+                el = el.s(background);
+            }
+            if let Some(rc) = extract_rounded_corners_from_fields(fields) {
+                el = el.s(rc);
+            }
+            if let Some(transform) = extract_transform_from_fields(fields) {
+                el = el.s(transform);
+            }
+            if let Some(outline) = extract_outline_from_fields(fields) {
+                el = el.s(outline);
+            }
+            if let Some(borders) = extract_borders_from_fields(fields) {
+                el = el.s(borders);
+            }
+            if let Some(align) = extract_align_content_from_fields(fields) {
+                el = el.s(align);
+            }
             el.unify()
         }
         "ElementStripe" => render_stripe_static(fields),
@@ -2343,19 +2671,26 @@ fn render_tagged_static(
                 .map(|v| v.to_display_string())
                 .unwrap_or_default();
             let mut el = Label::new().label(El::new().child(label));
-            if let Some(font) = extract_font_from_fields(fields) { el = el.s(font); }
-            if let Some(padding) = extract_padding_from_fields(fields) { el = el.s(padding); }
+            if let Some(font) = extract_font_from_fields(fields) {
+                el = el.s(font);
+            }
+            if let Some(padding) = extract_padding_from_fields(fields) {
+                el = el.s(padding);
+            }
             el.unify()
         }
         "ElementParagraph" => {
             let mut el = Paragraph::new();
-            if let Some(font) = extract_font_from_fields(fields) { el = el.s(font); }
+            if let Some(font) = extract_font_from_fields(fields) {
+                el = el.s(font);
+            }
             let rendered: Vec<RawElOrText> = extract_sorted_list_items(fields, "contents")
                 .iter()
                 .map(|item| render_value_static(item))
                 .collect();
             let (tx, rx) = mpsc::unbounded();
-            tx.unbounded_send(VecDiff::Replace { values: rendered }).ok();
+            tx.unbounded_send(VecDiff::Replace { values: rendered })
+                .ok();
             el.contents_signal_vec(VecDiffStreamSignalVec(rx)).unify()
         }
         "DocumentNew" => {
@@ -2375,8 +2710,11 @@ fn render_stripe_static(fields: &Fields) -> RawElOrText {
         .and_then(|v| v.as_tag())
         .unwrap_or("Column");
 
-    let mut el = Stripe::new()
-        .direction(if direction == "Row" { Direction::Row } else { Direction::Column });
+    let mut el = Stripe::new().direction(if direction == "Row" {
+        Direction::Row
+    } else {
+        Direction::Column
+    });
 
     if let Some(gap) = fields.get("gap").and_then(|v| v.as_number()) {
         if gap > 0.0 {
@@ -2384,53 +2722,105 @@ fn render_stripe_static(fields: &Fields) -> RawElOrText {
         }
     }
 
-    if let Some(font) = extract_font_from_fields(fields) { el = el.s(font); }
-    if let Some(width) = extract_width_from_fields(fields) { el = el.s(width); }
-    if let Some(height) = extract_height_from_fields(fields) { el = el.s(height); }
-    if let Some(padding) = extract_padding_from_fields(fields) { el = el.s(padding); }
-    if let Some(background) = extract_background_from_fields(fields) { el = el.s(background); }
-    if let Some(rc) = extract_rounded_corners_from_fields(fields) { el = el.s(rc); }
-    if let Some(transform) = extract_transform_from_fields(fields) { el = el.s(transform); }
-    if let Some(outline) = extract_outline_from_fields(fields) { el = el.s(outline); }
-    if let Some(borders) = extract_borders_from_fields(fields) { el = el.s(borders); }
-    if let Some(align) = extract_align_content_from_fields(fields) { el = el.s(align); }
+    if let Some(font) = extract_font_from_fields(fields) {
+        el = el.s(font);
+    }
+    if let Some(width) = extract_width_from_fields(fields) {
+        el = el.s(width);
+    }
+    if let Some(height) = extract_height_from_fields(fields) {
+        el = el.s(height);
+    }
+    if let Some(padding) = extract_padding_from_fields(fields) {
+        el = el.s(padding);
+    }
+    if let Some(background) = extract_background_from_fields(fields) {
+        el = el.s(background);
+    }
+    if let Some(rc) = extract_rounded_corners_from_fields(fields) {
+        el = el.s(rc);
+    }
+    if let Some(transform) = extract_transform_from_fields(fields) {
+        el = el.s(transform);
+    }
+    if let Some(outline) = extract_outline_from_fields(fields) {
+        el = el.s(outline);
+    }
+    if let Some(borders) = extract_borders_from_fields(fields) {
+        el = el.s(borders);
+    }
+    if let Some(align) = extract_align_content_from_fields(fields) {
+        el = el.s(align);
+    }
 
     let rendered_items: Vec<RawElOrText> = extract_sorted_list_items(fields, "items")
         .iter()
         .map(|item| render_value_static(item))
         .collect();
     let (tx, rx) = mpsc::unbounded();
-    tx.unbounded_send(VecDiff::Replace { values: rendered_items }).ok();
+    tx.unbounded_send(VecDiff::Replace {
+        values: rendered_items,
+    })
+    .ok();
     el.items_signal_vec(VecDiffStreamSignalVec(rx)).unify()
 }
 
 fn render_stack_static(fields: &Fields) -> RawElOrText {
     let mut el = Stack::new();
-    if let Some(width) = extract_width_from_fields(fields) { el = el.s(width); }
-    if let Some(height) = extract_height_from_fields(fields) { el = el.s(height); }
-    if let Some(background) = extract_background_from_fields(fields) { el = el.s(background); }
+    if let Some(width) = extract_width_from_fields(fields) {
+        el = el.s(width);
+    }
+    if let Some(height) = extract_height_from_fields(fields) {
+        el = el.s(height);
+    }
+    if let Some(background) = extract_background_from_fields(fields) {
+        el = el.s(background);
+    }
 
     let rendered_layers: Vec<RawElOrText> = extract_sorted_list_items(fields, "layers")
         .iter()
         .map(|item| render_value_static(item))
         .collect();
     let (tx, rx) = mpsc::unbounded();
-    tx.unbounded_send(VecDiff::Replace { values: rendered_layers }).ok();
+    tx.unbounded_send(VecDiff::Replace {
+        values: rendered_layers,
+    })
+    .ok();
     el.layers_signal_vec(VecDiffStreamSignalVec(rx)).unify()
 }
 
 fn render_container_static(fields: &Fields) -> RawElOrText {
     let mut el = El::new();
-    if let Some(font) = extract_font_from_fields(fields) { el = el.s(font); }
-    if let Some(width) = extract_width_from_fields(fields) { el = el.s(width); }
-    if let Some(height) = extract_height_from_fields(fields) { el = el.s(height); }
-    if let Some(padding) = extract_padding_from_fields(fields) { el = el.s(padding); }
-    if let Some(background) = extract_background_from_fields(fields) { el = el.s(background); }
-    if let Some(rc) = extract_rounded_corners_from_fields(fields) { el = el.s(rc); }
-    if let Some(transform) = extract_transform_from_fields(fields) { el = el.s(transform); }
-    if let Some(outline) = extract_outline_from_fields(fields) { el = el.s(outline); }
-    if let Some(borders) = extract_borders_from_fields(fields) { el = el.s(borders); }
-    if let Some(align) = extract_align_content_from_fields(fields) { el = el.s(align); }
+    if let Some(font) = extract_font_from_fields(fields) {
+        el = el.s(font);
+    }
+    if let Some(width) = extract_width_from_fields(fields) {
+        el = el.s(width);
+    }
+    if let Some(height) = extract_height_from_fields(fields) {
+        el = el.s(height);
+    }
+    if let Some(padding) = extract_padding_from_fields(fields) {
+        el = el.s(padding);
+    }
+    if let Some(background) = extract_background_from_fields(fields) {
+        el = el.s(background);
+    }
+    if let Some(rc) = extract_rounded_corners_from_fields(fields) {
+        el = el.s(rc);
+    }
+    if let Some(transform) = extract_transform_from_fields(fields) {
+        el = el.s(transform);
+    }
+    if let Some(outline) = extract_outline_from_fields(fields) {
+        el = el.s(outline);
+    }
+    if let Some(borders) = extract_borders_from_fields(fields) {
+        el = el.s(borders);
+    }
+    if let Some(align) = extract_align_content_from_fields(fields) {
+        el = el.s(align);
+    }
 
     if let Some(child) = fields.get("child") {
         el.child(render_value_static(child)).unify()

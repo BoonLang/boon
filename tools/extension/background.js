@@ -214,7 +214,7 @@ async function cdpClickAt(tabId, x, y) {
   console.log(`[Boon] CDP: Real click at page (${x}, ${y}) -> viewport (${viewportX}, ${viewportY})`);
 }
 
-// Double-click at coordinates (trusted event)
+// Double-click at coordinates using trusted CDP events only.
 async function cdpDoubleClickAt(tabId, x, y) {
   await attachDebugger(tabId);
 
@@ -228,7 +228,13 @@ async function cdpDoubleClickAt(tabId, x, y) {
     type: 'mouseMoved', x: viewportX, y: viewportY, button: 'none'
   });
 
-  // Send double-click with clickCount: 2
+  // Send two real clicks; browser will synthesize dblclick naturally.
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed', x: viewportX, y: viewportY, button: 'left', clickCount: 1
+  });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x: viewportX, y: viewportY, button: 'left', clickCount: 1
+  });
   await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
     type: 'mousePressed', x: viewportX, y: viewportY, button: 'left', clickCount: 2
   });
@@ -236,77 +242,10 @@ async function cdpDoubleClickAt(tabId, x, y) {
     type: 'mouseReleased', x: viewportX, y: viewportY, button: 'left', clickCount: 2
   });
 
-  // Also dispatch dblclick event via JS since Zoon may use it
-  // AND manage hover state tracking (same as cdpHoverAt) to ensure proper mouseleave later
-  await cdpEvaluate(tabId, `
-    (function() {
-      const viewportX = ${x} - window.scrollX;
-      const viewportY = ${y} - window.scrollY;
-      const el = document.elementFromPoint(viewportX, viewportY);
-      if (!el) {
-        console.warn('[Boon] No element at viewport coords for dblclick:', viewportX, viewportY);
-        return;
-      }
-
-      // Dispatch dblclick event
-      el.dispatchEvent(new MouseEvent('dblclick', {
-        bubbles: true, cancelable: true, view: window,
-        clientX: viewportX, clientY: viewportY,
-        detail: 2
-      }));
-
-      // === HOVER STATE TRACKING ===
-      // This ensures that when we later hover elsewhere, proper mouseleave events are dispatched.
-      // Without this, double-click leaves hover state corrupted.
-
-      // Get previous hovered elements (all ancestors that received mouseenter)
-      const prevElements = window.__boonHoveredElements || [];
-
-      // Collect new hover path (from target up to document)
-      const newElements = [];
-      let current = el;
-      while (current && current !== document) {
-        newElements.push(current);
-        current = current.parentElement;
-      }
-
-      // Find elements to leave (in prevElements but not in newElements)
-      const toLeave = prevElements.filter(el => !newElements.includes(el));
-
-      // Find elements to enter (in newElements but not in prevElements)
-      const toEnter = newElements.filter(el => !prevElements.includes(el));
-
-      // Dispatch mouseleave on elements we're leaving (from innermost to outermost)
-      for (const target of toLeave) {
-        target.dispatchEvent(new MouseEvent('mouseleave', {
-          bubbles: false, cancelable: false, view: window,
-          clientX: viewportX, clientY: viewportY,
-          relatedTarget: el
-        }));
-      }
-
-      // Dispatch mouseenter on elements we're entering (from outermost to innermost)
-      for (let i = toEnter.length - 1; i >= 0; i--) {
-        toEnter[i].dispatchEvent(new MouseEvent('mouseenter', {
-          bubbles: false, cancelable: false, view: window,
-          clientX: viewportX, clientY: viewportY,
-          relatedTarget: null
-        }));
-      }
-
-      // Update tracked elements
-      window.__boonHoveredElements = newElements;
-    })()
-  `);
-
-  console.log(`[Boon] CDP: Double-clicked at (${x}, ${y}) with hover state tracking`);
+  console.log(`[Boon] CDP: Trusted double-click at (${x}, ${y})`);
 }
 
-// Hover at coordinates (move mouse without clicking)
-// Uses CDP mouse movement + JavaScript mouseenter/mouseleave dispatch.
-// CDP mouseMoved positions the pointer but doesn't fire JS mouseenter/mouseleave events.
-// Zoon/dominator uses MouseEnter/MouseLeave events and doesn't check isTrusted,
-// so we dispatch synthetic JS events to trigger on_hovered_change callbacks.
+// Hover at coordinates using trusted CDP mouse movement only.
 async function cdpHoverAt(tabId, x, y) {
   await attachDebugger(tabId);
 
@@ -320,97 +259,7 @@ async function cdpHoverAt(tabId, x, y) {
     type: 'mouseMoved', x: viewportX, y: viewportY, button: 'none'
   });
 
-  // Dispatch JavaScript mouseenter/mouseleave events to trigger Zoon's on_hovered_change
-  // Zoon/dominator doesn't check isTrusted, so synthetic events work
-  await cdpEvaluate(tabId, `
-    (function() {
-      const viewportX = ${viewportX};
-      const viewportY = ${viewportY};
-      const newTarget = document.elementFromPoint(viewportX, viewportY);
-
-      // Get previous hovered elements (all ancestors that received mouseenter)
-      // Filter out any elements that are no longer in the document (e.g., after page navigation)
-      const prevElements = (window.__boonHoveredElements || []).filter(el => document.contains(el));
-
-      // Collect all ancestors of newTarget including itself
-      // If newTarget is null (hovering empty area), newElements stays empty
-      // which will cause mouseleave on all previously hovered elements
-      const newElements = [];
-      if (newTarget) {
-        let el = newTarget;
-        while (el && el !== document.documentElement) {
-          newElements.push(el);
-          el = el.parentElement;
-        }
-      }
-
-      // Find elements to leave (in prevElements but not in newElements)
-      const toLeave = prevElements.filter(el => !newElements.includes(el));
-
-      // Find elements to enter (in newElements but not in prevElements)
-      const toEnter = newElements.filter(el => !prevElements.includes(el));
-
-      // Dispatch leave events on elements we're leaving (from innermost to outermost)
-      // Dispatch both pointer and mouse events for broader compatibility
-      for (const el of toLeave) {
-        el.dispatchEvent(new PointerEvent('pointerleave', {
-          bubbles: false, cancelable: false, view: window,
-          clientX: viewportX, clientY: viewportY,
-          relatedTarget: newTarget, pointerType: 'mouse', isPrimary: true
-        }));
-        el.dispatchEvent(new MouseEvent('mouseleave', {
-          bubbles: false, cancelable: false, view: window,
-          clientX: viewportX, clientY: viewportY,
-          relatedTarget: newTarget
-        }));
-      }
-
-      // Dispatch enter events on elements we're entering (from outermost to innermost)
-      // Dispatch both pointer and mouse events for broader compatibility
-      for (let i = toEnter.length - 1; i >= 0; i--) {
-        toEnter[i].dispatchEvent(new PointerEvent('pointerenter', {
-          bubbles: false, cancelable: false, view: window,
-          clientX: viewportX, clientY: viewportY,
-          relatedTarget: prevElements[0] || null, pointerType: 'mouse', isPrimary: true
-        }));
-        toEnter[i].dispatchEvent(new MouseEvent('mouseenter', {
-          bubbles: false, cancelable: false, view: window,
-          clientX: viewportX, clientY: viewportY,
-          relatedTarget: prevElements[0] || null
-        }));
-      }
-
-      // Also dispatch bubbling over/out events on the target element
-      // Some frameworks use these instead of enter/leave
-      if (newTarget) {
-        newTarget.dispatchEvent(new PointerEvent('pointerover', {
-          bubbles: true, cancelable: true, view: window,
-          clientX: viewportX, clientY: viewportY,
-          relatedTarget: prevElements[0] || null, pointerType: 'mouse', isPrimary: true
-        }));
-        newTarget.dispatchEvent(new MouseEvent('mouseover', {
-          bubbles: true, cancelable: true, view: window,
-          clientX: viewportX, clientY: viewportY,
-          relatedTarget: prevElements[0] || null
-        }));
-      }
-
-      // Update tracked elements
-      window.__boonHoveredElements = newElements;
-
-      return {
-        success: true,
-        entered: toEnter.length,
-        left: toLeave.length,
-        newTarget: newTarget ? newTarget.tagName : null
-      };
-    })()
-  `);
-
-  // Small delay for event handlers to process
-  await new Promise(r => setTimeout(r, 50));
-
-  console.log(`[Boon] CDP: Hovered at (${x}, ${y}) with mouseenter/mouseleave dispatch`);
+  console.log(`[Boon] CDP: Trusted hover at (${x}, ${y})`);
 }
 
 // Get element bounding box via CDP
@@ -444,12 +293,6 @@ async function cdpClickSelector(tabId, selector) {
 
   await cdpClickAt(tabId, box.centerX, box.centerY);
   return { x: box.centerX, y: box.centerY };
-}
-
-// Type text (as if typing on keyboard - insertText is fast)
-async function cdpTypeText(tabId, text) {
-  await attachDebugger(tabId);
-  await chrome.debugger.sendCommand({ tabId }, 'Input.insertText', { text });
 }
 
 // Type text character by character using CDP Input.dispatchKeyEvent
@@ -513,81 +356,51 @@ async function cdpPressKey(tabId, key, modifiers = 0) {
   await attachDebugger(tabId);
 
   const keyMap = {
-    'Enter': { key: 'Enter', code: 'Enter', keyCode: 13, windowsVirtualKeyCode: 13 },
-    'Tab': { key: 'Tab', code: 'Tab', keyCode: 9, windowsVirtualKeyCode: 9 },
-    'Escape': { key: 'Escape', code: 'Escape', keyCode: 27, windowsVirtualKeyCode: 27 },
-    'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8, windowsVirtualKeyCode: 8 },
-    'Delete': { key: 'Delete', code: 'Delete', keyCode: 46, windowsVirtualKeyCode: 46 },
-    'End': { key: 'End', code: 'End', keyCode: 35, windowsVirtualKeyCode: 35 },
-    'Home': { key: 'Home', code: 'Home', keyCode: 36, windowsVirtualKeyCode: 36 },
-    'a': { key: 'a', code: 'KeyA', keyCode: 65, windowsVirtualKeyCode: 65 },
+    'Enter': { key: 'Enter', code: 'Enter', keyCode: 13, windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+    'Tab': { key: 'Tab', code: 'Tab', keyCode: 9, windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9 },
+    'Escape': { key: 'Escape', code: 'Escape', keyCode: 27, windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 },
+    'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8, windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
+    'Delete': { key: 'Delete', code: 'Delete', keyCode: 46, windowsVirtualKeyCode: 46, nativeVirtualKeyCode: 46 },
+    'End': { key: 'End', code: 'End', keyCode: 35, windowsVirtualKeyCode: 35, nativeVirtualKeyCode: 35 },
+    'Home': { key: 'Home', code: 'Home', keyCode: 36, windowsVirtualKeyCode: 36, nativeVirtualKeyCode: 36 },
   };
 
-  const keyInfo = keyMap[key] || { key, code: key, keyCode: 0, windowsVirtualKeyCode: 0 };
+  let keyInfo = keyMap[key];
+  if (!keyInfo) {
+    if (/^[a-zA-Z]$/.test(key)) {
+      const upper = key.toUpperCase();
+      const keyCode = upper.charCodeAt(0);
+      keyInfo = {
+        key,
+        code: `Key${upper}`,
+        keyCode,
+        windowsVirtualKeyCode: keyCode,
+        nativeVirtualKeyCode: keyCode,
+      };
+    } else if (/^[0-9]$/.test(key)) {
+      const keyCode = key.charCodeAt(0);
+      keyInfo = {
+        key,
+        code: `Digit${key}`,
+        keyCode,
+        windowsVirtualKeyCode: keyCode,
+        nativeVirtualKeyCode: keyCode,
+      };
+    } else {
+      keyInfo = { key, code: key, keyCode: 0, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 };
+    }
+  }
 
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
-    type: 'keyDown', ...keyInfo, modifiers
-  });
+  const keyDownEvent = { type: 'keyDown', ...keyInfo, modifiers };
+  if (keyInfo.key === 'Enter') {
+    keyDownEvent.text = '\r';
+    keyDownEvent.unmodifiedText = '\r';
+  }
+
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', keyDownEvent);
   await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
     type: 'keyUp', ...keyInfo, modifiers
   });
-}
-
-// Press special key using JavaScript dispatchEvent (triggers web_sys event listeners)
-async function jsDispatchKeyEvent(tabId, key) {
-  const keyMap = {
-    'Enter': { key: 'Enter', code: 'Enter', keyCode: 13, which: 13 },
-    'Tab': { key: 'Tab', code: 'Tab', keyCode: 9, which: 9 },
-    'Escape': { key: 'Escape', code: 'Escape', keyCode: 27, which: 27 },
-    'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8, which: 8 },
-    'Delete': { key: 'Delete', code: 'Delete', keyCode: 46, which: 46 },
-  };
-
-  const keyInfo = keyMap[key] || { key, code: key, keyCode: 0, which: 0 };
-
-  // Dispatch keydown event on the focused element
-  // Also try to find and dispatch on any input element in the preview pane
-  const script = `
-    (function() {
-      // First try document.activeElement
-      let target = document.activeElement;
-
-      // If activeElement is body or not an input, try to find the input in preview
-      if (!target || target === document.body || target.tagName !== 'INPUT') {
-        const previewPane = document.querySelector('.preview-pane') || document.querySelector('[class*="preview"]');
-        if (previewPane) {
-          const input = previewPane.querySelector('input');
-          if (input) {
-            target = input;
-            input.focus();
-          }
-        }
-      }
-
-      // Fallback to any input on the page
-      if (!target || target === document.body) {
-        target = document.querySelector('input') || document.body;
-      }
-
-      console.log('[boon-tools] Dispatching keydown on:', target.tagName, target.className);
-
-      const event = new KeyboardEvent('keydown', {
-        key: '${keyInfo.key}',
-        code: '${keyInfo.code}',
-        keyCode: ${keyInfo.keyCode},
-        which: ${keyInfo.which},
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        view: window
-      });
-
-      target.dispatchEvent(event);
-      return { target: target.tagName, className: target.className, key: '${keyInfo.key}' };
-    })()
-  `;
-
-  return await cdpEvaluate(tabId, script);
 }
 
 // Keyboard shortcut (Ctrl+A, Ctrl+V, etc.)
@@ -888,35 +701,12 @@ async function handleCommand(id, command) {
         return { type: 'success', data: { x: command.x, y: command.y, method: 'cdp' } };
 
       case 'type':
-        // Use CDP: focus element, then type
-        // After typing, dispatch input/change events to trigger Zoon callbacks
+        // Use trusted keyboard-like CDP events only.
         try {
           await cdpFocusElement(tab.id, command.selector);
           await cdpKeyboardShortcut(tab.id, 'a', true); // Ctrl+A to select all
-          await cdpTypeText(tab.id, command.text);
-          // CDP Input.insertText doesn't reliably trigger DOM events
-          // Dispatch input and change events to ensure Zoon's on_change fires
-          const dispatchScript = `
-            (function() {
-              const el = document.querySelector('${command.selector}');
-              if (el) {
-                console.log('[boon-tools] Input value after CDP type:', el.value);
-                // Create InputEvent (not just Event) for better compatibility
-                el.dispatchEvent(new InputEvent('input', {
-                  bubbles: true,
-                  inputType: 'insertText',
-                  data: el.value
-                }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                console.log('[boon-tools] Dispatched input/change events');
-              } else {
-                console.log('[boon-tools] Element not found:', '${command.selector}');
-              }
-            })();
-          `;
-          await chrome.debugger.sendCommand({ tabId: tab.id }, 'Runtime.evaluate', {
-            expression: dispatchScript
-          });
+          await cdpPressKey(tab.id, 'Backspace');
+          await cdpTypeTextCharByChar(tab.id, command.text);
           return { type: 'success', data: null };
         } catch (e) {
           return { type: 'error', message: e.message };
@@ -941,9 +731,8 @@ async function handleCommand(id, command) {
             await cdpKeyboardShortcut(tab.id, actualKey.toLowerCase(), hasCtrl, hasShift, hasAlt);
             return { type: 'success', data: { key: actualKey, ctrl: hasCtrl, shift: hasShift, alt: hasAlt, method: 'cdp' } };
           } else {
-            // Use JavaScript dispatchEvent for simple keys (triggers web_sys event listeners)
-            const result = await jsDispatchKeyEvent(tab.id, command.key);
-            return { type: 'success', data: result };
+            await cdpPressKey(tab.id, actualKey);
+            return { type: 'success', data: { key: actualKey, method: 'cdp' } };
           }
         } catch (e) {
           return { type: 'error', message: e.message };
@@ -1111,17 +900,45 @@ async function handleCommand(id, command) {
         }
 
       case 'clearStates':
-        // Click the "Clear saved states" button to trigger Rust/WASM handler
-        // This is important because the button handler calls invalidate_timers()
-        // which stops old timers before clearing localStorage (prevents race conditions)
+        // Click the "Clear saved states" button using trusted pointer events.
         try {
-          const result = await cdpEvaluate(tab.id, `(${clearSavedStates.toString()})()`);
-          if (result.type === 'success') {
-            return { type: 'success', data: result.data || { method: 'button-click', text: 'clear saved states' } };
-          } else {
-            // Fallback: if button not found, clear localStorage directly
-            // (but warn that timers may not be invalidated)
-            const fallbackResult = await cdpEvaluate(tab.id, `
+          const button = await cdpEvaluate(tab.id, `
+            (function() {
+              const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const candidates = Array.from(document.querySelectorAll('button, [role="button"], [data-action="clear-states"]'));
+              const target = candidates.find((el) => {
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return false;
+                const text = normalize(el.textContent);
+                return text === 'clear saved states' || text.includes('clear saved states');
+              });
+              if (!target) return { found: false };
+              const rect = target.getBoundingClientRect();
+              return {
+                found: true,
+                text: (target.textContent || '').trim(),
+                x: Math.round(rect.x + rect.width / 2),
+                y: Math.round(rect.y + rect.height / 2)
+              };
+            })()
+          `);
+
+          if (button && button.found) {
+            await cdpClickAtViewport(tab.id, button.x, button.y);
+            return {
+              type: 'success',
+              data: {
+                method: 'cdp-click',
+                text: button.text || 'Clear saved states',
+              },
+            };
+          }
+
+          // Fallback: if button not found, clear localStorage directly.
+          // This is less user-like but keeps recovery behavior available.
+          const fallbackResult = await cdpEvaluate(tab.id, `
               (function() {
                 const preserveKeys = ['boon-playground-engine-type'];
                 const preserved = {};
@@ -1137,8 +954,7 @@ async function handleCommand(id, command) {
                 return { cleared: keyCount, preserved: Object.keys(preserved), warning: 'Button not found, timers may not be invalidated' };
               })()
             `);
-            return { type: 'success', data: { method: 'fallback-clear', ...fallbackResult } };
-          }
+          return { type: 'success', data: { method: 'fallback-clear', ...fallbackResult } };
         } catch (e) {
           return { type: 'error', message: e.message };
         }
@@ -1439,24 +1255,6 @@ async function handleCommand(id, command) {
           // Click using real CDP mouse events at the button center coordinates
           await cdpClickAtViewport(tab.id, clickResult.centerX, clickResult.centerY);
 
-          // Fallback: CDP Input.dispatchMouseEvent doesn't fire handlers on elements
-          // that were toggled from display:none to visible (Chrome compositor limitation).
-          // Use element.click() which generates a trusted click event directly.
-          await cdpEvaluate(tab.id, `
-            (function() {
-              const preview = document.querySelector('[data-boon-panel="preview"]');
-              if (!preview) return;
-              let buttons = Array.from(preview.querySelectorAll('[role="button"]'));
-              buttons = buttons.filter(el => {
-                const rect = el.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0 &&
-                  window.getComputedStyle(el).display !== 'none';
-              });
-              const button = buttons[${command.index}];
-              if (button) button.click();
-            })()
-          `);
-
           return { type: 'success', data: clickResult };
         } catch (e) {
           return { type: 'error', message: `Click button failed: ${e.message}` };
@@ -1541,38 +1339,6 @@ async function handleCommand(id, command) {
 
           // Click using real CDP mouse events at the element center coordinates
           await cdpClickAtViewport(tab.id, result.element.centerX, result.element.centerY);
-
-          // Fallback: CDP Input.dispatchMouseEvent doesn't fire handlers on elements
-          // toggled from display:none (Chrome compositor limitation).
-          // Re-find and click via element.click() which generates trusted events.
-          await cdpEvaluate(tab.id, `
-            (function() {
-              const searchText = ${JSON.stringify(command.text)};
-              const exact = ${command.exact || false};
-              const preview = document.querySelector('[data-boon-panel="preview"]');
-              if (!preview) return;
-              const allElements = preview.querySelectorAll('*');
-              let bestEl = null;
-              let bestSize = Infinity;
-              allElements.forEach((el) => {
-                const rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) return;
-                const style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden') return;
-                let directText = '';
-                for (const node of el.childNodes) {
-                  if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
-                }
-                directText = directText.trim();
-                const matches = exact ? directText === searchText : directText.includes(searchText);
-                if (matches && rect.width * rect.height < bestSize) {
-                  bestSize = rect.width * rect.height;
-                  bestEl = el;
-                }
-              });
-              if (bestEl) bestEl.click();
-            })()
-          `);
 
           return { type: 'success', data: { text: result.element.text, x: result.element.centerX, y: result.element.centerY } };
         } catch (e) {
@@ -1765,56 +1531,6 @@ async function handleCommand(id, command) {
           // Click using real CDP mouse events at the button center coordinates
           await cdpClickAtViewport(tab.id, clickResult.centerX, clickResult.centerY);
 
-          // Fallback: CDP Input.dispatchMouseEvent doesn't fire handlers on elements
-          // toggled from display:none (Chrome compositor limitation).
-          // Re-find and click via element.click() which generates trusted events.
-          await cdpEvaluate(tab.id, `
-            (function() {
-              const searchText = ${JSON.stringify(command.text)};
-              const buttonText = ${JSON.stringify(command.buttonText || '×')};
-              const preview = document.querySelector('[data-boon-panel="preview"]');
-              if (!preview) return;
-              // Find target element
-              let targetElement = null;
-              let smallestSize = Infinity;
-              preview.querySelectorAll('*').forEach((el) => {
-                const rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) return;
-                if (window.getComputedStyle(el).display === 'none') return;
-                let directText = '';
-                for (const node of el.childNodes) {
-                  if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
-                }
-                if (directText.trim() === searchText) {
-                  const size = rect.width * rect.height;
-                  if (size < smallestSize) { smallestSize = size; targetElement = el; }
-                }
-              });
-              if (!targetElement) return;
-              // Walk up to find the button
-              let container = targetElement.parentElement;
-              let maxDepth = 5;
-              while (container && maxDepth > 0) {
-                const buttons = container.querySelectorAll('[role="button"]');
-                for (const btn of buttons) {
-                  let btnText = '';
-                  for (const node of btn.childNodes) {
-                    if (node.nodeType === Node.TEXT_NODE) btnText += node.textContent;
-                  }
-                  if (btnText.trim() === buttonText) {
-                    const r = btn.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0 && window.getComputedStyle(btn).display !== 'none') {
-                      btn.click();
-                      return;
-                    }
-                  }
-                }
-                container = container.parentElement;
-                maxDepth--;
-              }
-            })()
-          `);
-
           return { type: 'success', data: clickResult };
         } catch (e) {
           return { type: 'error', message: `Click button near text failed: ${e.message}` };
@@ -1835,8 +1551,6 @@ async function handleCommand(id, command) {
               }
 
               const input = inputs[inputIndex];
-              input.focus();
-              input.click();
 
               const rect = input.getBoundingClientRect();
               return {
@@ -1865,27 +1579,10 @@ async function handleCommand(id, command) {
         }
 
       case 'typeText':
-        // Type text into the currently focused element using CDP
-        // After typing, dispatch input/change events to trigger Zoon callbacks
+        // Type text into the currently focused element using trusted key events.
         try {
-          await cdpTypeText(tab.id, command.text);
-          // CDP Input.insertText inserts at cursor but may not reliably update DOM's .value
-          // We dispatch events so Zoon's on_change fires with the actual DOM value
-          // CRITICAL: Do NOT overwrite el.value - it would replace existing text instead of appending!
-          const dispatchScript = `
-            (function() {
-              const el = document.activeElement;
-              if (el && el.tagName === 'INPUT') {
-                console.log('[boon-tools] typeText: el.value after CDP insertText:', el.value);
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-              }
-            })();
-          `;
-          await chrome.debugger.sendCommand({ tabId: tab.id }, 'Runtime.evaluate', {
-            expression: dispatchScript
-          });
-          return { type: 'success', data: { text: command.text } };
+          await cdpTypeTextCharByChar(tab.id, command.text);
+          return { type: 'success', data: { text: command.text, method: 'char-by-char' } };
         } catch (e) {
           return { type: 'error', message: `Type text failed: ${e.message}` };
         }
@@ -1901,10 +1598,10 @@ async function handleCommand(id, command) {
         }
 
       case 'pressKey':
-        // Press a special key using JavaScript dispatchEvent (triggers web_sys listeners)
+        // Press a special key using trusted CDP keyboard events.
         try {
-          const result = await jsDispatchKeyEvent(tab.id, command.key);
-          return { type: 'success', data: result };
+          await cdpPressKey(tab.id, command.key);
+          return { type: 'success', data: { key: command.key, method: 'cdp' } };
         } catch (e) {
           return { type: 'error', message: `Press key failed: ${e.message}` };
         }
@@ -3409,76 +3106,6 @@ function scrollPreview(y, delta, toBottom) {
   }
 
   return { type: 'success', data: { scrollTop: preview.scrollTop, scrollHeight: preview.scrollHeight } };
-}
-
-// Clear saved states by clicking the "Clear saved states" button
-function clearSavedStates() {
-  // Normalize text for comparison (trim and collapse whitespace)
-  function normalizeText(text) {
-    return (text || '').replace(/\s+/g, ' ').trim().toLowerCase();
-  }
-
-  // Look for the clear states button
-  const clearButton = document.querySelector('[data-action="clear-states"]') ||
-                      Array.from(document.querySelectorAll('button')).find(btn => {
-                        const text = normalizeText(btn.textContent);
-                        return text === 'clear saved states' || text.includes('clear saved states');
-                      });
-  if (clearButton) {
-    // Dispatch proper MouseEvent instead of synthetic click() to trigger Zoon handlers
-    const rect = clearButton.getBoundingClientRect();
-    const centerX = rect.x + rect.width / 2;
-    const centerY = rect.y + rect.height / 2;
-
-    clearButton.dispatchEvent(new MouseEvent('pointerdown', {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-      clientX: centerX,
-      clientY: centerY
-    }));
-    clearButton.dispatchEvent(new MouseEvent('pointerup', {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-      clientX: centerX,
-      clientY: centerY
-    }));
-    clearButton.dispatchEvent(new MouseEvent('click', {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-      clientX: centerX,
-      clientY: centerY,
-      detail: 1
-    }));
-    return { type: 'success', data: { method: 'proper-events', text: 'clear saved states' } };
-  }
-
-  // Fallback: try to find by partial match on any clickable element
-  const allElements = document.querySelectorAll('button, [role="button"], [onclick]');
-  for (const el of allElements) {
-    const text = normalizeText(el.textContent);
-    if (text.includes('clear') && text.includes('states')) {
-      // Dispatch proper MouseEvent instead of synthetic click() to trigger Zoon handlers
-      const rect = el.getBoundingClientRect();
-      const centerX = rect.x + rect.width / 2;
-      const centerY = rect.y + rect.height / 2;
-
-      el.dispatchEvent(new MouseEvent('pointerdown', {
-        bubbles: true, cancelable: true, view: window, clientX: centerX, clientY: centerY
-      }));
-      el.dispatchEvent(new MouseEvent('pointerup', {
-        bubbles: true, cancelable: true, view: window, clientX: centerX, clientY: centerY
-      }));
-      el.dispatchEvent(new MouseEvent('click', {
-        bubbles: true, cancelable: true, view: window, clientX: centerX, clientY: centerY, detail: 1
-      }));
-      return { type: 'success', data: { foundBy: 'partial match', method: 'proper-events', text: el.textContent.trim() } };
-    }
-  }
-
-  return { type: 'error', message: 'Could not find Clear saved states button' };
 }
 
 // Service worker lifecycle handlers - critical for MV3 reliability

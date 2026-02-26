@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use zoon::futures_util::{future, select, stream, StreamExt};
@@ -2865,14 +2867,20 @@ fn element_text_input(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
+    enum TextInputDomEvent {
+        Change(TimestampedEvent<String>),
+        KeyDown(TimestampedEvent<String>),
+    }
+
     if LOG_DEBUG { zoon::println!("[EVENT:TextInput:v2] element_text_input CALLED - creating new TextInput"); }
     // Separate channels for each event type.
     // TimestampedEvent captures Lamport time at DOM callback, ensuring correct ordering
     // even when select! processes events out of order.
-    let (change_event_sender, mut change_event_receiver) = NamedChannel::<TimestampedEvent<String>>::new("text_input.change", BRIDGE_TEXT_CHANGE_CAPACITY);
-    let (key_down_event_sender, mut key_down_event_receiver) = NamedChannel::<TimestampedEvent<String>>::new("text_input.key_down", BRIDGE_KEY_DOWN_CAPACITY);
+    let (dom_event_sender, mut dom_event_receiver) = NamedChannel::<TextInputDomEvent>::new("text_input.dom_event", BRIDGE_KEY_DOWN_CAPACITY.max(BRIDGE_TEXT_CHANGE_CAPACITY));
     let (blur_event_sender, mut blur_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("text_input.blur", BRIDGE_BLUR_CAPACITY);
     let (focus_event_sender, mut focus_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("text_input.focus", BRIDGE_FOCUS_CAPACITY);
+    let dom_input_el: Rc<RefCell<Option<web_sys::HtmlInputElement>>> = Default::default();
+    let suppress_next_blur: Rc<RefCell<bool>> = Default::default();
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -3099,41 +3107,45 @@ fn element_text_input(
                     }
                     // TimestampedEvent carries Lamport time captured at DOM callback
                     // This ensures correct ordering even when select! processes events out of order
-                    event = change_event_receiver.select_next_some() => {
-                        if LOG_DEBUG {
-                            zoon::println!("[EVENT:TextInput] LOOP received change: text='{}', lamport={}, sender_ready={}",
-                                if event.data.len() > 50 { format!("{}...", &event.data[..50]) } else { event.data.clone() },
-                                event.lamport_time,
-                                change_link_value_sender.is_some());
-                        }
-                        // Dedup: skip if text hasn't changed since last emission
-                        if last_change_text.as_ref() == Some(&event.data) {
-                            inc_metric!(CHANGE_EVENTS_DEDUPED);
-                            continue;
-                        }
-                        last_change_text = Some(event.data.clone());
-                        if let Some(sender) = change_link_value_sender.as_ref() {
-                            sender.send_or_drop(create_change_event_value(&construct_context, event.data, event.lamport_time, scope_id));
-                        } else {
-                            // Buffer latest event until sender is ready (keep-latest, lossy)
-                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering change event (sender not ready)"); }
-                            pending_change_event = Some(event);
-                        }
-                    }
-                    event = key_down_event_receiver.select_next_some() => {
-                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LOOP received key_down: key='{}', lamport={}, sender_ready={}", event.data, event.lamport_time, key_down_link_value_sender.is_some()); }
-                        if let Some(sender) = key_down_link_value_sender.as_ref() {
-                            let event_value = create_key_down_event_value(&construct_context, event.data, event.lamport_time, scope_id);
-                            let result = sender.try_send(event_value);
-                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LINK send key_down result: {:?}", result.is_ok()); }
-                            if result.is_err() {
-                                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LINK send FAILED - channel closed or full!"); }
+                    event = dom_event_receiver.select_next_some() => {
+                        match event {
+                            TextInputDomEvent::Change(event) => {
+                                if LOG_DEBUG {
+                                    zoon::println!("[EVENT:TextInput] LOOP received change: text='{}', lamport={}, sender_ready={}",
+                                        if event.data.len() > 50 { format!("{}...", &event.data[..50]) } else { event.data.clone() },
+                                        event.lamport_time,
+                                        change_link_value_sender.is_some());
+                                }
+                                // Dedup: skip if text hasn't changed since last emission
+                                if last_change_text.as_ref() == Some(&event.data) {
+                                    inc_metric!(CHANGE_EVENTS_DEDUPED);
+                                    continue;
+                                }
+                                last_change_text = Some(event.data.clone());
+                                if let Some(sender) = change_link_value_sender.as_ref() {
+                                    sender.send_or_drop(create_change_event_value(&construct_context, event.data, event.lamport_time, scope_id));
+                                } else {
+                                    // Buffer latest event until sender is ready (keep-latest, lossy)
+                                    if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering change event (sender not ready)"); }
+                                    pending_change_event = Some(event);
+                                }
                             }
-                        } else {
-                            // Buffer event until sender is ready (bounded)
-                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering key_down event (sender not ready)"); }
-                            if pending_key_down_events.len() < BRIDGE_PENDING_KEY_DOWN_CAP {
-                                pending_key_down_events.push(event);
+                            TextInputDomEvent::KeyDown(event) => {
+                                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LOOP received key_down: key='{}', lamport={}, sender_ready={}", event.data, event.lamport_time, key_down_link_value_sender.is_some()); }
+                                if let Some(sender) = key_down_link_value_sender.as_ref() {
+                                    let event_value = create_key_down_event_value(&construct_context, event.data, event.lamport_time, scope_id);
+                                    let result = sender.try_send(event_value);
+                                    if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LINK send key_down result: {:?}", result.is_ok()); }
+                                    if result.is_err() {
+                                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LINK send FAILED - channel closed or full!"); }
+                                    }
+                                } else {
+                                    // Buffer event until sender is ready (bounded)
+                                    if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering key_down event (sender not ready)"); }
+                                    if pending_key_down_events.len() < BRIDGE_PENDING_KEY_DOWN_CAP {
+                                        pending_key_down_events.push(event);
+                                    }
+                                }
                             }
                         }
                     }
@@ -3447,8 +3459,16 @@ fn element_text_input(
         .label_hidden("text input")
         .text_signal(signal::from_stream(text_stream).map(|t| t.unwrap_or_default()))
         .placeholder(Placeholder::with_signal(placeholder_signal.map(|t| t.unwrap_or_default())).s(Font::new().italic().color_signal(placeholder_color_signal)))
+        .update_raw_el({
+            let dom_input_el_ref = dom_input_el.clone();
+            move |raw_el| {
+                raw_el.after_insert(move |input_el: web_sys::HtmlInputElement| {
+                    *dom_input_el_ref.borrow_mut() = Some(input_el);
+                })
+            }
+        })
         .on_change({
-            let sender = change_event_sender.clone();
+            let sender = dom_event_sender.clone();
             move |text| {
                 // Capture Lamport time NOW at DOM callback, before channel
                 let event = TimestampedEvent::now(text);
@@ -3457,26 +3477,76 @@ fn element_text_input(
                         if event.data.len() > 50 { format!("{}...", &event.data[..50]) } else { event.data.clone() },
                         event.lamport_time);
                 }
-                sender.send_or_drop(event);
+                sender.send_or_drop(TextInputDomEvent::Change(event));
             }
         })
         .on_key_down_event({
-            let sender = key_down_event_sender.clone();
+            let sender = dom_event_sender.clone();
+            let dom_input_el_ref = dom_input_el.clone();
+            let suppress_next_blur = suppress_next_blur.clone();
             move |event| {
                 let key_name = match event.key() {
                     Key::Enter => "Enter".to_string(),
                     Key::Escape => "Escape".to_string(),
                     Key::Other(k) => k.clone(),
                 };
-                // Capture Lamport time NOW at DOM callback, before channel
-                let ts_event = TimestampedEvent::now(key_name);
-                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] on_key_down fired: key='{}', lamport={}", ts_event.data, ts_event.lamport_time); }
-                sender.send_or_drop(ts_event);
+
+                let is_commit_key = matches!(key_name.as_str(), "Enter" | "Escape");
+                if is_commit_key {
+                    *suppress_next_blur.borrow_mut() = true;
+                    if let Some(input_el) = dom_input_el_ref.borrow().as_ref() {
+                        let change_event = TimestampedEvent::now(input_el.value());
+                        sender.send_or_drop(TextInputDomEvent::Change(change_event));
+                    }
+                }
+
+                if is_commit_key {
+                    let delayed_sender = sender.clone();
+                    let delayed_key = key_name;
+                    let timeout_closure = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(
+                        move || {
+                            let ts_event = TimestampedEvent::now(delayed_key.clone());
+                            if LOG_DEBUG {
+                                zoon::println!(
+                                    "[EVENT:TextInput] on_key_down (delayed) key='{}', lamport={}",
+                                    ts_event.data,
+                                    ts_event.lamport_time
+                                );
+                            }
+                            delayed_sender.send_or_drop(TextInputDomEvent::KeyDown(ts_event));
+                        },
+                    );
+                    if let Some(window) = web_sys::window() {
+                        window
+                            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                timeout_closure.as_ref().unchecked_ref(),
+                                50,
+                            )
+                            .ok();
+                    }
+                    timeout_closure.forget();
+                } else {
+                    // Capture Lamport time NOW at DOM callback, before channel
+                    let ts_event = TimestampedEvent::now(key_name);
+                    if LOG_DEBUG {
+                        zoon::println!(
+                            "[EVENT:TextInput] on_key_down fired: key='{}', lamport={}",
+                            ts_event.data,
+                            ts_event.lamport_time
+                        );
+                    }
+                    sender.send_or_drop(TextInputDomEvent::KeyDown(ts_event));
+                }
             }
         })
         .on_blur({
             let sender = blur_event_sender.clone();
+            let suppress_next_blur = suppress_next_blur.clone();
             move || {
+                if *suppress_next_blur.borrow() {
+                    *suppress_next_blur.borrow_mut() = false;
+                    return;
+                }
                 // Capture Lamport time NOW at DOM callback, before channel
                 let event = TimestampedEvent::now(());
                 if LOG_DEBUG { zoon::println!("[EVENT:TextInput] on_blur fired: lamport={}", event.lamport_time); }
@@ -4246,4 +4316,3 @@ fn list_change_to_vec_diff_stream(
         },
     )
 }
-

@@ -869,6 +869,36 @@ fn build_text_input(
                 });
             }
 
+            // Keep DOM value synchronized with `element.text` cell state so
+            // reruns and persistence restores show the stored draft text.
+            if let Some(cell_id) = text_cell {
+                let inst = instance.clone();
+                raw_el = raw_el.after_insert(move |input_el: web_sys::HtmlInputElement| {
+                    let store = inst.cell_store.clone();
+
+                    // Apply current value immediately on mount.
+                    let initial = store.get_cell_text(cell_id);
+                    if input_el.value() != initial {
+                        input_el.set_value(&initial);
+                    }
+
+                    // Reactively apply future updates from the text cell.
+                    let signal_store = store.clone();
+                    let read_store = store.clone();
+                    let input_for_signal = input_el.clone();
+                    let handle =
+                        Task::start_droppable(signal_store.get_cell_signal(cell_id).for_each_sync(
+                            move |_| {
+                                let text = read_store.get_cell_text(cell_id);
+                                if input_for_signal.value() != text {
+                                    input_for_signal.set_value(&text);
+                                }
+                            },
+                        ));
+                    std::mem::forget(handle);
+                });
+            }
+
             raw_el = apply_raw_css(raw_el, style, program, instance, None, false);
 
             // Set up keydown event listener.
@@ -1633,6 +1663,7 @@ fn find_matching_arm_idx(matchers: &[ArmMatcher], value: f64, cell_text: &str) -
 #[derive(Clone)]
 struct ItemContext {
     item_idx: u32,
+    item_cell_id: u32,
     template_cell_range: (u32, u32),
     template_event_range: (u32, u32),
 }
@@ -1803,6 +1834,7 @@ fn build_list_map(
             *live_items_for_closure.borrow_mut() = item_count as u32;
 
             let program = &inst.program;
+            let has_pending_snapshot = inst.has_pending_snapshot();
 
             let children: Vec<RawElOrText> = (0..item_count)
                 .map(|i| {
@@ -1811,15 +1843,8 @@ fn build_list_map(
                     // are original memory indices. For regular lists, use sequential index.
                     let item_idx = inst.list_store.item_memory_index(current_list_id, i) as u32;
 
-                    // Set per-item text on item_cell from ListStore item data.
                     if let Some(ref ics) = inst.item_cell_store {
                         ics.ensure_item(item_idx);
-                        if i < text_items.len() {
-                            ics.set_text(item_idx, item_cell.0, text_items[i].clone());
-                        } else if i < f64_items.len() {
-                            // Numeric list items: format value as text for label display.
-                            ics.set_text(item_idx, item_cell.0, format_number(f64_items[i]));
-                        }
                     }
 
                     // Initialize per-item template cells in WASM memory.
@@ -1828,6 +1853,20 @@ fn build_list_map(
                     if !initialized_indices.borrow().contains(&item_idx) {
                         let _ = inst.call_init_item(item_idx);
                         initialized_indices.borrow_mut().insert(item_idx);
+                    }
+
+                    // Seed item text from ListStore only when template item text
+                    // is still empty. This avoids overwriting restored per-item
+                    // state (e.g. edited Todo titles) during reruns.
+                    if let Some(ref ics) = inst.item_cell_store {
+                        if !has_pending_snapshot || ics.get_text(item_idx, item_cell.0).is_empty() {
+                            if i < text_items.len() {
+                                ics.set_text(item_idx, item_cell.0, text_items[i].clone());
+                            } else if i < f64_items.len() {
+                                // Numeric list items: format value as text for label display.
+                                ics.set_text(item_idx, item_cell.0, format_number(f64_items[i]));
+                            }
+                        }
                     }
 
                     // Copy item text to template-local namespace field cells.
@@ -1840,7 +1879,11 @@ fn build_list_map(
                                         && field_cell.0 < template_cell_range.1;
                                     let is_namespace =
                                         program.cell_field_cells.contains_key(field_cell);
-                                    if in_range && !is_namespace {
+                                    if in_range
+                                        && !is_namespace
+                                        && (!has_pending_snapshot
+                                            || ics.get_text(item_idx, field_cell.0).is_empty())
+                                    {
                                         ics.set_text(item_idx, field_cell.0, item_text.clone());
                                     }
                                 }
@@ -1851,6 +1894,7 @@ fn build_list_map(
                     // Build per-item element tree.
                     let ctx = ItemContext {
                         item_idx,
+                        item_cell_id: item_cell.0,
                         template_cell_range,
                         template_event_range,
                     };
@@ -2376,21 +2420,37 @@ fn build_item_text_input(
             .collect();
         let mut found_text: Option<String> = None;
         for cell_id in cells_to_try {
-            let text =
-                if cell_id >= ctx.template_cell_range.0 && cell_id < ctx.template_cell_range.1 {
-                    instance
-                        .item_cell_store
-                        .as_ref()
-                        .map(|ics| ics.get_text(item_idx, cell_id))
-                        .unwrap_or_default()
-                } else {
-                    instance.cell_store.get_cell_text(cell_id)
-                };
-            if !text.is_empty() {
+            let in_template_range =
+                cell_id >= ctx.template_cell_range.0 && cell_id < ctx.template_cell_range.1;
+
+            let mut candidates = Vec::with_capacity(2);
+            if in_template_range {
+                if let Some(ref ics) = instance.item_cell_store {
+                    candidates.push(ics.get_text(item_idx, cell_id));
+                }
+                candidates.push(instance.cell_store.get_cell_text(cell_id));
+            } else {
+                candidates.push(instance.cell_store.get_cell_text(cell_id));
+                if let Some(ref ics) = instance.item_cell_store {
+                    candidates.push(ics.get_text(item_idx, cell_id));
+                }
+            }
+
+            if let Some(text) = candidates.into_iter().find(|t| !t.is_empty()) {
                 found_text = Some(text);
                 break;
             }
         }
+
+        if found_text.is_none() {
+            if let Some(ref ics) = instance.item_cell_store {
+                let item_text = ics.get_text(item_idx, ctx.item_cell_id);
+                if !item_text.is_empty() {
+                    found_text = Some(item_text);
+                }
+            }
+        }
+
         found_text
     };
 

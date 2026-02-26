@@ -70,14 +70,14 @@ store: [
 ]
 
 FUNCTION new_todo(title) {
-    new_todo_with_completed(title: title, initial_completed: False)
+    new_todo_with_completed(initial_title: title, initial_completed: False)
 }
 
 FUNCTION new_todo_completed(title) {
-    new_todo_with_completed(title: title, initial_completed: True)
+    new_todo_with_completed(initial_title: title, initial_completed: True)
 }
 
-FUNCTION new_todo_with_completed(title, initial_completed) {
+FUNCTION new_todo_with_completed(initial_title, initial_completed) {
     [
         todo_elements: [
             remove_todo_button: LINK
@@ -85,23 +85,15 @@ FUNCTION new_todo_with_completed(title, initial_completed) {
             todo_title_element: LINK
             todo_checkbox: LINK
         ]
-        title: title |> HOLD state {
-            LATEST {
-                todo_elements.editing_todo_title_element.event.key_down.key
-                    |> WHEN { Enter => [], __ => SKIP }
-                todo_elements.editing_todo_title_element.event.blur
-                    |> THEN { [] }
-            }
-            |> THEN {
-                todo_elements.editing_todo_title_element.text
-                |> Text/trim()
+        title: LATEST {
+            initial_title
+            todo_elements.editing_todo_title_element.event.change.text
                 |> WHEN {
-                    trimmed_text =>
-                        trimmed_text
+                    changed_text =>
+                        changed_text
                         |> Text/is_not_empty()
-                        |> WHEN { True => trimmed_text, False => SKIP }
+                        |> WHEN { True => changed_text, False => SKIP }
                 }
-            }
         }
         editing: False |> HOLD state {
             LATEST {
@@ -350,10 +342,18 @@ FUNCTION todo_item(todo) {
                     label: Hidden[
                         text: TEXT { Edit todo }
                     ]
-                    text: LATEST {
-                        todo.title
-                        element.event.change.text
-                    }
+                    text:
+                        todo.title |> HOLD state {
+                            LATEST {
+                                todo.todo_elements.todo_title_element.event.double_click
+                                    |> THEN { todo.title }
+                                element.event.change.text
+                                element.event.key_down.key |> WHEN {
+                                    Escape => todo.title
+                                    __ => SKIP
+                                }
+                            }
+                        }
                     placeholder: []
                     focus: True
                 ) |> LINK {

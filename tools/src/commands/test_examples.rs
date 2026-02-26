@@ -1070,11 +1070,7 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            // Use TypeText (Input.insertText) for reliable text insertion.
-            // TypeTextCharByChar (dispatchKeyEvent per char) can fail when the DD engine
-            // rebuilds the DOM between events, potentially losing focus or missing input events.
-            // Input.insertText directly sets the text and fires one input event, which is
-            // sufficient for the DD engine's TextChange handling.
+            // Type via trusted CDP key events to match real user interaction as closely as possible.
             let response = send_command_to_server(port, WsCommand::TypeText { text: text.clone() }).await?;
             if let WsResponse::Error { message } = response {
                 anyhow::bail!("Type text failed: {}", message);

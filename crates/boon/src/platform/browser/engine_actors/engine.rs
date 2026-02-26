@@ -153,7 +153,7 @@ pub mod metrics {
 
 // Value actor channels (used by create_actor_complete, create_actor_with_initial_value, create_lazy_actor_complete)
 const VALUE_ACTOR_MESSAGE_CAPACITY: usize = 16;
-const VALUE_ACTOR_SUBSCRIPTION_CAPACITY: usize = 32;
+const VALUE_ACTOR_SUBSCRIPTION_CAPACITY: usize = 512;
 const VALUE_ACTOR_DIRECT_STORE_CAPACITY: usize = 64;
 const VALUE_ACTOR_QUERY_CAPACITY: usize = 8;
 const VALUE_ACTOR_SUBSCRIBER_CAPACITY: usize = 32;
@@ -1667,11 +1667,11 @@ impl ConstructStorage {
                             dirty = true;
                         },
                         (persistence_id, state_sender) = state_getter_receiver.select_next_some() => {
-                            // C4: Use remove() instead of get().cloned() to avoid cloning
-                            // serde_json::Value. Each state is loaded once during restore,
-                            // and ongoing saves will re-insert if needed.
+                            // Persistence reads must be non-destructive. Multiple restores can
+                            // occur across repeated Run clicks, and they must observe the same
+                            // stored value unless a write updates it.
                             let key = persistence_id.to_string();
-                            let state = states.remove(&key);
+                            let state = states.get(&key).cloned();
                             if state_sender.send(state).is_err() {
                                 zoon::eprintln!("Failed to send state from construct storage");
                             }
@@ -3064,14 +3064,26 @@ impl PassThroughConnector {
                                     pass_throughs.insert(key, (value_sender, actor, Vec::new()));
                                 }
                                 Some(PassThroughOp::Forward { key, value }) => {
-                                    if let Some((sender, _, _)) = pass_throughs.get_mut(&key) {
+                                    let is_closed = pass_throughs
+                                        .get(&key)
+                                        .map(|(sender, _, _)| sender.is_closed())
+                                        .unwrap_or(false);
+                                    if is_closed {
+                                        pass_throughs.remove(&key);
+                                    } else if let Some((sender, _, _)) = pass_throughs.get_mut(&key) {
                                         if let Err(e) = sender.send(value).await {
                                             zoon::println!("[PASS_THROUGH] Forward failed for key {:?}: {e}", key);
                                         }
                                     }
                                 }
                                 Some(PassThroughOp::AddForwarder { key, forwarder }) => {
-                                    if let Some((_, _, forwarders)) = pass_throughs.get_mut(&key) {
+                                    let is_closed = pass_throughs
+                                        .get(&key)
+                                        .map(|(sender, _, _)| sender.is_closed())
+                                        .unwrap_or(false);
+                                    if is_closed {
+                                        pass_throughs.remove(&key);
+                                    } else if let Some((_, _, forwarders)) = pass_throughs.get_mut(&key) {
                                         forwarders.push(forwarder);
                                     }
                                 }
@@ -3084,7 +3096,14 @@ impl PassThroughConnector {
                         result = getter_receiver.next() => {
                             match result {
                                 Some((key, response_sender)) => {
-                                    let actor = pass_throughs.get(&key).map(|(_, actor, _)| actor.clone());
+                                    let actor = match pass_throughs.get(&key) {
+                                        Some((sender, _, _)) if sender.is_closed() => {
+                                            pass_throughs.remove(&key);
+                                            None
+                                        }
+                                        Some((_, actor, _)) => Some(actor.clone()),
+                                        None => None,
+                                    };
                                     if response_sender.send(actor).is_err() {
                                         zoon::println!("[PASS_THROUGH] Getter reply receiver dropped for key {:?}", key);
                                     }
@@ -3098,7 +3117,14 @@ impl PassThroughConnector {
                         result = sender_getter_receiver.next() => {
                             match result {
                                 Some((key, response_sender)) => {
-                                    let sender = pass_throughs.get(&key).map(|(sender, _, _)| sender.clone());
+                                    let sender = match pass_throughs.get(&key) {
+                                        Some((sender, _, _)) if sender.is_closed() => {
+                                            pass_throughs.remove(&key);
+                                            None
+                                        }
+                                        Some((sender, _, _)) => Some(sender.clone()),
+                                        None => None,
+                                    };
                                     if response_sender.send(sender).is_err() {
                                         zoon::println!("[PASS_THROUGH] Sender getter reply receiver dropped for key {:?}", key);
                                     }
@@ -4127,10 +4153,17 @@ impl ActorHandle {
 
         let (tx, rx) = mpsc::channel(VALUE_ACTOR_SUBSCRIBER_CAPACITY);
         if LOG_ACTOR_FLOW { zoon::println!("[FLOW] stream() on {:?} → sending subscription (v0)", self.actor_id); }
-        self.subscription_sender.send_or_drop(SubscriptionSetup {
+        let setup = SubscriptionSetup {
             sender: tx,
             starting_version: 0,
-        });
+        };
+        if let Err(e) = self.subscription_sender.try_send(setup) {
+            let fallback_setup = e.into_inner();
+            let fallback_sender = self.subscription_sender.clone();
+            Task::start_droppable(async move {
+                let _ = fallback_sender.send(fallback_setup).await;
+            });
+        }
 
         rx.boxed_local()
     }
@@ -4143,10 +4176,17 @@ impl ActorHandle {
 
         let current_version = self.version();
         let (tx, rx) = mpsc::channel(VALUE_ACTOR_SUBSCRIBER_CAPACITY);
-        self.subscription_sender.send_or_drop(SubscriptionSetup {
+        let setup = SubscriptionSetup {
             sender: tx,
             starting_version: current_version,
-        });
+        };
+        if let Err(e) = self.subscription_sender.try_send(setup) {
+            let fallback_setup = e.into_inner();
+            let fallback_sender = self.subscription_sender.clone();
+            Task::start_droppable(async move {
+                let _ = fallback_sender.send(fallback_setup).await;
+            });
+        }
 
         rx.boxed_local()
     }
@@ -7572,7 +7612,7 @@ impl ListBindingFunction {
             type MapState = (
                 usize,
                 HashMap<parser::PersistenceId, parser::PersistenceId>,
-                HashMap<parser::PersistenceId, ActorHandle>, // B1: Transform cache
+                HashMap<parser::PersistenceId, (ActorId, ActorHandle)>, // B1: source actor id + transformed actor
                 Vec<parser::PersistenceId>, // Item order for Pop handling
             );
             list.stream().scan((0usize, HashMap::new(), HashMap::new(), Vec::new()), move |state: &mut MapState, change| {
@@ -9271,12 +9311,16 @@ impl ListBindingFunction {
         change: ListChange,
         current_length: usize,
         pid_map: &mut std::collections::HashMap<parser::PersistenceId, parser::PersistenceId>,
-        transform_cache: &mut std::collections::HashMap<parser::PersistenceId, ActorHandle>,
+        transform_cache: &mut std::collections::HashMap<parser::PersistenceId, (ActorId, ActorHandle)>,
         item_order: &mut Vec<parser::PersistenceId>,
         config: &ListBindingConfig,
         construct_context: ConstructContext,
         actor_context: ActorContext,
     ) -> (ListChange, usize) {
+        // Disable transform reuse for now. Reusing mapped actors can keep stale
+        // LINK wiring alive across list updates and break per-item edit state.
+        transform_cache.clear();
+
         match change {
             ListChange::Replace { items } => {
                 let new_length = items.len();
@@ -9294,11 +9338,29 @@ impl ListBindingFunction {
                     .enumerate()
                     .map(|(index, item)| {
                         let original_pid = item.persistence_id();
+                        let source_actor_id = item.actor_id();
                         item_order.push(original_pid.clone());
 
                         // B1: Check cache first - reuse transformed actor if available
-                        let transformed = if let Some(cached) = transform_cache.get(&original_pid) {
-                            cached.clone()
+                        let transformed = if let Some((cached_source_actor_id, cached_actor)) =
+                            transform_cache.get(&original_pid)
+                        {
+                            if *cached_source_actor_id == source_actor_id {
+                                cached_actor.clone()
+                            } else {
+                                let new_transformed = Self::transform_item(
+                                    item.clone(),
+                                    index,
+                                    config,
+                                    construct_context.clone(),
+                                    actor_context.clone(),
+                                );
+                                transform_cache.insert(
+                                    original_pid.clone(),
+                                    (source_actor_id, new_transformed.clone()),
+                                );
+                                new_transformed
+                            }
                         } else {
                             let new_transformed = Self::transform_item(
                                 item.clone(),
@@ -9307,7 +9369,8 @@ impl ListBindingFunction {
                                 construct_context.clone(),
                                 actor_context.clone(),
                             );
-                            transform_cache.insert(original_pid.clone(), new_transformed.clone());
+                            transform_cache
+                                .insert(original_pid.clone(), (source_actor_id, new_transformed.clone()));
                             new_transformed
                         };
 
@@ -9324,13 +9387,31 @@ impl ListBindingFunction {
             }
             ListChange::InsertAt { index, item } => {
                 let original_pid = item.persistence_id();
+                let source_actor_id = item.actor_id();
                 // Track item order
                 if index <= item_order.len() {
                     item_order.insert(index, original_pid.clone());
                 }
                 // B1: Check cache first, add to cache if miss
-                let transformed_item = if let Some(cached) = transform_cache.get(&original_pid) {
-                    cached.clone()
+                let transformed_item = if let Some((cached_source_actor_id, cached_actor)) =
+                    transform_cache.get(&original_pid)
+                {
+                    if *cached_source_actor_id == source_actor_id {
+                        cached_actor.clone()
+                    } else {
+                        let new_transformed = Self::transform_item(
+                            item,
+                            index,
+                            config,
+                            construct_context,
+                            actor_context,
+                        );
+                        transform_cache.insert(
+                            original_pid.clone(),
+                            (source_actor_id, new_transformed.clone()),
+                        );
+                        new_transformed
+                    }
                 } else {
                     let new_transformed = Self::transform_item(
                         item,
@@ -9339,7 +9420,8 @@ impl ListBindingFunction {
                         construct_context,
                         actor_context,
                     );
-                    transform_cache.insert(original_pid.clone(), new_transformed.clone());
+                    transform_cache
+                        .insert(original_pid.clone(), (source_actor_id, new_transformed.clone()));
                     new_transformed
                 };
                 let mapped_pid = transformed_item.persistence_id();
@@ -9348,6 +9430,7 @@ impl ListBindingFunction {
             }
             ListChange::UpdateAt { index, item } => {
                 let original_pid = item.persistence_id();
+                let source_actor_id = item.actor_id();
                 // B1: For updates, always re-transform (the item content changed)
                 let transformed_item = Self::transform_item(
                     item,
@@ -9356,18 +9439,37 @@ impl ListBindingFunction {
                     construct_context,
                     actor_context,
                 );
-                transform_cache.insert(original_pid.clone(), transformed_item.clone());
+                transform_cache
+                    .insert(original_pid.clone(), (source_actor_id, transformed_item.clone()));
                 let mapped_pid = transformed_item.persistence_id();
                 pid_map.insert(original_pid, mapped_pid);
                 (ListChange::UpdateAt { index, item: transformed_item }, current_length)
             }
             ListChange::Push { item } => {
                 let original_pid = item.persistence_id();
+                let source_actor_id = item.actor_id();
                 // Track item order
                 item_order.push(original_pid.clone());
                 // B1: Check cache first, add to cache if miss
-                let transformed_item = if let Some(cached) = transform_cache.get(&original_pid) {
-                    cached.clone()
+                let transformed_item = if let Some((cached_source_actor_id, cached_actor)) =
+                    transform_cache.get(&original_pid)
+                {
+                    if *cached_source_actor_id == source_actor_id {
+                        cached_actor.clone()
+                    } else {
+                        let new_transformed = Self::transform_item(
+                            item,
+                            current_length,
+                            config,
+                            construct_context,
+                            actor_context,
+                        );
+                        transform_cache.insert(
+                            original_pid.clone(),
+                            (source_actor_id, new_transformed.clone()),
+                        );
+                        new_transformed
+                    }
                 } else {
                     let new_transformed = Self::transform_item(
                         item,
@@ -9376,7 +9478,8 @@ impl ListBindingFunction {
                         construct_context,
                         actor_context,
                     );
-                    transform_cache.insert(original_pid.clone(), new_transformed.clone());
+                    transform_cache
+                        .insert(original_pid.clone(), (source_actor_id, new_transformed.clone()));
                     new_transformed
                 };
                 let mapped_pid = transformed_item.persistence_id();

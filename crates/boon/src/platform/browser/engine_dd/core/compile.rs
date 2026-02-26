@@ -22,8 +22,8 @@ use crate::parser::{
 
 use super::types::{
     BroadcastHandlerFn, CollectionSpec, DataflowGraph, InputId, InputKind, InputSpec,
-    KeyedListOutput, ListKey, SideEffectKind, VarId,
-    LIST_TAG, LINK_PATH_FIELD, HOVER_PATH_FIELD, HOVERED_FIELD, ROUTER_INPUT, PASSED_VAR, DEP_FIELD_PREFIX,
+    KeyedListOutput, ListKey, SideEffectKind, VarId, DEP_FIELD_PREFIX, HOVERED_FIELD,
+    HOVER_PATH_FIELD, LINK_PATH_FIELD, LIST_TAG, PASSED_VAR, ROUTER_INPUT,
 };
 use super::value::Value;
 
@@ -168,8 +168,10 @@ impl Compiler {
                     body,
                 } => {
                     let fn_name = name.as_str().to_string();
-                    let params: Vec<String> =
-                        parameters.iter().map(|p| p.node.as_str().to_string()).collect();
+                    let params: Vec<String> = parameters
+                        .iter()
+                        .map(|p| p.node.as_str().to_string())
+                        .collect();
                     self.functions
                         .push((fn_name, params, body.as_ref().clone()));
                 }
@@ -183,7 +185,8 @@ impl Compiler {
         if let Expression::Object(obj) = &expr.node {
             for var in &obj.variables {
                 let field_name = format!("{}.{}", prefix, var.node.name.as_str());
-                self.variables.push((field_name.clone(), var.node.value.clone()));
+                self.variables
+                    .push((field_name.clone(), var.node.value.clone()));
                 // Recurse for nested objects
                 self.flatten_object_fields(&field_name, &var.node.value);
             }
@@ -201,29 +204,43 @@ impl Compiler {
         // Only needs DataflowGraph if there are external inputs (LINK, Timer)
         // Programs with HOLD/WHILE but no external inputs (like fibonacci)
         // can be evaluated statically.
-        self.variables.iter().any(|(_, expr)| Self::has_external_input(expr))
+        self.variables
+            .iter()
+            .any(|(_, expr)| Self::has_external_input(expr))
     }
 
     fn has_external_input(expr: &Spanned<Expression>) -> bool {
         match &expr.node {
             Expression::Link | Expression::LinkSetter { .. } => true,
             Expression::Variable(var) => Self::has_external_input(&var.value),
-            Expression::Pipe { from, to } => Self::has_external_input(from) || Self::has_external_input(to),
+            Expression::Pipe { from, to } => {
+                Self::has_external_input(from) || Self::has_external_input(to)
+            }
             Expression::FunctionCall { path, arguments } => {
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                if matches!(path_strs.as_slice(), ["Timer", "interval"] | ["Router", "route"] | ["Router", "go_to"]) {
+                if matches!(
+                    path_strs.as_slice(),
+                    ["Timer", "interval"] | ["Router", "route"] | ["Router", "go_to"]
+                ) {
                     return true;
                 }
                 arguments.iter().any(|a| {
-                    a.node.value.as_ref()
+                    a.node
+                        .value
+                        .as_ref()
                         .map(|v| Self::has_external_input(v))
                         .unwrap_or(false)
                 })
             }
             Expression::List { items } => items.iter().any(Self::has_external_input),
-            Expression::Object(obj) => obj.variables.iter().any(|v| Self::has_external_input(&v.node.value)),
+            Expression::Object(obj) => obj
+                .variables
+                .iter()
+                .any(|v| Self::has_external_input(&v.node.value)),
             Expression::Block { variables, output } => {
-                variables.iter().any(|v| Self::has_external_input(&v.node.value))
+                variables
+                    .iter()
+                    .any(|v| Self::has_external_input(&v.node.value))
                     || Self::has_external_input(output)
             }
             Expression::Hold { body, .. } => Self::has_external_input(body),
@@ -231,12 +248,22 @@ impl Compiler {
             Expression::Then { body } => Self::has_external_input(body),
             Expression::While { arms } => arms.iter().any(|a| Self::has_external_input(&a.body)),
             Expression::ArithmeticOperator(op) => match op {
-                ArithmeticOperator::Add { operand_a, operand_b }
-                | ArithmeticOperator::Subtract { operand_a, operand_b }
-                | ArithmeticOperator::Multiply { operand_a, operand_b }
-                | ArithmeticOperator::Divide { operand_a, operand_b } => {
-                    Self::has_external_input(operand_a) || Self::has_external_input(operand_b)
+                ArithmeticOperator::Add {
+                    operand_a,
+                    operand_b,
                 }
+                | ArithmeticOperator::Subtract {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Multiply {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Divide {
+                    operand_a,
+                    operand_b,
+                } => Self::has_external_input(operand_a) || Self::has_external_input(operand_b),
                 ArithmeticOperator::Negate { operand } => Self::has_external_input(operand),
             },
             _ => false,
@@ -255,9 +282,18 @@ impl Compiler {
             Expression::When { .. } => true,
             Expression::FunctionCall { path, arguments } => {
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                if matches!(path_strs.as_slice(),
-                    ["Timer", "interval"] | ["Stream", "skip"] | ["Router", "route"] | ["Router", "go_to"]
-                    | ["List", "count"] | ["List", "retain"] | ["List", "map"] | ["List", "append"] | ["List", "clear"] | ["List", "remove"]
+                if matches!(
+                    path_strs.as_slice(),
+                    ["Timer", "interval"]
+                        | ["Stream", "skip"]
+                        | ["Router", "route"]
+                        | ["Router", "go_to"]
+                        | ["List", "count"]
+                        | ["List", "retain"]
+                        | ["List", "map"]
+                        | ["List", "append"]
+                        | ["List", "clear"]
+                        | ["List", "remove"]
                 ) {
                     return true;
                 }
@@ -300,18 +336,36 @@ impl Compiler {
             Expression::Comparator(cmp) => {
                 use static_expression::Comparator;
                 let (a, b) = match cmp {
-                    Comparator::Equal { operand_a, operand_b }
-                    | Comparator::NotEqual { operand_a, operand_b }
-                    | Comparator::Greater { operand_a, operand_b }
-                    | Comparator::GreaterOrEqual { operand_a, operand_b }
-                    | Comparator::Less { operand_a, operand_b }
-                    | Comparator::LessOrEqual { operand_a, operand_b } => {
-                        (operand_a, operand_b)
+                    Comparator::Equal {
+                        operand_a,
+                        operand_b,
                     }
+                    | Comparator::NotEqual {
+                        operand_a,
+                        operand_b,
+                    }
+                    | Comparator::Greater {
+                        operand_a,
+                        operand_b,
+                    }
+                    | Comparator::GreaterOrEqual {
+                        operand_a,
+                        operand_b,
+                    }
+                    | Comparator::Less {
+                        operand_a,
+                        operand_b,
+                    }
+                    | Comparator::LessOrEqual {
+                        operand_a,
+                        operand_b,
+                    } => (operand_a, operand_b),
                 };
                 Self::is_reactive_or_alias(a) || Self::is_reactive_or_alias(b)
             }
-            Expression::TextLiteral { parts } => parts.iter().any(|p| matches!(p, TextPart::Interpolation { .. })),
+            Expression::TextLiteral { parts } => parts
+                .iter()
+                .any(|p| matches!(p, TextPart::Interpolation { .. })),
             Expression::Alias(_) => {
                 // An alias might reference a reactive variable — conservative.
                 // But for top-level reactivity check, we look at definitions.
@@ -370,23 +424,22 @@ impl Compiler {
                     let mut val = self.resolve_alias_static(name, local_scope)?;
                     // Follow field access: a.b.c
                     for part in &parts[1..] {
-                        val = val
-                            .get_field(part.as_str())
-                            .cloned()
-                            .ok_or_else(|| format!("Field '{}' not found on {}", part.as_str(), val))?;
+                        val = val.get_field(part.as_str()).cloned().ok_or_else(|| {
+                            format!("Field '{}' not found on {}", part.as_str(), val)
+                        })?;
                     }
                     Ok(val)
                 }
                 Alias::WithPassed { extra_parts } => {
                     // Look up __passed in local scope
-                    let passed = local_scope.get(PASSED_VAR)
+                    let passed = local_scope
+                        .get(PASSED_VAR)
                         .ok_or_else(|| "PASSED not available in this context".to_string())?;
                     let mut val = passed.clone();
                     for part in extra_parts {
-                        val = val
-                            .get_field(part.as_str())
-                            .cloned()
-                            .ok_or_else(|| format!("Field '{}' not found on PASSED", part.as_str()))?;
+                        val = val.get_field(part.as_str()).cloned().ok_or_else(|| {
+                            format!("Field '{}' not found on PASSED", part.as_str())
+                        })?;
                     }
                     Ok(val)
                 }
@@ -465,9 +518,7 @@ impl Compiler {
             }
 
             // Spread operator: evaluate inner and include it directly
-            Expression::Spread { value } => {
-                self.eval_static_with_scope(value, local_scope)
-            }
+            Expression::Spread { value } => self.eval_static_with_scope(value, local_scope),
 
             // HOLD in static context (non-piped): just return initial state
             Expression::Hold { .. } => {
@@ -475,11 +526,12 @@ impl Compiler {
             }
 
             // THEN in static context (non-piped): evaluate body
-            Expression::Then { body } => {
-                self.eval_static_with_scope(body, local_scope)
-            }
+            Expression::Then { body } => self.eval_static_with_scope(body, local_scope),
 
-            _ => Err(format!("Unsupported expression in static eval: {:?}", std::mem::discriminant(&expr.node))),
+            _ => Err(format!(
+                "Unsupported expression in static eval: {:?}",
+                std::mem::discriminant(&expr.node)
+            )),
         }
     }
 
@@ -514,7 +566,9 @@ impl Compiler {
                     fields: Arc::new(fields),
                 }
             }
-            Expression::Block { variables, output, .. } => {
+            Expression::Block {
+                variables, output, ..
+            } => {
                 let mut new_scope = local_scope.clone();
                 for var in variables {
                     let val = self.eval_static_tolerant(&var.node.value, &new_scope);
@@ -541,7 +595,8 @@ impl Compiler {
                         Expression::While { arms } | Expression::When { arms } => {
                             // Try matching the from_val against WHILE/WHEN arms
                             for arm in arms {
-                                if let Some(bindings) = self.match_pattern(&from_val, &arm.pattern) {
+                                if let Some(bindings) = self.match_pattern(&from_val, &arm.pattern)
+                                {
                                     let mut arm_scope = local_scope.clone();
                                     arm_scope.extend(bindings);
                                     return self.eval_static_tolerant(&arm.body, &arm_scope);
@@ -554,19 +609,19 @@ impl Compiler {
                                 from_val
                             }
                         }
-                        Expression::Then { body } => {
-                            self.eval_static_tolerant(body, local_scope)
-                        }
+                        Expression::Then { body } => self.eval_static_tolerant(body, local_scope),
                         Expression::FunctionCall { path, arguments } => {
                             // Re-evaluate pipe with tolerant from_val
                             // Build a temporary scope with the from_val
                             let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                             match path_strs.as_slice() {
                                 ["List", "map"] => {
-                                    let item_param = arguments.first()
+                                    let item_param = arguments
+                                        .first()
                                         .map(|a| a.node.name.as_str().to_string())
                                         .unwrap_or_else(|| "item".to_string());
-                                    let map_expr = arguments.iter()
+                                    let map_expr = arguments
+                                        .iter()
                                         .find(|a| a.node.name.as_str() == "new")
                                         .and_then(|a| a.node.value.as_ref());
                                     if let Some(expr) = map_expr {
@@ -581,10 +636,12 @@ impl Compiler {
                                     }
                                 }
                                 ["List", "retain"] => {
-                                    let item_param = arguments.first()
+                                    let item_param = arguments
+                                        .first()
                                         .map(|a| a.node.name.as_str().to_string())
                                         .unwrap_or_else(|| "item".to_string());
-                                    let if_expr = arguments.iter()
+                                    let if_expr = arguments
+                                        .iter()
                                         .find(|a| a.node.name.as_str() == "if")
                                         .and_then(|a| a.node.value.as_ref());
                                     if let Some(pred) = if_expr {
@@ -611,7 +668,8 @@ impl Compiler {
                         Expression::FieldAccess { path: field_path } => {
                             let mut val = from_val;
                             for field in field_path {
-                                val = val.get_field(field.as_str())
+                                val = val
+                                    .get_field(field.as_str())
                                     .cloned()
                                     .unwrap_or(Value::Unit);
                             }
@@ -658,20 +716,26 @@ impl Compiler {
                         let mut elem_scope = local_scope.clone();
                         let mut hover_path: Option<String> = None;
                         let mut has_hovered_link = false;
-                        if let Some(el_arg) = arguments.iter().find(|a| a.node.name.as_str() == "element") {
+                        if let Some(el_arg) =
+                            arguments.iter().find(|a| a.node.name.as_str() == "element")
+                        {
                             if let Some(ref val_expr) = el_arg.node.value {
                                 let el_val = self.eval_static_tolerant(val_expr, local_scope);
                                 // Check for hovered: LINK and resolve hover state from scope
-                                has_hovered_link = el_val.get_field("hovered")
+                                has_hovered_link = el_val
+                                    .get_field("hovered")
                                     .map(|v| v.as_tag() == Some("LINK"))
                                     .unwrap_or(false);
                                 if has_hovered_link {
-                                    let hover_state = local_scope.values()
+                                    let hover_state = local_scope
+                                        .values()
                                         .find_map(|v| v.get_field(HOVERED_FIELD))
                                         .cloned()
                                         .unwrap_or(Value::tag("False"));
-                                    hover_path = local_scope.values()
-                                        .find_map(|v| v.get_field(HOVER_PATH_FIELD).and_then(|p| p.as_text().map(|s| s.to_string())));
+                                    hover_path = local_scope.values().find_map(|v| {
+                                        v.get_field(HOVER_PATH_FIELD)
+                                            .and_then(|p| p.as_text().map(|s| s.to_string()))
+                                    });
                                     let el_val = el_val.update_field("hovered", hover_state);
                                     let el_val = Self::replace_links_with_defaults(&el_val);
                                     elem_scope.insert("element".to_string(), el_val);
@@ -698,11 +762,17 @@ impl Compiler {
                         if has_hovered_link {
                             let mut hovered_scope = elem_scope.clone();
                             if let Some(el_val) = hovered_scope.get("element").cloned() {
-                                hovered_scope.insert("element".to_string(), el_val.update_field("hovered", Value::tag("True")));
+                                hovered_scope.insert(
+                                    "element".to_string(),
+                                    el_val.update_field("hovered", Value::tag("True")),
+                                );
                             }
-                            if let Some(style_arg) = arguments.iter().find(|a| a.node.name.as_str() == "style") {
+                            if let Some(style_arg) =
+                                arguments.iter().find(|a| a.node.name.as_str() == "style")
+                            {
                                 if let Some(ref val_expr) = style_arg.node.value {
-                                    let hovered_style = self.eval_static_tolerant(val_expr, &hovered_scope);
+                                    let hovered_style =
+                                        self.eval_static_tolerant(val_expr, &hovered_scope);
                                     fields.insert(Arc::from("__style_hovered__"), hovered_style);
                                 }
                             }
@@ -727,9 +797,7 @@ impl Compiler {
                         }
                     }
                     // User-defined function: try tolerant body evaluation
-                    [fn_name] => {
-                        self.eval_user_function_tolerant(fn_name, arguments, local_scope)
-                    }
+                    [fn_name] => self.eval_user_function_tolerant(fn_name, arguments, local_scope),
                     _ => Value::Unit,
                 }
             }
@@ -753,7 +821,8 @@ impl Compiler {
                 }
             }
             // For anything else, try strict eval and fall back to Unit
-            _ => self.eval_static_with_scope(expr, local_scope)
+            _ => self
+                .eval_static_with_scope(expr, local_scope)
                 .unwrap_or(Value::Unit),
         }
     }
@@ -880,9 +949,7 @@ impl Compiler {
                 self.eval_element_static("ElementLabel", arguments, local_scope)
             }
 
-            ["Element", "link"] => {
-                self.eval_element_static("ElementLink", arguments, local_scope)
-            }
+            ["Element", "link"] => self.eval_element_static("ElementLink", arguments, local_scope),
 
             ["Element", "checkbox"] => {
                 self.eval_element_static("ElementCheckbox", arguments, local_scope)
@@ -941,18 +1008,22 @@ impl Compiler {
             if let Some(ref val_expr) = el_arg.node.value {
                 let el_val = self.eval_static_with_scope(val_expr, local_scope)?;
                 // Check if element has hovered: LINK and resolve hover state from scope
-                has_hovered_link = el_val.get_field("hovered")
+                has_hovered_link = el_val
+                    .get_field("hovered")
                     .map(|v| v.as_tag() == Some("LINK"))
                     .unwrap_or(false);
                 if has_hovered_link {
                     // Look for __hovered state from any scope variable (from list item)
-                    let hover_state = local_scope.values()
+                    let hover_state = local_scope
+                        .values()
                         .find_map(|v| v.get_field(HOVERED_FIELD))
                         .cloned()
                         .unwrap_or(Value::tag("False"));
                     // Look for __hover_path__ from any scope variable
-                    hover_path = local_scope.values()
-                        .find_map(|v| v.get_field(HOVER_PATH_FIELD).and_then(|p| p.as_text().map(|s| s.to_string())));
+                    hover_path = local_scope.values().find_map(|v| {
+                        v.get_field(HOVER_PATH_FIELD)
+                            .and_then(|p| p.as_text().map(|s| s.to_string()))
+                    });
                     // Replace hovered with actual hover state
                     let el_val = el_val.update_field("hovered", hover_state);
                     let el_val = Self::replace_links_with_defaults(&el_val);
@@ -982,11 +1053,15 @@ impl Compiler {
         if has_hovered_link {
             let mut hovered_scope = elem_scope.clone();
             if let Some(el_val) = hovered_scope.get("element").cloned() {
-                hovered_scope.insert("element".to_string(), el_val.update_field("hovered", Value::tag("True")));
+                hovered_scope.insert(
+                    "element".to_string(),
+                    el_val.update_field("hovered", Value::tag("True")),
+                );
             }
             if let Some(style_arg) = arguments.iter().find(|a| a.node.name.as_str() == "style") {
                 if let Some(ref val_expr) = style_arg.node.value {
-                    if let Ok(hovered_style) = self.eval_static_with_scope(val_expr, &hovered_scope) {
+                    if let Ok(hovered_style) = self.eval_static_with_scope(val_expr, &hovered_scope)
+                    {
                         fields.insert(Arc::from("__style_hovered__"), hovered_style);
                     }
                 }
@@ -1085,7 +1160,8 @@ impl Compiler {
                         }
                     }
                     ["Stream", "skip"] => {
-                        let count = arguments.iter()
+                        let count = arguments
+                            .iter()
                             .find(|a| a.node.name.as_str() == "count")
                             .and_then(|a| a.node.value.as_ref())
                             .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
@@ -1117,9 +1193,7 @@ impl Compiler {
                             fields: Arc::new(fields),
                         })
                     }
-                    ["Log", "info"] => {
-                        Ok(from_val)
-                    }
+                    ["Log", "info"] => Ok(from_val),
 
                     // Text utilities (piped)
                     ["Text", "trim"] => {
@@ -1128,53 +1202,77 @@ impl Compiler {
                     }
                     ["Text", "is_not_empty"] => {
                         let s = from_val.as_text().unwrap_or("");
-                        Ok(if !s.is_empty() { Value::tag("True") } else { Value::tag("False") })
+                        Ok(if !s.is_empty() {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        })
                     }
                     ["Text", "is_empty"] => {
                         let s = from_val.as_text().unwrap_or("");
-                        Ok(if s.is_empty() { Value::tag("True") } else { Value::tag("False") })
+                        Ok(if s.is_empty() {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        })
                     }
 
                     // Bool utilities (piped)
                     ["Bool", "not"] => {
                         let b = from_val.as_bool().unwrap_or(false);
-                        Ok(if b { Value::tag("False") } else { Value::tag("True") })
+                        Ok(if b {
+                            Value::tag("False")
+                        } else {
+                            Value::tag("True")
+                        })
                     }
                     ["Bool", "or"] => {
                         let a = from_val.as_bool().unwrap_or(false);
-                        let b = arguments.iter()
+                        let b = arguments
+                            .iter()
                             .find(|arg| arg.node.name.as_str() == "that")
                             .and_then(|arg| arg.node.value.as_ref())
                             .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        Ok(if a || b { Value::tag("True") } else { Value::tag("False") })
+                        Ok(if a || b {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        })
                     }
                     ["Bool", "and"] => {
                         let a = from_val.as_bool().unwrap_or(false);
-                        let b = arguments.iter()
+                        let b = arguments
+                            .iter()
                             .find(|arg| arg.node.name.as_str() == "that")
                             .and_then(|arg| arg.node.value.as_ref())
                             .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        Ok(if a && b { Value::tag("True") } else { Value::tag("False") })
+                        Ok(if a && b {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        })
                     }
 
                     // List utilities (piped)
-                    ["List", "count"] => {
-                        Ok(Value::number(from_val.list_count() as f64))
-                    }
-                    ["List", "is_empty"] => {
-                        Ok(if from_val.list_is_empty() { Value::tag("True") } else { Value::tag("False") })
-                    }
+                    ["List", "count"] => Ok(Value::number(from_val.list_count() as f64)),
+                    ["List", "is_empty"] => Ok(if from_val.list_is_empty() {
+                        Value::tag("True")
+                    } else {
+                        Value::tag("False")
+                    }),
                     ["List", "map"] => {
                         // `list |> List/map(item, new: expr)`
                         // Extract the item parameter name and mapping expression
-                        let item_param = arguments.first()
+                        let item_param = arguments
+                            .first()
                             .map(|a| a.node.name.as_str().to_string())
                             .unwrap_or_else(|| "item".to_string());
-                        let map_expr = arguments.iter()
+                        let map_expr = arguments
+                            .iter()
                             .find(|a| a.node.name.as_str() == "new")
                             .and_then(|a| a.node.value.as_ref());
                         if let Some(expr) = map_expr {
@@ -1198,10 +1296,12 @@ impl Compiler {
                     }
                     ["List", "retain"] => {
                         // `list |> List/retain(item, if: predicate_expr)`
-                        let item_param = arguments.first()
+                        let item_param = arguments
+                            .first()
                             .map(|a| a.node.name.as_str().to_string())
                             .unwrap_or_else(|| "item".to_string());
-                        let if_expr = arguments.iter()
+                        let if_expr = arguments
+                            .iter()
                             .find(|a| a.node.name.as_str() == "if")
                             .and_then(|a| a.node.value.as_ref());
                         if let Some(pred) = if_expr {
@@ -1240,9 +1340,7 @@ impl Compiler {
                         }
                         Err(format!("Unknown piped function: {}", fn_name))
                     }
-                    _ => {
-                        self.eval_function_call_static(path, arguments, local_scope)
-                    }
+                    _ => self.eval_function_call_static(path, arguments, local_scope),
                 }
             }
             Expression::FieldAccess { path: field_path } => {
@@ -1255,12 +1353,8 @@ impl Compiler {
                 }
                 Ok(val)
             }
-            Expression::While { arms } => {
-                self.eval_while_static(&from_val, arms, local_scope)
-            }
-            Expression::When { arms } => {
-                self.eval_when_static(&from_val, arms, local_scope)
-            }
+            Expression::While { arms } => self.eval_while_static(&from_val, arms, local_scope),
+            Expression::When { arms } => self.eval_when_static(&from_val, arms, local_scope),
             Expression::Then { body } => {
                 // THEN in static context: evaluate body for each event
                 // In a fold context, this just applies the transform
@@ -1278,7 +1372,8 @@ impl Compiler {
                             if let Some(root_val) = local_scope.get(first) {
                                 let mut val = root_val.clone();
                                 for part in &parts[1..] {
-                                    val = val.get_field(part.as_str())
+                                    val = val
+                                        .get_field(part.as_str())
                                         .cloned()
                                         .unwrap_or(Value::Unit);
                                 }
@@ -1292,7 +1387,11 @@ impl Compiler {
                             None
                         };
                         resolved.unwrap_or_else(|| {
-                            parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".")
+                            parts
+                                .iter()
+                                .map(|p| p.as_str())
+                                .collect::<Vec<_>>()
+                                .join(".")
                         })
                     }
                     Alias::WithPassed { extra_parts } => {
@@ -1302,9 +1401,7 @@ impl Compiler {
                         if let Some(passed_val) = passed {
                             let mut val = passed_val.clone();
                             for part in extra_parts {
-                                val = val.get_field(part.as_str())
-                                    .cloned()
-                                    .unwrap_or(Value::Unit);
+                                val = val.get_field(part.as_str()).cloned().unwrap_or(Value::Unit);
                             }
                             // The resolved value might be an object with __link_path__
                             val.get_field(LINK_PATH_FIELD)
@@ -1313,10 +1410,18 @@ impl Compiler {
                                 .or_else(|| val.as_text().map(|s| s.to_string()))
                                 .unwrap_or_else(|| {
                                     // Build path from extra_parts
-                                    extra_parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".")
+                                    extra_parts
+                                        .iter()
+                                        .map(|p| p.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(".")
                                 })
                         } else {
-                            extra_parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".")
+                            extra_parts
+                                .iter()
+                                .map(|p| p.as_str())
+                                .collect::<Vec<_>>()
+                                .join(".")
                         }
                     }
                 };
@@ -1325,14 +1430,15 @@ impl Compiler {
                     let mut new_fields = (*fields).clone();
                     new_fields.insert(Arc::from("press_link"), Value::text(&*press_path));
                     new_fields.insert(Arc::from(LINK_PATH_FIELD), Value::text(link_path.as_str()));
-                    Ok(Value::Tagged { tag, fields: Arc::new(new_fields) })
+                    Ok(Value::Tagged {
+                        tag,
+                        fields: Arc::new(new_fields),
+                    })
                 } else {
                     Ok(from_val)
                 }
             }
-            _ => {
-                self.eval_static_with_scope(to, local_scope)
-            }
+            _ => self.eval_static_with_scope(to, local_scope),
         }
     }
 
@@ -1408,7 +1514,8 @@ impl Compiler {
                     let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                     if path_strs.as_slice() == ["Stream", "pulses"] {
                         let val = self.eval_static_with_scope(from, local_scope)?;
-                        return val.as_number()
+                        return val
+                            .as_number()
                             .map(|n| n as usize)
                             .ok_or_else(|| "Stream/pulses count must be a number".to_string());
                     }
@@ -1442,7 +1549,10 @@ impl Compiler {
                 return self.eval_static_with_scope(&arm.body, &arm_scope);
             }
         }
-        Err(format!("No WHILE arm matched value: {}", input.to_display_string()))
+        Err(format!(
+            "No WHILE arm matched value: {}",
+            input.to_display_string()
+        ))
     }
 
     /// Evaluate WHEN pattern matching statically.
@@ -1500,14 +1610,20 @@ impl Compiler {
                 }
             }
             Pattern::TaggedObject { tag, variables } => {
-                if let Value::Tagged { tag: val_tag, fields: val_fields } = value {
+                if let Value::Tagged {
+                    tag: val_tag,
+                    fields: val_fields,
+                } = value
+                {
                     if tag.as_str() == val_tag.as_ref() {
                         let mut bindings = IndexMap::new();
                         for var in variables {
                             let field_name = var.name.as_str();
                             if let Some(field_val) = val_fields.get(field_name) {
                                 if let Some(sub_pat) = &var.value {
-                                    if let Some(sub_bindings) = self.match_pattern(field_val, sub_pat) {
+                                    if let Some(sub_bindings) =
+                                        self.match_pattern(field_val, sub_pat)
+                                    {
                                         bindings.extend(sub_bindings);
                                     } else {
                                         return None;
@@ -1544,9 +1660,7 @@ impl Compiler {
                 }
                 Some(bindings)
             }
-            Pattern::WildCard => {
-                Some(IndexMap::new())
-            }
+            Pattern::WildCard => Some(IndexMap::new()),
             _ => {
                 // Unsupported pattern — no match
                 None
@@ -1624,7 +1738,11 @@ impl Compiler {
                 let a = self.eval_static_with_scope(operand_a, local_scope)?;
                 let b = self.eval_static_with_scope(operand_b, local_scope)?;
                 // Use Tag("True")/Tag("False") to match Boon's pattern matching
-                Ok(if a == b { Value::tag("True") } else { Value::tag("False") })
+                Ok(if a == b {
+                    Value::tag("True")
+                } else {
+                    Value::tag("False")
+                })
             }
             Comparator::NotEqual {
                 operand_a,
@@ -1632,7 +1750,11 @@ impl Compiler {
             } => {
                 let a = self.eval_static_with_scope(operand_a, local_scope)?;
                 let b = self.eval_static_with_scope(operand_b, local_scope)?;
-                Ok(if a != b { Value::tag("True") } else { Value::tag("False") })
+                Ok(if a != b {
+                    Value::tag("True")
+                } else {
+                    Value::tag("False")
+                })
             }
             Comparator::Greater {
                 operand_a,
@@ -1640,7 +1762,11 @@ impl Compiler {
             } => {
                 let a = self.eval_static_with_scope(operand_a, local_scope)?;
                 let b = self.eval_static_with_scope(operand_b, local_scope)?;
-                Ok(if a > b { Value::tag("True") } else { Value::tag("False") })
+                Ok(if a > b {
+                    Value::tag("True")
+                } else {
+                    Value::tag("False")
+                })
             }
             Comparator::GreaterOrEqual {
                 operand_a,
@@ -1648,7 +1774,11 @@ impl Compiler {
             } => {
                 let a = self.eval_static_with_scope(operand_a, local_scope)?;
                 let b = self.eval_static_with_scope(operand_b, local_scope)?;
-                Ok(if a >= b { Value::tag("True") } else { Value::tag("False") })
+                Ok(if a >= b {
+                    Value::tag("True")
+                } else {
+                    Value::tag("False")
+                })
             }
             Comparator::Less {
                 operand_a,
@@ -1656,7 +1786,11 @@ impl Compiler {
             } => {
                 let a = self.eval_static_with_scope(operand_a, local_scope)?;
                 let b = self.eval_static_with_scope(operand_b, local_scope)?;
-                Ok(if a < b { Value::tag("True") } else { Value::tag("False") })
+                Ok(if a < b {
+                    Value::tag("True")
+                } else {
+                    Value::tag("False")
+                })
             }
             Comparator::LessOrEqual {
                 operand_a,
@@ -1664,7 +1798,11 @@ impl Compiler {
             } => {
                 let a = self.eval_static_with_scope(operand_a, local_scope)?;
                 let b = self.eval_static_with_scope(operand_b, local_scope)?;
-                Ok(if a <= b { Value::tag("True") } else { Value::tag("False") })
+                Ok(if a <= b {
+                    Value::tag("True")
+                } else {
+                    Value::tag("False")
+                })
             }
         }
     }
@@ -1787,10 +1925,7 @@ impl<'a> GraphBuilder<'a> {
         id
     }
 
-    fn compile_program(
-        &mut self,
-        doc_expr: &Spanned<Expression>,
-    ) -> Result<DataflowGraph, String> {
+    fn compile_program(&mut self, doc_expr: &Spanned<Expression>) -> Result<DataflowGraph, String> {
         // Pass 1: Find all reactive variables and compile them
         let vars: Vec<(String, Spanned<Expression>)> = self.compiler.variables.clone();
         for (name, expr) in &vars {
@@ -1817,8 +1952,12 @@ impl<'a> GraphBuilder<'a> {
         let keyed_list_output = if let Some((list_name, keyed_var)) = self.keyed_hold_vars.first() {
             let list_name = list_name.clone();
             let keyed_var = keyed_var.clone();
-            let short_name = list_name.strip_prefix("store.").unwrap_or(&list_name).to_string();
-            let display_var = self.build_display_pipeline(&list_name, &keyed_var)
+            let short_name = list_name
+                .strip_prefix("store.")
+                .unwrap_or(&list_name)
+                .to_string();
+            let display_var = self
+                .build_display_pipeline(&list_name, &keyed_var)
                 .unwrap_or_else(|_| keyed_var.clone());
             // Find the element tag of the Stripe that displays keyed items
             let element_tag = self.compiler.find_keyed_stripe_element_tag(&short_name);
@@ -1857,7 +1996,11 @@ impl<'a> GraphBuilder<'a> {
         match &expr.node {
             // Alias references to existing reactive vars
             Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
-                let path = parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".");
+                let path = parts
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
                 // Check with scope prefix first
                 if let Some(ref prefix) = self.scope_prefix {
                     let prefixed = format!("{}.{}", prefix, path);
@@ -1872,10 +2015,14 @@ impl<'a> GraphBuilder<'a> {
                 match self.compiler.eval_static(expr) {
                     Ok(value) => {
                         let var = self.fresh_var(&format!("{}_literal", name));
-                        self.collections.insert(var.clone(), CollectionSpec::Literal(value));
+                        self.collections
+                            .insert(var.clone(), CollectionSpec::Literal(value));
                         Ok(var)
                     }
-                    Err(e) => Err(format!("Alias '{}' is not a reactive var and cannot be evaluated statically: {}", path, e))
+                    Err(e) => Err(format!(
+                        "Alias '{}' is not a reactive var and cannot be evaluated statically: {}",
+                        path, e
+                    )),
                 }
             }
 
@@ -1885,9 +2032,7 @@ impl<'a> GraphBuilder<'a> {
             }
 
             // Pattern: `LATEST { ... }`
-            Expression::Latest { inputs } => {
-                self.compile_latest(name, inputs)
-            }
+            Expression::Latest { inputs } => self.compile_latest(name, inputs),
 
             // Pattern: `Router/route()`
             Expression::FunctionCall { path, .. }
@@ -1898,20 +2043,17 @@ impl<'a> GraphBuilder<'a> {
             {
                 let input_id = self.add_input(InputKind::Router, Some(ROUTER_INPUT.to_string()));
                 let var = VarId::new(name);
-                self.collections.insert(var.clone(), CollectionSpec::Input(input_id));
+                self.collections
+                    .insert(var.clone(), CollectionSpec::Input(input_id));
                 self.reactive_vars.insert(name.to_string(), var.clone());
                 Ok(var)
             }
 
             // Pattern: `reactive_a - reactive_b` (or +, *, /)
-            Expression::ArithmeticOperator(op) => {
-                self.compile_reactive_arithmetic(name, op)
-            }
+            Expression::ArithmeticOperator(op) => self.compile_reactive_arithmetic(name, op),
 
             // Pattern: `reactive_a == reactive_b` (or !=, <, >, <=, >=)
-            Expression::Comparator(cmp) => {
-                self.compile_reactive_comparison(name, cmp)
-            }
+            Expression::Comparator(cmp) => self.compile_reactive_comparison(name, cmp),
 
             _ => {
                 // Check if this is an element with LINK bindings
@@ -1920,8 +2062,11 @@ impl<'a> GraphBuilder<'a> {
                     // Don't add to reactive collections
                     Ok(VarId::new(name))
                 } else {
-                    Err(format!("Unsupported reactive pattern for '{}': {:?}",
-                        name, std::mem::discriminant(&expr.node)))
+                    Err(format!(
+                        "Unsupported reactive pattern for '{}': {:?}",
+                        name,
+                        std::mem::discriminant(&expr.node)
+                    ))
                 }
             }
         }
@@ -1933,45 +2078,66 @@ impl<'a> GraphBuilder<'a> {
         name: &str,
         op: &ArithmeticOperator,
     ) -> Result<VarId, String> {
-        let (operand_a, operand_b, op_fn): (_, _, Arc<dyn Fn(&Value, &Value) -> Value + 'static>) = match op {
-            ArithmeticOperator::Add { operand_a, operand_b } => {
-                (operand_a, operand_b, Arc::new(|a: &Value, b: &Value| {
-                    Value::number(a.as_number().unwrap_or(0.0) + b.as_number().unwrap_or(0.0))
-                }))
-            }
-            ArithmeticOperator::Subtract { operand_a, operand_b } => {
-                (operand_a, operand_b, Arc::new(|a: &Value, b: &Value| {
-                    Value::number(a.as_number().unwrap_or(0.0) - b.as_number().unwrap_or(0.0))
-                }))
-            }
-            ArithmeticOperator::Multiply { operand_a, operand_b } => {
-                (operand_a, operand_b, Arc::new(|a: &Value, b: &Value| {
-                    Value::number(a.as_number().unwrap_or(0.0) * b.as_number().unwrap_or(0.0))
-                }))
-            }
-            ArithmeticOperator::Divide { operand_a, operand_b } => {
-                (operand_a, operand_b, Arc::new(|a: &Value, b: &Value| {
-                    let divisor = b.as_number().unwrap_or(1.0);
-                    Value::number(a.as_number().unwrap_or(0.0) / divisor)
-                }))
-            }
-            ArithmeticOperator::Negate { operand } => {
-                // Unary negate — compile as Map
-                let source_name = format!("{}_neg_src", name);
-                let source_var = self.compile_reactive_var(&source_name, operand)?;
-                self.reactive_vars.shift_remove(&source_name);
-                let var = VarId::new(name);
-                self.collections.insert(
-                    var.clone(),
-                    CollectionSpec::Map {
-                        source: source_var,
-                        f: Arc::new(|v: &Value| Value::number(-v.as_number().unwrap_or(0.0))),
-                    },
-                );
-                self.reactive_vars.insert(name.to_string(), var.clone());
-                return Ok(var);
-            }
-        };
+        let (operand_a, operand_b, op_fn): (_, _, Arc<dyn Fn(&Value, &Value) -> Value + 'static>) =
+            match op {
+                ArithmeticOperator::Add {
+                    operand_a,
+                    operand_b,
+                } => (
+                    operand_a,
+                    operand_b,
+                    Arc::new(|a: &Value, b: &Value| {
+                        Value::number(a.as_number().unwrap_or(0.0) + b.as_number().unwrap_or(0.0))
+                    }),
+                ),
+                ArithmeticOperator::Subtract {
+                    operand_a,
+                    operand_b,
+                } => (
+                    operand_a,
+                    operand_b,
+                    Arc::new(|a: &Value, b: &Value| {
+                        Value::number(a.as_number().unwrap_or(0.0) - b.as_number().unwrap_or(0.0))
+                    }),
+                ),
+                ArithmeticOperator::Multiply {
+                    operand_a,
+                    operand_b,
+                } => (
+                    operand_a,
+                    operand_b,
+                    Arc::new(|a: &Value, b: &Value| {
+                        Value::number(a.as_number().unwrap_or(0.0) * b.as_number().unwrap_or(0.0))
+                    }),
+                ),
+                ArithmeticOperator::Divide {
+                    operand_a,
+                    operand_b,
+                } => (
+                    operand_a,
+                    operand_b,
+                    Arc::new(|a: &Value, b: &Value| {
+                        let divisor = b.as_number().unwrap_or(1.0);
+                        Value::number(a.as_number().unwrap_or(0.0) / divisor)
+                    }),
+                ),
+                ArithmeticOperator::Negate { operand } => {
+                    // Unary negate — compile as Map
+                    let source_name = format!("{}_neg_src", name);
+                    let source_var = self.compile_reactive_var(&source_name, operand)?;
+                    self.reactive_vars.shift_remove(&source_name);
+                    let var = VarId::new(name);
+                    self.collections.insert(
+                        var.clone(),
+                        CollectionSpec::Map {
+                            source: source_var,
+                            f: Arc::new(|v: &Value| Value::number(-v.as_number().unwrap_or(0.0))),
+                        },
+                    );
+                    self.reactive_vars.insert(name.to_string(), var.clone());
+                    return Ok(var);
+                }
+            };
 
         // Compile both operands as reactive vars
         let left_name = format!("{}_arith_left", name);
@@ -2001,38 +2167,93 @@ impl<'a> GraphBuilder<'a> {
         cmp: &static_expression::Comparator,
     ) -> Result<VarId, String> {
         use static_expression::Comparator;
-        let (operand_a, operand_b, cmp_fn): (_, _, Arc<dyn Fn(&Value, &Value) -> Value + 'static>) = match cmp {
-            Comparator::Equal { operand_a, operand_b } => {
-                (operand_a, operand_b, Arc::new(|a: &Value, b: &Value| {
-                    if a == b { Value::tag("True") } else { Value::tag("False") }
-                }))
-            }
-            Comparator::NotEqual { operand_a, operand_b } => {
-                (operand_a, operand_b, Arc::new(|a: &Value, b: &Value| {
-                    if a != b { Value::tag("True") } else { Value::tag("False") }
-                }))
-            }
-            Comparator::Greater { operand_a, operand_b } => {
-                (operand_a, operand_b, Arc::new(|a: &Value, b: &Value| {
-                    if a > b { Value::tag("True") } else { Value::tag("False") }
-                }))
-            }
-            Comparator::GreaterOrEqual { operand_a, operand_b } => {
-                (operand_a, operand_b, Arc::new(|a: &Value, b: &Value| {
-                    if a >= b { Value::tag("True") } else { Value::tag("False") }
-                }))
-            }
-            Comparator::Less { operand_a, operand_b } => {
-                (operand_a, operand_b, Arc::new(|a: &Value, b: &Value| {
-                    if a < b { Value::tag("True") } else { Value::tag("False") }
-                }))
-            }
-            Comparator::LessOrEqual { operand_a, operand_b } => {
-                (operand_a, operand_b, Arc::new(|a: &Value, b: &Value| {
-                    if a <= b { Value::tag("True") } else { Value::tag("False") }
-                }))
-            }
-        };
+        let (operand_a, operand_b, cmp_fn): (_, _, Arc<dyn Fn(&Value, &Value) -> Value + 'static>) =
+            match cmp {
+                Comparator::Equal {
+                    operand_a,
+                    operand_b,
+                } => (
+                    operand_a,
+                    operand_b,
+                    Arc::new(|a: &Value, b: &Value| {
+                        if a == b {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        }
+                    }),
+                ),
+                Comparator::NotEqual {
+                    operand_a,
+                    operand_b,
+                } => (
+                    operand_a,
+                    operand_b,
+                    Arc::new(|a: &Value, b: &Value| {
+                        if a != b {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        }
+                    }),
+                ),
+                Comparator::Greater {
+                    operand_a,
+                    operand_b,
+                } => (
+                    operand_a,
+                    operand_b,
+                    Arc::new(|a: &Value, b: &Value| {
+                        if a > b {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        }
+                    }),
+                ),
+                Comparator::GreaterOrEqual {
+                    operand_a,
+                    operand_b,
+                } => (
+                    operand_a,
+                    operand_b,
+                    Arc::new(|a: &Value, b: &Value| {
+                        if a >= b {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        }
+                    }),
+                ),
+                Comparator::Less {
+                    operand_a,
+                    operand_b,
+                } => (
+                    operand_a,
+                    operand_b,
+                    Arc::new(|a: &Value, b: &Value| {
+                        if a < b {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        }
+                    }),
+                ),
+                Comparator::LessOrEqual {
+                    operand_a,
+                    operand_b,
+                } => (
+                    operand_a,
+                    operand_b,
+                    Arc::new(|a: &Value, b: &Value| {
+                        if a <= b {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        }
+                    }),
+                ),
+            };
 
         let left_name = format!("{}_cmp_left", name);
         let left_var = self.compile_reactive_var(&left_name, operand_a)?;
@@ -2103,7 +2324,10 @@ impl<'a> GraphBuilder<'a> {
                             let sum_var = VarId::new(name);
                             self.collections.insert(
                                 sum_var.clone(),
-                                CollectionSpec::Skip { source: hold_var, count: 1 },
+                                CollectionSpec::Skip {
+                                    source: hold_var,
+                                    count: 1,
+                                },
                             );
                             self.reactive_vars.insert(name.to_string(), sum_var.clone());
                             Ok(sum_var)
@@ -2111,9 +2335,7 @@ impl<'a> GraphBuilder<'a> {
                     }
 
                     // Pattern: `... |> Timer/interval()`
-                    ["Timer", "interval"] => {
-                        self.compile_timer(name, from)
-                    }
+                    ["Timer", "interval"] => self.compile_timer(name, from),
 
                     // Pattern: `... |> Stream/skip(count: N)`
                     ["Stream", "skip"] => {
@@ -2132,14 +2354,18 @@ impl<'a> GraphBuilder<'a> {
                                 count: skip_count,
                             },
                         );
-                        self.reactive_vars.insert(name.to_string(), skip_var.clone());
+                        self.reactive_vars
+                            .insert(name.to_string(), skip_var.clone());
                         Ok(skip_var)
                     }
 
                     // Pattern: `... |> Document/new()`
                     ["Document", "new"] => {
                         // This is handled in compile_document_expr, not here
-                        Err(format!("Document/new() should be handled at document level for '{}'", name))
+                        Err(format!(
+                            "Document/new() should be handled at document level for '{}'",
+                            name
+                        ))
                     }
 
                     // Pattern: `... |> Router/go_to()`
@@ -2156,53 +2382,50 @@ impl<'a> GraphBuilder<'a> {
                                 effect: SideEffectKind::RouterGoTo,
                             },
                         );
-                        self.reactive_vars.insert(name.to_string(), goto_var.clone());
+                        self.reactive_vars
+                            .insert(name.to_string(), goto_var.clone());
                         Ok(goto_var)
                     }
 
                     // Pattern: `... |> List/clear(on: event_source)`
                     // The `from` is typically `LIST {} |> List/append(item: X)`
-                    ["List", "clear"] => {
-                        self.compile_list_chain(name, from, arguments)
-                    }
+                    ["List", "clear"] => self.compile_list_chain(name, from, arguments),
 
                     // Pattern: `LIST {} |> List/append(item: X)` (without clear)
-                    ["List", "append"] => {
-                        self.compile_list_append_only(name, from, arguments)
-                    }
+                    ["List", "append"] => self.compile_list_append_only(name, from, arguments),
 
                     // Pattern: `source |> List/count()`
-                    ["List", "count"] => {
-                        self.compile_list_count(name, from)
-                    }
+                    ["List", "count"] => self.compile_list_count(name, from),
 
                     // Pattern: `source |> List/retain(item, if: predicate)`
-                    ["List", "retain"] => {
-                        self.compile_list_retain(name, from, arguments)
-                    }
+                    ["List", "retain"] => self.compile_list_retain(name, from, arguments),
 
                     // Pattern: `source |> List/map(item, new: transform)`
-                    ["List", "map"] => {
-                        self.compile_list_map(name, from, arguments)
-                    }
+                    ["List", "map"] => self.compile_list_map(name, from, arguments),
 
                     // Pattern: `source |> List/remove(on: event)`
-                    ["List", "remove"] => {
-                        self.compile_list_remove(name, from, arguments)
-                    }
+                    ["List", "remove"] => self.compile_list_remove(name, from, arguments),
 
                     _ => {
                         // Try user-defined function: `source |> my_function()`
                         // Compiled as a Map that evaluates the function body per input.
                         if path.len() == 1 {
                             let fn_name = path[0].as_str().to_string();
-                            if self.compiler.functions.iter().any(|(n, _, _)| n == &fn_name) {
+                            if self
+                                .compiler
+                                .functions
+                                .iter()
+                                .any(|(n, _, _)| n == &fn_name)
+                            {
                                 let source_var = self.resolve_reactive_source(from)?;
                                 let compiler = self.compiler.clone();
-                                let args_clone: Vec<(String, Option<Spanned<Expression>>)> = arguments
-                                    .iter()
-                                    .map(|a| (a.node.name.as_str().to_string(), a.node.value.clone()))
-                                    .collect();
+                                let args_clone: Vec<(String, Option<Spanned<Expression>>)> =
+                                    arguments
+                                        .iter()
+                                        .map(|a| {
+                                            (a.node.name.as_str().to_string(), a.node.value.clone())
+                                        })
+                                        .collect();
                                 let map_var = VarId::new(name);
                                 self.collections.insert(
                                     map_var.clone(),
@@ -2210,18 +2433,25 @@ impl<'a> GraphBuilder<'a> {
                                         source: source_var,
                                         f: Arc::new(move |input: &Value| {
                                             // Build scope: first positional param = piped input
-                                            let func = compiler.functions.iter()
+                                            let func = compiler
+                                                .functions
+                                                .iter()
                                                 .find(|(n, _, _)| n == &fn_name);
                                             if let Some((_, params, body)) = func {
                                                 let mut scope = IndexMap::new();
                                                 // Bind the piped value to the first parameter
                                                 if let Some(first_param) = params.first() {
-                                                    scope.insert(first_param.clone(), input.clone());
+                                                    scope
+                                                        .insert(first_param.clone(), input.clone());
                                                 }
                                                 // Bind explicit arguments
                                                 for (arg_name, arg_val) in &args_clone {
                                                     if let Some(val_expr) = arg_val {
-                                                        if let Ok(v) = compiler.eval_static_with_scope(val_expr, &scope) {
+                                                        if let Ok(v) = compiler
+                                                            .eval_static_with_scope(
+                                                                val_expr, &scope,
+                                                            )
+                                                        {
                                                             scope.insert(arg_name.clone(), v);
                                                         }
                                                     }
@@ -2229,14 +2459,20 @@ impl<'a> GraphBuilder<'a> {
                                                 // Bind by parameter position
                                                 for (i, p) in params.iter().enumerate().skip(1) {
                                                     if i - 1 < args_clone.len() {
-                                                        if let Some(val_expr) = &args_clone[i - 1].1 {
-                                                            if let Ok(v) = compiler.eval_static_with_scope(val_expr, &scope) {
+                                                        if let Some(val_expr) = &args_clone[i - 1].1
+                                                        {
+                                                            if let Ok(v) = compiler
+                                                                .eval_static_with_scope(
+                                                                    val_expr, &scope,
+                                                                )
+                                                            {
                                                                 scope.insert(p.clone(), v);
                                                             }
                                                         }
                                                     }
                                                 }
-                                                compiler.eval_static_with_scope(body, &scope)
+                                                compiler
+                                                    .eval_static_with_scope(body, &scope)
                                                     .unwrap_or(Value::Unit)
                                             } else {
                                                 Value::Unit
@@ -2248,9 +2484,12 @@ impl<'a> GraphBuilder<'a> {
                                 return Ok(map_var);
                             }
                         }
-                        Err(format!("Unsupported function in reactive pipe for '{}': {}",
-                            name, path_strs.join("/")))
-                    },
+                        Err(format!(
+                            "Unsupported function in reactive pipe for '{}': {}",
+                            name,
+                            path_strs.join("/")
+                        ))
+                    }
                 }
             }
 
@@ -2272,7 +2511,8 @@ impl<'a> GraphBuilder<'a> {
                         f: when_fn,
                     },
                 );
-                self.reactive_vars.insert(name.to_string(), when_var.clone());
+                self.reactive_vars
+                    .insert(name.to_string(), when_var.clone());
                 Ok(when_var)
             }
 
@@ -2288,7 +2528,8 @@ impl<'a> GraphBuilder<'a> {
                         body: transform,
                     },
                 );
-                self.reactive_vars.insert(name.to_string(), then_var.clone());
+                self.reactive_vars
+                    .insert(name.to_string(), then_var.clone());
                 Ok(then_var)
             }
 
@@ -2305,14 +2546,16 @@ impl<'a> GraphBuilder<'a> {
                         f: while_fn,
                     },
                 );
-                self.reactive_vars.insert(name.to_string(), while_var.clone());
+                self.reactive_vars
+                    .insert(name.to_string(), while_var.clone());
                 Ok(while_var)
             }
 
-            _ => {
-                Err(format!("Unsupported reactive pipe target for '{}': {:?}",
-                    name, std::mem::discriminant(&to.node)))
-            }
+            _ => Err(format!(
+                "Unsupported reactive pipe target for '{}': {:?}",
+                name,
+                std::mem::discriminant(&to.node)
+            )),
         }
     }
 
@@ -2326,17 +2569,13 @@ impl<'a> GraphBuilder<'a> {
         let seconds = self.extract_duration_seconds(duration_expr)?;
 
         // Create timer input
-        let input_id = self.add_input_with_timer(
-            InputKind::Timer,
-            Some(name.to_string()),
-            Some(seconds),
-        );
+        let input_id =
+            self.add_input_with_timer(InputKind::Timer, Some(name.to_string()), Some(seconds));
         let timer_var = VarId::new(name);
-        self.collections.insert(
-            timer_var.clone(),
-            CollectionSpec::Input(input_id),
-        );
-        self.reactive_vars.insert(name.to_string(), timer_var.clone());
+        self.collections
+            .insert(timer_var.clone(), CollectionSpec::Input(input_id));
+        self.reactive_vars
+            .insert(name.to_string(), timer_var.clone());
         Ok(timer_var)
     }
 
@@ -2346,8 +2585,10 @@ impl<'a> GraphBuilder<'a> {
                 if tag.as_str() == "Duration" {
                     for var in &object.variables {
                         if var.node.name.as_str() == "seconds" {
-                            return self.compiler.eval_static(&var.node.value)
-                                .and_then(|v| v.as_number().ok_or_else(|| "Duration seconds must be a number".to_string()));
+                            return self.compiler.eval_static(&var.node.value).and_then(|v| {
+                                v.as_number()
+                                    .ok_or_else(|| "Duration seconds must be a number".to_string())
+                            });
                         }
                     }
                     Err("Duration missing 'seconds' field".to_string())
@@ -2380,11 +2621,14 @@ impl<'a> GraphBuilder<'a> {
         body: &Spanned<Expression>,
     ) -> Result<VarId, String> {
         // Evaluate initial value statically
-        let initial_value = self.compiler.eval_static(initial_expr)
+        let initial_value = self
+            .compiler
+            .eval_static(initial_expr)
             .map_err(|e| format!("Cannot evaluate initial value for '{}': {}", name, e))?;
 
         // Check for persisted value to override initial
-        let effective_initial = self.persisted_holds
+        let effective_initial = self
+            .persisted_holds
             .get(name)
             .cloned()
             .unwrap_or_else(|| initial_value.clone());
@@ -2414,7 +2658,8 @@ impl<'a> GraphBuilder<'a> {
             },
         );
 
-        self.reactive_vars.insert(name.to_string(), hold_var.clone());
+        self.reactive_vars
+            .insert(name.to_string(), hold_var.clone());
 
         // Emit persistence side effect if storage_key is set
         if let Some(key) = self.storage_key.clone() {
@@ -2483,10 +2728,8 @@ impl<'a> GraphBuilder<'a> {
                 }
                 // Concat all event streams
                 let concat_var = self.fresh_var(&format!("{}_events_concat", hold_name));
-                self.collections.insert(
-                    concat_var.clone(),
-                    CollectionSpec::Concat(event_vars),
-                );
+                self.collections
+                    .insert(concat_var.clone(), CollectionSpec::Concat(event_vars));
                 // HoldLatest to keep only the most recent event
                 let latest_var = self.fresh_var(&format!("{}_events_latest", hold_name));
                 self.collections.insert(
@@ -2496,9 +2739,7 @@ impl<'a> GraphBuilder<'a> {
                 Ok((latest_var, None))
             }
 
-            _ => {
-                Err(format!("Unsupported HOLD body pattern for '{}'", hold_name))
-            }
+            _ => Err(format!("Unsupported HOLD body pattern for '{}'", hold_name)),
         }
     }
 
@@ -2568,25 +2809,19 @@ impl<'a> GraphBuilder<'a> {
                     let (kind, link_path) = Self::detect_event_kind_and_path(&effective_path);
                     let input_id = self.add_input(kind, Some(link_path.clone()));
                     let input_var = self.fresh_var("link_input");
-                    self.collections.insert(
-                        input_var.clone(),
-                        CollectionSpec::Input(input_id),
-                    );
+                    self.collections
+                        .insert(input_var.clone(), CollectionSpec::Input(input_id));
                     return Ok((input_var, Some(link_path)));
                 }
 
                 // Check if this references a variable with a LINK element
                 if let Some(var_expr) = self.compiler.get_var_expr(var_name) {
                     if self.compiler.expr_contains_link(var_expr) {
-                        let input_id = self.add_input(
-                            InputKind::LinkPress,
-                            Some(effective_path.clone()),
-                        );
+                        let input_id =
+                            self.add_input(InputKind::LinkPress, Some(effective_path.clone()));
                         let input_var = self.fresh_var("link_input");
-                        self.collections.insert(
-                            input_var.clone(),
-                            CollectionSpec::Input(input_id),
-                        );
+                        self.collections
+                            .insert(input_var.clone(), CollectionSpec::Input(input_id));
                         return Ok((input_var, Some(effective_path)));
                     }
                 }
@@ -2596,21 +2831,20 @@ impl<'a> GraphBuilder<'a> {
                     let prefixed_var_name = format!("{}.{}", prefix, var_name);
                     if let Some(var_expr) = self.compiler.get_var_expr(&prefixed_var_name) {
                         if self.compiler.expr_contains_link(var_expr) {
-                            let input_id = self.add_input(
-                                InputKind::LinkPress,
-                                Some(effective_path.clone()),
-                            );
+                            let input_id =
+                                self.add_input(InputKind::LinkPress, Some(effective_path.clone()));
                             let input_var = self.fresh_var("link_input");
-                            self.collections.insert(
-                                input_var.clone(),
-                                CollectionSpec::Input(input_id),
-                            );
+                            self.collections
+                                .insert(input_var.clone(), CollectionSpec::Input(input_id));
                             return Ok((input_var, Some(effective_path)));
                         }
                     }
                 }
 
-                Err(format!("Event source '{}' not found as reactive var or LINK element", path_str))
+                Err(format!(
+                    "Event source '{}' not found as reactive var or LINK element",
+                    path_str
+                ))
             }
             // Inline reactive pipe as event source (e.g., Duration |> Timer/interval())
             Expression::Pipe { .. } => {
@@ -2618,10 +2852,10 @@ impl<'a> GraphBuilder<'a> {
                 let var_id = self.compile_reactive_var(&inline_name, expr)?;
                 Ok((var_id, None))
             }
-            _ => {
-                Err(format!("Unsupported event source expression: {:?}",
-                    std::mem::discriminant(&expr.node)))
-            }
+            _ => Err(format!(
+                "Unsupported event source expression: {:?}",
+                std::mem::discriminant(&expr.node)
+            )),
         }
     }
 
@@ -2638,12 +2872,11 @@ impl<'a> GraphBuilder<'a> {
         }
 
         let latest_var = VarId::new(name);
-        self.collections.insert(
-            latest_var.clone(),
-            CollectionSpec::HoldLatest(source_vars),
-        );
+        self.collections
+            .insert(latest_var.clone(), CollectionSpec::HoldLatest(source_vars));
 
-        self.reactive_vars.insert(name.to_string(), latest_var.clone());
+        self.reactive_vars
+            .insert(name.to_string(), latest_var.clone());
         Ok(latest_var)
     }
 
@@ -2657,25 +2890,30 @@ impl<'a> GraphBuilder<'a> {
             Expression::Literal(lit) => {
                 let val = Compiler::eval_literal(lit);
                 let var = self.fresh_var(&format!("{}_lit{}", parent_name, index));
-                self.collections.insert(var.clone(), CollectionSpec::Literal(val));
+                self.collections
+                    .insert(var.clone(), CollectionSpec::Literal(val));
                 Ok(var)
             }
-            Expression::Pipe { from, to } => {
-                match &to.node {
-                    Expression::Then { body } => {
-                        let (source_var, _) = self.compile_event_source(from)?;
-                        let transform = self.build_then_transform(body);
-                        let then_var = self.fresh_var(&format!("{}_then{}", parent_name, index));
-                        self.collections.insert(
-                            then_var.clone(),
-                            CollectionSpec::Then { source: source_var, body: transform },
-                        );
-                        Ok(then_var)
-                    }
-                    _ => Err(format!("Unsupported LATEST input pipe")),
+            Expression::Pipe { from, to } => match &to.node {
+                Expression::Then { body } => {
+                    let (source_var, _) = self.compile_event_source(from)?;
+                    let transform = self.build_then_transform(body);
+                    let then_var = self.fresh_var(&format!("{}_then{}", parent_name, index));
+                    self.collections.insert(
+                        then_var.clone(),
+                        CollectionSpec::Then {
+                            source: source_var,
+                            body: transform,
+                        },
+                    );
+                    Ok(then_var)
                 }
-            }
-            _ => Err(format!("Unsupported LATEST input: {:?}", std::mem::discriminant(&expr.node))),
+                _ => Err(format!("Unsupported LATEST input pipe")),
+            },
+            _ => Err(format!(
+                "Unsupported LATEST input: {:?}",
+                std::mem::discriminant(&expr.node)
+            )),
         }
     }
 
@@ -2708,7 +2946,8 @@ impl<'a> GraphBuilder<'a> {
         }
 
         // Check for persisted value to override initial
-        let effective_initial = self.persisted_holds
+        let effective_initial = self
+            .persisted_holds
             .get(name)
             .cloned()
             .unwrap_or_else(|| initial_value.clone());
@@ -2725,10 +2964,8 @@ impl<'a> GraphBuilder<'a> {
             event_vars[0].clone()
         } else {
             let concat_var = self.fresh_var(&format!("{}_sum_events", name));
-            self.collections.insert(
-                concat_var.clone(),
-                CollectionSpec::Concat(event_vars),
-            );
+            self.collections
+                .insert(concat_var.clone(), CollectionSpec::Concat(event_vars));
             concat_var
         };
 
@@ -2768,10 +3005,7 @@ impl<'a> GraphBuilder<'a> {
         Ok(sum_var)
     }
 
-    fn compile_document_expr(
-        &mut self,
-        expr: &Spanned<Expression>,
-    ) -> Result<VarId, String> {
+    fn compile_document_expr(&mut self, expr: &Spanned<Expression>) -> Result<VarId, String> {
         // Handle `reactive_var |> Document/new()` pipe pattern
         if let Expression::Pipe { from, to } = &expr.node {
             if let Expression::FunctionCall { path, arguments } = &to.node {
@@ -2795,18 +3029,22 @@ impl<'a> GraphBuilder<'a> {
         // Standard pattern: `Document/new(root: some_element)`
         // Filter to only reactive vars with guaranteed initial values.
         // Event-only vars (LINK inputs, WHEN with SKIP) would block the Join chain.
-        let reactive_deps: Vec<String> = self.reactive_vars.iter()
+        let reactive_deps: Vec<String> = self
+            .reactive_vars
+            .iter()
             .filter(|(_, var_id)| self.has_initial_value(var_id))
             .map(|(name, _)| name.clone())
             .collect();
 
-
         if reactive_deps.is_empty() {
             // Static document
-            let val = self.compiler.eval_static(expr)
+            let val = self
+                .compiler
+                .eval_static(expr)
                 .map_err(|e| format!("Cannot evaluate document: {}", e))?;
             let doc_var = self.fresh_var("document");
-            self.collections.insert(doc_var.clone(), CollectionSpec::Literal(val));
+            self.collections
+                .insert(doc_var.clone(), CollectionSpec::Literal(val));
             return Ok(doc_var);
         }
 
@@ -2835,7 +3073,8 @@ impl<'a> GraphBuilder<'a> {
                 let root_var = self.reactive_vars.get(&root_dep).unwrap().clone();
 
                 // Build derived variable computations (closures that derive from root value)
-                let mut derived_fns: Vec<(String, Arc<dyn Fn(&Value) -> Value + 'static>)> = Vec::new();
+                let mut derived_fns: Vec<(String, Arc<dyn Fn(&Value) -> Value + 'static>)> =
+                    Vec::new();
                 let mut all_derived_handled = true;
                 for dep_name in &derived_deps {
                     let mut handled = false;
@@ -2862,7 +3101,10 @@ impl<'a> GraphBuilder<'a> {
 
                 // Build document closure that evaluates with reactive values in scope
                 #[cfg(target_arch = "wasm32")]
-                zoon::println!("[DD v2] compile_document_expr: root-derived path, root={}", root_dep);
+                zoon::println!(
+                    "[DD v2] compile_document_expr: root-derived path, root={}",
+                    root_dep
+                );
                 let compiler_clone = self.compiler.clone();
                 let doc_expr_clone = expr.clone();
                 let root_dep_name = root_dep.clone();
@@ -2898,10 +3140,7 @@ impl<'a> GraphBuilder<'a> {
     }
 
     /// Compile `reactive_var |> Document/new()` where the from is a simple alias.
-    fn compile_piped_document(
-        &mut self,
-        from: &Spanned<Expression>,
-    ) -> Result<VarId, String> {
+    fn compile_piped_document(&mut self, from: &Spanned<Expression>) -> Result<VarId, String> {
         // Check if `from` references a reactive variable
         if let Expression::Alias(Alias::WithoutPassed { parts, .. }) = &from.node {
             if parts.len() == 1 {
@@ -2965,8 +3204,13 @@ impl<'a> GraphBuilder<'a> {
             }
             Expression::FunctionCall { path, .. } => {
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                matches!(path_strs.as_slice(),
-                    ["Timer", "interval"] | ["Math", "sum"] | ["Stream", "skip"] | ["Document", "new"])
+                matches!(
+                    path_strs.as_slice(),
+                    ["Timer", "interval"]
+                        | ["Math", "sum"]
+                        | ["Stream", "skip"]
+                        | ["Document", "new"]
+                )
             }
             Expression::Then { .. } | Expression::Hold { .. } | Expression::Latest { .. } => true,
             Expression::TaggedObject { tag, .. } => tag.as_str() == "Duration",
@@ -3060,7 +3304,10 @@ impl<'a> GraphBuilder<'a> {
                 left: first_var,
                 right: second_var,
                 combine: Arc::new(move |a: &Value, b: &Value| {
-                    Value::object([(format!("{DEP_FIELD_PREFIX}0"), a.clone()), (format!("{DEP_FIELD_PREFIX}1"), b.clone())])
+                    Value::object([
+                        (format!("{DEP_FIELD_PREFIX}0"), a.clone()),
+                        (format!("{DEP_FIELD_PREFIX}1"), b.clone()),
+                    ])
                 }),
             },
         );
@@ -3125,7 +3372,10 @@ impl<'a> GraphBuilder<'a> {
                     continue;
                 }
                 // Try static evaluation for the default value
-                match self.compiler.eval_static_with_scope(var_expr, &IndexMap::new()) {
+                match self
+                    .compiler
+                    .eval_static_with_scope(var_expr, &IndexMap::new())
+                {
                     Ok(val) => {
                         link_defaults.push((field_name.to_string(), val));
                     }
@@ -3180,9 +3430,11 @@ impl<'a> GraphBuilder<'a> {
 
                 // Inject __link_path__ for LINK variables (top-level buttons, filter links, etc.)
                 for (nested_path, full_path) in &link_injections {
-                    store_value = set_nested_field(&store_value, nested_path, Value::object([
-                        (LINK_PATH_FIELD, Value::text(full_path.as_str())),
-                    ]));
+                    store_value = set_nested_field(
+                        &store_value,
+                        nested_path,
+                        Value::object([(LINK_PATH_FIELD, Value::text(full_path.as_str()))]),
+                    );
                 }
 
                 // Inject per-item link paths for list fields (todo items need keyed paths
@@ -3190,13 +3442,20 @@ impl<'a> GraphBuilder<'a> {
                 if let Value::Object(ref fields) = store_value {
                     let fields_snapshot = fields.clone();
                     for (field_name, field_val) in fields_snapshot.iter() {
-                        if let Value::Tagged { tag, fields: list_fields } = field_val {
+                        if let Value::Tagged {
+                            tag,
+                            fields: list_fields,
+                        } = field_val
+                        {
                             if tag.as_ref() == LIST_TAG {
                                 let list_path = format!("store.{}", field_name);
-                                let new_list_fields: BTreeMap<Arc<str>, Value> = list_fields.iter()
+                                let new_list_fields: BTreeMap<Arc<str>, Value> = list_fields
+                                    .iter()
                                     .map(|(key, item)| {
                                         let new_item = inject_item_link_paths_with_key(
-                                            item, &list_path, key.as_ref(),
+                                            item,
+                                            &list_path,
+                                            key.as_ref(),
                                         );
                                         (key.clone(), new_item)
                                     })
@@ -3250,7 +3509,8 @@ impl<'a> GraphBuilder<'a> {
                     Arc::new(move |state: &Value, _event: &Value| {
                         let mut scope = IndexMap::new();
                         scope.insert(sname.clone(), state.clone());
-                        compiler.eval_static_with_scope(&then_expr, &scope)
+                        compiler
+                            .eval_static_with_scope(&then_expr, &scope)
                             .unwrap_or_else(|_| {
                                 // Last resort fallback: increment by 1
                                 let current = state.as_number().unwrap_or(0.0);
@@ -3260,14 +3520,10 @@ impl<'a> GraphBuilder<'a> {
                 } else if matches!(&body.node, Expression::Latest { .. }) {
                     // LATEST body: each LATEST input produces the new state via THEN.
                     // The event value IS the new state — just replace.
-                    Arc::new(|_state: &Value, event: &Value| {
-                        event.clone()
-                    })
+                    Arc::new(|_state: &Value, event: &Value| event.clone())
                 } else {
                     // No THEN body found — event replaces state
-                    Arc::new(|_state: &Value, event: &Value| {
-                        event.clone()
-                    })
+                    Arc::new(|_state: &Value, event: &Value| event.clone())
                 }
             }
         }
@@ -3336,10 +3592,7 @@ impl<'a> GraphBuilder<'a> {
     }
 
     /// Resolve an alias expression to its reactive VarId.
-    fn resolve_reactive_source(
-        &mut self,
-        expr: &Spanned<Expression>,
-    ) -> Result<VarId, String> {
+    fn resolve_reactive_source(&mut self, expr: &Spanned<Expression>) -> Result<VarId, String> {
         if let Expression::Alias(Alias::WithoutPassed { parts, .. }) = &expr.node {
             if parts.len() == 1 {
                 let name = parts[0].as_str();
@@ -3364,13 +3617,13 @@ impl<'a> GraphBuilder<'a> {
             match path_strs.as_slice() {
                 ["Router", "route"] => {
                     // Router/route() is an input that receives route change events
-                    let input_id = self.add_input(InputKind::Router, Some(ROUTER_INPUT.to_string()));
+                    let input_id =
+                        self.add_input(InputKind::Router, Some(ROUTER_INPUT.to_string()));
                     let router_var = self.fresh_var(ROUTER_INPUT);
-                    self.collections.insert(
-                        router_var.clone(),
-                        CollectionSpec::Input(input_id),
-                    );
-                    self.reactive_vars.insert(ROUTER_INPUT.to_string(), router_var.clone());
+                    self.collections
+                        .insert(router_var.clone(), CollectionSpec::Input(input_id));
+                    self.reactive_vars
+                        .insert(ROUTER_INPUT.to_string(), router_var.clone());
                     return Ok(router_var);
                 }
                 _ => {}
@@ -3423,10 +3676,7 @@ impl<'a> GraphBuilder<'a> {
 
     /// Try to convert a WHEN pattern to a concrete Value for equality matching.
     /// Returns None for wildcards/bindings (which match anything).
-    fn try_eval_pattern_to_value(
-        &self,
-        pattern: &static_expression::Pattern,
-    ) -> Option<Value> {
+    fn try_eval_pattern_to_value(&self, pattern: &static_expression::Pattern) -> Option<Value> {
         match pattern {
             static_expression::Pattern::Literal(lit) => Some(Compiler::eval_literal(lit)),
             static_expression::Pattern::Alias { name } => {
@@ -3446,10 +3696,7 @@ impl<'a> GraphBuilder<'a> {
 
     /// Find the root reactive dependency among multiple deps.
     /// Returns (root_name, derived_dep_names).
-    fn find_root_and_derived(
-        &self,
-        deps: &[String],
-    ) -> Result<(String, Vec<String>), String> {
+    fn find_root_and_derived(&self, deps: &[String]) -> Result<(String, Vec<String>), String> {
         // Filter out side-effect collections and LINK markers
         let real_deps: Vec<&String> = deps
             .iter()
@@ -3511,8 +3758,7 @@ impl<'a> GraphBuilder<'a> {
                 parts.len() >= 1 && parts[0].as_str() == var_name
             }
             Expression::Pipe { from, to } => {
-                Self::expr_references_var(from, var_name)
-                    || Self::expr_references_var(to, var_name)
+                Self::expr_references_var(from, var_name) || Self::expr_references_var(to, var_name)
             }
             Expression::FunctionCall { arguments, .. } => arguments.iter().any(|a| {
                 a.node
@@ -3551,15 +3797,19 @@ impl<'a> GraphBuilder<'a> {
         arms: &[static_expression::Arm],
     ) -> bool {
         // Check for SKIP arms
-        let has_skip = arms.iter().any(|arm| {
-            matches!(arm.body.node, Expression::Skip)
-        });
+        let has_skip = arms
+            .iter()
+            .any(|arm| matches!(arm.body.node, Expression::Skip));
         if !has_skip {
             return false;
         }
         // Check if from is a key_down event path
         if let Expression::Alias(Alias::WithoutPassed { parts, .. }) = &from.node {
-            let path: String = parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".");
+            let path: String = parts
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
             let effective = if let Some(ref prefix) = self.scope_prefix {
                 format!("{}.{}", prefix, path)
             } else {
@@ -3589,9 +3839,11 @@ impl<'a> GraphBuilder<'a> {
     ) -> Result<VarId, String> {
         // Extract the event path from the `from` expression
         let from_path = match &from.node {
-            Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
-                parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".")
-            }
+            Expression::Alias(Alias::WithoutPassed { parts, .. }) => parts
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
             _ => return Err("Expected alias for text-dependent WHEN source".to_string()),
         };
         let effective_from = if let Some(ref prefix) = self.scope_prefix {
@@ -3604,7 +3856,8 @@ impl<'a> GraphBuilder<'a> {
         let (key_kind, key_link_path) = Self::detect_event_kind_and_path(&effective_from);
         let key_input_id = self.add_input(key_kind, Some(key_link_path.clone()));
         let key_input_var = self.fresh_var("key_down_input");
-        self.collections.insert(key_input_var.clone(), CollectionSpec::Input(key_input_id));
+        self.collections
+            .insert(key_input_var.clone(), CollectionSpec::Input(key_input_id));
 
         // Create TextChange input for the associated text input
         // Derive the change event path from the key_down path:
@@ -3612,7 +3865,8 @@ impl<'a> GraphBuilder<'a> {
         let change_path = key_link_path.replace(".event.key_down", ".event.change");
         let text_input_id = self.add_input(InputKind::TextChange, Some(change_path));
         let text_input_var = self.fresh_var("text_change_input");
-        self.collections.insert(text_input_var.clone(), CollectionSpec::Input(text_input_id));
+        self.collections
+            .insert(text_input_var.clone(), CollectionSpec::Input(text_input_id));
 
         // Tag the text change events: Value::text(text) → [__t: "text", v: text]
         let tagged_text_var = self.fresh_var("tagged_text");
@@ -3647,12 +3901,12 @@ impl<'a> GraphBuilder<'a> {
 
         // HoldState: tracks display text + pending text_to_add
         // State: [display: current_text, pending: Unit or trimmed_text]
-        let initial_state = Value::object([
-            ("display", Value::text("")),
-            ("pending", Value::Unit),
-        ]);
+        let initial_state = Value::object([("display", Value::text("")), ("pending", Value::Unit)]);
         let initial_var = self.fresh_var("text_state_init");
-        self.collections.insert(initial_var.clone(), CollectionSpec::Literal(initial_state.clone()));
+        self.collections.insert(
+            initial_var.clone(),
+            CollectionSpec::Literal(initial_state.clone()),
+        );
 
         let hold_var = self.fresh_var("text_key_state");
         self.collections.insert(
@@ -3662,7 +3916,8 @@ impl<'a> GraphBuilder<'a> {
                 events: combined_var,
                 initial_value: initial_state,
                 transform: Arc::new(|state: &Value, event: &Value| {
-                    let event_type = event.get_field("__t")
+                    let event_type = event
+                        .get_field("__t")
                         .and_then(|v| v.as_text())
                         .unwrap_or("")
                         .to_string();
@@ -3670,18 +3925,17 @@ impl<'a> GraphBuilder<'a> {
                         "text" => {
                             // Text change: update display text, clear pending
                             let text = event.get_field("v").cloned().unwrap_or(Value::text(""));
-                            Value::object([
-                                ("display", text),
-                                ("pending", Value::Unit),
-                            ])
+                            Value::object([("display", text), ("pending", Value::Unit)])
                         }
                         "key" => {
-                            let key = event.get_field("v")
+                            let key = event
+                                .get_field("v")
                                 .and_then(|v| v.as_text())
                                 .unwrap_or("")
                                 .to_string();
                             if key == "Enter" {
-                                let display = state.get_field("display")
+                                let display = state
+                                    .get_field("display")
                                     .and_then(|v| v.as_text())
                                     .unwrap_or("")
                                     .to_string();
@@ -3696,11 +3950,11 @@ impl<'a> GraphBuilder<'a> {
                                 }
                             } else {
                                 // Non-Enter key: clear pending (consumed by FlatMap)
-                                let display = state.get_field("display").cloned().unwrap_or(Value::text(""));
-                                Value::object([
-                                    ("display", display),
-                                    ("pending", Value::Unit),
-                                ])
+                                let display = state
+                                    .get_field("display")
+                                    .cloned()
+                                    .unwrap_or(Value::text(""));
+                                Value::object([("display", display), ("pending", Value::Unit)])
                             }
                         }
                         _ => state.clone(),
@@ -3727,12 +3981,11 @@ impl<'a> GraphBuilder<'a> {
         );
 
         // Store the hold var so the document can access display text
-        self.reactive_vars.insert(
-            format!("{}.__state", name),
-            hold_var,
-        );
+        self.reactive_vars
+            .insert(format!("{}.__state", name), hold_var);
 
-        self.reactive_vars.insert(name.to_string(), flatmap_var.clone());
+        self.reactive_vars
+            .insert(name.to_string(), flatmap_var.clone());
         Ok(flatmap_var)
     }
 
@@ -3752,11 +4005,10 @@ impl<'a> GraphBuilder<'a> {
         // so ListCount fires at t=0 with the correct initial count.
         if let Some(keyed_var) = self.resolve_keyed_source(from) {
             let count_var = VarId::new(name);
-            self.collections.insert(
-                count_var.clone(),
-                CollectionSpec::ListCount(keyed_var),
-            );
-            self.reactive_vars.insert(name.to_string(), count_var.clone());
+            self.collections
+                .insert(count_var.clone(), CollectionSpec::ListCount(keyed_var));
+            self.reactive_vars
+                .insert(name.to_string(), count_var.clone());
             return Ok(count_var);
         }
 
@@ -3764,7 +4016,11 @@ impl<'a> GraphBuilder<'a> {
         // Pattern: `keyed_source |> List/retain(item, if: predicate) |> List/count()`
         // Uses HoldState(initial=0, events=ListCount) because ListRetain may produce
         // empty results, and ListCount on empty keyed collection never fires.
-        if let Expression::Pipe { from: inner_from, to: inner_to } = &from.node {
+        if let Expression::Pipe {
+            from: inner_from,
+            to: inner_to,
+        } = &from.node
+        {
             if let Expression::FunctionCall { path, arguments } = &inner_to.node {
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                 if path_strs.as_slice() == ["List", "retain"] {
@@ -3786,7 +4042,8 @@ impl<'a> GraphBuilder<'a> {
                 f: Arc::new(|v: &Value| Value::number(v.list_count() as f64)),
             },
         );
-        self.reactive_vars.insert(name.to_string(), count_var.clone());
+        self.reactive_vars
+            .insert(name.to_string(), count_var.clone());
         Ok(count_var)
     }
 
@@ -3796,7 +4053,11 @@ impl<'a> GraphBuilder<'a> {
     /// - At t=0: HoldState starts with initial_value=0
     /// - If ListCount fires (non-empty retain result): state updates to actual count
     /// - If ListCount doesn't fire (empty retain result): state stays at 0
-    fn build_empty_safe_keyed_count(&mut self, name: &str, keyed_var: VarId) -> Result<VarId, String> {
+    fn build_empty_safe_keyed_count(
+        &mut self,
+        name: &str,
+        keyed_var: VarId,
+    ) -> Result<VarId, String> {
         // ListCount on the keyed retain result
         let count_events_var = self.fresh_var(&format!("{}_count_events", name));
         self.collections.insert(
@@ -3822,7 +4083,8 @@ impl<'a> GraphBuilder<'a> {
                 transform: Arc::new(|_state: &Value, event: &Value| event.clone()),
             },
         );
-        self.reactive_vars.insert(name.to_string(), count_var.clone());
+        self.reactive_vars
+            .insert(name.to_string(), count_var.clone());
         Ok(count_var)
     }
 
@@ -3835,12 +4097,14 @@ impl<'a> GraphBuilder<'a> {
         keyed_var: VarId,
         arguments: &[Spanned<Argument>],
     ) -> Result<VarId, String> {
-        let item_param: String = arguments.iter()
+        let item_param: String = arguments
+            .iter()
             .find(|a| a.node.value.is_none())
             .map(|a| a.node.name.as_str().to_string())
             .unwrap_or_else(|| "item".to_string());
 
-        let predicate_expr = arguments.iter()
+        let predicate_expr = arguments
+            .iter()
             .find(|a| a.node.name.as_str() == "if")
             .and_then(|a| a.node.value.as_ref())
             .ok_or_else(|| "List/retain missing 'if' argument".to_string())?;
@@ -3862,7 +4126,8 @@ impl<'a> GraphBuilder<'a> {
                     predicate: Arc::new(move |item: &Value| {
                         let mut scope = indexmap::IndexMap::new();
                         scope.insert(param_name.clone(), item.clone());
-                        compiler.eval_static_with_scope(&pred_expr, &scope)
+                        compiler
+                            .eval_static_with_scope(&pred_expr, &scope)
                             .and_then(|v| Ok(v.as_bool().unwrap_or(false)))
                             .unwrap_or(false)
                     }),
@@ -3871,7 +4136,9 @@ impl<'a> GraphBuilder<'a> {
         } else {
             // Reactive predicate → CollectionSpec::ListRetainReactive
             let reactive_dep = reactive_deps[0].clone();
-            let reactive_var = self.reactive_vars.get(&reactive_dep)
+            let reactive_var = self
+                .reactive_vars
+                .get(&reactive_dep)
                 .cloned()
                 .ok_or_else(|| format!("List/retain: reactive dep '{}' not found", reactive_dep))?;
 
@@ -3913,7 +4180,8 @@ impl<'a> GraphBuilder<'a> {
                             passed_val = Value::Object(Arc::new(fields));
                         }
                         scope.insert(PASSED_VAR.to_string(), passed_val);
-                        compiler.eval_static_with_scope(&pred_expr, &scope)
+                        compiler
+                            .eval_static_with_scope(&pred_expr, &scope)
                             .and_then(|v| Ok(v.as_bool().unwrap_or(false)))
                             .unwrap_or(false)
                     }),
@@ -3940,7 +4208,8 @@ impl<'a> GraphBuilder<'a> {
         keyed_var: &VarId,
     ) -> Result<VarId, String> {
         // Find the display pipeline pattern in function bodies
-        let pipeline = self.find_display_pipeline_in_functions(list_name)
+        let pipeline = self
+            .find_display_pipeline_in_functions(list_name)
             .ok_or_else(|| format!("No display pipeline found for '{}'", list_name))?;
 
         // Build keyed retain (if present) or use raw keyed var
@@ -3955,7 +4224,10 @@ impl<'a> GraphBuilder<'a> {
         let compiler = self.compiler.clone();
         let map_new_expr = pipeline.map_new_expr.clone();
         let map_item_param = pipeline.map_item_param.clone();
-        let list_path = format!("store.{}", list_name.strip_prefix("store.").unwrap_or(list_name));
+        let list_path = format!(
+            "store.{}",
+            list_name.strip_prefix("store.").unwrap_or(list_name)
+        );
 
         self.collections.insert(
             display_var.clone(),
@@ -3963,9 +4235,8 @@ impl<'a> GraphBuilder<'a> {
                 source: map_source,
                 f: Arc::new(move |key: &ListKey, item: &Value| {
                     // Inject link paths and hover state before evaluating the element template
-                    let item_with_links = inject_item_link_paths_with_key(
-                        item, &list_path, key.0.as_ref(),
-                    );
+                    let item_with_links =
+                        inject_item_link_paths_with_key(item, &list_path, key.0.as_ref());
                     let mut scope = IndexMap::new();
                     scope.insert(map_item_param.clone(), item_with_links);
                     // Use tolerant eval — the map function body may contain
@@ -3982,10 +4253,7 @@ impl<'a> GraphBuilder<'a> {
     ///
     /// Looks for: `PASSED.store.<list_name> |> List/retain(...) |> List/map(item, new: ...)`
     /// in `items:` arguments of Element/stripe calls within function bodies.
-    fn find_display_pipeline_in_functions(
-        &self,
-        list_name: &str,
-    ) -> Option<DisplayPipelineInfo> {
+    fn find_display_pipeline_in_functions(&self, list_name: &str) -> Option<DisplayPipelineInfo> {
         // The keyed name without "store." prefix for matching PASSED.store.<name>
         let short_name = list_name.strip_prefix("store.").unwrap_or(list_name);
 
@@ -4009,9 +4277,13 @@ impl<'a> GraphBuilder<'a> {
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                 if matches!(path_strs.as_slice(), ["Element", "stripe"]) {
                     // Check the items: argument
-                    if let Some(items_arg) = arguments.iter().find(|a| a.node.name.as_str() == "items") {
+                    if let Some(items_arg) =
+                        arguments.iter().find(|a| a.node.name.as_str() == "items")
+                    {
                         if let Some(ref items_expr) = items_arg.node.value {
-                            if let Some(info) = self.match_display_pipeline_pattern(items_expr, list_short_name) {
+                            if let Some(info) =
+                                self.match_display_pipeline_pattern(items_expr, list_short_name)
+                            {
                                 return Some(info);
                             }
                         }
@@ -4020,7 +4292,9 @@ impl<'a> GraphBuilder<'a> {
                 // Recurse into all argument values
                 for arg in arguments {
                     if let Some(ref val_expr) = arg.node.value {
-                        if let Some(info) = self.find_display_pipeline_in_expr(val_expr, list_short_name) {
+                        if let Some(info) =
+                            self.find_display_pipeline_in_expr(val_expr, list_short_name)
+                        {
                             return Some(info);
                         }
                     }
@@ -4034,9 +4308,13 @@ impl<'a> GraphBuilder<'a> {
                     return Some(info);
                 }
             }
-            Expression::Block { variables, output, .. } => {
+            Expression::Block {
+                variables, output, ..
+            } => {
                 for var in variables {
-                    if let Some(info) = self.find_display_pipeline_in_expr(&var.node.value, list_short_name) {
+                    if let Some(info) =
+                        self.find_display_pipeline_in_expr(&var.node.value, list_short_name)
+                    {
                         return Some(info);
                     }
                 }
@@ -4046,7 +4324,9 @@ impl<'a> GraphBuilder<'a> {
             }
             Expression::While { arms } | Expression::When { arms } => {
                 for arm in arms {
-                    if let Some(info) = self.find_display_pipeline_in_expr(&arm.body, list_short_name) {
+                    if let Some(info) =
+                        self.find_display_pipeline_in_expr(&arm.body, list_short_name)
+                    {
                         return Some(info);
                     }
                 }
@@ -4072,30 +4352,49 @@ impl<'a> GraphBuilder<'a> {
         expr: &Spanned<Expression>,
         list_short_name: &str,
     ) -> Option<DisplayPipelineInfo> {
-        if let Expression::Pipe { from: outer_from, to: outer_to } = &expr.node {
+        if let Expression::Pipe {
+            from: outer_from,
+            to: outer_to,
+        } = &expr.node
+        {
             // Check outer_to is List/map(...)
-            if let Expression::FunctionCall { path: map_path, arguments: map_args } = &outer_to.node {
+            if let Expression::FunctionCall {
+                path: map_path,
+                arguments: map_args,
+            } = &outer_to.node
+            {
                 let map_path_strs: Vec<&str> = map_path.iter().map(|s| s.as_str()).collect();
                 if map_path_strs.as_slice() != ["List", "map"] {
                     return None;
                 }
 
                 // Extract map info (shared by both patterns)
-                let map_item_param = map_args.iter()
+                let map_item_param = map_args
+                    .iter()
                     .find(|a| a.node.value.is_none())
                     .map(|a| a.node.name.as_str().to_string())
                     .unwrap_or_else(|| "item".to_string());
 
-                let map_new_expr = map_args.iter()
+                let map_new_expr = map_args
+                    .iter()
                     .find(|a| a.node.name.as_str() == "new")
                     .and_then(|a| a.node.value.as_ref())?
                     .clone();
 
                 // Pattern 1: PASSED.store.<name> |> List/retain(...) |> List/map(...)
-                if let Expression::Pipe { from: inner_from, to: inner_to } = &outer_from.node {
+                if let Expression::Pipe {
+                    from: inner_from,
+                    to: inner_to,
+                } = &outer_from.node
+                {
                     if self.is_passed_store_alias(inner_from, list_short_name) {
-                        if let Expression::FunctionCall { path: retain_path, arguments: retain_args } = &inner_to.node {
-                            let retain_path_strs: Vec<&str> = retain_path.iter().map(|s| s.as_str()).collect();
+                        if let Expression::FunctionCall {
+                            path: retain_path,
+                            arguments: retain_args,
+                        } = &inner_to.node
+                        {
+                            let retain_path_strs: Vec<&str> =
+                                retain_path.iter().map(|s| s.as_str()).collect();
                             if retain_path_strs.as_slice() == ["List", "retain"] {
                                 return Some(DisplayPipelineInfo {
                                     retain_arguments: Some(retain_args.clone()),
@@ -4142,13 +4441,15 @@ impl<'a> GraphBuilder<'a> {
         arguments: &[Spanned<Argument>],
     ) -> Result<VarId, String> {
         // Extract the item parameter name (e.g., "n" from `List/retain(n, if: ...)`)
-        let item_param: String = arguments.iter()
+        let item_param: String = arguments
+            .iter()
             .find(|a| a.node.value.is_none())
             .map(|a| a.node.name.as_str().to_string())
             .unwrap_or_else(|| "item".to_string());
 
         // Extract the `if:` predicate expression
-        let predicate_expr = arguments.iter()
+        let predicate_expr = arguments
+            .iter()
             .find(|a| a.node.name.as_str() == "if")
             .and_then(|a| a.node.value.as_ref())
             .ok_or_else(|| "List/retain missing 'if' argument".to_string())?;
@@ -4177,20 +4478,24 @@ impl<'a> GraphBuilder<'a> {
                         list.list_retain(|item| {
                             let mut scope = indexmap::IndexMap::new();
                             scope.insert(param_name.clone(), item.clone());
-                            let result = compiler.eval_static_with_scope(&pred_expr, &scope)
+                            let result = compiler
+                                .eval_static_with_scope(&pred_expr, &scope)
                                 .unwrap_or(Value::Unit);
                             result.as_bool().unwrap_or(false)
                         })
                     }),
                 },
             );
-            self.reactive_vars.insert(name.to_string(), retain_var.clone());
+            self.reactive_vars
+                .insert(name.to_string(), retain_var.clone());
             Ok(retain_var)
         } else {
             // Reactive predicate: Join source list with reactive deps, then filter
             // For simplicity, support a single reactive dependency for now
             let reactive_dep = reactive_deps[0].clone();
-            let reactive_var = self.reactive_vars.get(&reactive_dep)
+            let reactive_var = self
+                .reactive_vars
+                .get(&reactive_dep)
                 .cloned()
                 .ok_or_else(|| format!("List/retain: reactive dep '{}' not found", reactive_dep))?;
 
@@ -4225,14 +4530,16 @@ impl<'a> GraphBuilder<'a> {
                             let mut scope = indexmap::IndexMap::new();
                             scope.insert(param_name.clone(), item.clone());
                             scope.insert(dep_short.clone(), state.clone());
-                            let result = compiler.eval_static_with_scope(&pred_expr, &scope)
+                            let result = compiler
+                                .eval_static_with_scope(&pred_expr, &scope)
                                 .unwrap_or(Value::Unit);
                             result.as_bool().unwrap_or(false)
                         })
                     }),
                 },
             );
-            self.reactive_vars.insert(name.to_string(), retain_var.clone());
+            self.reactive_vars
+                .insert(name.to_string(), retain_var.clone());
             Ok(retain_var)
         }
     }
@@ -4247,12 +4554,14 @@ impl<'a> GraphBuilder<'a> {
         let source_var = self.resolve_list_source(from)?;
 
         // Extract item param name and `new:` expression
-        let item_param: String = arguments.iter()
+        let item_param: String = arguments
+            .iter()
             .find(|a| a.node.value.is_none())
             .map(|a| a.node.name.as_str().to_string())
             .unwrap_or_else(|| "item".to_string());
 
-        let new_expr = arguments.iter()
+        let new_expr = arguments
+            .iter()
             .find(|a| a.node.name.as_str() == "new")
             .and_then(|a| a.node.value.as_ref())
             .ok_or_else(|| "List/map missing 'new' argument".to_string())?;
@@ -4269,7 +4578,8 @@ impl<'a> GraphBuilder<'a> {
                     list.list_map(|item| {
                         let mut scope = indexmap::IndexMap::new();
                         scope.insert(param_name.clone(), item.clone());
-                        compiler.eval_static_with_scope(&new_expr, &scope)
+                        compiler
+                            .eval_static_with_scope(&new_expr, &scope)
                             .unwrap_or(Value::Unit)
                     })
                 }),
@@ -4305,29 +4615,27 @@ impl<'a> GraphBuilder<'a> {
         ops: &mut Vec<ListChainOp<'b>>,
     ) -> Result<&'b Spanned<Expression>, String> {
         match &expr.node {
-            Expression::Pipe { from, to } => {
-                match &to.node {
-                    Expression::FunctionCall { path, arguments } => {
-                        let p: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                        match p.as_slice() {
-                            ["List", "append"] => {
-                                ops.push(ListChainOp::Append(arguments));
-                                self.collect_list_chain_ops(from, ops)
-                            }
-                            ["List", "remove"] => {
-                                ops.push(ListChainOp::Remove(arguments));
-                                self.collect_list_chain_ops(from, ops)
-                            }
-                            ["List", "clear"] => {
-                                ops.push(ListChainOp::Clear(arguments));
-                                self.collect_list_chain_ops(from, ops)
-                            }
-                            _ => Ok(expr),
+            Expression::Pipe { from, to } => match &to.node {
+                Expression::FunctionCall { path, arguments } => {
+                    let p: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                    match p.as_slice() {
+                        ["List", "append"] => {
+                            ops.push(ListChainOp::Append(arguments));
+                            self.collect_list_chain_ops(from, ops)
                         }
+                        ["List", "remove"] => {
+                            ops.push(ListChainOp::Remove(arguments));
+                            self.collect_list_chain_ops(from, ops)
+                        }
+                        ["List", "clear"] => {
+                            ops.push(ListChainOp::Clear(arguments));
+                            self.collect_list_chain_ops(from, ops)
+                        }
+                        _ => Ok(expr),
                     }
-                    _ => Ok(expr),
                 }
-            }
+                _ => Ok(expr),
+            },
             _ => Ok(expr),
         }
     }
@@ -4345,7 +4653,8 @@ impl<'a> GraphBuilder<'a> {
         // Pre-check: if any Remove op references "item", use keyed pipeline
         let has_wildcard_ops = ops.iter().rev().any(|op| {
             if let ListChainOp::Remove(arguments) = op {
-                let on_arg = arguments.iter()
+                let on_arg = arguments
+                    .iter()
                     .find(|a| a.node.name.as_str() == "on")
                     .and_then(|a| a.node.value.as_ref());
                 if let Some(on_expr) = on_arg {
@@ -4363,14 +4672,17 @@ impl<'a> GraphBuilder<'a> {
         let mut remove_counter = 0u32;
 
         // Evaluate initial list statically
-        let initial_list = self.compiler.eval_static(initial_list_expr)
+        let initial_list = self
+            .compiler
+            .eval_static(initial_list_expr)
             .unwrap_or_else(|_| Value::empty_list());
 
         // Process each operation (they were collected outermost-first, so reverse to get pipeline order)
         for op in ops.iter().rev() {
             match op {
                 ListChainOp::Append(arguments) => {
-                    let item_arg = arguments.iter()
+                    let item_arg = arguments
+                        .iter()
                         .find(|a| a.node.name.as_str() == "item")
                         .and_then(|a| a.node.value.as_ref())
                         .ok_or_else(|| "List/append missing 'item' argument".to_string())?;
@@ -4392,7 +4704,8 @@ impl<'a> GraphBuilder<'a> {
                 ListChainOp::Remove(arguments) => {
                     // Only global event remove reaches here — per-item remove
                     // (referencing `item`) is handled by build_keyed_list_holdstate.
-                    let on_arg = arguments.iter()
+                    let on_arg = arguments
+                        .iter()
                         .find(|a| a.node.name.as_str() == "on")
                         .and_then(|a| a.node.value.as_ref())
                         .ok_or_else(|| "List/remove missing 'on' argument".to_string())?;
@@ -4415,7 +4728,8 @@ impl<'a> GraphBuilder<'a> {
                 }
 
                 ListChainOp::Clear(arguments) => {
-                    let clear_source_expr = arguments.iter()
+                    let clear_source_expr = arguments
+                        .iter()
                         .find(|a| a.node.name.as_str() == "on")
                         .and_then(|a| a.node.value.as_ref())
                         .ok_or_else(|| "List/clear missing 'on' argument".to_string())?;
@@ -4441,21 +4755,27 @@ impl<'a> GraphBuilder<'a> {
             event_vars.into_iter().next().unwrap()
         } else if event_vars.is_empty() {
             let empty_var = self.fresh_var("no_events");
-            self.collections.insert(empty_var.clone(), CollectionSpec::Literal(Value::Unit));
+            self.collections
+                .insert(empty_var.clone(), CollectionSpec::Literal(Value::Unit));
             empty_var
         } else {
             let concat_var = self.fresh_var("list_events");
-            self.collections.insert(concat_var.clone(), CollectionSpec::Concat(event_vars));
+            self.collections
+                .insert(concat_var.clone(), CollectionSpec::Concat(event_vars));
             concat_var
         };
 
         // HoldState: maintains the items list
         let initial_var = self.fresh_var("list_init");
-        let effective_initial = self.persisted_holds
+        let effective_initial = self
+            .persisted_holds
             .get(name)
             .cloned()
             .unwrap_or_else(|| initial_list.clone());
-        self.collections.insert(initial_var.clone(), CollectionSpec::Literal(effective_initial.clone()));
+        self.collections.insert(
+            initial_var.clone(),
+            CollectionSpec::Literal(effective_initial.clone()),
+        );
 
         // Build transform that handles all event types
         let list_var = VarId::new(name);
@@ -4466,7 +4786,8 @@ impl<'a> GraphBuilder<'a> {
                 events: events_var,
                 initial_value: effective_initial,
                 transform: Arc::new(|state: &Value, event: &Value| {
-                    let event_type = event.get_field("__t")
+                    let event_type = event
+                        .get_field("__t")
                         .and_then(|v| v.as_text())
                         .unwrap_or("")
                         .to_string();
@@ -4483,7 +4804,8 @@ impl<'a> GraphBuilder<'a> {
             },
         );
 
-        self.reactive_vars.insert(name.to_string(), list_var.clone());
+        self.reactive_vars
+            .insert(name.to_string(), list_var.clone());
 
         // Emit persistence side effect if storage_key is set
         if let Some(key) = self.storage_key.clone() {
@@ -4517,32 +4839,50 @@ impl<'a> GraphBuilder<'a> {
         use super::types::ClassifyFn;
 
         // Evaluate initial list statically
-        let initial_list = self.compiler.eval_static(initial_list_expr)
+        let initial_list = self
+            .compiler
+            .eval_static(initial_list_expr)
             .unwrap_or_else(|_| Value::empty_list());
 
         // Get effective initial (with persistence)
-        let effective_initial = self.persisted_holds
+        let effective_initial = self
+            .persisted_holds
             .get(name)
             .cloned()
             .unwrap_or_else(|| initial_list.clone());
 
         // Decompose initial list into (ListKey, Value) pairs
-        let initial_items: Vec<(ListKey, Value)> = if let Value::Tagged { ref tag, ref fields } = effective_initial {
+        let initial_items: Vec<(ListKey, Value)> = if let Value::Tagged {
+            ref tag,
+            ref fields,
+        } = effective_initial
+        {
             if tag.as_ref() == LIST_TAG {
-                fields.iter().map(|(k, v)| (ListKey::new(k.as_ref()), v.clone())).collect()
-            } else { Vec::new() }
-        } else { Vec::new() };
+                fields
+                    .iter()
+                    .map(|(k, v)| (ListKey::new(k.as_ref()), v.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         let initial_counter = initial_items.len();
 
         // 1. LiteralList for initial items
         let initial_list_var = self.fresh_var("keyed_initial");
-        self.collections.insert(initial_list_var.clone(), CollectionSpec::LiteralList(initial_items));
+        self.collections.insert(
+            initial_list_var.clone(),
+            CollectionSpec::LiteralList(initial_items),
+        );
 
         // 2. Find append source from ops and create AppendNewKeyed
         let mut append_source: Option<VarId> = None;
         for op in ops.iter().rev() {
             if let ListChainOp::Append(arguments) = op {
-                let item_arg = arguments.iter()
+                let item_arg = arguments
+                    .iter()
                     .find(|a| a.node.name.as_str() == "item")
                     .and_then(|a| a.node.value.as_ref())
                     .ok_or_else(|| "List/append missing 'item' argument".to_string())?;
@@ -4579,7 +4919,10 @@ impl<'a> GraphBuilder<'a> {
         // 4. Register wildcard input and create MapToKeyed
         let wildcard_id = self.add_input(InputKind::LinkPress, Some("__wildcard".to_string()));
         let wildcard_input_var = self.fresh_var("wildcard_input");
-        self.collections.insert(wildcard_input_var.clone(), CollectionSpec::Input(wildcard_id));
+        self.collections.insert(
+            wildcard_input_var.clone(),
+            CollectionSpec::Input(wildcard_id),
+        );
 
         let classify: ClassifyFn = Arc::new(|v: &Value| {
             let path = v.get_field("path")?.as_text()?.to_string();
@@ -4588,7 +4931,8 @@ impl<'a> GraphBuilder<'a> {
             let key = extract_list_item_key_from_path(&path)?;
 
             // Find subpath after the key
-            let subpath = path.split('.')
+            let subpath = path
+                .split('.')
                 .skip_while(|p| !(p.len() == 4 && p.chars().all(|c| c.is_ascii_digit())))
                 .skip(1) // skip the key itself
                 .collect::<Vec<_>>()
@@ -4603,16 +4947,26 @@ impl<'a> GraphBuilder<'a> {
             } else if subpath.contains("todo_title_element") && event_tag == "DoubleClick" {
                 Value::object([("type", Value::text("double_click"))])
             } else if subpath.contains("editing_todo_title_element") {
-                if let Some(text) = event_value.as_text() {
-                    match text {
+                if subpath.contains(".event.key_down") {
+                    let key = match event_value.as_text() {
+                        Some(key) => key,
+                        None => return None,
+                    };
+                    match key {
                         "Enter" => Value::object([("type", Value::text("edit_key_enter"))]),
                         "Escape" => Value::object([("type", Value::text("edit_key_escape"))]),
-                        _ => Value::object([
-                            ("type", Value::text("edit_text_change")),
-                            ("text", Value::text(text)),
-                        ]),
+                        _ => return None,
                     }
-                } else if event_tag == "Blur" {
+                } else if subpath.contains(".event.change") {
+                    let text = match event_value.as_text() {
+                        Some(text) => text,
+                        None => return None,
+                    };
+                    Value::object([
+                        ("type", Value::text("edit_text_change")),
+                        ("text", Value::text(text)),
+                    ])
+                } else if subpath.contains(".event.blur") && event_tag == "Blur" {
                     Value::object([("type", Value::text("edit_blur"))])
                 } else {
                     return None;
@@ -4653,18 +5007,25 @@ impl<'a> GraphBuilder<'a> {
         let mut has_broadcasts = false;
 
         // Toggle-all: check if the store has a toggle_all_checkbox LINK
-        if let Some(toggle_expr) = self.compiler.get_var_expr("store.elements.toggle_all_checkbox") {
+        if let Some(toggle_expr) = self
+            .compiler
+            .get_var_expr("store.elements.toggle_all_checkbox")
+        {
             if matches!(toggle_expr.node, Expression::Link) {
                 let toggle_path = "store.elements.toggle_all_checkbox".to_string();
                 let input_id = self.add_input(InputKind::LinkClick, Some(toggle_path));
                 let toggle_input_var = self.fresh_var("toggle_all_input");
-                self.collections.insert(toggle_input_var.clone(), CollectionSpec::Input(input_id));
+                self.collections
+                    .insert(toggle_input_var.clone(), CollectionSpec::Input(input_id));
                 // THEN: produce a tagged broadcast event
                 let toggle_then_var = self.fresh_var("toggle_all_then");
-                self.collections.insert(toggle_then_var.clone(), CollectionSpec::Then {
-                    source: toggle_input_var,
-                    body: Arc::new(|_| Value::tag("toggle_all")),
-                });
+                self.collections.insert(
+                    toggle_then_var.clone(),
+                    CollectionSpec::Then {
+                        source: toggle_input_var,
+                        body: Arc::new(|_| Value::tag("toggle_all")),
+                    },
+                );
                 broadcast_vars.push(toggle_then_var);
                 has_broadcasts = true;
             }
@@ -4673,7 +5034,8 @@ impl<'a> GraphBuilder<'a> {
         // Remove-completed: detect from ops
         for op in ops.iter().rev() {
             if let ListChainOp::Remove(arguments) = op {
-                let on_arg = arguments.iter()
+                let on_arg = arguments
+                    .iter()
                     .find(|a| a.node.name.as_str() == "on")
                     .and_then(|a| a.node.value.as_ref());
                 if let Some(on_expr) = on_arg {
@@ -4683,10 +5045,13 @@ impl<'a> GraphBuilder<'a> {
                                 if !Self::expr_references_name(from, "item") {
                                     let (event_var, _) = self.compile_event_source(from)?;
                                     let remove_then_var = self.fresh_var("remove_completed_then");
-                                    self.collections.insert(remove_then_var.clone(), CollectionSpec::Then {
-                                        source: event_var,
-                                        body: Arc::new(|_| Value::tag("remove_completed")),
-                                    });
+                                    self.collections.insert(
+                                        remove_then_var.clone(),
+                                        CollectionSpec::Then {
+                                            source: event_var,
+                                            body: Arc::new(|_| Value::tag("remove_completed")),
+                                        },
+                                    );
                                     broadcast_vars.push(remove_then_var);
                                     has_broadcasts = true;
                                 }
@@ -4703,7 +5068,8 @@ impl<'a> GraphBuilder<'a> {
                 Some(broadcast_vars.pop().unwrap())
             } else {
                 let concat_var = self.fresh_var("broadcasts_concat");
-                self.collections.insert(concat_var.clone(), CollectionSpec::Concat(broadcast_vars));
+                self.collections
+                    .insert(concat_var.clone(), CollectionSpec::Concat(broadcast_vars));
                 Some(concat_var)
             }
         } else {
@@ -4712,33 +5078,50 @@ impl<'a> GraphBuilder<'a> {
 
         // Build broadcast handler
         let broadcast_handler: Option<BroadcastHandlerFn> = if has_broadcasts {
-            Some(Arc::new(|states: &std::collections::HashMap<ListKey, Value>, event: &Value| {
-                let event_tag = event.as_tag().unwrap_or("");
-                match event_tag {
-                    "toggle_all" => {
-                        let all_completed = !states.is_empty() && states.values().all(|item| {
-                            item.get_field("completed")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false)
-                        });
-                        let target = !all_completed;
-                        let target_val = if target { Value::tag("True") } else { Value::tag("False") };
-                        states.iter().map(|(key, item)| {
-                            let new_item = item.update_field("completed", target_val.clone());
-                            (key.clone(), Some(new_item))
-                        }).collect()
+            Some(Arc::new(
+                |states: &std::collections::HashMap<ListKey, Value>, event: &Value| {
+                    let event_tag = event.as_tag().unwrap_or("");
+                    match event_tag {
+                        "toggle_all" => {
+                            let all_completed = !states.is_empty()
+                                && states.values().all(|item| {
+                                    item.get_field("completed")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false)
+                                });
+                            let target = !all_completed;
+                            let target_val = if target {
+                                Value::tag("True")
+                            } else {
+                                Value::tag("False")
+                            };
+                            states
+                                .iter()
+                                .map(|(key, item)| {
+                                    let new_item =
+                                        item.update_field("completed", target_val.clone());
+                                    (key.clone(), Some(new_item))
+                                })
+                                .collect()
+                        }
+                        "remove_completed" => states
+                            .iter()
+                            .filter_map(|(key, item)| {
+                                let completed = item
+                                    .get_field("completed")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                if completed {
+                                    Some((key.clone(), None))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
                     }
-                    "remove_completed" => {
-                        states.iter().filter_map(|(key, item)| {
-                            let completed = item.get_field("completed")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            if completed { Some((key.clone(), None)) } else { None }
-                        }).collect()
-                    }
-                    _ => Vec::new(),
-                }
-            }))
+                },
+            ))
         } else {
             None
         };
@@ -4746,7 +5129,8 @@ impl<'a> GraphBuilder<'a> {
         // 6. KeyedHoldState: per-item state with self-removal sentinel + broadcast support
         let keyed_hold_var = self.fresh_var("keyed_hold");
         // Store the keyed var for downstream keyed operators (ListCount, ListRetain)
-        self.keyed_hold_vars.insert(name.to_string(), keyed_hold_var.clone());
+        self.keyed_hold_vars
+            .insert(name.to_string(), keyed_hold_var.clone());
         self.keyed_collection_vars.insert(keyed_hold_var.clone());
         self.collections.insert(
             keyed_hold_var.clone(),
@@ -4754,24 +5138,46 @@ impl<'a> GraphBuilder<'a> {
                 initial: membership_var,
                 events: wildcard_keyed_var,
                 transform: Arc::new(|state: &Value, event: &Value| {
-                    let event_type = event.get_field("type")
+                    let event_type = event
+                        .get_field("type")
                         .and_then(|v| v.as_text())
                         .unwrap_or("")
                         .to_string();
 
+                    if event_type.starts_with("edit_") {
+                        zoon::println!(
+                            "[DD_DEBUG] keyed_hold event_type={} state_title={} state_editing={}",
+                            event_type,
+                            state
+                                .get_field("title")
+                                .and_then(|v| v.as_text())
+                                .unwrap_or(""),
+                            state
+                                .get_field("editing")
+                                .and_then(|v| v.as_tag())
+                                .unwrap_or("")
+                        );
+                    }
+
                     match event_type.as_str() {
                         "remove" => Value::Unit, // Self-removal sentinel
                         "checkbox_click" => {
-                            let completed = state.get_field("completed")
+                            let completed = state
+                                .get_field("completed")
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
                             state.update_field(
                                 "completed",
-                                if !completed { Value::tag("True") } else { Value::tag("False") },
+                                if !completed {
+                                    Value::tag("True")
+                                } else {
+                                    Value::tag("False")
+                                },
                             )
                         }
                         "double_click" => {
-                            let title = state.get_field("title")
+                            let title = state
+                                .get_field("title")
                                 .and_then(|v| v.as_text())
                                 .unwrap_or("")
                                 .to_string();
@@ -4780,7 +5186,8 @@ impl<'a> GraphBuilder<'a> {
                                 .update_field("__edit_text", Value::text(title.as_str()))
                         }
                         "edit_key_enter" => {
-                            let edit_text = state.get_field("__edit_text")
+                            let edit_text = state
+                                .get_field("__edit_text")
                                 .and_then(|v| v.as_text())
                                 .unwrap_or("")
                                 .to_string();
@@ -4793,17 +5200,17 @@ impl<'a> GraphBuilder<'a> {
                                 state.clone()
                             }
                         }
-                        "edit_key_escape" => {
-                            state.update_field("editing", Value::tag("False"))
-                        }
+                        "edit_key_escape" => state.update_field("editing", Value::tag("False")),
                         "edit_text_change" => {
-                            let text = event.get_field("text")
+                            let text = event
+                                .get_field("text")
                                 .and_then(|v| v.as_text())
                                 .unwrap_or("");
                             state.update_field("__edit_text", Value::text(text))
                         }
                         "edit_blur" => {
-                            let edit_text = state.get_field("__edit_text")
+                            let edit_text = state
+                                .get_field("__edit_text")
                                 .and_then(|v| v.as_text())
                                 .unwrap_or("")
                                 .to_string();
@@ -4817,12 +5224,17 @@ impl<'a> GraphBuilder<'a> {
                             }
                         }
                         "hover_change" => {
-                            let hovered = event.get_field("hovered")
+                            let hovered = event
+                                .get_field("hovered")
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
                             state.update_field(
                                 HOVERED_FIELD,
-                                if hovered { Value::tag("True") } else { Value::tag("False") },
+                                if hovered {
+                                    Value::tag("True")
+                                } else {
+                                    Value::tag("False")
+                                },
                             )
                         }
                         _ => state.clone(),
@@ -4840,10 +5252,8 @@ impl<'a> GraphBuilder<'a> {
         //   keyed_hold → ListCount → Map(count_to_stub_list) → reactive_var
         // This is O(1) per add/remove (count changes), NOT O(N) per item change.
         let count_var = self.fresh_var(&format!("{}_count_for_stub", name));
-        self.collections.insert(
-            count_var.clone(),
-            CollectionSpec::ListCount(keyed_hold_var),
-        );
+        self.collections
+            .insert(count_var.clone(), CollectionSpec::ListCount(keyed_hold_var));
         let list_var = VarId::new(name);
         self.collections.insert(
             list_var.clone(),
@@ -4867,7 +5277,8 @@ impl<'a> GraphBuilder<'a> {
                 }),
             },
         );
-        self.reactive_vars.insert(name.to_string(), list_var.clone());
+        self.reactive_vars
+            .insert(name.to_string(), list_var.clone());
 
         // 8. Persistence handled by keyed diff path in worker.rs
         // (KeyedPersistenceState + save_keyed_list). No SideEffect needed.
@@ -4905,21 +5316,23 @@ impl<'a> GraphBuilder<'a> {
                 Self::expr_references_name(from, name) || Self::expr_references_name(to, name)
             }
             Expression::Then { body } => Self::expr_references_name(body, name),
-            Expression::When { arms } => {
-                arms.iter().any(|a| Self::expr_references_name(&a.body, name))
-            }
-            Expression::While { arms } => {
-                arms.iter().any(|a| Self::expr_references_name(&a.body, name))
-            }
-            Expression::FunctionCall { arguments, .. } => {
-                arguments.iter().any(|a| {
-                    a.node.value.as_ref()
-                        .map(|v| Self::expr_references_name(v, name))
-                        .unwrap_or(false)
-                })
-            }
+            Expression::When { arms } => arms
+                .iter()
+                .any(|a| Self::expr_references_name(&a.body, name)),
+            Expression::While { arms } => arms
+                .iter()
+                .any(|a| Self::expr_references_name(&a.body, name)),
+            Expression::FunctionCall { arguments, .. } => arguments.iter().any(|a| {
+                a.node
+                    .value
+                    .as_ref()
+                    .map(|v| Self::expr_references_name(v, name))
+                    .unwrap_or(false)
+            }),
             Expression::Block { variables, output } => {
-                variables.iter().any(|v| Self::expr_references_name(&v.node.value, name))
+                variables
+                    .iter()
+                    .any(|v| Self::expr_references_name(&v.node.value, name))
                     || Self::expr_references_name(output, name)
             }
             _ => false,
@@ -4928,10 +5341,7 @@ impl<'a> GraphBuilder<'a> {
 
     /// Resolve a list source expression to a VarId.
     /// The source could be a reactive variable or a static expression.
-    fn resolve_list_source(
-        &mut self,
-        expr: &Spanned<Expression>,
-    ) -> Result<VarId, String> {
+    fn resolve_list_source(&mut self, expr: &Spanned<Expression>) -> Result<VarId, String> {
         // Try to resolve as a reactive variable first
         if let Ok(var) = self.resolve_reactive_source(expr) {
             return Ok(var);
@@ -4949,9 +5359,13 @@ impl<'a> GraphBuilder<'a> {
                     // Try static evaluation of the prefixed variable
                     if let Some(var_expr) = self.compiler.get_var_expr(&full_name) {
                         let var_expr = var_expr.clone();
-                        if let Ok(value) = self.compiler.eval_static_with_scope(&var_expr, &indexmap::IndexMap::new()) {
+                        if let Ok(value) = self
+                            .compiler
+                            .eval_static_with_scope(&var_expr, &indexmap::IndexMap::new())
+                        {
                             let literal_var = self.fresh_var("static_list");
-                            self.collections.insert(literal_var.clone(), CollectionSpec::Literal(value));
+                            self.collections
+                                .insert(literal_var.clone(), CollectionSpec::Literal(value));
                             return Ok(literal_var);
                         }
                     }
@@ -4960,12 +5374,19 @@ impl<'a> GraphBuilder<'a> {
         }
 
         // Try to evaluate statically and create a Literal
-        if let Ok(value) = self.compiler.eval_static_with_scope(expr, &indexmap::IndexMap::new()) {
+        if let Ok(value) = self
+            .compiler
+            .eval_static_with_scope(expr, &indexmap::IndexMap::new())
+        {
             let literal_var = self.fresh_var("static_list");
-            self.collections.insert(literal_var.clone(), CollectionSpec::Literal(value));
+            self.collections
+                .insert(literal_var.clone(), CollectionSpec::Literal(value));
             Ok(literal_var)
         } else {
-            Err(format!("Could not resolve list source: {:?}", std::mem::discriminant(&expr.node)))
+            Err(format!(
+                "Could not resolve list source: {:?}",
+                std::mem::discriminant(&expr.node)
+            ))
         }
     }
 
@@ -4977,7 +5398,11 @@ impl<'a> GraphBuilder<'a> {
     /// Handles scope prefix resolution (e.g., `todos` → `store.todos`).
     fn resolve_keyed_source(&self, expr: &Spanned<Expression>) -> Option<VarId> {
         if let Expression::Alias(Alias::WithoutPassed { parts, .. }) = &expr.node {
-            let name = parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".");
+            let name = parts
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
             // Direct lookup in keyed_hold_vars
             if let Some(var) = self.keyed_hold_vars.get(&name) {
                 return Some(var.clone());
@@ -5016,9 +5441,11 @@ impl<'a> GraphBuilder<'a> {
             Expression::Alias(alias) => {
                 // Build the full alias path and check if it (or a prefix) is a reactive var
                 let path = match alias {
-                    Alias::WithoutPassed { parts, .. } => {
-                        parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".")
-                    }
+                    Alias::WithoutPassed { parts, .. } => parts
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
                     Alias::WithPassed { extra_parts } => {
                         let mut p = vec!["PASSED"];
                         p.extend(extra_parts.iter().map(|s| s.as_str()));
@@ -5058,20 +5485,30 @@ impl<'a> GraphBuilder<'a> {
                     }
                 }
             }
-            Expression::ArithmeticOperator(op) => {
-                match op {
-                    ArithmeticOperator::Add { operand_a, operand_b }
-                    | ArithmeticOperator::Subtract { operand_a, operand_b }
-                    | ArithmeticOperator::Multiply { operand_a, operand_b }
-                    | ArithmeticOperator::Divide { operand_a, operand_b } => {
-                        self.collect_reactive_deps(operand_a, deps);
-                        self.collect_reactive_deps(operand_b, deps);
-                    }
-                    ArithmeticOperator::Negate { operand } => {
-                        self.collect_reactive_deps(operand, deps);
-                    }
+            Expression::ArithmeticOperator(op) => match op {
+                ArithmeticOperator::Add {
+                    operand_a,
+                    operand_b,
                 }
-            }
+                | ArithmeticOperator::Subtract {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Multiply {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Divide {
+                    operand_a,
+                    operand_b,
+                } => {
+                    self.collect_reactive_deps(operand_a, deps);
+                    self.collect_reactive_deps(operand_b, deps);
+                }
+                ArithmeticOperator::Negate { operand } => {
+                    self.collect_reactive_deps(operand, deps);
+                }
+            },
             _ => {}
         }
     }
@@ -5089,7 +5526,9 @@ impl<'a> GraphBuilder<'a> {
             Some(CollectionSpec::KeyedHoldState { .. }) => true,
             Some(CollectionSpec::Input(input_id)) => {
                 // Router inputs have initial values (current route), LINK inputs don't
-                self.inputs.iter().any(|spec| spec.id == *input_id && spec.kind == InputKind::Router)
+                self.inputs
+                    .iter()
+                    .any(|spec| spec.id == *input_id && spec.kind == InputKind::Router)
             }
             Some(CollectionSpec::Map { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::Then { source, .. }) => self.has_initial_value(source),
@@ -5110,9 +5549,9 @@ impl<'a> GraphBuilder<'a> {
             Some(CollectionSpec::SideEffect { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::ListCount(source)) => self.has_initial_value(source),
             Some(CollectionSpec::ListRetain { source, .. }) => self.has_initial_value(source),
-            Some(CollectionSpec::ListRetainReactive { list, filter_state, .. }) => {
-                self.has_initial_value(list) && self.has_initial_value(filter_state)
-            }
+            Some(CollectionSpec::ListRetainReactive {
+                list, filter_state, ..
+            }) => self.has_initial_value(list) && self.has_initial_value(filter_state),
             Some(CollectionSpec::ListMap { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::ListMapWithKey { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::ListAppend { list, .. }) => self.has_initial_value(list),
@@ -5135,7 +5574,8 @@ impl<'a> GraphBuilder<'a> {
         clear_args: &[Spanned<Argument>],
     ) -> Result<VarId, String> {
         // Extract the clear trigger from arguments: `on: event_source`
-        let clear_source_expr = clear_args.iter()
+        let clear_source_expr = clear_args
+            .iter()
             .find(|a| a.node.name.as_str() == "on")
             .and_then(|a| a.node.value.as_ref())
             .ok_or_else(|| "List/clear missing 'on' argument".to_string())?;
@@ -5143,7 +5583,10 @@ impl<'a> GraphBuilder<'a> {
 
         // Unwrap the from to find List/append
         let append_source = match &from.node {
-            Expression::Pipe { from: inner_from, to: inner_to } => {
+            Expression::Pipe {
+                from: inner_from,
+                to: inner_to,
+            } => {
                 match &inner_to.node {
                     Expression::FunctionCall { path, arguments }
                         if {
@@ -5152,7 +5595,8 @@ impl<'a> GraphBuilder<'a> {
                         } =>
                     {
                         // Extract the `item:` argument (the reactive var to append)
-                        let item_arg = arguments.iter()
+                        let item_arg = arguments
+                            .iter()
                             .find(|a| a.node.name.as_str() == "item")
                             .and_then(|a| a.node.value.as_ref())
                             .ok_or_else(|| "List/append missing 'item' argument".to_string())?;
@@ -5183,9 +5627,7 @@ impl<'a> GraphBuilder<'a> {
             clear_then_var.clone(),
             CollectionSpec::Then {
                 source: clear_input_var,
-                body: Arc::new(|_v: &Value| {
-                    Value::object([("__t", Value::text("clear"))])
-                }),
+                body: Arc::new(|_v: &Value| Value::object([("__t", Value::text("clear"))])),
             },
         );
 
@@ -5199,16 +5641,23 @@ impl<'a> GraphBuilder<'a> {
         // HoldState: maintains the items list
         let initial_list = Value::empty_list();
         let initial_var = self.fresh_var("list_init");
-        self.collections.insert(initial_var.clone(), CollectionSpec::Literal(initial_list.clone()));
+        self.collections.insert(
+            initial_var.clone(),
+            CollectionSpec::Literal(initial_list.clone()),
+        );
 
         // Check for persisted items
-        let effective_initial = self.persisted_holds
+        let effective_initial = self
+            .persisted_holds
             .get(name)
             .cloned()
             .unwrap_or_else(|| initial_list.clone());
         // Override initial collection if persisted
         if self.persisted_holds.contains_key(name) {
-            self.collections.insert(initial_var.clone(), CollectionSpec::Literal(effective_initial.clone()));
+            self.collections.insert(
+                initial_var.clone(),
+                CollectionSpec::Literal(effective_initial.clone()),
+            );
         }
 
         let list_var = VarId::new(name);
@@ -5219,7 +5668,8 @@ impl<'a> GraphBuilder<'a> {
                 events: events_var,
                 initial_value: effective_initial,
                 transform: Arc::new(|state: &Value, event: &Value| {
-                    let event_type = event.get_field("__t")
+                    let event_type = event
+                        .get_field("__t")
                         .and_then(|v| v.as_text())
                         .unwrap_or("")
                         .to_string();
@@ -5236,7 +5686,8 @@ impl<'a> GraphBuilder<'a> {
             },
         );
 
-        self.reactive_vars.insert(name.to_string(), list_var.clone());
+        self.reactive_vars
+            .insert(name.to_string(), list_var.clone());
 
         // Emit persistence side effect if storage_key is set
         if let Some(key) = self.storage_key.clone() {
@@ -5264,7 +5715,8 @@ impl<'a> GraphBuilder<'a> {
         arguments: &[Spanned<Argument>],
     ) -> Result<VarId, String> {
         // Extract item source
-        let item_arg = arguments.iter()
+        let item_arg = arguments
+            .iter()
             .find(|a| a.node.name.as_str() == "item")
             .and_then(|a| a.node.value.as_ref())
             .ok_or_else(|| "List/append missing 'item' argument".to_string())?;
@@ -5285,7 +5737,10 @@ impl<'a> GraphBuilder<'a> {
         // HoldState: maintains the items list
         let initial_list = Value::empty_list();
         let initial_var = self.fresh_var("list_init");
-        self.collections.insert(initial_var.clone(), CollectionSpec::Literal(initial_list.clone()));
+        self.collections.insert(
+            initial_var.clone(),
+            CollectionSpec::Literal(initial_list.clone()),
+        );
 
         let list_var = VarId::new(name);
         self.collections.insert(
@@ -5302,10 +5757,10 @@ impl<'a> GraphBuilder<'a> {
             },
         );
 
-        self.reactive_vars.insert(name.to_string(), list_var.clone());
+        self.reactive_vars
+            .insert(name.to_string(), list_var.clone());
         Ok(list_var)
     }
-
 }
 
 /// Handle a wildcard event for per-item list operations.
@@ -5332,7 +5787,10 @@ fn set_nested_field(obj: &Value, path: &str, value: Value) -> Value {
     if parts.len() == 1 {
         obj.update_field(parts[0], value)
     } else {
-        let existing = obj.get_field(parts[0]).cloned().unwrap_or_else(|| Value::Object(Arc::new(BTreeMap::new())));
+        let existing = obj
+            .get_field(parts[0])
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Arc::new(BTreeMap::new())));
         let updated = set_nested_field(&existing, parts[1], value);
         obj.update_field(parts[0], updated)
     }
@@ -5344,12 +5802,31 @@ fn inject_item_link_paths_with_key(item: &Value, list_path: &str, key: &str) -> 
     let item_path = format!("{}.{}", list_path, key);
     let mut result = item.clone();
 
+    // While editing, render the in-progress edit buffer via `title`.
+    // The TodoMVC edit input uses `LATEST { todo.title, element.event.change.text }`.
+    // In keyed DD rendering, this expression is re-evaluated from item state, so
+    // `element.event.change.text` is not persistent between updates. Mirroring
+    // `__edit_text` into `title` during edit mode preserves incremental typing.
+    let editing = result
+        .get_field("editing")
+        .and_then(|v| v.as_tag())
+        .map(|tag| tag == "True")
+        .unwrap_or(false);
+    if editing {
+        if let Some(edit_text) = result.get_field("__edit_text").and_then(|v| v.as_text()) {
+            result = result.update_field("title", Value::text(edit_text));
+        }
+    }
+
     // Inject hover path for per-item hover (element.hovered).
     // Preserve existing __hovered state (set by wildcard HoverChange events).
     if item.get_field(HOVERED_FIELD).is_none() {
         result = result.update_field(HOVERED_FIELD, Value::tag("False"));
     }
-    result = result.update_field(HOVER_PATH_FIELD, Value::text(format!("{}.hovered", item_path).as_str()));
+    result = result.update_field(
+        HOVER_PATH_FIELD,
+        Value::text(format!("{}.hovered", item_path).as_str()),
+    );
 
     // If the item has todo_elements, inject link paths
     if let Some(todo_elements) = item.get_field("todo_elements") {
@@ -5555,26 +6032,24 @@ impl Compiler {
                 }
             }
 
-            Expression::Pipe { from, to } => {
-                match &to.node {
-                    Expression::FunctionCall { .. } => {
-                        self.build_doc_template_inner(reactive_var_name, to, keyed_list_name)
-                            .or_else(|_| {
-                                let val = self.eval_static(expr).unwrap_or(Value::Unit);
-                                Ok(DocTemplate::Static(val))
-                            })
-                    }
-                    _ => {
+            Expression::Pipe { from, to } => match &to.node {
+                Expression::FunctionCall { .. } => self
+                    .build_doc_template_inner(reactive_var_name, to, keyed_list_name)
+                    .or_else(|_| {
                         let val = self.eval_static(expr).unwrap_or(Value::Unit);
                         Ok(DocTemplate::Static(val))
-                    }
+                    }),
+                _ => {
+                    let val = self.eval_static(expr).unwrap_or(Value::Unit);
+                    Ok(DocTemplate::Static(val))
                 }
-            }
+            },
 
             Expression::List { items } => {
                 let mut item_templates = Vec::new();
                 for (i, item) in items.iter().enumerate() {
-                    let tmpl = self.build_doc_template_inner(reactive_var_name, item, keyed_list_name)?;
+                    let tmpl =
+                        self.build_doc_template_inner(reactive_var_name, item, keyed_list_name)?;
                     item_templates.push((format!("{:04}", i), tmpl));
                 }
                 Ok(DocTemplate::Tagged {
@@ -5613,9 +6088,7 @@ impl Compiler {
                 }
             }
 
-            Expression::Link => {
-                Ok(DocTemplate::Static(Value::tag("LINK")))
-            }
+            Expression::Link => Ok(DocTemplate::Static(Value::tag("LINK"))),
 
             Expression::Object(obj) => {
                 let mut field_templates = Vec::new();
@@ -5634,18 +6107,15 @@ impl Compiler {
                 })
             }
 
-            Expression::Literal(_)
-            | Expression::TaggedObject { .. } => {
+            Expression::Literal(_) | Expression::TaggedObject { .. } => {
                 let val = self.eval_static(expr)?;
                 Ok(DocTemplate::Static(val))
             }
 
-            _ => {
-                match self.eval_static(expr) {
-                    Ok(val) => Ok(DocTemplate::Static(val)),
-                    Err(e) => Err(format!("Cannot build doc template: {}", e)),
-                }
-            }
+            _ => match self.eval_static(expr) {
+                Ok(val) => Ok(DocTemplate::Static(val)),
+                Err(e) => Err(format!("Cannot build doc template: {}", e)),
+            },
         }
     }
 
@@ -5715,7 +6185,9 @@ impl Compiler {
                             if arg.node.name.as_str() == "element" {
                                 if let Some(ref val_expr) = arg.node.value {
                                     if let Ok(val) = self.eval_static(val_expr) {
-                                        if let Some(tag) = val.get_field("tag").and_then(|t| t.as_tag()) {
+                                        if let Some(tag) =
+                                            val.get_field("tag").and_then(|t| t.as_tag())
+                                        {
                                             return Some(tag.to_string());
                                         }
                                     }
@@ -5727,17 +6199,18 @@ impl Compiler {
                 // Recurse into arguments
                 for arg in arguments {
                     if let Some(ref val_expr) = arg.node.value {
-                        if let Some(tag) = self.find_keyed_stripe_tag_in_expr(val_expr, keyed_list_short_name) {
+                        if let Some(tag) =
+                            self.find_keyed_stripe_tag_in_expr(val_expr, keyed_list_short_name)
+                        {
                             return Some(tag);
                         }
                     }
                 }
                 None
             }
-            Expression::Pipe { from, to } => {
-                self.find_keyed_stripe_tag_in_expr(from, keyed_list_short_name)
-                    .or_else(|| self.find_keyed_stripe_tag_in_expr(to, keyed_list_short_name))
-            }
+            Expression::Pipe { from, to } => self
+                .find_keyed_stripe_tag_in_expr(from, keyed_list_short_name)
+                .or_else(|| self.find_keyed_stripe_tag_in_expr(to, keyed_list_short_name)),
             Expression::Block { output, .. } => {
                 self.find_keyed_stripe_tag_in_expr(output, keyed_list_short_name)
             }
@@ -5753,13 +6226,13 @@ impl Compiler {
                 .iter()
                 .any(|v| self.expr_contains_link(&v.node.value)),
             Expression::List { items } => items.iter().any(|i| self.expr_contains_link(i)),
-            Expression::FunctionCall { arguments, .. } => {
-                arguments.iter().any(|a| {
-                    a.node.value.as_ref()
-                        .map(|v| self.expr_contains_link(v))
-                        .unwrap_or(false)
-                })
-            }
+            Expression::FunctionCall { arguments, .. } => arguments.iter().any(|a| {
+                a.node
+                    .value
+                    .as_ref()
+                    .map(|v| self.expr_contains_link(v))
+                    .unwrap_or(false)
+            }),
             _ => false,
         }
     }

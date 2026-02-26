@@ -18,8 +18,8 @@ use zoon::*;
 
 use super::super::core::runtime;
 use super::super::core::types::{
-    DataflowGraph, InputId, InputKind, KeyedDiff, LinkId, ListKey, SideEffectKind,
-    LIST_TAG, ROUTER_INPUT,
+    DataflowGraph, InputId, InputKind, KeyedDiff, LinkId, ListKey, SideEffectKind, LIST_TAG,
+    ROUTER_INPUT,
 };
 use super::super::core::value::Value;
 
@@ -140,35 +140,33 @@ impl DdWorkerHandle {
             });
 
         // Keyed diff buffer for bridge display (element Values from display_var)
-        let keyed_diff_buffer: Rc<RefCell<Vec<KeyedDiff>>> =
-            Rc::new(RefCell::new(Vec::new()));
+        let keyed_diff_buffer: Rc<RefCell<Vec<KeyedDiff>>> = Rc::new(RefCell::new(Vec::new()));
 
         // Build keyed diff callback for bridge display
         let has_keyed_output = graph.keyed_list_output.is_some();
-        let keyed_stripe_element_tag = graph.keyed_list_output.as_ref()
+        let keyed_stripe_element_tag = graph
+            .keyed_list_output
+            .as_ref()
             .and_then(|klo| klo.element_tag.clone());
         let kd_buffer_for_inspect = keyed_diff_buffer.clone();
-        let on_keyed_diff: Option<Arc<dyn Fn(KeyedDiff) + 'static>> =
-            if has_keyed_output {
-                Some(Arc::new(move |diff: KeyedDiff| {
-                    kd_buffer_for_inspect.borrow_mut().push(diff);
-                }))
-            } else {
-                None
-            };
+        let on_keyed_diff: Option<Arc<dyn Fn(KeyedDiff) + 'static>> = if has_keyed_output {
+            Some(Arc::new(move |diff: KeyedDiff| {
+                kd_buffer_for_inspect.borrow_mut().push(diff);
+            }))
+        } else {
+            None
+        };
 
         // Keyed diff buffer for persistence (raw data from persistence_var)
-        let keyed_persist_buffer: Rc<RefCell<Vec<KeyedDiff>>> =
-            Rc::new(RefCell::new(Vec::new()));
+        let keyed_persist_buffer: Rc<RefCell<Vec<KeyedDiff>>> = Rc::new(RefCell::new(Vec::new()));
         let kp_buffer_for_inspect = keyed_persist_buffer.clone();
-        let on_keyed_persist: Option<Arc<dyn Fn(KeyedDiff) + 'static>> =
-            if has_keyed_output {
-                Some(Arc::new(move |diff: KeyedDiff| {
-                    kp_buffer_for_inspect.borrow_mut().push(diff);
-                }))
-            } else {
-                None
-            };
+        let on_keyed_persist: Option<Arc<dyn Fn(KeyedDiff) + 'static>> = if has_keyed_output {
+            Some(Arc::new(move |diff: KeyedDiff| {
+                kp_buffer_for_inspect.borrow_mut().push(diff);
+            }))
+        } else {
+            None
+        };
 
         // Set up keyed persistence state if applicable
         let keyed_persistence: Rc<RefCell<Option<KeyedPersistenceState>>> =
@@ -178,9 +176,14 @@ impl DdWorkerHandle {
                 // Initialize from persisted state (load existing items)
                 let persisted_items = super::persistence::load_hold_state(sk, hn)
                     .map(|v| {
-                        if let Value::Tagged { ref tag, ref fields } = v {
+                        if let Value::Tagged {
+                            ref tag,
+                            ref fields,
+                        } = v
+                        {
                             if tag.as_ref() == LIST_TAG {
-                                return fields.iter()
+                                return fields
+                                    .iter()
                                     .map(|(k, v)| (ListKey::new(k.as_ref()), v.clone()))
                                     .collect();
                             }
@@ -329,38 +332,26 @@ impl DdWorkerHandle {
     /// compiled DataflowGraph's InputSpec entries, then steps the worker.
     pub fn inject_dd_event(&self, event: Event) {
         let (link_path, event_value) = match event {
-            Event::LinkPress { link_path } => {
-                (link_path, Value::tag("Press"))
-            }
-            Event::LinkClick { link_path } => {
-                (link_path, Value::tag("Click"))
-            }
-            Event::KeyDown { link_path, key } => {
-                (link_path, Value::text(key))
-            }
-            Event::TextChange { link_path, text } => {
-                (link_path, Value::text(text))
-            }
-            Event::Blur { link_path } => {
-                (link_path, Value::tag("Blur"))
-            }
-            Event::Focus { link_path } => {
-                (link_path, Value::tag("Focus"))
-            }
-            Event::DoubleClick { link_path } => {
-                (link_path, Value::tag("DoubleClick"))
-            }
-            Event::HoverChange { link_path, hovered } => {
-                (link_path, Value::bool(hovered))
-            }
-            Event::TimerTick { var_name } => {
-                (var_name, Value::tag("Tick"))
-            }
+            Event::LinkPress { link_path } => (link_path, Value::tag("Press")),
+            Event::LinkClick { link_path } => (link_path, Value::tag("Click")),
+            Event::KeyDown { link_path, key } => (link_path, Value::text(key)),
+            Event::TextChange { link_path, text } => (link_path, Value::text(text)),
+            Event::Blur { link_path } => (link_path, Value::tag("Blur")),
+            Event::Focus { link_path } => (link_path, Value::tag("Focus")),
+            Event::DoubleClick { link_path } => (link_path, Value::tag("DoubleClick")),
+            Event::HoverChange { link_path, hovered } => (link_path, Value::bool(hovered)),
+            Event::TimerTick { var_name } => (var_name, Value::tag("Tick")),
             Event::RouterChange { path } => {
                 // Router events map to the __router input with the route text as value
                 (ROUTER_INPUT.to_string(), Value::text(path))
             }
         };
+
+        zoon::println!(
+            "[DD_DEBUG] inject event path={} value={}",
+            link_path,
+            event_value.to_display_string()
+        );
 
         {
             let mut inner = self.inner.borrow_mut();
@@ -424,7 +415,10 @@ impl DdWorkerHandle {
         let effects: Vec<_> = self.side_effect_buffer.borrow_mut().drain(..).collect();
         for (kind, value) in effects {
             match kind {
-                SideEffectKind::PersistHold { ref key, ref hold_name } => {
+                SideEffectKind::PersistHold {
+                    ref key,
+                    ref hold_name,
+                } => {
                     super::persistence::save_hold_state(key, hold_name, &value);
                 }
                 SideEffectKind::RouterGoTo => {

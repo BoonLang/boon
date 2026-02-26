@@ -2310,7 +2310,8 @@ fn process_work_item(
                     let existing_sender: Option<mpsc::Sender<Value>> = match &connector_for_stream {
                         Some(conn) => conn.get_sender(pass_through_key_for_stream.clone()).await,
                         None => None,
-                    };
+                    }
+                    .and_then(|sender| if sender.is_closed() { None } else { Some(sender) });
 
                     let is_reeval = existing_sender.is_some();
                     if is_reeval {
@@ -2356,6 +2357,7 @@ fn process_work_item(
                             if let Some(ref mut sender) = existing_sender {
                                 if let Err(e) = sender.send(value.clone()).await {
                                     zoon::println!("[LINK_SETTER] Failed to forward to existing pass-through: {e}");
+                                    existing_sender = None;
                                 }
                             }
                             // Forward to our channel with backpressure (only matters on first evaluation)
@@ -2404,31 +2406,11 @@ fn process_work_item(
                     zoon::println!("[LINK_SETTER] Actor receiver dropped");
                 }
 
-                // Create relay actor that subscribes to EXISTING pass-through (if any)
-                // This ensures any new downstream code receives values from the stable pass-through
-                let connector_for_relay = new_ctx.try_pass_through_connector().map(|c| c.clone());
-                let pass_through_key_for_relay = pass_through_key.clone();
-                let relay_stream = stream::once(async move {
-                    // Try to get existing actor
-                    match &connector_for_relay {
-                        Some(conn) => conn.get(pass_through_key_for_relay).await,
-                        None => None,
-                    }
-                }).filter_map(|opt_actor| future::ready(opt_actor))
-                .flat_map(|existing_actor| {
-                    existing_actor.stream()
-                });
-
-                // Merge: on first eval, relay_stream is empty (no existing actor), so pass_through emits.
-                // On re-eval, relay_stream forwards from existing actor.
                 // Capture forwarder_actor to keep it alive — without this, the forwarder's
                 // task is cancelled when the local variable goes out of scope, and the
                 // value_tx channel closes before any values reach pass_through_actor.
                 let forwarder_keepalive = forwarder_actor;
-                let merged_stream = stream::select(
-                    pass_through_actor.clone().stream(),
-                    relay_stream,
-                ).map(move |v| {
+                let merged_stream = pass_through_actor.clone().stream().map(move |v| {
                     let _ = &forwarder_keepalive;
                     v
                 });
@@ -3751,56 +3733,79 @@ fn build_hold_actor(
     // ActorHandle doesn't keep the actor alive (the registry does), so we can
     // just clone the handle instead of using Weak references.
     //
-    // Use AtomicBool instead of Rc<RefCell<bool>> for lock-free flag.
-    let is_first_input = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    enum HoldResetInputState {
+        LoadingStored,
+        ForwardingSource {
+            source_subscription: LocalBoxStream<'static, Value>,
+        },
+    }
+
     let output_clone_for_initial = output.clone();
-    let initial_stream = initial_actor.clone().stream().then(move |value| {
-        let is_first_input = is_first_input.clone();
-        let output_clone = output_clone_for_initial.clone();
-        let mut state_sender = state_sender_for_reset.clone();
-        let storage = storage_for_initial_save.clone();
-        let construct_context = construct_context_for_initial.clone();
-        let actor_context = actor_context_for_initial.clone();
-        async move {
-            // swap() atomically reads AND sets to false in one operation
-            let is_first = is_first_input.swap(false, std::sync::atomic::Ordering::SeqCst);
-            if is_first {
-                // Check if we have stored state - if so, emit stored value instead of initial
-                // We check storage directly here to avoid race condition with state_stream
-                let stored: Option<zoon::serde_json::Value> = storage.clone().load_state(persistence_id).await;
-                if let Some(json) = stored {
-                    // Restore from storage - convert JSON to Value and emit to output
-                    let restored_value = Value::from_json(
-                        &json,
-                        ConstructId::new("HOLD restored value"),
-                        construct_context,
-                        ValueIdempotencyKey::new(),
-                        actor_context,
-                    );
-                    output_clone.store_value_directly(restored_value);
-                    // Don't save - we just loaded this value
-                    return value;
+    let initial_actor_for_initial = initial_actor.clone();
+    let initial_stream = stream::unfold(
+        HoldResetInputState::LoadingStored,
+        move |state| {
+            let output_clone = output_clone_for_initial.clone();
+            let initial_actor = initial_actor_for_initial.clone();
+            let mut state_sender = state_sender_for_reset.clone();
+            let storage = storage_for_initial_save.clone();
+            let construct_context = construct_context_for_initial.clone();
+            let actor_context = actor_context_for_initial.clone();
+            async move {
+                match state {
+                    HoldResetInputState::LoadingStored => {
+                        // Check if we have stored state - if so, emit it and subscribe
+                        // only to future reset values to avoid replay clobbering.
+                        let stored: Option<zoon::serde_json::Value> = storage.clone().load_state(persistence_id).await;
+                        if let Some(json) = stored {
+                            let restored_value = Value::from_json(
+                                &json,
+                                ConstructId::new("HOLD restored value"),
+                                construct_context,
+                                ValueIdempotencyKey::new(),
+                                actor_context,
+                            );
+                            output_clone.store_value_directly(restored_value.clone());
+                            return Some((
+                                restored_value,
+                                HoldResetInputState::ForwardingSource {
+                                    source_subscription: initial_actor.stream_from_now(),
+                                },
+                            ));
+                        }
+
+                        // No stored state: consume first source emission as initial state.
+                        let mut source_subscription = initial_actor.stream();
+                        let first_value = source_subscription.next().await?;
+                        output_clone.store_value_directly(first_value.clone());
+                        let json = first_value.to_json().await;
+                        storage.save_state(persistence_id, &json);
+                        Some((
+                            first_value,
+                            HoldResetInputState::ForwardingSource { source_subscription },
+                        ))
+                    }
+                    HoldResetInputState::ForwardingSource {
+                        mut source_subscription,
+                    } => {
+                        // Subsequent source values reset HOLD state.
+                        let value = source_subscription.next().await?;
+                        if let Err(e) = state_sender.send(value.clone()).await {
+                            zoon::println!("[HOLD] Failed to send state reset: {e}");
+                        }
+                        output_clone.store_value_directly(value.clone());
+                        let json = value.to_json().await;
+                        storage.save_state(persistence_id, &json);
+                        Some((
+                            value,
+                            HoldResetInputState::ForwardingSource { source_subscription },
+                        ))
+                    }
                 }
-                // No stored state, this is truly the first value
-                // Store to output and save
-                output_clone.store_value_directly(value.clone());
-                let json = value.to_json().await;
-                storage.save_state(persistence_id, &json);
-            } else {
-                // Subsequent values (reset): send to state_receiver with backpressure
-                if let Err(e) = state_sender.send(value.clone()).await {
-                    zoon::println!("[HOLD] Failed to send state reset: {e}");
-                }
-                // Store value directly to output
-                output_clone.store_value_directly(value.clone());
-                // Save reset state to storage
-                let json = value.to_json().await;
-                storage.save_state(persistence_id, &json);
             }
-            // Always pass through as HOLD output
-            value
-        }
-    }).boxed_local();
+        },
+    )
+    .boxed_local();
 
     // Modify state_update_stream to also store values directly to output
     // With arena-based ActorHandle, no circular reference issue - just clone the handle.
@@ -6017,5 +6022,3 @@ fn spawn_recorded_calls_storage_actor(
         if LOG_DEBUG { zoon::println!("[DEBUG] Storage actor for {} shutting down", storage_key); }
     })
 }
-
-

@@ -74,7 +74,12 @@ impl CellStore {
     }
 
     pub fn get_cell_text(&self, cell_id: u32) -> String {
-        self.inner.text_cells.borrow().get(cell_id as usize).cloned().unwrap_or_default()
+        self.inner
+            .text_cells
+            .borrow()
+            .get(cell_id as usize)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn cell_count(&self) -> usize {
@@ -144,8 +149,13 @@ impl ListStore {
         let idx = (list_id as usize).wrapping_sub(1);
         let mut lists = self.inner.lists.borrow_mut();
         if let Some(list) = lists.get_mut(idx) {
-            let is_index_based = self.inner.index_based.borrow()
-                .get(idx).copied().unwrap_or(false);
+            let is_index_based = self
+                .inner
+                .index_based
+                .borrow()
+                .get(idx)
+                .copied()
+                .unwrap_or(false);
             if is_index_based {
                 // For index-based lists, assign the next available memory index
                 // instead of using the passed value. This ensures the new item
@@ -210,8 +220,13 @@ impl ListStore {
     /// Used to keep f64 items in sync with text items for index-based lists.
     pub fn append_with_next_memory_index(&self, list_id: f64) {
         let idx = (list_id as usize).wrapping_sub(1);
-        let is_index_based = self.inner.index_based.borrow()
-            .get(idx).copied().unwrap_or(false);
+        let is_index_based = self
+            .inner
+            .index_based
+            .borrow()
+            .get(idx)
+            .copied()
+            .unwrap_or(false);
         if is_index_based {
             let mut next_mem = self.inner.next_memory_index.borrow_mut();
             let mem_idx = next_mem.get(idx).copied().unwrap_or(0);
@@ -236,19 +251,27 @@ impl ListStore {
         // This ensures new appends get fresh, never-used memory slots.
         let next_mem_idx = {
             let lists = self.inner.lists.borrow();
-            let is_dest_index_based = self.inner.index_based.borrow()
-                .get(dest_idx).copied().unwrap_or(false);
+            let is_dest_index_based = self
+                .inner
+                .index_based
+                .borrow()
+                .get(dest_idx)
+                .copied()
+                .unwrap_or(false);
             let dest_max = if is_dest_index_based {
-                lists.get(dest_idx)
+                lists
+                    .get(dest_idx)
                     .and_then(|l| l.iter().map(|v| *v as usize).max())
                     .unwrap_or(0)
             } else {
                 // Position-based: max memory index = count - 1
-                lists.get(dest_idx)
+                lists
+                    .get(dest_idx)
                     .map(|l| if l.is_empty() { 0 } else { l.len() - 1 })
                     .unwrap_or(0)
             };
-            let src_max = lists.get(src_idx)
+            let src_max = lists
+                .get(src_idx)
                 .and_then(|l| l.iter().map(|v| *v as usize).max())
                 .unwrap_or(0);
             dest_max.max(src_max) + 1
@@ -365,12 +388,22 @@ impl ListStore {
 
     pub fn is_index_based(&self, list_id: f64) -> bool {
         let idx = (list_id as usize).wrapping_sub(1);
-        self.inner.index_based.borrow().get(idx).copied().unwrap_or(false)
+        self.inner
+            .index_based
+            .borrow()
+            .get(idx)
+            .copied()
+            .unwrap_or(false)
     }
 
     pub fn next_memory_index(&self, list_id: f64) -> usize {
         let idx = (list_id as usize).wrapping_sub(1);
-        self.inner.next_memory_index.borrow().get(idx).copied().unwrap_or(0)
+        self.inner
+            .next_memory_index
+            .borrow()
+            .get(idx)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn set_next_memory_index(&self, list_id: f64, val: usize) {
@@ -404,7 +437,8 @@ impl ListStore {
         let index_based = self.inner.index_based.borrow();
         if index_based.get(idx).copied().unwrap_or(false) {
             let lists = self.inner.lists.borrow();
-            lists.get(idx)
+            lists
+                .get(idx)
                 .and_then(|l| l.get(position))
                 .map(|v| *v as usize)
                 .unwrap_or(position)
@@ -412,7 +446,6 @@ impl ListStore {
             position
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -635,21 +668,28 @@ pub struct WasmInstance {
 
 impl WasmInstance {
     /// Compile and instantiate the WASM binary with host imports.
-    pub fn new(wasm_bytes: &[u8], program: Rc<IrProgram>, text_patterns: Vec<String>) -> Result<Self, String> {
+    pub fn new(
+        wasm_bytes: &[u8],
+        program: Rc<IrProgram>,
+        text_patterns: Vec<String>,
+    ) -> Result<Self, String> {
         let cell_store = CellStore::new(program.cells.len());
         let list_store = ListStore::new();
 
         // Find ListMap template range for ItemCellStore.
         let mut template_range: Option<(u32, u32)> = None;
         for node in &program.nodes {
-            if let IrNode::ListMap { template_cell_range, .. } = node {
+            if let IrNode::ListMap {
+                template_cell_range,
+                ..
+            } = node
+            {
                 template_range = Some(*template_cell_range);
                 break;
             }
         }
-        let item_cell_store = template_range.map(|(start, end)| {
-            ItemCellStore::new(start, end - start)
-        });
+        let item_cell_store =
+            template_range.map(|(start, end)| ItemCellStore::new(start, end - start));
 
         // Create import object.
         let imports = Object::new();
@@ -670,25 +710,37 @@ impl WasmInstance {
             }
             store_clone.set_cell_f64(cid, value);
         }) as Box<dyn FnMut(i32, f64)>);
-        Reflect::set(&env, &"host_set_cell_f64".into(), set_cell_f64.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_set_cell_f64: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_set_cell_f64".into(),
+            set_cell_f64.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_set_cell_f64: {:?}", e))?;
         set_cell_f64.forget();
 
         // host_notify_init_done()
         let notify_init = Closure::wrap(Box::new(move || {
             // No-op for now; could trigger UI refresh.
         }) as Box<dyn FnMut()>);
-        Reflect::set(&env, &"host_notify_init_done".into(), notify_init.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_notify_init_done: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_notify_init_done".into(),
+            notify_init.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_notify_init_done: {:?}", e))?;
         notify_init.forget();
 
         // host_list_create() -> f64 (returns list_id)
         let ls_clone = list_store.clone();
-        let list_create = Closure::wrap(Box::new(move || -> f64 {
-            ls_clone.create()
-        }) as Box<dyn FnMut() -> f64>);
-        Reflect::set(&env, &"host_list_create".into(), list_create.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_list_create: {:?}", e))?;
+        let list_create = Closure::wrap(
+            Box::new(move || -> f64 { ls_clone.create() }) as Box<dyn FnMut() -> f64>
+        );
+        Reflect::set(
+            &env,
+            &"host_list_create".into(),
+            list_create.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_list_create: {:?}", e))?;
         list_create.forget();
 
         // host_list_append(list_cell_id: i32, item_value: f64)
@@ -698,8 +750,12 @@ impl WasmInstance {
             let list_id = cs_clone.get_cell_value(list_cell_id as u32);
             ls_clone.append(list_id, item_value);
         }) as Box<dyn FnMut(i32, f64)>);
-        Reflect::set(&env, &"host_list_append".into(), list_append.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_list_append: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_list_append".into(),
+            list_append.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_list_append: {:?}", e))?;
         list_append.forget();
 
         // host_list_clear(list_cell_id: i32)
@@ -709,8 +765,12 @@ impl WasmInstance {
             let list_id = cs_clone.get_cell_value(list_cell_id as u32);
             ls_clone.clear(list_id);
         }) as Box<dyn FnMut(i32)>);
-        Reflect::set(&env, &"host_list_clear".into(), list_clear.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_list_clear: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_list_clear".into(),
+            list_clear.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_list_clear: {:?}", e))?;
         list_clear.forget();
 
         // host_list_count(list_cell_id: i32) -> f64
@@ -720,29 +780,39 @@ impl WasmInstance {
             let list_id = cs_clone.get_cell_value(list_cell_id as u32);
             ls_clone.count(list_id)
         }) as Box<dyn FnMut(i32) -> f64>);
-        Reflect::set(&env, &"host_list_count".into(), list_count.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_list_count: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_list_count".into(),
+            list_count.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_list_count: {:?}", e))?;
         list_count.forget();
 
         // host_list_copy_item(new_list_id: f64, source_cell_id: i32, item_idx: i32)
         // Copies one item from source list to dest list, storing original index.
         let ls_clone = list_store.clone();
         let cs_clone = cell_store.clone();
-        let list_copy_item = Closure::wrap(Box::new(move |new_list_id: f64, source_cell_id: i32, item_idx: i32| {
-            let source_list_id = cs_clone.get_cell_value(source_cell_id as u32);
-            let text_items = ls_clone.items_text(source_list_id);
-            if let Some(text) = text_items.get(item_idx as usize) {
-                ls_clone.append_text(new_list_id, text.clone());
-            }
-            // Propagate the original memory index through filter chains.
-            // For index-based lists (from previous copy_item), look up the original index.
-            // For regular lists, position == original index.
-            let orig_idx = ls_clone.item_memory_index(source_list_id, item_idx as usize);
-            ls_clone.set_index_based(new_list_id);
-            ls_clone.append_with_index(new_list_id, orig_idx as f64);
-        }) as Box<dyn FnMut(f64, i32, i32)>);
-        Reflect::set(&env, &"host_list_copy_item".into(), list_copy_item.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_list_copy_item: {:?}", e))?;
+        let list_copy_item = Closure::wrap(Box::new(
+            move |new_list_id: f64, source_cell_id: i32, item_idx: i32| {
+                let source_list_id = cs_clone.get_cell_value(source_cell_id as u32);
+                let text_items = ls_clone.items_text(source_list_id);
+                if let Some(text) = text_items.get(item_idx as usize) {
+                    ls_clone.append_text(new_list_id, text.clone());
+                }
+                // Propagate the original memory index through filter chains.
+                // For index-based lists (from previous copy_item), look up the original index.
+                // For regular lists, position == original index.
+                let orig_idx = ls_clone.item_memory_index(source_list_id, item_idx as usize);
+                ls_clone.set_index_based(new_list_id);
+                ls_clone.append_with_index(new_list_id, orig_idx as f64);
+            },
+        ) as Box<dyn FnMut(f64, i32, i32)>);
+        Reflect::set(
+            &env,
+            &"host_list_copy_item".into(),
+            list_copy_item.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_list_copy_item: {:?}", e))?;
         list_copy_item.forget();
 
         // host_list_item_memory_index(list_cell_id: i32, position: i32) -> i32
@@ -751,12 +821,17 @@ impl WasmInstance {
         // For regular lists, returns the position itself.
         let ls_clone = list_store.clone();
         let cs_clone = cell_store.clone();
-        let list_item_memory_index = Closure::wrap(Box::new(move |list_cell_id: i32, position: i32| -> i32 {
-            let list_id = cs_clone.get_cell_value(list_cell_id as u32);
-            ls_clone.item_memory_index(list_id, position as usize) as i32
-        }) as Box<dyn FnMut(i32, i32) -> i32>);
-        Reflect::set(&env, &"host_list_item_memory_index".into(), list_item_memory_index.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_list_item_memory_index: {:?}", e))?;
+        let list_item_memory_index =
+            Closure::wrap(Box::new(move |list_cell_id: i32, position: i32| -> i32 {
+                let list_id = cs_clone.get_cell_value(list_cell_id as u32);
+                ls_clone.item_memory_index(list_id, position as usize) as i32
+            }) as Box<dyn FnMut(i32, i32) -> i32>);
+        Reflect::set(
+            &env,
+            &"host_list_item_memory_index".into(),
+            list_item_memory_index.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_list_item_memory_index: {:?}", e))?;
         list_item_memory_index.forget();
 
         // host_list_get_item_f64(list_cell_id: i32, position: i32) -> f64
@@ -764,17 +839,23 @@ impl WasmInstance {
         // Used in filter loops to load per-item values when items have no field cells.
         let ls_clone = list_store.clone();
         let cs_clone = cell_store.clone();
-        let list_get_item_f64 = Closure::wrap(Box::new(move |list_cell_id: i32, position: i32| -> f64 {
-            let list_id = cs_clone.get_cell_value(list_cell_id as u32);
-            let idx = (list_id as usize).wrapping_sub(1);
-            let lists = ls_clone.inner.lists.borrow();
-            lists.get(idx)
-                .and_then(|l| l.get(position as usize))
-                .copied()
-                .unwrap_or(0.0)
-        }) as Box<dyn FnMut(i32, i32) -> f64>);
-        Reflect::set(&env, &"host_list_get_item_f64".into(), list_get_item_f64.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_list_get_item_f64: {:?}", e))?;
+        let list_get_item_f64 =
+            Closure::wrap(Box::new(move |list_cell_id: i32, position: i32| -> f64 {
+                let list_id = cs_clone.get_cell_value(list_cell_id as u32);
+                let idx = (list_id as usize).wrapping_sub(1);
+                let lists = ls_clone.inner.lists.borrow();
+                lists
+                    .get(idx)
+                    .and_then(|l| l.get(position as usize))
+                    .copied()
+                    .unwrap_or(0.0)
+            }) as Box<dyn FnMut(i32, i32) -> f64>);
+        Reflect::set(
+            &env,
+            &"host_list_get_item_f64".into(),
+            list_get_item_f64.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_list_get_item_f64: {:?}", e))?;
         list_get_item_f64.forget();
 
         // host_list_replace(dest_cell: i32, source_cell: i32)
@@ -787,8 +868,12 @@ impl WasmInstance {
             let source_list_id = cs_clone.get_cell_value(source_cell as u32);
             ls_clone.replace_contents(dest_list_id, source_list_id);
         }) as Box<dyn FnMut(i32, i32)>);
-        Reflect::set(&env, &"host_list_replace".into(), list_replace.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_list_replace: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_list_replace".into(),
+            list_replace.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_list_replace: {:?}", e))?;
         list_replace.forget();
 
         // host_text_trim(dest_cell: i32, src_cell: i32)
@@ -815,8 +900,12 @@ impl WasmInstance {
             }
             cs_clone.set_cell_text(dest_cell as u32, trimmed);
         }) as Box<dyn FnMut(i32, i32)>);
-        Reflect::set(&env, &"host_text_trim".into(), text_trim.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_text_trim: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_text_trim".into(),
+            text_trim.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_text_trim: {:?}", e))?;
         text_trim.forget();
 
         // host_text_is_not_empty(cell_id: i32) -> f64
@@ -834,10 +923,18 @@ impl WasmInstance {
             } else {
                 cs_clone.get_cell_text(cell_id as u32)
             };
-            if text.is_empty() { 0.0 } else { 1.0 }
+            if text.is_empty() {
+                0.0
+            } else {
+                1.0
+            }
         }) as Box<dyn FnMut(i32) -> f64>);
-        Reflect::set(&env, &"host_text_is_not_empty".into(), text_is_not_empty.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_text_is_not_empty: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_text_is_not_empty".into(),
+            text_is_not_empty.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_text_is_not_empty: {:?}", e))?;
         text_is_not_empty.forget();
 
         // host_copy_text(dest_cell: i32, src_cell: i32)
@@ -874,8 +971,12 @@ impl WasmInstance {
             }
             cs_clone.set_cell_text(dest_cell as u32, src_text);
         }) as Box<dyn FnMut(i32, i32)>);
-        Reflect::set(&env, &"host_copy_text".into(), copy_text.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_copy_text: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_copy_text".into(),
+            copy_text.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_copy_text: {:?}", e))?;
         copy_text.forget();
 
         // host_list_append_text(list_cell_id: i32, item_cell_id: i32)
@@ -886,16 +987,21 @@ impl WasmInstance {
         // f64 items and text items in sync for correct count() results.
         let ls_clone = list_store.clone();
         let cs_clone = cell_store.clone();
-        let list_append_text = Closure::wrap(Box::new(move |list_cell_id: i32, item_cell_id: i32| {
-            let list_id = cs_clone.get_cell_value(list_cell_id as u32);
-            let text = cs_clone.get_cell_text(item_cell_id as u32);
-            ls_clone.append_text(list_id, text);
-            // For index-based lists, also add an f64 item with the next memory index
-            // to keep f64 items and text items in sync.
-            ls_clone.append_with_next_memory_index(list_id);
-        }) as Box<dyn FnMut(i32, i32)>);
-        Reflect::set(&env, &"host_list_append_text".into(), list_append_text.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_list_append_text: {:?}", e))?;
+        let list_append_text =
+            Closure::wrap(Box::new(move |list_cell_id: i32, item_cell_id: i32| {
+                let list_id = cs_clone.get_cell_value(list_cell_id as u32);
+                let text = cs_clone.get_cell_text(item_cell_id as u32);
+                ls_clone.append_text(list_id, text);
+                // For index-based lists, also add an f64 item with the next memory index
+                // to keep f64 items and text items in sync.
+                ls_clone.append_with_next_memory_index(list_id);
+            }) as Box<dyn FnMut(i32, i32)>);
+        Reflect::set(
+            &env,
+            &"host_list_append_text".into(),
+            list_append_text.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_list_append_text: {:?}", e))?;
         list_append_text.forget();
 
         // host_text_matches(cell_id: i32, pattern_idx: i32) -> i32
@@ -915,13 +1021,21 @@ impl WasmInstance {
                 cs_clone.get_cell_text(cell_id as u32)
             };
             if let Some(pattern) = patterns_clone.get(pattern_idx as usize) {
-                if cell_text == *pattern { 1 } else { 0 }
+                if cell_text == *pattern {
+                    1
+                } else {
+                    0
+                }
             } else {
                 0
             }
         }) as Box<dyn FnMut(i32, i32) -> i32>);
-        Reflect::set(&env, &"host_text_matches".into(), text_matches.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_text_matches: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_text_matches".into(),
+            text_matches.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_text_matches: {:?}", e))?;
         text_matches.forget();
 
         // host_set_cell_text_pattern(cell_id: i32, pattern_idx: i32) -> ()
@@ -941,8 +1055,12 @@ impl WasmInstance {
                 cs_clone.set_cell_text(cell_id as u32, pattern.clone());
             }
         }) as Box<dyn FnMut(i32, i32)>);
-        Reflect::set(&env, &"host_set_cell_text_pattern".into(), set_text_pattern.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_set_cell_text_pattern: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_set_cell_text_pattern".into(),
+            set_text_pattern.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_set_cell_text_pattern: {:?}", e))?;
         set_text_pattern.forget();
 
         // host_text_build_start(target_cell: i32) -> ()
@@ -962,8 +1080,12 @@ impl WasmInstance {
             }
             cs_clone.set_cell_text(target_cell as u32, String::new());
         }) as Box<dyn FnMut(i32)>);
-        Reflect::set(&env, &"host_text_build_start".into(), build_start.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_text_build_start: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_text_build_start".into(),
+            build_start.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_text_build_start: {:?}", e))?;
         build_start.forget();
 
         // host_text_build_literal(pattern_idx: i32) -> ()
@@ -989,8 +1111,12 @@ impl WasmInstance {
                 cs_clone.set_cell_text(target_cell, current);
             }
         }) as Box<dyn FnMut(i32)>);
-        Reflect::set(&env, &"host_text_build_literal".into(), build_literal.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_text_build_literal: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_text_build_literal".into(),
+            build_literal.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_text_build_literal: {:?}", e))?;
         build_literal.forget();
 
         // host_text_build_cell(cell_id: i32) -> ()
@@ -1041,8 +1167,12 @@ impl WasmInstance {
             current.push_str(&formatted);
             cs_clone.set_cell_text(target_cell, current);
         }) as Box<dyn FnMut(i32)>);
-        Reflect::set(&env, &"host_text_build_cell".into(), build_cell.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_text_build_cell: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_text_build_cell".into(),
+            build_cell.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_text_build_cell: {:?}", e))?;
         build_cell.forget();
 
         // host_set_item_context(item_idx: i32)
@@ -1054,16 +1184,24 @@ impl WasmInstance {
                 store.ensure_item(idx);
             }
         }) as Box<dyn FnMut(i32)>);
-        Reflect::set(&env, &"host_set_item_context".into(), set_item_ctx.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_set_item_context: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_set_item_context".into(),
+            set_item_ctx.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_set_item_context: {:?}", e))?;
         set_item_ctx.forget();
 
         // host_clear_item_context()
         let clear_item_ctx = Closure::wrap(Box::new(move || {
             CURRENT_ITEM_CTX.with(|c| c.set(None));
         }) as Box<dyn FnMut()>);
-        Reflect::set(&env, &"host_clear_item_context".into(), clear_item_ctx.as_ref().unchecked_ref())
-            .map_err(|e| format!("Failed to set host_clear_item_context: {:?}", e))?;
+        Reflect::set(
+            &env,
+            &"host_clear_item_context".into(),
+            clear_item_ctx.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_clear_item_context: {:?}", e))?;
         clear_item_ctx.forget();
 
         Reflect::set(&imports, &"env".into(), &env)
@@ -1100,10 +1238,11 @@ impl WasmInstance {
             .map_err(|e| format!("No get_item_cell export: {:?}", e))?
             .dyn_into()
             .map_err(|_| "get_item_cell is not a function".to_string())?;
-        let rerun_retain_filters_fn: js_sys::Function = Reflect::get(&exports, &"rerun_retain_filters".into())
-            .map_err(|e| format!("No rerun_retain_filters export: {:?}", e))?
-            .dyn_into()
-            .map_err(|_| "rerun_retain_filters is not a function".to_string())?;
+        let rerun_retain_filters_fn: js_sys::Function =
+            Reflect::get(&exports, &"rerun_retain_filters".into())
+                .map_err(|e| format!("No rerun_retain_filters export: {:?}", e))?
+                .dyn_into()
+                .map_err(|_| "rerun_retain_filters is not a function".to_string())?;
 
         let program_tag_table = program.tag_table.clone();
         let has_per_item_cells = item_cell_store.is_some();
@@ -1135,11 +1274,8 @@ impl WasmInstance {
         if let Ok(mem_val) = Reflect::get(&exports, &"memory".into()) {
             let mem: WebAssembly::Memory = mem_val.unchecked_into();
             let buffer = mem.buffer();
-            let view = Uint8Array::new_with_byte_offset_and_length(
-                &buffer,
-                offset as u32,
-                len as u32,
-            );
+            let view =
+                Uint8Array::new_with_byte_offset_and_length(&buffer, offset as u32, len as u32);
             view.to_vec()
         } else {
             Vec::new()
@@ -1233,11 +1369,7 @@ impl WasmInstance {
             if let Ok(mem_val) = Reflect::get(&exports, &"memory".into()) {
                 let mem: WebAssembly::Memory = mem_val.unchecked_into();
                 let buffer = mem.buffer();
-                let view = js_sys::Float64Array::new_with_byte_offset_and_length(
-                    &buffer,
-                    addr,
-                    1,
-                );
+                let view = js_sys::Float64Array::new_with_byte_offset_and_length(&buffer, addr, 1);
                 view.set_index(0, value);
             }
         }
@@ -1292,6 +1424,10 @@ impl WasmInstance {
     /// Store a snapshot for deferred restore during init_item calls.
     pub(super) fn set_pending_snapshot(&self, snapshot: Box<persistence::WasmSnapshot>) {
         *self.pending_snapshot.borrow_mut() = Some(snapshot);
+    }
+
+    pub fn has_pending_snapshot(&self) -> bool {
+        self.pending_snapshot.borrow().is_some()
     }
 
     /// Call `init_item(item_idx)` to initialize per-item template cells.
@@ -1368,8 +1504,6 @@ impl WasmInstance {
         Ok(())
     }
 }
-
-
 
 /// Format an f64 value as text for display (integers without decimals).
 fn format_f64_for_text(val: f64) -> String {
