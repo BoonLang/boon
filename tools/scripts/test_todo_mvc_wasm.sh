@@ -510,18 +510,117 @@ PREVIEW=$(bt preview)
 if echo "$PREVIEW" | grep -qF "×"; then
     ok "Hover reveals × button"
 else
-    fail "Hover reveals × button (× not found in preview)" "M8"
+    fail "Hover reveals × button (× not found in preview)"
 fi
 
 echo ""
-echo "[8.2] Click × removes item"
+echo "[8.2] Slide cursor from todo text to × keeps button visible"
+COORDS=$(bt eval-js '(() => {
+    const preview = document.querySelector("[data-boon-panel=\"preview\"]");
+    if (!preview) return { error: "preview_not_found" };
+
+    let label = null;
+    let bestSize = Infinity;
+    preview.querySelectorAll("*").forEach((el) => {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") return;
+
+        let directText = "";
+        for (const node of el.childNodes) {
+            if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
+        }
+        if (directText.trim() !== "Buy groceries") return;
+
+        const size = rect.width * rect.height;
+        if (size < bestSize) {
+            bestSize = size;
+            label = el;
+        }
+    });
+
+    if (!label) return { error: "label_not_found" };
+
+    let row = label.parentElement;
+    while (row && row !== preview && window.getComputedStyle(row).display !== "flex") {
+        row = row.parentElement;
+    }
+    if (!row) return { error: "row_not_found" };
+
+    const button = Array.from(row.querySelectorAll("[role=\"button\"],button"))
+        .find((b) => (b.textContent || "").trim() === "×");
+    if (!button) return { error: "button_not_found" };
+
+    const labelRect = label.getBoundingClientRect();
+    const buttonRect = button.getBoundingClientRect();
+
+    return {
+        startX: Math.round(labelRect.right - 6),
+        endX: Math.round(buttonRect.left + buttonRect.width / 2),
+        y: Math.round(labelRect.top + labelRect.height / 2)
+    };
+})()')
+
+START_X=$(echo "$COORDS" | grep -o '"startX":[0-9]\+' | cut -d: -f2)
+END_X=$(echo "$COORDS" | grep -o '"endX":[0-9]\+' | cut -d: -f2)
+CURSOR_Y=$(echo "$COORDS" | grep -o '"y":[0-9]\+' | cut -d: -f2)
+
+if [ -z "$START_X" ] || [ -z "$END_X" ] || [ -z "$CURSOR_Y" ]; then
+    fail "Hover slide keeps × visible (could not resolve coordinates: $COORDS)"
+else
+    if [ "$START_X" -gt "$END_X" ]; then
+        TMP_X="$START_X"
+        START_X="$END_X"
+        END_X="$TMP_X"
+    fi
+
+    SLIDE_OK=true
+    X="$START_X"
+    while [ "$X" -le "$END_X" ]; do
+        bt hover-at "$X" "$CURSOR_Y" >/dev/null 2>&1 || true
+        VISIBILITY=$(bt eval-js '(() => {
+            const preview = document.querySelector("[data-boon-panel=\"preview\"]");
+            if (!preview) return "missing_preview";
+
+            const row = Array.from(preview.querySelectorAll("div")).find((el) => {
+                const text = (el.textContent || "");
+                return text.includes("Buy groceries")
+                    && text.includes("×")
+                    && window.getComputedStyle(el).display === "flex";
+            });
+            if (!row) return "missing_row";
+
+            const button = Array.from(row.querySelectorAll("[role=\"button\"],button"))
+                .find((b) => (b.textContent || "").trim() === "×");
+            if (!button) return "missing_button";
+
+            return window.getComputedStyle(button).visibility;
+        })()')
+
+        if ! echo "$VISIBILITY" | grep -qF "visible"; then
+            SLIDE_OK=false
+            fail "Hover slide keeps × visible (became '$VISIBILITY' at x=$X, y=$CURSOR_Y)"
+            break
+        fi
+
+        X=$((X + 8))
+    done
+
+    if [ "$SLIDE_OK" = true ]; then
+        ok "Hover slide keeps × visible"
+    fi
+fi
+
+echo ""
+echo "[8.3] Click × removes item"
 bt click-text "×" >/dev/null 2>&1 || true
 sleep 1
 PREVIEW=$(bt preview)
 if echo "$PREVIEW" | grep -qF "1 item"; then
-    check_not_contains "$PREVIEW" "Buy groceries" "Item removed after clicking ×" "M8"
+    check_not_contains "$PREVIEW" "Buy groceries" "Item removed after clicking ×"
 else
-    fail "Click × removes item ('1 item' not found)" "M8"
+    fail "Click × removes item ('1 item' not found)"
 fi
 
 # ══════════════════════════════════════════════
@@ -728,11 +827,8 @@ echo "[14.2] Click × removes 'Buy milk' → empty list"
 bt click-text "×" >/dev/null 2>&1 || true
 sleep 1
 PREVIEW=$(bt preview)
-if echo "$PREVIEW" | grep -qF "0 items left"; then
-    check_not_contains "$PREVIEW" "Buy milk" "'Buy milk' removed after ×" "M8"
-else
-    fail "Click × removes item (counter not '0 items left')" "M8"
-fi
+check_not_visible "Buy milk" "'Buy milk' removed after ×"
+check_not_contains "$PREVIEW" "0 items left" "Footer hidden when list becomes empty"
 
 # ══════════════════════════════════════════════
 # SECTION 15: COMPLEX CLEAR COMPLETED

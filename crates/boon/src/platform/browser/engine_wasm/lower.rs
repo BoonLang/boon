@@ -19,7 +19,6 @@ struct FuncDef {
     body: Spanned<Expression>,
 }
 
-
 use super::ir::*;
 
 // ---------------------------------------------------------------------------
@@ -203,7 +202,10 @@ impl Lowerer {
         }
         // Also propagate pending per-item removes along the list chain.
         if let Some(removes) = self.pending_per_item_removes.get(&source).cloned() {
-            self.pending_per_item_removes.entry(target).or_default().extend(removes);
+            self.pending_per_item_removes
+                .entry(target)
+                .or_default()
+                .extend(removes);
         }
     }
 
@@ -260,7 +262,8 @@ impl Lowerer {
         if let IrExpr::CellRead(result_cell) = &result {
             // Bind item name to the constructor's result cell so template
             // can resolve field accesses (e.g., todo.editing) through it.
-            self.name_to_cell.insert(item_name.to_string(), *result_cell);
+            self.name_to_cell
+                .insert(item_name.to_string(), *result_cell);
 
             // Also propagate cell_field_cells to item_cell for bridge use.
             if let Some(fields) = self.cell_field_cells.get(result_cell).cloned() {
@@ -325,10 +328,16 @@ pub fn lower(ast: &[Spanned<Expression>]) -> Result<IrProgram, Vec<CompileError>
                     let fn_name_str = fn_name.as_str().to_string();
                     ctx.name_to_func.insert(fn_name_str.clone(), func_id);
                     // Store AST for inlining at call sites.
-                    ctx.func_defs.insert(fn_name_str, FuncDef {
-                        params: parameters.iter().map(|p| p.node.as_str().to_string()).collect(),
-                        body: (**body).clone(),
-                    });
+                    ctx.func_defs.insert(
+                        fn_name_str,
+                        FuncDef {
+                            params: parameters
+                                .iter()
+                                .map(|p| p.node.as_str().to_string())
+                                .collect(),
+                            body: (**body).clone(),
+                        },
+                    );
                 }
 
                 let cell = ctx.alloc_cell(name, item.span);
@@ -345,14 +354,23 @@ pub fn lower(ast: &[Spanned<Expression>]) -> Result<IrProgram, Vec<CompileError>
                 let fn_name_str = fn_name.as_str().to_string();
                 ctx.name_to_func.insert(fn_name_str.clone(), func_id);
                 // Store AST for inlining at call sites.
-                ctx.func_defs.insert(fn_name_str, FuncDef {
-                    params: parameters.iter().map(|p| p.node.as_str().to_string()).collect(),
-                    body: (**body).clone(),
-                });
+                ctx.func_defs.insert(
+                    fn_name_str,
+                    FuncDef {
+                        params: parameters
+                            .iter()
+                            .map(|p| p.node.as_str().to_string())
+                            .collect(),
+                        body: (**body).clone(),
+                    },
+                );
                 top_level_functions.push((item, item.span));
             }
             _ => {
-                ctx.error(item.span, "Top-level expression must be a variable or function definition");
+                ctx.error(
+                    item.span,
+                    "Top-level expression must be a variable or function definition",
+                );
             }
         }
     }
@@ -499,7 +517,12 @@ impl Lowerer {
                     });
                 self.nodes.push(IrNode::Element {
                     cell,
-                    kind: ElementKind::TextInput { placeholder, style, focus, text_cell },
+                    kind: ElementKind::TextInput {
+                        placeholder,
+                        style,
+                        focus,
+                        text_cell,
+                    },
                     links,
                     hovered_cell,
                 });
@@ -517,7 +540,10 @@ impl Lowerer {
                             IrExpr::CellRead(c) => c,
                             other => {
                                 let c = self.alloc_cell("checkbox_checked", span);
-                                self.nodes.push(IrNode::Derived { cell: c, expr: other });
+                                self.nodes.push(IrNode::Derived {
+                                    cell: c,
+                                    expr: other,
+                                });
                                 c
                             }
                         }
@@ -533,21 +559,29 @@ impl Lowerer {
                             IrExpr::CellRead(c) => c,
                             other => {
                                 let c = self.alloc_cell("checkbox_icon", span);
-                                self.nodes.push(IrNode::Derived { cell: c, expr: other });
+                                self.nodes.push(IrNode::Derived {
+                                    cell: c,
+                                    expr: other,
+                                });
                                 c
                             }
                         }
                     });
                 self.nodes.push(IrNode::Element {
                     cell,
-                    kind: ElementKind::Checkbox { checked, style, icon },
+                    kind: ElementKind::Checkbox {
+                        checked,
+                        style,
+                        icon,
+                    },
                     links,
                     hovered_cell,
                 });
             }
             ["Element", "stripe"] => {
                 let direction = self.find_arg_expr_or_default(arguments, "direction");
-                let gap = self.find_arg_expr_or(arguments, "gap", IrExpr::Constant(IrValue::Number(0.0)));
+                let gap =
+                    self.find_arg_expr_or(arguments, "gap", IrExpr::Constant(IrValue::Number(0.0)));
                 let style = self.find_arg_expr_or_default(arguments, "style");
                 let element_arg = self.find_arg_expr_or_default(arguments, "element");
 
@@ -639,7 +673,10 @@ impl Lowerer {
                     .and_then(|a| a.node.value.as_ref())
                     .map(|v| self.lower_expr(&v.node, v.span))
                     .unwrap_or_else(|| {
-                        self.error(span, "Element/paragraph requires a 'content' or 'contents' argument");
+                        self.error(
+                            span,
+                            "Element/paragraph requires a 'content' or 'contents' argument",
+                        );
                         IrExpr::Constant(IrValue::Void)
                     });
                 let style = self.find_arg_expr_or_default(arguments, "style");
@@ -747,7 +784,15 @@ impl Lowerer {
         let cell_name = self.cells[cell.0 as usize].name.clone();
 
         // Pre-allocate common event types.
-        let common_events = ["press", "click", "key_down", "change", "blur", "focus", "double_click"];
+        let common_events = [
+            "press",
+            "click",
+            "key_down",
+            "change",
+            "blur",
+            "focus",
+            "double_click",
+        ];
         let mut events = HashMap::new();
         for event_name in &common_events {
             let event_id = self.alloc_event(
@@ -772,12 +817,16 @@ impl Lowerer {
             expr: IrExpr::Constant(IrValue::Void),
         });
         // Register event for the key cell so WHEN can trigger on key changes.
-        if let Some(&event_id) = self.element_events.get(&cell_name)
+        if let Some(&event_id) = self
+            .element_events
+            .get(&cell_name)
             .and_then(|evts| evts.get("key_down"))
         {
             self.cell_events.insert(key_cell, event_id);
             // Add key_cell as payload for the key_down event.
-            self.events[event_id.0 as usize].payload_cells.push(key_cell);
+            self.events[event_id.0 as usize]
+                .payload_cells
+                .push(key_cell);
         }
 
         // change.text → CellId (stores the changed text)
@@ -789,11 +838,15 @@ impl Lowerer {
             expr: IrExpr::Constant(IrValue::Void),
         });
         // Add change_text_cell as payload for the change event.
-        if let Some(&event_id) = self.element_events.get(&cell_name)
+        if let Some(&event_id) = self
+            .element_events
+            .get(&cell_name)
             .and_then(|evts| evts.get("change"))
         {
             self.cell_events.insert(change_text_cell, event_id);
-            self.events[event_id.0 as usize].payload_cells.push(change_text_cell);
+            self.events[event_id.0 as usize]
+                .payload_cells
+                .push(change_text_cell);
         }
 
         // .text → CellId (current text value of the input)
@@ -825,7 +878,9 @@ impl Lowerer {
         // restore_element_self_ref can properly restore them even if
         // this Element call has no `element:` argument.
         let mut saved_bindings = Vec::new();
-        let keys: Vec<String> = self.name_to_cell.keys()
+        let keys: Vec<String> = self
+            .name_to_cell
+            .keys()
             .filter(|k| *k == "element" || k.starts_with("element."))
             .cloned()
             .collect();
@@ -833,7 +888,20 @@ impl Lowerer {
             saved_bindings.push((k.clone(), self.name_to_cell.get(k).copied()));
         }
         let saved_events = self.element_events.get("element").cloned();
-        let saved = SavedElementBindings { bindings: saved_bindings, events: saved_events };
+        let saved = SavedElementBindings {
+            bindings: saved_bindings,
+            events: saved_events,
+        };
+
+        // Isolate this Element call from any outer `element.*` bindings.
+        // Without this, nested elements that don't declare `hovered: LINK`
+        // can accidentally inherit the parent `element.hovered` cell,
+        // wiring hover handlers to the wrong element (e.g. Todo row label
+        // toggling the row's hover state and hiding the delete button).
+        for k in keys {
+            self.name_to_cell.remove(&k);
+        }
+        self.element_events.remove("element");
 
         let elem_arg = arguments.iter().find(|a| a.node.name.as_str() == "element");
         let elem_obj = match elem_arg {
@@ -853,7 +921,8 @@ impl Lowerer {
 
         // Allocate a namespace cell for "element".
         let element_cell = self.alloc_cell("element", span);
-        self.name_to_cell.insert("element".to_string(), element_cell);
+        self.name_to_cell
+            .insert("element".to_string(), element_cell);
         self.nodes.push(IrNode::Derived {
             cell: element_cell,
             expr: IrExpr::Constant(IrValue::Void),
@@ -871,7 +940,9 @@ impl Lowerer {
                         // When current_var_name is set (LINK connection), reuse
                         // pre-allocated EventIds so the bridge and event consumers
                         // (HOLD body, THEN, etc.) use the same EventId.
-                        let prealloc_events = self.current_var_name.as_ref()
+                        let prealloc_events = self
+                            .current_var_name
+                            .as_ref()
                             .and_then(|name| self.element_events.get(name))
                             .cloned();
                         let mut events = HashMap::new();
@@ -879,16 +950,19 @@ impl Lowerer {
                             if matches!(event_field.node.value.node, Expression::Link) {
                                 let event_name = event_field.node.name.as_str().to_string();
                                 // Reuse pre-allocated EventId if available.
-                                let event_id = prealloc_events.as_ref()
+                                let event_id = prealloc_events
+                                    .as_ref()
                                     .and_then(|pe| pe.get(&event_name).copied())
-                                    .unwrap_or_else(|| self.alloc_event(
-                                        &format!("element.{}", event_name),
-                                        EventSource::Link {
-                                            element: element_cell,
-                                            event_name: event_name.clone(),
-                                        },
-                                        span,
-                                    ));
+                                    .unwrap_or_else(|| {
+                                        self.alloc_event(
+                                            &format!("element.{}", event_name),
+                                            EventSource::Link {
+                                                element: element_cell,
+                                                event_name: event_name.clone(),
+                                            },
+                                            span,
+                                        )
+                                    });
                                 events.insert(event_name.clone(), event_id);
 
                                 // Pre-allocate payload cells for known event types.
@@ -901,7 +975,9 @@ impl Lowerer {
                                         expr: IrExpr::Constant(IrValue::Void),
                                     });
                                     self.cell_events.insert(key_cell, event_id);
-                                    self.events[event_id.0 as usize].payload_cells.push(key_cell);
+                                    self.events[event_id.0 as usize]
+                                        .payload_cells
+                                        .push(key_cell);
                                 }
                                 if event_name == "change" {
                                     let text_name = format!("element.event.change.text");
@@ -912,10 +988,14 @@ impl Lowerer {
                                         expr: IrExpr::Constant(IrValue::Void),
                                     });
                                     self.cell_events.insert(text_cell, event_id);
-                                    self.events[event_id.0 as usize].payload_cells.push(text_cell);
+                                    self.events[event_id.0 as usize]
+                                        .payload_cells
+                                        .push(text_cell);
                                 }
-                                if event_name == "blur" || event_name == "focus"
-                                    || event_name == "click" || event_name == "double_click"
+                                if event_name == "blur"
+                                    || event_name == "focus"
+                                    || event_name == "click"
+                                    || event_name == "double_click"
                                 {
                                     // Simple events — no payload cells needed,
                                     // but register a cell for the event source.
@@ -930,7 +1010,8 @@ impl Lowerer {
                                 }
                             }
                         }
-                        self.element_events.insert(element_name.clone(), events.clone());
+                        self.element_events
+                            .insert(element_name.clone(), events.clone());
                         // Also store events under current_var_name (LINK target)
                         // so they survive restore_element_self_ref cleanup.
                         // Without this, the LINK processing in lower_pipe can't find
@@ -987,7 +1068,9 @@ impl Lowerer {
     /// Restore element bindings after processing an Element call.
     fn restore_element_self_ref(&mut self, saved: SavedElementBindings) {
         // Remove ALL current element.* names (created by this Element call).
-        let to_remove: Vec<String> = self.name_to_cell.keys()
+        let to_remove: Vec<String> = self
+            .name_to_cell
+            .keys()
             .filter(|k| *k == "element" || k.starts_with("element."))
             .cloned()
             .collect();
@@ -1012,7 +1095,10 @@ impl Lowerer {
     fn has_top_level_bool_arg(&self, arguments: &[Spanned<Argument>], arg_name: &str) -> bool {
         arguments.iter().any(|a| {
             a.node.name.as_str() == arg_name
-                && a.node.value.as_ref().map_or(false, |v| Self::is_true_expr(&v.node))
+                && a.node
+                    .value
+                    .as_ref()
+                    .map_or(false, |v| Self::is_true_expr(&v.node))
         })
     }
 
@@ -1065,7 +1151,12 @@ impl Lowerer {
 
             // Try to lower as HoldLoop (object HOLD with Stream/pulses).
             if let Some(hold_loop) = self.try_lower_hold_loop(
-                &state_name, target, &init_expr, &body.node, body.span, from.span,
+                &state_name,
+                target,
+                &init_expr,
+                &body.node,
+                body.span,
+                from.span,
             ) {
                 self.nodes.push(hold_loop);
                 return;
@@ -1132,7 +1223,11 @@ impl Lowerer {
 
         // Special case: nested pipe `from |> mid |> final` where final is LinkSetter.
         // We need to detect `from |> LINK { target }` anywhere in the chain.
-        if let Expression::Pipe { from: mid, to: final_to } = &to.node {
+        if let Expression::Pipe {
+            from: mid,
+            to: final_to,
+        } = &to.node
+        {
             if let Expression::LinkSetter { alias } = &final_to.node {
                 let target_name = self.resolve_link_target_name(&alias.node, alias.span);
                 if let Some(ref name) = target_name {
@@ -1232,12 +1327,17 @@ impl Lowerer {
                             .or_else(|| self.resolve_event_from_cell(item_cell))
                             .or_else(|| self.resolve_event_from_expr(&val.node))
                             .unwrap_or_else(|| {
-                                self.alloc_event("list_append_trigger", EventSource::Synthetic, call_span)
+                                self.alloc_event(
+                                    "list_append_trigger",
+                                    EventSource::Synthetic,
+                                    call_span,
+                                )
                             });
                         // If trigger is Synthetic and we found a reactive dependency,
                         // use it as watch_cell so downstream updates trigger the append.
                         let watch_cell = if matches!(
-                            self.events[trigger.0 as usize].source, EventSource::Synthetic
+                            self.events[trigger.0 as usize].source,
+                            EventSource::Synthetic
                         ) {
                             reactive_dep
                         } else {
@@ -1255,7 +1355,10 @@ impl Lowerer {
                     }
                 }
                 // Fallback: pass-through.
-                self.nodes.push(IrNode::PipeThrough { cell: target, source: source_cell });
+                self.nodes.push(IrNode::PipeThrough {
+                    cell: target,
+                    source: source_cell,
+                });
                 self.propagate_list_constructor(source_cell, target);
             }
 
@@ -1265,13 +1368,18 @@ impl Lowerer {
                 let on_arg = arguments.iter().find(|a| a.node.name.as_str() == "on");
                 if let Some(arg) = on_arg {
                     if let Some(ref val) = arg.node.value {
-                        let trigger = self.resolve_event_from_expr(&val.node)
+                        let trigger = self
+                            .resolve_event_from_expr(&val.node)
                             .or_else(|| {
                                 let trigger_cell = self.lower_expr_to_cell(val, "clear_trigger");
                                 self.resolve_event_from_cell(trigger_cell)
                             })
                             .unwrap_or_else(|| {
-                                self.alloc_event("list_clear_trigger", EventSource::Synthetic, call_span)
+                                self.alloc_event(
+                                    "list_clear_trigger",
+                                    EventSource::Synthetic,
+                                    call_span,
+                                )
                             });
                         self.nodes.push(IrNode::ListClear {
                             cell: target,
@@ -1282,7 +1390,10 @@ impl Lowerer {
                         return;
                     }
                 }
-                self.nodes.push(IrNode::PipeThrough { cell: target, source: source_cell });
+                self.nodes.push(IrNode::PipeThrough {
+                    cell: target,
+                    source: source_cell,
+                });
                 self.propagate_list_constructor(source_cell, target);
             }
 
@@ -1299,11 +1410,13 @@ impl Lowerer {
             ["List", "map"] => {
                 let source_cell = self.lower_expr_to_cell(source, "list_source");
                 // Find the item parameter name (first positional arg or "item").
-                let item_name = arguments.first()
+                let item_name = arguments
+                    .first()
                     .map(|a| a.node.name.as_str().to_string())
                     .unwrap_or_else(|| "item".to_string());
                 // Find the template (the "to" or "new" argument).
-                let template_arg = arguments.iter()
+                let template_arg = arguments
+                    .iter()
                     .find(|a| matches!(a.node.name.as_str(), "to" | "new"));
                 if let Some(arg) = template_arg {
                     if let Some(ref val) = arg.node.value {
@@ -1318,13 +1431,19 @@ impl Lowerer {
                         // field access like `item.editing` to resolve to actual
                         // reactive cells instead of void placeholders.
                         self.inline_list_constructor_for_template(
-                            source_cell, item_cell, &item_name, call_span,
+                            source_cell,
+                            item_cell,
+                            &item_name,
+                            call_span,
                         );
                         // Lower the template expression.
                         let template_expr = self.lower_expr(&val.node, val.span);
                         // Wrap in a Derived node for the template.
                         let template_cell = self.alloc_cell("list_map_template", call_span);
-                        let template_node = IrNode::Derived { cell: template_cell, expr: template_expr };
+                        let template_node = IrNode::Derived {
+                            cell: template_cell,
+                            expr: template_expr,
+                        };
                         // Resolve any deferred per-item removes for this list.
                         // Template-scoped events from LINK propagation are now available.
                         if let Some(removes) = self.pending_per_item_removes.remove(&source_cell) {
@@ -1332,14 +1451,20 @@ impl Lowerer {
                                 // Temporarily bind the remove's item_name to the map's item cell
                                 // so resolve_event_from_expr can follow through field cells.
                                 let saved = self.name_to_cell.get(&remove.item_name).copied();
-                                let bind_cell = self.name_to_cell.get(&item_name).copied().unwrap_or(item_cell);
-                                self.name_to_cell.insert(
-                                    remove.item_name.clone(),
-                                    bind_cell,
-                                );
-                                if let Some(event_id) = self.resolve_event_from_expr(&remove.on_expr.node) {
+                                let bind_cell = self
+                                    .name_to_cell
+                                    .get(&item_name)
+                                    .copied()
+                                    .unwrap_or(item_cell);
+                                self.name_to_cell
+                                    .insert(remove.item_name.clone(), bind_cell);
+                                if let Some(event_id) =
+                                    self.resolve_event_from_expr(&remove.on_expr.node)
+                                {
                                     // Patch the placeholder trigger in the existing ListRemove node.
-                                    if let IrNode::ListRemove { trigger, .. } = &mut self.nodes[remove.node_index] {
+                                    if let IrNode::ListRemove { trigger, .. } =
+                                        &mut self.nodes[remove.node_index]
+                                    {
                                         *trigger = event_id;
                                     }
                                 }
@@ -1365,7 +1490,10 @@ impl Lowerer {
                         return;
                     }
                 }
-                self.nodes.push(IrNode::PipeThrough { cell: target, source: source_cell });
+                self.nodes.push(IrNode::PipeThrough {
+                    cell: target,
+                    source: source_cell,
+                });
             }
 
             // --- `source |> Stream/pulses()` ---
@@ -1428,7 +1556,8 @@ impl Lowerer {
                 let source_cell = self.lower_expr_to_cell(source, "list_source");
                 // Bind the item parameter (first positional arg) so the `on:` expression
                 // can reference item fields (e.g., item.todo_elements.remove_button.event.press).
-                let item_name = arguments.first()
+                let item_name = arguments
+                    .first()
                     .filter(|a| a.node.name.as_str() != "on" && a.node.name.as_str() != "if")
                     .map(|a| a.node.name.as_str().to_string())
                     .unwrap_or_else(|| "item".to_string());
@@ -1447,8 +1576,8 @@ impl Lowerer {
                         // Detect: on: global_event |> THEN { item.field |> WHEN { ... } }
                         if let Expression::Pipe { from, to } = &val.node {
                             if let Expression::Then { body } = &to.node {
-                                if let Some(event_id) = self.resolve_event_from_expr(&from.node)
-                                    .or_else(|| {
+                                if let Some(event_id) =
+                                    self.resolve_event_from_expr(&from.node).or_else(|| {
                                         let c = self.lower_expr_to_cell(from, "remove_event");
                                         self.resolve_event_from_cell(c)
                                     })
@@ -1460,14 +1589,16 @@ impl Lowerer {
                                         let mut field_map = HashMap::new();
                                         for field in &field_names {
                                             let sub_cell = self.alloc_cell(
-                                                &format!("{}.{}", item_name, field), call_span,
+                                                &format!("{}.{}", item_name, field),
+                                                call_span,
                                             );
                                             self.nodes.push(IrNode::Derived {
                                                 cell: sub_cell,
                                                 expr: IrExpr::Constant(IrValue::Void),
                                             });
                                             self.name_to_cell.insert(
-                                                format!("{}.{}", item_name, field), sub_cell,
+                                                format!("{}.{}", item_name, field),
+                                                sub_cell,
                                             );
                                             field_map.insert(field.clone(), sub_cell);
                                             item_field_cells.push((field.clone(), sub_cell));
@@ -1490,14 +1621,19 @@ impl Lowerer {
                                     }
                                     // Clean up sub-cell name_to_cell entries.
                                     for (field, _) in &item_field_cells {
-                                        self.name_to_cell.remove(&format!("{}.{}", item_name, field));
+                                        self.name_to_cell
+                                            .remove(&format!("{}.{}", item_name, field));
                                     }
                                     self.nodes.push(IrNode::ListRemove {
                                         cell: target,
                                         source: source_cell,
                                         trigger: event_id,
                                         predicate: predicate_cell,
-                                        item_cell: if item_field_cells.is_empty() { None } else { Some(item_cell) },
+                                        item_cell: if item_field_cells.is_empty() {
+                                            None
+                                        } else {
+                                            Some(item_cell)
+                                        },
                                         item_field_cells,
                                     });
                                     self.propagate_list_constructor(source_cell, target);
@@ -1565,8 +1701,13 @@ impl Lowerer {
                         let trigger = {
                             let trigger_cell = self.lower_expr_to_cell(val, "remove_trigger");
                             self.resolve_event_from_cell(trigger_cell)
-                        }.unwrap_or_else(|| {
-                            self.alloc_event("list_remove_trigger", EventSource::Synthetic, call_span)
+                        }
+                        .unwrap_or_else(|| {
+                            self.alloc_event(
+                                "list_remove_trigger",
+                                EventSource::Synthetic,
+                                call_span,
+                            )
                         });
                         // Restore item binding.
                         if let Some(prev) = saved_item {
@@ -1592,7 +1733,10 @@ impl Lowerer {
                 } else {
                     self.name_to_cell.remove(&item_name);
                 }
-                self.nodes.push(IrNode::PipeThrough { cell: target, source: source_cell });
+                self.nodes.push(IrNode::PipeThrough {
+                    cell: target,
+                    source: source_cell,
+                });
                 self.propagate_list_constructor(source_cell, target);
             }
 
@@ -1600,7 +1744,8 @@ impl Lowerer {
             ["List", "retain"] => {
                 let source_cell = self.lower_expr_to_cell(source, "list_source");
                 // Bind the item parameter so the `if:` expression can reference item fields.
-                let item_name = arguments.first()
+                let item_name = arguments
+                    .first()
                     .filter(|a| a.node.name.as_str() != "on" && a.node.name.as_str() != "if")
                     .map(|a| a.node.name.as_str().to_string())
                     .unwrap_or_else(|| "item".to_string());
@@ -1614,7 +1759,8 @@ impl Lowerer {
                 // Pre-scan the `if:` expression for field accesses on the item variable.
                 // Create sub-cells so `item.completed` resolves to CellRead(sub_cell)
                 // instead of dead FieldAccess.
-                let if_expr = arguments.iter()
+                let if_expr = arguments
+                    .iter()
                     .find(|a| a.node.name.as_str() == "if")
                     .and_then(|a| a.node.value.as_ref());
                 let mut item_field_cells = Vec::new();
@@ -1622,16 +1768,14 @@ impl Lowerer {
                     let field_names = collect_item_field_names(val, &item_name);
                     let mut field_map = HashMap::new();
                     for field in &field_names {
-                        let sub_cell = self.alloc_cell(
-                            &format!("{}.{}", item_name, field), call_span,
-                        );
+                        let sub_cell =
+                            self.alloc_cell(&format!("{}.{}", item_name, field), call_span);
                         self.nodes.push(IrNode::Derived {
                             cell: sub_cell,
                             expr: IrExpr::Constant(IrValue::Void),
                         });
-                        self.name_to_cell.insert(
-                            format!("{}.{}", item_name, field), sub_cell,
-                        );
+                        self.name_to_cell
+                            .insert(format!("{}.{}", item_name, field), sub_cell);
                         field_map.insert(field.clone(), sub_cell);
                         item_field_cells.push((field.clone(), sub_cell));
                     }
@@ -1640,8 +1784,7 @@ impl Lowerer {
                     }
                 }
                 // Lower the `if:` predicate expression and capture it as a cell.
-                let predicate_cell = if_expr
-                    .map(|val| self.lower_expr_to_cell(val, "retain_pred"));
+                let predicate_cell = if_expr.map(|val| self.lower_expr_to_cell(val, "retain_pred"));
                 // Restore item binding.
                 if let Some(prev) = saved_item {
                     self.name_to_cell.insert(item_name.clone(), prev);
@@ -1650,7 +1793,8 @@ impl Lowerer {
                 }
                 // Clean up sub-cell name_to_cell entries.
                 for (field, _) in &item_field_cells {
-                    self.name_to_cell.remove(&format!("{}.{}", item_name, field));
+                    self.name_to_cell
+                        .remove(&format!("{}.{}", item_name, field));
                 }
                 self.nodes.push(IrNode::ListRetain {
                     cell: target,
@@ -1678,7 +1822,10 @@ impl Lowerer {
                     if let Some(func_def) = self.func_defs.get(&fn_name).cloned() {
                         let source_cell = self.lower_expr_to_cell(source, "pipe_fn_arg");
                         let result = self.inline_function_call_with_pipe(
-                            &func_def, source_cell, arguments, call_span,
+                            &func_def,
+                            source_cell,
+                            arguments,
+                            call_span,
                         );
                         match result {
                             IrExpr::CellRead(result_cell) => {
@@ -1722,12 +1869,7 @@ impl Lowerer {
     }
 
     /// Lower LATEST { inputs }.
-    fn lower_latest(
-        &mut self,
-        target: CellId,
-        inputs: &[Spanned<Expression>],
-        var_span: Span,
-    ) {
+    fn lower_latest(&mut self, target: CellId, inputs: &[Spanned<Expression>], var_span: Span) {
         let mut arms = Vec::new();
         for input in inputs {
             match &input.node {
@@ -1738,9 +1880,11 @@ impl Lowerer {
                         Expression::Then { body } => {
                             // Try to resolve 'from' as an event reference (e.g., button.event.press).
                             // If not a direct alias, lower it to a cell (may create Timer etc.)
-                            let trigger = self.resolve_event_from_expr(&from.node)
+                            let trigger = self
+                                .resolve_event_from_expr(&from.node)
                                 .or_else(|| {
-                                    let from_cell = self.lower_expr_to_cell(from, "latest_trigger_source");
+                                    let from_cell =
+                                        self.lower_expr_to_cell(from, "latest_trigger_source");
                                     self.resolve_event_from_cell(from_cell)
                                 })
                                 .unwrap_or_else(|| {
@@ -1802,25 +1946,37 @@ impl Lowerer {
                         let outer_body_expr = self.lower_expr(&then_body.node, then_body.span);
                         let mut trigger_bodies = Vec::new();
                         for input in inputs {
-                            if let Expression::Pipe { from: inner_from, to: inner_to } = &input.node {
-                                let trigger = self.resolve_event_from_expr(&inner_from.node)
+                            if let Expression::Pipe {
+                                from: inner_from,
+                                to: inner_to,
+                            } = &input.node
+                            {
+                                let trigger = self
+                                    .resolve_event_from_expr(&inner_from.node)
                                     .or_else(|| {
-                                        let from_cell = self.lower_expr_to_cell(inner_from, "hold_trigger_source");
+                                        let from_cell = self
+                                            .lower_expr_to_cell(inner_from, "hold_trigger_source");
                                         self.resolve_event_from_cell(from_cell)
                                     })
                                     .unwrap_or_else(|| {
-                                        self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span)
+                                        self.alloc_event(
+                                            "hold_trigger",
+                                            EventSource::Synthetic,
+                                            hold_span,
+                                        )
                                     });
                                 if let Expression::When { arms } = &inner_to.node {
                                     // WHEN arm inside LATEST: wrap outer THEN body in PatternMatch.
                                     // Matching WHEN arms → evaluate outer body; SKIP arms → SKIP.
-                                    let source_cell = self.lower_expr_to_cell(inner_from, "hold_when_source");
+                                    let source_cell =
+                                        self.lower_expr_to_cell(inner_from, "hold_when_source");
                                     let ir_arms: Vec<(IrPattern, IrExpr)> = arms
                                         .iter()
                                         .map(|arm| {
                                             let pattern = self.lower_pattern(&arm.pattern);
                                             // Check if this arm's body is SKIP.
-                                            let is_skip = matches!(&arm.body.node, Expression::Skip);
+                                            let is_skip =
+                                                matches!(&arm.body.node, Expression::Skip);
                                             if is_skip {
                                                 (pattern, IrExpr::Constant(IrValue::Skip))
                                             } else {
@@ -1842,13 +1998,15 @@ impl Lowerer {
                             }
                         }
                         if trigger_bodies.is_empty() {
-                            let trigger = self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span);
+                            let trigger =
+                                self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span);
                             trigger_bodies.push((trigger, outer_body_expr));
                         }
                         return trigger_bodies;
                     }
                     // Simple case: single event source |> THEN { body }
-                    let trigger = self.resolve_event_from_expr(&from.node)
+                    let trigger = self
+                        .resolve_event_from_expr(&from.node)
                         .or_else(|| {
                             let from_cell = self.lower_expr_to_cell(from, "hold_trigger_source");
                             self.resolve_event_from_cell(from_cell)
@@ -1871,13 +2029,19 @@ impl Lowerer {
                 for input in inputs {
                     if let Expression::Pipe { from, to } = &input.node {
                         if let Expression::Then { body: then_body } = &to.node {
-                            let trigger = self.resolve_event_from_expr(&from.node)
+                            let trigger = self
+                                .resolve_event_from_expr(&from.node)
                                 .or_else(|| {
-                                    let from_cell = self.lower_expr_to_cell(from, "hold_trigger_source");
+                                    let from_cell =
+                                        self.lower_expr_to_cell(from, "hold_trigger_source");
                                     self.resolve_event_from_cell(from_cell)
                                 })
                                 .unwrap_or_else(|| {
-                                    self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span)
+                                    self.alloc_event(
+                                        "hold_trigger",
+                                        EventSource::Synthetic,
+                                        hold_span,
+                                    )
                                 });
                             let body_expr = self.lower_expr(&then_body.node, then_body.span);
                             trigger_bodies.push((trigger, body_expr));
@@ -1888,13 +2052,19 @@ impl Lowerer {
                             // produce an inline PatternMatch expression so the HOLD handler
                             // evaluates the match directly (avoiding ordering issues with
                             // downstream updates).
-                            let trigger = self.resolve_event_from_expr(&from.node)
+                            let trigger = self
+                                .resolve_event_from_expr(&from.node)
                                 .or_else(|| {
-                                    let from_cell = self.lower_expr_to_cell(from, "hold_trigger_source");
+                                    let from_cell =
+                                        self.lower_expr_to_cell(from, "hold_trigger_source");
                                     self.resolve_event_from_cell(from_cell)
                                 })
                                 .unwrap_or_else(|| {
-                                    self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span)
+                                    self.alloc_event(
+                                        "hold_trigger",
+                                        EventSource::Synthetic,
+                                        hold_span,
+                                    )
                                 });
                             // Lower the source to a cell (key_data_cell).
                             let source_cell = self.lower_expr_to_cell(from, "hold_when_source");
@@ -1930,7 +2100,8 @@ impl Lowerer {
                     }
                 }
                 if trigger_bodies.is_empty() {
-                    let trigger = self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span);
+                    let trigger =
+                        self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span);
                     trigger_bodies.push((trigger, IrExpr::Constant(IrValue::Void)));
                 }
                 trigger_bodies
@@ -2114,7 +2285,11 @@ impl Lowerer {
                 }
                 // Try compound name → cell with event
                 if parts.len() > 1 {
-                    let compound = parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".");
+                    let compound = parts
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
                     if let Some(&cell) = self.name_to_cell.get(&compound) {
                         return self.cell_events.get(&cell).copied();
                     }
@@ -2152,7 +2327,11 @@ impl Lowerer {
                     }
                 }
                 // Try compound name
-                let compound = parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".");
+                let compound = parts
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
                 self.name_to_cell.get(&compound).copied()
             }
             Expression::Pipe { from, .. } => {
@@ -2183,7 +2362,8 @@ impl Lowerer {
                     let field = part.as_str();
                     match current_expr {
                         Expression::Object(obj) => {
-                            let found = obj.variables.iter().find(|v| v.node.name.as_str() == field);
+                            let found =
+                                obj.variables.iter().find(|v| v.node.name.as_str() == field);
                             if let Some(var) = found {
                                 current_expr = &var.node.value.node;
                             } else {
@@ -2192,8 +2372,12 @@ impl Lowerer {
                         }
                         Expression::Alias(inner_alias) => {
                             // Resolve alias to get cell name, then append remaining parts.
-                            if let Alias::WithoutPassed { parts: alias_parts, .. } = inner_alias {
-                                if let Some(&cell) = self.name_to_cell.get(alias_parts[0].as_str()) {
+                            if let Alias::WithoutPassed {
+                                parts: alias_parts, ..
+                            } = inner_alias
+                            {
+                                if let Some(&cell) = self.name_to_cell.get(alias_parts[0].as_str())
+                                {
                                     let mut name = self.cells[cell.0 as usize].name.clone();
                                     name.push('.');
                                     name.push_str(field);
@@ -2229,8 +2413,14 @@ impl Lowerer {
             }
             Alias::WithoutPassed { parts, .. } => {
                 // Direct name resolution.
-                let compound = parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".");
-                if self.element_events.contains_key(&compound) || self.name_to_cell.contains_key(&compound) {
+                let compound = parts
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if self.element_events.contains_key(&compound)
+                    || self.name_to_cell.contains_key(&compound)
+                {
                     Some(compound)
                 } else if parts.len() == 1 {
                     if self.element_events.contains_key(parts[0].as_str()) {
@@ -2250,7 +2440,10 @@ impl Lowerer {
 
     /// Resolve a multi-part alias (e.g., "item.item_elements.toggle_button")
     /// through the cell hierarchy to find the actual cell name for element_events lookup.
-    fn resolve_link_alias_through_cells(&self, parts: &[crate::parser::StrSlice]) -> Option<String> {
+    fn resolve_link_alias_through_cells(
+        &self,
+        parts: &[crate::parser::StrSlice],
+    ) -> Option<String> {
         // Start with the first part and find its cell.
         let first = parts[0].as_str();
         let mut current_cell = self.name_to_cell.get(first).copied()?;
@@ -2364,7 +2557,9 @@ impl Lowerer {
                                         let mut current_cell = cell;
                                         let mut all_resolved = true;
                                         for part in &parts[1..] {
-                                            if let Some(fields) = self.cell_field_cells.get(&current_cell) {
+                                            if let Some(fields) =
+                                                self.cell_field_cells.get(&current_cell)
+                                            {
                                                 if let Some(&field_cell) = fields.get(*part) {
                                                     current_cell = field_cell;
                                                     continue;
@@ -2512,7 +2707,10 @@ impl Lowerer {
 
             // Hardware types — not supported in WASM engine.
             Expression::Bits { .. } | Expression::Memory { .. } | Expression::Bytes { .. } => {
-                self.error(span, "Hardware types (Bits/Memory/Bytes) are not supported in the WASM engine");
+                self.error(
+                    span,
+                    "Hardware types (Bits/Memory/Bytes) are not supported in the WASM engine",
+                );
                 IrExpr::Constant(IrValue::Void)
             }
 
@@ -2537,8 +2735,14 @@ impl Lowerer {
                 IrExpr::Constant(IrValue::Void)
             }
 
-            Expression::Hold { .. } | Expression::Then { .. } | Expression::When { .. } | Expression::While { .. } => {
-                self.error(span, "HOLD/THEN/WHEN/WHILE must appear on the right side of a pipe (|>)");
+            Expression::Hold { .. }
+            | Expression::Then { .. }
+            | Expression::When { .. }
+            | Expression::While { .. } => {
+                self.error(
+                    span,
+                    "HOLD/THEN/WHEN/WHILE must appear on the right side of a pipe (|>)",
+                );
                 IrExpr::Constant(IrValue::Void)
             }
 
@@ -2548,7 +2752,10 @@ impl Lowerer {
             }
 
             Expression::Map { .. } => {
-                self.error(span, "Map literals are not yet supported in the WASM engine");
+                self.error(
+                    span,
+                    "Map literals are not yet supported in the WASM engine",
+                );
                 IrExpr::Constant(IrValue::Void)
             }
 
@@ -2557,9 +2764,7 @@ impl Lowerer {
                 self.lower_expr(&value.node, value.span)
             }
 
-            Expression::Spread { value } => {
-                self.lower_expr(&value.node, value.span)
-            }
+            Expression::Spread { value } => self.lower_expr(&value.node, value.span),
         }
     }
 
@@ -2625,7 +2830,8 @@ impl Lowerer {
                     .map(|v| self.lower_expr(&v.node, v.span));
 
                 let cell = self.alloc_cell("text_input", span);
-                let links = self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
+                let links =
+                    self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
                 let hovered_cell = self.name_to_cell.get("element.hovered").copied();
 
                 let focus = self.has_element_bool_field(arguments, "focus")
@@ -2636,7 +2842,12 @@ impl Lowerer {
                 });
                 self.nodes.push(IrNode::Element {
                     cell,
-                    kind: ElementKind::TextInput { placeholder, style, focus, text_cell },
+                    kind: ElementKind::TextInput {
+                        placeholder,
+                        style,
+                        focus,
+                        text_cell,
+                    },
                     links,
                     hovered_cell,
                 });
@@ -2660,7 +2871,10 @@ impl Lowerer {
                             IrExpr::CellRead(c) => c,
                             other => {
                                 let c = self.alloc_cell("checkbox_checked", span);
-                                self.nodes.push(IrNode::Derived { cell: c, expr: other });
+                                self.nodes.push(IrNode::Derived {
+                                    cell: c,
+                                    expr: other,
+                                });
                                 c
                             }
                         }
@@ -2677,14 +2891,18 @@ impl Lowerer {
                             IrExpr::CellRead(c) => c,
                             other => {
                                 let c = self.alloc_cell("checkbox_icon", span);
-                                self.nodes.push(IrNode::Derived { cell: c, expr: other });
+                                self.nodes.push(IrNode::Derived {
+                                    cell: c,
+                                    expr: other,
+                                });
                                 c
                             }
                         }
                     });
 
                 let cell = self.alloc_cell("checkbox", span);
-                let links = self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
+                let links =
+                    self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
                 let hovered_cell = self.name_to_cell.get("element.hovered").copied();
 
                 self.nodes.push(IrNode::Element {
@@ -2713,7 +2931,8 @@ impl Lowerer {
                 let style = self.find_arg_expr_or_default(arguments, "style");
 
                 let cell = self.alloc_cell("container", span);
-                let links = self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
+                let links =
+                    self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
                 let hovered_cell = self.name_to_cell.get("element.hovered").copied();
 
                 self.nodes.push(IrNode::Element {
@@ -2736,7 +2955,8 @@ impl Lowerer {
                 let style = self.find_arg_expr_or_default(arguments, "style");
 
                 let cell = self.alloc_cell("label", span);
-                let links = self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
+                let links =
+                    self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
                 let hovered_cell = self.name_to_cell.get("element.hovered").copied();
 
                 self.nodes.push(IrNode::Element {
@@ -2761,7 +2981,8 @@ impl Lowerer {
                 });
 
                 let cell = self.alloc_cell("stack", span);
-                let links = self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
+                let links =
+                    self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
                 let hovered_cell = self.name_to_cell.get("element.hovered").copied();
 
                 self.nodes.push(IrNode::Element {
@@ -2794,7 +3015,8 @@ impl Lowerer {
                 let style = self.find_arg_expr_or_default(arguments, "style");
 
                 let cell = self.alloc_cell("link", span);
-                let links = self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
+                let links =
+                    self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
                 let hovered_cell = self.name_to_cell.get("element.hovered").copied();
 
                 self.nodes.push(IrNode::Element {
@@ -2820,13 +3042,17 @@ impl Lowerer {
                     .and_then(|a| a.node.value.as_ref())
                     .map(|v| self.lower_expr(&v.node, v.span))
                     .unwrap_or_else(|| {
-                        self.error(span, "Element/paragraph requires a 'content' or 'contents' argument");
+                        self.error(
+                            span,
+                            "Element/paragraph requires a 'content' or 'contents' argument",
+                        );
                         IrExpr::Constant(IrValue::Void)
                     });
                 let style = self.find_arg_expr_or_default(arguments, "style");
 
                 let cell = self.alloc_cell("paragraph", span);
-                let links = self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
+                let links =
+                    self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
                 let hovered_cell = self.name_to_cell.get("element.hovered").copied();
 
                 self.nodes.push(IrNode::Element {
@@ -2843,7 +3069,8 @@ impl Lowerer {
             ["Element", "stripe"] => {
                 let saved_elem = self.process_element_self_ref(arguments, span);
                 let direction = self.find_arg_expr_or_default(arguments, "direction");
-                let gap = self.find_arg_expr_or(arguments, "gap", IrExpr::Constant(IrValue::Number(0.0)));
+                let gap =
+                    self.find_arg_expr_or(arguments, "gap", IrExpr::Constant(IrValue::Number(0.0)));
                 let style = self.find_arg_expr_or_default(arguments, "style");
                 let element_arg = self.find_arg_expr_or_default(arguments, "element");
 
@@ -2855,7 +3082,8 @@ impl Lowerer {
                 });
 
                 let cell = self.alloc_cell("stripe", span);
-                let links = self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
+                let links =
+                    self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
                 let hovered_cell = self.name_to_cell.get("element.hovered").copied();
 
                 self.nodes.push(IrNode::Element {
@@ -2895,7 +3123,10 @@ impl Lowerer {
 
             // --- Math/sum() (standalone, not in pipe) ---
             ["Math", "sum"] => {
-                self.error(span, "Math/sum() must be used in pipe position: `source |> Math/sum()`");
+                self.error(
+                    span,
+                    "Math/sum() must be used in pipe position: `source |> Math/sum()`",
+                );
                 IrExpr::Constant(IrValue::Void)
             }
 
@@ -2915,18 +3146,17 @@ impl Lowerer {
             }
 
             // --- Text/empty() ---
-            ["Text", "empty"] => {
-                IrExpr::Constant(IrValue::Text(String::new()))
-            }
+            ["Text", "empty"] => IrExpr::Constant(IrValue::Text(String::new())),
 
             // --- Text/space() ---
-            ["Text", "space"] => {
-                IrExpr::Constant(IrValue::Text(" ".to_string()))
-            }
+            ["Text", "space"] => IrExpr::Constant(IrValue::Text(" ".to_string())),
 
             // --- Bool/not() — standalone usage (not in pipe) ---
             ["Bool", "not"] => {
-                self.error(span, "Bool/not() must be used in pipe position: `value |> Bool/not()`");
+                self.error(
+                    span,
+                    "Bool/not() must be used in pipe position: `value |> Bool/not()`",
+                );
                 IrExpr::Constant(IrValue::Void)
             }
 
@@ -3091,12 +3321,15 @@ impl Lowerer {
                                     .collect::<Vec<_>>()
                                     .join(".");
                                 let partial_global = format!("{}.{}", cell_global_name, partial);
-                                if let Some(&partial_cell) = self.name_to_cell.get(&partial_global) {
+                                if let Some(&partial_cell) = self.name_to_cell.get(&partial_global)
+                                {
                                     let rest = &remaining[rem_prefix..];
                                     // Check for .event pattern on this partial match.
                                     if rest.len() >= 2 && rest[0].as_str() == "event" {
                                         let event_name = rest[1].as_str();
-                                        if let Some(events) = self.element_events.get(&partial_global) {
+                                        if let Some(events) =
+                                            self.element_events.get(&partial_global)
+                                        {
                                             if let Some(&event_id) = events.get(event_name) {
                                                 if rest.len() == 2 {
                                                     self.cell_events.insert(partial_cell, event_id);
@@ -3106,9 +3339,15 @@ impl Lowerer {
                                                     let data_name = format!(
                                                         "{}.event.{}",
                                                         partial_global,
-                                                        rest[1..].iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".")
+                                                        rest[1..]
+                                                            .iter()
+                                                            .map(|p| p.as_str())
+                                                            .collect::<Vec<_>>()
+                                                            .join(".")
                                                     );
-                                                    if let Some(&data_cell) = self.name_to_cell.get(&data_name) {
+                                                    if let Some(&data_cell) =
+                                                        self.name_to_cell.get(&data_name)
+                                                    {
                                                         return IrExpr::CellRead(data_cell);
                                                     }
                                                 }
@@ -3118,7 +3357,8 @@ impl Lowerer {
                                     // Check for .text property.
                                     if rest.len() == 1 && rest[0].as_str() == "text" {
                                         let text_name = format!("{}.text", partial_global);
-                                        if let Some(&text_cell) = self.name_to_cell.get(&text_name) {
+                                        if let Some(&text_cell) = self.name_to_cell.get(&text_name)
+                                        {
                                             return IrExpr::CellRead(text_cell);
                                         }
                                     }
@@ -3141,9 +3381,15 @@ impl Lowerer {
                                             let data_name = format!(
                                                 "{}.event.{}",
                                                 compound,
-                                                remaining[1..].iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".")
+                                                remaining[1..]
+                                                    .iter()
+                                                    .map(|p| p.as_str())
+                                                    .collect::<Vec<_>>()
+                                                    .join(".")
                                             );
-                                            if let Some(&data_cell) = self.name_to_cell.get(&data_name) {
+                                            if let Some(&data_cell) =
+                                                self.name_to_cell.get(&data_name)
+                                            {
                                                 return IrExpr::CellRead(data_cell);
                                             }
                                         }
@@ -3212,9 +3458,15 @@ impl Lowerer {
                                                 let data_name = format!(
                                                     "{}.event.{}",
                                                     partial_global,
-                                                    rest[1..].iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".")
+                                                    rest[1..]
+                                                        .iter()
+                                                        .map(|p| p.as_str())
+                                                        .collect::<Vec<_>>()
+                                                        .join(".")
                                                 );
-                                                if let Some(&data_cell) = self.name_to_cell.get(&data_name) {
+                                                if let Some(&data_cell) =
+                                                    self.name_to_cell.get(&data_name)
+                                                {
                                                     return IrExpr::CellRead(data_cell);
                                                 }
                                             }
@@ -3243,9 +3495,14 @@ impl Lowerer {
                                         let data_name = format!(
                                             "{}.event.{}",
                                             element_name,
-                                            parts[2..].iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".")
+                                            parts[2..]
+                                                .iter()
+                                                .map(|p| p.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(".")
                                         );
-                                        if let Some(&data_cell) = self.name_to_cell.get(&data_name) {
+                                        if let Some(&data_cell) = self.name_to_cell.get(&data_name)
+                                        {
                                             return IrExpr::CellRead(data_cell);
                                         }
                                     }
@@ -3282,9 +3539,7 @@ impl Lowerer {
                     }
                 }
             }
-            Alias::WithPassed { extra_parts } => {
-                self.resolve_passed_path(extra_parts, span)
-            }
+            Alias::WithPassed { extra_parts } => self.resolve_passed_path(extra_parts, span),
         }
     }
 
@@ -3302,7 +3557,11 @@ impl Lowerer {
     ///
     /// The PASSED context is an AST expression (typically an object literal).
     /// We walk through it field by field to resolve the path.
-    fn resolve_passed_path(&mut self, extra_parts: &[crate::parser::StrSlice], span: Span) -> IrExpr {
+    fn resolve_passed_path(
+        &mut self,
+        extra_parts: &[crate::parser::StrSlice],
+        span: Span,
+    ) -> IrExpr {
         let passed = match self.current_passed.clone() {
             Some(p) => p,
             None => {
@@ -3389,7 +3648,9 @@ impl Lowerer {
                                                 partial,
                                                 rest[1..].join(".")
                                             );
-                                            if let Some(&data_cell) = self.name_to_cell.get(&data_name) {
+                                            if let Some(&data_cell) =
+                                                self.name_to_cell.get(&data_name)
+                                            {
                                                 return IrExpr::CellRead(data_cell);
                                             }
                                         }
@@ -3445,7 +3706,10 @@ impl Lowerer {
         let passed = match self.current_passed.clone() {
             Some(p) => p,
             None => {
-                self.error(span, "PASSED used in text interpolation but no PASS context is active");
+                self.error(
+                    span,
+                    "PASSED used in text interpolation but no PASS context is active",
+                );
                 return IrExpr::Constant(IrValue::Void);
             }
         };
@@ -3647,7 +3911,8 @@ impl Lowerer {
                 .find(|a| a.node.name.as_str() == param_name && a.node.name.as_str() != "PASS")
                 .or_else(|| {
                     // By position: skip PASS arguments.
-                    let non_pass: Vec<_> = arguments.iter()
+                    let non_pass: Vec<_> = arguments
+                        .iter()
                         .filter(|a| a.node.name.as_str() != "PASS")
                         .collect();
                     non_pass.get(i).copied()
@@ -3754,7 +4019,8 @@ impl Lowerer {
                 .iter()
                 .find(|a| a.node.name.as_str() == param_name && a.node.name.as_str() != "PASS")
                 .or_else(|| {
-                    let non_pass: Vec<_> = arguments.iter()
+                    let non_pass: Vec<_> = arguments
+                        .iter()
                         .filter(|a| a.node.name.as_str() != "PASS")
                         .collect();
                     non_pass.get(i.saturating_sub(1)).copied()
@@ -3859,12 +4125,7 @@ impl Lowerer {
     }
 
     /// Find a named argument and return its lowered IrExpr.
-    fn find_arg_expr(
-        &mut self,
-        arguments: &[Spanned<Argument>],
-        name: &str,
-        span: Span,
-    ) -> IrExpr {
+    fn find_arg_expr(&mut self, arguments: &[Spanned<Argument>], name: &str, span: Span) -> IrExpr {
         if let Some(arg) = arguments.iter().find(|a| a.node.name.as_str() == name) {
             if let Some(ref val) = arg.node.value {
                 return self.lower_expr(&val.node, val.span);
@@ -3927,7 +4188,8 @@ impl Lowerer {
         match &to.node {
             Expression::Then { body } => {
                 // Try to resolve event from the source cell (e.g., Timer output).
-                let trigger = self.resolve_event_from_cell(source_cell)
+                let trigger = self
+                    .resolve_event_from_cell(source_cell)
                     .unwrap_or_else(|| {
                         self.alloc_event("then_trigger", EventSource::Synthetic, to.span)
                     });
@@ -4090,17 +4352,23 @@ impl Lowerer {
                             if let Some(ref val) = arg.node.value {
                                 let reactive_dep = self.find_reactive_cell_in_expr(&val.node);
                                 let item_cell = self.lower_expr_to_cell(val, "append_item");
-                                let on_arg = arguments.iter().find(|a| a.node.name.as_str() == "on");
+                                let on_arg =
+                                    arguments.iter().find(|a| a.node.name.as_str() == "on");
                                 let trigger = on_arg
                                     .and_then(|a| a.node.value.as_ref())
                                     .and_then(|v| self.resolve_event_from_expr(&v.node))
                                     .or_else(|| self.resolve_event_from_cell(item_cell))
                                     .or_else(|| self.resolve_event_from_expr(&val.node))
                                     .unwrap_or_else(|| {
-                                        self.alloc_event("list_append_trigger", EventSource::Synthetic, to.span)
+                                        self.alloc_event(
+                                            "list_append_trigger",
+                                            EventSource::Synthetic,
+                                            to.span,
+                                        )
                                     });
                                 let watch_cell = if matches!(
-                                    self.events[trigger.0 as usize].source, EventSource::Synthetic
+                                    self.events[trigger.0 as usize].source,
+                                    EventSource::Synthetic
                                 ) {
                                     reactive_dep
                                 } else {
@@ -4117,20 +4385,29 @@ impl Lowerer {
                                 return;
                             }
                         }
-                        self.nodes.push(IrNode::PipeThrough { cell: target, source: source_cell });
+                        self.nodes.push(IrNode::PipeThrough {
+                            cell: target,
+                            source: source_cell,
+                        });
                         self.propagate_list_constructor(source_cell, target);
                     }
                     ["List", "clear"] => {
                         let on_arg = arguments.iter().find(|a| a.node.name.as_str() == "on");
                         if let Some(arg) = on_arg {
                             if let Some(ref val) = arg.node.value {
-                                let trigger = self.resolve_event_from_expr(&val.node)
+                                let trigger = self
+                                    .resolve_event_from_expr(&val.node)
                                     .or_else(|| {
-                                        let trigger_cell = self.lower_expr_to_cell(val, "clear_trigger");
+                                        let trigger_cell =
+                                            self.lower_expr_to_cell(val, "clear_trigger");
                                         self.resolve_event_from_cell(trigger_cell)
                                     })
                                     .unwrap_or_else(|| {
-                                        self.alloc_event("list_clear_trigger", EventSource::Synthetic, to.span)
+                                        self.alloc_event(
+                                            "list_clear_trigger",
+                                            EventSource::Synthetic,
+                                            to.span,
+                                        )
                                     });
                                 self.nodes.push(IrNode::ListClear {
                                     cell: target,
@@ -4141,7 +4418,10 @@ impl Lowerer {
                                 return;
                             }
                         }
-                        self.nodes.push(IrNode::PipeThrough { cell: target, source: source_cell });
+                        self.nodes.push(IrNode::PipeThrough {
+                            cell: target,
+                            source: source_cell,
+                        });
                         self.propagate_list_constructor(source_cell, target);
                     }
                     ["List", "count"] => {
@@ -4151,10 +4431,12 @@ impl Lowerer {
                         });
                     }
                     ["List", "map"] => {
-                        let item_name = arguments.first()
+                        let item_name = arguments
+                            .first()
                             .map(|a| a.node.name.as_str().to_string())
                             .unwrap_or_else(|| "item".to_string());
-                        let template_arg = arguments.iter()
+                        let template_arg = arguments
+                            .iter()
                             .find(|a| matches!(a.node.name.as_str(), "to" | "new"));
                         if let Some(arg) = template_arg {
                             if let Some(ref val) = arg.node.value {
@@ -4165,22 +4447,37 @@ impl Lowerer {
                                 self.name_to_cell.insert(item_name.clone(), item_cell);
                                 // Inline the list item constructor for per-item cells.
                                 self.inline_list_constructor_for_template(
-                                    source_cell, item_cell, &item_name, to.span,
+                                    source_cell,
+                                    item_cell,
+                                    &item_name,
+                                    to.span,
                                 );
                                 let template_expr = self.lower_expr(&val.node, val.span);
                                 let template_cell = self.alloc_cell("list_map_template", to.span);
-                                let template_node = IrNode::Derived { cell: template_cell, expr: template_expr };
+                                let template_node = IrNode::Derived {
+                                    cell: template_cell,
+                                    expr: template_expr,
+                                };
                                 // Resolve deferred per-item removes (same as primary List/map handler).
-                                if let Some(removes) = self.pending_per_item_removes.remove(&source_cell) {
+                                if let Some(removes) =
+                                    self.pending_per_item_removes.remove(&source_cell)
+                                {
                                     for remove in removes {
-                                        let saved = self.name_to_cell.get(&remove.item_name).copied();
-                                        let bind_cell = self.name_to_cell.get(&item_name).copied().unwrap_or(item_cell);
-                                        self.name_to_cell.insert(
-                                            remove.item_name.clone(),
-                                            bind_cell,
-                                        );
-                                        if let Some(event_id) = self.resolve_event_from_expr(&remove.on_expr.node) {
-                                            if let IrNode::ListRemove { trigger, .. } = &mut self.nodes[remove.node_index] {
+                                        let saved =
+                                            self.name_to_cell.get(&remove.item_name).copied();
+                                        let bind_cell = self
+                                            .name_to_cell
+                                            .get(&item_name)
+                                            .copied()
+                                            .unwrap_or(item_cell);
+                                        self.name_to_cell
+                                            .insert(remove.item_name.clone(), bind_cell);
+                                        if let Some(event_id) =
+                                            self.resolve_event_from_expr(&remove.on_expr.node)
+                                        {
+                                            if let IrNode::ListRemove { trigger, .. } =
+                                                &mut self.nodes[remove.node_index]
+                                            {
                                                 *trigger = event_id;
                                             }
                                         }
@@ -4205,7 +4502,10 @@ impl Lowerer {
                                 return;
                             }
                         }
-                        self.nodes.push(IrNode::PipeThrough { cell: target, source: source_cell });
+                        self.nodes.push(IrNode::PipeThrough {
+                            cell: target,
+                            source: source_cell,
+                        });
                     }
                     ["List", "is_empty"] => {
                         self.nodes.push(IrNode::ListIsEmpty {
@@ -4215,7 +4515,8 @@ impl Lowerer {
                     }
                     ["List", "remove"] => {
                         // Bind the item parameter so the `on:` expression can reference item fields.
-                        let item_name = arguments.first()
+                        let item_name = arguments
+                            .first()
                             .filter(|a| {
                                 let n = a.node.name.as_str();
                                 n != "on" && n != "if"
@@ -4234,35 +4535,45 @@ impl Lowerer {
                         if let Some(arg) = on_arg {
                             if let Some(ref val) = arg.node.value {
                                 // Case 2: Pipe { from: <event>, to: Then { body } } with per-item predicate.
-                                if let Expression::Pipe { from, to: then_expr } = &val.node {
+                                if let Expression::Pipe {
+                                    from,
+                                    to: then_expr,
+                                } = &val.node
+                                {
                                     if let Expression::Then { body } = &then_expr.node {
-                                        if let Some(event_id) = self.resolve_event_from_expr(&from.node)
-                                            .or_else(|| {
-                                                let c = self.lower_expr_to_cell(from, "remove_event");
+                                        if let Some(event_id) =
+                                            self.resolve_event_from_expr(&from.node).or_else(|| {
+                                                let c =
+                                                    self.lower_expr_to_cell(from, "remove_event");
                                                 self.resolve_event_from_cell(c)
                                             })
                                         {
                                             // Pre-scan THEN body for item field references.
-                                            let field_names = collect_item_field_names(body, &item_name);
+                                            let field_names =
+                                                collect_item_field_names(body, &item_name);
                                             let mut item_field_cells = Vec::new();
                                             if !field_names.is_empty() {
                                                 let mut field_map = HashMap::new();
                                                 for field in &field_names {
                                                     let sub_cell = self.alloc_cell(
-                                                        &format!("{}.{}", item_name, field), to.span,
+                                                        &format!("{}.{}", item_name, field),
+                                                        to.span,
                                                     );
                                                     self.nodes.push(IrNode::Derived {
                                                         cell: sub_cell,
                                                         expr: IrExpr::Constant(IrValue::Void),
                                                     });
                                                     self.name_to_cell.insert(
-                                                        format!("{}.{}", item_name, field), sub_cell,
+                                                        format!("{}.{}", item_name, field),
+                                                        sub_cell,
                                                     );
                                                     field_map.insert(field.clone(), sub_cell);
-                                                    item_field_cells.push((field.clone(), sub_cell));
+                                                    item_field_cells
+                                                        .push((field.clone(), sub_cell));
                                                 }
                                                 if !field_map.is_empty() {
-                                                    self.cell_field_cells.insert(item_cell, field_map);
+                                                    self.cell_field_cells
+                                                        .insert(item_cell, field_map);
                                                 }
                                             }
                                             // Lower THEN body to get predicate cell.
@@ -4279,14 +4590,19 @@ impl Lowerer {
                                             }
                                             // Clean up sub-cell name_to_cell entries.
                                             for (field, _) in &item_field_cells {
-                                                self.name_to_cell.remove(&format!("{}.{}", item_name, field));
+                                                self.name_to_cell
+                                                    .remove(&format!("{}.{}", item_name, field));
                                             }
                                             self.nodes.push(IrNode::ListRemove {
                                                 cell: target,
                                                 source: source_cell,
                                                 trigger: event_id,
                                                 predicate: predicate_cell,
-                                                item_cell: if item_field_cells.is_empty() { None } else { Some(item_cell) },
+                                                item_cell: if item_field_cells.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(item_cell)
+                                                },
                                                 item_field_cells,
                                             });
                                             self.propagate_list_constructor(source_cell, target);
@@ -4314,7 +4630,8 @@ impl Lowerer {
                                     return;
                                 }
                                 // Check if per-item event, defer to List/map.
-                                let is_per_item_event = Self::is_per_item_event_expr(&val.node, &item_name);
+                                let is_per_item_event =
+                                    Self::is_per_item_event_expr(&val.node, &item_name);
                                 if is_per_item_event {
                                     if let Some(prev) = saved_item {
                                         self.name_to_cell.insert(item_name.clone(), prev);
@@ -4344,10 +4661,16 @@ impl Lowerer {
                                 }
                                 // Fallback: lower expression to cell.
                                 let trigger = {
-                                    let trigger_cell = self.lower_expr_to_cell(val, "remove_trigger");
+                                    let trigger_cell =
+                                        self.lower_expr_to_cell(val, "remove_trigger");
                                     self.resolve_event_from_cell(trigger_cell)
-                                }.unwrap_or_else(|| {
-                                    self.alloc_event("list_remove_trigger", EventSource::Synthetic, to.span)
+                                }
+                                .unwrap_or_else(|| {
+                                    self.alloc_event(
+                                        "list_remove_trigger",
+                                        EventSource::Synthetic,
+                                        to.span,
+                                    )
                                 });
                                 if let Some(prev) = saved_item {
                                     self.name_to_cell.insert(item_name, prev);
@@ -4371,12 +4694,16 @@ impl Lowerer {
                         } else {
                             self.name_to_cell.remove(&item_name);
                         }
-                        self.nodes.push(IrNode::PipeThrough { cell: target, source: source_cell });
+                        self.nodes.push(IrNode::PipeThrough {
+                            cell: target,
+                            source: source_cell,
+                        });
                         self.propagate_list_constructor(source_cell, target);
                     }
                     ["List", "retain"] => {
                         // Bind the item parameter so the `if:` expression can reference item fields.
-                        let item_name = arguments.first()
+                        let item_name = arguments
+                            .first()
                             .filter(|a| {
                                 let n = a.node.name.as_str();
                                 n != "on" && n != "if"
@@ -4391,7 +4718,8 @@ impl Lowerer {
                             expr: IrExpr::Constant(IrValue::Void),
                         });
                         // Pre-scan the `if:` expression for field accesses on item.
-                        let if_expr = arguments.iter()
+                        let if_expr = arguments
+                            .iter()
                             .find(|a| a.node.name.as_str() == "if")
                             .and_then(|a| a.node.value.as_ref());
                         let mut item_field_cells = Vec::new();
@@ -4399,16 +4727,14 @@ impl Lowerer {
                             let field_names = collect_item_field_names(val, &item_name);
                             let mut field_map = HashMap::new();
                             for field in &field_names {
-                                let sub_cell = self.alloc_cell(
-                                    &format!("{}.{}", item_name, field), to.span,
-                                );
+                                let sub_cell =
+                                    self.alloc_cell(&format!("{}.{}", item_name, field), to.span);
                                 self.nodes.push(IrNode::Derived {
                                     cell: sub_cell,
                                     expr: IrExpr::Constant(IrValue::Void),
                                 });
-                                self.name_to_cell.insert(
-                                    format!("{}.{}", item_name, field), sub_cell,
-                                );
+                                self.name_to_cell
+                                    .insert(format!("{}.{}", item_name, field), sub_cell);
                                 field_map.insert(field.clone(), sub_cell);
                                 item_field_cells.push((field.clone(), sub_cell));
                             }
@@ -4417,8 +4743,8 @@ impl Lowerer {
                             }
                         }
                         // Lower the `if:` predicate expression and capture it as a cell.
-                        let predicate_cell = if_expr
-                            .map(|val| self.lower_expr_to_cell(val, "retain_pred"));
+                        let predicate_cell =
+                            if_expr.map(|val| self.lower_expr_to_cell(val, "retain_pred"));
                         // Restore item binding.
                         if let Some(prev) = saved_item {
                             self.name_to_cell.insert(item_name.clone(), prev);
@@ -4427,13 +4753,18 @@ impl Lowerer {
                         }
                         // Clean up sub-cell name_to_cell entries.
                         for (field, _) in &item_field_cells {
-                            self.name_to_cell.remove(&format!("{}.{}", item_name, field));
+                            self.name_to_cell
+                                .remove(&format!("{}.{}", item_name, field));
                         }
                         self.nodes.push(IrNode::ListRetain {
                             cell: target,
                             source: source_cell,
                             predicate: predicate_cell,
-                            item_cell: if item_field_cells.is_empty() { None } else { Some(item_cell) },
+                            item_cell: if item_field_cells.is_empty() {
+                                None
+                            } else {
+                                Some(item_cell)
+                            },
                             item_field_cells,
                         });
                         self.propagate_list_constructor(source_cell, target);
@@ -4468,7 +4799,10 @@ impl Lowerer {
                             let fn_name = path_strs[0].to_string();
                             if let Some(func_def) = self.func_defs.get(&fn_name).cloned() {
                                 let result = self.inline_function_call_with_pipe(
-                                    &func_def, source_cell, arguments, to.span,
+                                    &func_def,
+                                    source_cell,
+                                    arguments,
+                                    to.span,
                                 );
                                 match result {
                                     IrExpr::CellRead(result_cell) => {
@@ -4477,7 +4811,9 @@ impl Lowerer {
                                             source: result_cell,
                                         });
                                         // Propagate events from result cell.
-                                        if let Some(event) = self.cell_events.get(&result_cell).copied() {
+                                        if let Some(event) =
+                                            self.cell_events.get(&result_cell).copied()
+                                        {
                                             self.cell_events.insert(target, event);
                                         }
                                     }
@@ -4494,7 +4830,14 @@ impl Lowerer {
                         // Fallback: generic function call with source as pipe-through.
                         let source_span = crate::parser::span_at(0);
                         let source_expr = spanned(Expression::Skip, source_span);
-                        self.lower_pipe_to_function_call(target, &source_expr, path, arguments, to.span, var_span);
+                        self.lower_pipe_to_function_call(
+                            target,
+                            &source_expr,
+                            path,
+                            arguments,
+                            to.span,
+                            var_span,
+                        );
                         // Propagate field cell info through pass-through function calls.
                         if let Some(fields) = self.cell_field_cells.get(&source_cell).cloned() {
                             self.cell_field_cells.insert(target, fields);
@@ -4526,10 +4869,7 @@ impl Lowerer {
                         field: field.as_str().to_string(),
                     };
                 }
-                self.nodes.push(IrNode::Derived {
-                    cell: target,
-                    expr,
-                });
+                self.nodes.push(IrNode::Derived { cell: target, expr });
             }
 
             Expression::LinkSetter { alias } => {
@@ -4598,16 +4938,19 @@ impl Lowerer {
 
     /// Extract LINK event bindings for an element.
     /// Looks up the pre-allocated EventIds from Pass 1.5 scanning.
-    fn extract_links_for_element(
-        &self,
-        element_var_name: &str,
-    ) -> Vec<(String, EventId)> {
+    fn extract_links_for_element(&self, element_var_name: &str) -> Vec<(String, EventId)> {
         if let Some(events) = self.element_events.get(element_var_name) {
-            events.iter().map(|(name, &eid)| (name.clone(), eid)).collect()
+            events
+                .iter()
+                .map(|(name, &eid)| (name.clone(), eid))
+                .collect()
         } else if let Some(ref outer_name) = self.current_var_name {
             // Fallback: try the outer variable name (for elements inside function calls).
             if let Some(events) = self.element_events.get(outer_name) {
-                events.iter().map(|(name, &eid)| (name.clone(), eid)).collect()
+                events
+                    .iter()
+                    .map(|(name, &eid)| (name.clone(), eid))
+                    .collect()
             } else {
                 Vec::new()
             }
@@ -4640,7 +4983,8 @@ fn pre_scan_links_in_expr(
             let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
             // Scan Element/* calls for LINK patterns.
             if path_strs.first() == Some(&"Element") {
-                if let Some(elem_arg) = arguments.iter().find(|a| a.node.name.as_str() == "element") {
+                if let Some(elem_arg) = arguments.iter().find(|a| a.node.name.as_str() == "element")
+                {
                     if let Some(ref val) = elem_arg.node.value {
                         extract_link_events_from_ast(&val.node, var_name, element_cell, span, ctx);
                     }
@@ -4802,33 +5146,59 @@ fn scan_expr_for_fields(expr: &Expression, item_name: &str, fields: &mut Vec<Str
             }
             scan_expr_for_fields(&output.node, item_name, fields);
         }
-        Expression::Comparator(cmp) => {
-            match cmp {
-                Comparator::Equal { operand_a, operand_b }
-                | Comparator::NotEqual { operand_a, operand_b }
-                | Comparator::Greater { operand_a, operand_b }
-                | Comparator::GreaterOrEqual { operand_a, operand_b }
-                | Comparator::Less { operand_a, operand_b }
-                | Comparator::LessOrEqual { operand_a, operand_b } => {
-                    scan_expr_for_fields(&operand_a.node, item_name, fields);
-                    scan_expr_for_fields(&operand_b.node, item_name, fields);
-                }
+        Expression::Comparator(cmp) => match cmp {
+            Comparator::Equal {
+                operand_a,
+                operand_b,
             }
-        }
-        Expression::ArithmeticOperator(op) => {
-            match op {
-                ArithmeticOperator::Negate { operand } => {
-                    scan_expr_for_fields(&operand.node, item_name, fields);
-                }
-                ArithmeticOperator::Add { operand_a, operand_b }
-                | ArithmeticOperator::Subtract { operand_a, operand_b }
-                | ArithmeticOperator::Multiply { operand_a, operand_b }
-                | ArithmeticOperator::Divide { operand_a, operand_b } => {
-                    scan_expr_for_fields(&operand_a.node, item_name, fields);
-                    scan_expr_for_fields(&operand_b.node, item_name, fields);
-                }
+            | Comparator::NotEqual {
+                operand_a,
+                operand_b,
             }
-        }
+            | Comparator::Greater {
+                operand_a,
+                operand_b,
+            }
+            | Comparator::GreaterOrEqual {
+                operand_a,
+                operand_b,
+            }
+            | Comparator::Less {
+                operand_a,
+                operand_b,
+            }
+            | Comparator::LessOrEqual {
+                operand_a,
+                operand_b,
+            } => {
+                scan_expr_for_fields(&operand_a.node, item_name, fields);
+                scan_expr_for_fields(&operand_b.node, item_name, fields);
+            }
+        },
+        Expression::ArithmeticOperator(op) => match op {
+            ArithmeticOperator::Negate { operand } => {
+                scan_expr_for_fields(&operand.node, item_name, fields);
+            }
+            ArithmeticOperator::Add {
+                operand_a,
+                operand_b,
+            }
+            | ArithmeticOperator::Subtract {
+                operand_a,
+                operand_b,
+            }
+            | ArithmeticOperator::Multiply {
+                operand_a,
+                operand_b,
+            }
+            | ArithmeticOperator::Divide {
+                operand_a,
+                operand_b,
+            } => {
+                scan_expr_for_fields(&operand_a.node, item_name, fields);
+                scan_expr_for_fields(&operand_b.node, item_name, fields);
+            }
+        },
         Expression::List { items } => {
             for item in items {
                 scan_expr_for_fields(&item.node, item_name, fields);
@@ -4837,5 +5207,3 @@ fn scan_expr_for_fields(expr: &Expression, item_name: &str, fields: &mut Vec<Str
         _ => {}
     }
 }
-
-

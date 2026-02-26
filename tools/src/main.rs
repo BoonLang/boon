@@ -409,12 +409,12 @@ enum ExecAction {
         examples_dir: Option<PathBuf>,
     },
 
-    /// Get the currently selected engine (Actors or DD)
+    /// Get the currently selected engine (Actors, DD, or Wasm)
     GetEngine,
 
     /// Set the engine and trigger re-run
     SetEngine {
-        /// Engine to use: "Actors" or "DD"
+        /// Engine to use: "Actors", "DD", or "Wasm"
         engine: String,
     },
 
@@ -1094,8 +1094,11 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
 
         ExecAction::SetEngine { engine } => {
             // Validate engine value
-            if engine != "Actors" && engine != "DD" {
-                anyhow::bail!("Invalid engine '{}'. Must be 'Actors' or 'DD'", engine);
+            if engine != "Actors" && engine != "DD" && engine != "Wasm" {
+                anyhow::bail!(
+                    "Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'",
+                    engine
+                );
             }
             println!("Setting engine to: {}", engine);
             let response = send_command_to_server(port, WsCommand::SetEngine { engine: engine.clone() }).await?;

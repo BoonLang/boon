@@ -17,7 +17,10 @@ pub enum Command {
 
     /// Inject code into the CodeMirror editor
     /// If filename is provided, sets current file first (for persistence)
-    InjectCode { code: String, filename: Option<String> },
+    InjectCode {
+        code: String,
+        filename: Option<String>,
+    },
 
     /// Trigger run (call boonPlayground.run())
     TriggerRun,
@@ -192,7 +195,7 @@ pub enum Command {
 
     /// Set the engine type and trigger re-run
     SetEngine {
-        /// Engine name: "Actors" or "DD"
+        /// Engine name: "Actors", "DD", or "Wasm"
         engine: String,
     },
 
@@ -340,7 +343,7 @@ pub enum Response {
 
     /// Engine info response
     EngineInfo {
-        /// Current engine: "Actors" or "DD"
+        /// Current engine: "Actors", "DD", or "Wasm"
         engine: String,
         /// Whether engine switching is available
         switchable: bool,
