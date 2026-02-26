@@ -170,9 +170,7 @@ pub fn lexer<'code>()
     // Allow identifiers starting with underscore (like _log) but not just "_" alone
     // Note: "__" is the Wildcard token, handled separately
     let snake_case_identifier = any()
-        .filter(|character: &char| {
-            *character == '_' || character.is_ascii_lowercase()
-        })
+        .filter(|character: &char| *character == '_' || character.is_ascii_lowercase())
         .then(
             any()
                 .filter(|character: &char| {
@@ -184,7 +182,7 @@ pub fn lexer<'code>()
                 .at_least(
                     // If starts with '_', must have at least one more character
                     // to distinguish from potential wildcards
-                    0  // Actually 0 for regular identifiers, _foo is fine
+                    0, // Actually 0 for regular identifiers, _foo is fine
                 ),
         )
         .to_slice()
@@ -257,15 +255,11 @@ pub fn lexer<'code>()
 
     let text_content = just("TEXT")
         .then(text::inline_whitespace())
-        .ignore_then(
-            just('#').repeated().collect::<Vec<_>>()
-        )
+        .ignore_then(just('#').repeated().collect::<Vec<_>>())
         .then_ignore(just('{'))
         .then(text_content_inner)
         .then_ignore(just('}'))
-        .map(|(hashes, content): (Vec<_>, &str)| {
-            Token::TextContent(content.trim(), hashes.len())
-        });
+        .map(|(hashes, content): (Vec<_>, &str)| Token::TextContent(content.trim(), hashes.len()));
 
     let token = choice((
         bracket,
@@ -322,21 +316,36 @@ mod tests {
     fn test_text_content_multiple_interpolations() {
         let result = lexer().parse("TEXT { Hello {name}! You have {count} messages. }");
         let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
-        assert_eq!(tokens, vec![&Token::TextContent("Hello {name}! You have {count} messages.", 0)]);
+        assert_eq!(
+            tokens,
+            vec![&Token::TextContent(
+                "Hello {name}! You have {count} messages.",
+                0
+            )]
+        );
     }
 
     #[test]
     fn test_text_content_one_hash() {
         let result = lexer().parse("TEXT #{ function() { return #{value}; } }");
         let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
-        assert_eq!(tokens, vec![&Token::TextContent("function() { return #{value}; }", 1)]);
+        assert_eq!(
+            tokens,
+            vec![&Token::TextContent("function() { return #{value}; }", 1)]
+        );
     }
 
     #[test]
     fn test_text_content_two_hashes() {
         let result = lexer().parse("TEXT ##{ a[href^=\"#{url}\"] { color: ##{color}; } }");
         let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
-        assert_eq!(tokens, vec![&Token::TextContent("a[href^=\"#{url}\"] { color: ##{color}; }", 2)]);
+        assert_eq!(
+            tokens,
+            vec![&Token::TextContent(
+                "a[href^=\"#{url}\"] { color: ##{color}; }",
+                2
+            )]
+        );
     }
 
     #[test]
@@ -357,13 +366,16 @@ mod tests {
     fn test_text_pattern_in_when() {
         let result = lexer().parse("WHEN { TEXT { /active } => Active }");
         let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
-        assert_eq!(tokens, vec![
-            &Token::When,
-            &Token::BracketCurlyOpen,
-            &Token::TextContent("/active", 0),
-            &Token::Implies,
-            &Token::PascalCaseIdentifier("Active"),
-            &Token::BracketCurlyClose,
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                &Token::When,
+                &Token::BracketCurlyOpen,
+                &Token::TextContent("/active", 0),
+                &Token::Implies,
+                &Token::PascalCaseIdentifier("Active"),
+                &Token::BracketCurlyClose,
+            ]
+        );
     }
 }

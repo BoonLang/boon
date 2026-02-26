@@ -20,12 +20,12 @@
 
 use super::types::ListKey;
 use super::value::Value;
-use differential_dataflow::collection::AsCollection;
 use differential_dataflow::VecCollection;
+use differential_dataflow::collection::AsCollection;
 use timely::container::CapacityContainerBuilder;
+use timely::dataflow::Scope;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::generic::operator::Operator;
-use timely::dataflow::Scope;
 
 // ---------------------------------------------------------------------------
 // Custom stateful operators (can't be expressed as standard DD combinators)
@@ -56,27 +56,23 @@ where
     // Process events and produce retract-old / insert-new diffs
     let changes = events
         .inner
-        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
-            Pipeline,
-            "HoldState",
-            |_cap, _info| {
-                move |input, output| {
-                    input.for_each(|time, data| {
-                        let mut session = output.session(&time);
-                        for (event, ts, diff) in data.drain(..) {
-                            if diff > 0 {
-                                let new_state = transform(&state, &event);
-                                if new_state != state {
-                                    session.give((state.clone(), ts, -1isize));
-                                    session.give((new_state.clone(), ts, 1isize));
-                                    state = new_state;
-                                }
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(Pipeline, "HoldState", |_cap, _info| {
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let mut session = output.session(&time);
+                    for (event, ts, diff) in data.drain(..) {
+                        if diff > 0 {
+                            let new_state = transform(&state, &event);
+                            if new_state != state {
+                                session.give((state.clone(), ts, -1isize));
+                                session.give((new_state.clone(), ts, 1isize));
+                                state = new_state;
                             }
                         }
-                    });
-                }
-            },
-        )
+                    }
+                });
+            }
+        })
         .as_collection();
 
     // Merge initial value with state changes
@@ -88,9 +84,7 @@ where
 /// Takes a concatenated collection (from multiple LATEST inputs) and
 /// maintains only the most recently changed value. Always contains
 /// exactly one element.
-pub fn hold_latest<G>(
-    source: &VecCollection<G, Value, isize>,
-) -> VecCollection<G, Value, isize>
+pub fn hold_latest<G>(source: &VecCollection<G, Value, isize>) -> VecCollection<G, Value, isize>
 where
     G: Scope<Timestamp = u64>,
 {
@@ -107,7 +101,9 @@ where
                         let mut session = output.session(&time);
 
                         // Find the last positive insertion in batch (1 clone, not N)
-                        if let Some((value, ts, _)) = data.iter().rev().find(|(_, _, diff)| *diff > 0) {
+                        if let Some((value, ts, _)) =
+                            data.iter().rev().find(|(_, _, diff)| *diff > 0)
+                        {
                             let new_val = value.clone();
                             // Retract old value if we had one
                             if let Some(old) = current.take() {
@@ -232,28 +228,24 @@ where
     let mut has_emitted = false;
 
     list.inner
-        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
-            Pipeline,
-            "ListCount",
-            |_cap, _info| {
-                move |input, output| {
-                    input.for_each(|time, data| {
-                        let old_count = count;
-                        for (_, _, diff) in data.drain(..) {
-                            count += diff as i64;
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(Pipeline, "ListCount", |_cap, _info| {
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let old_count = count;
+                    for (_, _, diff) in data.drain(..) {
+                        count += diff as i64;
+                    }
+                    if count != old_count || !has_emitted {
+                        let mut session = output.session(&time);
+                        if has_emitted {
+                            session.give((Value::number(old_count as f64), *time.time(), -1isize));
                         }
-                        if count != old_count || !has_emitted {
-                            let mut session = output.session(&time);
-                            if has_emitted {
-                                session.give((Value::number(old_count as f64), *time.time(), -1isize));
-                            }
-                            session.give((Value::number(count as f64), *time.time(), 1isize));
-                            has_emitted = true;
-                        }
-                    });
-                }
-            },
-        )
+                        session.give((Value::number(count as f64), *time.time(), 1isize));
+                        has_emitted = true;
+                    }
+                });
+            }
+        })
         .as_collection()
 }
 
@@ -297,7 +289,8 @@ where
 
     let mut items: std::collections::HashMap<ListKey, Value> = std::collections::HashMap::new();
     let mut current_filter: Option<Value> = None;
-    let mut last_emitted: std::collections::HashMap<ListKey, bool> = std::collections::HashMap::new();
+    let mut last_emitted: std::collections::HashMap<ListKey, bool> =
+        std::collections::HashMap::new();
 
     combined
         .inner
@@ -313,7 +306,11 @@ where
                         let mut list_diffs = Vec::new();
                         let mut filter_diffs = Vec::new();
                         for item in data.drain(..) {
-                            if (item.0).1.0 == 0 { list_diffs.push(item) } else { filter_diffs.push(item) }
+                            if (item.0).1.0 == 0 {
+                                list_diffs.push(item)
+                            } else {
+                                filter_diffs.push(item)
+                            }
                         }
 
                         let mut filter_changed = false;
@@ -321,8 +318,8 @@ where
                         // Process list items first
                         for ((key, (_, value)), ts, diff) in list_diffs {
                             if diff > 0 {
-                                let passes = current_filter.as_ref()
-                                    .map(|fv| predicate(&value, fv));
+                                let passes =
+                                    current_filter.as_ref().map(|fv| predicate(&value, fv));
                                 items.insert(key.clone(), value.clone());
                                 if let Some(passes) = passes {
                                     if passes {
@@ -335,7 +332,8 @@ where
                             } else {
                                 items.remove(&key);
                                 if current_filter.is_some() {
-                                    let was_emitted = last_emitted.get(&key).copied().unwrap_or(false);
+                                    let was_emitted =
+                                        last_emitted.get(&key).copied().unwrap_or(false);
                                     if was_emitted {
                                         session.give(((key.clone(), value), ts, -1));
                                         last_emitted.remove(&key);
@@ -357,12 +355,17 @@ where
                             if let Some(ref fv) = current_filter {
                                 for (key, val) in &items {
                                     let passes = predicate(val, fv);
-                                    let was_emitted = last_emitted.get(key).copied().unwrap_or(false);
+                                    let was_emitted =
+                                        last_emitted.get(key).copied().unwrap_or(false);
                                     if passes && !was_emitted {
                                         session.give(((key.clone(), val.clone()), *time.time(), 1));
                                         last_emitted.insert(key.clone(), true);
                                     } else if !passes && was_emitted {
-                                        session.give(((key.clone(), val.clone()), *time.time(), -1));
+                                        session.give((
+                                            (key.clone(), val.clone()),
+                                            *time.time(),
+                                            -1,
+                                        ));
                                         last_emitted.insert(key.clone(), false);
                                     }
                                 }
@@ -500,7 +503,15 @@ pub fn keyed_hold_state<G>(
     events: &VecCollection<G, (ListKey, Value), isize>,
     transform: impl Fn(&Value, &Value) -> Value + 'static,
     broadcasts: Option<&VecCollection<G, Value, isize>>,
-    broadcast_handler: Option<std::sync::Arc<dyn Fn(&std::collections::HashMap<ListKey, Value>, &Value) -> Vec<(ListKey, Option<Value>)> + 'static>>,
+    broadcast_handler: Option<
+        std::sync::Arc<
+            dyn Fn(
+                    &std::collections::HashMap<ListKey, Value>,
+                    &Value,
+                ) -> Vec<(ListKey, Option<Value>)>
+                + 'static,
+        >,
+    >,
 ) -> VecCollection<G, (ListKey, Value), isize>
 where
     G: Scope<Timestamp = u64>,
@@ -579,8 +590,16 @@ where
                                             Some(new_val) => {
                                                 if let Some(old) = states.get(&bk) {
                                                     if *old != new_val {
-                                                        session.give(((bk.clone(), old.clone()), ts, -1isize));
-                                                        session.give(((bk.clone(), new_val.clone()), ts, 1isize));
+                                                        session.give((
+                                                            (bk.clone(), old.clone()),
+                                                            ts,
+                                                            -1isize,
+                                                        ));
+                                                        session.give((
+                                                            (bk.clone(), new_val.clone()),
+                                                            ts,
+                                                            1isize,
+                                                        ));
                                                         states.insert(bk, new_val);
                                                     }
                                                 }
@@ -619,23 +638,19 @@ where
 {
     events
         .inner
-        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
-            Pipeline,
-            "Then",
-            |_cap, _info| {
-                move |input, output| {
-                    input.for_each(|time, data| {
-                        let mut session = output.session(&time);
-                        for (event, ts, diff) in data.drain(..) {
-                            if diff > 0 {
-                                let result = body(event);
-                                session.give((result, ts, 1isize));
-                            }
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(Pipeline, "Then", |_cap, _info| {
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let mut session = output.session(&time);
+                    for (event, ts, diff) in data.drain(..) {
+                        if diff > 0 {
+                            let result = body(event);
+                            session.give((result, ts, 1isize));
                         }
-                    });
-                }
-            },
-        )
+                    }
+                });
+            }
+        })
         .as_collection()
 }
 
@@ -660,31 +675,27 @@ where
 
     source
         .inner
-        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
-            Pipeline,
-            "Skip",
-            |_cap, _info| {
-                move |input, output| {
-                    input.for_each(|time, data| {
-                        let mut session = output.session(&time);
-                        for (value, ts, diff) in data.drain(..) {
-                            if diff > 0 {
-                                if seen < count {
-                                    seen += 1;
-                                    // Skip: don't emit anything
-                                } else {
-                                    session.give((value, ts, 1isize));
-                                }
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(Pipeline, "Skip", |_cap, _info| {
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let mut session = output.session(&time);
+                    for (value, ts, diff) in data.drain(..) {
+                        if diff > 0 {
+                            if seen < count {
+                                seen += 1;
+                                // Skip: don't emit anything
                             } else {
-                                // Retractions: pass through for values we already emitted
-                                if seen > count {
-                                    session.give((value, ts, diff));
-                                }
+                                session.give((value, ts, 1isize));
+                            }
+                        } else {
+                            // Retractions: pass through for values we already emitted
+                            if seen > count {
+                                session.give((value, ts, diff));
                             }
                         }
-                    });
-                }
-            },
-        )
+                    }
+                });
+            }
+        })
         .as_collection()
 }

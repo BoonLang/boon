@@ -1,4 +1,6 @@
-use super::{ArithmeticOperator, Comparator, Expression, Literal, ParseError, Span, Spanned, TextPart, Token};
+use super::{
+    ArithmeticOperator, Comparator, Expression, Literal, ParseError, Span, Spanned, TextPart, Token,
+};
 
 use std::collections::HashMap;
 
@@ -98,7 +100,10 @@ impl PersistenceId {
     /// Used by API functions to create unique IDs for child variables.
     pub fn with_child_index(&self, index: u32) -> Self {
         // Mix index into the ID using rotation to spread bits
-        let index_bits = (index as u128) | ((index as u128) << 32) | ((index as u128) << 64) | ((index as u128) << 96);
+        let index_bits = (index as u128)
+            | ((index as u128) << 32)
+            | ((index as u128) << 64)
+            | ((index as u128) << 96);
         Self(self.0 ^ index_bits.rotate_left(37))
     }
 
@@ -277,7 +282,9 @@ fn set_persistence<'a, 'code, 'old_code>(
                 );
             }
             // Set value_changed based on value expression's persistence status
-            variable.value_changed = variable.value.persistence
+            variable.value_changed = variable
+                .value
+                .persistence
                 .as_ref()
                 .map(|p| p.status == PersistenceStatus::NewOrChanged)
                 .unwrap_or(true); // If no persistence, treat as changed
@@ -348,7 +355,9 @@ fn set_persistence<'a, 'code, 'old_code>(
                         );
                     }
                     // Set value_changed based on value expression's persistence status
-                    variable.value_changed = variable.value.persistence
+                    variable.value_changed = variable
+                        .value
+                        .persistence
                         .as_ref()
                         .map(|p| p.status == PersistenceStatus::NewOrChanged)
                         .unwrap_or(true);
@@ -380,7 +389,9 @@ fn set_persistence<'a, 'code, 'old_code>(
                         errors,
                     );
                     // Set value_changed based on value expression's persistence status
-                    variable.value_changed = variable.value.persistence
+                    variable.value_changed = variable
+                        .value
+                        .persistence
                         .as_ref()
                         .map(|p| p.status == PersistenceStatus::NewOrChanged)
                         .unwrap_or(true);
@@ -459,7 +470,9 @@ fn set_persistence<'a, 'code, 'old_code>(
                         );
                     }
                     // Set value_changed based on value expression's persistence status
-                    variable.value_changed = variable.value.persistence
+                    variable.value_changed = variable
+                        .value
+                        .persistence
                         .as_ref()
                         .map(|p| p.status == PersistenceStatus::NewOrChanged)
                         .unwrap_or(true);
@@ -491,7 +504,9 @@ fn set_persistence<'a, 'code, 'old_code>(
                         errors,
                     );
                     // Set value_changed based on value expression's persistence status
-                    variable.value_changed = variable.value.persistence
+                    variable.value_changed = variable
+                        .value
+                        .persistence
                         .as_ref()
                         .map(|p| p.status == PersistenceStatus::NewOrChanged)
                         .unwrap_or(true);
@@ -591,7 +606,9 @@ fn set_persistence<'a, 'code, 'old_code>(
                 // Just changing the status isn't enough - the scope is determined by the ID.
                 let any_arg_changed = arguments.iter().any(|arg| {
                     arg.node.value.as_ref().map_or(false, |v| {
-                        v.persistence.as_ref().map_or(false, |p| p.status == PersistenceStatus::NewOrChanged)
+                        v.persistence
+                            .as_ref()
+                            .map_or(false, |p| p.status == PersistenceStatus::NewOrChanged)
                     })
                 });
                 if any_arg_changed {
@@ -641,7 +658,11 @@ fn set_persistence<'a, 'code, 'old_code>(
                         Spanned {
                             span,
                             persistence: _,
-                            node: Expression::Block { variables: old_variables, output: old_output },
+                            node:
+                                Expression::Block {
+                                    variables: old_variables,
+                                    output: old_output,
+                                },
                         } => Some((old_variables, old_output, old_span_id_pairs[span])),
                         _ => None,
                     });
@@ -699,7 +720,9 @@ fn set_persistence<'a, 'code, 'old_code>(
                         );
                     }
                     // Set value_changed based on value expression's persistence status
-                    variable.value_changed = variable.value.persistence
+                    variable.value_changed = variable
+                        .value
+                        .persistence
                         .as_ref()
                         .map(|p| p.status == PersistenceStatus::NewOrChanged)
                         .unwrap_or(true);
@@ -738,7 +761,9 @@ fn set_persistence<'a, 'code, 'old_code>(
                         errors,
                     );
                     // Set value_changed based on value expression's persistence status
-                    variable.value_changed = variable.value.persistence
+                    variable.value_changed = variable
+                        .value
+                        .persistence
                         .as_ref()
                         .map(|p| p.status == PersistenceStatus::NewOrChanged)
                         .unwrap_or(true);
@@ -905,7 +930,13 @@ fn set_persistence<'a, 'code, 'old_code>(
             });
             // Recurse into arm bodies
             for arm in arms {
-                set_persistence(&mut arm.body, &[], old_span_id_pairs, new_span_id_pairs, errors);
+                set_persistence(
+                    &mut arm.body,
+                    &[],
+                    old_span_id_pairs,
+                    new_span_id_pairs,
+                    errors,
+                );
             }
         }
         Expression::While { arms } => {
@@ -917,7 +948,13 @@ fn set_persistence<'a, 'code, 'old_code>(
             });
             // Recurse into arm bodies
             for arm in arms {
-                set_persistence(&mut arm.body, &[], old_span_id_pairs, new_span_id_pairs, errors);
+                set_persistence(
+                    &mut arm.body,
+                    &[],
+                    old_span_id_pairs,
+                    new_span_id_pairs,
+                    errors,
+                );
             }
         }
         Expression::Pipe { from, to } => {
@@ -973,12 +1010,36 @@ fn set_persistence<'a, 'code, 'old_code>(
                 ArithmeticOperator::Negate { operand } => {
                     set_persistence(operand, &[], &old_span_id_pairs, new_span_id_pairs, errors);
                 }
-                ArithmeticOperator::Add { operand_a, operand_b }
-                | ArithmeticOperator::Subtract { operand_a, operand_b }
-                | ArithmeticOperator::Multiply { operand_a, operand_b }
-                | ArithmeticOperator::Divide { operand_a, operand_b } => {
-                    set_persistence(operand_a, &[], &old_span_id_pairs, new_span_id_pairs, errors);
-                    set_persistence(operand_b, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                ArithmeticOperator::Add {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Subtract {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Multiply {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Divide {
+                    operand_a,
+                    operand_b,
+                } => {
+                    set_persistence(
+                        operand_a,
+                        &[],
+                        &old_span_id_pairs,
+                        new_span_id_pairs,
+                        errors,
+                    );
+                    set_persistence(
+                        operand_b,
+                        &[],
+                        &old_span_id_pairs,
+                        new_span_id_pairs,
+                        errors,
+                    );
                 }
             }
         }
@@ -991,14 +1052,44 @@ fn set_persistence<'a, 'code, 'old_code>(
             });
             // Recurse into operands
             match cmp {
-                Comparator::Equal { operand_a, operand_b }
-                | Comparator::NotEqual { operand_a, operand_b }
-                | Comparator::Greater { operand_a, operand_b }
-                | Comparator::GreaterOrEqual { operand_a, operand_b }
-                | Comparator::Less { operand_a, operand_b }
-                | Comparator::LessOrEqual { operand_a, operand_b } => {
-                    set_persistence(operand_a, &[], &old_span_id_pairs, new_span_id_pairs, errors);
-                    set_persistence(operand_b, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                Comparator::Equal {
+                    operand_a,
+                    operand_b,
+                }
+                | Comparator::NotEqual {
+                    operand_a,
+                    operand_b,
+                }
+                | Comparator::Greater {
+                    operand_a,
+                    operand_b,
+                }
+                | Comparator::GreaterOrEqual {
+                    operand_a,
+                    operand_b,
+                }
+                | Comparator::Less {
+                    operand_a,
+                    operand_b,
+                }
+                | Comparator::LessOrEqual {
+                    operand_a,
+                    operand_b,
+                } => {
+                    set_persistence(
+                        operand_a,
+                        &[],
+                        &old_span_id_pairs,
+                        new_span_id_pairs,
+                        errors,
+                    );
+                    set_persistence(
+                        operand_b,
+                        &[],
+                        &old_span_id_pairs,
+                        new_span_id_pairs,
+                        errors,
+                    );
                 }
             }
         }
@@ -1214,8 +1305,14 @@ fn set_persistence<'a, 'code, 'old_code>(
                         Spanned {
                             span,
                             persistence: _,
-                            node: Expression::Hold { state_param: old_state_param, body: old_body },
-                        } if old_state_param == state_param => Some((old_body, old_span_id_pairs[span])),
+                            node:
+                                Expression::Hold {
+                                    state_param: old_state_param,
+                                    body: old_body,
+                                },
+                        } if old_state_param == state_param => {
+                            Some((old_body, old_span_id_pairs[span]))
+                        }
                         _ => None,
                     });
             if let Some((old_body, id)) = old_body_and_id {
@@ -1355,7 +1452,10 @@ fn set_persistence<'a, 'code, 'old_code>(
                         Spanned {
                             span,
                             persistence: _,
-                            node: Expression::Memory { address: old_address },
+                            node:
+                                Expression::Memory {
+                                    address: old_address,
+                                },
                         } => Some((old_address, old_span_id_pairs[span])),
                         _ => None,
                     });
@@ -1451,9 +1551,14 @@ fn text_parts_match<'a, 'b>(new_parts: &[TextPart<'a>], old_parts: &[TextPart<'b
     if new_parts.len() != old_parts.len() {
         return false;
     }
-    new_parts.iter().zip(old_parts.iter()).all(|(new, old)| match (new, old) {
-        (TextPart::Text(a), TextPart::Text(b)) => a == b,
-        (TextPart::Interpolation { var: a, .. }, TextPart::Interpolation { var: b, .. }) => a == b,
-        _ => false,
-    })
+    new_parts
+        .iter()
+        .zip(old_parts.iter())
+        .all(|(new, old)| match (new, old) {
+            (TextPart::Text(a), TextPart::Text(b)) => a == b,
+            (TextPart::Interpolation { var: a, .. }, TextPart::Interpolation { var: b, .. }) => {
+                a == b
+            }
+            _ => false,
+        })
 }

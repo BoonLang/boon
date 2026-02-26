@@ -5,9 +5,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use zoon::{web_sys, serde_json};
+use zoon::{serde_json, web_sys};
 
-use super::super::core::types::{ListKey, LIST_TAG};
+use super::super::core::types::{LIST_TAG, ListKey};
 use super::super::core::value::Value;
 
 /// Save a single hold state value to localStorage.
@@ -80,4 +80,3 @@ pub fn save_keyed_list(storage_key: &str, hold_name: &str, items: &HashMap<ListK
     };
     save_hold_state(storage_key, hold_name, &list_value);
 }
-

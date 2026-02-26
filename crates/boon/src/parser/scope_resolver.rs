@@ -1,4 +1,7 @@
-use super::{Alias, ArithmeticOperator, Comparator, Expression, ParseError, Pattern, Span, Spanned, TextPart, Token};
+use super::{
+    Alias, ArithmeticOperator, Comparator, Expression, ParseError, Pattern, Span, Spanned,
+    TextPart, Token,
+};
 use std::collections::{BTreeMap, HashSet};
 
 // @TODO Immutables or different tree traversal algorithm?
@@ -438,10 +441,22 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                     all_referenced,
                 );
             }
-            ArithmeticOperator::Add { operand_a, operand_b }
-            | ArithmeticOperator::Subtract { operand_a, operand_b }
-            | ArithmeticOperator::Multiply { operand_a, operand_b }
-            | ArithmeticOperator::Divide { operand_a, operand_b } => {
+            ArithmeticOperator::Add {
+                operand_a,
+                operand_b,
+            }
+            | ArithmeticOperator::Subtract {
+                operand_a,
+                operand_b,
+            }
+            | ArithmeticOperator::Multiply {
+                operand_a,
+                operand_b,
+            }
+            | ArithmeticOperator::Divide {
+                operand_a,
+                operand_b,
+            } => {
                 set_is_referenced_and_alias_referenceables(
                     operand_a,
                     reachable_referenceables.clone(),
@@ -459,14 +474,32 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                     all_referenced,
                 );
             }
-        }
+        },
         Expression::Comparator(cmp) => match cmp {
-            Comparator::Equal { operand_a, operand_b }
-            | Comparator::NotEqual { operand_a, operand_b }
-            | Comparator::Greater { operand_a, operand_b }
-            | Comparator::GreaterOrEqual { operand_a, operand_b }
-            | Comparator::Less { operand_a, operand_b }
-            | Comparator::LessOrEqual { operand_a, operand_b } => {
+            Comparator::Equal {
+                operand_a,
+                operand_b,
+            }
+            | Comparator::NotEqual {
+                operand_a,
+                operand_b,
+            }
+            | Comparator::Greater {
+                operand_a,
+                operand_b,
+            }
+            | Comparator::GreaterOrEqual {
+                operand_a,
+                operand_b,
+            }
+            | Comparator::Less {
+                operand_a,
+                operand_b,
+            }
+            | Comparator::LessOrEqual {
+                operand_a,
+                operand_b,
+            } => {
                 set_is_referenced_and_alias_referenceables(
                     operand_a,
                     reachable_referenceables.clone(),
@@ -484,7 +517,7 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                     all_referenced,
                 );
             }
-        }
+        },
         Expression::Function {
             name,
             parameters,
@@ -547,7 +580,11 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
             // Resolve interpolation variables in the text literal
             // Supports field access paths like "item.text" where "item" is the base variable
             for part in parts.iter_mut() {
-                if let TextPart::Interpolation { var, referenced_span } = part {
+                if let TextPart::Interpolation {
+                    var,
+                    referenced_span,
+                } = part
+                {
                     // Split on '.' to handle field access paths
                     let var_parts: Vec<&str> = var.split('.').collect();
                     let base_var = var_parts[0];
@@ -576,7 +613,13 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                         all_referenced.insert(*referenceable);
                     } else {
                         let reachable_names: Vec<_> = reachable_map.keys().collect();
-                        errors.push(ResolveError::custom(*span, format!("Cannot find variable '{}' for text interpolation. Available: {:?}", var, reachable_names)));
+                        errors.push(ResolveError::custom(
+                            *span,
+                            format!(
+                                "Cannot find variable '{}' for text interpolation. Available: {:?}",
+                                var, reachable_names
+                            ),
+                        ));
                     }
                 }
             }
@@ -718,20 +761,21 @@ fn resolve_pattern_references<'code>(
     match pattern {
         Pattern::Alias { name } => {
             // Pattern::Alias in WHEN/WHILE references an existing variable for comparison
-            let reachable: BTreeMap<&str, Referenceable> = reachable_referenceables
-                .iter()
-                .filter_map(|(name, referenceables)| {
-                    referenceables.iter().rev().enumerate().find_map(
-                        |(index, referenceable)| {
-                            if index == 0 && Some(referenceable.name) == parent_name {
-                                None
-                            } else {
-                                Some((referenceable.name, *referenceable))
-                            }
-                        },
-                    )
-                })
-                .collect();
+            let reachable: BTreeMap<&str, Referenceable> =
+                reachable_referenceables
+                    .iter()
+                    .filter_map(|(name, referenceables)| {
+                        referenceables.iter().rev().enumerate().find_map(
+                            |(index, referenceable)| {
+                                if index == 0 && Some(referenceable.name) == parent_name {
+                                    None
+                                } else {
+                                    Some((referenceable.name, *referenceable))
+                                }
+                            },
+                        )
+                    })
+                    .collect();
             if let Some(referenced) = reachable.get(name).copied() {
                 all_referenced.insert(referenced);
             }
@@ -740,28 +784,63 @@ fn resolve_pattern_references<'code>(
         }
         Pattern::List { items } => {
             for item in items {
-                resolve_pattern_references(item, span, reachable_referenceables, parent_name, errors, all_referenced);
+                resolve_pattern_references(
+                    item,
+                    span,
+                    reachable_referenceables,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
             }
         }
         Pattern::Object { variables } => {
             for var in variables {
                 if let Some(ref value) = var.value {
-                    resolve_pattern_references(value, span, reachable_referenceables, parent_name, errors, all_referenced);
+                    resolve_pattern_references(
+                        value,
+                        span,
+                        reachable_referenceables,
+                        parent_name,
+                        errors,
+                        all_referenced,
+                    );
                 }
             }
         }
         Pattern::TaggedObject { variables, .. } => {
             for var in variables {
                 if let Some(ref value) = var.value {
-                    resolve_pattern_references(value, span, reachable_referenceables, parent_name, errors, all_referenced);
+                    resolve_pattern_references(
+                        value,
+                        span,
+                        reachable_referenceables,
+                        parent_name,
+                        errors,
+                        all_referenced,
+                    );
                 }
             }
         }
         Pattern::Map { entries } => {
             for entry in entries {
-                resolve_pattern_references(&entry.key, span, reachable_referenceables, parent_name, errors, all_referenced);
+                resolve_pattern_references(
+                    &entry.key,
+                    span,
+                    reachable_referenceables,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
                 if let Some(ref value) = entry.value {
-                    resolve_pattern_references(value, span, reachable_referenceables, parent_name, errors, all_referenced);
+                    resolve_pattern_references(
+                        value,
+                        span,
+                        reachable_referenceables,
+                        parent_name,
+                        errors,
+                        all_referenced,
+                    );
                 }
             }
         }
@@ -792,7 +871,14 @@ fn collect_pattern_bindings<'code>(
         Pattern::Object { variables } => {
             for var in variables {
                 // The variable name itself is a binding
-                bindings.push((var.name, Referenceable { name: var.name, span, level }));
+                bindings.push((
+                    var.name,
+                    Referenceable {
+                        name: var.name,
+                        span,
+                        level,
+                    },
+                ));
                 // If there's a nested pattern, collect its bindings too
                 if let Some(ref value) = var.value {
                     bindings.extend(collect_pattern_bindings(value, span, level));
@@ -802,7 +888,14 @@ fn collect_pattern_bindings<'code>(
         Pattern::TaggedObject { variables, .. } => {
             for var in variables {
                 // The variable name itself is a binding
-                bindings.push((var.name, Referenceable { name: var.name, span, level }));
+                bindings.push((
+                    var.name,
+                    Referenceable {
+                        name: var.name,
+                        span,
+                        level,
+                    },
+                ));
                 // If there's a nested pattern, collect its bindings too
                 if let Some(ref value) = var.value {
                     bindings.extend(collect_pattern_bindings(value, span, level));

@@ -6,11 +6,11 @@
 
 use std::collections::HashMap;
 
+use crate::parser::Span;
 use crate::parser::static_expression::{
     Alias, Argument, ArithmeticOperator, Comparator, Expression, Literal, Spanned, TextPart,
     Variable,
 };
-use crate::parser::Span;
 
 /// Stored function definition for inlining at call sites.
 #[derive(Clone)]

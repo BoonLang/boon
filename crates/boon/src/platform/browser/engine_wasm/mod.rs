@@ -3,20 +3,20 @@
 //! This module is gated behind the `engine-wasm` feature flag.
 //! Pipeline: source → parse → IR lowering → WASM codegen → runtime instantiation → bridge UI
 
+pub mod bridge;
+mod codegen;
 pub mod ir;
 mod lower;
-mod codegen;
-pub mod runtime;
-pub mod bridge;
 mod persistence;
+pub mod runtime;
 
 use std::rc::Rc;
 
 use zoon::*;
 
 use crate::parser::{
-    lexer, parser, reset_expression_depth, resolve_references, span_at,
-    static_expression, SourceCode, Token,
+    SourceCode, Token, lexer, parser, reset_expression_depth, resolve_references, span_at,
+    static_expression,
 };
 
 pub use persistence::clear_wasm_persisted_states;
@@ -26,12 +26,10 @@ pub use persistence::clear_wasm_persisted_states;
 pub fn run_wasm(source: &str) -> RawElOrText {
     match compile_and_run(source, true) {
         Ok(element) => element,
-        Err(msg) => {
-            El::new()
-                .s(Font::new().color(color!("LightCoral")))
-                .child(msg)
-                .unify()
-        }
+        Err(msg) => El::new()
+            .s(Font::new().color(color!("LightCoral")))
+            .child(msg)
+            .unify(),
     }
 }
 
@@ -43,8 +41,12 @@ fn compile_and_run(source: &str, restore_persistence: bool) -> Result<RawElOrTex
     let wasm_output = codegen::emit_wasm(&program);
 
     // 3. Instantiate WASM module with host imports.
-    let instance = runtime::WasmInstance::new(&wasm_output.wasm_bytes, program.clone(), wasm_output.text_patterns)
-        .map_err(|e| format!("WASM instantiation failed: {}", e))?;
+    let instance = runtime::WasmInstance::new(
+        &wasm_output.wasm_bytes,
+        program.clone(),
+        wasm_output.text_patterns,
+    )
+    .map_err(|e| format!("WASM instantiation failed: {}", e))?;
 
     // 4. Wrap in Rc early (needed for router setup).
     let instance = Rc::new(instance);
@@ -53,7 +55,8 @@ fn compile_and_run(source: &str, restore_persistence: bool) -> Result<RawElOrTex
     bridge::setup_router(&program, &instance);
 
     // 6. Call init() to set initial cell values.
-    instance.call_init()
+    instance
+        .call_init()
         .map_err(|e| format!("init() failed: {}", e))?;
 
     // 7. Load persisted snapshot (only on page refresh, not on re-run).
@@ -112,10 +115,7 @@ fn format_errors(source: &str, errors: &[lower::CompileError]) -> String {
         let result = Report::build(ReportKind::Error, (filename, span.clone()))
             .with_config(Config::default().with_color(false))
             .with_message(&err.message)
-            .with_label(
-                Label::new((filename, span))
-                    .with_message(&err.message),
-            )
+            .with_label(Label::new((filename, span)).with_message(&err.message))
             .finish()
             .write((filename, Source::from(source)), &mut buf);
 
@@ -125,7 +125,10 @@ fn format_errors(source: &str, errors: &[lower::CompileError]) -> String {
             }
         } else {
             // Fallback if ariadne fails.
-            out.push_str(&format!("[{}-{}] {}\n", err.span.start, err.span.end, err.message));
+            out.push_str(&format!(
+                "[{}-{}] {}\n",
+                err.span.start, err.span.end, err.message
+            ));
         }
     }
     out

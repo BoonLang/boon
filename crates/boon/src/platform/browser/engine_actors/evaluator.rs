@@ -10,13 +10,14 @@ use ulid::Ulid;
 use zoon::futures_channel::oneshot;
 use zoon::futures_util::future;
 use zoon::futures_util::stream::{self, LocalBoxStream};
-use zoon::{Stream, StreamExt, SinkExt, mpsc, Task, TaskHandle};
+use zoon::{SinkExt, Stream, StreamExt, Task, TaskHandle, mpsc};
 
-use crate::parser::{
-    Persistence, PersistenceId, PersistenceStatus, Scope, SourceCode, Span, span_at, static_expression, lexer, parser, resolve_references, Token, Spanned,
-};
 use super::super::api;
 use super::engine::*;
+use crate::parser::{
+    Persistence, PersistenceId, PersistenceStatus, Scope, SourceCode, Span, Spanned, Token, lexer,
+    parser, resolve_references, span_at, static_expression,
+};
 
 /// Creates a persistence-wrapped stream for a variable.
 ///
@@ -47,7 +48,8 @@ fn create_variable_persistence_stream(
     // 2. Inside HOLD body (sequential_processing) - HOLD handles state persistence;
     //    variables inside HOLD body are recreated each iteration with fresh values
     if value_changed || actor_context.sequential_processing {
-        return source_actor.stream()
+        return source_actor
+            .stream()
             .then(move |value| {
                 let storage = storage.clone();
                 async move {
@@ -60,26 +62,33 @@ fn create_variable_persistence_stream(
 
     // Use unfold to manage state: first load stored value, then forward source
     // Returns Option<Value> so we can skip emissions (None) when needed
-    stream::unfold(
-        PersistenceState::LoadingStored,
-        move |state| {
-            let storage = storage.clone();
-            let source_actor = source_actor.clone();
-            let construct_context = construct_context.clone();
-            let actor_context = actor_context.clone();
+    stream::unfold(PersistenceState::LoadingStored, move |state| {
+        let storage = storage.clone();
+        let source_actor = source_actor.clone();
+        let construct_context = construct_context.clone();
+        let actor_context = actor_context.clone();
 
-            async move {
-                match state {
-                    PersistenceState::LoadingStored => {
-                        // Try to load stored value
-                        let loaded: Option<zoon::serde_json::Value> = storage.clone().load_state(scoped_id).await;
+        async move {
+            match state {
+                PersistenceState::LoadingStored => {
+                    // Try to load stored value
+                    let loaded: Option<zoon::serde_json::Value> =
+                        storage.clone().load_state(scoped_id).await;
 
-                        let restored_value = loaded.and_then(|json| {
-                            match &json {
-                                zoon::serde_json::Value::String(_) |
-                                zoon::serde_json::Value::Number(_) |
-                                zoon::serde_json::Value::Bool(_) |
-                                zoon::serde_json::Value::Null => {
+                    let restored_value = loaded.and_then(|json| {
+                        match &json {
+                            zoon::serde_json::Value::String(_)
+                            | zoon::serde_json::Value::Number(_)
+                            | zoon::serde_json::Value::Bool(_)
+                            | zoon::serde_json::Value::Null => Some(Value::from_json(
+                                &json,
+                                ConstructId::new("variable restored from storage"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                actor_context.clone(),
+                            )),
+                            zoon::serde_json::Value::Object(obj) => {
+                                if obj.len() == 1 && obj.contains_key("_tag") {
                                     Some(Value::from_json(
                                         &json,
                                         ConstructId::new("variable restored from storage"),
@@ -87,68 +96,77 @@ fn create_variable_persistence_stream(
                                         ValueIdempotencyKey::new(),
                                         actor_context.clone(),
                                     ))
-                                }
-                                zoon::serde_json::Value::Object(obj) => {
-                                    if obj.len() == 1 && obj.contains_key("_tag") {
-                                        Some(Value::from_json(
-                                            &json,
-                                            ConstructId::new("variable restored from storage"),
-                                            construct_context.clone(),
-                                            ValueIdempotencyKey::new(),
-                                            actor_context.clone(),
-                                        ))
-                                    } else {
-                                        None
-                                    }
-                                }
-                                zoon::serde_json::Value::Array(_) => {
-                                    // Don't restore Lists from variable persistence.
-                                    // Restoring creates a NEW List disconnected from the reactive chain.
-                                    // List items need to be persisted at the List actor level instead.
+                                } else {
                                     None
                                 }
                             }
-                        });
-
-                        let mut source_subscription = source_actor.stream();
-
-                        if let Some(value) = restored_value {
-                            // Emit restored value, then skip first source emission
-                            Some((Some(value), PersistenceState::SkipFirstSource {
-                                source_subscription,
-                                storage,
-                            }))
-                        } else {
-                            // No stored value, wait for first source emission and forward it
-                            let first_value = source_subscription.next().await?;
-                            save_value_if_applicable(&first_value, scoped_id, &storage).await;
-                            Some((Some(first_value), PersistenceState::ForwardingSource {
-                                source_subscription,
-                                storage,
-                            }))
+                            zoon::serde_json::Value::Array(_) => {
+                                // Don't restore Lists from variable persistence.
+                                // Restoring creates a NEW List disconnected from the reactive chain.
+                                // List items need to be persisted at the List actor level instead.
+                                None
+                            }
                         }
+                    });
+
+                    let mut source_subscription = source_actor.stream();
+
+                    if let Some(value) = restored_value {
+                        // Emit restored value, then skip first source emission
+                        Some((
+                            Some(value),
+                            PersistenceState::SkipFirstSource {
+                                source_subscription,
+                                storage,
+                            },
+                        ))
+                    } else {
+                        // No stored value, wait for first source emission and forward it
+                        let first_value = source_subscription.next().await?;
+                        save_value_if_applicable(&first_value, scoped_id, &storage).await;
+                        Some((
+                            Some(first_value),
+                            PersistenceState::ForwardingSource {
+                                source_subscription,
+                                storage,
+                            },
+                        ))
                     }
-                    PersistenceState::SkipFirstSource { mut source_subscription, storage } => {
-                        // Skip first emission from source (it's the initial empty state)
-                        // Return None to skip this iteration, but continue with ForwardingSource
-                        let _ = source_subscription.next().await?;
-                        Some((None, PersistenceState::ForwardingSource {
+                }
+                PersistenceState::SkipFirstSource {
+                    mut source_subscription,
+                    storage,
+                } => {
+                    // Skip first emission from source (it's the initial empty state)
+                    // Return None to skip this iteration, but continue with ForwardingSource
+                    let _ = source_subscription.next().await?;
+                    Some((
+                        None,
+                        PersistenceState::ForwardingSource {
                             source_subscription,
                             storage,
-                        }))
-                    }
-                    PersistenceState::ForwardingSource { mut source_subscription, storage } => {
-                        let value = source_subscription.next().await?;
-                        save_value_if_applicable(&value, scoped_id, &storage).await;
-                        Some((Some(value), PersistenceState::ForwardingSource {
+                        },
+                    ))
+                }
+                PersistenceState::ForwardingSource {
+                    mut source_subscription,
+                    storage,
+                } => {
+                    let value = source_subscription.next().await?;
+                    save_value_if_applicable(&value, scoped_id, &storage).await;
+                    Some((
+                        Some(value),
+                        PersistenceState::ForwardingSource {
                             source_subscription,
                             storage,
-                        }))
-                    }
+                        },
+                    ))
                 }
             }
         }
-    ).filter_map(future::ready).right_stream()
+    })
+    .filter_map(future::ready)
+    .right_stream()
 }
 
 enum PersistenceState {
@@ -163,7 +181,11 @@ enum PersistenceState {
     },
 }
 
-async fn save_value_if_applicable(value: &Value, scoped_id: PersistenceId, storage: &ConstructStorage) {
+async fn save_value_if_applicable(
+    value: &Value,
+    scoped_id: PersistenceId,
+    storage: &ConstructStorage,
+) {
     match value {
         // Don't persist Lists at variable level - they need List-actor-level persistence
         // Restoring a List from JSON creates a disconnected List
@@ -581,7 +603,8 @@ impl EvaluationState {
             return Arc::new(HashMap::new());
         }
         // Merge: clone parent + insert local overrides
-        let mut merged = ctx.function_registry_snapshot
+        let mut merged = ctx
+            .function_registry_snapshot
             .as_ref()
             .map(|s| (**s).clone())
             .unwrap_or_default();
@@ -691,7 +714,6 @@ fn schedule_expression(
         // ============================================================
         // IMMEDIATE VALUES (no sub-expressions to evaluate)
         // ============================================================
-
         static_expression::Expression::Variable(_) => {
             return Err("Failed to evaluate the variable in this context.".to_string());
         }
@@ -756,7 +778,6 @@ fn schedule_expression(
         // ============================================================
         // COLLECTIONS (schedule items first, then build)
         // ============================================================
-
         static_expression::Expression::List { items } => {
             // Allocate slots for each item
             let item_slots: Vec<SlotId> = items.iter().map(|_| state.alloc_slot()).collect();
@@ -799,7 +820,6 @@ fn schedule_expression(
         // ============================================================
         // BINARY OPERATIONS (schedule operands first, then combine)
         // ============================================================
-
         static_expression::Expression::ArithmeticOperator(op) => {
             schedule_arithmetic_op(state, op, span, persistence, ctx, result_slot)?;
         }
@@ -811,17 +831,10 @@ fn schedule_expression(
         // ============================================================
         // ALIAS (variable/parameter references)
         // ============================================================
-
         static_expression::Expression::Alias(alias) => {
             // For now, fall back to the recursive function for complex alias handling
             // This will be migrated in a future phase
-            let actor = evaluate_alias_immediate(
-                alias,
-                span,
-                persistence,
-                persistence_id,
-                ctx,
-            )?;
+            let actor = evaluate_alias_immediate(alias, span, persistence, persistence_id, ctx)?;
             state.store(result_slot, actor);
         }
 
@@ -829,7 +842,6 @@ fn schedule_expression(
         // CONTROL FLOW (THEN, WHEN, WHILE, HOLD)
         // These are special because their bodies are evaluated at runtime
         // ============================================================
-
         static_expression::Expression::Then { body } => {
             // THEN creates an actor that evaluates body at runtime for each piped value
             // We can build it immediately since the body is evaluated lazily
@@ -873,7 +885,10 @@ fn schedule_expression(
 
         static_expression::Expression::Hold { state_param, body } => {
             // HOLD needs the piped value for initial state, then body is evaluated at runtime
-            let piped = ctx.actor_context.piped.clone()
+            let piped = ctx
+                .actor_context
+                .piped
+                .clone()
                 .ok_or("HOLD requires a piped value for initial state")?;
 
             // Allocate slot before pushing to avoid double borrow
@@ -895,7 +910,6 @@ fn schedule_expression(
         // ============================================================
         // PIPE (chain of expressions)
         // ============================================================
-
         static_expression::Expression::Pipe { from, to } => {
             // Flatten nested pipes into a chain
             let mut steps = Vec::new();
@@ -916,7 +930,11 @@ fn schedule_expression(
             let steps_len = steps.len();
             for (i, step) in steps.into_iter().enumerate() {
                 let is_last = i == steps_len - 1;
-                let step_slot = if is_last { result_slot } else { state.alloc_slot() };
+                let step_slot = if is_last {
+                    result_slot
+                } else {
+                    state.alloc_slot()
+                };
 
                 pipe_items.push((step, prev_slot, step_slot));
                 prev_slot = step_slot;
@@ -940,7 +958,6 @@ fn schedule_expression(
         // ============================================================
         // BLOCK (local variables + output)
         // ============================================================
-
         static_expression::Expression::Block { variables, output } => {
             // Build object from variables first, then evaluate output
             // Use separate slots for the object and the output expression
@@ -970,7 +987,10 @@ fn schedule_expression(
                 // FIX: Include LINK variables to prevent span-based ReferenceConnector overwrites
                 // when multiple Objects are created from the same function definition
                 let forwarding_actor = if is_referenced {
-                    let var_persistence_id = var_persistence.as_ref().expect("variable persistence should be set by resolver").id;
+                    let var_persistence_id = var_persistence
+                        .as_ref()
+                        .expect("variable persistence should be set by resolver")
+                        .id;
                     let (actor, sender) = create_actor_forwarding(
                         ConstructInfo::new(
                             format!("PersistenceId: {}", var_persistence_id),
@@ -1057,7 +1077,6 @@ fn schedule_expression(
         // ============================================================
         // OBJECTS (schedule values first, then build)
         // ============================================================
-
         static_expression::Expression::Object(object) => {
             // First pass: collect variable data and allocate slots (don't schedule yet)
             let mut variable_data = Vec::new();
@@ -1079,7 +1098,10 @@ fn schedule_expression(
                 // FIX: Include LINK variables to prevent span-based ReferenceConnector overwrites
                 // when multiple Objects are created from the same function definition
                 let forwarding_actor = if is_referenced {
-                    let var_persistence_id = var_persistence.as_ref().expect("variable persistence should be set by resolver").id;
+                    let var_persistence_id = var_persistence
+                        .as_ref()
+                        .expect("variable persistence should be set by resolver")
+                        .id;
                     let (actor, sender) = create_actor_forwarding(
                         ConstructInfo::new(
                             format!("PersistenceId: {}", var_persistence_id),
@@ -1143,7 +1165,12 @@ fn schedule_expression(
             // First: schedule NON-referenced fields (processed last due to LIFO)
             for (var_expr, var_slot, is_referenced) in vars_to_schedule.iter() {
                 if !*is_referenced {
-                    schedule_expression(state, var_expr.clone(), ctx_with_locals.clone(), *var_slot)?;
+                    schedule_expression(
+                        state,
+                        var_expr.clone(),
+                        ctx_with_locals.clone(),
+                        *var_slot,
+                    )?;
                 }
             }
             // Last: schedule referenced fields (processed first due to LIFO)
@@ -1179,7 +1206,10 @@ fn schedule_expression(
                 // FIX: Include LINK variables to prevent span-based ReferenceConnector overwrites
                 // when multiple Objects are created from the same function definition
                 let forwarding_actor = if is_referenced {
-                    let var_persistence_id = var_persistence.as_ref().expect("variable persistence should be set by resolver").id;
+                    let var_persistence_id = var_persistence
+                        .as_ref()
+                        .expect("variable persistence should be set by resolver")
+                        .id;
                     let (actor, sender) = create_actor_forwarding(
                         ConstructInfo::new(
                             format!("PersistenceId: {}", var_persistence_id),
@@ -1244,7 +1274,12 @@ fn schedule_expression(
             // First: schedule NON-referenced fields (processed last due to LIFO)
             for (var_expr, var_slot, is_referenced) in vars_to_schedule.iter() {
                 if !*is_referenced {
-                    schedule_expression(state, var_expr.clone(), ctx_with_locals.clone(), *var_slot)?;
+                    schedule_expression(
+                        state,
+                        var_expr.clone(),
+                        ctx_with_locals.clone(),
+                        *var_slot,
+                    )?;
                 }
             }
             // Last: schedule referenced fields (processed first due to LIFO)
@@ -1258,7 +1293,6 @@ fn schedule_expression(
         // ============================================================
         // LATEST (merge multiple streams)
         // ============================================================
-
         static_expression::Expression::Latest { inputs } => {
             let item_slots: Vec<SlotId> = inputs.iter().map(|_| state.alloc_slot()).collect();
 
@@ -1278,7 +1312,6 @@ fn schedule_expression(
         // ============================================================
         // FUNCTION CALL
         // ============================================================
-
         static_expression::Expression::FunctionCall { path, arguments } => {
             let path_strs: Vec<String> = path.iter().map(|s| s.to_string()).collect();
             let path_strs_ref: Vec<&str> = path_strs.iter().map(|s| s.as_str()).collect();
@@ -1286,7 +1319,12 @@ fn schedule_expression(
             // Special handling for List binding functions (map, retain, remove, every, any, sort_by)
             // These need the unevaluated expression to evaluate per-item with bindings
             match path_strs_ref.as_slice() {
-                ["List", "map"] | ["List", "retain"] | ["List", "remove"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] => {
+                ["List", "map"]
+                | ["List", "retain"]
+                | ["List", "remove"]
+                | ["List", "every"]
+                | ["List", "any"]
+                | ["List", "sort_by"] => {
                     // Handle List binding functions specially - don't pre-evaluate transform expression
                     if let Some(actor) = build_list_binding_function(
                         &path_strs,
@@ -1365,7 +1403,8 @@ fn schedule_expression(
                             arg_locals.insert(arg_span, forwarding_actor.clone());
                             // Also register with ReferenceConnector for backward compatibility
                             if let Some(ref_connector) = ctx.try_reference_connector() {
-                                ref_connector.register_referenceable(arg_span, forwarding_actor.clone());
+                                ref_connector
+                                    .register_referenceable(arg_span, forwarding_actor.clone());
                             }
                             forwarding_connections.push((arg_slot, sender));
                         }
@@ -1381,7 +1420,10 @@ fn schedule_expression(
                                 arg_slots.push((arg_name, arg_slot));
                                 passed_slot = Some(arg_slot);
                             } else {
-                                return Err(format!("PASS argument requires piped value at {:?}", span));
+                                return Err(format!(
+                                    "PASS argument requires piped value at {:?}",
+                                    span
+                                ));
                             }
                         }
                     }
@@ -1424,7 +1466,8 @@ fn schedule_expression(
                     // Collect LATEST args that need persistence wrapping.
                     // Only LATEST expressions need value persistence here - other expressions
                     // (Objects, Literals, etc.) handle their own persistence internally.
-                    let latest_args_with_persistence: Vec<_> = args_to_schedule.iter()
+                    let latest_args_with_persistence: Vec<_> = args_to_schedule
+                        .iter()
                         .filter_map(|(expr, slot)| {
                             // Only wrap LATEST expressions with value persistence
                             if matches!(expr.node, static_expression::Expression::Latest { .. }) {
@@ -1440,12 +1483,21 @@ fn schedule_expression(
 
                     // DEBUG: Log LATEST args with persistence
                     if LOG_DEBUG && !latest_args_with_persistence.is_empty() {
-                        zoon::println!("[DEBUG] FunctionCall has {} LATEST args with persistence", latest_args_with_persistence.len());
+                        zoon::println!(
+                            "[DEBUG] FunctionCall has {} LATEST args with persistence",
+                            latest_args_with_persistence.len()
+                        );
                     }
 
                     // Push persistence wrappers for LATEST args
                     for (arg_slot, persistence_id, value_changed) in latest_args_with_persistence {
-                        if LOG_DEBUG { zoon::println!("[DEBUG] Pushing WrapWithPersistence for LATEST slot {:?} with id {}", arg_slot, persistence_id); }
+                        if LOG_DEBUG {
+                            zoon::println!(
+                                "[DEBUG] Pushing WrapWithPersistence for LATEST slot {:?} with id {}",
+                                arg_slot,
+                                persistence_id
+                            );
+                        }
                         state.push(WorkItem::WrapWithPersistence {
                             source_slot: arg_slot,
                             persistence_id,
@@ -1458,7 +1510,12 @@ fn schedule_expression(
                     // Schedule argument expressions last (will be processed first due to LIFO)
                     // Use ctx_with_arg_locals so subsequent args can resolve references to earlier args
                     for (arg_expr, arg_slot) in args_to_schedule {
-                        schedule_expression(state, arg_expr, ctx_with_arg_locals.clone(), arg_slot)?;
+                        schedule_expression(
+                            state,
+                            arg_expr,
+                            ctx_with_arg_locals.clone(),
+                            arg_slot,
+                        )?;
                     }
                 }
             }
@@ -1467,23 +1524,19 @@ fn schedule_expression(
         // ============================================================
         // TEXT LITERAL (text with interpolations)
         // ============================================================
-
         static_expression::Expression::TextLiteral { parts } => {
-            let actor = build_text_literal_actor(
-                parts,
-                span,
-                persistence,
-                persistence_id,
-                ctx,
-            )?;
+            let actor = build_text_literal_actor(parts, span, persistence, persistence_id, ctx)?;
             state.store(result_slot, actor);
         }
 
         // ============================================================
         // FUNCTION DEFINITION (registers function for later use)
         // ============================================================
-
-        static_expression::Expression::Function { name, parameters, body } => {
+        static_expression::Expression::Function {
+            name,
+            parameters,
+            body,
+        } => {
             // Register the function in the evaluation state's registry
             let func_name = name.to_string();
             let param_names: Vec<String> = parameters.iter().map(|p| p.node.to_string()).collect();
@@ -1514,45 +1567,33 @@ fn schedule_expression(
         // ============================================================
         // LINK SETTER (sets a link on an object)
         // ============================================================
-
         static_expression::Expression::LinkSetter { alias } => {
-            let actor = build_link_setter_actor(
-                alias,
-                span,
-                persistence,
-                persistence_id,
-                ctx,
-            )?;
+            let actor = build_link_setter_actor(alias, span, persistence, persistence_id, ctx)?;
             state.store(result_slot, actor);
         }
-
 
         // ============================================================
         // FIELD ACCESS (.field.subfield at pipe position)
         // Equivalent to WHILE { value => value.field.subfield }
         // ============================================================
-
         static_expression::Expression::FieldAccess { path } => {
             // Convert StrSlice path to Vec<String> for the function
             let path_strings: Vec<String> = path.iter().map(|s| s.to_string()).collect();
-            let actor = build_field_access_actor(
-                path_strings,
-                span,
-                persistence,
-                persistence_id,
-                ctx,
-            )?;
+            let actor =
+                build_field_access_actor(path_strings, span, persistence, persistence_id, ctx)?;
             state.store(result_slot, actor);
         }
 
         // ============================================================
         // TODO: More expression types to be added
         // ============================================================
-
         _ => {
             // For now, return an error for unsupported expressions
             // In the final version, all expression types will be handled
-            return Err(format!("Expression type not yet supported in stack-safe evaluator: {:?}", span));
+            return Err(format!(
+                "Expression type not yet supported in stack-safe evaluator: {:?}",
+                span
+            ));
         }
     }
 
@@ -1582,21 +1623,64 @@ fn schedule_arithmetic_op(
     result_slot: SlotId,
 ) -> Result<(), String> {
     match op {
-        static_expression::ArithmeticOperator::Add { operand_a, operand_b } => {
-            schedule_binary_op(state, BinaryOpKind::Add, *operand_a, *operand_b, span, persistence, ctx, result_slot)
-        }
-        static_expression::ArithmeticOperator::Subtract { operand_a, operand_b } => {
-            schedule_binary_op(state, BinaryOpKind::Subtract, *operand_a, *operand_b, span, persistence, ctx, result_slot)
-        }
-        static_expression::ArithmeticOperator::Multiply { operand_a, operand_b } => {
-            schedule_binary_op(state, BinaryOpKind::Multiply, *operand_a, *operand_b, span, persistence, ctx, result_slot)
-        }
-        static_expression::ArithmeticOperator::Divide { operand_a, operand_b } => {
-            schedule_binary_op(state, BinaryOpKind::Divide, *operand_a, *operand_b, span, persistence, ctx, result_slot)
-        }
+        static_expression::ArithmeticOperator::Add {
+            operand_a,
+            operand_b,
+        } => schedule_binary_op(
+            state,
+            BinaryOpKind::Add,
+            *operand_a,
+            *operand_b,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        ),
+        static_expression::ArithmeticOperator::Subtract {
+            operand_a,
+            operand_b,
+        } => schedule_binary_op(
+            state,
+            BinaryOpKind::Subtract,
+            *operand_a,
+            *operand_b,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        ),
+        static_expression::ArithmeticOperator::Multiply {
+            operand_a,
+            operand_b,
+        } => schedule_binary_op(
+            state,
+            BinaryOpKind::Multiply,
+            *operand_a,
+            *operand_b,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        ),
+        static_expression::ArithmeticOperator::Divide {
+            operand_a,
+            operand_b,
+        } => schedule_binary_op(
+            state,
+            BinaryOpKind::Divide,
+            *operand_a,
+            *operand_b,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        ),
         static_expression::ArithmeticOperator::Negate { operand } => {
             // Negate is implemented as multiply by -1
-            let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
+            let persistence_id = persistence
+                .as_ref()
+                .expect("persistence should be set by resolver")
+                .id;
             let neg_one_slot = state.alloc_slot();
             let operand_slot = state.alloc_slot();
 
@@ -1639,24 +1723,84 @@ fn schedule_comparator(
     result_slot: SlotId,
 ) -> Result<(), String> {
     match cmp {
-        static_expression::Comparator::Equal { operand_a, operand_b } => {
-            schedule_binary_op(state, BinaryOpKind::Equal, *operand_a, *operand_b, span, persistence, ctx, result_slot)
-        }
-        static_expression::Comparator::NotEqual { operand_a, operand_b } => {
-            schedule_binary_op(state, BinaryOpKind::NotEqual, *operand_a, *operand_b, span, persistence, ctx, result_slot)
-        }
-        static_expression::Comparator::Greater { operand_a, operand_b } => {
-            schedule_binary_op(state, BinaryOpKind::Greater, *operand_a, *operand_b, span, persistence, ctx, result_slot)
-        }
-        static_expression::Comparator::GreaterOrEqual { operand_a, operand_b } => {
-            schedule_binary_op(state, BinaryOpKind::GreaterOrEqual, *operand_a, *operand_b, span, persistence, ctx, result_slot)
-        }
-        static_expression::Comparator::Less { operand_a, operand_b } => {
-            schedule_binary_op(state, BinaryOpKind::Less, *operand_a, *operand_b, span, persistence, ctx, result_slot)
-        }
-        static_expression::Comparator::LessOrEqual { operand_a, operand_b } => {
-            schedule_binary_op(state, BinaryOpKind::LessOrEqual, *operand_a, *operand_b, span, persistence, ctx, result_slot)
-        }
+        static_expression::Comparator::Equal {
+            operand_a,
+            operand_b,
+        } => schedule_binary_op(
+            state,
+            BinaryOpKind::Equal,
+            *operand_a,
+            *operand_b,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        ),
+        static_expression::Comparator::NotEqual {
+            operand_a,
+            operand_b,
+        } => schedule_binary_op(
+            state,
+            BinaryOpKind::NotEqual,
+            *operand_a,
+            *operand_b,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        ),
+        static_expression::Comparator::Greater {
+            operand_a,
+            operand_b,
+        } => schedule_binary_op(
+            state,
+            BinaryOpKind::Greater,
+            *operand_a,
+            *operand_b,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        ),
+        static_expression::Comparator::GreaterOrEqual {
+            operand_a,
+            operand_b,
+        } => schedule_binary_op(
+            state,
+            BinaryOpKind::GreaterOrEqual,
+            *operand_a,
+            *operand_b,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        ),
+        static_expression::Comparator::Less {
+            operand_a,
+            operand_b,
+        } => schedule_binary_op(
+            state,
+            BinaryOpKind::Less,
+            *operand_a,
+            *operand_b,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        ),
+        static_expression::Comparator::LessOrEqual {
+            operand_a,
+            operand_b,
+        } => schedule_binary_op(
+            state,
+            BinaryOpKind::LessOrEqual,
+            *operand_a,
+            *operand_b,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        ),
     }
 }
 
@@ -1693,21 +1837,37 @@ fn schedule_binary_op(
 }
 
 /// Process a single work item from the queue.
-fn process_work_item(
-    state: &mut EvaluationState,
-    item: WorkItem,
-) -> Result<(), String> {
+fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), String> {
     match item {
-        WorkItem::Evaluate { expr, ctx, result_slot } => {
+        WorkItem::Evaluate {
+            expr,
+            ctx,
+            result_slot,
+        } => {
             // This delegates back to schedule_expression
             schedule_expression(state, expr, ctx, result_slot)?;
         }
 
-        WorkItem::BinaryOp { op, operand_a_slot, operand_b_slot, span, persistence, ctx, result_slot } => {
+        WorkItem::BinaryOp {
+            op,
+            operand_a_slot,
+            operand_b_slot,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        } => {
             // If either operand slot is empty, produce nothing
-            let Some(a) = state.get(operand_a_slot) else { return Ok(()); };
-            let Some(b) = state.get(operand_b_slot) else { return Ok(()); };
-            let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
+            let Some(a) = state.get(operand_a_slot) else {
+                return Ok(());
+            };
+            let Some(b) = state.get(operand_b_slot) else {
+                return Ok(());
+            };
+            let persistence_id = persistence
+                .as_ref()
+                .expect("persistence should be set by resolver")
+                .id;
 
             let construct_info = ConstructInfo::new(
                 format!("PersistenceId: {persistence_id}"),
@@ -1715,16 +1875,33 @@ fn process_work_item(
                 format!("{span}; BinaryOp {:?}", op),
             );
 
-            let actor = create_binary_op_actor(op, construct_info, ctx.construct_context, ctx.actor_context, a, b);
+            let actor = create_binary_op_actor(
+                op,
+                construct_info,
+                ctx.construct_context,
+                ctx.actor_context,
+                a,
+                b,
+            );
             state.store(result_slot, actor);
         }
 
-        WorkItem::BuildList { item_slots, span, persistence, ctx, result_slot } => {
+        WorkItem::BuildList {
+            item_slots,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        } => {
             // Collect items that have values (empty slots are ignored)
-            let items: Vec<_> = item_slots.iter()
+            let items: Vec<_> = item_slots
+                .iter()
                 .filter_map(|slot| state.get(*slot))
                 .collect();
-            let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
+            let persistence_id = persistence
+                .as_ref()
+                .expect("persistence should be set by resolver")
+                .id;
 
             let actor = List::new_arc_value_actor_with_persistence(
                 ConstructInfo::new(
@@ -1740,17 +1917,31 @@ fn process_work_item(
             state.store(result_slot, actor);
         }
 
-        WorkItem::BuildObject { variable_data, span, persistence, ctx, result_slot } => {
-            let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
+        WorkItem::BuildObject {
+            variable_data,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        } => {
+            let persistence_id = persistence
+                .as_ref()
+                .expect("persistence should be set by resolver")
+                .id;
 
             // Build variables
             let mut variables = Vec::new();
             for vd in variable_data.iter() {
-                let var_persistence_id = vd.persistence.as_ref().expect("persistence should be set by resolver").id;
+                let var_persistence_id = vd
+                    .persistence
+                    .as_ref()
+                    .expect("persistence should be set by resolver")
+                    .id;
                 let variable = if vd.is_link && vd.forwarding_actor.is_some() {
                     // LINK variable with forwarding actor (referenced by sibling field)
                     // Create the LINK and connect its value_actor to the forwarding actor
-                    let (forwarding_actor, forwarding_sender) = vd.forwarding_actor.as_ref().unwrap();
+                    let (forwarding_actor, forwarding_sender) =
+                        vd.forwarding_actor.as_ref().unwrap();
 
                     // First create a temporary LINK to get the connected sender and value_actor
                     let temp_link = Variable::new_link_arc(
@@ -1809,16 +2000,17 @@ fn process_work_item(
                 } else if let Some((forwarding_actor, sender)) = &vd.forwarding_actor {
                     // Use the pre-created forwarding actor for referenced fields
                     // Connect forwarding from source actor to forwarding actor
-                    let Some(source_actor) = state.get(vd.value_slot) else { continue; };
+                    let Some(source_actor) = state.get(vd.value_slot) else {
+                        continue;
+                    };
 
                     // connect_forwarding sends initial value asynchronously, then forwards async values
                     // Note: We create a 'static future by cloning source_actor into the async block
                     let source_actor_for_initial = source_actor.clone();
-                    let forwarding_loop = connect_forwarding(
-                        sender.clone(),
-                        source_actor.clone(),
-                        async move { source_actor_for_initial.current_value().await.ok() },
-                    );
+                    let forwarding_loop =
+                        connect_forwarding(sender.clone(), source_actor.clone(), async move {
+                            source_actor_for_initial.current_value().await.ok()
+                        });
                     Variable::new_arc_with_forwarding_loop(
                         ConstructInfo::new(
                             format!("PersistenceId: {}", var_persistence_id),
@@ -1834,7 +2026,9 @@ fn process_work_item(
                     )
                 } else {
                     // If value slot is empty, skip this variable
-                    let Some(value_actor) = state.get(vd.value_slot) else { continue; };
+                    let Some(value_actor) = state.get(vd.value_slot) else {
+                        continue;
+                    };
 
                     // Wrap with persistence: load stored value first, save each emitted value
                     let persistence_stream = create_variable_persistence_stream(
@@ -1891,7 +2085,11 @@ fn process_work_item(
                 if vd.is_link {
                     if let Some(sender) = variable.link_value_sender() {
                         if let Some(link_connector) = ctx.try_link_connector() {
-                            link_connector.register_link(vd.span, ctx.actor_context.scope.clone(), sender);
+                            link_connector.register_link(
+                                vd.span,
+                                ctx.actor_context.scope.clone(),
+                                sender,
+                            );
                         }
                     }
                 }
@@ -1913,16 +2111,31 @@ fn process_work_item(
             state.store(result_slot, actor);
         }
 
-        WorkItem::BuildTaggedObject { tag, variable_data, span, persistence, ctx, result_slot } => {
-            let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
+        WorkItem::BuildTaggedObject {
+            tag,
+            variable_data,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        } => {
+            let persistence_id = persistence
+                .as_ref()
+                .expect("persistence should be set by resolver")
+                .id;
 
             // Build variables
             let mut variables = Vec::new();
             for vd in variable_data.iter() {
-                let var_persistence_id = vd.persistence.as_ref().expect("persistence should be set by resolver").id;
+                let var_persistence_id = vd
+                    .persistence
+                    .as_ref()
+                    .expect("persistence should be set by resolver")
+                    .id;
                 let variable = if vd.is_link && vd.forwarding_actor.is_some() {
                     // LINK variable with forwarding actor (referenced by sibling field)
-                    let (forwarding_actor, forwarding_sender) = vd.forwarding_actor.as_ref().unwrap();
+                    let (forwarding_actor, forwarding_sender) =
+                        vd.forwarding_actor.as_ref().unwrap();
 
                     // First create a temporary LINK to get the connected sender and value_actor
                     let temp_link = Variable::new_link_arc(
@@ -1980,16 +2193,17 @@ fn process_work_item(
                 } else if let Some((forwarding_actor, sender)) = &vd.forwarding_actor {
                     // Use the pre-created forwarding actor for referenced fields
                     // Connect forwarding from source actor to forwarding actor
-                    let Some(source_actor) = state.get(vd.value_slot) else { continue; };
+                    let Some(source_actor) = state.get(vd.value_slot) else {
+                        continue;
+                    };
 
                     // connect_forwarding sends initial value asynchronously, then forwards async values
                     // Note: We create a 'static future by cloning source_actor into the async block
                     let source_actor_for_initial = source_actor.clone();
-                    let forwarding_loop = connect_forwarding(
-                        sender.clone(),
-                        source_actor.clone(),
-                        async move { source_actor_for_initial.current_value().await.ok() },
-                    );
+                    let forwarding_loop =
+                        connect_forwarding(sender.clone(), source_actor.clone(), async move {
+                            source_actor_for_initial.current_value().await.ok()
+                        });
                     Variable::new_arc_with_forwarding_loop(
                         ConstructInfo::new(
                             format!("PersistenceId: {}", var_persistence_id),
@@ -2005,7 +2219,9 @@ fn process_work_item(
                     )
                 } else {
                     // If value slot is empty, skip this variable
-                    let Some(value_actor) = state.get(vd.value_slot) else { continue; };
+                    let Some(value_actor) = state.get(vd.value_slot) else {
+                        continue;
+                    };
 
                     // Wrap with persistence: load stored value first, save each emitted value
                     let persistence_stream = create_variable_persistence_stream(
@@ -2062,7 +2278,11 @@ fn process_work_item(
                 if vd.is_link {
                     if let Some(sender) = variable.link_value_sender() {
                         if let Some(link_connector) = ctx.try_link_connector() {
-                            link_connector.register_link(vd.span, ctx.actor_context.scope.clone(), sender);
+                            link_connector.register_link(
+                                vd.span,
+                                ctx.actor_context.scope.clone(),
+                                sender,
+                            );
                         }
                     }
                 }
@@ -2085,12 +2305,22 @@ fn process_work_item(
             state.store(result_slot, actor);
         }
 
-        WorkItem::BuildLatest { input_slots, span, persistence, ctx, result_slot } => {
+        WorkItem::BuildLatest {
+            input_slots,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        } => {
             // Collect inputs that have values (empty slots are ignored)
-            let inputs: Vec<_> = input_slots.iter()
+            let inputs: Vec<_> = input_slots
+                .iter()
                 .filter_map(|slot| state.get(*slot))
                 .collect();
-            let _persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
+            let _persistence_id = persistence
+                .as_ref()
+                .expect("persistence should be set by resolver")
+                .id;
 
             let actor = LatestCombinator::new_arc_value_actor(
                 ConstructInfo::new(
@@ -2105,41 +2335,118 @@ fn process_work_item(
             state.store(result_slot, actor);
         }
 
-        WorkItem::BuildThen { piped_slot: _, body, span, persistence, ctx, result_slot } => {
-            let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
+        WorkItem::BuildThen {
+            piped_slot: _,
+            body,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        } => {
+            let persistence_id = persistence
+                .as_ref()
+                .expect("persistence should be set by resolver")
+                .id;
             let registry_snapshot = state.merged_registry_snapshot(&ctx);
-            let actor = build_then_actor(*body, span, persistence, persistence_id, ctx, registry_snapshot)?;
+            let actor = build_then_actor(
+                *body,
+                span,
+                persistence,
+                persistence_id,
+                ctx,
+                registry_snapshot,
+            )?;
             state.store(result_slot, actor);
         }
 
-        WorkItem::BuildWhen { piped_slot: _, arms, span, persistence, ctx, result_slot } => {
-            let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
+        WorkItem::BuildWhen {
+            piped_slot: _,
+            arms,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        } => {
+            let persistence_id = persistence
+                .as_ref()
+                .expect("persistence should be set by resolver")
+                .id;
             let registry_snapshot = state.merged_registry_snapshot(&ctx);
-            let actor = build_when_actor(arms, span, persistence, persistence_id, ctx, registry_snapshot)?;
+            let actor = build_when_actor(
+                arms,
+                span,
+                persistence,
+                persistence_id,
+                ctx,
+                registry_snapshot,
+            )?;
             state.store(result_slot, actor);
         }
 
-        WorkItem::BuildWhile { piped_slot: _, arms, span, persistence, ctx, result_slot } => {
-            let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
+        WorkItem::BuildWhile {
+            piped_slot: _,
+            arms,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        } => {
+            let persistence_id = persistence
+                .as_ref()
+                .expect("persistence should be set by resolver")
+                .id;
             let registry_snapshot = state.merged_registry_snapshot(&ctx);
-            let actor = build_while_actor(arms, span, persistence, persistence_id, ctx, registry_snapshot)?;
+            let actor = build_while_actor(
+                arms,
+                span,
+                persistence,
+                persistence_id,
+                ctx,
+                registry_snapshot,
+            )?;
             state.store(result_slot, actor);
         }
 
-        WorkItem::BuildHold { initial_slot, state_param, body, span, persistence, ctx, result_slot } => {
+        WorkItem::BuildHold {
+            initial_slot,
+            state_param,
+            body,
+            span,
+            persistence,
+            ctx,
+            result_slot,
+        } => {
             // If initial value slot is empty, produce nothing
             let Some(initial_actor) = state.get(initial_slot) else {
                 return Ok(());
             };
-            let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
-            if let Some(actor) = build_hold_actor(initial_actor, state_param, *body, span, persistence, persistence_id, ctx)? {
+            let persistence_id = persistence
+                .as_ref()
+                .expect("persistence should be set by resolver")
+                .id;
+            if let Some(actor) = build_hold_actor(
+                initial_actor,
+                state_param,
+                *body,
+                span,
+                persistence,
+                persistence_id,
+                ctx,
+            )? {
                 state.store(result_slot, actor);
             }
         }
 
-        WorkItem::BuildBlock { object_slot, output_slot, result_slot, scope_id } => {
+        WorkItem::BuildBlock {
+            object_slot,
+            output_slot,
+            result_slot,
+            scope_id,
+        } => {
             // If output slot is empty, this block produces nothing
-            let Some(output_actor) = state.get(output_slot) else { return Ok(()); };
+            let Some(output_actor) = state.get(output_slot) else {
+                return Ok(());
+            };
 
             // Get the Object actor which contains the Variables
             // We need to keep the Object alive so Variables don't get dropped
@@ -2150,13 +2457,20 @@ fn process_work_item(
                 // The stream::unfold keeps the Object alive in its closure, which keeps Variables alive
                 // Use deferred subscription pattern for async subscribe()
                 let value_stream = stream::unfold(
-                    (None::<LocalBoxStream<'static, Value>>, Some(output_actor.clone()), object_actor),
+                    (
+                        None::<LocalBoxStream<'static, Value>>,
+                        Some(output_actor.clone()),
+                        object_actor,
+                    ),
                     |(subscription_opt, actor_opt, obj)| async move {
                         let mut subscription = match subscription_opt {
                             Some(s) => s,
                             None => actor_opt.unwrap().stream(),
                         };
-                        subscription.next().await.map(|value| (value, (Some(subscription), None, obj)))
+                        subscription
+                            .next()
+                            .await
+                            .map(|value| (value, (Some(subscription), None, obj)))
                     },
                 );
                 let wrapper = create_actor(
@@ -2177,7 +2491,12 @@ fn process_work_item(
             }
         }
 
-        WorkItem::EvaluateWithPiped { expr, prev_slot, ctx, result_slot } => {
+        WorkItem::EvaluateWithPiped {
+            expr,
+            prev_slot,
+            ctx,
+            result_slot,
+        } => {
             // If piped value slot is empty, produce nothing
             let Some(prev_actor) = state.get(prev_slot) else {
                 return Ok(());
@@ -2193,7 +2512,13 @@ fn process_work_item(
 
                 // Check for List binding functions first
                 match path_strs_ref.as_slice() {
-                    ["List", "map"] | ["List", "retain"] | ["List", "remove"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] | ["List", "append"] => {
+                    ["List", "map"]
+                    | ["List", "retain"]
+                    | ["List", "remove"]
+                    | ["List", "every"]
+                    | ["List", "any"]
+                    | ["List", "sort_by"]
+                    | ["List", "append"] => {
                         // Handle List binding functions specially - they have their own handling
                         // These use the piped value from the context
                         // List/append also has special handling for call recording (persistence)
@@ -2229,7 +2554,10 @@ fn process_work_item(
                                     arg_slots.push((arg_name, arg_slot));
                                     passed_slot = Some(arg_slot);
                                 } else {
-                                    return Err(format!("PASS argument requires piped value at {:?}", span));
+                                    return Err(format!(
+                                        "PASS argument requires piped value at {:?}",
+                                        span
+                                    ));
                                 }
                             }
                         }
@@ -2240,7 +2568,7 @@ fn process_work_item(
                             arg_slots,
                             passed_slot,
                             passed_context,
-                            use_piped_for_builtin: true,  // This is the key difference!
+                            use_piped_for_builtin: true, // This is the key difference!
                             span,
                             persistence,
                             ctx: new_ctx.clone(),
@@ -2271,7 +2599,9 @@ fn process_work_item(
                 // the stable pass-through.
 
                 // Build key for stable pass-through lookup
-                let persistence_id = expr.persistence.as_ref()
+                let persistence_id = expr
+                    .persistence
+                    .as_ref()
                     .expect("LinkSetter should have persistence_id from resolver")
                     .id
                     .clone();
@@ -2292,7 +2622,8 @@ fn process_work_item(
                 let pass_through_key_for_stream = pass_through_key.clone();
                 let pass_through_key_for_registration = pass_through_key.clone();
                 let pass_through_key_for_forwarder_storage = pass_through_key.clone();
-                let connector_for_stream: Option<Arc<PassThroughConnector>> = new_ctx.try_pass_through_connector().map(|c| c.clone());
+                let connector_for_stream: Option<Arc<PassThroughConnector>> =
+                    new_ctx.try_pass_through_connector().map(|c| c.clone());
 
                 // Oneshot channel to pass the pass_through_actor to the forwarder for registration
                 let (actor_tx, actor_rx) = oneshot::channel::<ActorHandle>();
@@ -2302,38 +2633,61 @@ fn process_work_item(
 
                 // Get subscription scope to check if our context is still active
                 // When WHILE switches arms, the old arm's scope is cancelled
-                let subscription_scope_for_stream = new_ctx.actor_context.subscription_scope.clone();
+                let subscription_scope_for_stream =
+                    new_ctx.actor_context.subscription_scope.clone();
 
                 // Async setup: get LINK sender, check for existing pass-through, subscribe to prev_actor
                 let setup_stream = stream::once(async move {
                     // Check if existing pass-through exists FIRST (before any registration)
-                    let existing_sender: Option<mpsc::Sender<Value>> = match &connector_for_stream {
-                        Some(conn) => conn.get_sender(pass_through_key_for_stream.clone()).await,
-                        None => None,
-                    }
-                    .and_then(|sender| if sender.is_closed() { None } else { Some(sender) });
+                    let existing_sender: Option<mpsc::Sender<Value>> =
+                        match &connector_for_stream {
+                            Some(conn) => {
+                                conn.get_sender(pass_through_key_for_stream.clone()).await
+                            }
+                            None => None,
+                        }
+                        .and_then(|sender| {
+                            if sender.is_closed() {
+                                None
+                            } else {
+                                Some(sender)
+                            }
+                        });
 
                     let is_reeval = existing_sender.is_some();
                     if is_reeval {
                         // On re-evaluation, store the forwarder actor to keep it alive
-                        if let (Some(conn), Ok(forwarder)) = (&connector_for_stream, forwarder_rx.await) {
+                        if let (Some(conn), Ok(forwarder)) =
+                            (&connector_for_stream, forwarder_rx.await)
+                        {
                             conn.add_forwarder(pass_through_key_for_forwarder_storage, forwarder);
                         }
                     } else {
                         // Register this pass-through (first evaluation only)
                         // Wait for the actor to be created and sent to us
                         if let (Some(conn), Ok(actor)) = (&connector_for_stream, actor_rx.await) {
-                            conn.register(pass_through_key_for_registration, value_tx_for_registration, actor);
+                            conn.register(
+                                pass_through_key_for_registration,
+                                value_tx_for_registration,
+                                actor,
+                            );
                         }
                     }
 
                     // Get link sender (async)
-                    let link_sender = get_link_sender_from_alias(alias_for_stream, ctx_for_stream).await;
+                    let link_sender =
+                        get_link_sender_from_alias(alias_for_stream, ctx_for_stream).await;
 
                     // Subscribe to prev_actor
                     let sub = prev_actor_for_stream.clone().stream();
 
-                    (link_sender, existing_sender, sub, value_tx_for_stream, subscription_scope_for_stream)
+                    (
+                        link_sender,
+                        existing_sender,
+                        sub,
+                        value_tx_for_stream,
+                        subscription_scope_for_stream,
+                    )
                 });
 
                 // Flatten setup into value forwarding stream
@@ -2434,12 +2788,21 @@ fn process_work_item(
             }
         }
 
-        WorkItem::CallFunction { path, arg_slots, passed_slot: _, passed_context, use_piped_for_builtin, span, persistence, mut ctx, result_slot } => {
+        WorkItem::CallFunction {
+            path,
+            arg_slots,
+            passed_slot: _,
+            passed_context,
+            use_piped_for_builtin,
+            span,
+            persistence,
+            mut ctx,
+            result_slot,
+        } => {
             // Collect arguments that have values (empty slots are ignored)
-            let args: Vec<(String, ActorHandle)> = arg_slots.iter()
-                .filter_map(|(name, slot)| {
-                    state.get(*slot).map(|actor| (name.clone(), actor))
-                })
+            let args: Vec<(String, ActorHandle)> = arg_slots
+                .iter()
+                .filter_map(|(name, slot)| state.get(*slot).map(|actor| (name.clone(), actor)))
                 .collect();
 
             // Update passed context if PASS argument was provided
@@ -2454,7 +2817,9 @@ fn process_work_item(
                             parameters: ctx.actor_context.parameters,
                             sequential_processing: ctx.actor_context.sequential_processing,
                             backpressure_permit: ctx.actor_context.backpressure_permit,
-                            hold_state_update_callback: ctx.actor_context.hold_state_update_callback,
+                            hold_state_update_callback: ctx
+                                .actor_context
+                                .hold_state_update_callback,
                             use_lazy_actors: ctx.actor_context.use_lazy_actors,
                             is_snapshot_context: ctx.actor_context.is_snapshot_context,
                             object_locals: ctx.actor_context.object_locals,
@@ -2477,7 +2842,10 @@ fn process_work_item(
                 }
             }
 
-            let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
+            let persistence_id = persistence
+                .as_ref()
+                .expect("persistence should be set by resolver")
+                .id;
             let actor_opt = call_function(
                 path.clone(),
                 args,
@@ -2504,10 +2872,13 @@ fn process_work_item(
                             format!("{}; {}(..) (with forwarding)", span, path.join("/")),
                         ),
                         ctx.actor_context.clone(),
-                        TypedStream::infinite(actor.stream().scan(forwarding_loops, |_loops, value| {
-                            // Keep _loops alive in scan state
-                            async move { Some(value) }
-                        })),
+                        TypedStream::infinite(actor.stream().scan(
+                            forwarding_loops,
+                            |_loops, value| {
+                                // Keep _loops alive in scan state
+                                async move { Some(value) }
+                            },
+                        )),
                         persistence.map(|p| p.id).unwrap_or_else(PersistenceId::new),
                         ctx.actor_context.scope_id(),
                     );
@@ -2544,12 +2915,26 @@ fn process_work_item(
             }
         }
 
-        WorkItem::WrapWithPersistence { source_slot, persistence_id, ctx, result_slot, value_changed } => {
+        WorkItem::WrapWithPersistence {
+            source_slot,
+            persistence_id,
+            ctx,
+            result_slot,
+            value_changed,
+        } => {
             // Wrap an evaluated function argument with persistence.
             // This enables persistence for LATEST and other constructs used as function arguments.
-            if LOG_DEBUG { zoon::println!("[DEBUG] Processing WrapWithPersistence for slot {:?} with id {}", source_slot, persistence_id); }
+            if LOG_DEBUG {
+                zoon::println!(
+                    "[DEBUG] Processing WrapWithPersistence for slot {:?} with id {}",
+                    source_slot,
+                    persistence_id
+                );
+            }
             if let Some(source_actor) = state.get(source_slot) {
-                if LOG_DEBUG { zoon::println!("[DEBUG] Found source actor, wrapping with persistence"); }
+                if LOG_DEBUG {
+                    zoon::println!("[DEBUG] Found source actor, wrapping with persistence");
+                }
                 let persistence_stream = create_variable_persistence_stream(
                     source_actor.clone(),
                     ctx.construct_context.construct_storage.clone(),
@@ -2590,16 +2975,60 @@ fn create_binary_op_actor(
     b: ActorHandle,
 ) -> ActorHandle {
     match op {
-        BinaryOpKind::Add => ArithmeticCombinator::new_add(construct_info, construct_context, actor_context, a, b),
-        BinaryOpKind::Subtract => ArithmeticCombinator::new_subtract(construct_info, construct_context, actor_context, a, b),
-        BinaryOpKind::Multiply => ArithmeticCombinator::new_multiply(construct_info, construct_context, actor_context, a, b),
-        BinaryOpKind::Divide => ArithmeticCombinator::new_divide(construct_info, construct_context, actor_context, a, b),
-        BinaryOpKind::Equal => ComparatorCombinator::new_equal(construct_info, construct_context, actor_context, a, b),
-        BinaryOpKind::NotEqual => ComparatorCombinator::new_not_equal(construct_info, construct_context, actor_context, a, b),
-        BinaryOpKind::Greater => ComparatorCombinator::new_greater(construct_info, construct_context, actor_context, a, b),
-        BinaryOpKind::GreaterOrEqual => ComparatorCombinator::new_greater_or_equal(construct_info, construct_context, actor_context, a, b),
-        BinaryOpKind::Less => ComparatorCombinator::new_less(construct_info, construct_context, actor_context, a, b),
-        BinaryOpKind::LessOrEqual => ComparatorCombinator::new_less_or_equal(construct_info, construct_context, actor_context, a, b),
+        BinaryOpKind::Add => {
+            ArithmeticCombinator::new_add(construct_info, construct_context, actor_context, a, b)
+        }
+        BinaryOpKind::Subtract => ArithmeticCombinator::new_subtract(
+            construct_info,
+            construct_context,
+            actor_context,
+            a,
+            b,
+        ),
+        BinaryOpKind::Multiply => ArithmeticCombinator::new_multiply(
+            construct_info,
+            construct_context,
+            actor_context,
+            a,
+            b,
+        ),
+        BinaryOpKind::Divide => {
+            ArithmeticCombinator::new_divide(construct_info, construct_context, actor_context, a, b)
+        }
+        BinaryOpKind::Equal => {
+            ComparatorCombinator::new_equal(construct_info, construct_context, actor_context, a, b)
+        }
+        BinaryOpKind::NotEqual => ComparatorCombinator::new_not_equal(
+            construct_info,
+            construct_context,
+            actor_context,
+            a,
+            b,
+        ),
+        BinaryOpKind::Greater => ComparatorCombinator::new_greater(
+            construct_info,
+            construct_context,
+            actor_context,
+            a,
+            b,
+        ),
+        BinaryOpKind::GreaterOrEqual => ComparatorCombinator::new_greater_or_equal(
+            construct_info,
+            construct_context,
+            actor_context,
+            a,
+            b,
+        ),
+        BinaryOpKind::Less => {
+            ComparatorCombinator::new_less(construct_info, construct_context, actor_context, a, b)
+        }
+        BinaryOpKind::LessOrEqual => ComparatorCombinator::new_less_or_equal(
+            construct_info,
+            construct_context,
+            actor_context,
+            a,
+            b,
+        ),
     }
 }
 
@@ -2625,7 +3054,10 @@ fn evaluate_alias_immediate(
                 }
             }
         }
-        static_expression::Alias::WithoutPassed { parts, referenced_span } => {
+        static_expression::Alias::WithoutPassed {
+            parts,
+            referenced_span,
+        } => {
             let first_part = parts.first().map(|s| s.to_string()).unwrap_or_default();
             if let Some(param_actor) = ctx.actor_context.parameters.get(&first_part).cloned() {
                 // For simple parameter references (no field accesses), return directly
@@ -2642,13 +3074,17 @@ fn evaluate_alias_immediate(
                     Box::pin(async move { local_actor })
                 } else {
                     // Fall back to async lookup via ReferenceConnector
-                    let ref_connector = ctx.try_reference_connector()
-                        .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;
+                    let ref_connector = ctx.try_reference_connector().ok_or_else(|| {
+                        "ReferenceConnector dropped - program shutting down".to_string()
+                    })?;
                     Box::pin(ref_connector.referenceable(*ref_span))
                 }
             } else if parts.len() >= 2 {
                 // Module variable access - for now fall back to returning an error
-                return Err(format!("Module variable access '{}' not yet supported in stack-safe evaluator", first_part));
+                return Err(format!(
+                    "Module variable access '{}' not yet supported in stack-safe evaluator",
+                    first_part
+                ));
             } else {
                 return Err(format!("Failed to get aliased variable '{}'", first_part));
             }
@@ -2676,7 +3112,10 @@ fn build_then_actor(
     ctx: EvaluationContext,
     function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
 ) -> Result<ActorHandle, String> {
-    let piped = ctx.actor_context.piped.clone()
+    let piped = ctx
+        .actor_context
+        .piped
+        .clone()
         .ok_or("THEN requires a piped value")?;
 
     let sequential = ctx.actor_context.sequential_processing;
@@ -2702,170 +3141,170 @@ fn build_then_actor(
 
     // eval_body now returns a Stream instead of Option<Value>
     // This avoids blocking on .next().await which would hang if body returns SKIP
-    let eval_body = move |value: Value| -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Value>>>>>> {
-        let actor_context_clone = actor_context_for_then.clone();
-        let construct_context_clone = construct_context_for_then.clone();
-        let reference_connector_clone = reference_connector_for_then.clone();
-        let link_connector_clone = link_connector_for_then.clone();
-        let pass_through_connector_clone = pass_through_connector_for_then.clone();
-        let function_registry_clone = function_registry_for_then.clone();
-        let module_loader_clone = module_loader_for_then.clone();
-        let source_code_clone = source_code_for_then.clone();
-        let persistence_clone = persistence_for_then.clone();
-        let body_clone = body.clone();
-        let permit_clone = backpressure_permit_for_then.clone();
-        let hold_callback_clone = hold_callback_for_then.clone();
+    let eval_body =
+        move |value: Value| -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Value>>>>>> {
+            let actor_context_clone = actor_context_for_then.clone();
+            let construct_context_clone = construct_context_for_then.clone();
+            let reference_connector_clone = reference_connector_for_then.clone();
+            let link_connector_clone = link_connector_for_then.clone();
+            let pass_through_connector_clone = pass_through_connector_for_then.clone();
+            let function_registry_clone = function_registry_for_then.clone();
+            let module_loader_clone = module_loader_for_then.clone();
+            let source_code_clone = source_code_for_then.clone();
+            let persistence_clone = persistence_for_then.clone();
+            let body_clone = body.clone();
+            let permit_clone = backpressure_permit_for_then.clone();
+            let hold_callback_clone = hold_callback_for_then.clone();
 
-        Box::pin(async move {
-            // Acquire permit BEFORE body evaluation - this ensures HOLD's state update
-            // completes before we read state for the next iteration. Without this,
-            // all pulses would run in parallel reading the same initial state.
-            if let Some(ref permit) = permit_clone {
-                permit.acquire().await;
-            }
-
-            let value_actor: ActorHandle = create_actor(
-                ConstructInfo::new(
-                    "THEN input value".to_string(),
-                    None,
-                    format!("{span_for_then}; THEN input"),
-                ),
-                actor_context_clone.clone(),
-                constant(value),
-                PersistenceId::new(),
-                actor_context_clone.scope_id(),
-            );
-
-            // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics.
-            // When THEN body references `state` (from HOLD), we want the CURRENT value at the
-            // time of body evaluation, not all historical values from the reactive subscription.
-            //
-            // Without this fix:
-            // - Body creates BinaryOpCombinator for `state + 1`
-            // - BinaryOpCombinator subscribes to state_actor starting at version 0
-            // - Subscription returns ALL historical values: [{value:0}, {value:1}, ...]
-            // - First poll returns {value:0} (OLD value!) instead of current {value:1}
-            // - Result is 1 instead of 2
-            //
-            // With this fix:
-            // - We create a "frozen" actor for each parameter with just the current value
-            // - Body subscribes to this frozen actor, gets only the current value
-            // - Computation uses the correct current state
-            let mut frozen_parameters: HashMap<String, ActorHandle> = HashMap::new();
-            for (name, actor) in actor_context_clone.parameters.iter() {
-                // Create a constant actor from the current stored value (async)
-                if let Ok(current_value) = actor.current_value().await {
-                    let frozen_actor = create_actor(
-                        ConstructInfo::new(
-                            format!("frozen param: {name}"),
-                            None,
-                            format!("frozen parameter {name}"),
-                        ),
-                        actor_context_clone.clone(),
-                        constant(current_value),
-                        PersistenceId::new(),
-                        actor_context_clone.scope_id(),
-                    );
-                    frozen_parameters.insert(name.clone(), frozen_actor);
-                } else {
-                    // No value yet, keep original actor
-                    frozen_parameters.insert(name.clone(), actor.clone());
+            Box::pin(async move {
+                // Acquire permit BEFORE body evaluation - this ensures HOLD's state update
+                // completes before we read state for the next iteration. Without this,
+                // all pulses would run in parallel reading the same initial state.
+                if let Some(ref permit) = permit_clone {
+                    permit.acquire().await;
                 }
-            }
 
-            let new_actor_context = ActorContext {
-                output_valve_signal: actor_context_clone.output_valve_signal.clone(),
-                piped: Some(value_actor.clone()),
-                passed: actor_context_clone.passed.clone(),
-                parameters: frozen_parameters,
-                sequential_processing: actor_context_clone.sequential_processing,
-                backpressure_permit: actor_context_clone.backpressure_permit.clone(),
-                // Don't propagate callback to body - body evaluation is internal
-                hold_state_update_callback: None,
-                use_lazy_actors: actor_context_clone.use_lazy_actors,
-                // THEN body needs snapshot semantics - read current variable values, not history
-                is_snapshot_context: true,
-                // Inherit object_locals - THEN body may reference Object sibling fields
-                object_locals: actor_context_clone.object_locals.clone(),
-                scope: actor_context_clone.scope.clone(),
-                subscription_scope: actor_context_clone.subscription_scope.clone(),
-                call_recorder: actor_context_clone.call_recorder.clone(),
-                is_restoring: actor_context_clone.is_restoring,
-                list_append_storage_key: actor_context_clone.list_append_storage_key.clone(),
-                recording_counter: actor_context_clone.recording_counter.clone(),
-                // THEN body uses snapshot semantics for variables - don't filter stale values
-                // The filtering should only happen on the piped stream, not all variable refs
-                subscription_time: None,
-                registry_scope_id: actor_context_clone.registry_scope_id,
-            };
+                let value_actor: ActorHandle = create_actor(
+                    ConstructInfo::new(
+                        "THEN input value".to_string(),
+                        None,
+                        format!("{span_for_then}; THEN input"),
+                    ),
+                    actor_context_clone.clone(),
+                    constant(value),
+                    PersistenceId::new(),
+                    actor_context_clone.scope_id(),
+                );
 
-            let new_ctx = EvaluationContext {
-                construct_context: construct_context_clone.clone(),
-                actor_context: new_actor_context.clone(),
-                reference_connector: reference_connector_clone,
-                link_connector: link_connector_clone,
-                pass_through_connector: pass_through_connector_clone,
-                module_loader: module_loader_clone,
-                source_code: source_code_clone,
-                function_registry_snapshot: Some(function_registry_clone),
-            };
-
-            let body_expr = static_expression::Spanned {
-                span: body_clone.span,
-                persistence: persistence_clone,
-                node: body_clone.node.clone(),
-            };
-
-            match evaluate_expression(body_expr, new_ctx) {
-                Ok(Some(result_actor)) => {
-                    // Use value() for type-safe single-value semantics.
-                    // value() returns a Future that resolves to exactly ONE value,
-                    // making it impossible to accidentally create ongoing subscriptions.
-                    // This is critical for THEN bodies which should produce exactly ONE value per input.
-                    //
-                    // CRITICAL: Keepalive must be in filter_map, NOT in map!
-                    // If value() returns Err, filter_map filters it out and map closure never runs.
-                    // This would cause actors to be dropped before value() completes.
-                    //
-                    // We also need to keep new_actor_context alive because result_actor may
-                    // have subscriptions to frozen_parameters contained within it.
-                    let result_actor_keepalive = result_actor.clone();
-                    let value_actor_keepalive = value_actor.clone();
-                    let context_keepalive = new_actor_context.clone();
-                    let hold_callback_for_map = hold_callback_clone.clone();
-                    let result_actor_for_value = result_actor.clone();
-                    let result_stream = stream::once(async move { result_actor_for_value.value().await })
-                        .filter_map(move |v| {
-                            // Prevent drop: these are captured by the `move` closure and live as long as the stream combinator
-                            let _result_actor_keepalive = &result_actor_keepalive;
-                            let _value_actor_keepalive = &value_actor_keepalive;
-                            let _context_keepalive = &context_keepalive;
-                            async move { v.ok() }
-                        })
-                        .map(move |mut result_value| {
-                        // Prevent drop: captured by `move` closure, lives as long as stream combinator
-                        let _value_actor = &value_actor;
-                        result_value.set_idempotency_key(ValueIdempotencyKey::new());
-                        // CRITICAL: Call HOLD's callback synchronously if present.
-                        // This updates state_actor and releases the permit BEFORE this stream yields,
-                        // enabling the next pulse to be processed synchronously during eager polling.
-                        if let Some(ref callback) = hold_callback_for_map {
-                            callback(result_value.clone());
-                        }
-                        result_value
-                    });
-                    Box::pin(result_stream) as Pin<Box<dyn Stream<Item = Value>>>
+                // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics.
+                // When THEN body references `state` (from HOLD), we want the CURRENT value at the
+                // time of body evaluation, not all historical values from the reactive subscription.
+                //
+                // Without this fix:
+                // - Body creates BinaryOpCombinator for `state + 1`
+                // - BinaryOpCombinator subscribes to state_actor starting at version 0
+                // - Subscription returns ALL historical values: [{value:0}, {value:1}, ...]
+                // - First poll returns {value:0} (OLD value!) instead of current {value:1}
+                // - Result is 1 instead of 2
+                //
+                // With this fix:
+                // - We create a "frozen" actor for each parameter with just the current value
+                // - Body subscribes to this frozen actor, gets only the current value
+                // - Computation uses the correct current state
+                let mut frozen_parameters: HashMap<String, ActorHandle> = HashMap::new();
+                for (name, actor) in actor_context_clone.parameters.iter() {
+                    // Create a constant actor from the current stored value (async)
+                    if let Ok(current_value) = actor.current_value().await {
+                        let frozen_actor = create_actor(
+                            ConstructInfo::new(
+                                format!("frozen param: {name}"),
+                                None,
+                                format!("frozen parameter {name}"),
+                            ),
+                            actor_context_clone.clone(),
+                            constant(current_value),
+                            PersistenceId::new(),
+                            actor_context_clone.scope_id(),
+                        );
+                        frozen_parameters.insert(name.clone(), frozen_actor);
+                    } else {
+                        // No value yet, keep original actor
+                        frozen_parameters.insert(name.clone(), actor.clone());
+                    }
                 }
-                Ok(None) => {
-                    // SKIP - return finite empty stream (flatten_unordered removes it cleanly)
-                    Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>
+
+                let new_actor_context = ActorContext {
+                    output_valve_signal: actor_context_clone.output_valve_signal.clone(),
+                    piped: Some(value_actor.clone()),
+                    passed: actor_context_clone.passed.clone(),
+                    parameters: frozen_parameters,
+                    sequential_processing: actor_context_clone.sequential_processing,
+                    backpressure_permit: actor_context_clone.backpressure_permit.clone(),
+                    // Don't propagate callback to body - body evaluation is internal
+                    hold_state_update_callback: None,
+                    use_lazy_actors: actor_context_clone.use_lazy_actors,
+                    // THEN body needs snapshot semantics - read current variable values, not history
+                    is_snapshot_context: true,
+                    // Inherit object_locals - THEN body may reference Object sibling fields
+                    object_locals: actor_context_clone.object_locals.clone(),
+                    scope: actor_context_clone.scope.clone(),
+                    subscription_scope: actor_context_clone.subscription_scope.clone(),
+                    call_recorder: actor_context_clone.call_recorder.clone(),
+                    is_restoring: actor_context_clone.is_restoring,
+                    list_append_storage_key: actor_context_clone.list_append_storage_key.clone(),
+                    recording_counter: actor_context_clone.recording_counter.clone(),
+                    // THEN body uses snapshot semantics for variables - don't filter stale values
+                    // The filtering should only happen on the piped stream, not all variable refs
+                    subscription_time: None,
+                    registry_scope_id: actor_context_clone.registry_scope_id,
+                };
+
+                let new_ctx = EvaluationContext {
+                    construct_context: construct_context_clone.clone(),
+                    actor_context: new_actor_context.clone(),
+                    reference_connector: reference_connector_clone,
+                    link_connector: link_connector_clone,
+                    pass_through_connector: pass_through_connector_clone,
+                    module_loader: module_loader_clone,
+                    source_code: source_code_clone,
+                    function_registry_snapshot: Some(function_registry_clone),
+                };
+
+                let body_expr = static_expression::Spanned {
+                    span: body_clone.span,
+                    persistence: persistence_clone,
+                    node: body_clone.node.clone(),
+                };
+
+                match evaluate_expression(body_expr, new_ctx) {
+                    Ok(Some(result_actor)) => {
+                        // Use value() for type-safe single-value semantics.
+                        // value() returns a Future that resolves to exactly ONE value,
+                        // making it impossible to accidentally create ongoing subscriptions.
+                        // This is critical for THEN bodies which should produce exactly ONE value per input.
+                        //
+                        // CRITICAL: Keepalive must be in filter_map, NOT in map!
+                        // If value() returns Err, filter_map filters it out and map closure never runs.
+                        // This would cause actors to be dropped before value() completes.
+                        //
+                        // We also need to keep new_actor_context alive because result_actor may
+                        // have subscriptions to frozen_parameters contained within it.
+                        let result_actor_keepalive = result_actor.clone();
+                        let value_actor_keepalive = value_actor.clone();
+                        let context_keepalive = new_actor_context.clone();
+                        let hold_callback_for_map = hold_callback_clone.clone();
+                        let result_actor_for_value = result_actor.clone();
+                        let result_stream =
+                            stream::once(async move { result_actor_for_value.value().await })
+                                .filter_map(move |v| {
+                                    // Prevent drop: these are captured by the `move` closure and live as long as the stream combinator
+                                    let _result_actor_keepalive = &result_actor_keepalive;
+                                    let _value_actor_keepalive = &value_actor_keepalive;
+                                    let _context_keepalive = &context_keepalive;
+                                    async move { v.ok() }
+                                })
+                                .map(move |mut result_value| {
+                                    // Prevent drop: captured by `move` closure, lives as long as stream combinator
+                                    let _value_actor = &value_actor;
+                                    result_value.set_idempotency_key(ValueIdempotencyKey::new());
+                                    // CRITICAL: Call HOLD's callback synchronously if present.
+                                    // This updates state_actor and releases the permit BEFORE this stream yields,
+                                    // enabling the next pulse to be processed synchronously during eager polling.
+                                    if let Some(ref callback) = hold_callback_for_map {
+                                        callback(result_value.clone());
+                                    }
+                                    result_value
+                                });
+                        Box::pin(result_stream) as Pin<Box<dyn Stream<Item = Value>>>
+                    }
+                    Ok(None) => {
+                        // SKIP - return finite empty stream (flatten_unordered removes it cleanly)
+                        Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>
+                    }
+                    Err(_e) => Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>,
                 }
-                Err(_e) => {
-                    Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>
-                }
-            }
-        })
-    };
+            })
+        };
 
     // =========================================================================
     // REACTIVE SUBSCRIPTION WITH LAMPORT FILTERING
@@ -2887,19 +3326,16 @@ fn build_then_actor(
         future::ready(should_pass)
     });
 
-    let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
-        // For sequential mode, use regular flatten (processes one stream at a time)
-        let stream = filtered_piped
-            .then(eval_body)
-            .flatten();
-        Box::pin(stream)
-    } else {
-        // For non-sequential mode, use flatten_unordered for concurrent processing
-        let stream = filtered_piped
-            .then(eval_body)
-            .flatten_unordered(None);
-        Box::pin(stream)
-    };
+    let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> =
+        if backpressure_permit.is_some() || sequential {
+            // For sequential mode, use regular flatten (processes one stream at a time)
+            let stream = filtered_piped.then(eval_body).flatten();
+            Box::pin(stream)
+        } else {
+            // For non-sequential mode, use flatten_unordered for concurrent processing
+            let stream = filtered_piped.then(eval_body).flatten_unordered(None);
+            Box::pin(stream)
+        };
 
     // Use lazy actor construction when in HOLD body context for sequential state updates
     if ctx.actor_context.use_lazy_actors {
@@ -2909,7 +3345,8 @@ fn build_then_actor(
                 format!("PersistenceId: {persistence_id}"),
                 persistence,
                 format!("{span}; THEN {{..}}"),
-            ).complete(ConstructType::ValueActor),
+            )
+            .complete(ConstructType::ValueActor),
             flattened_stream,
             persistence_id,
             scope_id,
@@ -2939,7 +3376,10 @@ fn build_when_actor(
     ctx: EvaluationContext,
     function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
 ) -> Result<ActorHandle, String> {
-    let piped = ctx.actor_context.piped.clone()
+    let piped = ctx
+        .actor_context
+        .piped
+        .clone()
         .ok_or("WHEN requires a piped value")?;
 
     let sequential = ctx.actor_context.sequential_processing;
@@ -2962,155 +3402,171 @@ fn build_when_actor(
     // - SKIP returns empty stream (no blocking)
     // - Regular values return stream with one item
     // - flat_map naturally handles empty streams
-    let eval_body = move |value: Value| -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Value>>>>>> {
-        let actor_context_clone = actor_context_for_when.clone();
-        let construct_context_clone = construct_context_for_when.clone();
-        let reference_connector_clone = reference_connector_for_when.clone();
-        let link_connector_clone = link_connector_for_when.clone();
-        let pass_through_connector_clone = pass_through_connector_for_when.clone();
-        let function_registry_clone = function_registry_for_when.clone();
-        let module_loader_clone = module_loader_for_when.clone();
-        let source_code_clone = source_code_for_when.clone();
-        let persistence_clone = persistence_for_when.clone();
-        let arms_clone = arms.clone();
+    let eval_body =
+        move |value: Value| -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Value>>>>>> {
+            let actor_context_clone = actor_context_for_when.clone();
+            let construct_context_clone = construct_context_for_when.clone();
+            let reference_connector_clone = reference_connector_for_when.clone();
+            let link_connector_clone = link_connector_for_when.clone();
+            let pass_through_connector_clone = pass_through_connector_for_when.clone();
+            let function_registry_clone = function_registry_for_when.clone();
+            let module_loader_clone = module_loader_for_when.clone();
+            let source_code_clone = source_code_for_when.clone();
+            let persistence_clone = persistence_for_when.clone();
+            let arms_clone = arms.clone();
 
-        Box::pin(async move {
-            // Debug: log what WHEN receives
-            let value_desc = match &value {
-                Value::Tag(tag, _) => format!("Tag({})", tag.tag()),
-                Value::Object(_, _) => "Object".to_string(),
-                Value::Text(t, _) => format!("Text({})", t.text()),
-                Value::List(_, _) => "List".to_string(),
-                _ => "Other".to_string(),
-            };
-            if LOG_DEBUG { zoon::println!("[WHEN] Received value: {}", value_desc); }
+            Box::pin(async move {
+                // Debug: log what WHEN receives
+                let value_desc = match &value {
+                    Value::Tag(tag, _) => format!("Tag({})", tag.tag()),
+                    Value::Object(_, _) => "Object".to_string(),
+                    Value::Text(t, _) => format!("Text({})", t.text()),
+                    Value::List(_, _) => "List".to_string(),
+                    _ => "Other".to_string(),
+                };
+                if LOG_DEBUG {
+                    zoon::println!("[WHEN] Received value: {}", value_desc);
+                }
 
-            // Try to match against each arm
-            for arm in &arms_clone {
-                // Use async pattern matching to properly extract bindings from Objects
-                if let Some(bindings) = match_pattern(&arm.pattern, &value).await {
-                    if LOG_DEBUG { zoon::println!("[WHEN] Pattern MATCHED: {:?}", arm.pattern); }
-                    let value_actor: ActorHandle = create_actor(
-                        ConstructInfo::new(
-                            "WHEN input value".to_string(),
-                            None,
-                            format!("{span_for_when}; WHEN input"),
-                        ),
-                        actor_context_clone.clone(),
-                        constant(value.clone()),
-                        PersistenceId::new(),
-                        actor_context_clone.scope_id(),
-                    );
-
-                    // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics (same as THEN).
-                    // When WHEN body references `state` (from HOLD), we want the CURRENT value at the
-                    // time of body evaluation, not all historical values from the reactive subscription.
-                    let mut frozen_parameters: HashMap<String, ActorHandle> = HashMap::new();
-                    for (name, actor) in actor_context_clone.parameters.iter() {
-                        if let Ok(current_value) = actor.current_value().await {
-                            let frozen_actor = create_actor(
-                                ConstructInfo::new(
-                                    format!("frozen param: {name}"),
-                                    None,
-                                    format!("frozen parameter {name}"),
-                                ),
-                                actor_context_clone.clone(),
-                                constant(current_value),
-                                PersistenceId::new(),
-                                actor_context_clone.scope_id(),
-                            );
-                            frozen_parameters.insert(name.clone(), frozen_actor);
-                        } else {
-                            frozen_parameters.insert(name.clone(), actor.clone());
+                // Try to match against each arm
+                for arm in &arms_clone {
+                    // Use async pattern matching to properly extract bindings from Objects
+                    if let Some(bindings) = match_pattern(&arm.pattern, &value).await {
+                        if LOG_DEBUG {
+                            zoon::println!("[WHEN] Pattern MATCHED: {:?}", arm.pattern);
                         }
-                    }
-
-                    // Create parameter actors for the pattern bindings
-                    let mut parameters = frozen_parameters;
-                    for (name, bound_value) in bindings {
-                        let bound_actor = create_actor(
+                        let value_actor: ActorHandle = create_actor(
                             ConstructInfo::new(
-                                format!("WHEN binding: {}", name),
+                                "WHEN input value".to_string(),
                                 None,
-                                format!("{span_for_when}; WHEN binding"),
+                                format!("{span_for_when}; WHEN input"),
                             ),
                             actor_context_clone.clone(),
-                            constant(bound_value),
+                            constant(value.clone()),
                             PersistenceId::new(),
                             actor_context_clone.scope_id(),
                         );
-                        parameters.insert(name, bound_actor);
-                    }
 
-                    let new_actor_context = ActorContext {
-                        output_valve_signal: actor_context_clone.output_valve_signal.clone(),
-                        piped: Some(value_actor.clone()),
-                        passed: actor_context_clone.passed.clone(),
-                        parameters,
-                        sequential_processing: actor_context_clone.sequential_processing,
-                        backpressure_permit: actor_context_clone.backpressure_permit.clone(),
-                        // Don't propagate HOLD callback into WHEN arms - each arm is a separate evaluation
-                        hold_state_update_callback: None,
-                        use_lazy_actors: actor_context_clone.use_lazy_actors,
-                        // WHEN body needs snapshot semantics like THEN
-                        is_snapshot_context: true,
-                        // Inherit object_locals - WHEN body may reference Object sibling fields
-                        object_locals: actor_context_clone.object_locals.clone(),
-                        scope: actor_context_clone.scope.clone(),
-                        subscription_scope: actor_context_clone.subscription_scope.clone(),
-                        call_recorder: actor_context_clone.call_recorder.clone(),
-                        is_restoring: actor_context_clone.is_restoring,
-                        list_append_storage_key: actor_context_clone.list_append_storage_key.clone(),
-                        recording_counter: actor_context_clone.recording_counter.clone(),
-                        // WHEN body uses snapshot semantics for variables - don't filter stale values
-                        // The filtering should only happen on the piped stream, not all variable refs
-                        subscription_time: None,
-                        registry_scope_id: actor_context_clone.registry_scope_id,
-                    };
-
-                    let new_ctx = EvaluationContext {
-                        construct_context: construct_context_clone.clone(),
-                        actor_context: new_actor_context.clone(),
-                        reference_connector: reference_connector_clone.clone(),
-                        link_connector: link_connector_clone.clone(),
-                        pass_through_connector: pass_through_connector_clone.clone(),
-                        module_loader: module_loader_clone.clone(),
-                        source_code: source_code_clone.clone(),
-                        function_registry_snapshot: Some(function_registry_clone.clone()),
-                    };
-
-                    match evaluate_expression(arm.body.clone(), new_ctx) {
-                        Ok(Some(result_actor)) => {
-                            // Use value() for type-safe single-value semantics.
-                            // value() returns a Future that resolves to exactly ONE value,
-                            // making it impossible to accidentally create ongoing subscriptions.
-                            // This is critical for WHEN bodies which should produce exactly ONE value per input.
-                            let result_actor_keepalive = result_actor.clone();
-                            let result_actor_for_value = result_actor.clone();
-                            let result_stream = stream::once(async move { result_actor_for_value.value().await })
-                                .filter_map(|v| future::ready(v.ok()))
-                                .map(move |mut result_value| {
-                                    // Prevent drop: captured by `move` closure, lives as long as stream combinator
-                                    let _value_actor = &value_actor;
-                                    let _result_actor_keepalive = &result_actor_keepalive;
-                                    result_value.set_idempotency_key(ValueIdempotencyKey::new());
-                                    result_value
-                                });
-                            return Box::pin(result_stream) as Pin<Box<dyn Stream<Item = Value>>>;
+                        // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics (same as THEN).
+                        // When WHEN body references `state` (from HOLD), we want the CURRENT value at the
+                        // time of body evaluation, not all historical values from the reactive subscription.
+                        let mut frozen_parameters: HashMap<String, ActorHandle> = HashMap::new();
+                        for (name, actor) in actor_context_clone.parameters.iter() {
+                            if let Ok(current_value) = actor.current_value().await {
+                                let frozen_actor = create_actor(
+                                    ConstructInfo::new(
+                                        format!("frozen param: {name}"),
+                                        None,
+                                        format!("frozen parameter {name}"),
+                                    ),
+                                    actor_context_clone.clone(),
+                                    constant(current_value),
+                                    PersistenceId::new(),
+                                    actor_context_clone.scope_id(),
+                                );
+                                frozen_parameters.insert(name.clone(), frozen_actor);
+                            } else {
+                                frozen_parameters.insert(name.clone(), actor.clone());
+                            }
                         }
-                        Ok(None) => {
-                            // SKIP - return finite empty stream (flatten_unordered removes it cleanly)
-                            return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
+
+                        // Create parameter actors for the pattern bindings
+                        let mut parameters = frozen_parameters;
+                        for (name, bound_value) in bindings {
+                            let bound_actor = create_actor(
+                                ConstructInfo::new(
+                                    format!("WHEN binding: {}", name),
+                                    None,
+                                    format!("{span_for_when}; WHEN binding"),
+                                ),
+                                actor_context_clone.clone(),
+                                constant(bound_value),
+                                PersistenceId::new(),
+                                actor_context_clone.scope_id(),
+                            );
+                            parameters.insert(name, bound_actor);
                         }
-                        Err(_) => {
-                            return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
+
+                        let new_actor_context = ActorContext {
+                            output_valve_signal: actor_context_clone.output_valve_signal.clone(),
+                            piped: Some(value_actor.clone()),
+                            passed: actor_context_clone.passed.clone(),
+                            parameters,
+                            sequential_processing: actor_context_clone.sequential_processing,
+                            backpressure_permit: actor_context_clone.backpressure_permit.clone(),
+                            // Don't propagate HOLD callback into WHEN arms - each arm is a separate evaluation
+                            hold_state_update_callback: None,
+                            use_lazy_actors: actor_context_clone.use_lazy_actors,
+                            // WHEN body needs snapshot semantics like THEN
+                            is_snapshot_context: true,
+                            // Inherit object_locals - WHEN body may reference Object sibling fields
+                            object_locals: actor_context_clone.object_locals.clone(),
+                            scope: actor_context_clone.scope.clone(),
+                            subscription_scope: actor_context_clone.subscription_scope.clone(),
+                            call_recorder: actor_context_clone.call_recorder.clone(),
+                            is_restoring: actor_context_clone.is_restoring,
+                            list_append_storage_key: actor_context_clone
+                                .list_append_storage_key
+                                .clone(),
+                            recording_counter: actor_context_clone.recording_counter.clone(),
+                            // WHEN body uses snapshot semantics for variables - don't filter stale values
+                            // The filtering should only happen on the piped stream, not all variable refs
+                            subscription_time: None,
+                            registry_scope_id: actor_context_clone.registry_scope_id,
+                        };
+
+                        let new_ctx = EvaluationContext {
+                            construct_context: construct_context_clone.clone(),
+                            actor_context: new_actor_context.clone(),
+                            reference_connector: reference_connector_clone.clone(),
+                            link_connector: link_connector_clone.clone(),
+                            pass_through_connector: pass_through_connector_clone.clone(),
+                            module_loader: module_loader_clone.clone(),
+                            source_code: source_code_clone.clone(),
+                            function_registry_snapshot: Some(function_registry_clone.clone()),
+                        };
+
+                        match evaluate_expression(arm.body.clone(), new_ctx) {
+                            Ok(Some(result_actor)) => {
+                                // Use value() for type-safe single-value semantics.
+                                // value() returns a Future that resolves to exactly ONE value,
+                                // making it impossible to accidentally create ongoing subscriptions.
+                                // This is critical for WHEN bodies which should produce exactly ONE value per input.
+                                let result_actor_keepalive = result_actor.clone();
+                                let result_actor_for_value = result_actor.clone();
+                                let result_stream =
+                                    stream::once(
+                                        async move { result_actor_for_value.value().await },
+                                    )
+                                    .filter_map(|v| future::ready(v.ok()))
+                                    .map(
+                                        move |mut result_value| {
+                                            // Prevent drop: captured by `move` closure, lives as long as stream combinator
+                                            let _value_actor = &value_actor;
+                                            let _result_actor_keepalive = &result_actor_keepalive;
+                                            result_value
+                                                .set_idempotency_key(ValueIdempotencyKey::new());
+                                            result_value
+                                        },
+                                    );
+                                return Box::pin(result_stream)
+                                    as Pin<Box<dyn Stream<Item = Value>>>;
+                            }
+                            Ok(None) => {
+                                // SKIP - return finite empty stream (flatten_unordered removes it cleanly)
+                                return Box::pin(stream::empty())
+                                    as Pin<Box<dyn Stream<Item = Value>>>;
+                            }
+                            Err(_) => {
+                                return Box::pin(stream::empty())
+                                    as Pin<Box<dyn Stream<Item = Value>>>;
+                            }
                         }
                     }
                 }
-            }
-            Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>
-        })
-    };
+                Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>
+            })
+        };
 
     // =========================================================================
     // REACTIVE SUBSCRIPTION (NO LAMPORT FILTERING FOR WHEN)
@@ -3126,20 +3582,21 @@ fn build_when_actor(
     //
     // Example: `count |> WHEN { 1 => "1 item", n => "{n} items" }` needs the
     // current count immediately, not just future changes.
-    let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
-        // For sequential mode, use regular flatten (processes one stream at a time)
-        let stream = piped.clone().stream()
-            .then(eval_body)
-            .flatten();
-        Box::pin(stream)
-    } else {
-        // For non-sequential mode, use flatten_unordered for concurrent processing
-        // None = unlimited concurrency
-        let stream = piped.clone().stream()
-            .then(eval_body)
-            .flatten_unordered(None);
-        Box::pin(stream)
-    };
+    let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> =
+        if backpressure_permit.is_some() || sequential {
+            // For sequential mode, use regular flatten (processes one stream at a time)
+            let stream = piped.clone().stream().then(eval_body).flatten();
+            Box::pin(stream)
+        } else {
+            // For non-sequential mode, use flatten_unordered for concurrent processing
+            // None = unlimited concurrency
+            let stream = piped
+                .clone()
+                .stream()
+                .then(eval_body)
+                .flatten_unordered(None);
+            Box::pin(stream)
+        };
 
     let scope_id = ctx.actor_context.scope_id();
     Ok(create_actor(
@@ -3164,7 +3621,10 @@ fn build_while_actor(
     ctx: EvaluationContext,
     function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
 ) -> Result<ActorHandle, String> {
-    let piped = ctx.actor_context.piped.clone()
+    let piped = ctx
+        .actor_context
+        .piped
+        .clone()
         .ok_or("WHILE requires a piped value")?;
 
     let construct_context_for_while = ctx.construct_context.clone();
@@ -3205,7 +3665,11 @@ fn build_while_actor(
         // any async work and the forwarded body stream) and start a new one.
         stream::once(async move {
             // Find matching arm using async pattern matching
-            let mut matched_arm_with_bindings: Option<(usize, &static_expression::Arm, HashMap<String, Value>)> = None;
+            let mut matched_arm_with_bindings: Option<(
+                usize,
+                &static_expression::Arm,
+                HashMap<String, Value>,
+            )> = None;
             for (arm_idx, arm) in arms_clone.iter().enumerate() {
                 if let Some(bindings) = match_pattern(&arm.pattern, &value).await {
                     matched_arm_with_bindings = Some((arm_idx, arm, bindings));
@@ -3221,12 +3685,13 @@ fn build_while_actor(
 
                 // Create a registry scope for this arm - all actors created within
                 // will be destroyed when the arm switches (ScopeDestroyGuard dropped)
-                let arm_registry_scope = actor_context_clone.registry_scope_id.map(|parent_scope| {
-                    let scope_id = REGISTRY.with(|reg: &std::cell::RefCell<ActorRegistry>| {
-                        reg.borrow_mut().create_scope(Some(parent_scope))
+                let arm_registry_scope =
+                    actor_context_clone.registry_scope_id.map(|parent_scope| {
+                        let scope_id = REGISTRY.with(|reg: &std::cell::RefCell<ActorRegistry>| {
+                            reg.borrow_mut().create_scope(Some(parent_scope))
+                        });
+                        (scope_id, ScopeDestroyGuard::new(scope_id))
                     });
-                    (scope_id, ScopeDestroyGuard::new(scope_id))
-                });
 
                 let value_actor: ActorHandle = create_actor(
                     ConstructInfo::new(
@@ -3264,7 +3729,9 @@ fn build_while_actor(
                     sequential_processing: actor_context_clone.sequential_processing,
                     backpressure_permit: actor_context_clone.backpressure_permit.clone(),
                     // Propagate HOLD callback through WHILE arms - body might need it
-                    hold_state_update_callback: actor_context_clone.hold_state_update_callback.clone(),
+                    hold_state_update_callback: actor_context_clone
+                        .hold_state_update_callback
+                        .clone(),
                     use_lazy_actors: actor_context_clone.use_lazy_actors,
                     // WHILE is continuous, not snapshot - variables should stream normally
                     is_snapshot_context: false,
@@ -3304,7 +3771,9 @@ fn build_while_actor(
                     // WHILE is streaming context - don't filter stale values, accept all
                     subscription_time: None,
                     // Use the arm's registry scope (if available) so actors are owned by this arm
-                    registry_scope_id: arm_registry_scope.as_ref().map(|(id, _)| *id)
+                    registry_scope_id: arm_registry_scope
+                        .as_ref()
+                        .map(|(id, _)| *id)
                         .or(actor_context_clone.registry_scope_id),
                 };
 
@@ -3327,9 +3796,13 @@ fn build_while_actor(
                         // both guards are dropped: scope_guard cancels subscriptions,
                         // scope_destroy_guard destroys registry scope and all its actors
                         let body_stream = result_actor.stream();
-                        stream::unfold((body_stream, Some(scope_guard), arm_registry_scope), |(mut s, guard, reg_scope)| async move {
-                            s.next().await.map(|v| (v, (s, guard, reg_scope)))
-                        }).boxed_local()
+                        stream::unfold(
+                            (body_stream, Some(scope_guard), arm_registry_scope),
+                            |(mut s, guard, reg_scope)| async move {
+                                s.next().await.map(|v| (v, (s, guard, reg_scope)))
+                            },
+                        )
+                        .boxed_local()
                     }
                     Ok(None) => {
                         // SKIP - scope_guard dropped here, scope cancelled immediately
@@ -3347,7 +3820,8 @@ fn build_while_actor(
             } else {
                 stream::empty().boxed_local()
             }
-        }).flatten()
+        })
+        .flatten()
     });
 
     let scope_id = ctx.actor_context.scope_id();
@@ -3416,7 +3890,10 @@ fn build_field_access_actor(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
 ) -> Result<ActorHandle, String> {
-    let piped = ctx.actor_context.piped.clone()
+    let piped = ctx
+        .actor_context
+        .piped
+        .clone()
         .ok_or("FieldAccess requires a piped value")?;
 
     let path_display = path.join(".");
@@ -3445,8 +3922,13 @@ fn build_field_access_actor(
                 Value::Number(_, _) => "Number",
                 _ => "Other",
             };
-            zoon::println!("[FIELD_ACCESS] .{} step {}: received {} for field '{}'",
-                path_display, field_idx, value_type, field_name);
+            zoon::println!(
+                "[FIELD_ACCESS] .{} step {}: received {} for field '{}'",
+                path_display,
+                field_idx,
+                value_type,
+                field_name
+            );
 
             let variable = match &value {
                 Value::Object(object, _) => object.variable(&field_name),
@@ -3456,13 +3938,22 @@ fn build_field_access_actor(
 
             if let Some(var) = variable {
                 let value_actor = var.value_actor();
-                zoon::println!("[FIELD_ACCESS] .{} step {}: found field '{}', subscribing to actor",
-                    path_display, field_idx, field_name);
+                zoon::println!(
+                    "[FIELD_ACCESS] .{} step {}: found field '{}', subscribing to actor",
+                    path_display,
+                    field_idx,
+                    field_name
+                );
                 value_actor.stream()
             } else {
                 // Field not found - emit empty stream (switch_map handles this gracefully)
-                zoon::println!("[FIELD_ACCESS] .{} step {}: field '{}' NOT FOUND in {}",
-                    path_display, field_idx, field_name, value_type);
+                zoon::println!(
+                    "[FIELD_ACCESS] .{} step {}: field '{}' NOT FOUND in {}",
+                    path_display,
+                    field_idx,
+                    field_name,
+                    value_type
+                );
                 stream::empty().boxed_local()
             }
         });
@@ -3518,7 +4009,8 @@ fn build_hold_actor(
 
     // Shared state for restoration tracking
     // restored_value_holder: stores the restored value to emit to output after output is created
-    let restored_value_holder: Arc<std::sync::OnceLock<Value>> = Arc::new(std::sync::OnceLock::new());
+    let restored_value_holder: Arc<std::sync::OnceLock<Value>> =
+        Arc::new(std::sync::OnceLock::new());
     let restored_value_for_state = restored_value_holder.clone();
 
     // Create a ValueActor that provides the current state to the body
@@ -3527,7 +4019,7 @@ fn build_hold_actor(
     // State stream: load stored value first (if exists), else initial_actor, then state_receiver
     let initial_actor_for_state = initial_actor.clone();
     let state_stream = stream::unfold(
-        (true, state_receiver),  // (is_first, receiver)
+        (true, state_receiver), // (is_first, receiver)
         move |(is_first, mut receiver)| {
             let storage = storage_for_state_load.clone();
             let initial_actor = initial_actor_for_state.clone();
@@ -3537,7 +4029,8 @@ fn build_hold_actor(
             async move {
                 if is_first {
                     // Try storage first - load persisted state
-                    let loaded: Option<zoon::serde_json::Value> = storage.load_state(persistence_id).await;
+                    let loaded: Option<zoon::serde_json::Value> =
+                        storage.load_state(persistence_id).await;
                     if let Some(json) = loaded {
                         // Deserialize stored value
                         let value = Value::from_json(
@@ -3595,12 +4088,13 @@ fn build_hold_actor(
     // This ensures the next body evaluation sees the updated state.
     // NOTE: We do NOT store to output here - state_update_stream handles that.
     // Storing in both places would cause duplicate emissions.
-    let hold_state_update_callback: Arc<dyn Fn(Value) + Send + Sync> = Arc::new(move |new_value: Value| {
-        // Update state_actor's stored value directly - THEN will read from here
-        state_actor_for_callback.store_value_directly(new_value);
-        // Release permit to allow THEN to process next input
-        permit_for_callback.release();
-    });
+    let hold_state_update_callback: Arc<dyn Fn(Value) + Send + Sync> =
+        Arc::new(move |new_value: Value| {
+            // Update state_actor's stored value directly - THEN will read from here
+            state_actor_for_callback.store_value_directly(new_value);
+            // Release permit to allow THEN to process next input
+            permit_for_callback.release();
+        });
 
     let body_actor_context = ActorContext {
         output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
@@ -3697,7 +4191,8 @@ fn build_hold_actor(
     // which cancels the driver task. This ensures Timer/interval stops when switching examples.
     //
     // Using OnceLock instead of Rc<RefCell> - it's a thread-safe write-once cell.
-    let driver_loop_holder: Arc<std::sync::OnceLock<ActorLoop>> = Arc::new(std::sync::OnceLock::new());
+    let driver_loop_holder: Arc<std::sync::OnceLock<ActorLoop>> =
+        Arc::new(std::sync::OnceLock::new());
     let driver_loop_holder_for_stream = driver_loop_holder.clone();
     let output_stream = stream::poll_fn(move |_cx| {
         // Prevent drop: captured by `move` closure - when dropped, the ActorLoop is dropped
@@ -3742,84 +4237,88 @@ fn build_hold_actor(
 
     let output_clone_for_initial = output.clone();
     let initial_actor_for_initial = initial_actor.clone();
-    let initial_stream = stream::unfold(
-        HoldResetInputState::LoadingStored,
-        move |state| {
-            let output_clone = output_clone_for_initial.clone();
-            let initial_actor = initial_actor_for_initial.clone();
-            let mut state_sender = state_sender_for_reset.clone();
-            let storage = storage_for_initial_save.clone();
-            let construct_context = construct_context_for_initial.clone();
-            let actor_context = actor_context_for_initial.clone();
-            async move {
-                match state {
-                    HoldResetInputState::LoadingStored => {
-                        // Check if we have stored state - if so, emit it and subscribe
-                        // only to future reset values to avoid replay clobbering.
-                        let stored: Option<zoon::serde_json::Value> = storage.clone().load_state(persistence_id).await;
-                        if let Some(json) = stored {
-                            let restored_value = Value::from_json(
-                                &json,
-                                ConstructId::new("HOLD restored value"),
-                                construct_context,
-                                ValueIdempotencyKey::new(),
-                                actor_context,
-                            );
-                            output_clone.store_value_directly(restored_value.clone());
-                            return Some((
-                                restored_value,
-                                HoldResetInputState::ForwardingSource {
-                                    source_subscription: initial_actor.stream_from_now(),
-                                },
-                            ));
-                        }
+    let initial_stream = stream::unfold(HoldResetInputState::LoadingStored, move |state| {
+        let output_clone = output_clone_for_initial.clone();
+        let initial_actor = initial_actor_for_initial.clone();
+        let mut state_sender = state_sender_for_reset.clone();
+        let storage = storage_for_initial_save.clone();
+        let construct_context = construct_context_for_initial.clone();
+        let actor_context = actor_context_for_initial.clone();
+        async move {
+            match state {
+                HoldResetInputState::LoadingStored => {
+                    // Check if we have stored state - if so, emit it and subscribe
+                    // only to future reset values to avoid replay clobbering.
+                    let stored: Option<zoon::serde_json::Value> =
+                        storage.clone().load_state(persistence_id).await;
+                    if let Some(json) = stored {
+                        let restored_value = Value::from_json(
+                            &json,
+                            ConstructId::new("HOLD restored value"),
+                            construct_context,
+                            ValueIdempotencyKey::new(),
+                            actor_context,
+                        );
+                        output_clone.store_value_directly(restored_value.clone());
+                        return Some((
+                            restored_value,
+                            HoldResetInputState::ForwardingSource {
+                                source_subscription: initial_actor.stream_from_now(),
+                            },
+                        ));
+                    }
 
-                        // No stored state: consume first source emission as initial state.
-                        let mut source_subscription = initial_actor.stream();
-                        let first_value = source_subscription.next().await?;
-                        output_clone.store_value_directly(first_value.clone());
-                        let json = first_value.to_json().await;
-                        storage.save_state(persistence_id, &json);
-                        Some((
-                            first_value,
-                            HoldResetInputState::ForwardingSource { source_subscription },
-                        ))
+                    // No stored state: consume first source emission as initial state.
+                    let mut source_subscription = initial_actor.stream();
+                    let first_value = source_subscription.next().await?;
+                    output_clone.store_value_directly(first_value.clone());
+                    let json = first_value.to_json().await;
+                    storage.save_state(persistence_id, &json);
+                    Some((
+                        first_value,
+                        HoldResetInputState::ForwardingSource {
+                            source_subscription,
+                        },
+                    ))
+                }
+                HoldResetInputState::ForwardingSource {
+                    mut source_subscription,
+                } => {
+                    // Subsequent source values reset HOLD state.
+                    let value = source_subscription.next().await?;
+                    if let Err(e) = state_sender.send(value.clone()).await {
+                        zoon::println!("[HOLD] Failed to send state reset: {e}");
                     }
-                    HoldResetInputState::ForwardingSource {
-                        mut source_subscription,
-                    } => {
-                        // Subsequent source values reset HOLD state.
-                        let value = source_subscription.next().await?;
-                        if let Err(e) = state_sender.send(value.clone()).await {
-                            zoon::println!("[HOLD] Failed to send state reset: {e}");
-                        }
-                        output_clone.store_value_directly(value.clone());
-                        let json = value.to_json().await;
-                        storage.save_state(persistence_id, &json);
-                        Some((
-                            value,
-                            HoldResetInputState::ForwardingSource { source_subscription },
-                        ))
-                    }
+                    output_clone.store_value_directly(value.clone());
+                    let json = value.to_json().await;
+                    storage.save_state(persistence_id, &json);
+                    Some((
+                        value,
+                        HoldResetInputState::ForwardingSource {
+                            source_subscription,
+                        },
+                    ))
                 }
             }
-        },
-    )
+        }
+    })
     .boxed_local();
 
     // Modify state_update_stream to also store values directly to output
     // With arena-based ActorHandle, no circular reference issue - just clone the handle.
     let output_clone_for_update = output.clone();
-    let state_update_stream = state_update_stream.map(move |value| {
-        output_clone_for_update.store_value_directly(value.clone());
-        value
-    }).boxed_local();
+    let state_update_stream = state_update_stream
+        .map(move |value| {
+            output_clone_for_update.store_value_directly(value.clone());
+            value
+        })
+        .boxed_local();
 
     // Combine: input stream sets/resets state, body updates state
     // Use select to merge both streams - any emission from input resets state
     let combined_stream = stream::select(
         initial_stream, // Any emission from input resets the state
-        state_update_stream
+        state_update_stream,
     );
 
     // Create an actor loop to drive the combined stream (poll it so closures execute).
@@ -3871,7 +4370,10 @@ fn build_text_literal_actor(
                 );
                 part_actors.push((true, text_actor));
             }
-            static_expression::TextPart::Interpolation { var, referenced_span } => {
+            static_expression::TextPart::Interpolation {
+                var,
+                referenced_span,
+            } => {
                 // Interpolation - look up the variable (supports field access paths like "item.text")
                 let var_name = var.to_string();
                 let parts: Vec<&str> = var_name.split('.').collect();
@@ -3879,40 +4381,42 @@ fn build_text_literal_actor(
                 let field_path: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
                 // Look up the base variable
-                let base_actor = if let Some(var_actor) = ctx.actor_context.parameters.get(base_name) {
-                    Some(var_actor.clone())
-                } else if let Some(ref_span) = referenced_span {
-                    // Use reference_connector for outer scope
-                    let ref_connector = ctx.try_reference_connector()
-                        .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;
-                    let ref_span_copy = *ref_span;
+                let base_actor =
+                    if let Some(var_actor) = ctx.actor_context.parameters.get(base_name) {
+                        Some(var_actor.clone())
+                    } else if let Some(ref_span) = referenced_span {
+                        // Use reference_connector for outer scope
+                        let ref_connector = ctx.try_reference_connector().ok_or_else(|| {
+                            "ReferenceConnector dropped - program shutting down".to_string()
+                        })?;
+                        let ref_span_copy = *ref_span;
 
-                    // Create forwarding actor for the base variable
-                    let (base_ref_actor, base_sender) = create_actor_forwarding(
-                        ConstructInfo::new(
-                            format!("TextInterpolation:{}:base", var_name),
-                            None,
-                            format!("{span}; TextInterpolation base for '{}'", base_name),
-                        ),
-                        ctx.actor_context.clone(),
-                        PersistenceId::new(),
-                        ctx.actor_context.scope_id(),
-                    );
+                        // Create forwarding actor for the base variable
+                        let (base_ref_actor, base_sender) = create_actor_forwarding(
+                            ConstructInfo::new(
+                                format!("TextInterpolation:{}:base", var_name),
+                                None,
+                                format!("{span}; TextInterpolation base for '{}'", base_name),
+                            ),
+                            ctx.actor_context.clone(),
+                            PersistenceId::new(),
+                            ctx.actor_context.scope_id(),
+                        );
 
-                    let actor_loop = ActorLoop::new(async move {
-                        let actor = ref_connector.referenceable(ref_span_copy).await;
-                        let mut subscription = actor.stream();
-                        while let Some(value) = subscription.next().await {
-                            if base_sender.send(value).await.is_err() {
-                                break;
+                        let actor_loop = ActorLoop::new(async move {
+                            let actor = ref_connector.referenceable(ref_span_copy).await;
+                            let mut subscription = actor.stream();
+                            while let Some(value) = subscription.next().await {
+                                if base_sender.send(value).await.is_err() {
+                                    break;
+                                }
                             }
-                        }
-                    });
-                    forwarding_loops.push(actor_loop);
-                    Some(base_ref_actor)
-                } else {
-                    None
-                };
+                        });
+                        forwarding_loops.push(actor_loop);
+                        Some(base_ref_actor)
+                    } else {
+                        None
+                    };
 
                 if let Some(base_actor) = base_actor {
                     if field_path.is_empty() {
@@ -3955,10 +4459,13 @@ fn build_text_literal_actor(
                                         if let Some(var) = obj.variable(field_name) {
                                             if is_last {
                                                 // Last field - we want to subscribe to this
-                                                current_value_actor = Some(var.value_actor().clone());
+                                                current_value_actor =
+                                                    Some(var.value_actor().clone());
                                             } else {
                                                 // Intermediate field - get its stored value to navigate further
-                                                if let Ok(val) = var.value_actor().current_value().await {
+                                                if let Ok(val) =
+                                                    var.value_actor().current_value().await
+                                                {
                                                     current_obj_value = val;
                                                 } else {
                                                     return; // Can't resolve path
@@ -3971,9 +4478,12 @@ fn build_text_literal_actor(
                                     Value::TaggedObject(tagged, _) => {
                                         if let Some(var) = tagged.variable(field_name) {
                                             if is_last {
-                                                current_value_actor = Some(var.value_actor().clone());
+                                                current_value_actor =
+                                                    Some(var.value_actor().clone());
                                             } else {
-                                                if let Ok(val) = var.value_actor().current_value().await {
+                                                if let Ok(val) =
+                                                    var.value_actor().current_value().await
+                                                {
                                                     current_obj_value = val;
                                                 } else {
                                                     return;
@@ -4002,8 +4512,11 @@ fn build_text_literal_actor(
                         part_actors.push((false, field_actor));
                     }
                 } else {
-                    return Err(format!("Variable '{}' not found for text interpolation. Available: {:?}",
-                        var_name, ctx.actor_context.parameters.keys().collect::<Vec<_>>()));
+                    return Err(format!(
+                        "Variable '{}' not found for text interpolation. Available: {:?}",
+                        var_name,
+                        ctx.actor_context.parameters.keys().collect::<Vec<_>>()
+                    ));
                 }
             }
         }
@@ -4039,9 +4552,12 @@ fn build_text_literal_actor(
 
         // For simplicity, use select_all and latest values approach.
         // Sort by Lamport timestamp to restore happened-before ordering.
-        let merged = stream::select_all(part_subscriptions.into_iter().enumerate().map(|(idx, s)| {
-            s.map(move |v| (idx, v))
-        }))
+        let merged = stream::select_all(
+            part_subscriptions
+                .into_iter()
+                .enumerate()
+                .map(|(idx, s)| s.map(move |v| (idx, v))),
+        )
         .ready_chunks(8)
         .flat_map(|mut chunk| {
             chunk.sort_by_key(|(_, value)| value.lamport_time());
@@ -4050,35 +4566,34 @@ fn build_text_literal_actor(
 
         let part_count = part_actors.len();
         // Move forwarding_loops into scan state to keep them alive
-        let combined_stream = merged.scan(
-            (vec![None; part_count], forwarding_loops),
-            move |(latest_values, _forwarding_loops), (idx, value)| {
-                latest_values[idx] = Some(value);
+        let combined_stream = merged
+            .scan(
+                (vec![None; part_count], forwarding_loops),
+                move |(latest_values, _forwarding_loops), (idx, value)| {
+                    latest_values[idx] = Some(value);
 
-                // Check if all parts have values
-                if latest_values.iter().all(|v| v.is_some()) {
-                    // Combine all text parts
-                    let combined: String = latest_values
-                        .iter()
-                        .filter_map(|v| {
-                            v.as_ref().and_then(|val| {
-                                match val {
+                    // Check if all parts have values
+                    if latest_values.iter().all(|v| v.is_some()) {
+                        // Combine all text parts
+                        let combined: String = latest_values
+                            .iter()
+                            .filter_map(|v| {
+                                v.as_ref().and_then(|val| match val {
                                     Value::Text(text, _) => Some(text.text().to_string()),
                                     Value::Number(num, _) => Some(num.number().to_string()),
                                     Value::Tag(tag, _) => Some(tag.tag().to_string()),
                                     _ => None,
-                                }
+                                })
                             })
-                        })
-                        .collect();
+                            .collect();
 
-                    std::future::ready(Some(Some(combined)))
-                } else {
-                    std::future::ready(Some(None))
-                }
-            },
-        )
-        .filter_map(|opt| async move { opt });
+                        std::future::ready(Some(Some(combined)))
+                    } else {
+                        std::future::ready(Some(None))
+                    }
+                },
+            )
+            .filter_map(|opt| async move { opt });
 
         // Map combined strings directly to Text Values.
         // IMPORTANT: Do NOT use flat_map with Text actors here!
@@ -4182,8 +4697,11 @@ async fn get_link_sender_from_alias(
                     Value::Object(obj, _) => obj.variable(&part_str),
                     Value::TaggedObject(tagged, _) => tagged.variable(&part_str),
                     _ => {
-                        zoon::eprintln!("[get_link_sender_from_alias] Expected object at '{}', got {}",
-                            part_str, current_value.construct_info());
+                        zoon::eprintln!(
+                            "[get_link_sender_from_alias] Expected object at '{}', got {}",
+                            part_str,
+                            current_value.construct_info()
+                        );
                         return None;
                     }
                 }?;
@@ -4200,7 +4718,10 @@ async fn get_link_sender_from_alias(
 
             None
         }
-        static_expression::Alias::WithoutPassed { parts, referenced_span } => {
+        static_expression::Alias::WithoutPassed {
+            parts,
+            referenced_span,
+        } => {
             // For non-PASSED aliases, use the reference connector to get the root variable
             if parts.is_empty() {
                 return None;
@@ -4212,7 +4733,9 @@ async fn get_link_sender_from_alias(
             // calls to the same function would overwrite each other's LINK registrations.
             let first_part = parts.first()?.to_string();
 
-            let root_actor = if let Some(param_actor) = ctx.actor_context.parameters.get(&first_part).cloned() {
+            let root_actor = if let Some(param_actor) =
+                ctx.actor_context.parameters.get(&first_part).cloned()
+            {
                 param_actor
             } else if let Some(ref_span) = referenced_span {
                 // First check object_locals (which includes arg_locals for function arguments)
@@ -4225,7 +4748,10 @@ async fn get_link_sender_from_alias(
                     ref_connector.referenceable(ref_span).await
                 }
             } else {
-                zoon::eprintln!("[get_link_sender_from_alias] Cannot resolve root variable '{}'", first_part);
+                zoon::eprintln!(
+                    "[get_link_sender_from_alias] Cannot resolve root variable '{}'",
+                    first_part
+                );
                 return None;
             };
 
@@ -4234,7 +4760,10 @@ async fn get_link_sender_from_alias(
                 // without object navigation context. LINK senders are obtained from Variables,
                 // and for single-part aliases we only have a ValueActor.
                 // Multi-part paths like `obj.link_field` navigate to the Variable and work.
-                zoon::eprintln!("[get_link_sender_from_alias] Single-part LINK alias '{}' not supported without object context", first_part);
+                zoon::eprintln!(
+                    "[get_link_sender_from_alias] Single-part LINK alias '{}' not supported without object context",
+                    first_part
+                );
                 return None;
             }
 
@@ -4252,8 +4781,11 @@ async fn get_link_sender_from_alias(
                     Value::Object(obj, _) => obj.variable(&part_str),
                     Value::TaggedObject(tagged, _) => tagged.variable(&part_str),
                     _ => {
-                        zoon::eprintln!("[get_link_sender_from_alias] Expected object at '{}', got {}",
-                            part_str, current_value.construct_info());
+                        zoon::eprintln!(
+                            "[get_link_sender_from_alias] Expected object at '{}', got {}",
+                            part_str,
+                            current_value.construct_info()
+                        );
                         return None;
                     }
                 }?;
@@ -4262,7 +4794,10 @@ async fn get_link_sender_from_alias(
                     // At the end of the path, this should be a LINK variable
                     let sender = variable.link_value_sender();
                     if sender.is_none() {
-                        zoon::eprintln!("[get_link_sender_from_alias] Final variable '{}' is not a LINK", part_str);
+                        zoon::eprintln!(
+                            "[get_link_sender_from_alias] Final variable '{}' is not a LINK",
+                            part_str
+                        );
                     }
                     return sender;
                 } else {
@@ -4323,14 +4858,20 @@ fn build_list_binding_function(
     };
 
     // Get transform/predicate expression from second argument (NOT evaluated)
-    let transform_expr = arguments[1].node.value.clone()
+    let transform_expr = arguments[1]
+        .node
+        .value
+        .clone()
         .ok_or_else(|| format!("List/{} requires a transform expression", path_strs[1]))?;
 
-    let reference_connector = ctx.try_reference_connector()
+    let reference_connector = ctx
+        .try_reference_connector()
         .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;
-    let link_connector = ctx.try_link_connector()
+    let link_connector = ctx
+        .try_link_connector()
         .ok_or_else(|| "LinkConnector dropped - program shutting down".to_string())?;
-    let pass_through_connector = ctx.try_pass_through_connector()
+    let pass_through_connector = ctx
+        .try_pass_through_connector()
         .ok_or_else(|| "PassThroughConnector dropped - program shutting down".to_string())?;
     let config = ListBindingConfig {
         binding_name,
@@ -4377,7 +4918,11 @@ fn build_list_append_with_recording(
 ) -> Result<Option<ActorHandle>, String> {
     if LOG_DEBUG {
         zoon::println!("[DEBUG] build_list_append_with_recording called");
-        zoon::println!("[DEBUG] persistence: {:?}, persistence_id: {}", persistence.is_some(), persistence_id);
+        zoon::println!(
+            "[DEBUG] persistence: {:?}, persistence_id: {}",
+            persistence.is_some(),
+            persistence_id
+        );
     }
 
     // For List/append(item: expr):
@@ -4396,7 +4941,10 @@ fn build_list_append_with_recording(
 
     // Get the item expression
     let item_arg = &arguments[0];
-    let item_expr = item_arg.node.value.clone()
+    let item_expr = item_arg
+        .node
+        .value
+        .clone()
         .ok_or_else(|| "List/append requires an item expression".to_string())?;
 
     // Create persisting child scope for item evaluation
@@ -4405,8 +4953,16 @@ fn build_list_append_with_recording(
     let scope_id = format!("list_append_{}", span);
     // Storage key must be defined first to pass to with_persisting_child_scope
     let storage_key = format!("list_calls:{}", scope_id);
-    let (child_ctx, call_receiver) = ctx.actor_context.with_persisting_child_scope(&scope_id, storage_key.clone());
-    if LOG_DEBUG { zoon::println!("[DEBUG] Created persisting scope: {}, call_recorder is Some: {}", scope_id, child_ctx.call_recorder.is_some()); }
+    let (child_ctx, call_receiver) = ctx
+        .actor_context
+        .with_persisting_child_scope(&scope_id, storage_key.clone());
+    if LOG_DEBUG {
+        zoon::println!(
+            "[DEBUG] Created persisting scope: {}, call_recorder is Some: {}",
+            scope_id,
+            child_ctx.call_recorder.is_some()
+        );
+    }
 
     // Create new evaluation context with the persisting scope
     let item_eval_ctx = EvaluationContext {
@@ -4427,12 +4983,15 @@ fn build_list_append_with_recording(
     // Load any existing recorded calls for restoration
     // These are replayed to recreate list items from previous sessions
     let stored_calls: Vec<RecordedCall> = {
-        use zoon::{local_storage, WebStorage};
+        use zoon::{WebStorage, local_storage};
         match local_storage().get::<Vec<RecordedCall>>(&storage_key) {
             None => Vec::new(),
             Some(Ok(calls)) => calls,
             Some(Err(error)) => {
-                zoon::eprintln!("[DEBUG] Failed to load stored calls for restoration: {:#}", error);
+                zoon::eprintln!(
+                    "[DEBUG] Failed to load stored calls for restoration: {:#}",
+                    error
+                );
                 Vec::new()
             }
         }
@@ -4448,9 +5007,16 @@ fn build_list_append_with_recording(
     // Each call creates an item by evaluating the function with stored inputs
     let mut restored_items: Vec<ActorHandle> = Vec::new();
     if !stored_calls.is_empty() {
-        if LOG_DEBUG { zoon::println!("[DEBUG] Restoring {} items from stored calls", stored_calls.len()); }
+        if LOG_DEBUG {
+            zoon::println!(
+                "[DEBUG] Restoring {} items from stored calls",
+                stored_calls.len()
+            );
+        }
         for (index, recorded_call) in stored_calls.iter().enumerate() {
-            if LOG_DEBUG { zoon::println!("[DEBUG] Restoring item {}: {:?}", index, recorded_call); }
+            if LOG_DEBUG {
+                zoon::println!("[DEBUG] Restoring item {}: {:?}", index, recorded_call);
+            }
 
             // 1. Convert CapturedValue back to a Value actor
             let Some(input_value) = recorded_call.inputs.restore_with_context(
@@ -4478,9 +5044,15 @@ fn build_list_append_with_recording(
 
             // 2. Look up the function in registry
             let function_path = recorded_call.path.join("/");
-            let Some(func_def) = ctx.function_registry_snapshot.as_ref()
-                .and_then(|registry| registry.get(&function_path)) else {
-                zoon::eprintln!("[DEBUG] Function '{}' not found for restoration", function_path);
+            let Some(func_def) = ctx
+                .function_registry_snapshot
+                .as_ref()
+                .and_then(|registry| registry.get(&function_path))
+            else {
+                zoon::eprintln!(
+                    "[DEBUG] Function '{}' not found for restoration",
+                    function_path
+                );
                 continue;
             };
 
@@ -4488,10 +5060,19 @@ fn build_list_append_with_recording(
             // For `title_to_add |> new_todo()`, the piped value becomes the first argument (title)
             let mut parameters = ctx.actor_context.parameters.clone();
             if let Some(first_param) = func_def.parameters.first() {
-                if LOG_DEBUG { zoon::println!("[DEBUG] Binding restored input to parameter '{}' for function '{}'", first_param, function_path); }
+                if LOG_DEBUG {
+                    zoon::println!(
+                        "[DEBUG] Binding restored input to parameter '{}' for function '{}'",
+                        first_param,
+                        function_path
+                    );
+                }
                 parameters.insert(first_param.clone(), input_actor.clone());
             } else {
-                zoon::eprintln!("[DEBUG] Function '{}' has no parameters to bind input to", function_path);
+                zoon::eprintln!(
+                    "[DEBUG] Function '{}' has no parameters to bind input to",
+                    function_path
+                );
             }
 
             // 4. Create restoring context with parameters bound (prevents re-recording)
@@ -4509,7 +5090,9 @@ fn build_list_append_with_recording(
             // 5. Evaluate function body
             match evaluate_expression(func_def.body.clone(), body_ctx) {
                 Ok(Some(item_actor)) => {
-                    if LOG_DEBUG { zoon::println!("[DEBUG] Restored item {} successfully", index); }
+                    if LOG_DEBUG {
+                        zoon::println!("[DEBUG] Restored item {} successfully", index);
+                    }
                     // Wrap the item with origin for removal tracking
                     let origin = ListItemOrigin {
                         source_storage_key: storage_key.clone(),
@@ -4530,7 +5113,9 @@ fn build_list_append_with_recording(
                     restored_items.push(wrapped_item);
                 }
                 Ok(None) => {
-                    if LOG_DEBUG { zoon::println!("[DEBUG] Restored item {} was SKIP", index); }
+                    if LOG_DEBUG {
+                        zoon::println!("[DEBUG] Restored item {} was SKIP", index);
+                    }
                 }
                 Err(e) => {
                     zoon::eprintln!("[DEBUG] Failed to restore item {}: {}", index, e);
@@ -4539,7 +5124,9 @@ fn build_list_append_with_recording(
         }
     }
     let storage_handle = spawn_recorded_calls_storage_actor(storage_key.clone(), call_receiver);
-    if LOG_DEBUG { zoon::println!("[DEBUG] Spawned storage actor for key: {}", storage_key); }
+    if LOG_DEBUG {
+        zoon::println!("[DEBUG] Spawned storage actor for key: {}", storage_key);
+    }
 
     // Build a custom change stream that includes restored items
     // This replicates function_list_append logic but injects restored items after the first Replace
@@ -4560,18 +5147,25 @@ fn build_list_append_with_recording(
 
     // Source list changes
     let list_actor_for_stream = list_actor.clone();
-    let list_changes = list_actor_for_stream.stream().filter_map(|value| {
-        future::ready(match value {
-            Value::List(list, _) => Some(list),
-            _ => None,
+    let list_changes = list_actor_for_stream
+        .stream()
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::List(list, _) => Some(list),
+                _ => None,
+            })
         })
-    }).flat_map(|list| list.stream()).map(TaggedChange::FromList);
+        .flat_map(|list| list.stream())
+        .map(TaggedChange::FromList);
 
     // New item changes (from item_actor stream)
     let item_actor_for_stream = item_actor.clone();
     let append_changes = item_actor_for_stream.stream().map(move |value| {
         // Generate call_id that matches the one used during recording
-        let call_id = format!("call_{}", appending_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+        let call_id = format!(
+            "call_{}",
+            appending_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        );
         let origin = ListItemOrigin {
             source_storage_key: storage_key_for_append.clone(),
             call_id,
@@ -4588,19 +5182,21 @@ fn build_list_append_with_recording(
             origin,
             actor_context_for_append.scope_id(),
         );
-        TaggedChange::FromAppend(ListChange::Push { item: new_item_actor })
+        TaggedChange::FromAppend(ListChange::Push {
+            item: new_item_actor,
+        })
     });
 
     // Restored item changes (one-time stream of Push changes for each restored item)
     // Track if we have stored calls - determines whether to override initial items
     let had_stored_calls = !restored_items.is_empty();
 
-    let restored_changes = stream::iter(
-        restored_items.into_iter().map(|item| {
-            if LOG_DEBUG { zoon::println!("[DEBUG] Emitting restored item to change stream"); }
-            TaggedChange::FromRestored(ListChange::Push { item })
-        })
-    );
+    let restored_changes = stream::iter(restored_items.into_iter().map(|item| {
+        if LOG_DEBUG {
+            zoon::println!("[DEBUG] Emitting restored item to change stream");
+        }
+        TaggedChange::FromRestored(ListChange::Push { item })
+    }));
 
     // Merge all change streams, then use scan to ensure proper ordering:
     // 1. First list Replace must come first
@@ -4655,7 +5251,7 @@ fn build_list_append_with_recording(
             };
 
             future::ready(Some(changes_to_emit))
-        }
+        },
     )
     .flat_map(|changes| stream::iter(changes));
 
@@ -4668,7 +5264,7 @@ fn build_list_append_with_recording(
         ),
         ctx.actor_context.clone(),
         change_stream,
-        (list_actor, item_actor, storage_handle),  // Keep these alive
+        (list_actor, item_actor, storage_handle), // Keep these alive
     );
 
     let result_stream = constant(Value::List(
@@ -4718,7 +5314,8 @@ fn call_function(
     // Check user-defined functions first
     // For nested evaluations (closures), use snapshot from context.
     // For main evaluation, use the passed registry.
-    let func_def_opt = ctx.function_registry_snapshot
+    let func_def_opt = ctx
+        .function_registry_snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.get(&full_path).cloned())
         .or_else(|| function_registry.get(&full_path).cloned());
@@ -4769,15 +5366,29 @@ fn call_function(
             let result_stream = piped_for_closure.stream().flat_map(move |piped_value| {
                 // Generate unique invocation_id for this call (used for both recording and scope)
                 // This ensures each invocation of the function gets its own scope for internal HOLDs
-                let invocation_id = ctx_for_closure.actor_context.recording_counter
+                let invocation_id = ctx_for_closure
+                    .actor_context
+                    .recording_counter
                     .as_ref()
-                    .map(|counter| format!("call_{}", counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)))
+                    .map(|counter| {
+                        format!(
+                            "call_{}",
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        )
+                    })
                     .unwrap_or_else(|| format!("call_{}", ulid::Ulid::new()));
 
                 // Record the call if we're in a persisting scope
                 if let Some(call_recorder) = &ctx_for_closure.actor_context.call_recorder {
                     let captured_input = CapturedValue::capture(&piped_value);
-                    if LOG_DEBUG { zoon::println!("[DEBUG] Recording call: {:?} with id: {} and input: {:?}", path_for_recording, invocation_id, captured_input); }
+                    if LOG_DEBUG {
+                        zoon::println!(
+                            "[DEBUG] Recording call: {:?} with id: {} and input: {:?}",
+                            path_for_recording,
+                            invocation_id,
+                            captured_input
+                        );
+                    }
                     let recorded_call = RecordedCall {
                         id: invocation_id.clone(),
                         path: path_for_recording.clone(),
@@ -4791,7 +5402,10 @@ fn call_function(
                     ConstructInfo::new(
                         "piped function input".to_string(),
                         None,
-                        format!("piped value for user function param: {}", param_name_for_closure),
+                        format!(
+                            "piped value for user function param: {}",
+                            param_name_for_closure
+                        ),
                     ),
                     ctx_for_closure.actor_context.clone(),
                     constant(piped_value),
@@ -4832,7 +5446,10 @@ fn call_function(
                     subscription_scope: ctx_for_closure.actor_context.subscription_scope.clone(),
                     call_recorder: ctx_for_closure.actor_context.call_recorder.clone(),
                     is_restoring: ctx_for_closure.actor_context.is_restoring,
-                    list_append_storage_key: ctx_for_closure.actor_context.list_append_storage_key.clone(),
+                    list_append_storage_key: ctx_for_closure
+                        .actor_context
+                        .list_append_storage_key
+                        .clone(),
                     recording_counter: ctx_for_closure.actor_context.recording_counter.clone(),
                     // Inherit subscription_time - function bodies should respect caller's filtering
                     subscription_time: ctx_for_closure.actor_context.subscription_time,
@@ -4854,8 +5471,10 @@ fn call_function(
                 match evaluate_expression(func_body.clone(), new_ctx) {
                     Ok(Some(result_actor)) => {
                         // Use value() for type-safe single-value semantics (like THEN does)
-                        let result_stream: Pin<Box<dyn Stream<Item = Value>>> =
-                            Box::pin(stream::once(async move { result_actor.value().await }).filter_map(|v| async { v.ok() }));
+                        let result_stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(
+                            stream::once(async move { result_actor.value().await })
+                                .filter_map(|v| async { v.ok() }),
+                        );
                         result_stream
                     }
                     Ok(None) => {
@@ -4896,9 +5515,7 @@ fn call_function(
         // for each call site (e.g., each call to new_todo() gets its own scope).
         let call_scope = match &ctx.actor_context.scope {
             Scope::Root => Scope::Nested(persistence_id.to_string()),
-            Scope::Nested(existing) => {
-                Scope::Nested(format!("{}:{}", existing, persistence_id))
-            }
+            Scope::Nested(existing) => Scope::Nested(format!("{}:{}", existing, persistence_id)),
         };
 
         let new_actor_context = ActorContext {
@@ -5014,9 +5631,7 @@ fn call_function(
                 builtin_args,
             )))
         }
-        Err(_) => {
-            Err(format!("Function '{}' not found", full_path))
-        }
+        Err(_) => Err(format!("Function '{}' not found", full_path)),
     }
 }
 
@@ -5036,32 +5651,30 @@ async fn match_pattern(
             Some(bindings)
         }
 
-        static_expression::Pattern::Literal(lit) => {
-            match (lit, value) {
-                (static_expression::Literal::Number(n), Value::Number(v, _)) => {
-                    if (*n - v.number()).abs() < f64::EPSILON {
-                        Some(bindings)
-                    } else {
-                        None
-                    }
+        static_expression::Pattern::Literal(lit) => match (lit, value) {
+            (static_expression::Literal::Number(n), Value::Number(v, _)) => {
+                if (*n - v.number()).abs() < f64::EPSILON {
+                    Some(bindings)
+                } else {
+                    None
                 }
-                (static_expression::Literal::Tag(t), Value::Tag(v, _)) => {
-                    if t.as_str() == v.tag() {
-                        Some(bindings)
-                    } else {
-                        None
-                    }
-                }
-                (static_expression::Literal::Text(t), Value::Text(v, _)) => {
-                    if t.as_str() == v.text() {
-                        Some(bindings)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
             }
-        }
+            (static_expression::Literal::Tag(t), Value::Tag(v, _)) => {
+                if t.as_str() == v.tag() {
+                    Some(bindings)
+                } else {
+                    None
+                }
+            }
+            (static_expression::Literal::Text(t), Value::Text(v, _)) => {
+                if t.as_str() == v.text() {
+                    Some(bindings)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
 
         static_expression::Pattern::TaggedObject { tag, variables } => {
             if let Value::TaggedObject(to, _) = value {
@@ -5070,13 +5683,18 @@ async fn match_pattern(
                     for pattern_var in variables {
                         let var_name = pattern_var.name.as_str();
                         // Find the variable in the tagged object by name
-                        if let Some(variable) = to.variables().iter().find(|v| v.name() == var_name) {
+                        if let Some(variable) = to.variables().iter().find(|v| v.name() == var_name)
+                        {
                             // Await the current value from the reactive actor
-                            if let Some(field_value) = variable.value_actor().current_value().await.ok() {
+                            if let Some(field_value) =
+                                variable.value_actor().current_value().await.ok()
+                            {
                                 // Handle nested patterns if present
                                 if let Some(ref nested_pattern) = pattern_var.value {
                                     // Recursively match nested pattern
-                                    if let Some(nested_bindings) = Box::pin(match_pattern(nested_pattern, &field_value)).await {
+                                    if let Some(nested_bindings) =
+                                        Box::pin(match_pattern(nested_pattern, &field_value)).await
+                                    {
                                         bindings.extend(nested_bindings);
                                     } else {
                                         return None; // Nested pattern didn't match
@@ -5113,11 +5731,14 @@ async fn match_pattern(
                     // Find the variable in the object by name
                     if let Some(variable) = variables.iter().find(|v| v.name() == var_name) {
                         // Await the current value from the reactive actor
-                        if let Some(field_value) = variable.value_actor().current_value().await.ok() {
+                        if let Some(field_value) = variable.value_actor().current_value().await.ok()
+                        {
                             // Handle nested patterns if present
                             if let Some(ref nested_pattern) = pattern_var.value {
                                 // Recursively match nested pattern
-                                if let Some(nested_bindings) = Box::pin(match_pattern(nested_pattern, &field_value)).await {
+                                if let Some(nested_bindings) =
+                                    Box::pin(match_pattern(nested_pattern, &field_value)).await
+                                {
                                     bindings.extend(nested_bindings);
                                 } else {
                                     return false; // Nested pattern didn't match
@@ -5168,7 +5789,9 @@ async fn match_pattern(
                     // Get the current value from the item actor
                     if let Some(item_value) = item_actor.clone().current_value().await.ok() {
                         // Recursively match the pattern
-                        if let Some(nested_bindings) = Box::pin(match_pattern(item_pattern, &item_value)).await {
+                        if let Some(nested_bindings) =
+                            Box::pin(match_pattern(item_pattern, &item_value)).await
+                        {
                             bindings.extend(nested_bindings);
                         } else {
                             return None; // Pattern didn't match
@@ -5219,9 +5842,17 @@ pub struct ModuleData {
 /// Request types for the module loader actor.
 enum ModuleLoaderRequest {
     SetBaseDir(String),
-    GetBaseDir { reply: oneshot::Sender<String> },
-    GetCached { name: String, reply: oneshot::Sender<Option<ModuleData>> },
-    Cache { name: String, data: ModuleData },
+    GetBaseDir {
+        reply: oneshot::Sender<String>,
+    },
+    GetCached {
+        name: String,
+        reply: oneshot::Sender<Option<ModuleData>>,
+    },
+    Cache {
+        name: String,
+        data: ModuleData,
+    },
 }
 
 /// Module loader with caching for loading and parsing Boon modules.
@@ -5241,7 +5872,8 @@ impl Default for ModuleLoader {
 
 impl ModuleLoader {
     pub fn new(base_dir: impl Into<String>) -> Self {
-        let (tx, mut rx) = NamedChannel::new("module_loader.requests", MODULE_LOADER_REQUEST_CAPACITY);
+        let (tx, mut rx) =
+            NamedChannel::new("module_loader.requests", MODULE_LOADER_REQUEST_CAPACITY);
         let initial_base_dir = base_dir.into();
 
         let actor_loop = ActorLoop::new(async move {
@@ -5260,7 +5892,10 @@ impl ModuleLoader {
                     }
                     ModuleLoaderRequest::GetCached { name, reply } => {
                         if reply.send(cache.get(&name).cloned()).is_err() {
-                            zoon::println!("[MODULE_LOADER] GetCached reply receiver dropped for {}", name);
+                            zoon::println!(
+                                "[MODULE_LOADER] GetCached reply receiver dropped for {}",
+                                name
+                            );
                         }
                     }
                     ModuleLoaderRequest::Cache { name, data } => {
@@ -5278,7 +5913,10 @@ impl ModuleLoader {
 
     /// Set the base directory for module resolution (fire-and-forget).
     pub fn set_base_dir(&self, dir: impl Into<String>) {
-        if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::SetBaseDir(dir.into())) {
+        if let Err(e) = self
+            .request_sender
+            .try_send(ModuleLoaderRequest::SetBaseDir(dir.into()))
+        {
             zoon::eprintln!("[MODULE_LOADER] Failed to send SetBaseDir: {e}");
         }
     }
@@ -5286,7 +5924,10 @@ impl ModuleLoader {
     /// Get the base directory (async).
     pub async fn base_dir(&self) -> String {
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::GetBaseDir { reply: tx }) {
+        if let Err(e) = self
+            .request_sender
+            .try_send(ModuleLoaderRequest::GetBaseDir { reply: tx })
+        {
             zoon::eprintln!("[MODULE_LOADER] Failed to send GetBaseDir: {e}");
             return String::new();
         }
@@ -5296,10 +5937,13 @@ impl ModuleLoader {
     /// Get a cached module (async).
     async fn get_cached(&self, name: &str) -> Option<ModuleData> {
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::GetCached {
-            name: name.to_string(),
-            reply: tx,
-        }) {
+        if let Err(e) = self
+            .request_sender
+            .try_send(ModuleLoaderRequest::GetCached {
+                name: name.to_string(),
+                reply: tx,
+            })
+        {
             zoon::println!("[MODULE_LOADER] Failed to send GetCached for {}: {e}", name);
             return None;
         }
@@ -5308,7 +5952,10 @@ impl ModuleLoader {
 
     /// Cache a module (fire-and-forget).
     fn cache(&self, name: String, data: ModuleData) {
-        if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::Cache { name: name.clone(), data }) {
+        if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::Cache {
+            name: name.clone(),
+            data,
+        }) {
             zoon::eprintln!("[MODULE_LOADER] Failed to cache module {}: {e}", name);
         }
     }
@@ -5348,13 +5995,20 @@ impl ModuleLoader {
             make_path(base, &format!("Generated/{}.bn", module_name)),
             // Also try from the module loader's base directory if current_dir is different
             make_path(&base_dir_owned, &format!("{}.bn", module_name)),
-            make_path(&base_dir_owned, &format!("{}/{}.bn", module_name, module_name)),
+            make_path(
+                &base_dir_owned,
+                &format!("{}/{}.bn", module_name, module_name),
+            ),
             make_path(&base_dir_owned, &format!("Generated/{}.bn", module_name)),
         ];
 
         for path in paths_to_try {
             if let Some(source_code) = virtual_fs.read_text(&path).await {
-                zoon::println!("[ModuleLoader] Loading module '{}' from '{}'", module_name, path);
+                zoon::println!(
+                    "[ModuleLoader] Loading module '{}' from '{}'",
+                    module_name,
+                    path
+                );
                 if let Some(module_data) = parse_module(&path, &source_code) {
                     // Cache the module
                     self.cache(module_name.to_string(), module_data.clone());
@@ -5363,7 +6017,11 @@ impl ModuleLoader {
             }
         }
 
-        zoon::eprintln!("[ModuleLoader] Could not find module '{}' (tried from base '{}')", module_name, base);
+        zoon::eprintln!(
+            "[ModuleLoader] Could not find module '{}' (tried from base '{}')",
+            module_name,
+            base
+        );
         None
     }
 
@@ -5375,7 +6033,9 @@ impl ModuleLoader {
         virtual_fs: &VirtualFilesystem,
         current_dir: Option<&str>,
     ) -> Option<StaticFunctionDefinition> {
-        let module = self.load_module(module_name, virtual_fs, current_dir).await?;
+        let module = self
+            .load_module(module_name, virtual_fs, current_dir)
+            .await?;
         module.functions.get(function_name).cloned()
     }
 
@@ -5387,7 +6047,9 @@ impl ModuleLoader {
         virtual_fs: &VirtualFilesystem,
         current_dir: Option<&str>,
     ) -> Option<static_expression::Spanned<static_expression::Expression>> {
-        let module = self.load_module(module_name, virtual_fs, current_dir).await?;
+        let module = self
+            .load_module(module_name, virtual_fs, current_dir)
+            .await?;
         module.variables.get(variable_name).cloned()
     }
 }
@@ -5397,7 +6059,11 @@ fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
     // Lexer
     let (tokens, errors) = lexer().parse(source_code).into_output_errors();
     if !errors.is_empty() {
-        zoon::eprintln!("[ModuleLoader] Lex errors in '{}': {:?}", filename, errors.len());
+        zoon::eprintln!(
+            "[ModuleLoader] Lex errors in '{}': {:?}",
+            filename,
+            errors.len()
+        );
         return None;
     }
     let mut tokens = tokens?;
@@ -5407,11 +6073,19 @@ fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
     let (ast, errors) = parser()
         .parse(ChumskyStream::from_iter(tokens).map(
             span_at(source_code.len()),
-            |Spanned { node, span, persistence: _ }| (node, span),
+            |Spanned {
+                 node,
+                 span,
+                 persistence: _,
+             }| (node, span),
         ))
         .into_output_errors();
     if !errors.is_empty() {
-        zoon::eprintln!("[ModuleLoader] Parse errors in '{}': {:?}", filename, errors.len());
+        zoon::eprintln!(
+            "[ModuleLoader] Parse errors in '{}': {:?}",
+            filename,
+            errors.len()
+        );
         return None;
     }
     let ast = ast?;
@@ -5420,7 +6094,11 @@ fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
     let ast = match resolve_references(ast) {
         Ok(ast) => ast,
         Err(errors) => {
-            zoon::eprintln!("[ModuleLoader] Reference errors in '{}': {:?}", filename, errors.len());
+            zoon::eprintln!(
+                "[ModuleLoader] Reference errors in '{}': {:?}",
+                filename,
+                errors.len()
+            );
             return None;
         }
     };
@@ -5440,7 +6118,11 @@ fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
                 let value_expr = variable.value;
                 variables.insert(name, value_expr);
             }
-            static_expression::Expression::Function { name, parameters, body } => {
+            static_expression::Expression::Function {
+                name,
+                parameters,
+                body,
+            } => {
                 functions.insert(
                     name.to_string(),
                     StaticFunctionDefinition {
@@ -5453,7 +6135,10 @@ fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
         }
     }
 
-    Some(ModuleData { functions, variables })
+    Some(ModuleData {
+        functions,
+        variables,
+    })
 }
 
 /// Main evaluation function - takes static expressions (owned, 'static, no lifetimes).
@@ -5500,11 +6185,22 @@ pub fn evaluate_with_registry(
     virtual_fs: VirtualFilesystem,
     mut function_registry: FunctionRegistry,
     module_loader: ModuleLoader,
-) -> Result<(Arc<Object>, ConstructContext, FunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>, Arc<PassThroughConnector>, ScopeDestroyGuard), String> {
+) -> Result<
+    (
+        Arc<Object>,
+        ConstructContext,
+        FunctionRegistry,
+        ModuleLoader,
+        Arc<ReferenceConnector>,
+        Arc<LinkConnector>,
+        Arc<PassThroughConnector>,
+        ScopeDestroyGuard,
+    ),
+    String,
+> {
     // Create root scope in the actor registry for deterministic lifetime management
-    let root_scope_id = REGISTRY.with(|reg: &std::cell::RefCell<ActorRegistry>| {
-        reg.borrow_mut().create_scope(None)
-    });
+    let root_scope_id = REGISTRY
+        .with(|reg: &std::cell::RefCell<ActorRegistry>| reg.borrow_mut().create_scope(None));
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
@@ -5580,7 +6276,16 @@ pub fn evaluate_with_registry(
         evaluated_variables?,
     );
     let root_scope_guard = ScopeDestroyGuard::new(root_scope_id);
-    Ok((root_object, construct_context, function_registry, module_loader, reference_connector, link_connector, pass_through_connector, root_scope_guard))
+    Ok((
+        root_object,
+        construct_context,
+        function_registry,
+        module_loader,
+        reference_connector,
+        link_connector,
+        pass_through_connector,
+        root_scope_guard,
+    ))
 }
 
 /// Evaluates a static variable into a Variable.
@@ -5622,7 +6327,13 @@ fn static_spanned_variable_into_variable(
     let scope_for_link = actor_context.scope.clone();
 
     let variable = if is_link {
-        Variable::new_link_arc(construct_info, construct_context, name_string, actor_context, persistence_id)
+        Variable::new_link_arc(
+            construct_info,
+            construct_context,
+            name_string,
+            actor_context,
+            persistence_id,
+        )
     } else {
         Variable::new_arc(
             construct_info,
@@ -5779,7 +6490,6 @@ fn static_spanned_expression_into_value_actor(
         .ok_or_else(|| "Top-level expression cannot be SKIP".to_string())
 }
 
-
 /// Get function definition for static function calls.
 fn static_function_call_path_to_definition(
     path: &[&str],
@@ -5797,186 +6507,509 @@ fn static_function_call_path_to_definition(
 > {
     let definition = match path {
         ["Math", "sum"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_math_sum(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_math_sum(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["Text", "empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_text_empty(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_text_empty(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["Text", "space"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_text_space(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_text_space(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["Text", "trim"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_text_trim(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_text_trim(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
-        ["Text", "is_empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_text_is_empty(arguments, id, persistence_id, construct_context, actor_context)
+        ["Text", "is_empty"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_text_is_empty(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Text", "is_not_empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_text_is_not_empty(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Text", "is_not_empty"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_text_is_not_empty(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
+            }
+        }
         ["Bool", "not"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_bool_not(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_bool_not(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["Bool", "toggle"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_bool_toggle(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_bool_toggle(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["Bool", "or"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_bool_or(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_bool_or(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["List", "count"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_list_count(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_list_count(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["List", "append"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_list_append(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_list_append(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["List", "clear"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_list_clear(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_list_clear(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["List", "latest"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_list_latest(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_list_latest(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
-        ["List", "is_empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_list_is_empty(arguments, id, persistence_id, construct_context, actor_context)
+        ["List", "is_empty"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_list_is_empty(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["List", "is_not_empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_list_is_not_empty(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["List", "is_not_empty"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_list_is_not_empty(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
+            }
+        }
         ["Router", "route"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_router_route(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_router_route(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["Router", "go_to"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_router_go_to(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_router_go_to(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
-        ["Ulid", "generate"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_ulid_generate(arguments, id, persistence_id, construct_context, actor_context)
+        ["Ulid", "generate"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_ulid_generate(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
+            }
+        }
         ["Document", "new"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_document_new(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_document_new(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
-        ["Element", "stripe"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_stripe(arguments, id, persistence_id, construct_context, actor_context)
+        ["Element", "stripe"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_stripe(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Element", "container"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_container(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Element", "container"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_container(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Element", "stack"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_stack(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Element", "stack"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_stack(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Element", "button"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_button(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Element", "button"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_button(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Element", "text_input"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_text_input(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Element", "text_input"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_text_input(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Element", "checkbox"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_checkbox(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Element", "checkbox"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_checkbox(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Element", "label"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_label(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Element", "label"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_label(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Element", "paragraph"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_paragraph(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Element", "paragraph"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_paragraph(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
+            }
+        }
         ["Element", "link"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_link(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_element_link(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
-        ["Timer", "interval"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_timer_interval(arguments, id, persistence_id, construct_context, actor_context)
+        ["Timer", "interval"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_timer_interval(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
+            }
+        }
         ["Log", "info"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_log_info(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_log_info(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["Log", "error"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_log_error(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_log_error(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
-        ["Build", "succeed"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_build_succeed(arguments, id, persistence_id, construct_context, actor_context)
+        ["Build", "succeed"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_build_succeed(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
+            }
+        }
         ["Build", "fail"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_build_fail(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_build_fail(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["Scene", "new"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_scene_new(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_scene_new(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
-        ["Theme", "background_color"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_theme_background_color(arguments, id, persistence_id, construct_context, actor_context)
+        ["Theme", "background_color"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_theme_background_color(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Theme", "text_color"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_theme_text_color(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Theme", "text_color"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_theme_text_color(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Theme", "accent_color"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_theme_accent_color(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Theme", "accent_color"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_theme_accent_color(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["File", "read_text"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_file_read_text(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["File", "read_text"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_file_read_text(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["File", "write_text"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_file_write_text(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["File", "write_text"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_file_write_text(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Directory", "entries"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_directory_entries(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Directory", "entries"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_directory_entries(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
+            }
+        }
         ["Stream", "skip"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_stream_skip(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_stream_skip(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
         ["Stream", "take"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_stream_take(arguments, id, persistence_id, construct_context, actor_context)
-                .boxed_local()
+            api::function_stream_take(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
-        ["Stream", "distinct"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_stream_distinct(arguments, id, persistence_id, construct_context, actor_context)
+        ["Stream", "distinct"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_stream_distinct(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Stream", "pulses"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_stream_pulses(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Stream", "pulses"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_stream_pulses(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        ["Stream", "debounce"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_stream_debounce(arguments, id, persistence_id, construct_context, actor_context)
+            }
+        }
+        ["Stream", "debounce"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_stream_debounce(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
                 .boxed_local()
-        },
-        _ => return Err(format!("Unknown function '{}(..)' in static context", path.join("/"))),
+            }
+        }
+        _ => {
+            return Err(format!(
+                "Unknown function '{}(..)' in static context",
+                path.join("/")
+            ));
+        }
     };
     Ok(definition)
 }
@@ -5992,33 +7025,56 @@ fn spawn_recorded_calls_storage_actor(
     mut call_receiver: mpsc::Receiver<RecordedCall>,
 ) -> TaskHandle {
     use zoon::futures_util::StreamExt;
-    use zoon::{local_storage, WebStorage};
+    use zoon::{WebStorage, local_storage};
 
     Task::start_droppable(async move {
         // Load existing recorded calls from storage (if any)
-        let mut recorded_calls: Vec<RecordedCall> = match local_storage().get::<Vec<RecordedCall>>(&storage_key) {
-            None => Vec::new(),
-            Some(Ok(calls)) => calls,
-            Some(Err(error)) => {
-                zoon::eprintln!("[DEBUG] Failed to deserialize recorded calls for {}: {:#}", storage_key, error);
-                Vec::new()
-            }
-        };
-        if LOG_DEBUG { zoon::println!("[DEBUG] Storage actor loaded {} existing calls for {}", recorded_calls.len(), storage_key); }
+        let mut recorded_calls: Vec<RecordedCall> =
+            match local_storage().get::<Vec<RecordedCall>>(&storage_key) {
+                None => Vec::new(),
+                Some(Ok(calls)) => calls,
+                Some(Err(error)) => {
+                    zoon::eprintln!(
+                        "[DEBUG] Failed to deserialize recorded calls for {}: {:#}",
+                        storage_key,
+                        error
+                    );
+                    Vec::new()
+                }
+            };
+        if LOG_DEBUG {
+            zoon::println!(
+                "[DEBUG] Storage actor loaded {} existing calls for {}",
+                recorded_calls.len(),
+                storage_key
+            );
+        }
 
         // Process incoming recorded calls
         while let Some(call) = call_receiver.next().await {
-            if LOG_DEBUG { zoon::println!("[DEBUG] Storage actor received call: {:?}", call); }
+            if LOG_DEBUG {
+                zoon::println!("[DEBUG] Storage actor received call: {:?}", call);
+            }
             recorded_calls.push(call);
 
             // Save to localStorage after each call
             if let Err(error) = local_storage().insert(&storage_key, &recorded_calls) {
-                zoon::eprintln!("[DEBUG] Failed to save recorded calls for {}: {:#}", storage_key, error);
+                zoon::eprintln!(
+                    "[DEBUG] Failed to save recorded calls for {}: {:#}",
+                    storage_key,
+                    error
+                );
             } else if LOG_DEBUG {
-                zoon::println!("[DEBUG] Storage actor saved {} calls to {}", recorded_calls.len(), storage_key);
+                zoon::println!(
+                    "[DEBUG] Storage actor saved {} calls to {}",
+                    recorded_calls.len(),
+                    storage_key
+                );
             }
         }
 
-        if LOG_DEBUG { zoon::println!("[DEBUG] Storage actor for {} shutting down", storage_key); }
+        if LOG_DEBUG {
+            zoon::println!("[DEBUG] Storage actor for {} shutting down", storage_key);
+        }
     })
 }

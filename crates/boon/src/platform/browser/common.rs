@@ -36,7 +36,9 @@ impl EngineType {
     pub fn description(&self) -> &'static str {
         match self {
             Self::Actors => "Reactive actor subscriptions (mixed push/pull)",
-            Self::DifferentialDataflow => "Incremental computation based on the Differential Dataflow library",
+            Self::DifferentialDataflow => {
+                "Incremental computation based on the Differential Dataflow library"
+            }
             Self::Wasm => "Compiled to WebAssembly bytecode",
         }
     }

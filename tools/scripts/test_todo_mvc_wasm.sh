@@ -686,7 +686,7 @@ PREVIEW=$(bt preview)
 if echo "$PREVIEW" | grep -qF "Clean room EDITED"; then
     ok "Edit saved: 'Clean room EDITED' visible"
 else
-    fail "Edit saved: expected 'Clean room EDITED' in preview" "M8"
+    fail "Edit saved: expected 'Clean room EDITED' in preview"
 fi
 
 # ══════════════════════════════════════════════
@@ -902,7 +902,7 @@ PREVIEW=$(bt preview)
 if echo "$PREVIEW" | grep -qF "Todo to keep EDITED"; then
     ok "Edit saved: 'Todo to keep EDITED'"
 else
-    fail "Edit saved: expected 'Todo to keep EDITED'" "M8"
+    fail "Edit saved: expected 'Todo to keep EDITED'"
 fi
 
 # ══════════════════════════════════════════════

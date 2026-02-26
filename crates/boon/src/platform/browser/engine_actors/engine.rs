@@ -2,32 +2,31 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::marker::PhantomData;
-use std::pin::{pin, Pin};
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-
+use super::evaluator::{FunctionRegistry, evaluate_static_expression_with_registry};
 use crate::parser;
 use crate::parser::SourceCode;
 use crate::parser::static_expression;
-use super::evaluator::{evaluate_static_expression_with_registry, FunctionRegistry};
 
 use ulid::Ulid;
 
 use zoon::IntoCowStr;
 use zoon::future;
 use zoon::futures_channel::{mpsc, oneshot};
+use zoon::futures_util::SinkExt;
 use zoon::futures_util::future::{FutureExt, Shared};
 use zoon::futures_util::select;
 use zoon::futures_util::stream::{self, LocalBoxStream, Stream, StreamExt};
 use zoon::{Deserialize, DeserializeOwned, Serialize, serde, serde_json};
 use zoon::{Task, TaskHandle};
 use zoon::{WebStorage, local_storage};
-use zoon::futures_util::SinkExt;
 
-use std::cell::Cell;
 use smallvec::SmallVec;
+use std::cell::Cell;
 
 // --- Performance Metrics ---
 //
@@ -91,14 +90,16 @@ pub mod metrics {
     /// Dump all counters to the browser console.
     pub fn dump_to_console() {
         zoon::println!("[actors-metrics] === Performance Counters ===");
-        zoon::println!("[actors-metrics] Bridge: change_constructed={}, keydown_constructed={}, hover_emitted={}, hover_deduped={}, change_deduped={}",
+        zoon::println!(
+            "[actors-metrics] Bridge: change_constructed={}, keydown_constructed={}, hover_emitted={}, hover_deduped={}, change_deduped={}",
             CHANGE_EVENTS_CONSTRUCTED.load(Ordering::Relaxed),
             KEYDOWN_EVENTS_CONSTRUCTED.load(Ordering::Relaxed),
             HOVER_EVENTS_EMITTED.load(Ordering::Relaxed),
             HOVER_EVENTS_DEDUPED.load(Ordering::Relaxed),
             CHANGE_EVENTS_DEDUPED.load(Ordering::Relaxed),
         );
-        zoon::println!("[actors-metrics] List: replace_sent={}, replace_items={}, fanout_sends={}, retain_rebuilds={}, retain_items={}, remove_spawned={}, remove_completed={}",
+        zoon::println!(
+            "[actors-metrics] List: replace_sent={}, replace_items={}, fanout_sends={}, retain_rebuilds={}, retain_items={}, remove_spawned={}, remove_completed={}",
             REPLACE_PAYLOADS_SENT.load(Ordering::Relaxed),
             REPLACE_PAYLOAD_TOTAL_ITEMS.load(Ordering::Relaxed),
             REPLACE_FANOUT_SENDS.load(Ordering::Relaxed),
@@ -107,17 +108,20 @@ pub mod metrics {
             REMOVE_TASKS_SPAWNED.load(Ordering::Relaxed),
             REMOVE_TASKS_COMPLETED.load(Ordering::Relaxed),
         );
-        zoon::println!("[actors-metrics] Actors: created={}, dropped={}, channel_drops={}",
+        zoon::println!(
+            "[actors-metrics] Actors: created={}, dropped={}, channel_drops={}",
             ACTORS_CREATED.load(Ordering::Relaxed),
             ACTORS_DROPPED.load(Ordering::Relaxed),
             CHANNEL_DROPS.load(Ordering::Relaxed),
         );
-        zoon::println!("[actors-metrics] Evaluator: slots_allocated={}, registry_clones={}, registry_clone_entries={}",
+        zoon::println!(
+            "[actors-metrics] Evaluator: slots_allocated={}, registry_clones={}, registry_clone_entries={}",
             SLOTS_ALLOCATED.load(Ordering::Relaxed),
             REGISTRY_CLONES.load(Ordering::Relaxed),
             REGISTRY_CLONE_ENTRIES.load(Ordering::Relaxed),
         );
-        zoon::println!("[actors-metrics] Persistence: writes={}",
+        zoon::println!(
+            "[actors-metrics] Persistence: writes={}",
             PERSISTENCE_WRITES.load(Ordering::Relaxed),
         );
     }
@@ -306,8 +310,12 @@ pub fn add_to_removed_set(removed_set_key: &str, call_id: &str) {
         if let Err(e) = local_storage().insert(removed_set_key, &removed) {
             zoon::eprintln!("[DEBUG] Failed to save removed set: {:#}", e);
         } else if LOG_DEBUG {
-            zoon::println!("[DEBUG] Added {} to removed set {}, now {} items",
-                call_id, removed_set_key, removed.len());
+            zoon::println!(
+                "[DEBUG] Added {} to removed set {}, now {} items",
+                call_id,
+                removed_set_key,
+                removed.len()
+            );
         }
     }
 }
@@ -464,13 +472,15 @@ impl<T> NamedChannel<T> {
             if LOG_ACTOR_FLOW {
                 zoon::eprintln!(
                     "[FLOW] send_or_drop FAILED on '{}' (full or disconnected, capacity: {})",
-                    self.name, self.capacity
+                    self.name,
+                    self.capacity
                 );
             }
             #[cfg(feature = "debug-channels")]
             zoon::eprintln!(
                 "[BACKPRESSURE DROP] '{}' dropped event (full, capacity: {})",
-                self.name, self.capacity
+                self.name,
+                self.capacity
             );
         } else if LOG_ACTOR_FLOW && self.name == "value_actor.subscriptions" {
             zoon::println!(
@@ -492,7 +502,8 @@ impl<T> NamedChannel<T> {
             if e.is_full() {
                 zoon::eprintln!(
                     "[BACKPRESSURE] '{}' channel full (capacity: {})",
-                    self.name, self.capacity
+                    self.name,
+                    self.capacity
                 );
             }
             // Don't log disconnected - it's expected during WHILE arm switches
@@ -584,7 +595,9 @@ impl<S> TypedStream<S, Finite> {
 
     /// Convert a finite stream to an infinite one by chaining with pending().
     /// This is the proper way to use a finite stream with ValueActor.
-    pub fn keep_alive(self) -> TypedStream<stream::Chain<S, stream::Once<future::Pending<S::Item>>>, Infinite>
+    pub fn keep_alive(
+        self,
+    ) -> TypedStream<stream::Chain<S, stream::Once<future::Pending<S::Item>>>, Infinite>
     where
         S: Stream,
     {
@@ -714,7 +727,12 @@ where
     // State as tuple: (outer_stream, inner_stream_opt, map_fn, pending_outer_value)
     // pending_outer_value: When outer emits while inner is active, we store the outer value
     // and drain the inner stream before switching. This prevents losing in-flight events.
-    let initial: (FusedOuter<S::Item>, Option<FusedInner<U::Item>>, F, Option<S::Item>) = (
+    let initial: (
+        FusedOuter<S::Item>,
+        Option<FusedInner<U::Item>>,
+        F,
+        Option<S::Item>,
+    ) = (
         outer.boxed_local().fuse(),
         None,
         f,
@@ -722,8 +740,8 @@ where
     );
 
     stream::unfold(initial, |state| async move {
-        use zoon::futures_util::future::Either;
         use std::task::Poll;
+        use zoon::futures_util::future::Either;
 
         // Destructure state - we need to rebuild it for the return
         let (mut outer_stream, mut inner_opt, map_fn, mut pending_outer) = state;
@@ -754,22 +772,30 @@ where
                                             Poll::Ready(item) => Poll::Ready(item),
                                             Poll::Pending => Poll::Ready(None), // No ready item
                                         }
-                                    }).await;
+                                    })
+                                    .await;
 
                                     if let Some(item) = inner_item {
                                         // Inner had a ready item - emit it and store outer for later
                                         pending_outer = Some(new_outer_value);
-                                        return Some((item, (outer_stream, inner_opt, map_fn, pending_outer)));
+                                        return Some((
+                                            item,
+                                            (outer_stream, inner_opt, map_fn, pending_outer),
+                                        ));
                                     } else {
                                         // No ready items in inner - safe to switch now
                                         drop(inner_opt.take());
-                                        inner_opt = Some(map_fn(new_outer_value).boxed_local().fuse());
+                                        inner_opt =
+                                            Some(map_fn(new_outer_value).boxed_local().fuse());
                                     }
                                 }
                                 None => {
                                     // Outer ended - drain inner then finish
                                     while let Some(item) = inner.next().await {
-                                        return Some((item, (outer_stream, inner_opt, map_fn, None)));
+                                        return Some((
+                                            item,
+                                            (outer_stream, inner_opt, map_fn, None),
+                                        ));
                                     }
                                     return None;
                                 }
@@ -778,7 +804,10 @@ where
                         Either::Right((inner_opt_val, _)) => {
                             match inner_opt_val {
                                 Some(item) => {
-                                    return Some((item, (outer_stream, inner_opt, map_fn, pending_outer)));
+                                    return Some((
+                                        item,
+                                        (outer_stream, inner_opt, map_fn, pending_outer),
+                                    ));
                                 }
                                 None => {
                                     // Inner ended - clear it
@@ -828,8 +857,8 @@ where
     S: Stream + 'static,
     S::Item: 'static,
 {
-    use zoon::futures_util::stream::FusedStream;
     use std::task::Poll;
+    use zoon::futures_util::stream::FusedStream;
 
     let fused_source = source.boxed_local().fuse();
 
@@ -1010,7 +1039,6 @@ impl BackpressureCoordinator {
                     break;
                 }
             }
-
         });
 
         Self {
@@ -1115,7 +1143,8 @@ impl LazyValueActor {
         source_stream: S,
     ) -> Self {
         let construct_info = Arc::new(construct_info);
-        let (request_tx, request_rx) = NamedChannel::new("lazy_value_actor.requests", LAZY_ACTOR_REQUEST_CAPACITY);
+        let (request_tx, request_rx) =
+            NamedChannel::new("lazy_value_actor.requests", LAZY_ACTOR_REQUEST_CAPACITY);
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
@@ -1201,7 +1230,6 @@ impl LazyValueActor {
                 zoon::println!("[LAZY_ACTOR] Subscriber dropped before receiving value");
             }
         }
-
     }
 
     /// Subscribe to this lazy actor's values.
@@ -1225,7 +1253,6 @@ impl LazyValueActor {
         &self.construct_info
     }
 }
-
 
 /// Subscription to a LazyValueActor.
 ///
@@ -1328,15 +1355,11 @@ pub enum ActorMessage {
         is_final: bool,
     },
     /// Acknowledgment of batch receipt (backpressure)
-    BatchAck {
-        batch_id: u64,
-    },
+    BatchAck { batch_id: u64 },
     /// Migration complete, ready to receive new subscribers
     MigrationComplete,
     /// Redirect all subscribers to a new actor
-    RedirectSubscribers {
-        target: ActorHandle,
-    },
+    RedirectSubscribers { target: ActorHandle },
 
     // === Lifecycle ===
     /// Graceful shutdown request
@@ -1445,7 +1468,10 @@ impl VirtualFilesystem {
 
     /// Create a VirtualFilesystem pre-populated with files
     pub fn with_files(initial_files: HashMap<String, String>) -> Self {
-        let (tx, mut rx) = NamedChannel::new("virtual_filesystem.requests", VIRTUAL_FILESYSTEM_REQUEST_CAPACITY);
+        let (tx, mut rx) = NamedChannel::new(
+            "virtual_filesystem.requests",
+            VIRTUAL_FILESYSTEM_REQUEST_CAPACITY,
+        );
 
         let actor_loop = ActorLoop::new(async move {
             let mut files: HashMap<String, String> = initial_files;
@@ -1507,7 +1533,10 @@ impl VirtualFilesystem {
                         entries.sort();
                         entries.dedup();
                         if reply.send(entries).is_err() {
-                            zoon::println!("[VFS] ListDirectory reply receiver dropped for {}", path);
+                            zoon::println!(
+                                "[VFS] ListDirectory reply receiver dropped for {}",
+                                path
+                            );
                         }
                     }
                 }
@@ -1523,10 +1552,14 @@ impl VirtualFilesystem {
     /// Read text content from a file (async)
     pub async fn read_text(&self, path: &str) -> Option<String> {
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.request_sender.send(FsRequest::ReadText {
-            path: path.to_string(),
-            reply: tx,
-        }).await {
+        if let Err(e) = self
+            .request_sender
+            .send(FsRequest::ReadText {
+                path: path.to_string(),
+                reply: tx,
+            })
+            .await
+        {
             zoon::eprintln!("[VFS] Failed to send ReadText request for {}: {e}", path);
             return None;
         }
@@ -1547,11 +1580,18 @@ impl VirtualFilesystem {
     /// List entries in a directory (async)
     pub async fn list_directory(&self, path: &str) -> Vec<String> {
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.request_sender.send(FsRequest::ListDirectory {
-            path: path.to_string(),
-            reply: tx,
-        }).await {
-            zoon::eprintln!("[VFS] Failed to send ListDirectory request for {}: {e}", path);
+        if let Err(e) = self
+            .request_sender
+            .send(FsRequest::ListDirectory {
+                path: path.to_string(),
+                reply: tx,
+            })
+            .await
+        {
+            zoon::eprintln!(
+                "[VFS] Failed to send ListDirectory request for {}: {e}",
+                path
+            );
             return Vec::new();
         }
         rx.await.unwrap_or_default()
@@ -1560,10 +1600,14 @@ impl VirtualFilesystem {
     /// Check if a file exists (async)
     pub async fn exists(&self, path: &str) -> bool {
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.request_sender.send(FsRequest::Exists {
-            path: path.to_string(),
-            reply: tx,
-        }).await {
+        if let Err(e) = self
+            .request_sender
+            .send(FsRequest::Exists {
+                path: path.to_string(),
+                reply: tx,
+            })
+            .await
+        {
             zoon::eprintln!("[VFS] Failed to send Exists request for {}: {e}", path);
             return false;
         }
@@ -1573,10 +1617,14 @@ impl VirtualFilesystem {
     /// Delete a file (async)
     pub async fn delete(&self, path: &str) -> bool {
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.request_sender.send(FsRequest::Delete {
-            path: path.to_string(),
-            reply: tx,
-        }).await {
+        if let Err(e) = self
+            .request_sender
+            .send(FsRequest::Delete {
+                path: path.to_string(),
+                reply: tx,
+            })
+            .await
+        {
             zoon::eprintln!("[VFS] Failed to send Delete request for {}: {e}", path);
             return false;
         }
@@ -1634,13 +1682,21 @@ pub struct ConstructStorage {
 impl ConstructStorage {
     pub fn new(states_local_storage_key: impl Into<Cow<'static, str>>) -> Self {
         let states_local_storage_key = states_local_storage_key.into();
-        let (state_inserter_sender, mut state_inserter_receiver) = NamedChannel::new("construct_storage.inserter", CONSTRUCT_STORAGE_INSERTER_CAPACITY);
-        let (state_getter_sender, mut state_getter_receiver) = NamedChannel::new("construct_storage.getter", CONSTRUCT_STORAGE_GETTER_CAPACITY);
+        let (state_inserter_sender, mut state_inserter_receiver) = NamedChannel::new(
+            "construct_storage.inserter",
+            CONSTRUCT_STORAGE_INSERTER_CAPACITY,
+        );
+        let (state_getter_sender, mut state_getter_receiver) = NamedChannel::new(
+            "construct_storage.getter",
+            CONSTRUCT_STORAGE_GETTER_CAPACITY,
+        );
         Self {
             state_inserter_sender,
             state_getter_sender,
             actor_loop: ActorLoop::new(async move {
-                let mut states: BTreeMap<String, serde_json::Value> = match local_storage().get::<BTreeMap<String, serde_json::Value>>(&states_local_storage_key) {
+                let mut states: BTreeMap<String, serde_json::Value> = match local_storage()
+                    .get::<BTreeMap<String, serde_json::Value>>(&states_local_storage_key)
+                {
                     None => BTreeMap::new(),
                     Some(Ok(states)) => states,
                     Some(Err(error)) => panic!("Failed to deserialize states: {error:#}"),
@@ -1649,12 +1705,16 @@ impl ConstructStorage {
                 loop {
                     // C3: Coalesce writes - drain all pending inserts before flushing once
                     if dirty {
-                        while let Ok(Some((persistence_id, json_value))) = state_inserter_receiver.try_next() {
+                        while let Ok(Some((persistence_id, json_value))) =
+                            state_inserter_receiver.try_next()
+                        {
                             let key = persistence_id.to_string();
                             states.insert(key, json_value);
                         }
                         inc_metric!(PERSISTENCE_WRITES);
-                        if let Err(error) = local_storage().insert(&states_local_storage_key, &states) {
+                        if let Err(error) =
+                            local_storage().insert(&states_local_storage_key, &states)
+                        {
                             zoon::eprintln!("Failed to save states: {error:#}");
                         }
                         dirty = false;
@@ -1695,7 +1755,8 @@ impl ConstructStorage {
             }
         };
         // Fire-and-forget - actor persists asynchronously
-        self.state_inserter_sender.send_or_drop((persistence_id, json_value));
+        self.state_inserter_sender
+            .send_or_drop((persistence_id, json_value));
     }
 
     // @TODO is &self enough?
@@ -1744,10 +1805,7 @@ pub enum CapturedValue {
 
     // Actor reference - for persisting actors (HOLD, persisted LIST)
     // Resolved against graph on restore
-    ActorRef {
-        persistence_id: u128,
-        scope: String,
-    },
+    ActorRef { persistence_id: u128, scope: String },
 }
 
 impl CapturedValue {
@@ -1853,7 +1911,8 @@ impl SubscriptionScope {
 
     /// Cancel this scope, causing all streams checking it to terminate.
     pub fn cancel(&self) {
-        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Check if this scope has been cancelled.
@@ -1897,7 +1956,9 @@ pub struct ScopeDestroyGuard {
 
 impl ScopeDestroyGuard {
     pub fn new(scope_id: ScopeId) -> Self {
-        Self { scope_id: Some(scope_id) }
+        Self {
+            scope_id: Some(scope_id),
+        }
     }
 
     /// Prevent destruction on drop (e.g., when transferring ownership).
@@ -2039,7 +2100,8 @@ impl ActorContext {
     /// Get the registry scope ID, panicking if not set.
     /// All actors should be created within a scope after evaluation starts.
     pub fn scope_id(&self) -> ScopeId {
-        self.registry_scope_id.expect("Bug: no registry scope - all actors should be created within a scope")
+        self.registry_scope_id
+            .expect("Bug: no registry scope - all actors should be created within a scope")
     }
 
     /// Creates a child context with a new unique nested scope.
@@ -2077,7 +2139,11 @@ impl ActorContext {
     /// The `storage_key` is used for list append recording to attach origin info to items.
     ///
     /// Returns (child_context, receiver) where receiver collects RecordedCalls.
-    pub fn with_persisting_child_scope(&self, scope_id: &str, storage_key: String) -> (Self, mpsc::Receiver<RecordedCall>) {
+    pub fn with_persisting_child_scope(
+        &self,
+        scope_id: &str,
+        storage_key: String,
+    ) -> (Self, mpsc::Receiver<RecordedCall>) {
         let new_prefix = match &self.scope {
             parser::Scope::Root => scope_id.to_string(),
             parser::Scope::Nested(existing) => format!("{}:{}", existing, scope_id),
@@ -2130,8 +2196,10 @@ pub struct ActorOutputValveSignal {
 
 impl ActorOutputValveSignal {
     pub fn new(impulse_stream: impl Stream<Item = ()> + 'static) -> Self {
-        let (impulse_sender_sender, mut impulse_sender_receiver) =
-            NamedChannel::new("output_valve.subscriptions", OUTPUT_VALVE_SUBSCRIPTION_CAPACITY);
+        let (impulse_sender_sender, mut impulse_sender_receiver) = NamedChannel::new(
+            "output_valve.subscriptions",
+            OUTPUT_VALVE_SUBSCRIPTION_CAPACITY,
+        );
         Self {
             impulse_sender_sender,
             actor_loop: ActorLoop::new(async move {
@@ -2382,7 +2450,8 @@ impl Variable {
         let actor_construct_info =
             ConstructInfo::new(actor_id.clone(), persistence, "Link variable value actor")
                 .complete(ConstructType::ValueActor);
-        let (link_value_sender, link_value_receiver) = NamedChannel::new("link.values", LINK_VALUE_CAPACITY);
+        let (link_value_sender, link_value_receiver) =
+            NamedChannel::new("link.values", LINK_VALUE_CAPACITY);
         // Capture the scope before actor_context is moved
         let scope = actor_context.scope.clone();
         let scope_id = actor_context.scope_id();
@@ -2397,18 +2466,30 @@ impl Variable {
                     Value::Object(_, _) => "Object".to_string(),
                     _ => "Other".to_string(),
                 };
-                zoon::println!("[LINK_ACTOR] Received from channel: {} for {}", value_desc, desc_for_closure);
+                zoon::println!(
+                    "[LINK_ACTOR] Received from channel: {} for {}",
+                    value_desc,
+                    desc_for_closure
+                );
             }
             value
         });
 
         if LOG_DEBUG {
-            zoon::println!("[LINK_ACTOR] Created link_value_actor pid={} scope={:?} for {}",
-                persistence_id, scope, variable_description_for_log);
+            zoon::println!(
+                "[LINK_ACTOR] Created link_value_actor pid={} scope={:?} for {}",
+                persistence_id,
+                scope,
+                variable_description_for_log
+            );
         }
 
         let value_actor = create_actor_complete(
-            actor_construct_info, actor_context, TypedStream::infinite(logged_receiver), persistence_id, scope_id,
+            actor_construct_info,
+            actor_context,
+            TypedStream::infinite(logged_receiver),
+            persistence_id,
+            scope_id,
         );
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
@@ -2473,9 +2554,13 @@ impl Variable {
         stream::unfold(
             (subscription, self),
             |(mut subscription, variable)| async move {
-                subscription.next().await.map(|value| (value, (subscription, variable)))
-            }
-        ).boxed_local()
+                subscription
+                    .next()
+                    .await
+                    .map(|value| (value, (subscription, variable)))
+            },
+        )
+        .boxed_local()
     }
 
     /// Subscribe to future values only - skips historical replay.
@@ -2492,9 +2577,13 @@ impl Variable {
         stream::unfold(
             (subscription, self),
             |(mut subscription, variable)| async move {
-                subscription.next().await.map(|value| (value, (subscription, variable)))
-            }
-        ).boxed_local()
+                subscription
+                    .next()
+                    .await
+                    .map(|value| (value, (subscription, variable)))
+            },
+        )
+        .boxed_local()
     }
 
     pub fn value_actor(&self) -> ActorHandle {
@@ -2520,7 +2609,6 @@ impl Variable {
         }
     }
 }
-
 
 // --- VariableOrArgumentReference ---
 
@@ -2573,7 +2661,10 @@ impl VariableOrArgumentReference {
         // Log subscription_time for debugging
         if LOG_DEBUG {
             if let Some(sub_time) = subscription_time {
-                zoon::println!("[VAR_REF] Creating path subscription with subscription_time={}", sub_time);
+                zoon::println!(
+                    "[VAR_REF] Creating path subscription with subscription_time={}",
+                    sub_time
+                );
             }
         }
 
@@ -2592,9 +2683,7 @@ impl VariableOrArgumentReference {
             // 3. switch_map creates new subscription when outer emits again
             // 4. When WHILE switches back, new Variables get new subscription
             let alias_part_for_log = alias_part.clone();
-            value_stream = switch_map(
-                value_stream,
-                move |value| {
+            value_stream = switch_map(value_stream, move |value| {
                 let alias_part = alias_part.clone();
                 let alias_part_log = alias_part_for_log.clone();
                 if LOG_DEBUG {
@@ -2604,7 +2693,12 @@ impl VariableOrArgumentReference {
                         Value::Tag(tag, _) => tag.tag(),
                         _ => "Other",
                     };
-                    zoon::println!("[VAR_REF] step {} outer received {} for field '{}'", step_idx, value_type, alias_part_log);
+                    zoon::println!(
+                        "[VAR_REF] step {} outer received {} for field '{}'",
+                        step_idx,
+                        value_type,
+                        alias_part_log
+                    );
                 }
                 match value {
                     Value::Object(object, _) => {
@@ -2703,8 +2797,20 @@ impl VariableOrArgumentReference {
                             // Always use stream() - stale events are filtered by Lamport timestamps.
                             // This replaces the old hardcoded is_event_link pattern.
                             stream::unfold(
-                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable, subscription_time),
-                                move |(subscription_opt, actor_opt, tagged_object, variable, sub_time)| {
+                                (
+                                    None::<LocalBoxStream<'static, Value>>,
+                                    Some(variable_actor),
+                                    tagged_object,
+                                    variable,
+                                    subscription_time,
+                                ),
+                                move |(
+                                    subscription_opt,
+                                    actor_opt,
+                                    tagged_object,
+                                    variable,
+                                    sub_time,
+                                )| {
                                     async move {
                                         let mut subscription = match subscription_opt {
                                             Some(s) => s,
@@ -2728,7 +2834,16 @@ impl VariableOrArgumentReference {
                                                         }
                                                     }
                                                     // Fresh value - emit it
-                                                    return Some((value, (Some(subscription), None, tagged_object, variable, sub_time)));
+                                                    return Some((
+                                                        value,
+                                                        (
+                                                            Some(subscription),
+                                                            None,
+                                                            tagged_object,
+                                                            variable,
+                                                            sub_time,
+                                                        ),
+                                                    ));
                                                 }
                                                 None => {
                                                     // Stream ended
@@ -2737,8 +2852,9 @@ impl VariableOrArgumentReference {
                                             }
                                         }
                                     }
-                                }
-                            ).boxed_local()
+                                },
+                            )
+                            .boxed_local()
                         }
                     }
                     other => panic!(
@@ -2766,17 +2882,20 @@ impl VariableOrArgumentReference {
 /// Uses ActorLoop internally to encapsulate the async task.
 pub struct ReferenceConnector {
     referenceable_inserter_sender: NamedChannel<(parser::Span, ActorHandle)>,
-    referenceable_getter_sender:
-        NamedChannel<(parser::Span, oneshot::Sender<ActorHandle>)>,
+    referenceable_getter_sender: NamedChannel<(parser::Span, oneshot::Sender<ActorHandle>)>,
     actor_loop: ActorLoop,
 }
 
 impl ReferenceConnector {
     pub fn new() -> Self {
-        let (referenceable_inserter_sender, referenceable_inserter_receiver) =
-            NamedChannel::new("reference_connector.inserter", REFERENCE_CONNECTOR_INSERTER_CAPACITY);
-        let (referenceable_getter_sender, referenceable_getter_receiver) =
-            NamedChannel::new("reference_connector.getter", REFERENCE_CONNECTOR_GETTER_CAPACITY);
+        let (referenceable_inserter_sender, referenceable_inserter_receiver) = NamedChannel::new(
+            "reference_connector.inserter",
+            REFERENCE_CONNECTOR_INSERTER_CAPACITY,
+        );
+        let (referenceable_getter_sender, referenceable_getter_receiver) = NamedChannel::new(
+            "reference_connector.getter",
+            REFERENCE_CONNECTOR_GETTER_CAPACITY,
+        );
         Self {
             referenceable_inserter_sender,
             referenceable_getter_sender,
@@ -2842,10 +2961,7 @@ impl ReferenceConnector {
     }
 
     pub fn register_referenceable(&self, span: parser::Span, actor: ActorHandle) {
-        if let Err(error) = self
-            .referenceable_inserter_sender
-            .try_send((span, actor))
-        {
+        if let Err(error) = self.referenceable_inserter_sender.try_send((span, actor)) {
             zoon::eprintln!("Failed to register referenceable: {error:#}")
         }
     }
@@ -2891,8 +3007,7 @@ impl ScopedSpan {
 /// per list item, not just per source position.
 pub struct LinkConnector {
     link_inserter_sender: NamedChannel<(ScopedSpan, NamedChannel<Value>)>,
-    link_getter_sender:
-        NamedChannel<(ScopedSpan, oneshot::Sender<NamedChannel<Value>>)>,
+    link_getter_sender: NamedChannel<(ScopedSpan, oneshot::Sender<NamedChannel<Value>>)>,
     actor_loop: ActorLoop,
 }
 
@@ -2969,24 +3084,27 @@ impl LinkConnector {
     /// Register a LINK variable's sender with its span and scope.
     /// The scope is critical for distinguishing LINK bindings at the same source position
     /// but in different contexts (e.g., different list items).
-    pub fn register_link(&self, span: parser::Span, scope: parser::Scope, sender: NamedChannel<Value>) {
+    pub fn register_link(
+        &self,
+        span: parser::Span,
+        scope: parser::Scope,
+        sender: NamedChannel<Value>,
+    ) {
         let scoped_span = ScopedSpan::new(span, scope);
-        if let Err(error) = self
-            .link_inserter_sender
-            .try_send((scoped_span, sender))
-        {
+        if let Err(error) = self.link_inserter_sender.try_send((scoped_span, sender)) {
             zoon::eprintln!("Failed to register link: {error:#}")
         }
     }
 
     /// Get a LINK variable's sender by its span and scope.
-    pub async fn link_sender(self: Arc<Self>, span: parser::Span, scope: parser::Scope) -> NamedChannel<Value> {
+    pub async fn link_sender(
+        self: Arc<Self>,
+        span: parser::Span,
+        scope: parser::Scope,
+    ) -> NamedChannel<Value> {
         let scoped_span = ScopedSpan::new(span, scope);
         let (link_sender, link_receiver) = oneshot::channel();
-        if let Err(error) = self
-            .link_getter_sender
-            .try_send((scoped_span, link_sender))
-        {
+        if let Err(error) = self.link_getter_sender.try_send((scoped_span, link_sender)) {
             zoon::eprintln!("Failed to get link sender: {error:#}")
         }
         link_receiver
@@ -3007,7 +3125,8 @@ pub struct PassThroughConnector {
     /// Sender for getting existing pass-through actors
     getter_sender: NamedChannel<(PassThroughKey, oneshot::Sender<Option<ActorHandle>>)>,
     /// Sender for getting existing pass-through value senders
-    sender_getter_sender: NamedChannel<(PassThroughKey, oneshot::Sender<Option<mpsc::Sender<Value>>>)>,
+    sender_getter_sender:
+        NamedChannel<(PassThroughKey, oneshot::Sender<Option<mpsc::Sender<Value>>>)>,
     actor_loop: ActorLoop,
 }
 
@@ -3026,10 +3145,7 @@ enum PassThroughOp {
         actor: ActorHandle,
     },
     /// Forward a value to an existing pass-through
-    Forward {
-        key: PassThroughKey,
-        value: Value,
-    },
+    Forward { key: PassThroughKey, value: Value },
     /// Add a forwarder to keep alive for an existing pass-through
     AddForwarder {
         key: PassThroughKey,
@@ -3039,10 +3155,14 @@ enum PassThroughOp {
 
 impl PassThroughConnector {
     pub fn new() -> Self {
-        let (op_sender, op_receiver) = NamedChannel::new("pass_through.ops", PASS_THROUGH_OPS_CAPACITY);
-        let (getter_sender, getter_receiver) = NamedChannel::new("pass_through.getter", PASS_THROUGH_GETTER_CAPACITY);
-        let (sender_getter_sender, sender_getter_receiver) =
-            NamedChannel::new("pass_through.sender_getter", PASS_THROUGH_SENDER_GETTER_CAPACITY);
+        let (op_sender, op_receiver) =
+            NamedChannel::new("pass_through.ops", PASS_THROUGH_OPS_CAPACITY);
+        let (getter_sender, getter_receiver) =
+            NamedChannel::new("pass_through.getter", PASS_THROUGH_GETTER_CAPACITY);
+        let (sender_getter_sender, sender_getter_receiver) = NamedChannel::new(
+            "pass_through.sender_getter",
+            PASS_THROUGH_SENDER_GETTER_CAPACITY,
+        );
 
         Self {
             op_sender,
@@ -3050,7 +3170,10 @@ impl PassThroughConnector {
             sender_getter_sender,
             actor_loop: ActorLoop::new(async move {
                 // (sender, actor, forwarders) - forwarders kept alive for the lifetime of the pass-through
-                let mut pass_throughs = HashMap::<PassThroughKey, (mpsc::Sender<Value>, ActorHandle, Vec<ActorHandle>)>::new();
+                let mut pass_throughs = HashMap::<
+                    PassThroughKey,
+                    (mpsc::Sender<Value>, ActorHandle, Vec<ActorHandle>),
+                >::new();
                 let mut op_receiver = op_receiver.fuse();
                 let mut getter_receiver = getter_receiver.fuse();
                 let mut sender_getter_receiver = sender_getter_receiver.fuse();
@@ -3144,22 +3267,37 @@ impl PassThroughConnector {
     }
 
     /// Register a new pass-through actor
-    pub fn register(&self, key: PassThroughKey, value_sender: mpsc::Sender<Value>, actor: ActorHandle) {
-        if let Err(e) = self.op_sender.try_send(PassThroughOp::Register { key, value_sender, actor }) {
+    pub fn register(
+        &self,
+        key: PassThroughKey,
+        value_sender: mpsc::Sender<Value>,
+        actor: ActorHandle,
+    ) {
+        if let Err(e) = self.op_sender.try_send(PassThroughOp::Register {
+            key,
+            value_sender,
+            actor,
+        }) {
             zoon::eprintln!("[PASS_THROUGH] Failed to send Register: {e}");
         }
     }
 
     /// Forward a value to an existing pass-through
     pub fn forward(&self, key: PassThroughKey, value: Value) {
-        if let Err(e) = self.op_sender.try_send(PassThroughOp::Forward { key, value }) {
+        if let Err(e) = self
+            .op_sender
+            .try_send(PassThroughOp::Forward { key, value })
+        {
             zoon::println!("[PASS_THROUGH] Failed to send Forward: {e}");
         }
     }
 
     /// Add a forwarder to keep alive for an existing pass-through
     pub fn add_forwarder(&self, key: PassThroughKey, forwarder: ActorHandle) {
-        if let Err(e) = self.op_sender.try_send(PassThroughOp::AddForwarder { key, forwarder }) {
+        if let Err(e) = self
+            .op_sender
+            .try_send(PassThroughOp::AddForwarder { key, forwarder })
+        {
             zoon::eprintln!("[PASS_THROUGH] Failed to send AddForwarder: {e}");
         }
     }
@@ -3248,10 +3386,12 @@ impl FunctionCall {
             // Subscribe to all arguments and filter for FLUSHED values only
             let flushed_streams: Vec<_> = arguments_for_flushed
                 .iter()
-                .map(|arg| arg.clone().stream().filter(|v| {
-                    let is_flushed = v.is_flushed();
-                    std::future::ready(is_flushed)
-                }))
+                .map(|arg| {
+                    arg.clone().stream().filter(|v| {
+                        let is_flushed = v.is_flushed();
+                        std::future::ready(is_flushed)
+                    })
+                })
                 .collect();
             zoon::futures_util::stream::select_all(flushed_streams).boxed_local()
         };
@@ -3323,9 +3463,12 @@ impl LatestCombinator {
         let value_stream =
             stream::select_all(inputs.iter().enumerate().map(|(index, value_actor)| {
                 // Use stream() to properly handle lazy actors in HOLD body context
-                value_actor.clone().stream().map(move |value| (index, value))
+                value_actor
+                    .clone()
+                    .stream()
+                    .map(move |value| (index, value))
             }))
-            .ready_chunks(16)  // Buffer up to 16 concurrent values
+            .ready_chunks(16) // Buffer up to 16 concurrent values
             .flat_map(|mut chunk| {
                 // Sort by Lamport timestamp to restore happened-before ordering
                 chunk.sort_by_key(|(_, value)| value.lamport_time());
@@ -3416,34 +3559,34 @@ impl BinaryOperatorCombinator {
         let a_stream = operand_a.stream().map(|v| (0usize, v));
         let b_stream = operand_b.stream().map(|v| (1usize, v));
         let value_stream = stream::select_all([a_stream.boxed_local(), b_stream.boxed_local()])
-        .ready_chunks(4)  // Buffer concurrent values
-        .flat_map(|mut chunk| {
-            chunk.sort_by_key(|(_, value)| value.lamport_time());
-            stream::iter(chunk)
-        })
-        .scan(
-            (None::<Value>, None::<Value>),
-            move |(latest_a, latest_b), (index, value)| {
-                match index {
-                    0 => *latest_a = Some(value),
-                    1 => *latest_b = Some(value),
-                    _ => unreachable!(),
+            .ready_chunks(4) // Buffer concurrent values
+            .flat_map(|mut chunk| {
+                chunk.sort_by_key(|(_, value)| value.lamport_time());
+                stream::iter(chunk)
+            })
+            .scan(
+                (None::<Value>, None::<Value>),
+                move |(latest_a, latest_b), (index, value)| {
+                    match index {
+                        0 => *latest_a = Some(value),
+                        1 => *latest_b = Some(value),
+                        _ => unreachable!(),
+                    }
+                    let result = match (latest_a.clone(), latest_b.clone()) {
+                        (Some(a), Some(b)) => Some((a, b)),
+                        _ => None,
+                    };
+                    future::ready(Some(result))
+                },
+            )
+            .filter_map(future::ready)
+            .map({
+                let construct_context = construct_context.clone();
+                move |(a, b)| {
+                    let idempotency_key = ValueIdempotencyKey::new();
+                    operation(a, b, construct_context.clone(), idempotency_key)
                 }
-                let result = match (latest_a.clone(), latest_b.clone()) {
-                    (Some(a), Some(b)) => Some((a, b)),
-                    _ => None,
-                };
-                future::ready(Some(result))
-            },
-        )
-        .filter_map(future::ready)
-        .map({
-            let construct_context = construct_context.clone();
-            move |(a, b)| {
-                let idempotency_key = ValueIdempotencyKey::new();
-                operation(a, b, construct_context.clone(), idempotency_key)
-            }
-        });
+            });
 
         // Subscription-based streams are infinite (subscriptions never terminate first)
         let scope_id = actor_context.scope_id();
@@ -3623,9 +3766,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Text(t1, _), Value::Text(t2, _)) => t1.text() == t2.text(),
         (Value::Tag(tag1, _), Value::Tag(tag2, _)) => tag1.tag() == tag2.tag(),
         // For objects, we can only do identity comparison without async
-        (Value::TaggedObject(to1, _), Value::TaggedObject(to2, _)) => {
-            Arc::ptr_eq(to1, to2)
-        }
+        (Value::TaggedObject(to1, _), Value::TaggedObject(to2, _)) => Arc::ptr_eq(to1, to2),
         (Value::Object(o1, _), Value::Object(o2, _)) => Arc::ptr_eq(o1, o2),
         _ => false, // Different types are not equal
     }
@@ -3802,7 +3943,8 @@ impl ValueHistory {
     /// and the caller should fall back to snapshot.
     pub fn get_values_since(&self, since_version: u64) -> (Vec<Value>, Option<u64>) {
         let oldest = self.values.front().map(|(v, _)| *v);
-        let values: Vec<Value> = self.values
+        let values: Vec<Value> = self
+            .values
             .iter()
             .filter(|(v, _)| *v > since_version)
             .map(|(_, val)| val.clone())
@@ -3812,7 +3954,10 @@ impl ValueHistory {
 
     /// Check if a version is available in the history.
     pub fn has_version(&self, version: u64) -> bool {
-        self.values.front().map(|(v, _)| *v <= version).unwrap_or(false)
+        self.values
+            .front()
+            .map(|(v, _)| *v <= version)
+            .unwrap_or(false)
     }
 
     /// Get the latest value in the history.
@@ -3935,11 +4080,17 @@ impl ActorRegistry {
                 Slot::Free { next_generation } => *next_generation,
                 Slot::Occupied { .. } => unreachable!("free list points to occupied slot"),
             };
-            self.scopes[idx] = Slot::Occupied { generation: next_gen, value: scope };
+            self.scopes[idx] = Slot::Occupied {
+                generation: next_gen,
+                value: scope,
+            };
             (free_idx, next_gen)
         } else {
             let idx = u32::try_from(self.scopes.len()).unwrap();
-            self.scopes.push(Slot::Occupied { generation: 0, value: scope });
+            self.scopes.push(Slot::Occupied {
+                generation: 0,
+                value: scope,
+            });
             (idx, 0)
         };
         let scope_id = ScopeId { index, generation };
@@ -3955,18 +4106,28 @@ impl ActorRegistry {
     /// Destroy a scope and all its actors and child scopes (recursive).
     pub fn destroy_scope(&mut self, scope_id: ScopeId) {
         let scope_idx = usize::try_from(scope_id.index).unwrap();
-        let Some(scope) = self.get_scope(scope_id) else { return };
+        let Some(scope) = self.get_scope(scope_id) else {
+            return;
+        };
 
         // Collect children and actors before removing
         let children: Vec<ScopeId> = scope.children.clone();
         let actors: Vec<ActorId> = scope.actors.clone();
         if LOG_ACTOR_FLOW {
-            zoon::println!("[FLOW] destroy_scope({:?}): {} children, {} actors: {:?}", scope_id, children.len(), actors.len(), actors);
+            zoon::println!(
+                "[FLOW] destroy_scope({:?}): {} children, {} actors: {:?}",
+                scope_id,
+                children.len(),
+                actors.len(),
+                actors
+            );
         }
 
         // Free the scope slot with incremented generation
         let old_gen = scope_id.generation;
-        self.scopes[scope_idx] = Slot::Free { next_generation: old_gen + 1 };
+        self.scopes[scope_idx] = Slot::Free {
+            next_generation: old_gen + 1,
+        };
         self.scope_free_list.push(scope_id.index);
 
         // Destroy child scopes recursively
@@ -3988,11 +4149,17 @@ impl ActorRegistry {
                 Slot::Free { next_generation } => *next_generation,
                 Slot::Occupied { .. } => unreachable!("free list points to occupied slot"),
             };
-            self.actors[idx] = Slot::Occupied { generation: next_gen, value: actor };
+            self.actors[idx] = Slot::Occupied {
+                generation: next_gen,
+                value: actor,
+            };
             (free_idx, next_gen)
         } else {
             let idx = u32::try_from(self.actors.len()).unwrap();
-            self.actors.push(Slot::Occupied { generation: 0, value: actor });
+            self.actors.push(Slot::Occupied {
+                generation: 0,
+                value: actor,
+            });
             (idx, 0)
         };
         let actor_id = ActorId { index, generation };
@@ -4009,13 +4176,19 @@ impl ActorRegistry {
         match &self.actors.get(actor_idx) {
             Some(Slot::Occupied { generation, value }) if *generation == actor_id.generation => {
                 if LOG_ACTOR_FLOW {
-                    zoon::println!("[FLOW] remove_actor({:?}): dropping {}", actor_id, value.construct_info);
+                    zoon::println!(
+                        "[FLOW] remove_actor({:?}): dropping {}",
+                        actor_id,
+                        value.construct_info
+                    );
                 }
             }
             _ => return,
         }
         let old_gen = actor_id.generation;
-        self.actors[actor_idx] = Slot::Free { next_generation: old_gen + 1 };
+        self.actors[actor_idx] = Slot::Free {
+            next_generation: old_gen + 1,
+        };
         self.actor_free_list.push(actor_id.index);
     }
 
@@ -4023,7 +4196,9 @@ impl ActorRegistry {
     pub fn get_actor(&self, actor_id: ActorId) -> Option<&OwnedActor> {
         let actor_idx = usize::try_from(actor_id.index).ok()?;
         match self.actors.get(actor_idx)? {
-            Slot::Occupied { generation, value } if *generation == actor_id.generation => Some(value),
+            Slot::Occupied { generation, value } if *generation == actor_id.generation => {
+                Some(value)
+            }
             _ => None,
         }
     }
@@ -4032,7 +4207,9 @@ impl ActorRegistry {
     pub fn get_actor_mut(&mut self, actor_id: ActorId) -> Option<&mut OwnedActor> {
         let actor_idx = usize::try_from(actor_id.index).ok()?;
         match self.actors.get_mut(actor_idx)? {
-            Slot::Occupied { generation, value } if *generation == actor_id.generation => Some(value),
+            Slot::Occupied { generation, value } if *generation == actor_id.generation => {
+                Some(value)
+            }
             _ => None,
         }
     }
@@ -4041,7 +4218,9 @@ impl ActorRegistry {
     fn get_scope(&self, scope_id: ScopeId) -> Option<&Scope> {
         let idx = usize::try_from(scope_id.index).ok()?;
         match self.scopes.get(idx)? {
-            Slot::Occupied { generation, value } if *generation == scope_id.generation => Some(value),
+            Slot::Occupied { generation, value } if *generation == scope_id.generation => {
+                Some(value)
+            }
             _ => None,
         }
     }
@@ -4050,7 +4229,9 @@ impl ActorRegistry {
     fn get_scope_mut(&mut self, scope_id: ScopeId) -> Option<&mut Scope> {
         let idx = usize::try_from(scope_id.index).ok()?;
         match self.scopes.get_mut(idx)? {
-            Slot::Occupied { generation, value } if *generation == scope_id.generation => Some(value),
+            Slot::Occupied { generation, value } if *generation == scope_id.generation => {
+                Some(value)
+            }
             _ => None,
         }
     }
@@ -4132,7 +4313,12 @@ impl ActorHandle {
     /// Get the current stored value (async).
     pub async fn current_value(&self) -> Result<Value, CurrentValueError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.stored_value_query_sender.send(StoredValueQuery { reply: reply_tx }).await.is_err() {
+        if self
+            .stored_value_query_sender
+            .send(StoredValueQuery { reply: reply_tx })
+            .await
+            .is_err()
+        {
             return Err(CurrentValueError::ActorDropped);
         }
         match reply_rx.await {
@@ -4147,12 +4333,19 @@ impl ActorHandle {
     /// The registry scope owns the actor's lifetime.
     pub fn stream(&self) -> LocalBoxStream<'static, Value> {
         if let Some(ref lazy_delegate) = self.lazy_delegate {
-            if LOG_ACTOR_FLOW { zoon::println!("[FLOW] stream() on {:?} → lazy delegate", self.actor_id); }
+            if LOG_ACTOR_FLOW {
+                zoon::println!("[FLOW] stream() on {:?} → lazy delegate", self.actor_id);
+            }
             return lazy_delegate.clone().stream().boxed_local();
         }
 
         let (tx, rx) = mpsc::channel(VALUE_ACTOR_SUBSCRIBER_CAPACITY);
-        if LOG_ACTOR_FLOW { zoon::println!("[FLOW] stream() on {:?} → sending subscription (v0)", self.actor_id); }
+        if LOG_ACTOR_FLOW {
+            zoon::println!(
+                "[FLOW] stream() on {:?} → sending subscription (v0)",
+                self.actor_id
+            );
+        }
         let setup = SubscriptionSetup {
             sender: tx,
             starting_version: 0,
@@ -4235,7 +4428,13 @@ pub fn create_actor<S: Stream<Item = Value> + 'static>(
     scope_id: ScopeId,
 ) -> ActorHandle {
     let construct_info = Arc::new(construct_info.complete(ConstructType::ValueActor));
-    create_actor_arc_info(construct_info, actor_context, value_stream, persistence_id, scope_id)
+    create_actor_arc_info(
+        construct_info,
+        actor_context,
+        value_stream,
+        persistence_id,
+        scope_id,
+    )
 }
 
 /// Create an actor from a pre-completed `ConstructInfoComplete`.
@@ -4248,7 +4447,13 @@ pub fn create_actor_complete<S: Stream<Item = Value> + 'static>(
     persistence_id: parser::PersistenceId,
     scope_id: ScopeId,
 ) -> ActorHandle {
-    create_actor_arc_info(Arc::new(construct_info), actor_context, value_stream, persistence_id, scope_id)
+    create_actor_arc_info(
+        Arc::new(construct_info),
+        actor_context,
+        value_stream,
+        persistence_id,
+        scope_id,
+    )
 }
 
 fn create_actor_arc_info<S: Stream<Item = Value> + 'static>(
@@ -4259,18 +4464,25 @@ fn create_actor_arc_info<S: Stream<Item = Value> + 'static>(
     scope_id: ScopeId,
 ) -> ActorHandle {
     inc_metric!(ACTORS_CREATED);
-    let (message_sender, message_receiver) = NamedChannel::new("value_actor.messages", VALUE_ACTOR_MESSAGE_CAPACITY);
+    let (message_sender, message_receiver) =
+        NamedChannel::new("value_actor.messages", VALUE_ACTOR_MESSAGE_CAPACITY);
     let current_version = Arc::new(AtomicU64::new(0));
 
-    let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.subscriptions", VALUE_ACTOR_SUBSCRIPTION_CAPACITY);
-    let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.direct_store", VALUE_ACTOR_DIRECT_STORE_CAPACITY);
-    let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.queries", VALUE_ACTOR_QUERY_CAPACITY);
+    let (subscription_sender, subscription_receiver) = NamedChannel::new(
+        "value_actor.subscriptions",
+        VALUE_ACTOR_SUBSCRIPTION_CAPACITY,
+    );
+    let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new(
+        "value_actor.direct_store",
+        VALUE_ACTOR_DIRECT_STORE_CAPACITY,
+    );
+    let (stored_value_query_sender, stored_value_query_receiver) =
+        NamedChannel::new("value_actor.queries", VALUE_ACTOR_QUERY_CAPACITY);
 
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
     let ready_signal = ready_rx.shared();
 
-    let boxed_stream: std::pin::Pin<Box<dyn Stream<Item = Value>>> =
-        Box::pin(value_stream.inner);
+    let boxed_stream: std::pin::Pin<Box<dyn Stream<Item = Value>>> = Box::pin(value_stream.inner);
 
     let actor_loop = ActorLoop::new({
         let construct_info = construct_info.clone();
@@ -4278,7 +4490,9 @@ fn create_actor_arc_info<S: Stream<Item = Value> + 'static>(
         let output_valve_signal = actor_context.output_valve_signal;
 
         async move {
-            if LOG_ACTOR_FLOW { zoon::println!("[FLOW] Actor loop STARTED: {construct_info}"); }
+            if LOG_ACTOR_FLOW {
+                zoon::println!("[FLOW] Actor loop STARTED: {construct_info}");
+            }
             let mut value_history = ValueHistory::new(64);
             let mut subscribers: SmallVec<[mpsc::Sender<Value>; 4]> = SmallVec::new();
             let mut stream_ever_produced = false;
@@ -4460,9 +4674,7 @@ fn create_actor_arc_info<S: Stream<Item = Value> + 'static>(
         },
     };
 
-    let actor_id = REGISTRY.with(|reg| {
-        reg.borrow_mut().insert_actor(scope_id, owned_actor)
-    });
+    let actor_id = REGISTRY.with(|reg| reg.borrow_mut().insert_actor(scope_id, owned_actor));
 
     ActorHandle {
         actor_id,
@@ -4490,12 +4702,20 @@ pub fn create_actor_with_initial_value<S: Stream<Item = Value> + 'static>(
     inc_metric!(ACTORS_CREATED);
     let value_stream = value_stream.inner;
     let construct_info = Arc::new(construct_info.complete(ConstructType::ValueActor));
-    let (message_sender, message_receiver) = NamedChannel::new("value_actor.initial.messages", VALUE_ACTOR_MESSAGE_CAPACITY);
+    let (message_sender, message_receiver) =
+        NamedChannel::new("value_actor.initial.messages", VALUE_ACTOR_MESSAGE_CAPACITY);
     let current_version = Arc::new(AtomicU64::new(1));
 
-    let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.initial.subscriptions", VALUE_ACTOR_SUBSCRIPTION_CAPACITY);
-    let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.initial.direct_store", VALUE_ACTOR_DIRECT_STORE_CAPACITY);
-    let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.initial.queries", VALUE_ACTOR_QUERY_CAPACITY);
+    let (subscription_sender, subscription_receiver) = NamedChannel::new(
+        "value_actor.initial.subscriptions",
+        VALUE_ACTOR_SUBSCRIPTION_CAPACITY,
+    );
+    let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new(
+        "value_actor.initial.direct_store",
+        VALUE_ACTOR_DIRECT_STORE_CAPACITY,
+    );
+    let (stored_value_query_sender, stored_value_query_receiver) =
+        NamedChannel::new("value_actor.initial.queries", VALUE_ACTOR_QUERY_CAPACITY);
 
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
     ready_tx.send(()).ok();
@@ -4614,9 +4834,7 @@ pub fn create_actor_with_initial_value<S: Stream<Item = Value> + 'static>(
         },
     };
 
-    let actor_id = REGISTRY.with(|reg| {
-        reg.borrow_mut().insert_actor(scope_id, owned_actor)
-    });
+    let actor_id = REGISTRY.with(|reg| reg.borrow_mut().insert_actor(scope_id, owned_actor));
 
     ActorHandle {
         actor_id,
@@ -4660,7 +4878,13 @@ pub fn create_actor_with_origin<S: Stream<Item = Value> + 'static>(
     origin: ListItemOrigin,
     scope_id: ScopeId,
 ) -> ActorHandle {
-    let mut handle = create_actor(construct_info, actor_context, value_stream, persistence_id, scope_id);
+    let mut handle = create_actor(
+        construct_info,
+        actor_context,
+        value_stream,
+        persistence_id,
+        scope_id,
+    );
     let origin = Arc::new(origin);
     handle.list_item_origin = Some(origin.clone());
     // Also set on OwnedActor in registry
@@ -4699,18 +4923,23 @@ pub fn create_actor_lazy<S: Stream<Item = Value> + 'static>(
     scope_id: ScopeId,
 ) -> ActorHandle {
     inc_metric!(ACTORS_CREATED);
-    let lazy_actor = Arc::new(LazyValueActor::new(
-        construct_info.clone(),
-        value_stream,
-    ));
+    let lazy_actor = Arc::new(LazyValueActor::new(construct_info.clone(), value_stream));
 
     let construct_info = Arc::new(construct_info);
     // Dummy channels (not used — lazy_delegate handles subscriptions)
-    let (message_sender, _message_receiver) = NamedChannel::new("value_actor.lazy.messages", VALUE_ACTOR_MESSAGE_CAPACITY);
+    let (message_sender, _message_receiver) =
+        NamedChannel::new("value_actor.lazy.messages", VALUE_ACTOR_MESSAGE_CAPACITY);
     let current_version = Arc::new(AtomicU64::new(0));
-    let (subscription_sender, _subscription_receiver) = NamedChannel::<SubscriptionSetup>::new("value_actor.lazy.subscriptions", VALUE_ACTOR_SUBSCRIPTION_CAPACITY);
-    let (direct_store_sender, _direct_store_receiver) = NamedChannel::new("value_actor.lazy.direct_store", VALUE_ACTOR_DIRECT_STORE_CAPACITY);
-    let (stored_value_query_sender, _stored_value_query_receiver) = NamedChannel::new("value_actor.lazy.queries", VALUE_ACTOR_QUERY_CAPACITY);
+    let (subscription_sender, _subscription_receiver) = NamedChannel::<SubscriptionSetup>::new(
+        "value_actor.lazy.subscriptions",
+        VALUE_ACTOR_SUBSCRIPTION_CAPACITY,
+    );
+    let (direct_store_sender, _direct_store_receiver) = NamedChannel::new(
+        "value_actor.lazy.direct_store",
+        VALUE_ACTOR_DIRECT_STORE_CAPACITY,
+    );
+    let (stored_value_query_sender, _stored_value_query_receiver) =
+        NamedChannel::new("value_actor.lazy.queries", VALUE_ACTOR_QUERY_CAPACITY);
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
     drop(ready_tx);
     let ready_signal = ready_rx.shared();
@@ -4732,9 +4961,7 @@ pub fn create_actor_lazy<S: Stream<Item = Value> + 'static>(
         },
     };
 
-    let actor_id = REGISTRY.with(|reg| {
-        reg.borrow_mut().insert_actor(scope_id, owned_actor)
-    });
+    let actor_id = REGISTRY.with(|reg| reg.borrow_mut().insert_actor(scope_id, owned_actor));
 
     ActorHandle {
         actor_id,
@@ -4778,22 +5005,36 @@ pub fn connect_forwarding(
     initial_value_future: impl Future<Output = Option<Value>> + 'static,
 ) -> ActorLoop {
     ActorLoop::new(async move {
-        if LOG_DEBUG { zoon::println!("[FWD2] connect_forwarding loop STARTED"); }
+        if LOG_DEBUG {
+            zoon::println!("[FWD2] connect_forwarding loop STARTED");
+        }
         // Send initial value first (awaiting if needed)
         if let Some(value) = initial_value_future.await {
-            if LOG_DEBUG { zoon::println!("[FORWARDING] Sending initial value"); }
+            if LOG_DEBUG {
+                zoon::println!("[FORWARDING] Sending initial value");
+            }
             if let Err(e) = forwarding_sender.send(value).await {
-                if LOG_DEBUG { zoon::println!("[FORWARDING] Initial forwarding FAILED: {e} - EXITING!"); }
+                if LOG_DEBUG {
+                    zoon::println!("[FORWARDING] Initial forwarding FAILED: {e} - EXITING!");
+                }
                 return;
             }
-            if LOG_DEBUG { zoon::println!("[FORWARDING] Initial value sent OK"); }
+            if LOG_DEBUG {
+                zoon::println!("[FORWARDING] Initial value sent OK");
+            }
         } else {
-            if LOG_DEBUG { zoon::println!("[FORWARDING] No initial value"); }
+            if LOG_DEBUG {
+                zoon::println!("[FORWARDING] No initial value");
+            }
         }
 
-        if LOG_DEBUG { zoon::println!("[FORWARDING] Subscribing to source_actor..."); }
+        if LOG_DEBUG {
+            zoon::println!("[FORWARDING] Subscribing to source_actor...");
+        }
         let mut subscription = source_actor.stream();
-        if LOG_DEBUG { zoon::println!("[FORWARDING] Subscribed, entering forwarding loop"); }
+        if LOG_DEBUG {
+            zoon::println!("[FORWARDING] Subscribed, entering forwarding loop");
+        }
         while let Some(value) = subscription.next().await {
             if LOG_DEBUG {
                 let value_desc = match &value {
@@ -4804,11 +5045,15 @@ pub fn connect_forwarding(
                 zoon::println!("[FORWARDING] Received value: {}", value_desc);
             }
             if forwarding_sender.send(value).await.is_err() {
-                if LOG_DEBUG { zoon::println!("[FORWARDING] Forwarding FAILED - breaking loop"); }
+                if LOG_DEBUG {
+                    zoon::println!("[FORWARDING] Forwarding FAILED - breaking loop");
+                }
                 break;
             }
         }
-        if LOG_DEBUG { zoon::println!("[FORWARDING] Forwarding loop ENDED"); }
+        if LOG_DEBUG {
+            zoon::println!("[FORWARDING] Forwarding loop ENDED");
+        }
     })
 }
 
@@ -5097,12 +5342,13 @@ impl Value {
     /// This is an async function because it needs to subscribe to streaming values.
     pub async fn to_json(&self) -> serde_json::Value {
         match self {
-            Value::Text(text, _) => {
-                serde_json::Value::String(text.text().to_string())
-            }
+            Value::Text(text, _) => serde_json::Value::String(text.text().to_string()),
             Value::Tag(tag, _) => {
                 let mut obj = serde_json::Map::new();
-                obj.insert("_tag".to_string(), serde_json::Value::String(tag.tag().to_string()));
+                obj.insert(
+                    "_tag".to_string(),
+                    serde_json::Value::String(tag.tag().to_string()),
+                );
                 serde_json::Value::Object(obj)
             }
             Value::Number(number, _) => {
@@ -5121,7 +5367,10 @@ impl Value {
             }
             Value::TaggedObject(tagged_object, _) => {
                 let mut obj = serde_json::Map::new();
-                obj.insert("_tag".to_string(), serde_json::Value::String(tagged_object.tag().to_string()));
+                obj.insert(
+                    "_tag".to_string(),
+                    serde_json::Value::String(tagged_object.tag().to_string()),
+                );
                 for variable in tagged_object.variables() {
                     let value = variable.value_actor().current_value().await.ok();
                     if let Some(value) = value {
@@ -5168,37 +5417,34 @@ impl Value {
     ) -> Value {
         match json {
             serde_json::Value::String(s) => {
-                let construct_info = ConstructInfo::new(
-                    construct_id,
-                    None,
-                    "Text from JSON",
-                );
-                Text::new_value(construct_info, construct_context, idempotency_key, s.clone())
+                let construct_info = ConstructInfo::new(construct_id, None, "Text from JSON");
+                Text::new_value(
+                    construct_info,
+                    construct_context,
+                    idempotency_key,
+                    s.clone(),
+                )
             }
             serde_json::Value::Number(n) => {
-                let construct_info = ConstructInfo::new(
-                    construct_id,
-                    None,
-                    "Number from JSON",
-                );
+                let construct_info = ConstructInfo::new(construct_id, None, "Number from JSON");
                 let number = n.as_f64().unwrap_or(0.0);
                 Number::new_value(construct_info, construct_context, idempotency_key, number)
             }
             serde_json::Value::Object(obj) => {
                 if let Some(serde_json::Value::String(tag)) = obj.get("_tag") {
                     // TaggedObject or Tag
-                    let other_fields: Vec<_> = obj.iter()
-                        .filter(|(k, _)| *k != "_tag")
-                        .collect();
+                    let other_fields: Vec<_> = obj.iter().filter(|(k, _)| *k != "_tag").collect();
 
                     if other_fields.is_empty() {
                         // Just a Tag
-                        let construct_info = ConstructInfo::new(
-                            construct_id,
-                            None,
-                            "Tag from JSON",
-                        );
-                        Tag::new_value(construct_info, construct_context, idempotency_key, tag.clone())
+                        let construct_info =
+                            ConstructInfo::new(construct_id, None, "Tag from JSON");
+                        Tag::new_value(
+                            construct_info,
+                            construct_context,
+                            idempotency_key,
+                            tag.clone(),
+                        )
                     } else {
                         // TaggedObject
                         let construct_info = ConstructInfo::new(
@@ -5206,7 +5452,8 @@ impl Value {
                             None,
                             "TaggedObject from JSON",
                         );
-                        let variables: Vec<Arc<Variable>> = other_fields.iter()
+                        let variables: Vec<Arc<Variable>> = other_fields
+                            .iter()
                             .map(|(name, value)| {
                                 let var_construct_info = ConstructInfo::new(
                                     construct_id.with_child_id(format!("var_{name}")),
@@ -5240,12 +5487,10 @@ impl Value {
                     }
                 } else {
                     // Regular Object
-                    let construct_info = ConstructInfo::new(
-                        construct_id.clone(),
-                        None,
-                        "Object from JSON",
-                    );
-                    let variables: Vec<Arc<Variable>> = obj.iter()
+                    let construct_info =
+                        ConstructInfo::new(construct_id.clone(), None, "Object from JSON");
+                    let variables: Vec<Arc<Variable>> = obj
+                        .iter()
                         .map(|(name, value)| {
                             let var_construct_info = ConstructInfo::new(
                                 construct_id.with_child_id(format!("var_{name}")),
@@ -5269,16 +5514,19 @@ impl Value {
                             )
                         })
                         .collect();
-                    Object::new_value(construct_info, construct_context, idempotency_key, variables)
+                    Object::new_value(
+                        construct_info,
+                        construct_context,
+                        idempotency_key,
+                        variables,
+                    )
                 }
             }
             serde_json::Value::Array(arr) => {
-                let construct_info = ConstructInfo::new(
-                    construct_id.clone(),
-                    None,
-                    "List from JSON",
-                );
-                let items: Vec<ActorHandle> = arr.iter()
+                let construct_info =
+                    ConstructInfo::new(construct_id.clone(), None, "List from JSON");
+                let items: Vec<ActorHandle> = arr
+                    .iter()
                     .enumerate()
                     .map(|(i, item)| {
                         value_actor_from_json(
@@ -5290,25 +5538,23 @@ impl Value {
                         )
                     })
                     .collect();
-                List::new_value(construct_info, construct_context, idempotency_key, actor_context, items)
+                List::new_value(
+                    construct_info,
+                    construct_context,
+                    idempotency_key,
+                    actor_context,
+                    items,
+                )
             }
             serde_json::Value::Bool(b) => {
                 // Represent booleans as tags
-                let construct_info = ConstructInfo::new(
-                    construct_id,
-                    None,
-                    "Tag from JSON bool",
-                );
+                let construct_info = ConstructInfo::new(construct_id, None, "Tag from JSON bool");
                 let tag = if *b { "True" } else { "False" };
                 Tag::new_value(construct_info, construct_context, idempotency_key, tag)
             }
             serde_json::Value::Null => {
                 // Represent null as a tag
-                let construct_info = ConstructInfo::new(
-                    construct_id,
-                    None,
-                    "Tag from JSON null",
-                );
+                let construct_info = ConstructInfo::new(construct_id, None, "Tag from JSON null");
                 Tag::new_value(construct_info, construct_context, idempotency_key, "None")
             }
         }
@@ -5334,7 +5580,8 @@ pub fn value_actor_from_json(
         construct_id.with_child_id("value_actor"),
         None,
         "ValueActor from JSON",
-    ).complete(ConstructType::ValueActor);
+    )
+    .complete(ConstructType::ValueActor);
     let scope_id = actor_context.scope_id();
     create_actor_complete(
         actor_construct_info,
@@ -5388,14 +5635,16 @@ pub async fn materialize_value(
                         var_value,
                         construct_context.clone(),
                         actor_context.clone(),
-                    )).await;
+                    ))
+                    .await;
                     // Create a constant ValueActor for the materialized value
                     let value_actor = create_actor_complete(
                         ConstructInfo::new(
                             format!("materialized_{}", variable.name()),
                             None,
                             format!("Materialized variable {}", variable.name()),
-                        ).complete(ConstructType::ValueActor),
+                        )
+                        .complete(ConstructType::ValueActor),
                         actor_context.clone(),
                         constant(materialized),
                         parser::PersistenceId::new(),
@@ -5433,13 +5682,15 @@ pub async fn materialize_value(
                         var_value,
                         construct_context.clone(),
                         actor_context.clone(),
-                    )).await;
+                    ))
+                    .await;
                     let value_actor = create_actor_complete(
                         ConstructInfo::new(
                             format!("materialized_{}", variable.name()),
                             None,
                             format!("Materialized variable {}", variable.name()),
-                        ).complete(ConstructType::ValueActor),
+                        )
+                        .complete(ConstructType::ValueActor),
                         actor_context.clone(),
                         constant(materialized),
                         parser::PersistenceId::new(),
@@ -5461,7 +5712,11 @@ pub async fn materialize_value(
                 }
             }
             let new_tagged_object = TaggedObject::new_arc(
-                ConstructInfo::new("materialized_tagged_object", None, "Materialized tagged object"),
+                ConstructInfo::new(
+                    "materialized_tagged_object",
+                    None,
+                    "Materialized tagged object",
+                ),
                 construct_context,
                 tagged_object.tag().to_string(),
                 materialized_vars,
@@ -5469,11 +5724,8 @@ pub async fn materialize_value(
             Value::TaggedObject(new_tagged_object, metadata)
         }
         Value::Flushed(inner, metadata) => {
-            let materialized_inner = Box::pin(materialize_value(
-                *inner,
-                construct_context,
-                actor_context,
-            )).await;
+            let materialized_inner =
+                Box::pin(materialize_value(*inner, construct_context, actor_context)).await;
             Value::Flushed(Box::new(materialized_inner), metadata)
         }
         // Scalars don't need materialization
@@ -5618,7 +5870,6 @@ impl Object {
     }
 }
 
-
 // --- TaggedObject ---
 
 pub struct TaggedObject {
@@ -5755,7 +6006,6 @@ impl TaggedObject {
     }
 }
 
-
 // --- Text ---
 
 pub struct Text {
@@ -5877,7 +6127,10 @@ impl Text {
         text: impl Into<Cow<'static, str>>,
     ) -> Value {
         Value::Text(
-            Arc::new(Self { construct_info, text: text.into() }),
+            Arc::new(Self {
+                construct_info,
+                text: text.into(),
+            }),
             ValueMetadata::new(idempotency_key),
         )
     }
@@ -5890,12 +6143,14 @@ impl Text {
         text: impl Into<Cow<'static, str>>,
     ) -> Value {
         Value::Text(
-            Arc::new(Self { construct_info, text: text.into() }),
+            Arc::new(Self {
+                construct_info,
+                text: text.into(),
+            }),
             ValueMetadata::with_lamport_time(idempotency_key, lamport_time),
         )
     }
 }
-
 
 // --- Tag ---
 
@@ -6018,7 +6273,10 @@ impl Tag {
         tag: impl Into<Cow<'static, str>>,
     ) -> Value {
         Value::Tag(
-            Arc::new(Self { construct_info, tag: tag.into() }),
+            Arc::new(Self {
+                construct_info,
+                tag: tag.into(),
+            }),
             ValueMetadata::new(idempotency_key),
         )
     }
@@ -6031,12 +6289,14 @@ impl Tag {
         tag: impl Into<Cow<'static, str>>,
     ) -> Value {
         Value::Tag(
-            Arc::new(Self { construct_info, tag: tag.into() }),
+            Arc::new(Self {
+                construct_info,
+                tag: tag.into(),
+            }),
             ValueMetadata::with_lamport_time(idempotency_key, lamport_time),
         )
     }
 }
-
 
 // --- Number ---
 
@@ -6137,7 +6397,6 @@ impl Number {
     }
 }
 
-
 // --- List ---
 
 /// Query types for List's diff history actor
@@ -6186,15 +6445,20 @@ impl List {
     ) -> Self {
         let construct_info = Arc::new(construct_info.complete(ConstructType::List));
         let (change_sender_sender, mut change_sender_receiver) =
-            NamedChannel::<NamedChannel<ListChange>>::new("list.change_subscribers", LIST_CHANGE_SUBSCRIBER_CAPACITY);
+            NamedChannel::<NamedChannel<ListChange>>::new(
+                "list.change_subscribers",
+                LIST_CHANGE_SUBSCRIBER_CAPACITY,
+            );
 
         // Version tracking for push-pull architecture
         let current_version = Arc::new(AtomicU64::new(0));
         let current_version_for_loop = current_version.clone();
 
         // Channel for diff subscriber registration (bounded channels)
-        let (notify_sender_sender, notify_sender_receiver) =
-            NamedChannel::<mpsc::Sender<()>>::new("list.diff_subscribers", LIST_DIFF_SUBSCRIBER_CAPACITY);
+        let (notify_sender_sender, notify_sender_receiver) = NamedChannel::<mpsc::Sender<()>>::new(
+            "list.diff_subscribers",
+            LIST_DIFF_SUBSCRIBER_CAPACITY,
+        );
 
         // Channel for diff history queries (actor-owned, no RefCell)
         let (diff_query_sender, diff_query_receiver) =
@@ -6226,7 +6490,8 @@ impl List {
                 // Invalidated when `list` is mutated via `apply_to_vec`.
                 let mut list_arc_cache: Option<Arc<[ActorHandle]>> = None;
                 // Queue for subscribers that register before list is initialized
-                let mut pending_subscribers: SmallVec<[NamedChannel<ListChange>; 2]> = SmallVec::new();
+                let mut pending_subscribers: SmallVec<[NamedChannel<ListChange>; 2]> =
+                    SmallVec::new();
                 loop {
                     select! {
                         // Handle diff history queries
@@ -6381,10 +6646,13 @@ impl List {
     /// Returns diffs if subscriber is close, snapshot if too far behind.
     pub async fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.diff_query_sender.try_send(DiffHistoryQuery::GetUpdateSince {
-            subscriber_version,
-            reply: tx,
-        }) {
+        if let Err(e) = self
+            .diff_query_sender
+            .try_send(DiffHistoryQuery::GetUpdateSince {
+                subscriber_version,
+                reply: tx,
+            })
+        {
             zoon::println!("[LIST] Failed to send GetUpdateSince query: {e}");
             return ValueUpdate::Current;
         }
@@ -6394,9 +6662,10 @@ impl List {
     /// Get current snapshot of items with their stable IDs (async).
     pub async fn snapshot(&self) -> Vec<(ItemId, ActorHandle)> {
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.diff_query_sender.try_send(DiffHistoryQuery::Snapshot {
-            reply: tx,
-        }) {
+        if let Err(e) = self
+            .diff_query_sender
+            .try_send(DiffHistoryQuery::Snapshot { reply: tx })
+        {
             zoon::println!("[LIST] Failed to send Snapshot query: {e}");
             return Vec::new();
         }
@@ -6513,7 +6782,8 @@ impl List {
     /// Callers should use `.clone().stream()` if they need to retain a reference.
     pub fn stream(self: Arc<Self>) -> ListSubscription {
         // ListChange events use bounded channel with backpressure - keeps senders that are just full
-        let (change_sender, change_receiver) = NamedChannel::new("list.changes", LIST_CHANGE_CAPACITY);
+        let (change_sender, change_receiver) =
+            NamedChannel::new("list.changes", LIST_CHANGE_CAPACITY);
         if let Err(error) = self.change_sender_sender.try_send(change_sender) {
             zoon::eprintln!("Failed to subscribe to {}: {error:#}", self.construct_info);
         }
@@ -6588,9 +6858,17 @@ impl List {
                 let storage_for_save = construct_storage.clone();
                 async move {
                     match state {
-                        PersistState::Init { storage, pid, mut change_stream, ctx, actor_ctx, cid } => {
+                        PersistState::Init {
+                            storage,
+                            pid,
+                            mut change_stream,
+                            ctx,
+                            actor_ctx,
+                            cid,
+                        } => {
                             // Check for saved state
-                            let loaded_items: Option<Vec<serde_json::Value>> = storage.clone().load_state(pid).await;
+                            let loaded_items: Option<Vec<serde_json::Value>> =
+                                storage.clone().load_state(pid).await;
 
                             // Only restore simple values from JSON - complex Objects with nested
                             // fields (like TodoMVC items) don't survive JSON restoration because
@@ -6641,11 +6919,20 @@ impl List {
                                     let restored_change = ListChange::Replace { items: items_arc };
                                     return Some((
                                         restored_change,
-                                        PersistState::Restored { pid, change_stream, current_items, ctx, actor_ctx, cid },
+                                        PersistState::Restored {
+                                            pid,
+                                            change_stream,
+                                            current_items,
+                                            ctx,
+                                            actor_ctx,
+                                            cid,
+                                        },
                                     ));
                                 }
                             } else if loaded_items.is_some() && LOG_DEBUG {
-                                zoon::println!("[DEBUG] Skipping JSON restoration for list with complex objects - use recorded-call restoration instead");
+                                zoon::println!(
+                                    "[DEBUG] Skipping JSON restoration for list with complex objects - use recorded-call restoration instead"
+                                );
                             }
 
                             // No saved state OR skipped restoration - forward first change from source
@@ -6659,13 +6946,27 @@ impl List {
 
                                 Some((
                                     change,
-                                    PersistState::Running { pid, change_stream, current_items: items, ctx, actor_ctx, cid },
+                                    PersistState::Running {
+                                        pid,
+                                        change_stream,
+                                        current_items: items,
+                                        ctx,
+                                        actor_ctx,
+                                        cid,
+                                    },
                                 ))
                             } else {
                                 None
                             }
                         }
-                        PersistState::Restored { pid, mut change_stream, current_items, ctx, actor_ctx, cid } => {
+                        PersistState::Restored {
+                            pid,
+                            mut change_stream,
+                            current_items,
+                            ctx,
+                            actor_ctx,
+                            cid,
+                        } => {
                             // Need to skip the first Replace from source (their initial state)
                             if let Some(change) = change_stream.next().await {
                                 if matches!(&change, ListChange::Replace { .. }) {
@@ -6675,7 +6976,14 @@ impl List {
                                     let running_items = items_arc.to_vec();
                                     Some((
                                         ListChange::Replace { items: items_arc },
-                                        PersistState::Running { pid, change_stream, current_items: running_items, ctx, actor_ctx, cid },
+                                        PersistState::Running {
+                                            pid,
+                                            change_stream,
+                                            current_items: running_items,
+                                            ctx,
+                                            actor_ctx,
+                                            cid,
+                                        },
                                     ))
                                 } else {
                                     // Non-Replace change, process normally
@@ -6687,14 +6995,28 @@ impl List {
 
                                     Some((
                                         change,
-                                        PersistState::Running { pid, change_stream, current_items: items, ctx, actor_ctx, cid },
+                                        PersistState::Running {
+                                            pid,
+                                            change_stream,
+                                            current_items: items,
+                                            ctx,
+                                            actor_ctx,
+                                            cid,
+                                        },
                                     ))
                                 }
                             } else {
                                 None
                             }
                         }
-                        PersistState::Running { pid, mut change_stream, current_items, ctx, actor_ctx, cid } => {
+                        PersistState::Running {
+                            pid,
+                            mut change_stream,
+                            current_items,
+                            ctx,
+                            actor_ctx,
+                            cid,
+                        } => {
                             // Forward changes and save
                             if let Some(change) = change_stream.next().await {
                                 let mut items = current_items;
@@ -6705,7 +7027,14 @@ impl List {
 
                                 Some((
                                     change,
-                                    PersistState::Running { pid, change_stream, current_items: items, ctx, actor_ctx, cid },
+                                    PersistState::Running {
+                                        pid,
+                                        change_stream,
+                                        current_items: items,
+                                        ctx,
+                                        actor_ctx,
+                                        cid,
+                                    },
                                 ))
                             } else {
                                 None
@@ -6806,10 +7135,8 @@ impl List {
                         idempotency_key,
                     } => {
                         // Try to load from storage (clone the Arc since load_state takes ownership)
-                        let loaded_items: Option<Vec<serde_json::Value>> = construct_storage
-                            .clone()
-                            .load_state(persistence_id)
-                            .await;
+                        let loaded_items: Option<Vec<serde_json::Value>> =
+                            construct_storage.clone().load_state(persistence_id).await;
 
                         let initial_items = if let Some(json_items) = loaded_items {
                             // Merge code_items with loaded_items:
@@ -6872,11 +7199,14 @@ impl List {
                                             json_items.push(value.to_json().await);
                                         }
                                     }
-                                    construct_storage_for_save.save_state(persistence_id, &json_items);
+                                    construct_storage_for_save
+                                        .save_state(persistence_id, &json_items);
                                 } else {
                                     // For incremental changes, we need to get the full list and save it
                                     let mut list_stream = pin!(list_for_save.clone().stream());
-                                    if let Some(ListChange::Replace { items }) = list_stream.next().await {
+                                    if let Some(ListChange::Replace { items }) =
+                                        list_stream.next().await
+                                    {
                                         let mut json_items = Vec::new();
                                         for item in items.iter() {
                                             // Use current_value() to get current value without subscription churn
@@ -6884,7 +7214,8 @@ impl List {
                                                 json_items.push(value.to_json().await);
                                             }
                                         }
-                                        construct_storage_for_save.save_state(persistence_id, &json_items);
+                                        construct_storage_for_save
+                                            .save_state(persistence_id, &json_items);
                                     }
                                 }
                             }
@@ -6899,14 +7230,12 @@ impl List {
                         future::pending::<Option<(Value, InitState)>>().await
                     }
                 }
-            }
+            },
         );
 
-        let actor_construct_info = ConstructInfo::new(
-            actor_id,
-            Some(persistence_data),
-            "Persistent list wrapper",
-        ).complete(ConstructType::ValueActor);
+        let actor_construct_info =
+            ConstructInfo::new(actor_id, Some(persistence_data), "Persistent list wrapper")
+                .complete(ConstructType::ValueActor);
 
         let scope_id = actor_context.scope_id();
         create_actor_complete(
@@ -6918,7 +7247,6 @@ impl List {
         )
     }
 }
-
 
 // --- ListSubscription ---
 
@@ -7044,13 +7372,12 @@ impl DiffHistory {
             ListDiff::Insert { id, after, value } => {
                 let pos = match after {
                     None => 0,
-                    Some(after_id) => {
-                        self.current_snapshot
-                            .iter()
-                            .position(|(id, _)| id == after_id)
-                            .map(|i| i + 1)
-                            .unwrap_or(self.current_snapshot.len())
-                    }
+                    Some(after_id) => self
+                        .current_snapshot
+                        .iter()
+                        .position(|(id, _)| id == after_id)
+                        .map(|i| i + 1)
+                        .unwrap_or(self.current_snapshot.len()),
                 };
                 self.current_snapshot.insert(pos, (*id, value.clone()));
             }
@@ -7058,7 +7385,11 @@ impl DiffHistory {
                 self.current_snapshot.retain(|(item_id, _)| item_id != id);
             }
             ListDiff::Update { id, value } => {
-                if let Some((_, v)) = self.current_snapshot.iter_mut().find(|(item_id, _)| item_id == id) {
+                if let Some((_, v)) = self
+                    .current_snapshot
+                    .iter_mut()
+                    .find(|(item_id, _)| item_id == id)
+                {
                     *v = value.clone();
                 }
             }
@@ -7076,7 +7407,9 @@ impl DiffHistory {
         let effective_max = if let Some(oldest_sub) = self.oldest_subscriber_version {
             let needed = self.current_version.saturating_sub(oldest_sub);
             let needed_usize = usize::try_from(needed).unwrap_or(usize::MAX);
-            needed_usize.max(DIFF_HISTORY_MIN_ENTRIES).min(self.config.max_entries)
+            needed_usize
+                .max(DIFF_HISTORY_MIN_ENTRIES)
+                .min(self.config.max_entries)
         } else {
             self.config.max_entries
         };
@@ -7106,7 +7439,8 @@ impl DiffHistory {
         }
 
         // Calculate how many diffs needed
-        let diffs_needed: Vec<_> = self.diffs
+        let diffs_needed: Vec<_> = self
+            .diffs
             .iter()
             .filter(|(v, _)| *v > subscriber_version)
             .map(|(_, d)| d.clone())
@@ -7129,7 +7463,8 @@ impl DiffHistory {
 
     fn snapshot_update(&self) -> ValueUpdate {
         // Return a Replace diff containing the full snapshot
-        let items: Vec<_> = self.current_snapshot
+        let items: Vec<_> = self
+            .current_snapshot
             .iter()
             .map(|(id, actor)| (*id, actor.clone()))
             .collect();
@@ -7171,14 +7506,22 @@ impl ListChange {
                 if index <= vec.len() {
                     vec.insert(index, item);
                 } else {
-                    zoon::eprintln!("ListChange::InsertAt index {} out of bounds (len: {})", index, vec.len());
+                    zoon::eprintln!(
+                        "ListChange::InsertAt index {} out of bounds (len: {})",
+                        index,
+                        vec.len()
+                    );
                 }
             }
             Self::UpdateAt { index, item } => {
                 if index < vec.len() {
                     vec[index] = item;
                 } else {
-                    zoon::eprintln!("ListChange::UpdateAt index {} out of bounds (len: {})", index, vec.len());
+                    zoon::eprintln!(
+                        "ListChange::UpdateAt index {} out of bounds (len: {})",
+                        index,
+                        vec.len()
+                    );
                 }
             }
             Self::Push { item } => {
@@ -7199,7 +7542,11 @@ impl ListChange {
                     let insert_index = new_index.min(vec.len());
                     vec.insert(insert_index, item);
                 } else {
-                    zoon::eprintln!("ListChange::Move old_index {} out of bounds (len: {})", old_index, vec.len());
+                    zoon::eprintln!(
+                        "ListChange::Move old_index {} out of bounds (len: {})",
+                        old_index,
+                        vec.len()
+                    );
                 }
             }
             Self::Pop => {
@@ -7223,7 +7570,9 @@ impl ListChange {
                     .iter()
                     .map(|actor| (ItemId::new(), actor.clone()))
                     .collect();
-                ListDiff::Replace { items: items_with_ids }
+                ListDiff::Replace {
+                    items: items_with_ids,
+                }
             }
             Self::InsertAt { index, item } => {
                 let new_id = ItemId::new();
@@ -7239,7 +7588,10 @@ impl ListChange {
                 }
             }
             Self::UpdateAt { index, item } => {
-                let id = snapshot.get(*index).map(|(id, _)| *id).unwrap_or_else(ItemId::new);
+                let id = snapshot
+                    .get(*index)
+                    .map(|(id, _)| *id)
+                    .unwrap_or_else(ItemId::new);
                 ListDiff::Update {
                     id,
                     value: item.clone(),
@@ -7256,17 +7608,22 @@ impl ListChange {
             }
             Self::Remove { id: persistence_id } => {
                 // Find ItemId by matching PersistenceId in snapshot
-                let item_id = snapshot.iter()
+                let item_id = snapshot
+                    .iter()
                     .find(|(_, actor)| actor.persistence_id() == *persistence_id)
                     .map(|(id, _)| *id)
                     .unwrap_or_else(ItemId::new);
                 ListDiff::Remove { id: item_id }
             }
-            Self::Move { old_index, new_index } => {
+            Self::Move {
+                old_index,
+                new_index,
+            } => {
                 // Move is Remove + Insert
                 // For simplicity, we model it as Remove followed by Insert
                 // The caller should handle this as two separate diffs if needed
-                if let Some((id, value)) = snapshot.get(*old_index).map(|(id, v)| (*id, v.clone())) {
+                if let Some((id, value)) = snapshot.get(*old_index).map(|(id, v)| (*id, v.clone()))
+                {
                     let after = if *new_index == 0 {
                         None
                     } else {
@@ -7281,15 +7638,22 @@ impl ListChange {
                     // Return as Insert with same ID (effectively a move)
                     ListDiff::Insert { id, after, value }
                 } else {
-                    zoon::eprintln!("ListChange::Move old_index {} out of bounds in to_diff (snapshot len: {})", old_index, snapshot.len());
+                    zoon::eprintln!(
+                        "ListChange::Move old_index {} out of bounds in to_diff (snapshot len: {})",
+                        old_index,
+                        snapshot.len()
+                    );
                     // Return a no-op by replacing with current snapshot
                     ListDiff::Replace {
-                        items: snapshot.iter().map(|(id, v)| (*id, v.clone())).collect()
+                        items: snapshot.iter().map(|(id, v)| (*id, v.clone())).collect(),
                     }
                 }
             }
             Self::Pop => {
-                let id = snapshot.last().map(|(id, _)| *id).unwrap_or_else(ItemId::new);
+                let id = snapshot
+                    .last()
+                    .map(|(id, _)| *id)
+                    .unwrap_or_else(ItemId::new);
                 ListDiff::Remove { id }
             }
             Self::Clear => {
@@ -7302,8 +7666,8 @@ impl ListChange {
 
 // --- ListBindingFunction ---
 
-use crate::parser::static_expression::{Expression as StaticExpression, Spanned as StaticSpanned};
 use crate::parser::StrSlice;
+use crate::parser::static_expression::{Expression as StaticExpression, Spanned as StaticSpanned};
 
 /// Handles List binding functions (map, retain, every, any) that need to
 /// evaluate an expression for each list item.
@@ -7389,8 +7753,11 @@ impl PartialEq for SortKey {
         match (self, other) {
             (SortKey::Number(a), SortKey::Number(b)) => {
                 // Handle NaN properly
-                if a.is_nan() && b.is_nan() { true }
-                else { a == b }
+                if a.is_nan() && b.is_nan() {
+                    true
+                } else {
+                    a == b
+                }
             }
             (SortKey::Text(a), SortKey::Text(b)) => a == b,
             (SortKey::Tag(a), SortKey::Tag(b)) => a == b,
@@ -7454,12 +7821,16 @@ fn compute_sort_diff(
 
         // Find the target item in current order
         let item_idx = new_order[target_pos];
-        let current_pos = current.iter().position(|&x| x == item_idx)
+        let current_pos = current
+            .iter()
+            .position(|&x| x == item_idx)
             .expect("Bug: item missing from current sorted order");
 
         // Remove from current position
         let item = &items[item_idx];
-        changes.push(ListChange::Remove { id: item.persistence_id() });
+        changes.push(ListChange::Remove {
+            id: item.persistence_id(),
+        });
         current.remove(current_pos);
 
         // Insert at target position
@@ -7495,34 +7866,28 @@ impl ListBindingFunction {
         let config = Arc::new(config);
 
         match config.operation {
-            ListBindingOperation::Map => {
-                Self::create_map_actor(
-                    construct_info,
-                    construct_context,
-                    actor_context,
-                    source_list_actor,
-                    config,
-                )
-            }
-            ListBindingOperation::Retain => {
-                Self::create_retain_actor(
-                    construct_info,
-                    construct_context,
-                    actor_context,
-                    source_list_actor,
-                    config,
-                )
-            }
-            ListBindingOperation::Remove => {
-                Self::create_remove_actor(
-                    construct_info,
-                    construct_context,
-                    actor_context,
-                    source_list_actor,
-                    config,
-                    persistence_id,
-                )
-            }
+            ListBindingOperation::Map => Self::create_map_actor(
+                construct_info,
+                construct_context,
+                actor_context,
+                source_list_actor,
+                config,
+            ),
+            ListBindingOperation::Retain => Self::create_retain_actor(
+                construct_info,
+                construct_context,
+                actor_context,
+                source_list_actor,
+                config,
+            ),
+            ListBindingOperation::Remove => Self::create_remove_actor(
+                construct_info,
+                construct_context,
+                actor_context,
+                source_list_actor,
+                config,
+                persistence_id,
+            ),
             ListBindingOperation::Every => {
                 Self::create_every_any_actor(
                     construct_info,
@@ -7543,15 +7908,13 @@ impl ListBindingFunction {
                     false, // is_every (false = any)
                 )
             }
-            ListBindingOperation::SortBy => {
-                Self::create_sort_by_actor(
-                    construct_info,
-                    construct_context,
-                    actor_context,
-                    source_list_actor,
-                    config,
-                )
-            }
+            ListBindingOperation::SortBy => Self::create_sort_by_actor(
+                construct_info,
+                construct_context,
+                actor_context,
+                source_list_actor,
+                config,
+            ),
         }
     }
 
@@ -7575,62 +7938,71 @@ impl ListBindingFunction {
         // But filter out re-emissions of the same list by ID to avoid cancelling
         // LINK connections unnecessarily.
         let change_stream = switch_map(
-            source_list_actor.clone().stream()
-            // Check if subscription scope is cancelled (e.g., WHILE arm switched)
-            .take_while(move |_| {
-                let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
-                future::ready(is_active)
-            })
-            .filter_map(move |value| {
-                future::ready(match value {
-                    Value::List(list, _) => Some(list),
-                    _ => None,
+            source_list_actor
+                .clone()
+                .stream()
+                // Check if subscription scope is cancelled (e.g., WHILE arm switched)
+                .take_while(move |_| {
+                    let is_active = subscription_scope
+                        .as_ref()
+                        .map_or(true, |s| !s.is_cancelled());
+                    future::ready(is_active)
                 })
-            })
-            // Deduplicate by list ID - only emit when we see a genuinely new list
-            .scan(None, move |prev_id: &mut Option<ConstructId>, list| {
-                let list_id = list.construct_info.id.clone();
-                if prev_id.as_ref() == Some(&list_id) {
-                    // Same list re-emitted, skip to avoid cancelling LINK connections
-                    future::ready(Some(None))
-                } else {
-                    *prev_id = Some(list_id);
-                    future::ready(Some(Some(list)))
-                }
-            })
-            .filter_map(future::ready),
+                .filter_map(move |value| {
+                    future::ready(match value {
+                        Value::List(list, _) => Some(list),
+                        _ => None,
+                    })
+                })
+                // Deduplicate by list ID - only emit when we see a genuinely new list
+                .scan(None, move |prev_id: &mut Option<ConstructId>, list| {
+                    let list_id = list.construct_info.id.clone();
+                    if prev_id.as_ref() == Some(&list_id) {
+                        // Same list re-emitted, skip to avoid cancelling LINK connections
+                        future::ready(Some(None))
+                    } else {
+                        *prev_id = Some(list_id);
+                        future::ready(Some(Some(list)))
+                    }
+                })
+                .filter_map(future::ready),
             move |list| {
-            use std::collections::HashMap;
-            let config = config_for_stream.clone();
-            let construct_context = construct_context_for_stream.clone();
-            let actor_context = actor_context_for_stream.clone();
+                use std::collections::HashMap;
+                let config = config_for_stream.clone();
+                let construct_context = construct_context_for_stream.clone();
+                let actor_context = actor_context_for_stream.clone();
 
-            // Track length, PersistenceId mapping, transform cache, AND item order.
-            // The transform cache (B1 optimization) caches transformed actors by source PersistenceId
-            // to avoid re-transforming unchanged items on Replace events.
-            // Item order (Vec) is needed to clean cache on Pop (we need to know which item was last).
-            type MapState = (
-                usize,
-                HashMap<parser::PersistenceId, parser::PersistenceId>,
-                HashMap<parser::PersistenceId, (ActorId, ActorHandle)>, // B1: source actor id + transformed actor
-                Vec<parser::PersistenceId>, // Item order for Pop handling
-            );
-            list.stream().scan((0usize, HashMap::new(), HashMap::new(), Vec::new()), move |state: &mut MapState, change| {
-                let (length, pid_map, transform_cache, item_order) = state;
-                let (transformed_change, new_length) = Self::transform_list_change_for_map_with_tracking(
-                    change,
-                    *length,
-                    pid_map,
-                    transform_cache,
-                    item_order,
-                    &config,
-                    construct_context.clone(),
-                    actor_context.clone(),
+                // Track length, PersistenceId mapping, transform cache, AND item order.
+                // The transform cache (B1 optimization) caches transformed actors by source PersistenceId
+                // to avoid re-transforming unchanged items on Replace events.
+                // Item order (Vec) is needed to clean cache on Pop (we need to know which item was last).
+                type MapState = (
+                    usize,
+                    HashMap<parser::PersistenceId, parser::PersistenceId>,
+                    HashMap<parser::PersistenceId, (ActorId, ActorHandle)>, // B1: source actor id + transformed actor
+                    Vec<parser::PersistenceId>, // Item order for Pop handling
                 );
-                *length = new_length;
-                future::ready(Some(transformed_change))
-            })
-        });
+                list.stream().scan(
+                    (0usize, HashMap::new(), HashMap::new(), Vec::new()),
+                    move |state: &mut MapState, change| {
+                        let (length, pid_map, transform_cache, item_order) = state;
+                        let (transformed_change, new_length) =
+                            Self::transform_list_change_for_map_with_tracking(
+                                change,
+                                *length,
+                                pid_map,
+                                transform_cache,
+                                item_order,
+                                &config,
+                                construct_context.clone(),
+                                actor_context.clone(),
+                            );
+                        *length = new_length;
+                        future::ready(Some(transformed_change))
+                    },
+                )
+            },
+        );
 
         let list = List::new_with_change_stream(
             ConstructInfo::new(
@@ -7675,50 +8047,54 @@ impl ListBindingFunction {
 
         // Use switch_map for proper list replacement handling
         let value_stream = switch_map(
-            source_list_actor.clone().stream()
-            .take_while(move |_| {
-                let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
-                future::ready(is_active)
-            })
-            .filter_map(|value| {
-                future::ready(match value {
-                    Value::List(list, _) => Some(list),
-                    _ => None,
+            source_list_actor
+                .clone()
+                .stream()
+                .take_while(move |_| {
+                    let is_active = subscription_scope
+                        .as_ref()
+                        .map_or(true, |s| !s.is_cancelled());
+                    future::ready(is_active)
                 })
-            })
-            // Deduplicate by list ID
-            .scan(None, |prev_id: &mut Option<ConstructId>, list| {
-                let list_id = list.construct_info.id.clone();
-                if prev_id.as_ref() == Some(&list_id) {
-                    future::ready(Some(None))
-                } else {
-                    *prev_id = Some(list_id);
-                    future::ready(Some(Some(list)))
-                }
-            })
-            .filter_map(future::ready),
+                .filter_map(|value| {
+                    future::ready(match value {
+                        Value::List(list, _) => Some(list),
+                        _ => None,
+                    })
+                })
+                // Deduplicate by list ID
+                .scan(None, |prev_id: &mut Option<ConstructId>, list| {
+                    let list_id = list.construct_info.id.clone();
+                    if prev_id.as_ref() == Some(&list_id) {
+                        future::ready(Some(None))
+                    } else {
+                        *prev_id = Some(list_id);
+                        future::ready(Some(Some(list)))
+                    }
+                })
+                .filter_map(future::ready),
             move |list| {
-            let config = config.clone();
-            let construct_context = construct_context.clone();
-            let actor_context = actor_context.clone();
+                let config = config.clone();
+                let construct_context = construct_context.clone();
+                let actor_context = actor_context.clone();
 
-            // Use stream::unfold with select for fine-grained control
-            // Uses PersistenceId-based tracking to avoid index shift bugs on Remove/Pop
+                // Use stream::unfold with select for fine-grained control
+                // Uses PersistenceId-based tracking to avoid index shift bugs on Remove/Pop
 
-            // State: (items, predicates, predicate_results, list_stream, merged_predicate_stream)
-            // Note: Using HashMap keyed by PersistenceId for predicates and results
-            // to avoid index misalignment when items are removed
-            type RetainState = (
-                Vec<ActorHandle>,                    // items (order matters for output)
-                HashMap<parser::PersistenceId, ActorHandle>,  // predicates by PersistenceId
-                HashMap<parser::PersistenceId, bool>,    // predicate_results by PersistenceId
-                Pin<Box<dyn Stream<Item = ListChange>>>, // list_stream
-                Option<Pin<Box<dyn Stream<Item = (parser::PersistenceId, bool)>>>>, // merged predicates
-            );
+                // State: (items, predicates, predicate_results, list_stream, merged_predicate_stream)
+                // Note: Using HashMap keyed by PersistenceId for predicates and results
+                // to avoid index misalignment when items are removed
+                type RetainState = (
+                    Vec<ActorHandle>,                            // items (order matters for output)
+                    HashMap<parser::PersistenceId, ActorHandle>, // predicates by PersistenceId
+                    HashMap<parser::PersistenceId, bool>, // predicate_results by PersistenceId
+                    Pin<Box<dyn Stream<Item = ListChange>>>, // list_stream
+                    Option<Pin<Box<dyn Stream<Item = (parser::PersistenceId, bool)>>>>, // merged predicates
+                );
 
-            let list_stream: Pin<Box<dyn Stream<Item = ListChange>>> = Box::pin(list.stream());
+                let list_stream: Pin<Box<dyn Stream<Item = ListChange>>> = Box::pin(list.stream());
 
-            stream::unfold(
+                stream::unfold(
                 (
                     Vec::<ActorHandle>::new(),
                     HashMap::<parser::PersistenceId, ActorHandle>::new(),
@@ -8288,7 +8664,8 @@ impl ListBindingFunction {
                 }
             )
             .filter_map(future::ready)
-        });
+            },
+        );
 
         let list = List::new_with_change_stream(
             ConstructInfo::new(
@@ -8327,9 +8704,9 @@ impl ListBindingFunction {
         use std::collections::HashSet;
 
         // Storage key for this List/remove's removed set (per-branch removal tracking)
-        let removed_set_key: Option<String> = persistence_id.as_ref().map(|pid| {
-            format!("list_removed:{}", pid)
-        });
+        let removed_set_key: Option<String> = persistence_id
+            .as_ref()
+            .map(|pid| format!("list_removed:{}", pid));
 
         // Clone for use after the chain
         let actor_context_for_list = actor_context.clone();
@@ -8341,75 +8718,81 @@ impl ListBindingFunction {
 
         // Use switch_map for proper list replacement handling
         let value_stream = switch_map(
-            source_list_actor.clone().stream()
-            // Check if subscription scope is cancelled (e.g., WHILE arm switched)
-            .take_while(move |_| {
-                let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
-                future::ready(is_active)
-            })
-            .filter_map(|value| {
-                future::ready(match value {
-                    Value::List(list, _) => Some(list),
-                    _ => None,
+            source_list_actor
+                .clone()
+                .stream()
+                // Check if subscription scope is cancelled (e.g., WHILE arm switched)
+                .take_while(move |_| {
+                    let is_active = subscription_scope
+                        .as_ref()
+                        .map_or(true, |s| !s.is_cancelled());
+                    future::ready(is_active)
                 })
-            })
-            // Deduplicate by list ID
-            .scan(None, |prev_id: &mut Option<ConstructId>, list| {
-                let list_id = list.construct_info.id.clone();
-                if prev_id.as_ref() == Some(&list_id) {
-                    future::ready(Some(None))
-                } else {
-                    *prev_id = Some(list_id);
-                    future::ready(Some(Some(list)))
-                }
-            })
-            .filter_map(future::ready),
+                .filter_map(|value| {
+                    future::ready(match value {
+                        Value::List(list, _) => Some(list),
+                        _ => None,
+                    })
+                })
+                // Deduplicate by list ID
+                .scan(None, |prev_id: &mut Option<ConstructId>, list| {
+                    let list_id = list.construct_info.id.clone();
+                    if prev_id.as_ref() == Some(&list_id) {
+                        future::ready(Some(None))
+                    } else {
+                        *prev_id = Some(list_id);
+                        future::ready(Some(Some(list)))
+                    }
+                })
+                .filter_map(future::ready),
             move |list| {
-            let config = config.clone();
-            let construct_context = construct_context.clone();
-            let actor_context = actor_context.clone();
-            let removed_set_key = removed_set_key.clone();
+                let config = config.clone();
+                let construct_context = construct_context.clone();
+                let actor_context = actor_context.clone();
+                let removed_set_key = removed_set_key.clone();
 
-            // Load persisted removed set for restoration (call_ids that were previously removed)
-            let persisted_removed: HashSet<String> = removed_set_key.as_ref()
-                .map(|key| load_removed_set(key).into_iter().collect())
-                .unwrap_or_default();
+                // Load persisted removed set for restoration (call_ids that were previously removed)
+                let persisted_removed: HashSet<String> = removed_set_key
+                    .as_ref()
+                    .map(|key| load_removed_set(key).into_iter().collect())
+                    .unwrap_or_default();
 
-            // Create channel for removal events (PersistenceId of item to remove)
-            let (remove_tx, remove_rx) = mpsc::channel::<parser::PersistenceId>(64);
+                // Create channel for removal events (PersistenceId of item to remove)
+                let (remove_tx, remove_rx) = mpsc::channel::<parser::PersistenceId>(64);
 
-            // Event type for merged streams
-            enum RemoveEvent {
-                ListChange(ListChange),
-                RemoveItem(parser::PersistenceId),
-            }
+                // Event type for merged streams
+                enum RemoveEvent {
+                    ListChange(ListChange),
+                    RemoveItem(parser::PersistenceId),
+                }
 
-            // Create list change stream
-            let list_changes = list.clone().stream().map(RemoveEvent::ListChange);
+                // Create list change stream
+                let list_changes = list.clone().stream().map(RemoveEvent::ListChange);
 
-            // Create removal event stream
-            let removal_events = remove_rx.map(RemoveEvent::RemoveItem);
+                // Create removal event stream
+                let removal_events = remove_rx.map(RemoveEvent::RemoveItem);
 
-            // State: track items and which PersistenceIds have been removed by THIS List/remove
-            // removed_persistence_ids is bounded: items are removed from this set when they're
-            // removed from upstream (no longer in Replace payload or via Remove { id }).
-            type ItemEntry = (usize, ActorHandle, ActorHandle);
-            // (internal_idx, item, when_actor) — no TaskHandle needed with stream fan-in
+                // State: track items and which PersistenceIds have been removed by THIS List/remove
+                // removed_persistence_ids is bounded: items are removed from this set when they're
+                // removed from upstream (no longer in Replace payload or via Remove { id }).
+                type ItemEntry = (usize, ActorHandle, ActorHandle);
+                // (internal_idx, item, when_actor) — no TaskHandle needed with stream fan-in
 
-            /// B6: Create a trigger stream for a single when_actor.
-            /// Emits the persistence_id once when the when_actor produces a value, then ends.
-            fn make_trigger_stream(
-                when_actor: ActorHandle,
-                persistence_id: parser::PersistenceId,
-            ) -> LocalBoxStream<'static, parser::PersistenceId> {
-                when_actor.stream_from_now()
-                    .map(move |_| persistence_id.clone())
-                    .take(1)
-                    .boxed_local()
-            }
+                /// B6: Create a trigger stream for a single when_actor.
+                /// Emits the persistence_id once when the when_actor produces a value, then ends.
+                fn make_trigger_stream(
+                    when_actor: ActorHandle,
+                    persistence_id: parser::PersistenceId,
+                ) -> LocalBoxStream<'static, parser::PersistenceId> {
+                    when_actor
+                        .stream_from_now()
+                        .map(move |_| persistence_id.clone())
+                        .take(1)
+                        .boxed_local()
+                }
 
-            // Merge list changes and removal events
-            stream::select(list_changes, removal_events).scan(
+                // Merge list changes and removal events
+                stream::select(list_changes, removal_events).scan(
                 (
                     Vec::<ItemEntry>::new(),
                     HashSet::<parser::PersistenceId>::new(), // removed_persistence_ids
@@ -8622,7 +9005,8 @@ impl ListBindingFunction {
                     }
                 }
             ).filter_map(future::ready)
-        });
+            },
+        );
 
         // Use persistence-aware list creation if persistence_id is provided
         let list = if let Some(pid) = persistence_id {
@@ -8686,41 +9070,45 @@ impl ListBindingFunction {
         // But filter out re-emissions of the same list by ID to avoid cancelling
         // subscriptions unnecessarily.
         let value_stream = switch_map(
-            source_list_actor.clone().stream()
-            // Check if subscription scope is cancelled (e.g., WHILE arm switched)
-            .take_while(move |_| {
-                let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
-                future::ready(is_active)
-            })
-            .filter_map(|value| {
-                future::ready(match value {
-                    Value::List(list, _) => Some(list),
-                    _ => None,
+            source_list_actor
+                .clone()
+                .stream()
+                // Check if subscription scope is cancelled (e.g., WHILE arm switched)
+                .take_while(move |_| {
+                    let is_active = subscription_scope
+                        .as_ref()
+                        .map_or(true, |s| !s.is_cancelled());
+                    future::ready(is_active)
                 })
-            })
-            // Deduplicate by list ID - only emit when we see a genuinely new list
-            .scan(None, |prev_id: &mut Option<ConstructId>, list| {
-                let list_id = list.construct_info.id.clone();
-                if prev_id.as_ref() == Some(&list_id) {
-                    // Same list re-emitted, skip
-                    future::ready(Some(None))
-                } else {
-                    *prev_id = Some(list_id);
-                    future::ready(Some(Some(list)))
-                }
-            })
-            .filter_map(future::ready),
+                .filter_map(|value| {
+                    future::ready(match value {
+                        Value::List(list, _) => Some(list),
+                        _ => None,
+                    })
+                })
+                // Deduplicate by list ID - only emit when we see a genuinely new list
+                .scan(None, |prev_id: &mut Option<ConstructId>, list| {
+                    let list_id = list.construct_info.id.clone();
+                    if prev_id.as_ref() == Some(&list_id) {
+                        // Same list re-emitted, skip
+                        future::ready(Some(None))
+                    } else {
+                        *prev_id = Some(list_id);
+                        future::ready(Some(Some(list)))
+                    }
+                })
+                .filter_map(future::ready),
             move |list| {
-            let config = config.clone();
-            let construct_context = construct_context.clone();
-            let actor_context = actor_context.clone();
-            let construct_info_id = construct_info_id.clone();
+                let config = config.clone();
+                let construct_context = construct_context.clone();
+                let actor_context = actor_context.clone();
+                let construct_info_id = construct_info_id.clone();
 
-            // Clone for the second flat_map
-            let construct_info_id_inner = construct_info_id.clone();
-            let construct_context_inner = construct_context.clone();
+                // Clone for the second flat_map
+                let construct_info_id_inner = construct_info_id.clone();
+                let construct_context_inner = construct_context.clone();
 
-            list.stream().scan(
+                list.stream().scan(
                 Vec::<(ActorHandle, ActorHandle)>::new(),
                 move |item_predicates, change| {
                     let config = config.clone();
@@ -8887,21 +9275,24 @@ impl ListBindingFunction {
                     })
                     .boxed_local()
             })
-        });
+            },
+        );
 
         // Deduplicate: only emit when the boolean result actually changes
-        let deduplicated_stream = value_stream.scan(None::<bool>, |last_result, value| {
-            let current_result = match &value {
-                Value::Tag(tag, _) => tag.tag() == "True",
-                _ => false,
-            };
-            if *last_result != Some(current_result) {
-                *last_result = Some(current_result);
-                future::ready(Some(Some(value)))
-            } else {
-                future::ready(Some(None))
-            }
-        }).filter_map(future::ready);
+        let deduplicated_stream = value_stream
+            .scan(None::<bool>, |last_result, value| {
+                let current_result = match &value {
+                    Value::Tag(tag, _) => tag.tag() == "True",
+                    _ => false,
+                };
+                if *last_result != Some(current_result) {
+                    *last_result = Some(current_result);
+                    future::ready(Some(Some(value)))
+                } else {
+                    future::ready(Some(None))
+                }
+            })
+            .filter_map(future::ready);
 
         let scope_id = actor_context_for_result.scope_id();
         create_actor_complete(
@@ -8940,41 +9331,45 @@ impl ListBindingFunction {
         // But filter out re-emissions of the same list by ID to avoid cancelling
         // subscriptions unnecessarily.
         let value_stream = switch_map(
-            source_list_actor.clone().stream()
-            // Check if subscription scope is cancelled (e.g., WHILE arm switched)
-            .take_while(move |_| {
-                let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
-                future::ready(is_active)
-            })
-            .filter_map(|value| {
-                future::ready(match value {
-                    Value::List(list, _) => Some(list),
-                    _ => None,
+            source_list_actor
+                .clone()
+                .stream()
+                // Check if subscription scope is cancelled (e.g., WHILE arm switched)
+                .take_while(move |_| {
+                    let is_active = subscription_scope
+                        .as_ref()
+                        .map_or(true, |s| !s.is_cancelled());
+                    future::ready(is_active)
                 })
-            })
-            // Deduplicate by list ID - only emit when we see a genuinely new list
-            .scan(None, |prev_id: &mut Option<ConstructId>, list| {
-                let list_id = list.construct_info.id.clone();
-                if prev_id.as_ref() == Some(&list_id) {
-                    // Same list re-emitted, skip
-                    future::ready(Some(None))
-                } else {
-                    *prev_id = Some(list_id);
-                    future::ready(Some(Some(list)))
-                }
-            })
-            .filter_map(future::ready),
+                .filter_map(|value| {
+                    future::ready(match value {
+                        Value::List(list, _) => Some(list),
+                        _ => None,
+                    })
+                })
+                // Deduplicate by list ID - only emit when we see a genuinely new list
+                .scan(None, |prev_id: &mut Option<ConstructId>, list| {
+                    let list_id = list.construct_info.id.clone();
+                    if prev_id.as_ref() == Some(&list_id) {
+                        // Same list re-emitted, skip
+                        future::ready(Some(None))
+                    } else {
+                        *prev_id = Some(list_id);
+                        future::ready(Some(Some(list)))
+                    }
+                })
+                .filter_map(future::ready),
             move |list| {
-            let config = config.clone();
-            let construct_context = construct_context.clone();
-            let actor_context = actor_context.clone();
-            let construct_info_id = construct_info_id.clone();
+                let config = config.clone();
+                let construct_context = construct_context.clone();
+                let actor_context = actor_context.clone();
+                let construct_info_id = construct_info_id.clone();
 
-            // Clone for the second flat_map
-            let construct_info_id_inner = construct_info_id.clone();
+                // Clone for the second flat_map
+                let construct_info_id_inner = construct_info_id.clone();
 
-            // Track items and their keys
-            list.stream().scan(
+                // Track items and their keys
+                list.stream().scan(
                 Vec::<(ActorHandle, ActorHandle)>::new(), // (item, key_actor)
                 move |item_keys, change| {
                     let config = config.clone();
@@ -9125,7 +9520,8 @@ impl ListBindingFunction {
                     .flat_map(|changes| stream::iter(changes))
                     .boxed_local()
             })
-        });
+            },
+        );
 
         let list = List::new_with_change_stream(
             ConstructInfo::new(
@@ -9221,7 +9617,7 @@ impl ListBindingFunction {
                     ),
                     new_actor_context,
                     TypedStream::infinite(result_actor.stream()),
-                    original_pid,  // Preserve original PersistenceId!
+                    original_pid, // Preserve original PersistenceId!
                     scope_id,
                 )
             }
@@ -9261,27 +9657,34 @@ impl ListBindingFunction {
                         )
                     })
                     .collect();
-                (ListChange::Replace { items: Arc::from(transformed_items) }, new_length)
+                (
+                    ListChange::Replace {
+                        items: Arc::from(transformed_items),
+                    },
+                    new_length,
+                )
             }
             ListChange::InsertAt { index, item } => {
-                let transformed_item = Self::transform_item(
-                    item,
-                    index,
-                    config,
-                    construct_context,
-                    actor_context,
-                );
-                (ListChange::InsertAt { index, item: transformed_item }, current_length + 1)
+                let transformed_item =
+                    Self::transform_item(item, index, config, construct_context, actor_context);
+                (
+                    ListChange::InsertAt {
+                        index,
+                        item: transformed_item,
+                    },
+                    current_length + 1,
+                )
             }
             ListChange::UpdateAt { index, item } => {
-                let transformed_item = Self::transform_item(
-                    item,
-                    index,
-                    config,
-                    construct_context,
-                    actor_context,
-                );
-                (ListChange::UpdateAt { index, item: transformed_item }, current_length)
+                let transformed_item =
+                    Self::transform_item(item, index, config, construct_context, actor_context);
+                (
+                    ListChange::UpdateAt {
+                        index,
+                        item: transformed_item,
+                    },
+                    current_length,
+                )
             }
             ListChange::Push { item } => {
                 // Use current_length as the index for the new item.
@@ -9293,11 +9696,27 @@ impl ListBindingFunction {
                     construct_context,
                     actor_context,
                 );
-                (ListChange::Push { item: transformed_item }, current_length + 1)
+                (
+                    ListChange::Push {
+                        item: transformed_item,
+                    },
+                    current_length + 1,
+                )
             }
             // These operations don't involve new items, pass through with updated length
-            ListChange::Remove { id } => (ListChange::Remove { id }, current_length.saturating_sub(1)),
-            ListChange::Move { old_index, new_index } => (ListChange::Move { old_index, new_index }, current_length),
+            ListChange::Remove { id } => {
+                (ListChange::Remove { id }, current_length.saturating_sub(1))
+            }
+            ListChange::Move {
+                old_index,
+                new_index,
+            } => (
+                ListChange::Move {
+                    old_index,
+                    new_index,
+                },
+                current_length,
+            ),
             ListChange::Pop => (ListChange::Pop, current_length.saturating_sub(1)),
             ListChange::Clear => (ListChange::Clear, 0),
         }
@@ -9311,7 +9730,10 @@ impl ListBindingFunction {
         change: ListChange,
         current_length: usize,
         pid_map: &mut std::collections::HashMap<parser::PersistenceId, parser::PersistenceId>,
-        transform_cache: &mut std::collections::HashMap<parser::PersistenceId, (ActorId, ActorHandle)>,
+        transform_cache: &mut std::collections::HashMap<
+            parser::PersistenceId,
+            (ActorId, ActorHandle),
+        >,
         item_order: &mut Vec<parser::PersistenceId>,
         config: &ListBindingConfig,
         construct_context: ConstructContext,
@@ -9329,9 +9751,8 @@ impl ListBindingFunction {
                 item_order.clear();
 
                 // B1: Track which items are still present for cache cleanup
-                let current_pids: std::collections::HashSet<_> = items.iter()
-                    .map(|item| item.persistence_id())
-                    .collect();
+                let current_pids: std::collections::HashSet<_> =
+                    items.iter().map(|item| item.persistence_id()).collect();
 
                 let transformed_items: Vec<ActorHandle> = items
                     .iter()
@@ -9369,8 +9790,10 @@ impl ListBindingFunction {
                                 construct_context.clone(),
                                 actor_context.clone(),
                             );
-                            transform_cache
-                                .insert(original_pid.clone(), (source_actor_id, new_transformed.clone()));
+                            transform_cache.insert(
+                                original_pid.clone(),
+                                (source_actor_id, new_transformed.clone()),
+                            );
                             new_transformed
                         };
 
@@ -9383,7 +9806,12 @@ impl ListBindingFunction {
                 // B1: Clean up cache - remove items no longer in the list
                 transform_cache.retain(|pid, _| current_pids.contains(pid));
 
-                (ListChange::Replace { items: Arc::from(transformed_items) }, new_length)
+                (
+                    ListChange::Replace {
+                        items: Arc::from(transformed_items),
+                    },
+                    new_length,
+                )
             }
             ListChange::InsertAt { index, item } => {
                 let original_pid = item.persistence_id();
@@ -9413,37 +9841,43 @@ impl ListBindingFunction {
                         new_transformed
                     }
                 } else {
-                    let new_transformed = Self::transform_item(
-                        item,
-                        index,
-                        config,
-                        construct_context,
-                        actor_context,
+                    let new_transformed =
+                        Self::transform_item(item, index, config, construct_context, actor_context);
+                    transform_cache.insert(
+                        original_pid.clone(),
+                        (source_actor_id, new_transformed.clone()),
                     );
-                    transform_cache
-                        .insert(original_pid.clone(), (source_actor_id, new_transformed.clone()));
                     new_transformed
                 };
                 let mapped_pid = transformed_item.persistence_id();
                 pid_map.insert(original_pid, mapped_pid);
-                (ListChange::InsertAt { index, item: transformed_item }, current_length + 1)
+                (
+                    ListChange::InsertAt {
+                        index,
+                        item: transformed_item,
+                    },
+                    current_length + 1,
+                )
             }
             ListChange::UpdateAt { index, item } => {
                 let original_pid = item.persistence_id();
                 let source_actor_id = item.actor_id();
                 // B1: For updates, always re-transform (the item content changed)
-                let transformed_item = Self::transform_item(
-                    item,
-                    index,
-                    config,
-                    construct_context,
-                    actor_context,
+                let transformed_item =
+                    Self::transform_item(item, index, config, construct_context, actor_context);
+                transform_cache.insert(
+                    original_pid.clone(),
+                    (source_actor_id, transformed_item.clone()),
                 );
-                transform_cache
-                    .insert(original_pid.clone(), (source_actor_id, transformed_item.clone()));
                 let mapped_pid = transformed_item.persistence_id();
                 pid_map.insert(original_pid, mapped_pid);
-                (ListChange::UpdateAt { index, item: transformed_item }, current_length)
+                (
+                    ListChange::UpdateAt {
+                        index,
+                        item: transformed_item,
+                    },
+                    current_length,
+                )
             }
             ListChange::Push { item } => {
                 let original_pid = item.persistence_id();
@@ -9478,13 +9912,20 @@ impl ListBindingFunction {
                         construct_context,
                         actor_context,
                     );
-                    transform_cache
-                        .insert(original_pid.clone(), (source_actor_id, new_transformed.clone()));
+                    transform_cache.insert(
+                        original_pid.clone(),
+                        (source_actor_id, new_transformed.clone()),
+                    );
                     new_transformed
                 };
                 let mapped_pid = transformed_item.persistence_id();
                 pid_map.insert(original_pid, mapped_pid);
-                (ListChange::Push { item: transformed_item }, current_length + 1)
+                (
+                    ListChange::Push {
+                        item: transformed_item,
+                    },
+                    current_length + 1,
+                )
             }
             ListChange::Remove { id } => {
                 // B1: Remove from cache and item order
@@ -9492,20 +9933,35 @@ impl ListBindingFunction {
                 item_order.retain(|pid| *pid != id);
                 // Translate the original PersistenceId to the mapped PersistenceId
                 if let Some(mapped_pid) = pid_map.remove(&id) {
-                    (ListChange::Remove { id: mapped_pid }, current_length.saturating_sub(1))
+                    (
+                        ListChange::Remove { id: mapped_pid },
+                        current_length.saturating_sub(1),
+                    )
                 } else {
                     // Item not found in mapping - this shouldn't happen, but pass through
-                    zoon::println!("[List/map] WARNING: Remove for unknown PersistenceId {:?}", id);
+                    zoon::println!(
+                        "[List/map] WARNING: Remove for unknown PersistenceId {:?}",
+                        id
+                    );
                     (ListChange::Remove { id }, current_length.saturating_sub(1))
                 }
             }
-            ListChange::Move { old_index, new_index } => {
+            ListChange::Move {
+                old_index,
+                new_index,
+            } => {
                 // Update item order for Move
                 if old_index < item_order.len() && new_index < item_order.len() {
                     let pid = item_order.remove(old_index);
                     item_order.insert(new_index, pid);
                 }
-                (ListChange::Move { old_index, new_index }, current_length)
+                (
+                    ListChange::Move {
+                        old_index,
+                        new_index,
+                    },
+                    current_length,
+                )
             }
             ListChange::Pop => {
                 // B1: Now we can clean cache because we track item order

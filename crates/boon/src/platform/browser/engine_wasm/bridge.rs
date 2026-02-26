@@ -2491,6 +2491,10 @@ fn build_item_text_input(
             let raw_el = if let Some(event_id) = key_down_event {
                 let inst = instance.clone();
                 let is_template = ctx.is_template_event(event_id);
+                let change_event_for_key = change_event;
+                let change_is_template = change_event
+                    .map(|eid| ctx.is_template_event(eid))
+                    .unwrap_or(false);
                 let ics = ics_clone.clone();
                 let template_cell_range = ctx.template_cell_range;
                 raw_el.event_handler(move |event: events::KeyDown| {
@@ -2515,6 +2519,18 @@ fn build_item_text_input(
                                         inst.cell_store.set_cell_text(cell_id, input_text.clone());
                                     }
                                 }
+                            }
+                        }
+                    }
+                    // For edit-save flows, commit the latest text through the
+                    // `change` pipeline before handling Enter key_down. Some
+                    // browsers don't dispatch an input/change event for Enter.
+                    if key == "Enter" {
+                        if let Some(change_eid) = change_event_for_key {
+                            if change_is_template {
+                                let _ = inst.call_on_item_event(item_idx, change_eid.0);
+                            } else {
+                                let _ = inst.fire_event(change_eid.0);
                             }
                         }
                     }
@@ -3185,11 +3201,7 @@ fn build_font_static(value: &IrExpr, program: &IrProgram) -> Option<Font<'static
             _ => {}
         }
     }
-    if has_any {
-        Some(font)
-    } else {
-        None
-    }
+    if has_any { Some(font) } else { None }
 }
 
 /// Build a typed Background style (static color + static URL only).
@@ -3231,11 +3243,7 @@ fn build_background_static(value: &IrExpr, program: &IrProgram) -> Option<Backgr
             _ => {}
         }
     }
-    if has_any {
-        Some(bg)
-    } else {
-        None
-    }
+    if has_any { Some(bg) } else { None }
 }
 
 /// Build a typed Borders style.
@@ -3454,11 +3462,7 @@ fn build_transform(value: &IrExpr, program: &IrProgram) -> Option<Transform> {
             _ => {}
         }
     }
-    if has_any {
-        Some(transform)
-    } else {
-        None
-    }
+    if has_any { Some(transform) } else { None }
 }
 
 /// Apply typed Zoon styles to a Styleable element.
@@ -3921,13 +3925,8 @@ fn apply_reactive_visible<T: RawEl>(
                     let item_idx = ctx.item_idx;
                     return el.style_signal(
                         "visibility",
-                        ics.get_signal(item_idx, cell_id).map(|v| {
-                            if v != 0.0 {
-                                "visible"
-                            } else {
-                                "hidden"
-                            }
-                        }),
+                        ics.get_signal(item_idx, cell_id)
+                            .map(|v| if v != 0.0 { "visible" } else { "hidden" }),
                     );
                 }
             }

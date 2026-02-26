@@ -172,10 +172,8 @@ impl Value {
     pub fn list_map(&self, f: impl Fn(&Value) -> Value) -> Self {
         if let Value::Tagged { tag, fields } = self {
             if tag.as_ref() == LIST_TAG {
-                let new_fields: BTreeMap<Arc<str>, Value> = fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), f(v)))
-                    .collect();
+                let new_fields: BTreeMap<Arc<str>, Value> =
+                    fields.iter().map(|(k, v)| (k.clone(), f(v))).collect();
                 return Value::Tagged {
                     tag: tag.clone(),
                     fields: Arc::new(new_fields),
@@ -255,10 +253,7 @@ impl Value {
             Value::Tagged { tag, fields } => {
                 if tag.as_ref() == LIST_TAG {
                     // Display lists as values only (keys are internal indices)
-                    let items: Vec<_> = fields
-                        .values()
-                        .map(|v| v.to_display_string())
-                        .collect();
+                    let items: Vec<_> = fields.values().map(|v| v.to_display_string()).collect();
                     format!("List[{}]", items.join(", "))
                 } else if fields.is_empty() {
                     tag.to_string()

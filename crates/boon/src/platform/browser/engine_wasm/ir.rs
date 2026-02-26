@@ -117,10 +117,7 @@ pub enum CmpOp {
 #[derive(Debug)]
 pub enum IrNode {
     /// Derived cell: value computed from expression (no external trigger).
-    Derived {
-        cell: CellId,
-        expr: IrExpr,
-    },
+    Derived { cell: CellId, expr: IrExpr },
 
     /// HOLD: mutable cell with initial value, updated on triggers.
     /// Each trigger has its own body expression (e.g., LATEST inside HOLD
@@ -160,10 +157,7 @@ pub enum IrNode {
     },
 
     /// Timer: periodic event source.
-    Timer {
-        event: EventId,
-        interval_ms: IrExpr,
-    },
+    Timer { event: EventId, interval_ms: IrExpr },
 
     /// Element with LINK bindings.
     Element {
@@ -175,9 +169,7 @@ pub enum IrNode {
     },
 
     /// Document root.
-    Document {
-        root: CellId,
-    },
+    Document { root: CellId },
 
     /// TEXT interpolation output cell.
     TextInterpolation {
@@ -186,16 +178,10 @@ pub enum IrNode {
     },
 
     /// Math/sum accumulator.
-    MathSum {
-        cell: CellId,
-        input: CellId,
-    },
+    MathSum { cell: CellId, input: CellId },
 
     /// Pipe from one cell to another (identity / pass-through).
-    PipeThrough {
-        cell: CellId,
-        source: CellId,
-    },
+    PipeThrough { cell: CellId, source: CellId },
 
     /// FunctionCall that doesn't map to a known built-in — placeholder for
     /// user-defined functions or not-yet-implemented built-ins.
@@ -223,10 +209,7 @@ pub enum IrNode {
     },
 
     /// List count: output f64 count of items in source list.
-    ListCount {
-        cell: CellId,
-        source: CellId,
-    },
+    ListCount { cell: CellId, source: CellId },
 
     /// List map: transform each item to an element.
     ListMap {
@@ -272,28 +255,16 @@ pub enum IrNode {
     },
 
     /// List is_empty: output bool (1.0/0.0) whether list is empty.
-    ListIsEmpty {
-        cell: CellId,
-        source: CellId,
-    },
+    ListIsEmpty { cell: CellId, source: CellId },
 
     /// Router/go_to: navigate to a URL.
-    RouterGoTo {
-        cell: CellId,
-        source: CellId,
-    },
+    RouterGoTo { cell: CellId, source: CellId },
 
     /// Text/trim: trim whitespace.
-    TextTrim {
-        cell: CellId,
-        source: CellId,
-    },
+    TextTrim { cell: CellId, source: CellId },
 
     /// Text/is_not_empty: check if text is non-empty.
-    TextIsNotEmpty {
-        cell: CellId,
-        source: CellId,
-    },
+    TextIsNotEmpty { cell: CellId, source: CellId },
 
     /// HOLD with object state and Stream/pulses loop.
     /// Computes N iterations at init time, updating per-field cells.
@@ -312,7 +283,6 @@ pub enum IrNode {
         count_expr: IrExpr,
         body_fields: Vec<(String, IrExpr)>,
     },
-
 }
 
 #[derive(Debug)]
@@ -425,10 +395,7 @@ pub struct EventInfo {
 
 #[derive(Debug)]
 pub enum EventSource {
-    Link {
-        element: CellId,
-        event_name: String,
-    },
+    Link { element: CellId, event_name: String },
     Timer,
     Router,
     Synthetic,
@@ -444,30 +411,158 @@ pub struct IrFunction {
 /// Short debug representation of an IrNode (for logging).
 pub fn node_debug_short(node: &IrNode) -> String {
     match node {
-        IrNode::Derived { cell, expr } => format!("Derived(cell={}, expr={:?})", cell.0, expr_short(expr)),
-        IrNode::Hold { cell, trigger_bodies, .. } => format!("Hold(cell={}, triggers={:?})", cell.0, trigger_bodies.iter().map(|(e, _)| e).collect::<Vec<_>>()),
-        IrNode::Latest { target, arms } => format!("Latest(target={}, arms={})", target.0, arms.len()),
-        IrNode::Then { cell, trigger, body } => format!("Then(cell={}, trigger={:?}, body={})", cell.0, trigger, expr_short(body)),
-        IrNode::When { cell, source, arms } => format!("When(cell={}, source={}, arms={})", cell.0, source.0, arms.len()),
-        IrNode::While { cell, source, deps, arms } => format!("While(cell={}, source={}, deps={:?}, arms={})", cell.0, source.0, deps.iter().map(|d| d.0).collect::<Vec<_>>(), arms.len()),
+        IrNode::Derived { cell, expr } => {
+            format!("Derived(cell={}, expr={:?})", cell.0, expr_short(expr))
+        }
+        IrNode::Hold {
+            cell,
+            trigger_bodies,
+            ..
+        } => format!(
+            "Hold(cell={}, triggers={:?})",
+            cell.0,
+            trigger_bodies.iter().map(|(e, _)| e).collect::<Vec<_>>()
+        ),
+        IrNode::Latest { target, arms } => {
+            format!("Latest(target={}, arms={})", target.0, arms.len())
+        }
+        IrNode::Then {
+            cell,
+            trigger,
+            body,
+        } => format!(
+            "Then(cell={}, trigger={:?}, body={})",
+            cell.0,
+            trigger,
+            expr_short(body)
+        ),
+        IrNode::When { cell, source, arms } => format!(
+            "When(cell={}, source={}, arms={})",
+            cell.0,
+            source.0,
+            arms.len()
+        ),
+        IrNode::While {
+            cell,
+            source,
+            deps,
+            arms,
+        } => format!(
+            "While(cell={}, source={}, deps={:?}, arms={})",
+            cell.0,
+            source.0,
+            deps.iter().map(|d| d.0).collect::<Vec<_>>(),
+            arms.len()
+        ),
         IrNode::Timer { event, .. } => format!("Timer(event={:?})", event),
-        IrNode::Element { cell, kind, .. } => format!("Element(cell={}, kind={})", cell.0, element_kind_name(kind)),
+        IrNode::Element { cell, kind, .. } => {
+            format!("Element(cell={}, kind={})", cell.0, element_kind_name(kind))
+        }
         IrNode::Document { root } => format!("Document(root={})", root.0),
-        IrNode::TextInterpolation { cell, parts } => format!("TextInterp(cell={}, parts={})", cell.0, parts.len()),
+        IrNode::TextInterpolation { cell, parts } => {
+            format!("TextInterp(cell={}, parts={})", cell.0, parts.len())
+        }
         IrNode::MathSum { cell, input } => format!("MathSum(cell={}, input={})", cell.0, input.0),
-        IrNode::PipeThrough { cell, source } => format!("PipeThrough(cell={}, source={})", cell.0, source.0),
-        IrNode::CustomCall { cell, path, .. } => format!("CustomCall(cell={}, path={:?})", cell.0, path),
-        IrNode::ListAppend { cell, source, item, trigger, watch_cell } => format!("ListAppend(cell={}, source={}, item={}, trigger={:?}, watch={:?})", cell.0, source.0, item.0, trigger, watch_cell.map(|c| c.0)),
-        IrNode::ListClear { cell, source, trigger } => format!("ListClear(cell={}, source={}, trigger={:?})", cell.0, source.0, trigger),
-        IrNode::ListCount { cell, source } => format!("ListCount(cell={}, source={})", cell.0, source.0),
-        IrNode::ListMap { cell, source, item_name, template_cell_range, template_event_range, .. } => format!("ListMap(cell={}, source={}, item={}, cells={:?}, events={:?})", cell.0, source.0, item_name, template_cell_range, template_event_range),
-        IrNode::ListRemove { cell, source, trigger, predicate, item_cell, item_field_cells } => format!("ListRemove(cell={}, source={}, trigger={:?}, pred={:?}, item={:?}, fields={:?})", cell.0, source.0, trigger, predicate.map(|p| p.0), item_cell.map(|c| c.0), item_field_cells.iter().map(|(n, c)| format!("{}:{}", n, c.0)).collect::<Vec<_>>()),
-        IrNode::ListRetain { cell, source, predicate, item_cell, item_field_cells } => format!("ListRetain(cell={}, source={}, pred={:?}, item={:?}, fields={:?})", cell.0, source.0, predicate.map(|p| p.0), item_cell.map(|c| c.0), item_field_cells.iter().map(|(n, c)| format!("{}:{}", n, c.0)).collect::<Vec<_>>()),
-        IrNode::ListIsEmpty { cell, source } => format!("ListIsEmpty(cell={}, source={})", cell.0, source.0),
-        IrNode::RouterGoTo { cell, source } => format!("RouterGoTo(cell={}, source={})", cell.0, source.0),
-        IrNode::TextTrim { cell, source } => format!("TextTrim(cell={}, source={})", cell.0, source.0),
-        IrNode::TextIsNotEmpty { cell, source } => format!("TextIsNotEmpty(cell={}, source={})", cell.0, source.0),
-        IrNode::HoldLoop { cell, field_cells, .. } => format!("HoldLoop(cell={}, fields={:?})", cell.0, field_cells.iter().map(|(n, c)| format!("{}:{}", n, c.0)).collect::<Vec<_>>()),
+        IrNode::PipeThrough { cell, source } => {
+            format!("PipeThrough(cell={}, source={})", cell.0, source.0)
+        }
+        IrNode::CustomCall { cell, path, .. } => {
+            format!("CustomCall(cell={}, path={:?})", cell.0, path)
+        }
+        IrNode::ListAppend {
+            cell,
+            source,
+            item,
+            trigger,
+            watch_cell,
+        } => format!(
+            "ListAppend(cell={}, source={}, item={}, trigger={:?}, watch={:?})",
+            cell.0,
+            source.0,
+            item.0,
+            trigger,
+            watch_cell.map(|c| c.0)
+        ),
+        IrNode::ListClear {
+            cell,
+            source,
+            trigger,
+        } => format!(
+            "ListClear(cell={}, source={}, trigger={:?})",
+            cell.0, source.0, trigger
+        ),
+        IrNode::ListCount { cell, source } => {
+            format!("ListCount(cell={}, source={})", cell.0, source.0)
+        }
+        IrNode::ListMap {
+            cell,
+            source,
+            item_name,
+            template_cell_range,
+            template_event_range,
+            ..
+        } => format!(
+            "ListMap(cell={}, source={}, item={}, cells={:?}, events={:?})",
+            cell.0, source.0, item_name, template_cell_range, template_event_range
+        ),
+        IrNode::ListRemove {
+            cell,
+            source,
+            trigger,
+            predicate,
+            item_cell,
+            item_field_cells,
+        } => format!(
+            "ListRemove(cell={}, source={}, trigger={:?}, pred={:?}, item={:?}, fields={:?})",
+            cell.0,
+            source.0,
+            trigger,
+            predicate.map(|p| p.0),
+            item_cell.map(|c| c.0),
+            item_field_cells
+                .iter()
+                .map(|(n, c)| format!("{}:{}", n, c.0))
+                .collect::<Vec<_>>()
+        ),
+        IrNode::ListRetain {
+            cell,
+            source,
+            predicate,
+            item_cell,
+            item_field_cells,
+        } => format!(
+            "ListRetain(cell={}, source={}, pred={:?}, item={:?}, fields={:?})",
+            cell.0,
+            source.0,
+            predicate.map(|p| p.0),
+            item_cell.map(|c| c.0),
+            item_field_cells
+                .iter()
+                .map(|(n, c)| format!("{}:{}", n, c.0))
+                .collect::<Vec<_>>()
+        ),
+        IrNode::ListIsEmpty { cell, source } => {
+            format!("ListIsEmpty(cell={}, source={})", cell.0, source.0)
+        }
+        IrNode::RouterGoTo { cell, source } => {
+            format!("RouterGoTo(cell={}, source={})", cell.0, source.0)
+        }
+        IrNode::TextTrim { cell, source } => {
+            format!("TextTrim(cell={}, source={})", cell.0, source.0)
+        }
+        IrNode::TextIsNotEmpty { cell, source } => {
+            format!("TextIsNotEmpty(cell={}, source={})", cell.0, source.0)
+        }
+        IrNode::HoldLoop {
+            cell, field_cells, ..
+        } => format!(
+            "HoldLoop(cell={}, fields={:?})",
+            cell.0,
+            field_cells
+                .iter()
+                .map(|(n, c)| format!("{}:{}", n, c.0))
+                .collect::<Vec<_>>()
+        ),
     }
 }
 

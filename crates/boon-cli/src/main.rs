@@ -1,10 +1,10 @@
-use clap::{Parser as ClapParser, Subcommand};
-use std::path::PathBuf;
-use std::fs;
 use boon::engine_v2::event_loop::EventLoop;
 use boon::evaluator_v2::CompileContext;
-use boon::parser::{lexer, parser, reset_expression_depth, Parser, Input, Spanned, span_at};
+use boon::parser::{Input, Parser, Spanned, lexer, parser, reset_expression_depth, span_at};
 use boon::platform::cli::clock::TestClock;
+use clap::{Parser as ClapParser, Subcommand};
+use std::fs;
+use std::path::PathBuf;
 
 #[derive(ClapParser)]
 #[command(name = "boon")]
@@ -57,29 +57,25 @@ fn main() {
         Commands::Eval { code, ticks } => {
             eval_code(&code, ticks.unwrap_or(100));
         }
-        Commands::Run { file, ticks, state } => {
-            match fs::read_to_string(&file) {
-                Ok(code) => {
-                    eprintln!("Running: {}", file.display());
-                    eval_code_with_persistence(&code, ticks.unwrap_or(100), state);
-                }
-                Err(e) => {
-                    eprintln!("Error reading file: {}", e);
-                    std::process::exit(1);
-                }
+        Commands::Run { file, ticks, state } => match fs::read_to_string(&file) {
+            Ok(code) => {
+                eprintln!("Running: {}", file.display());
+                eval_code_with_persistence(&code, ticks.unwrap_or(100), state);
             }
-        }
-        Commands::Check { file } => {
-            match fs::read_to_string(&file) {
-                Ok(code) => {
-                    check_code(&code, &file);
-                }
-                Err(e) => {
-                    eprintln!("Error reading file: {}", e);
-                    std::process::exit(1);
-                }
+            Err(e) => {
+                eprintln!("Error reading file: {}", e);
+                std::process::exit(1);
             }
-        }
+        },
+        Commands::Check { file } => match fs::read_to_string(&file) {
+            Ok(code) => {
+                check_code(&code, &file);
+            }
+            Err(e) => {
+                eprintln!("Error reading file: {}", e);
+                std::process::exit(1);
+            }
+        },
         Commands::Test { files, update } => {
             run_tests(&files, update);
         }
@@ -175,7 +171,13 @@ fn run_test_file(file: &PathBuf, content: &str, update: bool) -> (usize, usize, 
 }
 
 /// Run a single test case.
-fn run_single_test(file: &PathBuf, name: &str, code: &str, expected: Option<&str>, _update: bool) -> bool {
+fn run_single_test(
+    file: &PathBuf,
+    name: &str,
+    code: &str,
+    expected: Option<&str>,
+    _update: bool,
+) -> bool {
     eprint!("  {} ... ", name);
 
     // Evaluate the code
@@ -272,11 +274,7 @@ fn parse_test_advance(line: &str) -> Option<u64> {
 
 /// Run the event loop until quiescent, with TestClock for timers.
 /// Used during initial evaluation to register newly created timers.
-fn run_with_clock(
-    event_loop: &mut EventLoop,
-    clock: &mut TestClock,
-    max_ticks: u64,
-) {
+fn run_with_clock(event_loop: &mut EventLoop, clock: &mut TestClock, max_ticks: u64) {
     for _ in 0..max_ticks {
         event_loop.run_tick();
 
@@ -307,12 +305,7 @@ fn run_until_quiescent(event_loop: &mut EventLoop, max_ticks: u64) {
 }
 
 /// Advance virtual time and fire any timers that become ready.
-fn advance_time(
-    event_loop: &mut EventLoop,
-    clock: &mut TestClock,
-    ms: u64,
-    max_ticks: u64,
-) {
+fn advance_time(event_loop: &mut EventLoop, clock: &mut TestClock, ms: u64, max_ticks: u64) {
     // Advance clock and get timers that should fire
     let fired = clock.advance_by(ms);
 
@@ -346,7 +339,11 @@ fn eval_code_to_json(code: &str, max_ticks: u64) -> Result<serde_json::Value, St
 
     let input = tokens.map(
         span_at(cleaned_code.len()),
-        |Spanned { node, span, persistence: _ }| (node, span),
+        |Spanned {
+             node,
+             span,
+             persistence: _,
+         }| (node, span),
     );
 
     let (expressions, parse_errors) = parser().parse(input).into_output_errors();
@@ -367,8 +364,15 @@ fn eval_code_to_json(code: &str, max_ticks: u64) -> Result<serde_json::Value, St
     // Mark all nodes dirty
     let all_slots: Vec<_> = (0..event_loop.arena_len() as u32)
         .filter_map(|idx| {
-            let slot = boon::engine_v2::arena::SlotId { index: idx, generation: 0 };
-            if event_loop.is_valid(slot) { Some(slot) } else { None }
+            let slot = boon::engine_v2::arena::SlotId {
+                index: idx,
+                generation: 0,
+            };
+            if event_loop.is_valid(slot) {
+                Some(slot)
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -427,7 +431,11 @@ fn check_code(code: &str, file: &PathBuf) {
     // Create input with span mapping
     let input = tokens.map(
         span_at(code.len()),
-        |Spanned { node, span, persistence: _ }| (node, span),
+        |Spanned {
+             node,
+             span,
+             persistence: _,
+         }| (node, span),
     );
 
     // Parse
@@ -459,10 +467,13 @@ fn eval_code_with_persistence(code: &str, max_ticks: u64, state_file: Option<Pat
 
     if !lex_errors.is_empty() {
         eprintln!("Lexer errors: {:?}", lex_errors);
-        println!("{}", serde_json::json!({
-            "status": "error",
-            "error": format!("Lexer errors: {:?}", lex_errors)
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "error",
+                "error": format!("Lexer errors: {:?}", lex_errors)
+            })
+        );
         return;
     }
 
@@ -470,10 +481,13 @@ fn eval_code_with_persistence(code: &str, max_ticks: u64, state_file: Option<Pat
         Some(t) => t,
         None => {
             eprintln!("No tokens from lexer");
-            println!("{}", serde_json::json!({
-                "status": "error",
-                "error": "No tokens from lexer"
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "error",
+                    "error": "No tokens from lexer"
+                })
+            );
             return;
         }
     };
@@ -484,7 +498,11 @@ fn eval_code_with_persistence(code: &str, max_ticks: u64, state_file: Option<Pat
     // Create input with span mapping
     let input = tokens.map(
         span_at(code.len()),
-        |Spanned { node, span, persistence: _ }| (node, span),
+        |Spanned {
+             node,
+             span,
+             persistence: _,
+         }| (node, span),
     );
 
     // Parse
@@ -492,10 +510,13 @@ fn eval_code_with_persistence(code: &str, max_ticks: u64, state_file: Option<Pat
 
     if !parse_errors.is_empty() {
         eprintln!("Parser errors: {:?}", parse_errors);
-        println!("{}", serde_json::json!({
-            "status": "error",
-            "error": format!("Parser errors: {:?}", parse_errors)
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "error",
+                "error": format!("Parser errors: {:?}", parse_errors)
+            })
+        );
         return;
     }
 
@@ -503,11 +524,14 @@ fn eval_code_with_persistence(code: &str, max_ticks: u64, state_file: Option<Pat
         Some(e) => e,
         None => {
             eprintln!("No expressions from parser");
-            println!("{}", serde_json::json!({
-                "status": "ok",
-                "ticks": 0,
-                "note": "No expressions to evaluate"
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "ok",
+                    "ticks": 0,
+                    "note": "No expressions to evaluate"
+                })
+            );
             return;
         }
     };
@@ -523,17 +547,15 @@ fn eval_code_with_persistence(code: &str, max_ticks: u64, state_file: Option<Pat
     if let Some(ref state_path) = state_file {
         if state_path.exists() {
             match fs::read_to_string(state_path) {
-                Ok(json_str) => {
-                    match GraphSnapshot::from_json(&json_str) {
-                        Ok(snapshot) => {
-                            event_loop.restore_snapshot(&snapshot);
-                            eprintln!("Loaded state from: {}", state_path.display());
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: Failed to parse state file: {}", e);
-                        }
+                Ok(json_str) => match GraphSnapshot::from_json(&json_str) {
+                    Ok(snapshot) => {
+                        event_loop.restore_snapshot(&snapshot);
+                        eprintln!("Loaded state from: {}", state_path.display());
                     }
-                }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to parse state file: {}", e);
+                    }
+                },
                 Err(e) => {
                     eprintln!("Warning: Failed to read state file: {}", e);
                 }
@@ -544,8 +566,15 @@ fn eval_code_with_persistence(code: &str, max_ticks: u64, state_file: Option<Pat
     // Mark all nodes as dirty to trigger initial evaluation
     let all_slots: Vec<_> = (0..event_loop.arena_len() as u32)
         .filter_map(|idx| {
-            let slot = boon::engine_v2::arena::SlotId { index: idx, generation: 0 };
-            if event_loop.is_valid(slot) { Some(slot) } else { None }
+            let slot = boon::engine_v2::arena::SlotId {
+                index: idx,
+                generation: 0,
+            };
+            if event_loop.is_valid(slot) {
+                Some(slot)
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -566,16 +595,14 @@ fn eval_code_with_persistence(code: &str, max_ticks: u64, state_file: Option<Pat
     if let Some(ref state_path) = state_file {
         let snapshot = event_loop.create_snapshot();
         match snapshot.to_json() {
-            Ok(json_str) => {
-                match fs::write(state_path, json_str) {
-                    Ok(_) => {
-                        eprintln!("Saved state to: {}", state_path.display());
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to write state file: {}", e);
-                    }
+            Ok(json_str) => match fs::write(state_path, json_str) {
+                Ok(_) => {
+                    eprintln!("Saved state to: {}", state_path.display());
                 }
-            }
+                Err(e) => {
+                    eprintln!("Warning: Failed to write state file: {}", e);
+                }
+            },
             Err(e) => {
                 eprintln!("Warning: Failed to serialize state: {}", e);
             }
@@ -585,23 +612,32 @@ fn eval_code_with_persistence(code: &str, max_ticks: u64, state_file: Option<Pat
     // Output result as JSON
     if let Some(slot) = result_slot {
         if let Some(value) = event_loop.get_current_value(slot) {
-            println!("{}", serde_json::json!({
-                "status": "ok",
-                "ticks": event_loop.current_tick,
-                "result": event_loop.expand_payload_to_json(value)
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "ok",
+                    "ticks": event_loop.current_tick,
+                    "result": event_loop.expand_payload_to_json(value)
+                })
+            );
         } else {
-            println!("{}", serde_json::json!({
-                "status": "ok",
-                "ticks": event_loop.current_tick,
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "ok",
+                    "ticks": event_loop.current_tick,
+                })
+            );
         }
     } else {
-        println!("{}", serde_json::json!({
-            "status": "ok",
-            "ticks": event_loop.current_tick,
-            "note": "No expressions to evaluate"
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "ticks": event_loop.current_tick,
+                "note": "No expressions to evaluate"
+            })
+        );
     }
 }
 
@@ -613,10 +649,13 @@ fn eval_code(code: &str, max_ticks: u64) {
 
     if !lex_errors.is_empty() {
         eprintln!("Lexer errors: {:?}", lex_errors);
-        println!("{}", serde_json::json!({
-            "status": "error",
-            "error": format!("Lexer errors: {:?}", lex_errors)
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "error",
+                "error": format!("Lexer errors: {:?}", lex_errors)
+            })
+        );
         return;
     }
 
@@ -624,10 +663,13 @@ fn eval_code(code: &str, max_ticks: u64) {
         Some(t) => t,
         None => {
             eprintln!("No tokens from lexer");
-            println!("{}", serde_json::json!({
-                "status": "error",
-                "error": "No tokens from lexer"
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "error",
+                    "error": "No tokens from lexer"
+                })
+            );
             return;
         }
     };
@@ -638,7 +680,11 @@ fn eval_code(code: &str, max_ticks: u64) {
     // Create input with span mapping
     let input = tokens.map(
         span_at(code.len()),
-        |Spanned { node, span, persistence: _ }| (node, span),
+        |Spanned {
+             node,
+             span,
+             persistence: _,
+         }| (node, span),
     );
 
     // Parse
@@ -646,10 +692,13 @@ fn eval_code(code: &str, max_ticks: u64) {
 
     if !parse_errors.is_empty() {
         eprintln!("Parser errors: {:?}", parse_errors);
-        println!("{}", serde_json::json!({
-            "status": "error",
-            "error": format!("Parser errors: {:?}", parse_errors)
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "error",
+                "error": format!("Parser errors: {:?}", parse_errors)
+            })
+        );
         return;
     }
 
@@ -657,11 +706,14 @@ fn eval_code(code: &str, max_ticks: u64) {
         Some(e) => e,
         None => {
             eprintln!("No expressions from parser");
-            println!("{}", serde_json::json!({
-                "status": "ok",
-                "ticks": 0,
-                "note": "No expressions to evaluate"
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "ok",
+                    "ticks": 0,
+                    "note": "No expressions to evaluate"
+                })
+            );
             return;
         }
     };
@@ -677,8 +729,15 @@ fn eval_code(code: &str, max_ticks: u64) {
     // This ensures all Producers emit their initial values
     let all_slots: Vec<_> = (0..event_loop.arena_len() as u32)
         .filter_map(|idx| {
-            let slot = boon::engine_v2::arena::SlotId { index: idx, generation: 0 };
-            if event_loop.is_valid(slot) { Some(slot) } else { None }
+            let slot = boon::engine_v2::arena::SlotId {
+                index: idx,
+                generation: 0,
+            };
+            if event_loop.is_valid(slot) {
+                Some(slot)
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -699,22 +758,31 @@ fn eval_code(code: &str, max_ticks: u64) {
     // Output result as JSON - use expand_payload_to_json for lists/objects
     if let Some(slot) = result_slot {
         if let Some(value) = event_loop.get_current_value(slot) {
-            println!("{}", serde_json::json!({
-                "status": "ok",
-                "ticks": event_loop.current_tick,
-                "result": event_loop.expand_payload_to_json(value)
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "ok",
+                    "ticks": event_loop.current_tick,
+                    "result": event_loop.expand_payload_to_json(value)
+                })
+            );
         } else {
-            println!("{}", serde_json::json!({
-                "status": "ok",
-                "ticks": event_loop.current_tick,
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "ok",
+                    "ticks": event_loop.current_tick,
+                })
+            );
         }
     } else {
-        println!("{}", serde_json::json!({
-            "status": "ok",
-            "ticks": event_loop.current_tick,
-            "note": "No expressions to evaluate"
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "ticks": event_loop.current_tick,
+                "note": "No expressions to evaluate"
+            })
+        );
     }
 }

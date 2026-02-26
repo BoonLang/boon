@@ -1,7 +1,7 @@
 //! File-based persistence for CLI.
 
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
 
 pub struct FileStorage {
     base_path: PathBuf,

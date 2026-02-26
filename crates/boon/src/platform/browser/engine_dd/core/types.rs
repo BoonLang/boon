@@ -49,7 +49,9 @@ impl LinkId {
 ///
 /// Lists are DD collections of `(ListKey, Value)` pairs.
 /// ListKey provides stable identity for incremental updates.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ListKey(pub Arc<str>);
 
 impl ListKey {
@@ -184,10 +186,7 @@ pub type FlatMapFn = Arc<dyn Fn(Value) -> Option<Value> + 'static>;
 pub type HoldTransformFn = Arc<dyn Fn(&Value, &Value) -> Value + 'static>;
 pub type ClassifyFn = Arc<dyn Fn(&Value) -> Option<(ListKey, Value)> + 'static>;
 pub type BroadcastHandlerFn = Arc<
-    dyn Fn(
-            &std::collections::HashMap<ListKey, Value>,
-            &Value,
-        ) -> Vec<(ListKey, Option<Value>)>
+    dyn Fn(&std::collections::HashMap<ListKey, Value>, &Value) -> Vec<(ListKey, Option<Value>)>
         + 'static,
 >;
 
@@ -219,22 +218,13 @@ pub enum CollectionSpec {
     },
 
     /// THEN: event-triggered map (positive diffs only).
-    Then {
-        source: VarId,
-        body: TransformFn,
-    },
+    Then { source: VarId, body: TransformFn },
 
     /// Pure transform on a single source.
-    Map {
-        source: VarId,
-        f: TransformFn,
-    },
+    Map { source: VarId, f: TransformFn },
 
     /// Pattern matching (WHEN): 0 or 1 output per input.
-    FlatMap {
-        source: VarId,
-        f: FlatMapFn,
-    },
+    FlatMap { source: VarId, f: FlatMapFn },
 
     /// Reactive join of two scalar collections.
     /// Used for WHILE, reactive TEXT, reactive arithmetic.
@@ -264,10 +254,7 @@ pub enum CollectionSpec {
     },
 
     /// Transform each list item.
-    ListMap {
-        source: VarId,
-        f: TransformFn,
-    },
+    ListMap { source: VarId, f: TransformFn },
 
     /// Transform each list item with access to the item's key.
     /// Used for injecting per-item link paths (key → link path).
@@ -277,16 +264,10 @@ pub enum CollectionSpec {
     },
 
     /// Append items to a list (concat).
-    ListAppend {
-        list: VarId,
-        new_items: VarId,
-    },
+    ListAppend { list: VarId, new_items: VarId },
 
     /// Remove items from a list by key.
-    ListRemove {
-        list: VarId,
-        remove_keys: VarId,
-    },
+    ListRemove { list: VarId, remove_keys: VarId },
 
     /// Per-item stateful accumulator for keyed list elements.
     KeyedHoldState {
@@ -300,10 +281,7 @@ pub enum CollectionSpec {
     },
 
     /// Scalar event → keyed pairs (for wildcard event demuxing).
-    MapToKeyed {
-        source: VarId,
-        classify: ClassifyFn,
-    },
+    MapToKeyed { source: VarId, classify: ClassifyFn },
 
     /// Scalar trigger → new keyed item with auto-incrementing key.
     AppendNewKeyed {
@@ -313,10 +291,7 @@ pub enum CollectionSpec {
     },
 
     /// Skip first N positive diffs from a collection.
-    Skip {
-        source: VarId,
-        count: usize,
-    },
+    Skip { source: VarId, count: usize },
 
     /// Side effect (e.g., localStorage persistence).
     SideEffect {

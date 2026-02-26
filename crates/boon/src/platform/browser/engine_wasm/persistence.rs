@@ -7,7 +7,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use zoon::web_sys;
 
 use super::runtime::WasmInstance;
@@ -164,7 +164,13 @@ fn capture_snapshot(instance: &WasmInstance) -> WasmSnapshot {
         Vec::new()
     };
 
-    WasmSnapshot { cells, texts, lists, item_cells, wasm_memory }
+    WasmSnapshot {
+        cells,
+        texts,
+        lists,
+        item_cells,
+        wasm_memory,
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -165,7 +165,10 @@ pub enum ArithmeticOperator {
 #[derive(Debug, Clone)]
 pub enum TextPart {
     Text(StrSlice),
-    Interpolation { var: StrSlice, referenced_span: Option<SimpleSpan> },
+    Interpolation {
+        var: StrSlice,
+        referenced_span: Option<SimpleSpan>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -284,7 +287,10 @@ impl ExpressionConverter {
     }
 
     /// Convert parser::Spanned<parser::Expression> to Spanned<Expression>.
-    pub fn convert_spanned(&self, spanned: &parser::Spanned<parser::Expression>) -> Spanned<Expression> {
+    pub fn convert_spanned(
+        &self,
+        spanned: &parser::Spanned<parser::Expression>,
+    ) -> Spanned<Expression> {
         Spanned {
             span: spanned.span,
             persistence: spanned.persistence.clone(),
@@ -310,7 +316,11 @@ impl ExpressionConverter {
             parser::Expression::Map { entries } => Expression::Map {
                 entries: entries.iter().map(|e| self.convert_map_entry(e)).collect(),
             },
-            parser::Expression::Function { name, parameters, body } => Expression::Function {
+            parser::Expression::Function {
+                name,
+                parameters,
+                body,
+            } => Expression::Function {
                 name: self.str_to_slice(name),
                 parameters: parameters
                     .iter()
@@ -450,12 +460,8 @@ impl ExpressionConverter {
 
     fn convert_map_entry_key(&self, key: &parser::MapEntryKey) -> MapEntryKey {
         match key {
-            parser::MapEntryKey::Literal(lit) => {
-                MapEntryKey::Literal(self.convert_literal(lit))
-            }
-            parser::MapEntryKey::Alias(alias) => {
-                MapEntryKey::Alias(self.convert_alias(alias))
-            }
+            parser::MapEntryKey::Literal(lit) => MapEntryKey::Literal(self.convert_literal(lit)),
+            parser::MapEntryKey::Alias(alias) => MapEntryKey::Alias(self.convert_alias(alias)),
         }
     }
 
@@ -475,9 +481,14 @@ impl ExpressionConverter {
 
     fn convert_alias(&self, alias: &parser::Alias) -> Alias {
         match alias {
-            parser::Alias::WithoutPassed { parts, referenceables } => Alias::WithoutPassed {
+            parser::Alias::WithoutPassed {
+                parts,
+                referenceables,
+            } => Alias::WithoutPassed {
                 parts: parts.iter().map(|s| self.str_to_slice(s)).collect(),
-                referenced_span: referenceables.as_ref().and_then(|r| r.referenced.map(|ref_| ref_.span)),
+                referenced_span: referenceables
+                    .as_ref()
+                    .and_then(|r| r.referenced.map(|ref_| ref_.span)),
             },
             parser::Alias::WithPassed { extra_parts } => Alias::WithPassed {
                 extra_parts: extra_parts.iter().map(|s| self.str_to_slice(s)).collect(),
@@ -499,14 +510,23 @@ impl ExpressionConverter {
                 items: items.iter().map(|i| self.convert_pattern(i)).collect(),
             },
             parser::Pattern::Object { variables } => Pattern::Object {
-                variables: variables.iter().map(|v| self.convert_pattern_variable(v)).collect(),
+                variables: variables
+                    .iter()
+                    .map(|v| self.convert_pattern_variable(v))
+                    .collect(),
             },
             parser::Pattern::TaggedObject { tag, variables } => Pattern::TaggedObject {
                 tag: self.str_to_slice(tag),
-                variables: variables.iter().map(|v| self.convert_pattern_variable(v)).collect(),
+                variables: variables
+                    .iter()
+                    .map(|v| self.convert_pattern_variable(v))
+                    .collect(),
             },
             parser::Pattern::Map { entries } => Pattern::Map {
-                entries: entries.iter().map(|e| self.convert_pattern_map_entry(e)).collect(),
+                entries: entries
+                    .iter()
+                    .map(|e| self.convert_pattern_map_entry(e))
+                    .collect(),
             },
             parser::Pattern::Alias { name } => Pattern::Alias {
                 name: self.str_to_slice(name),
@@ -531,27 +551,45 @@ impl ExpressionConverter {
 
     fn convert_comparator(&self, cmp: &parser::Comparator) -> Comparator {
         match cmp {
-            parser::Comparator::Equal { operand_a, operand_b } => Comparator::Equal {
+            parser::Comparator::Equal {
+                operand_a,
+                operand_b,
+            } => Comparator::Equal {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::Comparator::NotEqual { operand_a, operand_b } => Comparator::NotEqual {
+            parser::Comparator::NotEqual {
+                operand_a,
+                operand_b,
+            } => Comparator::NotEqual {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::Comparator::Greater { operand_a, operand_b } => Comparator::Greater {
+            parser::Comparator::Greater {
+                operand_a,
+                operand_b,
+            } => Comparator::Greater {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::Comparator::GreaterOrEqual { operand_a, operand_b } => Comparator::GreaterOrEqual {
+            parser::Comparator::GreaterOrEqual {
+                operand_a,
+                operand_b,
+            } => Comparator::GreaterOrEqual {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::Comparator::Less { operand_a, operand_b } => Comparator::Less {
+            parser::Comparator::Less {
+                operand_a,
+                operand_b,
+            } => Comparator::Less {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::Comparator::LessOrEqual { operand_a, operand_b } => Comparator::LessOrEqual {
+            parser::Comparator::LessOrEqual {
+                operand_a,
+                operand_b,
+            } => Comparator::LessOrEqual {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
@@ -563,19 +601,31 @@ impl ExpressionConverter {
             parser::ArithmeticOperator::Negate { operand } => ArithmeticOperator::Negate {
                 operand: Box::new(self.convert_spanned(operand)),
             },
-            parser::ArithmeticOperator::Add { operand_a, operand_b } => ArithmeticOperator::Add {
+            parser::ArithmeticOperator::Add {
+                operand_a,
+                operand_b,
+            } => ArithmeticOperator::Add {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::ArithmeticOperator::Subtract { operand_a, operand_b } => ArithmeticOperator::Subtract {
+            parser::ArithmeticOperator::Subtract {
+                operand_a,
+                operand_b,
+            } => ArithmeticOperator::Subtract {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::ArithmeticOperator::Multiply { operand_a, operand_b } => ArithmeticOperator::Multiply {
+            parser::ArithmeticOperator::Multiply {
+                operand_a,
+                operand_b,
+            } => ArithmeticOperator::Multiply {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::ArithmeticOperator::Divide { operand_a, operand_b } => ArithmeticOperator::Divide {
+            parser::ArithmeticOperator::Divide {
+                operand_a,
+                operand_b,
+            } => ArithmeticOperator::Divide {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
@@ -585,7 +635,10 @@ impl ExpressionConverter {
     fn convert_text_part(&self, part: &parser::TextPart) -> TextPart {
         match part {
             parser::TextPart::Text(s) => TextPart::Text(self.str_to_slice(s)),
-            parser::TextPart::Interpolation { var, referenced_span } => TextPart::Interpolation {
+            parser::TextPart::Interpolation {
+                var,
+                referenced_span,
+            } => TextPart::Interpolation {
                 var: self.str_to_slice(var),
                 referenced_span: *referenced_span,
             },
@@ -599,7 +652,10 @@ pub fn convert_expressions(
     expressions: Vec<parser::Spanned<parser::Expression>>,
 ) -> Vec<Spanned<Expression>> {
     let converter = ExpressionConverter::new(source);
-    expressions.iter().map(|e| converter.convert_spanned(e)).collect()
+    expressions
+        .iter()
+        .map(|e| converter.convert_spanned(e))
+        .collect()
 }
 
 #[cfg(test)]

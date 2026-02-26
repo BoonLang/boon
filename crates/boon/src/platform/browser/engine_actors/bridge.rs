@@ -2,18 +2,18 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use zoon::futures_util::{future, select, stream, StreamExt};
 use zoon::futures_util::stream::LocalBoxStream;
+use zoon::futures_util::{StreamExt, future, select, stream};
 use zoon::*;
 
 use super::engine::{
-    ActorContext, ActorHandle, ActorLoop, ConstructContext, ConstructInfo, ConstructInfoComplete,
-    ConstructType, ListChange, LOG_DEBUG, NamedChannel, Object,
-    ScopeId, TaggedObject, TimestampedEvent, TypedStream, Value, ValueIdempotencyKey, Variable,
-    Text as EngineText, Tag as EngineTag, create_actor, switch_map, inc_metric,
-    BRIDGE_PENDING_KEY_DOWN_CAP, BRIDGE_PENDING_BLUR_CAP, BRIDGE_PENDING_FOCUS_CAP,
-    BRIDGE_HOVER_CAPACITY, BRIDGE_PRESS_EVENT_CAPACITY, BRIDGE_TEXT_CHANGE_CAPACITY,
-    BRIDGE_KEY_DOWN_CAPACITY, BRIDGE_BLUR_CAPACITY, BRIDGE_FOCUS_CAPACITY,
+    ActorContext, ActorHandle, ActorLoop, BRIDGE_BLUR_CAPACITY, BRIDGE_FOCUS_CAPACITY,
+    BRIDGE_HOVER_CAPACITY, BRIDGE_KEY_DOWN_CAPACITY, BRIDGE_PENDING_BLUR_CAP,
+    BRIDGE_PENDING_FOCUS_CAP, BRIDGE_PENDING_KEY_DOWN_CAP, BRIDGE_PRESS_EVENT_CAPACITY,
+    BRIDGE_TEXT_CHANGE_CAPACITY, ConstructContext, ConstructInfo, ConstructInfoComplete,
+    ConstructType, LOG_DEBUG, ListChange, NamedChannel, Object, ScopeId, Tag as EngineTag,
+    TaggedObject, Text as EngineText, TimestampedEvent, TypedStream, Value, ValueIdempotencyKey,
+    Variable, create_actor, inc_metric, switch_map,
 };
 
 // --- Cached ConstructInfoComplete for hot bridge paths ---
@@ -85,7 +85,12 @@ fn log_unexpected_type(context: &str, expected: &str, got: &Value) {
             Value::List(_, _) => "List",
             Value::Flushed(_, _) => "Flushed",
         };
-        zoon::eprintln!("[TYPE_MISMATCH] {}: expected {}, got {}", context, expected, type_name);
+        zoon::eprintln!(
+            "[TYPE_MISMATCH] {}: expected {}, got {}",
+            context,
+            expected,
+            type_name
+        );
     }
     // In release mode, do nothing - this maintains current behavior
     #[cfg(not(debug_assertions))]
@@ -102,16 +107,13 @@ pub fn object_with_document_to_element_signal(
     // CRITICAL: Use switch_map (not flat_map) because the inner stream is infinite.
     // When example is switched, the document changes and we MUST switch to the new
     // root_element stream. flat_map would stay subscribed to the old one forever.
-    let element_stream = switch_map(
-        doc_actor.clone().stream(),
-        |value| {
-            let document_object = value.expect_object();
-            let root_element_var = document_object.expect_variable("root_element").clone();
-            root_element_var.value_actor().clone().stream()
-        }
-    )
-        .map(move |value| value_to_element(value, construct_context.clone()))
-        .boxed_local();
+    let element_stream = switch_map(doc_actor.clone().stream(), |value| {
+        let document_object = value.expect_object();
+        let root_element_var = document_object.expect_variable("root_element").clone();
+        root_element_var.value_actor().clone().stream()
+    })
+    .map(move |value| value_to_element(value, construct_context.clone()))
+    .boxed_local();
 
     signal::from_stream(element_stream)
 }
@@ -123,7 +125,7 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
         Value::Tag(tag, _) => {
             // Handle special tags like NoElement
             match tag.tag() {
-                "NoElement" => El::new().unify(), // Empty element
+                "NoElement" => El::new().unify(),        // Empty element
                 other => zoon::Text::new(other).unify(), // Render tag as text
             }
         }
@@ -145,7 +147,10 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
         }
         Value::Object(obj, _) => {
             // Object can't be rendered as element - render as debug info
-            zoon::eprintln!("Warning: Object value passed to element context - rendering as empty. Object has {} variables", obj.variables().len());
+            zoon::eprintln!(
+                "Warning: Object value passed to element context - rendering as empty. Object has {} variables",
+                obj.variables().len()
+            );
             El::new().unify()
         }
         Value::List(_list, _) => {
@@ -158,22 +163,20 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
 
 /// Create a reactive visible signal from a settings variable.
 /// Returns a signal that emits `Option<bool>` for the `visible` style property.
-fn visible_signal_from_settings(settings_variable: Arc<Variable>) -> impl Signal<Item = Option<bool>> + 'static {
+fn visible_signal_from_settings(
+    settings_variable: Arc<Variable>,
+) -> impl Signal<Item = Option<bool>> + 'static {
     signal::from_stream({
-        let style_stream = switch_map(
-            settings_variable.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("visible") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(settings_variable.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("visible") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| {
             future::ready(match value {
                 Value::Tag(tag, _) => Some(tag.tag() == "True"),
@@ -192,14 +195,13 @@ fn element_container(
 
     // Use switch_map (not flat_map) because child stream is infinite.
     // When example switches, we must re-subscribe to the new child element.
-    let child_stream = switch_map(
-        settings_variable.clone().stream(),
-        |value| value.expect_object().expect_variable("child").stream()
-    )
-        .map({
-            let construct_context = construct_context.clone();
-            move |value| value_to_element(value, construct_context.clone())
-        });
+    let child_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value.expect_object().expect_variable("child").stream()
+    })
+    .map({
+        let construct_context = construct_context.clone();
+        move |value| value_to_element(value, construct_context.clone())
+    });
 
     // Create style streams
     let sv2 = tagged_object.expect_variable("settings");
@@ -221,70 +223,91 @@ fn element_container(
     // Uses Zoon's Padding::*_signal APIs for typed styling
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let padding_tuple_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv7.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("padding") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv7.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("padding") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| async move {
-                match value {
-                    Value::Number(n, _) => {
-                        let all = n.number() as u32;
-                        Some((all, all, all, all))
-                    },
-                    Value::Object(obj, _) => {
-                        let top = if let Some(v) = obj.variable("top") {
-                            if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number() as u32
-                            } else { 0 }
-                        } else if let Some(v) = obj.variable("column") {
-                            if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number() as u32
-                            } else { 0 }
-                        } else { 0 };
-                        let right = if let Some(v) = obj.variable("right") {
-                            if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number() as u32
-                            } else { 0 }
-                        } else if let Some(v) = obj.variable("row") {
-                            if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number() as u32
-                            } else { 0 }
-                        } else { 0 };
-                        let bottom = if let Some(v) = obj.variable("bottom") {
-                            if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number() as u32
-                            } else { 0 }
-                        } else if let Some(v) = obj.variable("column") {
-                            if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number() as u32
-                            } else { 0 }
-                        } else { 0 };
-                        let left = if let Some(v) = obj.variable("left") {
-                            if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number() as u32
-                            } else { 0 }
-                        } else if let Some(v) = obj.variable("row") {
-                            if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number() as u32
-                            } else { 0 }
-                        } else { 0 };
-                        Some((top, right, bottom, left))
-                    }
-                    _ => None,
+            match value {
+                Value::Number(n, _) => {
+                    let all = n.number() as u32;
+                    Some((all, all, all, all))
                 }
-            })
-            .boxed_local()
-    }).broadcast();
+                Value::Object(obj, _) => {
+                    let top = if let Some(v) = obj.variable("top") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else {
+                            0
+                        }
+                    } else if let Some(v) = obj.variable("column") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    let right = if let Some(v) = obj.variable("right") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else {
+                            0
+                        }
+                    } else if let Some(v) = obj.variable("row") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    let bottom = if let Some(v) = obj.variable("bottom") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else {
+                            0
+                        }
+                    } else if let Some(v) = obj.variable("column") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    let left = if let Some(v) = obj.variable("left") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else {
+                            0
+                        }
+                    } else if let Some(v) = obj.variable("row") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    Some((top, right, bottom, left))
+                }
+                _ => None,
+            }
+        })
+        .boxed_local()
+    })
+    .broadcast();
     // Derive individual padding signals from the broadcasted tuple
     let padding_top_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(t, _, _, _)| t));
     let padding_right_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, r, _, _)| r));
@@ -294,34 +317,29 @@ fn element_container(
     // Font size - produces u32 for typed Font API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let font_size_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_size.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let font_stream = switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("font") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_font_size.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        );
-        switch_map(
-            font_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("size") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        });
+        switch_map(font_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("size") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| {
             let result = if let Value::Number(n, _) = value {
                 Some(n.number() as u32)
-            } else { None };
+            } else {
+                None
+            };
             future::ready(result)
         })
         .boxed_local()
@@ -331,32 +349,25 @@ fn element_container(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let font_color_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_color.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let font_stream = switch_map(
-            style_stream,
-            |value| {
+        let style_stream = switch_map(sv_font_color.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        switch_map(
+            switch_map(font_stream, |value| {
                 let obj = value.expect_object();
-                match obj.variable("font") {
+                match obj.variable("color") {
                     Some(var) => var.stream().left_stream(),
                     None => stream::empty().right_stream(),
                 }
-            }
-        );
-        switch_map(
-            switch_map(
-                font_stream,
-                |value| {
-                    let obj = value.expect_object();
-                    match obj.variable("color") {
-                        Some(var) => var.stream().left_stream(),
-                        None => stream::empty().right_stream(),
-                    }
-                }
-            ),
-            |value| oklch_to_css_stream(value)
+            }),
+            |value| oklch_to_css_stream(value),
         )
         .boxed_local()
     });
@@ -364,47 +375,38 @@ fn element_container(
     // Font weight - produces FontWeight typed values
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let font_weight_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_weight.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let font_stream = switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("font") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_font_weight.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        );
-        switch_map(
-            font_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("weight") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        });
+        switch_map(font_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("weight") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| {
             let result = match value {
-                Value::Tag(tag, _) => {
-                    match tag.tag() {
-                        "Hairline" => Some(FontWeight::Hairline),
-                        "ExtraLight" | "UltraLight" => Some(FontWeight::ExtraLight),
-                        "Light" => Some(FontWeight::Light),
-                        "Regular" | "Normal" => Some(FontWeight::Regular),
-                        "Medium" => Some(FontWeight::Medium),
-                        "SemiBold" | "DemiBold" => Some(FontWeight::SemiBold),
-                        "Bold" => Some(FontWeight::Bold),
-                        "ExtraBold" | "UltraBold" => Some(FontWeight::ExtraBold),
-                        "Black" | "Heavy" => Some(FontWeight::Heavy),
-                        "ExtraHeavy" => Some(FontWeight::ExtraHeavy),
-                        _ => None,
-                    }
-                }
+                Value::Tag(tag, _) => match tag.tag() {
+                    "Hairline" => Some(FontWeight::Hairline),
+                    "ExtraLight" | "UltraLight" => Some(FontWeight::ExtraLight),
+                    "Light" => Some(FontWeight::Light),
+                    "Regular" | "Normal" => Some(FontWeight::Regular),
+                    "Medium" => Some(FontWeight::Medium),
+                    "SemiBold" | "DemiBold" => Some(FontWeight::SemiBold),
+                    "Bold" => Some(FontWeight::Bold),
+                    "ExtraBold" | "UltraBold" => Some(FontWeight::ExtraBold),
+                    "Black" | "Heavy" => Some(FontWeight::Heavy),
+                    "ExtraHeavy" => Some(FontWeight::ExtraHeavy),
+                    _ => None,
+                },
                 Value::Number(n, _) => Some(FontWeight::Number(n.number() as u32)),
                 _ => None,
             };
@@ -417,41 +419,32 @@ fn element_container(
     // Produces Font values for Font::with_signal_self() - no FontAlignment enum needed
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let align_font_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_align.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let align_stream = switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("align") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_align.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let align_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("align") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        );
-        switch_map(
-            align_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("row") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        });
+        switch_map(align_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("row") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| {
             let result: Option<Font<'static>> = match value {
-                Value::Tag(tag, _) => {
-                    match tag.tag() {
-                        "Center" => Some(Font::new().center()),
-                        "Left" | "Start" => Some(Font::new().left()),
-                        "Right" | "End" => Some(Font::new().right()),
-                        "Justify" => Some(Font::new().justify()),
-                        _ => None,
-                    }
-                }
+                Value::Tag(tag, _) => match tag.tag() {
+                    "Center" => Some(Font::new().center()),
+                    "Left" | "Start" => Some(Font::new().left()),
+                    "Right" | "End" => Some(Font::new().right()),
+                    "Justify" => Some(Font::new().justify()),
+                    _ => None,
+                },
                 _ => None,
             };
             future::ready(result)
@@ -462,78 +455,67 @@ fn element_container(
     // Width signal - produces u32 for typed Width API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let width_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv2.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("width") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv2.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("width") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
-        .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(n.number() as u32),
-            _ => None,
-        }))
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number() as u32),
+                _ => None,
+            })
+        })
     });
 
     // Height signal - produces u32 for typed Height API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let height_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv3.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("height") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv3.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("height") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
-        .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(n.number() as u32),
-            _ => None,
-        }))
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number() as u32),
+                _ => None,
+            })
+        })
     });
 
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let background_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv4.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let bg_stream = switch_map(
-            style_stream,
-            |value| {
+        let style_stream = switch_map(sv4.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let bg_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("background") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        switch_map(
+            switch_map(bg_stream, |value| {
                 let obj = value.expect_object();
-                match obj.variable("background") {
+                match obj.variable("color") {
                     Some(var) => var.stream().left_stream(),
                     None => stream::empty().right_stream(),
                 }
-            }
-        );
-        switch_map(
-            switch_map(
-                bg_stream,
-                |value| {
-                    let obj = value.expect_object();
-                    match obj.variable("color") {
-                        Some(var) => var.stream().left_stream(),
-                        None => stream::empty().right_stream(),
-                    }
-                }
-            ),
-            |value| oklch_to_css_stream(value)
+            }),
+            |value| oklch_to_css_stream(value),
         )
         .boxed_local()
     });
@@ -541,168 +523,153 @@ fn element_container(
     // Background image URL - produces raw URL string for typed Background::url_signal API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let background_image_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_bg_url.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let bg_stream = switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("background") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_bg_url.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let bg_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("background") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        );
-        switch_map(
-            bg_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("url") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        });
+        switch_map(bg_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("url") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
-        .filter_map(|value| future::ready(match value {
-            Value::Text(text, _) => Some(text.text().to_string()),
-            _ => None,
-        }))
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Text(text, _) => Some(text.text().to_string()),
+                _ => None,
+            })
+        })
     });
 
     // Size (shorthand for width + height) - produces u32 for typed Width/Height API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let size_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_size.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("size") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_size.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("size") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
-        .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(n.number() as u32),
-            _ => None,
-        }))
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number() as u32),
+                _ => None,
+            })
+        })
     });
 
     // Border radius - produces u32 for typed RoundedCorners API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let border_radius_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv5.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("rounded_corners") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv5.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("rounded_corners") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
-        .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(n.number() as u32),
-            _ => None,
-        }))
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number() as u32),
+                _ => None,
+            })
+        })
     });
 
     // Transform: move_right, move_down, and rotate - produces Transform typed values
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let transform_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv6.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("transform") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv6.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("transform") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| async move {
-                let obj = value.expect_object();
-                let move_right = if let Some(v) = obj.variable("move_right") {
-                    match v.value_actor().current_value().await {
-                        Ok(Value::Number(n, _)) => n.number(),
-                        _ => 0.0,
-                    }
-                } else {
-                    0.0
-                };
-                let move_down = if let Some(v) = obj.variable("move_down") {
-                    match v.value_actor().current_value().await {
-                        Ok(Value::Number(n, _)) => n.number(),
-                        _ => 0.0,
-                    }
-                } else {
-                    0.0
-                };
-                let rotate = if let Some(v) = obj.variable("rotate") {
-                    match v.value_actor().current_value().await {
-                        Ok(Value::Number(n, _)) => n.number(),
-                        _ => 0.0,
-                    }
-                } else {
-                    0.0
-                };
-                // Build Transform using typed API
-                let has_transform = move_right != 0.0 || move_down != 0.0 || rotate != 0.0;
-                if has_transform {
-                    let mut transform = Transform::new();
-                    if move_right != 0.0 {
-                        transform = transform.move_right(move_right);
-                    }
-                    if move_down != 0.0 {
-                        transform = transform.move_down(move_down);
-                    }
-                    if rotate != 0.0 {
-                        transform = transform.rotate(rotate);
-                    }
-                    Some(transform)
-                } else {
-                    None
+            let obj = value.expect_object();
+            let move_right = if let Some(v) = obj.variable("move_right") {
+                match v.value_actor().current_value().await {
+                    Ok(Value::Number(n, _)) => n.number(),
+                    _ => 0.0,
                 }
-            })
-            .boxed_local()
+            } else {
+                0.0
+            };
+            let move_down = if let Some(v) = obj.variable("move_down") {
+                match v.value_actor().current_value().await {
+                    Ok(Value::Number(n, _)) => n.number(),
+                    _ => 0.0,
+                }
+            } else {
+                0.0
+            };
+            let rotate = if let Some(v) = obj.variable("rotate") {
+                match v.value_actor().current_value().await {
+                    Ok(Value::Number(n, _)) => n.number(),
+                    _ => 0.0,
+                }
+            } else {
+                0.0
+            };
+            // Build Transform using typed API
+            let has_transform = move_right != 0.0 || move_down != 0.0 || rotate != 0.0;
+            if has_transform {
+                let mut transform = Transform::new();
+                if move_right != 0.0 {
+                    transform = transform.move_right(move_right);
+                }
+                if move_down != 0.0 {
+                    transform = transform.move_down(move_down);
+                }
+                if rotate != 0.0 {
+                    transform = transform.rotate(rotate);
+                }
+                Some(transform)
+            } else {
+                None
+            }
+        })
+        .boxed_local()
     });
 
     // Size signal for height (duplicate for separate signal) - produces u32
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_size2 = tagged_object.expect_variable("settings");
     let size_for_height_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_size2.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("size") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_size2.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("size") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
-        .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(n.number() as u32),
-            _ => None,
-        }))
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number() as u32),
+                _ => None,
+            })
+        })
     });
 
     // Use Stripe (flex container by design) with typed styles
@@ -721,12 +688,14 @@ fn element_container(
     // The helper function boon_tag_to_zoon_tag() is already implemented and ready.
     Stripe::new()
         .direction(Direction::Column)
-        .s(AlignContent::new().center_x())  // Center children horizontally (not the element itself)
+        .s(AlignContent::new().center_x()) // Center children horizontally (not the element itself)
         .s(Width::exact_signal(width_signal))
-        .s(Width::exact_signal(size_signal))  // size overrides width
+        .s(Width::exact_signal(size_signal)) // size overrides width
         .s(Height::exact_signal(height_signal))
-        .s(Height::exact_signal(size_for_height_signal))  // size overrides height
-        .s(Background::new().color_signal(background_signal).url_signal(background_image_signal))
+        .s(Height::exact_signal(size_for_height_signal)) // size overrides height
+        .s(Background::new()
+            .color_signal(background_signal)
+            .url_signal(background_image_signal))
         .s(RoundedCorners::all_signal(border_radius_signal))
         .s(Transform::with_signal_self(transform_signal))
         .s(Font::new()
@@ -751,23 +720,21 @@ fn element_stripe(
     construct_context: ConstructContext,
 ) -> impl Element {
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
-    let (hovered_sender, mut hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("element.hovered", BRIDGE_HOVER_CAPACITY);
+    let (hovered_sender, mut hovered_receiver) =
+        NamedChannel::<TimestampedEvent<bool>>::new("element.hovered", BRIDGE_HOVER_CAPACITY);
 
     // Set up hovered link if element field exists with hovered property
     // Access element through settings, like other properties (style, direction, etc.)
     let sv_element_for_hover = tagged_object.expect_variable("settings");
     // CRITICAL: Use switch_map (not flat_map) because element variable stream is infinite.
-    let hovered_stream = switch_map(
-        sv_element_for_hover.stream(),
-        |value| {
-            // Get element from settings object if it exists
-            let obj = value.expect_object();
-            match obj.variable("element") {
-                Some(var) => var.stream().left_stream(),
-                None => stream::empty().right_stream(),
-            }
+    let hovered_stream = switch_map(sv_element_for_hover.stream(), |value| {
+        // Get element from settings object if it exists
+        let obj = value.expect_object();
+        match obj.variable("element") {
+            Some(var) => var.stream().left_stream(),
+            None => stream::empty().right_stream(),
         }
-    )
+    })
     .filter_map(|value| {
         let obj = value.expect_object();
         future::ready(obj.variable("hovered"))
@@ -826,28 +793,24 @@ fn element_stripe(
     // that stays alive independently of the parent Object. switch_map keeps the Variable
     // alive for its subscription lifetime.
 
-    let direction_stream = switch_map(
-        settings_variable.clone().stream(),
-        |value| {
-            let object = value.expect_object();
-            // object.expect_variable returns Arc<Variable> which is kept alive by switch_map
-            object.expect_variable("direction").stream()
-        }
-    )
+    let direction_stream = switch_map(settings_variable.clone().stream(), |value| {
+        let object = value.expect_object();
+        // object.expect_variable returns Arc<Variable> which is kept alive by switch_map
+        object.expect_variable("direction").stream()
+    })
     .map(|direction| match direction.expect_tag().tag() {
         "Column" => Direction::Column,
         "Row" => Direction::Row,
-        other => panic!("Invalid Stripe element direction value: Found: '{other}', Expected: 'Column' or 'Row'"),
+        other => panic!(
+            "Invalid Stripe element direction value: Found: '{other}', Expected: 'Column' or 'Row'"
+        ),
     });
 
     // Gap - produces u32 for typed Gap API
-    let gap_stream = switch_map(
-        settings_variable.clone().stream(),
-        |value| {
-            let object = value.expect_object();
-            object.expect_variable("gap").stream()
-        }
-    )
+    let gap_stream = switch_map(settings_variable.clone().stream(), |value| {
+        let object = value.expect_object();
+        object.expect_variable("gap").stream()
+    })
     .filter_map(|value| {
         future::ready(match value {
             Value::Number(n, _) => Some(n.number() as u32),
@@ -864,20 +827,16 @@ fn element_stripe(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_width = tagged_object.expect_variable("settings");
     let width_typed_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_width.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("width") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_width.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("width") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| async move {
             match value {
                 Value::Number(n, _) => Some(Width::exact(n.number() as u32)),
@@ -924,20 +883,16 @@ fn element_stripe(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_height = tagged_object.expect_variable("settings");
     let height_typed_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_height.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("height") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_height.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("height") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| async move {
             match value {
                 Value::Number(n, _) => Some(Height::exact(n.number() as u32)),
@@ -982,32 +937,25 @@ fn element_stripe(
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let sv_bg = tagged_object.expect_variable("settings");
     let background_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_bg.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let bg_stream = switch_map(
-            style_stream,
-            |value| {
+        let style_stream = switch_map(sv_bg.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let bg_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("background") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        switch_map(
+            switch_map(bg_stream, |value| {
                 let obj = value.expect_object();
-                match obj.variable("background") {
+                match obj.variable("color") {
                     Some(var) => var.stream().left_stream(),
                     None => stream::empty().right_stream(),
                 }
-            }
-        );
-        switch_map(
-            switch_map(
-                bg_stream,
-                |value| {
-                    let obj = value.expect_object();
-                    match obj.variable("color") {
-                        Some(var) => var.stream().left_stream(),
-                        None => stream::empty().right_stream(),
-                    }
-                }
-            ),
-            |value| oklch_to_css_stream(value)
+            }),
+            |value| oklch_to_css_stream(value),
         )
         .boxed_local()
     });
@@ -1016,56 +964,53 @@ fn element_stripe(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_padding = tagged_object.expect_variable("settings");
     let padding_tuple_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_padding.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("padding") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_padding.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("padding") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| async move {
-                match value {
-                    Value::Number(n, _) => {
-                        let all = n.number() as u32;
-                        Some((all, all, all, all))
-                    },
-                    Value::Object(obj, _) => {
-                        async fn get_num(obj: &Object, name: &str) -> u32 {
-                            if let Some(v) = obj.variable(name) {
-                                match v.value_actor().current_value().await {
-                                    Ok(Value::Number(n, _)) => n.number() as u32,
-                                    _ => 0,
-                                }
-                            } else {
-                                0
-                            }
-                        }
-                        let top = get_num(&obj, "top").await;
-                        let bottom = get_num(&obj, "bottom").await;
-                        let left = get_num(&obj, "left").await;
-                        let right = get_num(&obj, "right").await;
-                        let column = get_num(&obj, "column").await;
-                        let row = get_num(&obj, "row").await;
-
-                        let final_top = if top > 0 { top } else { column };
-                        let final_bottom = if bottom > 0 { bottom } else { column };
-                        let final_left = if left > 0 { left } else { row };
-                        let final_right = if right > 0 { right } else { row };
-
-                        Some((final_top, final_right, final_bottom, final_left))
-                    }
-                    _ => None,
+            match value {
+                Value::Number(n, _) => {
+                    let all = n.number() as u32;
+                    Some((all, all, all, all))
                 }
-            })
-            .boxed_local()
-    }).broadcast();
+                Value::Object(obj, _) => {
+                    async fn get_num(obj: &Object, name: &str) -> u32 {
+                        if let Some(v) = obj.variable(name) {
+                            match v.value_actor().current_value().await {
+                                Ok(Value::Number(n, _)) => n.number() as u32,
+                                _ => 0,
+                            }
+                        } else {
+                            0
+                        }
+                    }
+                    let top = get_num(&obj, "top").await;
+                    let bottom = get_num(&obj, "bottom").await;
+                    let left = get_num(&obj, "left").await;
+                    let right = get_num(&obj, "right").await;
+                    let column = get_num(&obj, "column").await;
+                    let row = get_num(&obj, "row").await;
+
+                    let final_top = if top > 0 { top } else { column };
+                    let final_bottom = if bottom > 0 { bottom } else { column };
+                    let final_left = if left > 0 { left } else { row };
+                    let final_right = if right > 0 { right } else { row };
+
+                    Some((final_top, final_right, final_bottom, final_left))
+                }
+                _ => None,
+            }
+        })
+        .boxed_local()
+    })
+    .broadcast();
     // Derive individual padding signals from the broadcasted tuple
     let padding_top_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(t, _, _, _)| t));
     let padding_right_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, r, _, _)| r));
@@ -1076,119 +1021,104 @@ fn element_stripe(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_shadows = tagged_object.expect_variable("settings");
     let shadows_typed_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_shadows.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("shadows") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_shadows.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("shadows") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| async move {
-                if let Value::List(list, _) = &value {
-                    let mut shadows: Vec<Shadow> = Vec::new();
-                    // Get all items from the list (snapshot returns (ItemId, ActorHandle) pairs)
-                    let snapshot = list.snapshot().await;
-                    for (_item_id, actor) in snapshot {
-                        let item = actor.current_value().await;
-                        if let Ok(Value::Object(obj, _)) = item {
-                            async fn get_num(obj: &Object, name: &str) -> f64 {
-                                if let Some(v) = obj.variable(name) {
-                                    match v.value_actor().current_value().await {
-                                        Ok(Value::Number(n, _)) => n.number(),
-                                        _ => 0.0,
-                                    }
-                                } else {
-                                    0.0
-                                }
-                            }
-                            let x = get_num(&obj, "x").await as i32;
-                            let y = get_num(&obj, "y").await as i32;
-                            let blur = get_num(&obj, "blur").await as u32;
-                            let spread = get_num(&obj, "spread").await as i32;
-
-                            // Check for inset (direction: Inwards)
-                            let inset = if let Some(v) = obj.variable("direction") {
+            if let Value::List(list, _) = &value {
+                let mut shadows: Vec<Shadow> = Vec::new();
+                // Get all items from the list (snapshot returns (ItemId, ActorHandle) pairs)
+                let snapshot = list.snapshot().await;
+                for (_item_id, actor) in snapshot {
+                    let item = actor.current_value().await;
+                    if let Ok(Value::Object(obj, _)) = item {
+                        async fn get_num(obj: &Object, name: &str) -> f64 {
+                            if let Some(v) = obj.variable(name) {
                                 match v.value_actor().current_value().await {
-                                    Ok(Value::Tag(tag, _)) if tag.tag() == "Inwards" => true,
-                                    _ => false,
+                                    Ok(Value::Number(n, _)) => n.number(),
+                                    _ => 0.0,
                                 }
                             } else {
-                                false
-                            };
+                                0.0
+                            }
+                        }
+                        let x = get_num(&obj, "x").await as i32;
+                        let y = get_num(&obj, "y").await as i32;
+                        let blur = get_num(&obj, "blur").await as u32;
+                        let spread = get_num(&obj, "spread").await as i32;
 
-                            // Get color using typed API
-                            let color: Option<Color> = if let Some(v) = obj.variable("color") {
-                                if let Ok(color_value) = v.value_actor().current_value().await {
-                                    oklch_to_color(color_value).await
-                                } else {
-                                    None
-                                }
+                        // Check for inset (direction: Inwards)
+                        let inset = if let Some(v) = obj.variable("direction") {
+                            match v.value_actor().current_value().await {
+                                Ok(Value::Tag(tag, _)) if tag.tag() == "Inwards" => true,
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        };
+
+                        // Get color using typed API
+                        let color: Option<Color> = if let Some(v) = obj.variable("color") {
+                            if let Ok(color_value) = v.value_actor().current_value().await {
+                                oklch_to_color(color_value).await
                             } else {
                                 None
-                            };
+                            }
+                        } else {
+                            None
+                        };
 
-                            // Build typed Shadow
-                            let mut shadow = Shadow::new()
-                                .x(x)
-                                .y(y)
-                                .blur(blur)
-                                .spread(spread);
-                            if inset {
-                                shadow = shadow.inner();
-                            }
-                            if let Some(c) = color {
-                                shadow = shadow.color(c);
-                            }
-                            shadows.push(shadow);
+                        // Build typed Shadow
+                        let mut shadow = Shadow::new().x(x).y(y).blur(blur).spread(spread);
+                        if inset {
+                            shadow = shadow.inner();
                         }
+                        if let Some(c) = color {
+                            shadow = shadow.color(c);
+                        }
+                        shadows.push(shadow);
                     }
-                    if !shadows.is_empty() {
-                        Some(shadows)
-                    } else {
-                        None
-                    }
+                }
+                if !shadows.is_empty() {
+                    Some(shadows)
                 } else {
                     None
                 }
-            })
-            .boxed_local()
+            } else {
+                None
+            }
+        })
+        .boxed_local()
     });
 
     // Font size - produces u32 for typed Font API (cascading to children)
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_font_size = tagged_object.expect_variable("settings");
     let font_size_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_size.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let font_stream = switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("font") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_font_size.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        );
-        switch_map(
-            font_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("size") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        });
+        switch_map(font_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("size") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| {
             future::ready(match value {
                 Value::Number(n, _) => Some(n.number() as u32),
@@ -1202,32 +1132,25 @@ fn element_stripe(
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let sv_font_color = tagged_object.expect_variable("settings");
     let font_color_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_color.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let font_stream = switch_map(
-            style_stream,
-            |value| {
+        let style_stream = switch_map(sv_font_color.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        switch_map(
+            switch_map(font_stream, |value| {
                 let obj = value.expect_object();
-                match obj.variable("font") {
+                match obj.variable("color") {
                     Some(var) => var.stream().left_stream(),
                     None => stream::empty().right_stream(),
                 }
-            }
-        );
-        switch_map(
-            switch_map(
-                font_stream,
-                |value| {
-                    let obj = value.expect_object();
-                    match obj.variable("color") {
-                        Some(var) => var.stream().left_stream(),
-                        None => stream::empty().right_stream(),
-                    }
-                }
-            ),
-            |value| oklch_to_css_stream(value)
+            }),
+            |value| oklch_to_css_stream(value),
         )
         .boxed_local()
     });
@@ -1236,47 +1159,38 @@ fn element_stripe(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_font_weight = tagged_object.expect_variable("settings");
     let font_weight_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_weight.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let font_stream = switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("font") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_font_weight.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        );
-        switch_map(
-            font_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("weight") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        });
+        switch_map(font_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("weight") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| {
             let result = match value {
-                Value::Tag(tag, _) => {
-                    match tag.tag() {
-                        "Hairline" => Some(FontWeight::Hairline),
-                        "ExtraLight" | "UltraLight" => Some(FontWeight::ExtraLight),
-                        "Light" => Some(FontWeight::Light),
-                        "Regular" | "Normal" => Some(FontWeight::Regular),
-                        "Medium" => Some(FontWeight::Medium),
-                        "SemiBold" | "DemiBold" => Some(FontWeight::SemiBold),
-                        "Bold" => Some(FontWeight::Bold),
-                        "ExtraBold" | "UltraBold" => Some(FontWeight::ExtraBold),
-                        "Black" | "Heavy" => Some(FontWeight::Heavy),
-                        "ExtraHeavy" => Some(FontWeight::ExtraHeavy),
-                        _ => None,
-                    }
-                }
+                Value::Tag(tag, _) => match tag.tag() {
+                    "Hairline" => Some(FontWeight::Hairline),
+                    "ExtraLight" | "UltraLight" => Some(FontWeight::ExtraLight),
+                    "Light" => Some(FontWeight::Light),
+                    "Regular" | "Normal" => Some(FontWeight::Regular),
+                    "Medium" => Some(FontWeight::Medium),
+                    "SemiBold" | "DemiBold" => Some(FontWeight::SemiBold),
+                    "Bold" => Some(FontWeight::Bold),
+                    "ExtraBold" | "UltraBold" => Some(FontWeight::ExtraBold),
+                    "Black" | "Heavy" => Some(FontWeight::Heavy),
+                    "ExtraHeavy" => Some(FontWeight::ExtraHeavy),
+                    _ => None,
+                },
                 Value::Number(n, _) => Some(FontWeight::Number(n.number() as u32)),
                 _ => None,
             };
@@ -1289,30 +1203,23 @@ fn element_stripe(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_font_family = tagged_object.expect_variable("settings");
     let font_family_typed_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_family.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let font_stream = switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("font") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_font_family.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        );
-        switch_map(
-            font_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("family") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        });
+        switch_map(font_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("family") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| async move {
             if let Value::List(list, _) = &value {
                 // Get all items from list (snapshot returns (ItemId, ActorHandle) pairs)
@@ -1323,7 +1230,8 @@ fn element_stripe(
                         match item {
                             Value::Text(t, _) => {
                                 // Custom font name - leak to get 'static lifetime
-                                let name: &'static str = Box::leak(t.text().to_string().into_boxed_str());
+                                let name: &'static str =
+                                    Box::leak(t.text().to_string().into_boxed_str());
                                 families.push(FontFamily::new(name));
                             }
                             Value::Tag(tag, _) => match tag.tag() {
@@ -1352,41 +1260,32 @@ fn element_stripe(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_font_align = tagged_object.expect_variable("settings");
     let font_align_font_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_align.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let font_stream = switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("font") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_font_align.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        );
-        switch_map(
-            font_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("align") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        });
+        switch_map(font_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("align") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| {
             let result: Option<Font<'static>> = match value {
-                Value::Tag(tag, _) => {
-                    match tag.tag() {
-                        "Center" => Some(Font::new().center()),
-                        "Left" => Some(Font::new().left()),
-                        "Right" => Some(Font::new().right()),
-                        "Justify" => Some(Font::new().justify()),
-                        _ => None,
-                    }
-                }
+                Value::Tag(tag, _) => match tag.tag() {
+                    "Center" => Some(Font::new().center()),
+                    "Left" => Some(Font::new().left()),
+                    "Right" => Some(Font::new().right()),
+                    "Justify" => Some(Font::new().justify()),
+                    _ => None,
+                },
                 _ => None,
             };
             future::ready(result)
@@ -1398,40 +1297,30 @@ fn element_stripe(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_borders = tagged_object.expect_variable("settings");
     let border_top_typed_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_borders.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let borders_stream = switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("borders") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_borders.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let borders_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("borders") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        );
-        let top_stream = switch_map(
-            borders_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("top") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        });
+        let top_stream = switch_map(borders_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("top") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        );
-        switch_map(
-            top_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("color") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        });
+        switch_map(top_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("color") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| async move {
             if let Some(color) = oklch_to_color(value).await {
                 // Create typed Border with width 3, solid style, and the color
@@ -1447,10 +1336,9 @@ fn element_stripe(
     // CRITICAL: Uses nested switch_map (not flat_map) because all variable streams are infinite.
     let sv_outline = tagged_object.expect_variable("settings");
     let outline_value_stream = {
-        let style_stream = switch_map(
-            sv_outline.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_outline.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("outline") {
@@ -1459,83 +1347,79 @@ fn element_stripe(
             }
         })
     };
-    let outline_signal = signal::from_stream(
-        switch_map(outline_value_stream, |value| {
-            match &value {
-                Value::Tag(tag, _) if tag.tag() == "NoOutline" => {
-                    // Return None to remove outline
-                    stream::once(future::ready(None::<zoon::Outline>))
-                        .chain(stream::pending())
-                        .boxed_local()
-                }
-                Value::Object(obj, _) => {
-                    let obj = obj.clone();
-                    stream::once(async move {
-                        // Parse thickness (default: 1)
-                        let thickness = if let Some(thickness_var) = obj.variable("thickness") {
-                            match thickness_var.value_actor().value().await {
-                                Ok(Value::Number(n, _)) => n.number() as u32,
-                                _ => 1,
-                            }
-                        } else {
-                            1
-                        };
-
-                        // Parse side: Inner or Outer (default: Outer)
-                        let is_inner = if let Some(side_var) = obj.variable("side") {
-                            match side_var.value_actor().value().await {
-                                Ok(Value::Tag(tag, _)) => tag.tag() == "Inner",
-                                _ => false,
-                            }
-                        } else {
-                            false
-                        };
-
-                        // Parse line_style: solid (default), dashed, dotted
-                        let line_style = if let Some(style_var) = obj.variable("line_style") {
-                            match style_var.value_actor().value().await {
-                                Ok(Value::Tag(tag, _)) => match tag.tag() {
-                                    "Dashed" => "dashed",
-                                    "Dotted" => "dotted",
-                                    _ => "solid",
-                                },
-                                _ => "solid",
-                            }
-                        } else {
-                            "solid"
-                        };
-
-                        // Parse color (required)
-                        if let Some(color_var) = obj.variable("color") {
-                            if let Ok(color_value) = color_var.value_actor().value().await {
-                                if let Some(css_color) = oklch_to_css(color_value).await {
-                                    // Build typed Outline value
-                                    let mut outline = if is_inner {
-                                        zoon::Outline::inner()
-                                    } else {
-                                        zoon::Outline::outer()
-                                    };
-                                    outline = outline.width(thickness).color(css_color);
-                                    outline = match line_style {
-                                        "dashed" => outline.dashed(),
-                                        "dotted" => outline.dotted(),
-                                        _ => outline.solid(),
-                                    };
-                                    return Some(outline);
-                                }
-                            }
-                        }
-                        None
-                    })
+    let outline_signal = signal::from_stream(switch_map(outline_value_stream, |value| {
+        match &value {
+            Value::Tag(tag, _) if tag.tag() == "NoOutline" => {
+                // Return None to remove outline
+                stream::once(future::ready(None::<zoon::Outline>))
                     .chain(stream::pending())
                     .boxed_local()
-                }
-                _ => {
-                    stream::pending::<Option<zoon::Outline>>().boxed_local()
-                }
             }
-        })
-    );
+            Value::Object(obj, _) => {
+                let obj = obj.clone();
+                stream::once(async move {
+                    // Parse thickness (default: 1)
+                    let thickness = if let Some(thickness_var) = obj.variable("thickness") {
+                        match thickness_var.value_actor().value().await {
+                            Ok(Value::Number(n, _)) => n.number() as u32,
+                            _ => 1,
+                        }
+                    } else {
+                        1
+                    };
+
+                    // Parse side: Inner or Outer (default: Outer)
+                    let is_inner = if let Some(side_var) = obj.variable("side") {
+                        match side_var.value_actor().value().await {
+                            Ok(Value::Tag(tag, _)) => tag.tag() == "Inner",
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    };
+
+                    // Parse line_style: solid (default), dashed, dotted
+                    let line_style = if let Some(style_var) = obj.variable("line_style") {
+                        match style_var.value_actor().value().await {
+                            Ok(Value::Tag(tag, _)) => match tag.tag() {
+                                "Dashed" => "dashed",
+                                "Dotted" => "dotted",
+                                _ => "solid",
+                            },
+                            _ => "solid",
+                        }
+                    } else {
+                        "solid"
+                    };
+
+                    // Parse color (required)
+                    if let Some(color_var) = obj.variable("color") {
+                        if let Ok(color_value) = color_var.value_actor().value().await {
+                            if let Some(css_color) = oklch_to_css(color_value).await {
+                                // Build typed Outline value
+                                let mut outline = if is_inner {
+                                    zoon::Outline::inner()
+                                } else {
+                                    zoon::Outline::outer()
+                                };
+                                outline = outline.width(thickness).color(css_color);
+                                outline = match line_style {
+                                    "dashed" => outline.dashed(),
+                                    "dotted" => outline.dotted(),
+                                    _ => outline.solid(),
+                                };
+                                return Some(outline);
+                            }
+                        }
+                    }
+                    None
+                })
+                .chain(stream::pending())
+                .boxed_local()
+            }
+            _ => stream::pending::<Option<zoon::Outline>>().boxed_local(),
+        }
+    }));
 
     // AlignContent (row: horizontal content alignment, column: vertical content alignment)
     // Uses Zoon's AlignContent API which controls how CONTAINER aligns its CHILDREN
@@ -1544,97 +1428,89 @@ fn element_stripe(
 
     // Horizontal alignment signal (align.row) - produces Option<HorizontalAlignment>
     #[derive(Clone, Copy, Debug)]
-    enum HorizontalContentAlignment { Center, Left, Right }
+    enum HorizontalContentAlignment {
+        Center,
+        Left,
+        Right,
+    }
 
     let sv_align_row = tagged_object.expect_variable("settings");
     let horizontal_content_align_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_align_row.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let align_stream = switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("align") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_align_row.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let align_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("align") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        );
-        switch_map(
-            align_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("row") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        });
+        switch_map(align_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("row") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| {
             let result = match value {
-                Value::Tag(tag, _) => {
-                    match tag.tag() {
-                        "Center" => Some(HorizontalContentAlignment::Center),
-                        "Start" => Some(HorizontalContentAlignment::Left),
-                        "End" => Some(HorizontalContentAlignment::Right),
-                        _ => None,
-                    }
-                }
+                Value::Tag(tag, _) => match tag.tag() {
+                    "Center" => Some(HorizontalContentAlignment::Center),
+                    "Start" => Some(HorizontalContentAlignment::Left),
+                    "End" => Some(HorizontalContentAlignment::Right),
+                    _ => None,
+                },
                 _ => None,
             };
             future::ready(result)
         })
         .boxed_local()
-    }).broadcast();
+    })
+    .broadcast();
 
     // Vertical alignment signal (align.column) - produces Option<VerticalContentAlignment>
     #[derive(Clone, Copy, Debug)]
-    enum VerticalContentAlignment { Center, Top, Bottom }
+    enum VerticalContentAlignment {
+        Center,
+        Top,
+        Bottom,
+    }
 
     let sv_align_col = tagged_object.expect_variable("settings");
     let vertical_content_align_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_align_col.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let align_stream = switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("align") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_align_col.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let align_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("align") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        );
-        switch_map(
-            align_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("column") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        });
+        switch_map(align_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("column") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| {
             let result = match value {
-                Value::Tag(tag, _) => {
-                    match tag.tag() {
-                        "Center" => Some(VerticalContentAlignment::Center),
-                        "Start" => Some(VerticalContentAlignment::Top),
-                        "End" => Some(VerticalContentAlignment::Bottom),
-                        _ => None,
-                    }
-                }
+                Value::Tag(tag, _) => match tag.tag() {
+                    "Center" => Some(VerticalContentAlignment::Center),
+                    "Start" => Some(VerticalContentAlignment::Top),
+                    "End" => Some(VerticalContentAlignment::Bottom),
+                    _ => None,
+                },
                 _ => None,
             };
             future::ready(result)
         })
         .boxed_local()
-    }).broadcast();
+    })
+    .broadcast();
 
     // Combined content alignment signal - combines horizontal and vertical into AlignContent values
     // Uses map_ref! to combine both signals when either changes
@@ -1665,82 +1541,71 @@ fn element_stripe(
 
     // Use switch_map for items stream - critical for proper re-rendering when example switches
     let items_vec_diff_stream = switch_map(
-        switch_map(
-            settings_variable.stream(),
-            |value| {
-                let object = value.expect_object();
-                object.expect_variable("items").stream()
-            }
-        ),
+        switch_map(settings_variable.stream(), |value| {
+            let object = value.expect_object();
+            object.expect_variable("items").stream()
+        }),
         |value| {
             // value.expect_list() returns Arc<List> which is kept alive by the stream
             list_change_to_vec_diff_stream(value.expect_list().stream())
-        }
+        },
     );
 
     // Raw CSS properties (no Zoon typed equivalent) — line-height, font-smoothing, text-shadow
     let sv_line_height = tagged_object.expect_variable("settings");
     let line_height_css_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_line_height.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("line_height") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_line_height.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("line_height") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
-        .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(format!("{}", n.number())),
-            _ => None,
-        }))
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}", n.number())),
+                _ => None,
+            })
+        })
         .boxed_local()
     });
 
     let sv_font_smoothing = tagged_object.expect_variable("settings");
     let font_smoothing_css_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_smoothing.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("font_smoothing") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_font_smoothing.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font_smoothing") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
-        .filter_map(|value| future::ready(match &value {
-            Value::Tag(tag, _) if tag.tag() == "Antialiased" => Some("antialiased".to_string()),
-            _ => None,
-        }))
+        })
+        .filter_map(|value| {
+            future::ready(match &value {
+                Value::Tag(tag, _) if tag.tag() == "Antialiased" => Some("antialiased".to_string()),
+                _ => None,
+            })
+        })
         .boxed_local()
     });
 
     let sv_text_shadow = tagged_object.expect_variable("settings");
     let text_shadow_css_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_text_shadow.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("text_shadow") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_text_shadow.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("text_shadow") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| async move {
             if let Value::Object(obj, _) = &value {
                 async fn get_num(obj: &Object, name: &str) -> f64 {
@@ -1759,7 +1624,11 @@ fn element_stripe(
                 let color_css = if let Some(color_var) = obj.variable("color") {
                     match color_var.value_actor().current_value().await {
                         Ok(Value::TaggedObject(tagged, _)) if tagged.tag() == "Oklch" => {
-                            async fn get_oklch(tagged: &TaggedObject, name: &str, default: f64) -> f64 {
+                            async fn get_oklch(
+                                tagged: &TaggedObject,
+                                name: &str,
+                                default: f64,
+                            ) -> f64 {
                                 if let Some(v) = tagged.variable(name) {
                                     match v.value_actor().value().await {
                                         Ok(Value::Number(n, _)) => n.number(),
@@ -1823,10 +1692,16 @@ fn element_stripe(
         .s(Font::with_signal_self(font_align_font_signal))
         .s(Width::with_signal_self(width_typed_signal))
         .s(Height::with_signal_self(height_typed_signal))
-        .s(Shadows::with_signal(shadows_typed_signal.map(|opt| opt.unwrap_or_default())))
+        .s(Shadows::with_signal(
+            shadows_typed_signal.map(|opt| opt.unwrap_or_default()),
+        ))
         .s(Borders::new().top_signal(border_top_typed_signal))
-        .s(Outline::with_signal_self(outline_signal.map(|opt| opt.flatten())))
-        .s(AlignContent::with_signal_self(combined_content_align_signal))
+        .s(Outline::with_signal_self(
+            outline_signal.map(|opt| opt.flatten()),
+        ))
+        .s(AlignContent::with_signal_self(
+            combined_content_align_signal,
+        ))
         .s(Visible::with_signal(visible_sig))
         // Raw CSS properties without Zoon typed equivalents
         .update_raw_el(move |raw_el| {
@@ -1853,16 +1728,11 @@ fn element_stack(
 
     // Use switch_map for layers stream - critical for proper re-rendering when example switches
     let layers_vec_diff_stream = switch_map(
-        switch_map(
-            settings_variable.clone().stream(),
-            |value| {
-                let object = value.expect_object();
-                object.expect_variable("layers").stream()
-            }
-        ),
-        |value| {
-            list_change_to_vec_diff_stream(value.expect_list().stream())
-        }
+        switch_map(settings_variable.clone().stream(), |value| {
+            let object = value.expect_object();
+            object.expect_variable("layers").stream()
+        }),
+        |value| list_change_to_vec_diff_stream(value.expect_list().stream()),
     );
 
     // Create individual style streams directly from settings
@@ -1875,76 +1745,65 @@ fn element_stack(
 
     // Width - produces u32 for typed Width API
     let width_signal = signal::from_stream({
-        let style_stream = switch_map(
-            settings_variable_2.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("width") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(settings_variable_2.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("width") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
-        .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(n.number() as u32),
-            _ => None,
-        }))
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number() as u32),
+                _ => None,
+            })
+        })
     });
 
     // Height - produces u32 for typed Height API
     let height_signal = signal::from_stream({
-        let style_stream = switch_map(
-            settings_variable_3.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("height") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(settings_variable_3.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("height") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
-        .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(n.number() as u32),
-            _ => None,
-        }))
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number() as u32),
+                _ => None,
+            })
+        })
     });
 
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let background_signal = signal::from_stream({
-        let style_stream = switch_map(
-            settings_variable_4.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        let bg_stream = switch_map(
-            style_stream,
-            |value| {
+        let style_stream = switch_map(settings_variable_4.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let bg_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("background") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        switch_map(
+            switch_map(bg_stream, |value| {
                 let obj = value.expect_object();
-                match obj.variable("background") {
+                match obj.variable("color") {
                     Some(var) => var.stream().left_stream(),
                     None => stream::empty().right_stream(),
                 }
-            }
-        );
-        switch_map(
-            switch_map(
-                bg_stream,
-                |value| {
-                    let obj = value.expect_object();
-                    match obj.variable("color") {
-                        Some(var) => var.stream().left_stream(),
-                        None => stream::empty().right_stream(),
-                    }
-                }
-            ),
-            |value| oklch_to_css_stream(value)
+            }),
+            |value| oklch_to_css_stream(value),
         )
         .boxed_local()
     });
@@ -1995,7 +1854,13 @@ async fn oklch_to_css(value: Value) -> Option<String> {
                 // oklch(lightness chroma hue / alpha)
                 // Lightness is 0-1, needs to be percentage
                 let css = if alpha < 1.0 {
-                    format!("oklch({}% {} {} / {})", lightness * 100.0, chroma, hue, alpha)
+                    format!(
+                        "oklch({}% {} {} / {})",
+                        lightness * 100.0,
+                        chroma,
+                        hue,
+                        alpha
+                    )
                 } else {
                     format!("oklch({}% {} {})", lightness * 100.0, chroma, hue)
                 };
@@ -2090,15 +1955,22 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
             // Create streams for each component, with defaults for missing variables
             // Use enum to identify which component is emitting
             #[derive(Clone, Copy)]
-            enum Component { Lightness, Chroma, Hue, Alpha }
+            enum Component {
+                Lightness,
+                Chroma,
+                Hue,
+                Alpha,
+            }
 
             let lightness_stream: LocalBoxStream<'static, (Component, f64)> =
                 if let Some(v) = tagged.variable("lightness") {
                     v.stream()
-                        .filter_map(|val| future::ready(match &val {
-                            Value::Number(n, _) => Some((Component::Lightness, n.number())),
-                            _ => None,
-                        }))
+                        .filter_map(|val| {
+                            future::ready(match &val {
+                                Value::Number(n, _) => Some((Component::Lightness, n.number())),
+                                _ => None,
+                            })
+                        })
                         .boxed_local()
                 } else {
                     stream::once(future::ready((Component::Lightness, 0.5)))
@@ -2109,10 +1981,12 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
             let chroma_stream: LocalBoxStream<'static, (Component, f64)> =
                 if let Some(v) = tagged.variable("chroma") {
                     v.stream()
-                        .filter_map(|val| future::ready(match val {
-                            Value::Number(n, _) => Some((Component::Chroma, n.number())),
-                            _ => None,
-                        }))
+                        .filter_map(|val| {
+                            future::ready(match val {
+                                Value::Number(n, _) => Some((Component::Chroma, n.number())),
+                                _ => None,
+                            })
+                        })
                         .boxed_local()
                 } else {
                     stream::once(future::ready((Component::Chroma, 0.0)))
@@ -2123,10 +1997,12 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
             let hue_stream: LocalBoxStream<'static, (Component, f64)> =
                 if let Some(v) = tagged.variable("hue") {
                     v.stream()
-                        .filter_map(|val| future::ready(match val {
-                            Value::Number(n, _) => Some((Component::Hue, n.number())),
-                            _ => None,
-                        }))
+                        .filter_map(|val| {
+                            future::ready(match val {
+                                Value::Number(n, _) => Some((Component::Hue, n.number())),
+                                _ => None,
+                            })
+                        })
                         .boxed_local()
                 } else {
                     stream::once(future::ready((Component::Hue, 0.0)))
@@ -2137,10 +2013,12 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
             let alpha_stream: LocalBoxStream<'static, (Component, f64)> =
                 if let Some(v) = tagged.variable("alpha") {
                     v.stream()
-                        .filter_map(|val| future::ready(match val {
-                            Value::Number(n, _) => Some((Component::Alpha, n.number())),
-                            _ => None,
-                        }))
+                        .filter_map(|val| {
+                            future::ready(match val {
+                                Value::Number(n, _) => Some((Component::Alpha, n.number())),
+                                _ => None,
+                            })
+                        })
                         .boxed_local()
                 } else {
                     stream::once(future::ready((Component::Alpha, 1.0)))
@@ -2150,28 +2028,23 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
 
             // Combine all streams - emit new CSS whenever any component changes
             // Use scan to maintain state of all components
-            stream::select_all([
-                lightness_stream,
-                chroma_stream,
-                hue_stream,
-                alpha_stream,
-            ])
-            .scan((0.5, 0.0, 0.0, 1.0), |state, (component, value)| {
-                match component {
-                    Component::Lightness => state.0 = value,
-                    Component::Chroma => state.1 = value,
-                    Component::Hue => state.2 = value,
-                    Component::Alpha => state.3 = value,
-                }
-                let (l, c, h, a) = *state;
-                let css = if a < 1.0 {
-                    format!("oklch({}% {} {} / {})", l * 100.0, c, h, a)
-                } else {
-                    format!("oklch({}% {} {})", l * 100.0, c, h)
-                };
-                future::ready(Some(css))
-            })
-            .boxed_local()
+            stream::select_all([lightness_stream, chroma_stream, hue_stream, alpha_stream])
+                .scan((0.5, 0.0, 0.0, 1.0), |state, (component, value)| {
+                    match component {
+                        Component::Lightness => state.0 = value,
+                        Component::Chroma => state.1 = value,
+                        Component::Hue => state.2 = value,
+                        Component::Alpha => state.3 = value,
+                    }
+                    let (l, c, h, a) = *state;
+                    let css = if a < 1.0 {
+                        format!("oklch({}% {} {} / {})", l * 100.0, c, h, a)
+                    } else {
+                        format!("oklch({}% {} {})", l * 100.0, c, h)
+                    };
+                    future::ready(Some(css))
+                })
+                .boxed_local()
         }
         Value::Tag(tag, _) => {
             // Handle named CSS colors - return constant infinite stream
@@ -2205,8 +2078,12 @@ fn element_button(
     construct_context: ConstructContext,
 ) -> impl Element {
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
-    let (press_event_sender, mut press_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("button.press_event", BRIDGE_PRESS_EVENT_CAPACITY);
-    let (hovered_sender, mut hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("button.hovered", BRIDGE_HOVER_CAPACITY);
+    let (press_event_sender, mut press_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new(
+        "button.press_event",
+        BRIDGE_PRESS_EVENT_CAPACITY,
+    );
+    let (hovered_sender, mut hovered_receiver) =
+        NamedChannel::<TimestampedEvent<bool>>::new("button.hovered", BRIDGE_HOVER_CAPACITY);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -2220,12 +2097,12 @@ fn element_button(
             .clone()
             .stream()
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
-        |variable| variable.stream()
+        |variable| variable.stream(),
     )
-        .filter_map(|value| future::ready(value.expect_object().variable("press")))
-        .map(|variable| variable.expect_link_value_sender())
-        .chain(stream::pending())
-        .fuse();
+    .filter_map(|value| future::ready(value.expect_object().variable("press")))
+    .map(|variable| variable.expect_link_value_sender())
+    .chain(stream::pending())
+    .fuse();
 
     // Set up hovered link if element field exists with hovered property
     // Chain with pending() to prevent stream termination (same as press_stream)
@@ -2305,10 +2182,9 @@ fn element_button(
 
     // CRITICAL: Use switch_map (not flat_map) because label variable stream is infinite.
     // When settings change, switch_map cancels the old label subscription.
-    let label_stream = switch_map(
-        settings_variable.clone().stream(),
-        |value| value.expect_object().expect_variable("label").stream()
-    )
+    let label_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value.expect_object().expect_variable("label").stream()
+    })
     .map({
         let construct_context = construct_context.clone();
         move |value| value_to_element(value, construct_context.clone())
@@ -2318,10 +2194,9 @@ fn element_button(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_font_size = settings_variable.clone();
     let font_size_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_size.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_font_size.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         let font_stream = switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("font") {
@@ -2352,10 +2227,9 @@ fn element_button(
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let sv_font_color = settings_variable.clone();
     let font_color_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_color.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_font_color.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         let font_stream = switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("font") {
@@ -2371,7 +2245,7 @@ fn element_button(
                     None => stream::empty().right_stream(),
                 }
             }),
-            |value| oklch_to_css_stream(value)
+            |value| oklch_to_css_stream(value),
         )
         .boxed_local()
     });
@@ -2380,10 +2254,9 @@ fn element_button(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_padding = settings_variable.clone();
     let padding_tuple_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_padding.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_padding.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("padding") {
@@ -2396,51 +2269,76 @@ fn element_button(
                 Value::Number(n, _) => {
                     let all = n.number() as u32;
                     Some((all, all, all, all))
-                },
+                }
                 Value::Object(obj, _) => {
                     let top = if let Some(v) = obj.variable("top") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
+                        } else {
+                            0
+                        }
                     } else if let Some(v) = obj.variable("column") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
-                    } else { 0 };
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
                     let right = if let Some(v) = obj.variable("right") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
+                        } else {
+                            0
+                        }
                     } else if let Some(v) = obj.variable("row") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
-                    } else { 0 };
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
                     let bottom = if let Some(v) = obj.variable("bottom") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
+                        } else {
+                            0
+                        }
                     } else if let Some(v) = obj.variable("column") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
-                    } else { 0 };
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
                     let left = if let Some(v) = obj.variable("left") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
+                        } else {
+                            0
+                        }
                     } else if let Some(v) = obj.variable("row") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
-                    } else { 0 };
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
                     Some((top, right, bottom, left))
                 }
                 _ => None,
             }
         })
         .boxed_local()
-    }).broadcast();
+    })
+    .broadcast();
     // Derive individual padding signals from the broadcasted tuple
     let padding_top_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(t, _, _, _)| t));
     let padding_right_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, r, _, _)| r));
@@ -2451,10 +2349,9 @@ fn element_button(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_size_width = settings_variable.clone();
     let size_width_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_size_width.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_size_width.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("size") {
@@ -2477,10 +2374,9 @@ fn element_button(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_size_height = settings_variable.clone();
     let size_height_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_size_height.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_size_height.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("size") {
@@ -2503,10 +2399,9 @@ fn element_button(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_rounded = settings_variable.clone();
     let rounded_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_rounded.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_rounded.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("rounded_corners") {
@@ -2529,10 +2424,9 @@ fn element_button(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_transform = settings_variable.clone();
     let transform_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_transform.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_transform.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("transform") {
@@ -2545,28 +2439,48 @@ fn element_button(
                 let move_left = if let Some(v) = obj.variable("move_left") {
                     if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                         n.number()
-                    } else { 0.0 }
-                } else { 0.0 };
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 let move_down = if let Some(v) = obj.variable("move_down") {
                     if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                         n.number()
-                    } else { 0.0 }
-                } else { 0.0 };
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 let move_up = if let Some(v) = obj.variable("move_up") {
                     if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                         n.number()
-                    } else { 0.0 }
-                } else { 0.0 };
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 let move_right = if let Some(v) = obj.variable("move_right") {
                     if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                         n.number()
-                    } else { 0.0 }
-                } else { 0.0 };
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 let rotate = if let Some(v) = obj.variable("rotate") {
                     if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                         n.number()
-                    } else { 0.0 }
-                } else { 0.0 };
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
 
                 // Build typed Transform value
                 let mut transform = zoon::Transform::new();
@@ -2586,7 +2500,12 @@ fn element_button(
                     transform = transform.rotate(rotate);
                 }
                 // Return None if no transformations were applied
-                if move_left == 0.0 && move_right == 0.0 && move_up == 0.0 && move_down == 0.0 && rotate == 0.0 {
+                if move_left == 0.0
+                    && move_right == 0.0
+                    && move_up == 0.0
+                    && move_down == 0.0
+                    && rotate == 0.0
+                {
                     None
                 } else {
                     Some(transform)
@@ -2602,10 +2521,9 @@ fn element_button(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_font_align = settings_variable.clone();
     let font_align_font_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_align.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_font_align.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         let font_stream = switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("font") {
@@ -2622,15 +2540,13 @@ fn element_button(
         })
         .filter_map(|value| {
             let result: Option<Font<'static>> = match value {
-                Value::Tag(tag, _) => {
-                    match tag.tag() {
-                        "Center" => Some(Font::new().center()),
-                        "Left" => Some(Font::new().left()),
-                        "Right" => Some(Font::new().right()),
-                        "Justify" => Some(Font::new().justify()),
-                        _ => None,
-                    }
-                }
+                Value::Tag(tag, _) => match tag.tag() {
+                    "Center" => Some(Font::new().center()),
+                    "Left" => Some(Font::new().left()),
+                    "Right" => Some(Font::new().right()),
+                    "Justify" => Some(Font::new().justify()),
+                    _ => None,
+                },
                 _ => None,
             };
             future::ready(result)
@@ -2641,10 +2557,9 @@ fn element_button(
     // Align signal - self-alignment within parent container
     let sv_align = settings_variable.clone();
     let align_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_align.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_align.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("align") {
@@ -2652,22 +2567,30 @@ fn element_button(
                 None => stream::empty().right_stream(),
             }
         })
-        .map(|value| {
-            match &value {
-                Value::Tag(tag, _) => {
-                    let mut align = zoon::Align::new();
-                    match tag.tag() {
-                        "Right" => { align = align.right(); }
-                        "Left" => { align = align.left(); }
-                        "Top" => { align = align.top(); }
-                        "Bottom" => { align = align.bottom(); }
-                        "Center" => { align = align.center_x().center_y(); }
-                        _ => {}
+        .map(|value| match &value {
+            Value::Tag(tag, _) => {
+                let mut align = zoon::Align::new();
+                match tag.tag() {
+                    "Right" => {
+                        align = align.right();
                     }
-                    Some(align)
+                    "Left" => {
+                        align = align.left();
+                    }
+                    "Top" => {
+                        align = align.top();
+                    }
+                    "Bottom" => {
+                        align = align.bottom();
+                    }
+                    "Center" => {
+                        align = align.center_x().center_y();
+                    }
+                    _ => {}
                 }
-                _ => None,
+                Some(align)
             }
+            _ => None,
         })
         .boxed_local()
     });
@@ -2677,10 +2600,9 @@ fn element_button(
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let sv_background = settings_variable.clone();
     let background_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_background.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_background.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         let bg_stream = switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("background") {
@@ -2696,7 +2618,7 @@ fn element_button(
                     None => stream::empty().right_stream(),
                 }
             }),
-            |value| oklch_to_css_stream(value)
+            |value| oklch_to_css_stream(value),
         )
         .boxed_local()
     });
@@ -2707,27 +2629,45 @@ fn element_button(
     let sv_outline = settings_variable.clone();
     let button_id = Arc::as_ptr(&sv_outline) as usize;
     let outline_value_stream = {
-        let style_stream = switch_map(
-            sv_outline.stream(),
-            move |value| {
-                if LOG_DEBUG { zoon::println!("[OUTLINE_DEBUG btn={:x}] sv_outline emitted, getting style variable", button_id); }
-                value.expect_object().expect_variable("style").stream()
+        let style_stream = switch_map(sv_outline.stream(), move |value| {
+            if LOG_DEBUG {
+                zoon::println!(
+                    "[OUTLINE_DEBUG btn={:x}] sv_outline emitted, getting style variable",
+                    button_id
+                );
             }
-        );
+            value.expect_object().expect_variable("style").stream()
+        });
         switch_map(style_stream, move |value| {
-            if LOG_DEBUG { zoon::println!("[OUTLINE_DEBUG btn={:x}] style_stream emitted, getting outline variable", button_id); }
+            if LOG_DEBUG {
+                zoon::println!(
+                    "[OUTLINE_DEBUG btn={:x}] style_stream emitted, getting outline variable",
+                    button_id
+                );
+            }
             let obj = value.expect_object();
             match obj.variable("outline") {
                 Some(var) => {
-                    if LOG_DEBUG { zoon::println!("[OUTLINE_DEBUG btn={:x}] Got outline variable, subscribing to its value_actor", button_id); }
-                    var.value_actor().clone().stream()
+                    if LOG_DEBUG {
+                        zoon::println!(
+                            "[OUTLINE_DEBUG btn={:x}] Got outline variable, subscribing to its value_actor",
+                            button_id
+                        );
+                    }
+                    var.value_actor()
+                        .clone()
+                        .stream()
                         .map(move |v| {
                             if LOG_DEBUG {
-                                zoon::println!("[OUTLINE_DEBUG btn={:x}] outline value_actor emitted: {}", button_id, match &v {
-                                    Value::Tag(t, _) => format!("Tag({})", t.tag()),
-                                    Value::Object(_, _) => "Object".to_string(),
-                                    _ => "other".to_string(),
-                                });
+                                zoon::println!(
+                                    "[OUTLINE_DEBUG btn={:x}] outline value_actor emitted: {}",
+                                    button_id,
+                                    match &v {
+                                        Value::Tag(t, _) => format!("Tag({})", t.tag()),
+                                        Value::Object(_, _) => "Object".to_string(),
+                                        _ => "other".to_string(),
+                                    }
+                                );
                             }
                             v
                         })
@@ -2737,18 +2677,17 @@ fn element_button(
             }
         })
     };
-    let outline_signal = signal::from_stream(
-        switch_map(outline_value_stream, |value| {
-            match &value {
-                Value::Tag(tag, _) if tag.tag() == "NoOutline" => {
-                    // Return None to remove outline
-                    stream::once(future::ready(None::<zoon::Outline>))
-                        .chain(stream::pending())
-                        .boxed_local()
-                }
-                Value::Object(obj, _) => {
-                    let obj = obj.clone();
-                    stream::once(async move {
+    let outline_signal = signal::from_stream(switch_map(outline_value_stream, |value| {
+        match &value {
+            Value::Tag(tag, _) if tag.tag() == "NoOutline" => {
+                // Return None to remove outline
+                stream::once(future::ready(None::<zoon::Outline>))
+                    .chain(stream::pending())
+                    .boxed_local()
+            }
+            Value::Object(obj, _) => {
+                let obj = obj.clone();
+                stream::once(async move {
                         // Parse thickness (default: 1)
                         let thickness = if let Some(thickness_var) = obj.variable("thickness") {
                             match thickness_var.value_actor().value().await {
@@ -2814,14 +2753,13 @@ fn element_button(
                     })
                     .chain(stream::pending())
                     .boxed_local()
-                }
-                other => {
-                    log_unexpected_type("button outline", "Object or NoOutline tag", other);
-                    stream::pending::<Option<zoon::Outline>>().boxed_local()
-                }
             }
-        })
-    );
+            other => {
+                log_unexpected_type("button outline", "Object or NoOutline tag", other);
+                stream::pending::<Option<zoon::Outline>>().boxed_local()
+            }
+        }
+    }));
 
     Button::new()
         .label_signal(signal::from_stream(label_stream).map(|label| {
@@ -2844,7 +2782,9 @@ fn element_button(
         .s(Height::exact_signal(size_height_signal))
         .s(RoundedCorners::all_signal(rounded_signal))
         .s(Transform::with_signal_self(transform_signal))
-        .s(Outline::with_signal_self(outline_signal.map(|opt| opt.flatten())))
+        .s(Outline::with_signal_self(
+            outline_signal.map(|opt| opt.flatten()),
+        ))
         .s(Background::new().color_signal(background_signal))
         .s(Font::new()
             .size_signal(font_size_signal)
@@ -2855,7 +2795,9 @@ fn element_button(
             .bottom_signal(padding_bottom_signal)
             .left_signal(padding_left_signal))
         .s(Font::with_signal_self(font_align_font_signal))
-        .s(Align::with_signal_self(align_signal.map(|opt| opt.flatten())))
+        .s(Align::with_signal_self(
+            align_signal.map(|opt| opt.flatten()),
+        ))
         .s(Visible::with_signal(visible_sig))
         .after_remove(move |_| {
             drop(event_handler_loop);
@@ -2872,13 +2814,20 @@ fn element_text_input(
         KeyDown(TimestampedEvent<String>),
     }
 
-    if LOG_DEBUG { zoon::println!("[EVENT:TextInput:v2] element_text_input CALLED - creating new TextInput"); }
+    if LOG_DEBUG {
+        zoon::println!("[EVENT:TextInput:v2] element_text_input CALLED - creating new TextInput");
+    }
     // Separate channels for each event type.
     // TimestampedEvent captures Lamport time at DOM callback, ensuring correct ordering
     // even when select! processes events out of order.
-    let (dom_event_sender, mut dom_event_receiver) = NamedChannel::<TextInputDomEvent>::new("text_input.dom_event", BRIDGE_KEY_DOWN_CAPACITY.max(BRIDGE_TEXT_CHANGE_CAPACITY));
-    let (blur_event_sender, mut blur_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("text_input.blur", BRIDGE_BLUR_CAPACITY);
-    let (focus_event_sender, mut focus_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("text_input.focus", BRIDGE_FOCUS_CAPACITY);
+    let (dom_event_sender, mut dom_event_receiver) = NamedChannel::<TextInputDomEvent>::new(
+        "text_input.dom_event",
+        BRIDGE_KEY_DOWN_CAPACITY.max(BRIDGE_TEXT_CHANGE_CAPACITY),
+    );
+    let (blur_event_sender, mut blur_event_receiver) =
+        NamedChannel::<TimestampedEvent<()>>::new("text_input.blur", BRIDGE_BLUR_CAPACITY);
+    let (focus_event_sender, mut focus_event_receiver) =
+        NamedChannel::<TimestampedEvent<()>>::new("text_input.focus", BRIDGE_FOCUS_CAPACITY);
     let dom_input_el: Rc<RefCell<Option<web_sys::HtmlInputElement>>> = Default::default();
     let suppress_next_blur: Rc<RefCell<bool>> = Default::default();
 
@@ -2894,51 +2843,56 @@ fn element_text_input(
             .clone()
             .stream()
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
-        |variable| variable.stream()
+        |variable| variable.stream(),
     )
-        .filter_map(|value| future::ready(value.expect_object().variable("change")))
-        .map(move |variable| variable.expect_link_value_sender())
-        .chain(stream::pending())
-        .fuse();
+    .filter_map(|value| future::ready(value.expect_object().variable("change")))
+    .map(move |variable| variable.expect_link_value_sender())
+    .chain(stream::pending())
+    .fuse();
 
     let mut key_down_stream = switch_map(
         element_variable
             .clone()
             .stream()
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
-        |variable| variable.stream()
+        |variable| variable.stream(),
     )
-        .filter_map(|value| future::ready(value.expect_object().variable("key_down")))
-        .map(move |variable| variable.expect_link_value_sender())
-        .chain(stream::pending())
-        .fuse();
+    .filter_map(|value| future::ready(value.expect_object().variable("key_down")))
+    .map(move |variable| variable.expect_link_value_sender())
+    .chain(stream::pending())
+    .fuse();
 
     let mut blur_stream = switch_map(
         element_variable
             .clone()
             .stream()
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
-        |variable| variable.stream()
+        |variable| variable.stream(),
     )
-        .filter_map(|value| future::ready(value.expect_object().variable("blur")))
-        .map(move |variable| variable.expect_link_value_sender())
-        .chain(stream::pending())
-        .fuse();
+    .filter_map(|value| future::ready(value.expect_object().variable("blur")))
+    .map(move |variable| variable.expect_link_value_sender())
+    .chain(stream::pending())
+    .fuse();
 
     let mut focus_stream = switch_map(
         element_variable
             .clone()
             .stream()
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
-        |variable| variable.stream()
+        |variable| variable.stream(),
     )
-        .filter_map(|value| future::ready(value.expect_object().variable("focus")))
-        .map(move |variable| variable.expect_link_value_sender())
-        .chain(stream::pending())
-        .fuse();
+    .filter_map(|value| future::ready(value.expect_object().variable("focus")))
+    .map(move |variable| variable.expect_link_value_sender())
+    .chain(stream::pending())
+    .fuse();
 
     // Helper to create change event value with captured Lamport timestamp
-    fn create_change_event_value(construct_context: &ConstructContext, text: String, lamport_time: u64, scope_id: ScopeId) -> Value {
+    fn create_change_event_value(
+        construct_context: &ConstructContext,
+        text: String,
+        lamport_time: u64,
+        scope_id: ScopeId,
+    ) -> Value {
         inc_metric!(CHANGE_EVENTS_CONSTRUCTED);
         // C1: Use cached ConstructInfoComplete for the inner text value
         // to avoid ConstructInfo::new() allocation on every keystroke
@@ -2958,9 +2912,15 @@ fn element_text_input(
                 construct_context.clone(),
                 "text",
                 create_actor(
-                    ConstructInfo::new("text_input::change_event::text_actor", None, "change text actor"),
+                    ConstructInfo::new(
+                        "text_input::change_event::text_actor",
+                        None,
+                        "change text actor",
+                    ),
                     ActorContext::default(),
-                    TypedStream::infinite(stream::once(future::ready(text_value)).chain(stream::pending())),
+                    TypedStream::infinite(
+                        stream::once(future::ready(text_value)).chain(stream::pending()),
+                    ),
                     parser::PersistenceId::new(),
                     scope_id,
                 ),
@@ -2972,7 +2932,12 @@ fn element_text_input(
 
     // Helper to create key_down event value with captured Lamport timestamp
     // Only contains 'key', no 'text' - text should be obtained from the change event using LATEST
-    fn create_key_down_event_value(construct_context: &ConstructContext, key: String, lamport_time: u64, scope_id: ScopeId) -> Value {
+    fn create_key_down_event_value(
+        construct_context: &ConstructContext,
+        key: String,
+        lamport_time: u64,
+        scope_id: ScopeId,
+    ) -> Value {
         inc_metric!(KEYDOWN_EVENTS_CONSTRUCTED);
         // C1: Use cached ConstructInfoComplete for the inner tag value
         let tag_value = EngineTag::new_value_cached_with_lamport_time(
@@ -2982,34 +2947,46 @@ fn element_text_input(
             key,
         );
         Object::new_value_with_lamport_time(
-            ConstructInfo::new("text_input::key_down_event", None, "TextInput key_down event"),
+            ConstructInfo::new(
+                "text_input::key_down_event",
+                None,
+                "TextInput key_down event",
+            ),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
             lamport_time,
-            [
-                Variable::new_arc(
-                    ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
-                    construct_context.clone(),
-                    "key",
-                    create_actor(
-                        ConstructInfo::new("text_input::key_down_event::key_actor", None, "key_down key actor"),
-                        ActorContext::default(),
-                        TypedStream::infinite(stream::once(future::ready(tag_value)).chain(stream::pending())),
-                        parser::PersistenceId::new(),
-                        scope_id,
+            [Variable::new_arc(
+                ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
+                construct_context.clone(),
+                "key",
+                create_actor(
+                    ConstructInfo::new(
+                        "text_input::key_down_event::key_actor",
+                        None,
+                        "key_down key actor",
                     ),
-                    parser::PersistenceId::default(),
-                    parser::Scope::Root,
+                    ActorContext::default(),
+                    TypedStream::infinite(
+                        stream::once(future::ready(tag_value)).chain(stream::pending()),
+                    ),
+                    parser::PersistenceId::new(),
+                    scope_id,
                 ),
-            ],
+                parser::PersistenceId::default(),
+                parser::Scope::Root,
+            )],
         )
     }
 
     let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
-            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Event handler loop STARTED"); }
-            let scope_id = construct_context.bridge_scope_id.expect("Bug: bridge_scope_id not set for text_input event handler");
+            if LOG_DEBUG {
+                zoon::println!("[EVENT:TextInput] Event handler loop STARTED");
+            }
+            let scope_id = construct_context
+                .bridge_scope_id
+                .expect("Bug: bridge_scope_id not set for text_input event handler");
             let mut change_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut key_down_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut blur_link_value_sender: Option<NamedChannel<Value>> = None;
@@ -3179,10 +3156,9 @@ fn element_text_input(
     let visible_sig = visible_signal_from_settings(sv_visible);
 
     // CRITICAL: Use switch_map (not flat_map) because text variable stream is infinite.
-    let text_stream = switch_map(
-        settings_variable.clone().stream(),
-        |value| value.expect_object().expect_variable("text").stream()
-    )
+    let text_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value.expect_object().expect_variable("text").stream()
+    })
     .filter_map(|value| {
         future::ready(match value {
             Value::Text(text, _) => Some(text.text().to_string()),
@@ -3192,24 +3168,19 @@ fn element_text_input(
 
     // Placeholder text stream - extract actual text from placeholder object
     // CRITICAL: Use nested switch_map (not flat_map) because all variable streams are infinite.
-    let placeholder_text_stream = switch_map(
-        settings_variable.clone().stream(),
-        |value| value.expect_object().expect_variable("placeholder").stream()
-    );
-    let placeholder_text_stream = switch_map(
-        placeholder_text_stream,
-        |value| {
-            match value {
-                Value::Object(obj, _) => {
-                    match obj.variable("text") {
-                        Some(var) => var.stream().left_stream(),
-                        None => stream::empty().right_stream(),
-                    }
-                }
-                _ => stream::empty().right_stream(),
-            }
-        }
-    )
+    let placeholder_text_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value
+            .expect_object()
+            .expect_variable("placeholder")
+            .stream()
+    });
+    let placeholder_text_stream = switch_map(placeholder_text_stream, |value| match value {
+        Value::Object(obj, _) => match obj.variable("text") {
+            Some(var) => var.stream().left_stream(),
+            None => stream::empty().right_stream(),
+        },
+        _ => stream::empty().right_stream(),
+    })
     .filter_map(|value| {
         future::ready(match value {
             Value::Text(text, _) => Some(text.text().to_string()),
@@ -3223,10 +3194,12 @@ fn element_text_input(
     // Placeholder font color signal: placeholder → style → font → color → oklch CSS
     let sv_ph_color = tagged_object.expect_variable("settings");
     let placeholder_color_signal = signal::from_stream({
-        let ph_stream = switch_map(
-            sv_ph_color.stream(),
-            |value| value.expect_object().expect_variable("placeholder").stream()
-        );
+        let ph_stream = switch_map(sv_ph_color.stream(), |value| {
+            value
+                .expect_object()
+                .expect_variable("placeholder")
+                .stream()
+        });
         let style_stream = switch_map(ph_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("style") {
@@ -3249,7 +3222,7 @@ fn element_text_input(
                     None => stream::empty().right_stream(),
                 }
             }),
-            |value| oklch_to_css_stream(value)
+            |value| oklch_to_css_stream(value),
         )
         .boxed_local()
     });
@@ -3259,10 +3232,9 @@ fn element_text_input(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_width = tagged_object.expect_variable("settings");
     let width_typed_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_width.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_width.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("width") {
@@ -3283,10 +3255,9 @@ fn element_text_input(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_padding = tagged_object.expect_variable("settings");
     let padding_tuple_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_padding.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_padding.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("padding") {
@@ -3299,7 +3270,7 @@ fn element_text_input(
                 Value::Number(n, _) => {
                     let all = n.number() as u32;
                     Some((all, all, all, all))
-                },
+                }
                 Value::Object(obj, _) => {
                     // Handle directional padding: [top, column, left, right, row, bottom]
                     async fn get_num(obj: &Object, name: &str) -> u32 {
@@ -3331,7 +3302,8 @@ fn element_text_input(
             }
         })
         .boxed_local()
-    }).broadcast();
+    })
+    .broadcast();
     // Derive individual padding signals from the broadcasted tuple
     let padding_top_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(t, _, _, _)| t));
     let padding_right_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, r, _, _)| r));
@@ -3342,10 +3314,9 @@ fn element_text_input(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_font_size = tagged_object.expect_variable("settings");
     let font_size_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_size.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_font_size.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         let font_stream = switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("font") {
@@ -3373,10 +3344,9 @@ fn element_text_input(
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let sv_font_color = tagged_object.expect_variable("settings");
     let font_color_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_font_color.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_font_color.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         let font_stream = switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("font") {
@@ -3392,7 +3362,7 @@ fn element_text_input(
                     None => stream::empty().right_stream(),
                 }
             }),
-            |value| oklch_to_css_stream(value)
+            |value| oklch_to_css_stream(value),
         )
         .boxed_local()
     });
@@ -3402,10 +3372,9 @@ fn element_text_input(
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let sv_bg_color = tagged_object.expect_variable("settings");
     let background_color_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_bg_color.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_bg_color.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         let bg_stream = switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("background") {
@@ -3421,7 +3390,7 @@ fn element_text_input(
                     None => stream::empty().right_stream(),
                 }
             }),
-            |value| oklch_to_css_stream(value)
+            |value| oklch_to_css_stream(value),
         )
         .boxed_local()
     });
@@ -3433,10 +3402,9 @@ fn element_text_input(
 
     // Update the mutable when the stream emits
     // CRITICAL: Use switch_map (not flat_map) because focus variable stream is infinite.
-    let focus_stream = switch_map(
-        settings_variable.stream(),
-        |value| value.expect_object().expect_variable("focus").stream()
-    )
+    let focus_stream = switch_map(settings_variable.stream(), |value| {
+        value.expect_object().expect_variable("focus").stream()
+    })
     .filter_map(|value| {
         future::ready(match value {
             Value::Tag(tag, _) => Some(tag.tag() == "True"),
@@ -3458,7 +3426,10 @@ fn element_text_input(
     TextInput::new()
         .label_hidden("text input")
         .text_signal(signal::from_stream(text_stream).map(|t| t.unwrap_or_default()))
-        .placeholder(Placeholder::with_signal(placeholder_signal.map(|t| t.unwrap_or_default())).s(Font::new().italic().color_signal(placeholder_color_signal)))
+        .placeholder(
+            Placeholder::with_signal(placeholder_signal.map(|t| t.unwrap_or_default()))
+                .s(Font::new().italic().color_signal(placeholder_color_signal)),
+        )
         .update_raw_el({
             let dom_input_el_ref = dom_input_el.clone();
             move |raw_el| {
@@ -3473,9 +3444,15 @@ fn element_text_input(
                 // Capture Lamport time NOW at DOM callback, before channel
                 let event = TimestampedEvent::now(text);
                 if LOG_DEBUG {
-                    zoon::println!("[EVENT:TextInput] on_change fired: text='{}', lamport={}",
-                        if event.data.len() > 50 { format!("{}...", &event.data[..50]) } else { event.data.clone() },
-                        event.lamport_time);
+                    zoon::println!(
+                        "[EVENT:TextInput] on_change fired: text='{}', lamport={}",
+                        if event.data.len() > 50 {
+                            format!("{}...", &event.data[..50])
+                        } else {
+                            event.data.clone()
+                        },
+                        event.lamport_time
+                    );
                 }
                 sender.send_or_drop(TextInputDomEvent::Change(event));
             }
@@ -3503,8 +3480,8 @@ fn element_text_input(
                 if is_commit_key {
                     let delayed_sender = sender.clone();
                     let delayed_key = key_name;
-                    let timeout_closure = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(
-                        move || {
+                    let timeout_closure =
+                        wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
                             let ts_event = TimestampedEvent::now(delayed_key.clone());
                             if LOG_DEBUG {
                                 zoon::println!(
@@ -3514,8 +3491,7 @@ fn element_text_input(
                                 );
                             }
                             delayed_sender.send_or_drop(TextInputDomEvent::KeyDown(ts_event));
-                        },
-                    );
+                        });
                     if let Some(window) = web_sys::window() {
                         window
                             .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -3549,7 +3525,12 @@ fn element_text_input(
                 }
                 // Capture Lamport time NOW at DOM callback, before channel
                 let event = TimestampedEvent::now(());
-                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] on_blur fired: lamport={}", event.lamport_time); }
+                if LOG_DEBUG {
+                    zoon::println!(
+                        "[EVENT:TextInput] on_blur fired: lamport={}",
+                        event.lamport_time
+                    );
+                }
                 sender.send_or_drop(event);
             }
         })
@@ -3558,7 +3539,12 @@ fn element_text_input(
             move |raw_el| {
                 raw_el.event_handler(move |_: events::Focus| {
                     let event = TimestampedEvent::now(());
-                    if LOG_DEBUG { zoon::println!("[EVENT:TextInput] on_focus fired: lamport={}", event.lamport_time); }
+                    if LOG_DEBUG {
+                        zoon::println!(
+                            "[EVENT:TextInput] on_focus fired: lamport={}",
+                            event.lamport_time
+                        );
+                    }
                     sender.send_or_drop(event);
                 })
             }
@@ -3576,7 +3562,9 @@ fn element_text_input(
         .s(Width::with_signal_self(width_typed_signal))
         .s(Visible::with_signal(visible_sig))
         .after_remove(move |_| {
-            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Element REMOVED - dropping event handlers"); }
+            if LOG_DEBUG {
+                zoon::println!("[EVENT:TextInput] Element REMOVED - dropping event handlers");
+            }
             drop(event_handler_loop);
             drop(focus_loop);
         })
@@ -3587,7 +3575,8 @@ fn element_checkbox(
     construct_context: ConstructContext,
 ) -> impl Element {
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
-    let (click_event_sender, mut click_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("checkbox.click", BRIDGE_PRESS_EVENT_CAPACITY);
+    let (click_event_sender, mut click_event_receiver) =
+        NamedChannel::<TimestampedEvent<()>>::new("checkbox.click", BRIDGE_PRESS_EVENT_CAPACITY);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -3597,18 +3586,17 @@ fn element_checkbox(
         element_variable
             .stream()
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
-        |variable| variable.stream()
+        |variable| variable.stream(),
     );
 
     // Get the click Variable (not just the sender) so we can access its registry_key
-    let click_var_stream = event_stream
-        .filter_map(|value| future::ready(value.expect_object().variable("click")));
+    let click_var_stream =
+        event_stream.filter_map(|value| future::ready(value.expect_object().variable("click")));
 
     // Map to sender - the Variable stream already handles uniqueness via persistence_id + scope
     // Chain with pending() to prevent stream termination causing busy-polling in select!
-    let click_sender_stream = click_var_stream.map(move |variable| {
-        variable.expect_link_value_sender()
-    });
+    let click_sender_stream =
+        click_var_stream.map(move |variable| variable.expect_link_value_sender());
 
     let mut click_sender_stream = click_sender_stream.chain(stream::pending()).fuse();
 
@@ -3665,10 +3653,9 @@ fn element_checkbox(
     let visible_sig = visible_signal_from_settings(sv_visible);
 
     // CRITICAL: Use switch_map (not flat_map) because variable streams are infinite.
-    let checked_stream = switch_map(
-        settings_variable.clone().stream(),
-        |value| value.expect_object().expect_variable("checked").stream()
-    )
+    let checked_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value.expect_object().expect_variable("checked").stream()
+    })
     .filter_map(|value| {
         future::ready(match value {
             Value::Tag(tag, _) => Some(tag.tag() == "True"),
@@ -3677,78 +3664,98 @@ fn element_checkbox(
     });
 
     // CRITICAL: Use switch_map (not flat_map) because icon variable stream is infinite.
-    let icon_stream = switch_map(
-        settings_variable.stream(),
-        |value| value.expect_object().expect_variable("icon").stream()
-    )
+    let icon_stream = switch_map(settings_variable.stream(), |value| {
+        value.expect_object().expect_variable("icon").stream()
+    })
     .map(move |value| value_to_element(value, construct_context.clone()));
 
     // Padding support for checkbox element
     let padding_tuple_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_padding.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("padding") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
+        let style_stream = switch_map(sv_padding.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("padding") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
             }
-        )
+        })
         .filter_map(|value| async move {
             match value {
                 Value::Number(n, _) => {
                     let all = n.number() as u32;
                     Some((all, all, all, all))
-                },
+                }
                 Value::Object(obj, _) => {
                     let top = if let Some(v) = obj.variable("top") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
+                        } else {
+                            0
+                        }
                     } else if let Some(v) = obj.variable("column") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
-                    } else { 0 };
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
                     let right = if let Some(v) = obj.variable("right") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
+                        } else {
+                            0
+                        }
                     } else if let Some(v) = obj.variable("row") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
-                    } else { 0 };
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
                     let bottom = if let Some(v) = obj.variable("bottom") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
+                        } else {
+                            0
+                        }
                     } else if let Some(v) = obj.variable("column") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
-                    } else { 0 };
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
                     let left = if let Some(v) = obj.variable("left") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
+                        } else {
+                            0
+                        }
                     } else if let Some(v) = obj.variable("row") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
                             n.number() as u32
-                        } else { 0 }
-                    } else { 0 };
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
                     Some((top, right, bottom, left))
                 }
                 _ => None,
             }
         })
         .boxed_local()
-    }).broadcast();
+    })
+    .broadcast();
     let padding_top_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(t, _, _, _)| t));
     let padding_right_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, r, _, _)| r));
     let padding_bottom_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, _, b, _)| b));
@@ -3757,9 +3764,7 @@ fn element_checkbox(
     Checkbox::new()
         .label_hidden("checkbox")
         .checked_signal(signal::from_stream(checked_stream).map(|c| c.unwrap_or(false)))
-        .icon(move |_checked_mutable| {
-            El::new().child_signal(signal::from_stream(icon_stream))
-        })
+        .icon(move |_checked_mutable| El::new().child_signal(signal::from_stream(icon_stream)))
         .s(Visible::with_signal(visible_sig))
         .s(Padding::new()
             .top_signal(padding_top_signal)
@@ -3773,9 +3778,7 @@ fn element_checkbox(
                 sender.send_or_drop(TimestampedEvent::now(()));
             }
         })
-        .after_remove(move |_| {
-            drop(event_handler_loop)
-        })
+        .after_remove(move |_| drop(event_handler_loop))
 }
 
 fn element_label(
@@ -3783,8 +3786,13 @@ fn element_label(
     construct_context: ConstructContext,
 ) -> impl Element {
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
-    let (double_click_sender, mut double_click_receiver) = NamedChannel::<TimestampedEvent<()>>::new("double_click.event", BRIDGE_PRESS_EVENT_CAPACITY);
-    let (hovered_sender, _hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("double_click.hovered", BRIDGE_HOVER_CAPACITY);
+    let (double_click_sender, mut double_click_receiver) =
+        NamedChannel::<TimestampedEvent<()>>::new(
+            "double_click.event",
+            BRIDGE_PRESS_EVENT_CAPACITY,
+        );
+    let (hovered_sender, _hovered_receiver) =
+        NamedChannel::<TimestampedEvent<bool>>::new("double_click.hovered", BRIDGE_HOVER_CAPACITY);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -3801,13 +3809,11 @@ fn element_label(
     // Use switch_map (not flat_map) because variable.stream() is infinite.
     // When element is recreated, switch_map cancels old subscription and re-subscribes to new one.
     let event_stream = switch_map(
-        element_variable
-            .stream()
-            .filter_map(move |value| {
-                let obj = value.expect_object();
-                future::ready(obj.variable("event"))
-            }),
-        move |variable| variable.stream()
+        element_variable.stream().filter_map(move |value| {
+            let obj = value.expect_object();
+            future::ready(obj.variable("event"))
+        }),
+        move |variable| variable.stream(),
     );
 
     // Chain with pending() to prevent stream termination causing busy-polling in select!
@@ -3866,10 +3872,9 @@ fn element_label(
 
     // CRITICAL: Use switch_map (not flat_map) because label variable stream is infinite.
     // When settings change, switch_map cancels the old label subscription.
-    let label_stream = switch_map(
-        settings_variable.clone().stream(),
-        |value| value.expect_object().expect_variable("label").stream()
-    )
+    let label_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value.expect_object().expect_variable("label").stream()
+    })
     .map({
         let construct_context = construct_context.clone();
         move |value| value_to_element(value, construct_context.clone())
@@ -3886,10 +3891,9 @@ fn element_label(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     // Produces u32 for Padding::all_signal (uniform padding from simple number)
     let padding_all_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv2.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv2.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("padding") {
@@ -3897,19 +3901,20 @@ fn element_label(
                 None => stream::empty().right_stream(),
             }
         })
-        .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(n.number() as u32),
-            _ => None,
-        }))
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number() as u32),
+                _ => None,
+            })
+        })
     });
 
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let font_color_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv3.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv3.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         let font_stream = switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("font") {
@@ -3925,17 +3930,16 @@ fn element_label(
                     None => stream::empty().right_stream(),
                 }
             }),
-            |value| oklch_to_css_stream(value)
+            |value| oklch_to_css_stream(value),
         )
         .boxed_local()
     });
 
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let font_size_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv4.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv4.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         let font_stream = switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("font") {
@@ -3961,10 +3965,9 @@ fn element_label(
     // Strikethrough signal (font.line.strikethrough) - produces bool for FontLine::strike_signal()
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let strikethrough_bool_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv5.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv5.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         let font_stream = switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("font") {
@@ -3988,13 +3991,11 @@ fn element_label(
         })
         .filter_map(|value| {
             let result = match value {
-                Value::Tag(tag, _) => {
-                    match tag.tag() {
-                        "True" => Some(true),
-                        "False" => Some(false),
-                        _ => None,
-                    }
-                }
+                Value::Tag(tag, _) => match tag.tag() {
+                    "True" => Some(true),
+                    "False" => Some(false),
+                    _ => None,
+                },
                 _ => None,
             };
             future::ready(result)
@@ -4005,10 +4006,9 @@ fn element_label(
     // Width signal (supports Fill or exact number)
     let sv_width = tagged_object.expect_variable("settings");
     let width_typed_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_width.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_width.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("width") {
@@ -4031,11 +4031,15 @@ fn element_label(
         .s(Font::new()
             .size_signal(font_size_signal)
             .color_signal(font_color_signal)
-            .line(FontLine::new().strike_signal(strikethrough_bool_signal.map(|opt| opt.unwrap_or(false)))))
+            .line(
+                FontLine::new()
+                    .strike_signal(strikethrough_bool_signal.map(|opt| opt.unwrap_or(false))),
+            ))
         .s(Padding::all_signal(padding_all_signal))
-        .label_signal(signal::from_stream(label_stream).map(|l| {
-            l.unwrap_or_else(|| zoon::Text::new("").unify())
-        }))
+        .label_signal(
+            signal::from_stream(label_stream)
+                .map(|l| l.unwrap_or_else(|| zoon::Text::new("").unify())),
+        )
         .on_double_click({
             let sender = double_click_sender.clone();
             move || {
@@ -4056,25 +4060,23 @@ fn element_paragraph(
     let visible_sig = visible_signal_from_settings(sv_visible);
 
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
-    let contents_stream = switch_map(
-        settings_variable.stream(),
-        |value| value.expect_object().expect_variable("contents").stream()
-    );
-    let contents_vec_diff_stream = switch_map(
-        contents_stream,
-        |value| list_change_to_vec_diff_stream(value.expect_list().stream())
-    );
+    let contents_stream = switch_map(settings_variable.stream(), |value| {
+        value.expect_object().expect_variable("contents").stream()
+    });
+    let contents_vec_diff_stream = switch_map(contents_stream, |value| {
+        list_change_to_vec_diff_stream(value.expect_list().stream())
+    });
 
     Paragraph::new()
         // white-space: pre-wrap is already global in MoonZoon's basic.css
-        .contents_signal_vec(
-            VecDiffStreamSignalVec(contents_vec_diff_stream).map_signal(move |value_actor| {
+        .contents_signal_vec(VecDiffStreamSignalVec(contents_vec_diff_stream).map_signal(
+            move |value_actor| {
                 signal::from_stream(value_actor.stream().map({
                     let construct_context = construct_context.clone();
                     move |value| value_to_element(value, construct_context.clone())
                 }))
-            }),
-        )
+            },
+        ))
         .s(Visible::with_signal(visible_sig))
 }
 
@@ -4083,7 +4085,8 @@ fn element_link(
     construct_context: ConstructContext,
 ) -> impl Element {
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
-    let (hovered_sender, mut hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("link.hovered", BRIDGE_HOVER_CAPACITY);
+    let (hovered_sender, mut hovered_receiver) =
+        NamedChannel::<TimestampedEvent<bool>>::new("link.hovered", BRIDGE_HOVER_CAPACITY);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -4144,10 +4147,9 @@ fn element_link(
 
     // CRITICAL: Use switch_map (not flat_map) because label variable stream is infinite.
     // When settings change, switch_map cancels the old label subscription.
-    let label_stream = switch_map(
-        settings_variable.clone().stream(),
-        |value| value.expect_object().expect_variable("label").stream()
-    )
+    let label_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value.expect_object().expect_variable("label").stream()
+    })
     .map({
         let construct_context = construct_context.clone();
         move |value| value_to_element(value, construct_context.clone())
@@ -4155,10 +4157,9 @@ fn element_link(
 
     let sv_to = settings_variable.clone();
     // CRITICAL: Use switch_map (not flat_map) because 'to' variable stream is infinite.
-    let to_stream = switch_map(
-        sv_to.stream(),
-        |value| value.expect_object().expect_variable("to").stream()
-    )
+    let to_stream = switch_map(sv_to.stream(), |value| {
+        value.expect_object().expect_variable("to").stream()
+    })
     .filter_map(|value| {
         future::ready(match value {
             Value::Text(text, _) => Some(text.text().to_string()),
@@ -4170,10 +4171,9 @@ fn element_link(
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_underline = settings_variable.clone();
     let underline_bool_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_underline.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
+        let style_stream = switch_map(sv_underline.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
         let font_stream = switch_map(style_stream, |value| {
             let obj = value.expect_object();
             match obj.variable("font") {
@@ -4197,13 +4197,11 @@ fn element_link(
         })
         .filter_map(|value| {
             let result = match value {
-                Value::Tag(tag, _) => {
-                    match tag.tag() {
-                        "True" => Some(true),
-                        "False" => Some(false),
-                        _ => None,
-                    }
-                }
+                Value::Tag(tag, _) => match tag.tag() {
+                    "True" => Some(true),
+                    "False" => Some(false),
+                    _ => None,
+                },
                 _ => None,
             };
             future::ready(result)
@@ -4212,16 +4210,19 @@ fn element_link(
     });
 
     Link::new()
-        .label_signal(signal::from_stream(label_stream).map(|l| {
-            l.unwrap_or_else(|| zoon::Text::new("").unify())
-        }))
+        .label_signal(
+            signal::from_stream(label_stream)
+                .map(|l| l.unwrap_or_else(|| zoon::Text::new("").unify())),
+        )
         .to_signal(signal::from_stream(to_stream).map(|t| t.unwrap_or_default()))
         .new_tab(NewTab::new())
         .on_hovered_change(move |is_hovered| {
             // Capture Lamport time NOW at DOM callback, before channel
             hovered_sender.send_or_drop(TimestampedEvent::now(is_hovered));
         })
-        .s(Font::new().line(FontLine::new().underline_signal(underline_bool_signal.map(|opt| opt.unwrap_or(false)))))
+        .s(Font::new().line(
+            FontLine::new().underline_signal(underline_bool_signal.map(|opt| opt.unwrap_or(false))),
+        ))
         .s(Visible::with_signal(visible_sig))
         .after_remove(move |_| {
             drop(event_handler_loop);
@@ -4256,63 +4257,70 @@ fn list_change_to_vec_diff_stream(
 ) -> impl Stream<Item = VecDiff<ActorHandle>> {
     use futures_signals::signal_vec::VecDiff;
 
-    change_stream.scan(
-        Vec::<ActorHandle>::new(),
-        move |items, change| {
-            let vec_diff = match change {
-                ListChange::Replace { items: new_items } => {
-                    *items = new_items.to_vec();
-                    VecDiff::Replace { values: new_items.to_vec() }
+    change_stream.scan(Vec::<ActorHandle>::new(), move |items, change| {
+        let vec_diff = match change {
+            ListChange::Replace { items: new_items } => {
+                *items = new_items.to_vec();
+                VecDiff::Replace {
+                    values: new_items.to_vec(),
                 }
-                ListChange::InsertAt { index, item } => {
-                    if index <= items.len() {
-                        items.insert(index, item.clone());
+            }
+            ListChange::InsertAt { index, item } => {
+                if index <= items.len() {
+                    items.insert(index, item.clone());
+                }
+                VecDiff::InsertAt { index, value: item }
+            }
+            ListChange::UpdateAt { index, item } => {
+                if index < items.len() {
+                    items[index] = item.clone();
+                }
+                VecDiff::UpdateAt { index, value: item }
+            }
+            ListChange::Remove { id } => {
+                // Find index by PersistenceId
+                if let Some(index) = items.iter().position(|item| item.persistence_id() == id) {
+                    items.remove(index);
+                    VecDiff::RemoveAt { index }
+                } else {
+                    // Item not found - emit a no-op Replace with current items
+                    // This shouldn't happen in normal operation
+                    VecDiff::Replace {
+                        values: items.clone(),
                     }
-                    VecDiff::InsertAt { index, value: item }
                 }
-                ListChange::UpdateAt { index, item } => {
-                    if index < items.len() {
-                        items[index] = item.clone();
-                    }
-                    VecDiff::UpdateAt { index, value: item }
-                }
-                ListChange::Remove { id } => {
-                    // Find index by PersistenceId
-                    if let Some(index) = items.iter().position(|item| item.persistence_id() == id) {
-                        items.remove(index);
-                        VecDiff::RemoveAt { index }
+            }
+            ListChange::Move {
+                old_index,
+                new_index,
+            } => {
+                if old_index < items.len() {
+                    let item = items.remove(old_index);
+                    let insert_index = if new_index > old_index {
+                        new_index.saturating_sub(1).min(items.len())
                     } else {
-                        // Item not found - emit a no-op Replace with current items
-                        // This shouldn't happen in normal operation
-                        VecDiff::Replace { values: items.clone() }
-                    }
+                        new_index.min(items.len())
+                    };
+                    items.insert(insert_index, item);
                 }
-                ListChange::Move { old_index, new_index } => {
-                    if old_index < items.len() {
-                        let item = items.remove(old_index);
-                        let insert_index = if new_index > old_index {
-                            new_index.saturating_sub(1).min(items.len())
-                        } else {
-                            new_index.min(items.len())
-                        };
-                        items.insert(insert_index, item);
-                    }
-                    VecDiff::Move { old_index, new_index }
+                VecDiff::Move {
+                    old_index,
+                    new_index,
                 }
-                ListChange::Push { item } => {
-                    items.push(item.clone());
-                    VecDiff::Push { value: item }
-                }
-                ListChange::Pop => {
-                    items.pop();
-                    VecDiff::Pop {}
-                }
-                ListChange::Clear => {
-                    items.clear();
-                    VecDiff::Clear {}
-                }
-            };
-            future::ready(Some(vec_diff))
-        },
-    )
+            }
+            ListChange::Push { item } => {
+                items.push(item.clone());
+                VecDiff::Push { value: item }
+            }
+            ListChange::Pop => {
+                items.pop();
+                VecDiff::Pop {}
+            }
+            ListChange::Clear => {
+                items.clear();
+                VecDiff::Clear {}
+            }
+        };
+        future::ready(Some(vec_diff))
+    })
 }

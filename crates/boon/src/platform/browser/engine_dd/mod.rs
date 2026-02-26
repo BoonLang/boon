@@ -171,16 +171,21 @@ pub fn run_dd_reactive_with_persistence(
         }
 
         CompiledProgram::Dataflow { graph } => {
-            zoon::println!("[DD v2] Dataflow program ({} collections, {} inputs)",
-                graph.collections.len(), graph.inputs.len());
+            zoon::println!(
+                "[DD v2] Dataflow program ({} collections, {} inputs)",
+                graph.collections.len(),
+                graph.inputs.len()
+            );
 
-            let has_timers = graph.inputs.iter().any(|i| {
-                i.kind == core::types::InputKind::Timer
-            });
+            let has_timers = graph
+                .inputs
+                .iter()
+                .any(|i| i.kind == core::types::InputKind::Timer);
 
-            let has_router = graph.inputs.iter().any(|i| {
-                i.kind == core::types::InputKind::Router
-            });
+            let has_router = graph
+                .inputs
+                .iter()
+                .any(|i| i.kind == core::types::InputKind::Router);
 
             // Collect timer specifications before moving graph into worker
             let timer_specs: Vec<(String, f64)> = graph
@@ -197,12 +202,9 @@ pub fn run_dd_reactive_with_persistence(
             let output = Mutable::new(Value::Unit);
             let output_for_callback = output.clone();
 
-            let worker_handle = io::worker::DdWorkerHandle::new_from_graph(
-                graph,
-                move |value| {
-                    output_for_callback.set(value.clone());
-                },
-            );
+            let worker_handle = io::worker::DdWorkerHandle::new_from_graph(graph, move |value| {
+                output_for_callback.set(value.clone());
+            });
 
             // Set up JavaScript intervals for timer inputs
             for (var_name, secs) in &timer_specs {
@@ -239,12 +241,10 @@ pub fn run_dd_reactive_with_persistence(
                                 .inject_dd_event(io::worker::Event::RouterChange { path });
                         },
                     );
-                let _ = web_sys::window()
-                    .unwrap()
-                    .add_event_listener_with_callback(
-                        "popstate",
-                        popstate_closure.as_ref().unchecked_ref(),
-                    );
+                let _ = web_sys::window().unwrap().add_event_listener_with_callback(
+                    "popstate",
+                    popstate_closure.as_ref().unchecked_ref(),
+                );
                 popstate_closure.forget(); // Listener lives until page unload
             }
 
@@ -287,9 +287,8 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
             if let Some(ref w) = worker {
                 // Dataflow programs: retained tree for efficient updates.
                 let ready = Mutable::new(false);
-                let root_cell: std::rc::Rc<
-                    std::cell::RefCell<Option<RawElOrText>>,
-                > = Default::default();
+                let root_cell: std::rc::Rc<std::cell::RefCell<Option<RawElOrText>>> =
+                    Default::default();
                 let retained: std::rc::Rc<
                     std::cell::RefCell<Option<render::bridge::RetainedTree>>,
                 > = Default::default();
@@ -335,9 +334,7 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                 El::new()
                     .s(Width::fill())
                     .s(Height::fill())
-                    .update_raw_el(move |raw_el| {
-                        raw_el.after_remove(move |_| drop(_task_handle))
-                    })
+                    .update_raw_el(move |raw_el| raw_el.after_remove(move |_| drop(_task_handle)))
                     .child_signal(ready.signal().map({
                         let root_cell = root_cell.clone();
                         move |is_ready| {
@@ -350,9 +347,11 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                     }))
             } else {
                 // Static: single render
-                El::new().child_signal(doc.value.signal_cloned().map(|value| {
-                    render::bridge::render_value_static(&value)
-                }))
+                El::new().child_signal(
+                    doc.value
+                        .signal_cloned()
+                        .map(|value| render::bridge::render_value_static(&value)),
+                )
             }
         }
         None => El::new().child("DD Engine: No document"),
@@ -379,5 +378,3 @@ pub fn clear_dd_persisted_states() {
         }
     }
 }
-
-

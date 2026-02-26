@@ -28,7 +28,9 @@ mod scope_resolver;
 pub use scope_resolver::{Referenceables, resolve_references};
 
 mod persistence_resolver;
-pub use persistence_resolver::{Persistence, PersistenceId, PersistenceStatus, Scope, resolve_persistence};
+pub use persistence_resolver::{
+    Persistence, PersistenceId, PersistenceStatus, Scope, resolve_persistence,
+};
 
 mod source;
 pub use source::{SourceCode, StrSlice};
@@ -953,7 +955,10 @@ pub enum TextPart<'code> {
     // Plain text content
     Text(&'code str),
     // Interpolated variable: {var_name}
-    Interpolation { var: &'code str, referenced_span: Option<SimpleSpan> },
+    Interpolation {
+        var: &'code str,
+        referenced_span: Option<SimpleSpan>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1079,7 +1084,11 @@ mod tests {
             let tokens = lexer().parse($code).unwrap();
             let input = tokens.map(
                 span_at($code.len()),
-                |Spanned { node, span, persistence: _ }| (node, span),
+                |Spanned {
+                     node,
+                     span,
+                     persistence: _,
+                 }| (node, span),
             );
             let expressions = parser().parse(input).unwrap();
             let expr = &expressions.into_iter().next().unwrap().node;
@@ -1105,7 +1114,10 @@ mod tests {
             if let Expression::TextLiteral { parts } = expr {
                 assert_eq!(parts.len(), 2);
                 assert!(matches!(parts[0], TextPart::Text("hello ")));
-                assert!(matches!(parts[1], TextPart::Interpolation { var: "name", .. }));
+                assert!(matches!(
+                    parts[1],
+                    TextPart::Interpolation { var: "name", .. }
+                ));
             } else {
                 panic!("Expected TextLiteral, got {:?}", expr);
             }
@@ -1114,18 +1126,27 @@ mod tests {
 
     #[test]
     fn test_text_literal_multiple_interpolations() {
-        parse_and_test!("TEXT { Hello {name}! You have {count} messages. }", |expr: &Expression| {
-            if let Expression::TextLiteral { parts } = expr {
-                assert_eq!(parts.len(), 5);
-                assert!(matches!(parts[0], TextPart::Text("Hello ")));
-                assert!(matches!(parts[1], TextPart::Interpolation { var: "name", .. }));
-                assert!(matches!(parts[2], TextPart::Text("! You have ")));
-                assert!(matches!(parts[3], TextPart::Interpolation { var: "count", .. }));
-                assert!(matches!(parts[4], TextPart::Text(" messages.")));
-            } else {
-                panic!("Expected TextLiteral, got {:?}", expr);
+        parse_and_test!(
+            "TEXT { Hello {name}! You have {count} messages. }",
+            |expr: &Expression| {
+                if let Expression::TextLiteral { parts } = expr {
+                    assert_eq!(parts.len(), 5);
+                    assert!(matches!(parts[0], TextPart::Text("Hello ")));
+                    assert!(matches!(
+                        parts[1],
+                        TextPart::Interpolation { var: "name", .. }
+                    ));
+                    assert!(matches!(parts[2], TextPart::Text("! You have ")));
+                    assert!(matches!(
+                        parts[3],
+                        TextPart::Interpolation { var: "count", .. }
+                    ));
+                    assert!(matches!(parts[4], TextPart::Text(" messages.")));
+                } else {
+                    panic!("Expected TextLiteral, got {:?}", expr);
+                }
             }
-        });
+        );
     }
 
     #[test]
@@ -1166,65 +1187,92 @@ mod tests {
     #[test]
     fn test_comparison_equal() {
         parse_and_test!("1 == 2", |expr: &Expression| {
-            assert!(matches!(expr, Expression::Comparator(Comparator::Equal { .. })));
+            assert!(matches!(
+                expr,
+                Expression::Comparator(Comparator::Equal { .. })
+            ));
         });
     }
 
     #[test]
     fn test_comparison_not_equal() {
         parse_and_test!("1 =/= 2", |expr: &Expression| {
-            assert!(matches!(expr, Expression::Comparator(Comparator::NotEqual { .. })));
+            assert!(matches!(
+                expr,
+                Expression::Comparator(Comparator::NotEqual { .. })
+            ));
         });
     }
 
     #[test]
     fn test_comparison_less() {
         parse_and_test!("1 < 2", |expr: &Expression| {
-            assert!(matches!(expr, Expression::Comparator(Comparator::Less { .. })));
+            assert!(matches!(
+                expr,
+                Expression::Comparator(Comparator::Less { .. })
+            ));
         });
     }
 
     #[test]
     fn test_comparison_greater() {
         parse_and_test!("1 > 2", |expr: &Expression| {
-            assert!(matches!(expr, Expression::Comparator(Comparator::Greater { .. })));
+            assert!(matches!(
+                expr,
+                Expression::Comparator(Comparator::Greater { .. })
+            ));
         });
     }
 
     #[test]
     fn test_arithmetic_add() {
         parse_and_test!("1 + 2", |expr: &Expression| {
-            assert!(matches!(expr, Expression::ArithmeticOperator(ArithmeticOperator::Add { .. })));
+            assert!(matches!(
+                expr,
+                Expression::ArithmeticOperator(ArithmeticOperator::Add { .. })
+            ));
         });
     }
 
     #[test]
     fn test_arithmetic_subtract() {
         parse_and_test!("3 - 1", |expr: &Expression| {
-            assert!(matches!(expr, Expression::ArithmeticOperator(ArithmeticOperator::Subtract { .. })));
+            assert!(matches!(
+                expr,
+                Expression::ArithmeticOperator(ArithmeticOperator::Subtract { .. })
+            ));
         });
     }
 
     #[test]
     fn test_arithmetic_multiply() {
         parse_and_test!("2 * 3", |expr: &Expression| {
-            assert!(matches!(expr, Expression::ArithmeticOperator(ArithmeticOperator::Multiply { .. })));
+            assert!(matches!(
+                expr,
+                Expression::ArithmeticOperator(ArithmeticOperator::Multiply { .. })
+            ));
         });
     }
 
     #[test]
     fn test_when_with_text_pattern() {
-        parse_and_test!("WHEN { TEXT { /active } => Active, __ => All }", |expr: &Expression| {
-            if let Expression::When { arms } = expr {
-                assert_eq!(arms.len(), 2);
-                // First arm should have TEXT literal pattern
-                assert!(matches!(arms[0].pattern, Pattern::Literal(Literal::Text("/active"))));
-                // Second arm should have wildcard pattern
-                assert!(matches!(arms[1].pattern, Pattern::WildCard));
-            } else {
-                panic!("Expected When, got {:?}", expr);
+        parse_and_test!(
+            "WHEN { TEXT { /active } => Active, __ => All }",
+            |expr: &Expression| {
+                if let Expression::When { arms } = expr {
+                    assert_eq!(arms.len(), 2);
+                    // First arm should have TEXT literal pattern
+                    assert!(matches!(
+                        arms[0].pattern,
+                        Pattern::Literal(Literal::Text("/active"))
+                    ));
+                    // Second arm should have wildcard pattern
+                    assert!(matches!(arms[1].pattern, Pattern::WildCard));
+                } else {
+                    panic!("Expected When, got {:?}", expr);
+                }
             }
-        });
+        );
     }
 
     #[test]
@@ -1239,7 +1287,11 @@ mod tests {
 
         let input = tokens.map(
             span_at(source.len()),
-            |Spanned { node, span, persistence: _ }| (node, span)
+            |Spanned {
+                 node,
+                 span,
+                 persistence: _,
+             }| (node, span),
         );
 
         let (ast, errors) = parser().parse(input).into_output_errors();

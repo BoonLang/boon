@@ -24,7 +24,7 @@ use futures_channel::mpsc;
 use pin_project::pin_project;
 use zoon::*;
 
-use super::super::core::types::{KeyedDiff, HOVER_PATH_FIELD, LINK_PATH_FIELD, LIST_TAG};
+use super::super::core::types::{HOVER_PATH_FIELD, KeyedDiff, LINK_PATH_FIELD, LIST_TAG};
 use super::super::core::value::Value;
 use super::super::io::worker::{DdWorkerHandle, Event};
 
@@ -481,11 +481,7 @@ fn extract_background_from_fields(fields: &Fields) -> Option<Background<'static>
         background = background.url(url.to_string());
         has_any = true;
     }
-    if has_any {
-        Some(background)
-    } else {
-        None
-    }
+    if has_any { Some(background) } else { None }
 }
 
 /// Extract background color from a Value (for signal closures).
@@ -670,11 +666,7 @@ fn extract_borders_from_fields(fields: &Fields) -> Option<Borders<'static>> {
             has_any = true;
         }
     }
-    if has_any {
-        Some(result)
-    } else {
-        None
-    }
+    if has_any { Some(result) } else { None }
 }
 
 /// Extract AlignContent from element fields' style.
@@ -704,11 +696,7 @@ fn extract_align_content_from_fields(fields: &Fields) -> Option<AlignContent> {
         };
         has_any = true;
     }
-    if has_any {
-        Some(result)
-    } else {
-        None
-    }
+    if has_any { Some(result) } else { None }
 }
 
 fn extract_align_content(value: &Value) -> Option<AlignContent> {

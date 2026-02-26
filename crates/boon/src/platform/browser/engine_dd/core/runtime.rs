@@ -8,13 +8,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use differential_dataflow::VecCollection;
 use differential_dataflow::input::Input;
 use differential_dataflow::input::InputSession;
-use differential_dataflow::VecCollection;
 use timely::dataflow::Scope;
 
 use super::operators;
-use super::types::{CollectionSpec, DataflowGraph, InputId, KeyedDiff, ListKey, SideEffectKind, VarId};
+use super::types::{
+    CollectionSpec, DataflowGraph, InputId, KeyedDiff, ListKey, SideEffectKind, VarId,
+};
 use super::value::Value;
 
 /// Result of materializing a DataflowGraph into a live DD dataflow.
@@ -112,14 +114,12 @@ where
                 AnyCollection::Keyed(coll)
             }
 
-            CollectionSpec::Input(input_id) => {
-                AnyCollection::Scalar(
-                    input_collections
-                        .get(input_id)
-                        .expect("Input collection not found")
-                        .clone(),
-                )
-            }
+            CollectionSpec::Input(input_id) => AnyCollection::Scalar(
+                input_collections
+                    .get(input_id)
+                    .expect("Input collection not found")
+                    .clone(),
+            ),
 
             CollectionSpec::HoldState {
                 initial,
@@ -199,10 +199,7 @@ where
                     .as_scalar()
                     .clone();
                 for src in &sources[1..] {
-                    let other = collections
-                        .get(src)
-                        .expect("Source not found")
-                        .as_scalar();
+                    let other = collections.get(src).expect("Source not found").as_scalar();
                     concatted = concatted.concat(other);
                 }
                 AnyCollection::Scalar(operators::hold_latest(&concatted))
@@ -215,10 +212,7 @@ where
                     .as_scalar()
                     .clone();
                 for src in &sources[1..] {
-                    let other = collections
-                        .get(src)
-                        .expect("Source not found")
-                        .as_scalar();
+                    let other = collections.get(src).expect("Source not found").as_scalar();
                     result = result.concat(other);
                 }
                 AnyCollection::Scalar(result)
@@ -251,7 +245,6 @@ where
             // ---------------------------------------------------------------
             // List operations — real DD operators
             // ---------------------------------------------------------------
-
             CollectionSpec::ListCount(source) => {
                 let list = collections
                     .get(source)
@@ -370,10 +363,7 @@ where
                     .expect("MapToKeyed source not found")
                     .as_scalar();
                 let classify = Arc::clone(classify);
-                AnyCollection::Keyed(operators::map_to_keyed(
-                    source_coll,
-                    move |v| classify(v),
-                ))
+                AnyCollection::Keyed(operators::map_to_keyed(source_coll, move |v| classify(v)))
             }
 
             CollectionSpec::AppendNewKeyed {
@@ -392,7 +382,6 @@ where
                     *initial_counter,
                 ))
             }
-
         };
 
         collections.insert(var_id.clone(), any_collection);

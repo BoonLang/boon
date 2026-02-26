@@ -18,8 +18,8 @@ use zoon::*;
 
 use super::super::core::runtime;
 use super::super::core::types::{
-    DataflowGraph, InputId, InputKind, KeyedDiff, LinkId, ListKey, SideEffectKind, LIST_TAG,
-    ROUTER_INPUT,
+    DataflowGraph, InputId, InputKind, KeyedDiff, LIST_TAG, LinkId, ListKey, ROUTER_INPUT,
+    SideEffectKind,
 };
 use super::super::core::value::Value;
 

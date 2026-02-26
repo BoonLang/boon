@@ -2,10 +2,13 @@ use std::future;
 use std::sync::Arc;
 
 use zoon::Timer;
-use zoon::futures_util::{select, stream::{self, LocalBoxStream, Stream, StreamExt}, FutureExt, SinkExt};
 use zoon::futures_channel::mpsc;
+use zoon::futures_util::{
+    FutureExt, SinkExt, select,
+    stream::{self, LocalBoxStream, Stream, StreamExt},
+};
+use zoon::{Closure, JsCast, JsValue, SendWrapper, UnwrapThrowExt, history, window};
 use zoon::{Deserialize, Serialize, serde};
-use zoon::{window, history, Closure, JsValue, UnwrapThrowExt, JsCast, SendWrapper};
 
 use super::engine::*;
 
@@ -95,10 +98,19 @@ pub fn function_element_stripe(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [argument_element, argument_direction, argument_gap, argument_style, argument_items] =
-        arguments.as_slice() else {
-            panic!("Element/stripe requires 5 arguments, got {}", arguments.len());
-        };
+    let [
+        argument_element,
+        argument_direction,
+        argument_gap,
+        argument_style,
+        argument_items,
+    ] = arguments.as_slice()
+    else {
+        panic!(
+            "Element/stripe requires 5 arguments, got {}",
+            arguments.len()
+        );
+    };
     let scoped_id = function_call_persistence_id;
     TaggedObject::new_constant(
         ConstructInfo::new(
@@ -299,7 +311,10 @@ pub fn function_element_stack(
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let [argument_element, argument_style, argument_layers] = arguments.as_slice() else {
-        panic!("Element/stack requires 3 arguments, got {}", arguments.len());
+        panic!(
+            "Element/stack requires 3 arguments, got {}",
+            arguments.len()
+        );
     };
     let scoped_id = function_call_persistence_id;
     TaggedObject::new_constant(
@@ -526,8 +541,14 @@ pub fn function_element_text_input(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [argument_element, argument_style, argument_label, argument_text, argument_placeholder, argument_focus] =
-        arguments.as_slice()
+    let [
+        argument_element,
+        argument_style,
+        argument_label,
+        argument_text,
+        argument_placeholder,
+        argument_focus,
+    ] = arguments.as_slice()
     else {
         panic!("Element/text_input expects 6 arguments")
     };
@@ -711,8 +732,13 @@ pub fn function_element_checkbox(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [argument_element, argument_style, argument_label, argument_checked, argument_icon] =
-        arguments.as_slice()
+    let [
+        argument_element,
+        argument_style,
+        argument_label,
+        argument_checked,
+        argument_icon,
+    ] = arguments.as_slice()
     else {
         panic!("Element/checkbox expects 5 arguments")
     };
@@ -1096,8 +1122,13 @@ pub fn function_element_link(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [argument_element, argument_style, argument_label, argument_to, argument_new_tab] =
-        arguments.as_slice()
+    let [
+        argument_element,
+        argument_style,
+        argument_label,
+        argument_to,
+        argument_new_tab,
+    ] = arguments.as_slice()
     else {
         panic!("Element/link expects 5 arguments")
     };
@@ -1231,66 +1262,68 @@ pub fn function_math_sum(
             loaded
         }
     })
-        .filter_map(future::ready)
-        .chain(stream::once(async move {
+    .filter_map(future::ready)
+    .chain(
+        stream::once(async move {
             argument_increment_for_chain.stream().map(|value| State {
                 input_value_idempotency_key: Some(value.idempotency_key()),
                 sum: value.expect_number().number(),
                 output_value_idempotency_key: None,
             })
-        }).flatten())
-        // @TODO refactor with async closure once possible?
-        .scan(State::default(), {
-            move |state,
-                  State {
-                      input_value_idempotency_key,
-                      sum: number,
-                      output_value_idempotency_key,
-                  }| {
-                let storage = storage.clone();
-                let skip_value = state.input_value_idempotency_key == input_value_idempotency_key;
-                if !skip_value {
-                    state.input_value_idempotency_key = input_value_idempotency_key;
-                    state.sum += number;
-                    state.output_value_idempotency_key = if output_value_idempotency_key.is_some() {
-                        output_value_idempotency_key
-                    } else {
-                        Some(ValueIdempotencyKey::new())
-                    };
-                }
-                let state = *state;
-                async move {
-                    if skip_value {
-                        Some(None)
-                    } else {
-                        storage.save_state(function_call_persistence_id, &state);
-                        Some(Some((
-                            state.sum,
-                            state.output_value_idempotency_key.unwrap(),
-                        )))
-                    }
+        })
+        .flatten(),
+    )
+    // @TODO refactor with async closure once possible?
+    .scan(State::default(), {
+        move |state,
+              State {
+                  input_value_idempotency_key,
+                  sum: number,
+                  output_value_idempotency_key,
+              }| {
+            let storage = storage.clone();
+            let skip_value = state.input_value_idempotency_key == input_value_idempotency_key;
+            if !skip_value {
+                state.input_value_idempotency_key = input_value_idempotency_key;
+                state.sum += number;
+                state.output_value_idempotency_key = if output_value_idempotency_key.is_some() {
+                    output_value_idempotency_key
+                } else {
+                    Some(ValueIdempotencyKey::new())
+                };
+            }
+            let state = *state;
+            async move {
+                if skip_value {
+                    Some(None)
+                } else {
+                    storage.save_state(function_call_persistence_id, &state);
+                    Some(Some((
+                        state.sum,
+                        state.output_value_idempotency_key.unwrap(),
+                    )))
                 }
             }
-        })
-        .filter_map(future::ready)
-        .map({
-            let mut result_version = 0u64;
-            move |(sum, idempotency_key)| {
-                let value = Number::new_value(
-                    ConstructInfo::new(
-                        function_call_id
-                            .with_child_id(format!("Math/sum result v.{result_version}")),
-                        None,
-                        "Math/sum(..) -> Number",
-                    ),
-                    construct_context.clone(),
-                    idempotency_key,
-                    sum,
-                );
-                result_version += 1;
-                value
-            }
-        })
+        }
+    })
+    .filter_map(future::ready)
+    .map({
+        let mut result_version = 0u64;
+        move |(sum, idempotency_key)| {
+            let value = Number::new_value(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(format!("Math/sum result v.{result_version}")),
+                    None,
+                    "Math/sum(..) -> Number",
+                ),
+                construct_context.clone(),
+                idempotency_key,
+                sum,
+            );
+            result_version += 1;
+            value
+        }
+    })
 }
 
 // @TODO remember configuration?
@@ -1415,27 +1448,35 @@ pub fn function_text_is_empty(
     let [argument_text] = arguments.as_slice() else {
         panic!("Text/is_empty expects 1 argument")
     };
-    argument_text.clone().stream().scan(None::<bool>, move |last_result, value| {
-        let text = match &value {
-            Value::Text(t, _) => t.text(),
-            _ => panic!("Text/is_empty expects a Text value"),
-        };
-        let current_result = text.is_empty();
+    argument_text
+        .clone()
+        .stream()
+        .scan(None::<bool>, move |last_result, value| {
+            let text = match &value {
+                Value::Text(t, _) => t.text(),
+                _ => panic!("Text/is_empty expects a Text value"),
+            };
+            let current_result = text.is_empty();
 
-        // Only emit when result actually changes
-        if *last_result != Some(current_result) {
-            *last_result = Some(current_result);
-            let tag = if current_result { "True" } else { "False" };
-            future::ready(Some(Some(Tag::new_value(
-                ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/is_empty result"),
-                construct_context.clone(),
-                ValueIdempotencyKey::new(),
-                tag.to_string(),
-            ))))
-        } else {
-            future::ready(Some(None))
-        }
-    }).filter_map(future::ready)
+            // Only emit when result actually changes
+            if *last_result != Some(current_result) {
+                *last_result = Some(current_result);
+                let tag = if current_result { "True" } else { "False" };
+                future::ready(Some(Some(Tag::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "Text/is_empty result",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    tag.to_string(),
+                ))))
+            } else {
+                future::ready(Some(None))
+            }
+        })
+        .filter_map(future::ready)
 }
 
 /// Text/is_not_empty(text) -> Tag (True/False)
@@ -1450,27 +1491,35 @@ pub fn function_text_is_not_empty(
     let [argument_text] = arguments.as_slice() else {
         panic!("Text/is_not_empty expects 1 argument")
     };
-    argument_text.clone().stream().scan(None::<bool>, move |last_result, value| {
-        let text = match &value {
-            Value::Text(t, _) => t.text(),
-            _ => panic!("Text/is_not_empty expects a Text value"),
-        };
-        let current_result = !text.is_empty();
+    argument_text
+        .clone()
+        .stream()
+        .scan(None::<bool>, move |last_result, value| {
+            let text = match &value {
+                Value::Text(t, _) => t.text(),
+                _ => panic!("Text/is_not_empty expects a Text value"),
+            };
+            let current_result = !text.is_empty();
 
-        // Only emit when result actually changes
-        if *last_result != Some(current_result) {
-            *last_result = Some(current_result);
-            let tag = if current_result { "True" } else { "False" };
-            future::ready(Some(Some(Tag::new_value(
-                ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/is_not_empty result"),
-                construct_context.clone(),
-                ValueIdempotencyKey::new(),
-                tag.to_string(),
-            ))))
-        } else {
-            future::ready(Some(None))
-        }
-    }).filter_map(future::ready)
+            // Only emit when result actually changes
+            if *last_result != Some(current_result) {
+                *last_result = Some(current_result);
+                let tag = if current_result { "True" } else { "False" };
+                future::ready(Some(Some(Tag::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "Text/is_not_empty result",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    tag.to_string(),
+                ))))
+            } else {
+                future::ready(Some(None))
+            }
+        })
+        .filter_map(future::ready)
 }
 
 // --- Bool functions ---
@@ -1535,13 +1584,17 @@ pub fn function_bool_toggle(
             _ => false,
         };
         let new_value = match state {
-            None => is_true, // First value sets initial state
+            None => is_true,            // First value sets initial state
             Some(_) => !state.unwrap(), // Toggle on subsequent values
         };
         *state = Some(new_value);
         let result_tag = if new_value { "True" } else { "False" };
         future::ready(Some(Tag::new_value(
-            ConstructInfo::new(function_call_id.with_child_id(0), None, "Bool/toggle result"),
+            ConstructInfo::new(
+                function_call_id.with_child_id(0),
+                None,
+                "Bool/toggle result",
+            ),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
             result_tag.to_string(),
@@ -1566,18 +1619,21 @@ pub fn function_bool_or(
     let that_stream = that_actor.stream().map(|v| (false, v));
 
     stream::select(this_stream, that_stream)
-        .scan((None::<bool>, None::<bool>), move |state, (is_this, value)| {
-            let is_true = match &value {
-                Value::Tag(tag, _) => tag.tag() == "True",
-                _ => false,
-            };
-            if is_this {
-                state.0 = Some(is_true);
-            } else {
-                state.1 = Some(is_true);
-            }
-            future::ready(Some(*state))
-        })
+        .scan(
+            (None::<bool>, None::<bool>),
+            move |state, (is_this, value)| {
+                let is_true = match &value {
+                    Value::Tag(tag, _) => tag.tag() == "True",
+                    _ => false,
+                };
+                if is_this {
+                    state.0 = Some(is_true);
+                } else {
+                    state.1 = Some(is_true);
+                }
+                future::ready(Some(*state))
+            },
+        )
         .filter_map(move |(this_bool, that_bool)| {
             let construct_context = construct_context.clone();
             let function_call_id = function_call_id.clone();
@@ -1586,7 +1642,11 @@ pub fn function_bool_or(
                     let result = a || b;
                     let tag = if result { "True" } else { "False" };
                     Some(Tag::new_value(
-                        ConstructInfo::new(function_call_id.with_child_id(0), None, "Bool/or result"),
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(0),
+                            None,
+                            "Bool/or result",
+                        ),
                         construct_context,
                         ValueIdempotencyKey::new(),
                         tag.to_string(),
@@ -1610,34 +1670,46 @@ pub fn function_list_is_empty(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
-    list_actor.stream().filter_map(move |value| {
-        let result = match &value {
-            Value::List(list, _) => Some(list.clone()),
-            _ => None,
-        };
-        future::ready(result)
-    }).flat_map(move |list| {
-        let construct_context = construct_context.clone();
-        let function_call_id = function_call_id.clone();
-        list.stream().scan((Vec::<ActorHandle>::new(), None::<bool>), move |(items, last_result), change| {
-            change.apply_to_vec(items);
-            let current_result = items.is_empty();
+    list_actor
+        .stream()
+        .filter_map(move |value| {
+            let result = match &value {
+                Value::List(list, _) => Some(list.clone()),
+                _ => None,
+            };
+            future::ready(result)
+        })
+        .flat_map(move |list| {
+            let construct_context = construct_context.clone();
+            let function_call_id = function_call_id.clone();
+            list.stream()
+                .scan(
+                    (Vec::<ActorHandle>::new(), None::<bool>),
+                    move |(items, last_result), change| {
+                        change.apply_to_vec(items);
+                        let current_result = items.is_empty();
 
-            // Only emit when result actually changes
-            if *last_result != Some(current_result) {
-                *last_result = Some(current_result);
-                let tag = if current_result { "True" } else { "False" };
-                future::ready(Some(Some(Tag::new_value(
-                    ConstructInfo::new(function_call_id.with_child_id(0), None, "List/is_empty result"),
-                    construct_context.clone(),
-                    ValueIdempotencyKey::new(),
-                    tag.to_string(),
-                ))))
-            } else {
-                future::ready(Some(None))
-            }
-        }).filter_map(future::ready)
-    })
+                        // Only emit when result actually changes
+                        if *last_result != Some(current_result) {
+                            *last_result = Some(current_result);
+                            let tag = if current_result { "True" } else { "False" };
+                            future::ready(Some(Some(Tag::new_value(
+                                ConstructInfo::new(
+                                    function_call_id.with_child_id(0),
+                                    None,
+                                    "List/is_empty result",
+                                ),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                tag.to_string(),
+                            ))))
+                        } else {
+                            future::ready(Some(None))
+                        }
+                    },
+                )
+                .filter_map(future::ready)
+        })
 }
 
 /// List/count -> Number
@@ -1651,33 +1723,45 @@ pub fn function_list_count(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
-    list_actor.stream().filter_map(move |value| {
-        let result = match &value {
-            Value::List(list, _) => Some(list.clone()),
-            _ => None,
-        };
-        future::ready(result)
-    }).flat_map(move |list| {
-        let construct_context = construct_context.clone();
-        let function_call_id = function_call_id.clone();
-        list.stream().scan((Vec::<ActorHandle>::new(), None::<usize>), move |(items, last_count), change| {
-            change.apply_to_vec(items);
-            let current_count = items.len();
+    list_actor
+        .stream()
+        .filter_map(move |value| {
+            let result = match &value {
+                Value::List(list, _) => Some(list.clone()),
+                _ => None,
+            };
+            future::ready(result)
+        })
+        .flat_map(move |list| {
+            let construct_context = construct_context.clone();
+            let function_call_id = function_call_id.clone();
+            list.stream()
+                .scan(
+                    (Vec::<ActorHandle>::new(), None::<usize>),
+                    move |(items, last_count), change| {
+                        change.apply_to_vec(items);
+                        let current_count = items.len();
 
-            // Only emit when count actually changes
-            if *last_count != Some(current_count) {
-                *last_count = Some(current_count);
-                future::ready(Some(Some(Number::new_value(
-                    ConstructInfo::new(function_call_id.with_child_id(0), None, "List/count result"),
-                    construct_context.clone(),
-                    ValueIdempotencyKey::new(),
-                    current_count as f64,
-                ))))
-            } else {
-                future::ready(Some(None))
-            }
-        }).filter_map(future::ready)
-    })
+                        // Only emit when count actually changes
+                        if *last_count != Some(current_count) {
+                            *last_count = Some(current_count);
+                            future::ready(Some(Some(Number::new_value(
+                                ConstructInfo::new(
+                                    function_call_id.with_child_id(0),
+                                    None,
+                                    "List/count result",
+                                ),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                current_count as f64,
+                            ))))
+                        } else {
+                            future::ready(Some(None))
+                        }
+                    },
+                )
+                .filter_map(future::ready)
+        })
 }
 
 /// List/is_not_empty() -> Tag (True/False)
@@ -1691,34 +1775,46 @@ pub fn function_list_is_not_empty(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
-    list_actor.stream().filter_map(move |value| {
-        let result = match &value {
-            Value::List(list, _) => Some(list.clone()),
-            _ => None,
-        };
-        future::ready(result)
-    }).flat_map(move |list| {
-        let construct_context = construct_context.clone();
-        let function_call_id = function_call_id.clone();
-        list.stream().scan((Vec::<ActorHandle>::new(), None::<bool>), move |(items, last_result), change| {
-            change.apply_to_vec(items);
-            let current_result = !items.is_empty();
+    list_actor
+        .stream()
+        .filter_map(move |value| {
+            let result = match &value {
+                Value::List(list, _) => Some(list.clone()),
+                _ => None,
+            };
+            future::ready(result)
+        })
+        .flat_map(move |list| {
+            let construct_context = construct_context.clone();
+            let function_call_id = function_call_id.clone();
+            list.stream()
+                .scan(
+                    (Vec::<ActorHandle>::new(), None::<bool>),
+                    move |(items, last_result), change| {
+                        change.apply_to_vec(items);
+                        let current_result = !items.is_empty();
 
-            // Only emit when result actually changes
-            if *last_result != Some(current_result) {
-                *last_result = Some(current_result);
-                let tag = if current_result { "True" } else { "False" };
-                future::ready(Some(Some(Tag::new_value(
-                    ConstructInfo::new(function_call_id.with_child_id(0), None, "List/is_not_empty result"),
-                    construct_context.clone(),
-                    ValueIdempotencyKey::new(),
-                    tag.to_string(),
-                ))))
-            } else {
-                future::ready(Some(None))
-            }
-        }).filter_map(future::ready)
-    })
+                        // Only emit when result actually changes
+                        if *last_result != Some(current_result) {
+                            *last_result = Some(current_result);
+                            let tag = if current_result { "True" } else { "False" };
+                            future::ready(Some(Some(Tag::new_value(
+                                ConstructInfo::new(
+                                    function_call_id.with_child_id(0),
+                                    None,
+                                    "List/is_not_empty result",
+                                ),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                tag.to_string(),
+                            ))))
+                        } else {
+                            future::ready(Some(None))
+                        }
+                    },
+                )
+                .filter_map(future::ready)
+        })
 }
 
 /// List/append(item: value) -> List
@@ -1758,12 +1854,17 @@ pub fn function_list_append(
             FromAppend(ListChange),
         }
 
-        let list_changes = list_actor.clone().stream().filter_map(|value| {
-            future::ready(match value {
-                Value::List(list, _) => Some(list),
-                _ => None,
+        let list_changes = list_actor
+            .clone()
+            .stream()
+            .filter_map(|value| {
+                future::ready(match value {
+                    Value::List(list, _) => Some(list),
+                    _ => None,
+                })
             })
-        }).flat_map(|list| list.stream()).map(TaggedChange::FromList);
+            .flat_map(|list| list.stream())
+            .map(TaggedChange::FromList);
 
         let append_changes = item_actor.clone().stream().map(move |value| {
             // When item stream produces a value, create a new constant ValueActor
@@ -1781,7 +1882,9 @@ pub fn function_list_append(
                 PersistenceId::new(),
                 actor_context_for_append.scope_id(),
             );
-            TaggedChange::FromAppend(ListChange::Push { item: new_item_actor })
+            TaggedChange::FromAppend(ListChange::Push {
+                item: new_item_actor,
+            })
         });
 
         // Merge both change streams, then use scan to ensure proper ordering
@@ -1817,13 +1920,17 @@ pub fn function_list_append(
                     };
 
                     future::ready(Some(changes_to_emit))
-                }
+                },
             )
             .flat_map(|changes| stream::iter(changes))
     };
 
     let list = List::new_with_change_stream(
-        ConstructInfo::new(function_call_id.with_child_id(ulid::Ulid::new().to_string()), None, "List/append result"),
+        ConstructInfo::new(
+            function_call_id.with_child_id(ulid::Ulid::new().to_string()),
+            None,
+            "List/append result",
+        ),
         actor_context,
         change_stream,
         (list_actor, item_actor),
@@ -1845,7 +1952,6 @@ pub fn function_list_clear(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-
     // arguments[0] = the list (piped)
     // arguments[1] = the trigger stream (on: xxx)
     let list_actor = arguments[0].clone();
@@ -1866,17 +1972,23 @@ pub fn function_list_clear(
             Clear,
         }
 
-        let list_changes = list_actor.clone().stream().filter_map(|value| {
-            future::ready(match value {
-                Value::List(list, _) => Some(list),
-                _ => None,
+        let list_changes = list_actor
+            .clone()
+            .stream()
+            .filter_map(|value| {
+                future::ready(match value {
+                    Value::List(list, _) => Some(list),
+                    _ => None,
+                })
             })
-        }).flat_map(|list| list.stream()).map(TaggedChange::FromList);
+            .flat_map(|list| list.stream())
+            .map(TaggedChange::FromList);
 
         // When trigger stream emits any value, emit Clear
-        let clear_changes = trigger_actor.clone().stream().map(|_value| {
-            TaggedChange::Clear
-        });
+        let clear_changes = trigger_actor
+            .clone()
+            .stream()
+            .map(|_value| TaggedChange::Clear);
 
         // Track items so we can clear their source storage on Clear
         // State: (has_received_first, has_pending_clear, tracked_items)
@@ -1906,7 +2018,9 @@ pub fn function_list_clear(
                                     tracked_items.clear();
                                 }
                                 ListChange::Remove { id } => {
-                                    if let Some(pos) = tracked_items.iter().position(|i| i.persistence_id() == *id) {
+                                    if let Some(pos) =
+                                        tracked_items.iter().position(|i| i.persistence_id() == *id)
+                                    {
                                         tracked_items.remove(pos);
                                     }
                                 }
@@ -1944,7 +2058,7 @@ pub fn function_list_clear(
                     };
 
                     future::ready(Some(changes_to_emit))
-                }
+                },
             )
             .flat_map(|changes| stream::iter(changes))
     };
@@ -1969,7 +2083,7 @@ pub fn function_list_clear(
 /// Called when List/clear triggers to ensure items don't restore on next Run.
 fn clear_source_storage_for_items(items: &[ActorHandle]) {
     use std::collections::HashSet;
-    use zoon::{local_storage, WebStorage};
+    use zoon::{WebStorage, local_storage};
 
     // Collect unique source storage keys
     let mut source_keys: HashSet<String> = HashSet::new();
@@ -1981,7 +2095,9 @@ fn clear_source_storage_for_items(items: &[ActorHandle]) {
 
     // Clear each source storage key
     for key in source_keys {
-        if LOG_DEBUG { zoon::println!("[DEBUG] List/clear: Clearing source storage key: {}", key); }
+        if LOG_DEBUG {
+            zoon::println!("[DEBUG] List/clear: Clearing source storage key: {}", key);
+        }
         local_storage().remove(&key);
     }
 }
@@ -1998,38 +2114,46 @@ pub fn function_list_latest(
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
 
-    list_actor.stream().filter_map(|value| {
-        future::ready(match value {
-            Value::List(list, _) => Some(list),
-            _ => None,
+    list_actor
+        .stream()
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::List(list, _) => Some(list),
+                _ => None,
+            })
         })
-    }).flat_map(move |list| {
-        let construct_context = construct_context.clone();
-        let function_call_id = function_call_id.clone();
+        .flat_map(move |list| {
+            let construct_context = construct_context.clone();
+            let function_call_id = function_call_id.clone();
 
-        // Subscribe to list changes and maintain current items
-        list.stream().scan(Vec::<ActorHandle>::new(), move |items, change| {
-            change.apply_to_vec(items);
-            // Return current items for merging
-            future::ready(Some(items.clone()))
-        }).flat_map(move |items| {
-            // Merge all item streams, sorted by Lamport timestamp
-            let streams: Vec<_> = items.iter().map(|item| item.clone().stream()).collect();
-            stream::select_all(streams)
-                .ready_chunks(16)
-                .flat_map(|mut chunk| {
-                    chunk.sort_by_key(|value| value.lamport_time());
-                    stream::iter(chunk)
+            // Subscribe to list changes and maintain current items
+            list.stream()
+                .scan(Vec::<ActorHandle>::new(), move |items, change| {
+                    change.apply_to_vec(items);
+                    // Return current items for merging
+                    future::ready(Some(items.clone()))
+                })
+                .flat_map(move |items| {
+                    // Merge all item streams, sorted by Lamport timestamp
+                    let streams: Vec<_> = items.iter().map(|item| item.clone().stream()).collect();
+                    stream::select_all(streams)
+                        .ready_chunks(16)
+                        .flat_map(|mut chunk| {
+                            chunk.sort_by_key(|value| value.lamport_time());
+                            stream::iter(chunk)
+                        })
                 })
         })
-    })
 }
 
 // --- Router functions ---
 
 /// Get the current URL pathname from the browser
 fn get_current_pathname() -> String {
-    window().location().pathname().unwrap_or_else(|_| "/".to_string())
+    window()
+        .location()
+        .pathname()
+        .unwrap_or_else(|_| "/".to_string())
 }
 
 /// Router/route() -> Text
@@ -2047,9 +2171,13 @@ pub fn function_router_route(
 
     // Send initial route
     let initial_path = get_current_pathname();
-    if LOG_DEBUG { zoon::println!("[ROUTER] Initial route: '{}'", initial_path); }
+    if LOG_DEBUG {
+        zoon::println!("[ROUTER] Initial route: '{}'", initial_path);
+    }
     if let Err(e) = route_sender.try_send(initial_path) {
-        if LOG_DEBUG { zoon::println!("[ROUTER] Failed to send initial route: {e}"); }
+        if LOG_DEBUG {
+            zoon::println!("[ROUTER] Failed to send initial route: {e}");
+        }
     }
 
     // Set up popstate listener for browser back/forward navigation
@@ -2058,7 +2186,9 @@ pub fn function_router_route(
         move || {
             let path = get_current_pathname();
             if let Err(e) = route_sender.clone().try_send(path) {
-                if LOG_DEBUG { zoon::println!("[ROUTER] Failed to send popstate route: {e}"); }
+                if LOG_DEBUG {
+                    zoon::println!("[ROUTER] Failed to send popstate route: {e}");
+                }
             }
         }
     });
@@ -2077,7 +2207,9 @@ pub fn function_router_route(
 
     // Convert route strings to Text values
     route_receiver.map(move |path| {
-        if LOG_DEBUG { zoon::println!("[ROUTER] Emitting route: '{}'", path); }
+        if LOG_DEBUG {
+            zoon::println!("[ROUTER] Emitting route: '{}'", path);
+        }
         // Prevent drop: captured by `move` closure, lives as long as stream combinator
         let _popstate_closure = &popstate_closure;
         Text::new_value(
@@ -2110,7 +2242,9 @@ pub fn function_router_go_to(
             Value::Text(text, _) => text.text().to_string(),
             _ => "/".to_string(),
         };
-        if LOG_DEBUG { zoon::println!("[ROUTER] go_to called with route: '{}'", route); }
+        if LOG_DEBUG {
+            zoon::println!("[ROUTER] go_to called with route: '{}'", route);
+        }
 
         // Navigate using browser history API
         if route.starts_with('/') {
@@ -2122,14 +2256,20 @@ pub fn function_router_go_to(
             ROUTE_SENDER.with(|cell| {
                 if let Some(sender) = cell.borrow_mut().as_mut() {
                     if let Err(e) = sender.try_send(route) {
-                        if LOG_DEBUG { zoon::println!("[ROUTER] Failed to send go_to route: {e}"); }
+                        if LOG_DEBUG {
+                            zoon::println!("[ROUTER] Failed to send go_to route: {e}");
+                        }
                     }
                 }
             });
         }
 
         Object::new_value(
-            ConstructInfo::new(function_call_id.with_child_id(0), None, "Router/go_to result"),
+            ConstructInfo::new(
+                function_call_id.with_child_id(0),
+                None,
+                "Router/go_to result",
+            ),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
             [],
@@ -2157,8 +2297,8 @@ pub fn function_ulid_generate(
 
 // --- Log functions ---
 
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 
 /// Default timeout in milliseconds for waiting on nested actor values
 const LOG_VALUE_DEFAULT_TIMEOUT_MS: u32 = 100;
@@ -2192,7 +2332,8 @@ fn resolve_value_for_log(value: Value, timeout_ms: u32) -> Pin<Box<dyn Future<Ou
                 let mut fields = Vec::new();
                 for variable in object.variables() {
                     let name = variable.name().to_string();
-                    let field_value = resolve_actor_value_for_log(variable.value_actor(), timeout_ms).await;
+                    let field_value =
+                        resolve_actor_value_for_log(variable.value_actor(), timeout_ms).await;
                     fields.push(format!("{}: {}", name, field_value));
                 }
                 format!("[{}]", fields.join(", "))
@@ -2201,7 +2342,8 @@ fn resolve_value_for_log(value: Value, timeout_ms: u32) -> Pin<Box<dyn Future<Ou
                 let mut fields = Vec::new();
                 for variable in tagged.variables() {
                     let name = variable.name().to_string();
-                    let field_value = resolve_actor_value_for_log(variable.value_actor(), timeout_ms).await;
+                    let field_value =
+                        resolve_actor_value_for_log(variable.value_actor(), timeout_ms).await;
                     fields.push(format!("{}: {}", name, field_value));
                 }
                 format!("{}[{}]", tagged.tag(), fields.join(", "))
@@ -2218,21 +2360,25 @@ fn resolve_value_for_log(value: Value, timeout_ms: u32) -> Pin<Box<dyn Future<Ou
                     format!("LIST {{ {} }}", items.join(", "))
                 }
             }
-            Value::Flushed(inner, _) => format!("Flushed[{}]", resolve_value_for_log(*inner, timeout_ms).await),
+            Value::Flushed(inner, _) => format!(
+                "Flushed[{}]",
+                resolve_value_for_log(*inner, timeout_ms).await
+            ),
         }
     })
 }
 
 /// Async function to get value from a ValueActor for logging with timeout.
 /// Returns `?` if no value arrives within the timeout.
-fn resolve_actor_value_for_log(actor: ActorHandle, timeout_ms: u32) -> Pin<Box<dyn Future<Output = String>>> {
+fn resolve_actor_value_for_log(
+    actor: ActorHandle,
+    timeout_ms: u32,
+) -> Pin<Box<dyn Future<Output = String>>> {
     Box::pin(async move {
         use zoon::futures_util::StreamExt;
 
         // Race subscription against timeout
-        let get_value = async {
-            actor.stream().next().await
-        };
+        let get_value = async { actor.stream().next().await };
         let timeout = Timer::sleep(timeout_ms);
 
         select! {
@@ -2286,12 +2432,18 @@ async fn extract_log_options_from_with(with_actor: ActorHandle) -> LogOptions {
                 if let Value::TaggedObject(tagged, _) = timeout_value {
                     if tagged.tag() == "Duration" {
                         if let Some(seconds_var) = tagged.variable("seconds") {
-                            if let Some(Value::Number(num, _)) = seconds_var.value_actor().stream().next().await {
-                                options.timeout_ms = (num.number() * 1000.0).max(0.0).min(u32::MAX as f64) as u32;
+                            if let Some(Value::Number(num, _)) =
+                                seconds_var.value_actor().stream().next().await
+                            {
+                                options.timeout_ms =
+                                    (num.number() * 1000.0).max(0.0).min(u32::MAX as f64) as u32;
                             }
                         } else if let Some(milliseconds_var) = tagged.variable("milliseconds") {
-                            if let Some(Value::Number(num, _)) = milliseconds_var.value_actor().stream().next().await {
-                                options.timeout_ms = num.number().max(0.0).min(u32::MAX as f64) as u32;
+                            if let Some(Value::Number(num, _)) =
+                                milliseconds_var.value_actor().stream().next().await
+                            {
+                                options.timeout_ms =
+                                    num.number().max(0.0).min(u32::MAX as f64) as u32;
                             }
                         }
                     }
@@ -2337,7 +2489,9 @@ pub fn function_log_info(
             let value_str = resolve_value_for_log_with_timeout(value, options.timeout_ms).await;
             // Log with or without label
             match options.label {
-                Some(label) if !label.is_empty() => zoon::println!("[INFO] {}: {}", label, value_str),
+                Some(label) if !label.is_empty() => {
+                    zoon::println!("[INFO] {}: {}", label, value_str)
+                }
                 _ => zoon::println!("[INFO] {}", value_str),
             }
         }
@@ -2359,10 +2513,20 @@ pub fn function_log_info(
                 } else {
                     // Input stream ended - keep actor alive with pending
                     let _keep_alive = &actor;
-                    future::pending::<Option<(Value, (LocalBoxStream<'static, Value>, mpsc::Sender<(Value, Option<ActorHandle>)>, Option<ActorLoop>))>>().await
+                    future::pending::<
+                        Option<(
+                            Value,
+                            (
+                                LocalBoxStream<'static, Value>,
+                                mpsc::Sender<(Value, Option<ActorHandle>)>,
+                                Option<ActorLoop>,
+                            ),
+                        )>,
+                    >()
+                    .await
                 }
             }
-        }
+        },
     )
 }
 
@@ -2400,7 +2564,9 @@ pub fn function_log_error(
             let value_str = resolve_value_for_log_with_timeout(value, options.timeout_ms).await;
             // Log with or without label
             match options.label {
-                Some(label) if !label.is_empty() => zoon::eprintln!("[ERROR] {}: {}", label, value_str),
+                Some(label) if !label.is_empty() => {
+                    zoon::eprintln!("[ERROR] {}: {}", label, value_str)
+                }
                 _ => zoon::eprintln!("[ERROR] {}", value_str),
             }
         }
@@ -2416,16 +2582,28 @@ pub fn function_log_error(
                 if let Some(value) = stream.next().await {
                     // Send log request to the actor (backpressure if channel full)
                     if sender.send((value.clone(), with_actor)).await.is_err() {
-                        zoon::eprintln!("[Log/error] Failed to send log request - receiver dropped");
+                        zoon::eprintln!(
+                            "[Log/error] Failed to send log request - receiver dropped"
+                        );
                     }
                     Some((value, (stream, sender, actor)))
                 } else {
                     // Input stream ended - keep actor alive with pending
                     let _keep_alive = &actor;
-                    future::pending::<Option<(Value, (LocalBoxStream<'static, Value>, mpsc::Sender<(Value, Option<ActorHandle>)>, Option<ActorLoop>))>>().await
+                    future::pending::<
+                        Option<(
+                            Value,
+                            (
+                                LocalBoxStream<'static, Value>,
+                                mpsc::Sender<(Value, Option<ActorHandle>)>,
+                                Option<ActorLoop>,
+                            ),
+                        )>,
+                    >()
+                    .await
                 }
             }
-        }
+        },
     )
 }
 
@@ -2525,7 +2703,11 @@ pub fn function_theme_background_color(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     stream::once(future::ready(Text::new_value(
-        ConstructInfo::new(function_call_id.with_child_id(0), None, "Theme/background_color"),
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Theme/background_color",
+        ),
         construct_context,
         ValueIdempotencyKey::new(),
         "#ffffff".to_string(),
@@ -2559,7 +2741,11 @@ pub fn function_theme_accent_color(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     stream::once(future::ready(Text::new_value(
-        ConstructInfo::new(function_call_id.with_child_id(0), None, "Theme/accent_color"),
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Theme/accent_color",
+        ),
         construct_context,
         ValueIdempotencyKey::new(),
         "#0066cc".to_string(),
@@ -2657,22 +2843,40 @@ pub fn function_stream_skip(
 
     // State type for unfold
     type FusedSub = stream::Fuse<LocalBoxStream<'static, Value>>;
-    type InitialState = (Option<FusedSub>, Option<FusedSub>, ActorHandle, ActorHandle, usize, usize, bool, Vec<Value>);
+    type InitialState = (
+        Option<FusedSub>,
+        Option<FusedSub>,
+        ActorHandle,
+        ActorHandle,
+        usize,
+        usize,
+        bool,
+        Vec<Value>,
+    );
 
     // Defer subscription to inside async unfold
     let initial_state: InitialState = (
-        None,  // stream_sub - will be initialized in unfold
-        None,  // count_sub - will be initialized in unfold
+        None, // stream_sub - will be initialized in unfold
+        None, // count_sub - will be initialized in unfold
         stream_actor,
         count_actor,
-        0,     // current_skip_count
-        0,     // skipped
-        false, // count_received
+        0,          // current_skip_count
+        0,          // skipped
+        false,      // count_received
         Vec::new(), // buffered_values
     );
 
     stream::unfold(initial_state, |state| async move {
-        let (stream_sub_opt, count_sub_opt, stream_actor, count_actor, mut skip_count, mut skipped, mut count_received, mut buffer) = state;
+        let (
+            stream_sub_opt,
+            count_sub_opt,
+            stream_actor,
+            count_actor,
+            mut skip_count,
+            mut skipped,
+            mut count_received,
+            mut buffer,
+        ) = state;
 
         // Subscribe on first iteration
         let mut stream_sub = match stream_sub_opt {
@@ -2692,7 +2896,19 @@ pub fn function_stream_skip(
                     skipped += 1;
                     // Continue loop to process next buffered value
                 } else {
-                    return Some((buffered, (Some(stream_sub), Some(count_sub), stream_actor, count_actor, skip_count, skipped, count_received, buffer)));
+                    return Some((
+                        buffered,
+                        (
+                            Some(stream_sub),
+                            Some(count_sub),
+                            stream_actor,
+                            count_actor,
+                            skip_count,
+                            skipped,
+                            count_received,
+                            buffer,
+                        ),
+                    ));
                 }
                 continue;
             }
@@ -2771,22 +2987,40 @@ pub fn function_stream_take(
 
     // State type for unfold
     type FusedSub = stream::Fuse<LocalBoxStream<'static, Value>>;
-    type TakeState = (Option<FusedSub>, Option<FusedSub>, ActorHandle, ActorHandle, usize, usize, bool, Vec<Value>);
+    type TakeState = (
+        Option<FusedSub>,
+        Option<FusedSub>,
+        ActorHandle,
+        ActorHandle,
+        usize,
+        usize,
+        bool,
+        Vec<Value>,
+    );
 
     // Defer subscription to inside async unfold
     let initial_state: TakeState = (
-        None,  // stream_sub - will be initialized in unfold
-        None,  // count_sub - will be initialized in unfold
+        None, // stream_sub - will be initialized in unfold
+        None, // count_sub - will be initialized in unfold
         stream_actor,
         count_actor,
-        0,     // current_take_count
-        0,     // taken
-        false, // count_received
+        0,          // current_take_count
+        0,          // taken
+        false,      // count_received
         Vec::new(), // buffered_values
     );
 
     stream::unfold(initial_state, |state| async move {
-        let (stream_sub_opt, count_sub_opt, stream_actor, count_actor, mut take_count, mut taken, mut count_received, mut buffer) = state;
+        let (
+            stream_sub_opt,
+            count_sub_opt,
+            stream_actor,
+            count_actor,
+            mut take_count,
+            mut taken,
+            mut count_received,
+            mut buffer,
+        ) = state;
 
         // Subscribe on first iteration
         let mut stream_sub = match stream_sub_opt {
@@ -2804,7 +3038,19 @@ pub fn function_stream_take(
                 let buffered = buffer.remove(0);
                 if taken < take_count {
                     taken += 1;
-                    return Some((buffered, (Some(stream_sub), Some(count_sub), stream_actor, count_actor, take_count, taken, count_received, buffer)));
+                    return Some((
+                        buffered,
+                        (
+                            Some(stream_sub),
+                            Some(count_sub),
+                            stream_actor,
+                            count_actor,
+                            take_count,
+                            taken,
+                            count_received,
+                            buffer,
+                        ),
+                    ));
                 }
                 // Exceeded take limit, drop this buffered value and continue
                 continue;
@@ -2877,17 +3123,19 @@ pub fn function_stream_distinct(
 ) -> impl Stream<Item = Value> {
     let stream_actor = arguments[0].clone();
 
-    stream_actor.stream().scan(None::<ValueIdempotencyKey>, move |last_key, value| {
-        let current_key = value.idempotency_key();
-        let should_emit = last_key.map_or(true, |k| k != current_key);
-        *last_key = Some(current_key);
-        if should_emit {
-            future::ready(Some(Some(value)))
-        } else {
-            future::ready(Some(None))
-        }
-    })
-    .filter_map(future::ready)
+    stream_actor
+        .stream()
+        .scan(None::<ValueIdempotencyKey>, move |last_key, value| {
+            let current_key = value.idempotency_key();
+            let should_emit = last_key.map_or(true, |k| k != current_key);
+            *last_key = Some(current_key);
+            if should_emit {
+                future::ready(Some(Some(value)))
+            } else {
+                future::ready(Some(None))
+            }
+        })
+        .filter_map(future::ready)
 }
 
 /// Stream/pulses() -> Stream<Number>
@@ -2933,7 +3181,9 @@ pub fn function_stream_pulses(
     };
 
     // Subscribe to count actor and generate pulses for each count value
-    count_actor.stream().flat_map(move |v| stream::iter(make_pulses(&v)))
+    count_actor
+        .stream()
+        .flat_map(move |v| stream::iter(make_pulses(&v)))
 }
 
 /// Stream/debounce(duration) -> Stream<Value>
@@ -2980,7 +3230,14 @@ pub fn function_stream_debounce(
 
     // State type for unfold
     type FusedSub = stream::Fuse<LocalBoxStream<'static, Value>>;
-    type DebounceState = (Option<FusedSub>, Option<FusedSub>, ActorHandle, ActorHandle, Option<Value>, f64);
+    type DebounceState = (
+        Option<FusedSub>,
+        Option<FusedSub>,
+        ActorHandle,
+        ActorHandle,
+        Option<Value>,
+        f64,
+    );
 
     let initial_state: DebounceState = (
         None, // input_stream - deferred
@@ -2992,7 +3249,8 @@ pub fn function_stream_debounce(
     );
 
     stream::unfold(initial_state, |state| async move {
-        let (input_opt, duration_opt, stream_actor, duration_actor, mut pending, mut duration_ms) = state;
+        let (input_opt, duration_opt, stream_actor, duration_actor, mut pending, mut duration_ms) =
+            state;
 
         // Subscribe on first iteration
         let mut input_stream = match input_opt {
@@ -3007,7 +3265,9 @@ pub fn function_stream_debounce(
         loop {
             if pending.is_some() && duration_ms > 0.0 {
                 // Have pending value and valid duration - race timer vs new input
-                let mut timer = Box::pin(Timer::sleep(duration_ms.round().max(0.0).min(u32::MAX as f64) as u32).fuse());
+                let mut timer = Box::pin(
+                    Timer::sleep(duration_ms.round().max(0.0).min(u32::MAX as f64) as u32).fuse(),
+                );
 
                 select! {
                     new_value = input_stream.next() => {

@@ -4,9 +4,9 @@
 //! It allows advancing time instantly without real waiting,
 //! making timer tests fast and deterministic.
 
-use std::collections::BinaryHeap;
-use std::cmp::Ordering;
 use crate::engine_v2::arena::SlotId;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 /// Entry for a pending timer.
 #[derive(Debug, Clone)]
@@ -117,9 +117,9 @@ impl TestClock {
 
     /// Get the time until the next timer fires (if any).
     pub fn time_to_next_timer(&self) -> Option<u64> {
-        self.pending_timers.peek().map(|entry| {
-            entry.fire_at_ms.saturating_sub(self.current_time_ms)
-        })
+        self.pending_timers
+            .peek()
+            .map(|entry| entry.fire_at_ms.saturating_sub(self.current_time_ms))
     }
 
     /// Clear all pending timers.
@@ -157,7 +157,10 @@ mod tests {
     #[test]
     fn timer_fires_at_deadline() {
         let mut clock = TestClock::new();
-        let node_id = SlotId { index: 0, generation: 0 };
+        let node_id = SlotId {
+            index: 0,
+            generation: 0,
+        };
 
         clock.register_timer(node_id, 1000.0);
         assert!(clock.has_pending_timers());
@@ -180,7 +183,10 @@ mod tests {
     #[test]
     fn multiple_fires_in_single_advance() {
         let mut clock = TestClock::new();
-        let node_id = SlotId { index: 0, generation: 0 };
+        let node_id = SlotId {
+            index: 0,
+            generation: 0,
+        };
 
         clock.register_timer(node_id, 100.0);
 
@@ -194,7 +200,10 @@ mod tests {
         let mut clock = TestClock::new();
         assert!(clock.time_to_next_timer().is_none());
 
-        let node_id = SlotId { index: 0, generation: 0 };
+        let node_id = SlotId {
+            index: 0,
+            generation: 0,
+        };
         clock.register_timer(node_id, 1000.0);
 
         assert_eq!(clock.time_to_next_timer(), Some(1000));

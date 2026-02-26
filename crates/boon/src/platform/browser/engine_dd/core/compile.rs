@@ -13,17 +13,16 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 
 use crate::parser::{
-    lexer, parser, reset_expression_depth, resolve_references, span_at,
+    SourceCode, lexer, parser, reset_expression_depth, resolve_references, span_at,
     static_expression::{
         self, Alias, Argument, ArithmeticOperator, Expression, Literal, Spanned, TextPart,
     },
-    SourceCode,
 };
 
 use super::types::{
-    BroadcastHandlerFn, CollectionSpec, DataflowGraph, InputId, InputKind, InputSpec,
-    KeyedListOutput, ListKey, SideEffectKind, VarId, DEP_FIELD_PREFIX, HOVERED_FIELD,
-    HOVER_PATH_FIELD, LINK_PATH_FIELD, LIST_TAG, PASSED_VAR, ROUTER_INPUT,
+    BroadcastHandlerFn, CollectionSpec, DEP_FIELD_PREFIX, DataflowGraph, HOVER_PATH_FIELD,
+    HOVERED_FIELD, InputId, InputKind, InputSpec, KeyedListOutput, LINK_PATH_FIELD, LIST_TAG,
+    ListKey, PASSED_VAR, ROUTER_INPUT, SideEffectKind, VarId,
 };
 use super::value::Value;
 

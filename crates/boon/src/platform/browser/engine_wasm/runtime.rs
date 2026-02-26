@@ -7,8 +7,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use js_sys::{Object, Reflect, Uint8Array, WebAssembly};
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use zoon::*;
 
 use super::ir::{BinOp, IrExpr, IrNode, IrProgram, IrValue};
@@ -923,11 +923,7 @@ impl WasmInstance {
             } else {
                 cs_clone.get_cell_text(cell_id as u32)
             };
-            if text.is_empty() {
-                0.0
-            } else {
-                1.0
-            }
+            if text.is_empty() { 0.0 } else { 1.0 }
         }) as Box<dyn FnMut(i32) -> f64>);
         Reflect::set(
             &env,
@@ -1021,11 +1017,7 @@ impl WasmInstance {
                 cs_clone.get_cell_text(cell_id as u32)
             };
             if let Some(pattern) = patterns_clone.get(pattern_idx as usize) {
-                if cell_text == *pattern {
-                    1
-                } else {
-                    0
-                }
+                if cell_text == *pattern { 1 } else { 0 }
             } else {
                 0
             }
