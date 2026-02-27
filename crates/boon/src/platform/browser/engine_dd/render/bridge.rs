@@ -360,6 +360,23 @@ fn extract_font(value: &Value) -> Option<Font<'static>> {
     extract_font_from_fields(get_fields(value)?)
 }
 
+fn extract_placeholder_text(value: &Value) -> String {
+    get_fields(value)
+        .and_then(|fields| fields.get("placeholder"))
+        .and_then(get_fields)
+        .and_then(|placeholder| placeholder.get("text"))
+        .and_then(|text| text.as_text())
+        .map(|text| text.to_string())
+        .unwrap_or_default()
+}
+
+fn extract_placeholder_font(value: &Value) -> Option<Font<'static>> {
+    let placeholder_fields = get_fields(value)
+        .and_then(|fields| fields.get("placeholder"))
+        .and_then(get_fields)?;
+    extract_font_from_fields(placeholder_fields)
+}
+
 /// Also check align.row for text alignment (used when font.align is not set).
 fn extract_align_font_from_fields(fields: &Fields) -> Option<Font<'static>> {
     let style = get_style_obj(fields)?;
@@ -1798,15 +1815,9 @@ fn build_retained_text_input(
                 .unwrap_or_default()
         }))
         .placeholder(
-            Placeholder::with_signal(vm.signal_cloned().map(|v| {
-                get_fields(&v)
-                    .and_then(|f| f.get("placeholder"))
-                    .and_then(|v| v.get_field("text"))
-                    .and_then(|v| v.as_text())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default()
-            }))
-            .s(Font::new().italic()),
+            Placeholder::with_signal(vm.signal_cloned().map(|v| extract_placeholder_text(&v))).s(
+                Font::with_signal_self(vm.signal_cloned().map(|v| extract_placeholder_font(&v))),
+            ),
         )
         .s(Font::with_signal_self(
             vm.signal_cloned().map(|v| extract_font(&v)),

@@ -845,6 +845,7 @@ fn build_text_input(
     let key_data_cell = find_data_cell_for_event(program, links, "key_down", "key");
     let change_text_cell = find_data_cell_for_event(program, links, "change", "text");
     let text_cell = find_text_property_cell(program, links);
+    let inherit_text_color = !style_defines_font_color(style, program);
 
     let mut ti = TextInput::new();
     ti = apply_typed_styles(ti, style, program, false);
@@ -859,8 +860,11 @@ fn build_text_input(
                 .style("box-sizing", "border-box")
                 .style("border", "none")
                 .style("outline", "none")
-                .style("color", "inherit")
                 .style("background", "transparent");
+
+            if inherit_text_color {
+                raw_el = raw_el.style("color", "inherit");
+            }
 
             if focus {
                 raw_el = raw_el.attr("autofocus", "");
@@ -956,6 +960,43 @@ fn build_text_input(
             }
         })
         .into_raw_unchecked()
+}
+
+fn style_defines_font_color(style: &IrExpr, program: &IrProgram) -> bool {
+    let reconstructed_style;
+    let style_fields: &[(String, IrExpr)] = match style {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed_style = reconstruct_object_fields(program, *cell);
+            &reconstructed_style
+        }
+        _ => return false,
+    };
+
+    for (name, value) in style_fields {
+        if name != "font" {
+            continue;
+        }
+
+        let reconstructed_font;
+        let font_fields: &[(String, IrExpr)] = match value {
+            IrExpr::ObjectConstruct(fields) => fields,
+            IrExpr::CellRead(cell) => {
+                reconstructed_font = reconstruct_object_fields(program, *cell);
+                &reconstructed_font
+            }
+            _ => continue,
+        };
+
+        if font_fields
+            .iter()
+            .any(|(field_name, _)| field_name == "color")
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Find a data cell for an event payload (e.g., key_down.key, change.text).
@@ -2515,6 +2556,7 @@ fn build_item_text_input(
 
         found_text
     };
+    let inherit_text_color = !style_defines_font_color(style, program);
 
     let mut ti = TextInput::new();
     ti = apply_typed_styles(ti, style, program, false);
@@ -2529,8 +2571,11 @@ fn build_item_text_input(
                 .style("box-sizing", "border-box")
                 .style("border", "none")
                 .style("outline", "none")
-                .style("color", "inherit")
                 .style("background", "transparent");
+
+            if inherit_text_color {
+                raw_el = raw_el.style("color", "inherit");
+            }
 
             raw_el = apply_raw_css(raw_el, style, program, instance, Some(ctx), false);
 
@@ -3914,6 +3959,20 @@ fn resolve_font_family(expr: &IrExpr, program: &IrProgram) -> Option<String> {
         .iter()
         .filter_map(|item| match item {
             IrExpr::Constant(IrValue::Text(t)) => Some(format!("\"{}\"", t)),
+            IrExpr::TextConcat(parts) => {
+                let text: String = parts
+                    .iter()
+                    .map(|p| match p {
+                        TextSegment::Literal(s) => s.clone(),
+                        _ => String::new(),
+                    })
+                    .collect();
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(format!("\"{}\"", text))
+                }
+            }
             IrExpr::Constant(IrValue::Tag(t)) => match t.as_str() {
                 "SansSerif" => Some("sans-serif".to_string()),
                 "Serif" => Some("serif".to_string()),
@@ -3950,6 +4009,8 @@ fn resolve_font_family(expr: &IrExpr, program: &IrProgram) -> Option<String> {
                             ..
                         } => match t.as_str() {
                             "SansSerif" => Some("sans-serif".to_string()),
+                            "Serif" => Some("serif".to_string()),
+                            "Monospace" => Some("monospace".to_string()),
                             _ => Some(t.clone()),
                         },
                         _ => None,
