@@ -3099,11 +3099,6 @@ impl<'a> GraphBuilder<'a> {
                 }
 
                 // Build document closure that evaluates with reactive values in scope
-                #[cfg(target_arch = "wasm32")]
-                zoon::println!(
-                    "[DD v2] compile_document_expr: root-derived path, root={}",
-                    root_dep
-                );
                 let compiler_clone = self.compiler.clone();
                 let doc_expr_clone = expr.clone();
                 let root_dep_name = root_dep.clone();
@@ -5142,21 +5137,6 @@ impl<'a> GraphBuilder<'a> {
                         .and_then(|v| v.as_text())
                         .unwrap_or("")
                         .to_string();
-
-                    if event_type.starts_with("edit_") {
-                        zoon::println!(
-                            "[DD_DEBUG] keyed_hold event_type={} state_title={} state_editing={}",
-                            event_type,
-                            state
-                                .get_field("title")
-                                .and_then(|v| v.as_text())
-                                .unwrap_or(""),
-                            state
-                                .get_field("editing")
-                                .and_then(|v| v.as_tag())
-                                .unwrap_or("")
-                        );
-                    }
 
                     match event_type.as_str() {
                         "remove" => Value::Unit, // Self-removal sentinel

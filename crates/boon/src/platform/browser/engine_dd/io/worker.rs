@@ -347,12 +347,6 @@ impl DdWorkerHandle {
             }
         };
 
-        zoon::println!(
-            "[DD_DEBUG] inject event path={} value={}",
-            link_path,
-            event_value.to_display_string()
-        );
-
         {
             let mut inner = self.inner.borrow_mut();
 

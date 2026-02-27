@@ -2004,8 +2004,6 @@ impl Playground {
 
         #[cfg(feature = "engine-dd")]
         if engine_type == EngineType::DifferentialDataflow {
-            println!("[DD Engine] Running with DD engine");
-
             // Run with DD engine (reactive evaluation)
             let result = run_dd_reactive_with_persistence(
                 filename,
@@ -2017,8 +2015,6 @@ impl Playground {
 
             if let Some(dd_result) = result {
                 if let Some(document) = dd_result.document.clone() {
-                    println!("[DD Engine] Document rendered successfully");
-
                     // Always use full rendering (handles all element types, events, timers)
                     return render_dd_result_reactive_signal(dd_result)
                         .unify();

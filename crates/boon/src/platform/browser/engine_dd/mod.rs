@@ -51,9 +51,6 @@ fn clear_active_intervals() {
                         window.clear_interval_with_handle(id as i32);
                     }
                 }
-                if count > 0 {
-                    zoon::println!("[DD v2] Cleared {} intervals", count);
-                }
             }
         }
         // Reset to empty array
@@ -142,8 +139,6 @@ pub fn run_dd_reactive_with_persistence(
         reset_save_disabled();
     }
 
-    zoon::println!("[DD v2] Compiling...");
-
     // Load persisted hold values from localStorage
     let persisted_holds = if let Some(key) = states_storage_key {
         io::persistence::load_holds_map(key)
@@ -154,14 +149,13 @@ pub fn run_dd_reactive_with_persistence(
     let compiled = match compile::compile(source_code, states_storage_key, &persisted_holds) {
         Ok(program) => program,
         Err(e) => {
-            zoon::eprintln!("[DD v2] Compilation error: {}", e);
+            zoon::eprintln!("DD compilation error: {}", e);
             return None;
         }
     };
 
     match compiled {
         CompiledProgram::Static { document_value } => {
-            zoon::println!("[DD v2] Static program");
             let output = Mutable::new(document_value);
             Some(DdResult {
                 document: Some(DdDocument { value: output }),
@@ -171,12 +165,6 @@ pub fn run_dd_reactive_with_persistence(
         }
 
         CompiledProgram::Dataflow { graph } => {
-            zoon::println!(
-                "[DD v2] Dataflow program ({} collections, {} inputs)",
-                graph.collections.len(),
-                graph.inputs.len()
-            );
-
             let has_timers = graph
                 .inputs
                 .iter()
@@ -278,7 +266,6 @@ pub fn render_dd_document_reactive_signal(
 /// For all reactive programs, uses the worker rendering path:
 /// rebuilds the element tree on each output change.
 pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
-    zoon::println!("[DD v2] render_dd_result_reactive_signal called");
     let worker = result.worker_handle;
     let document = result.document;
 
