@@ -70,14 +70,6 @@ store: [
 ]
 
 FUNCTION new_todo(title) {
-    new_todo_with_completed(initial_title: title, initial_completed: False)
-}
-
-FUNCTION new_todo_completed(title) {
-    new_todo_with_completed(initial_title: title, initial_completed: True)
-}
-
-FUNCTION new_todo_with_completed(initial_title, initial_completed) {
     [
         todo_elements: [
             remove_todo_button: LINK
@@ -86,7 +78,7 @@ FUNCTION new_todo_with_completed(initial_title, initial_completed) {
             todo_checkbox: LINK
         ]
         title: LATEST {
-            initial_title
+            title
             todo_elements.editing_todo_title_element.event.change.text
                 |> WHEN {
                     changed_text =>
@@ -108,7 +100,7 @@ FUNCTION new_todo_with_completed(initial_title, initial_completed) {
                     |> THEN { False }
             }
         }
-        completed: initial_completed |> HOLD state {
+        completed: False |> HOLD state {
             LATEST {
                 todo_elements.todo_checkbox.event.click
                     |> THEN { state |> Bool/not() }

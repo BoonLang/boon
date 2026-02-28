@@ -93,6 +93,7 @@ pub enum Expression {
     ArithmeticOperator(ArithmeticOperator),
     TextLiteral {
         parts: Vec<TextPart>,
+        hash_count: usize,
     },
     // Hardware types (parse-only for now)
     Bits {
@@ -396,8 +397,9 @@ impl ExpressionConverter {
             parser::Expression::ArithmeticOperator(op) => {
                 Expression::ArithmeticOperator(self.convert_arithmetic(op))
             }
-            parser::Expression::TextLiteral { parts } => Expression::TextLiteral {
+            parser::Expression::TextLiteral { parts, hash_count } => Expression::TextLiteral {
                 parts: parts.iter().map(|p| self.convert_text_part(p)).collect(),
+                hash_count: *hash_count,
             },
             // Hardware types (parse-only for now)
             parser::Expression::Bits { size } => Expression::Bits {

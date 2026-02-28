@@ -1338,7 +1338,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                 });
             }
         }
-        Expression::TextLiteral { parts } => {
+        Expression::TextLiteral { parts, .. } => {
             // Try to find matching TextLiteral with same parts (like Literal matches by value)
             let id = old_expressions
                 .iter()
@@ -1346,7 +1346,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     Spanned {
                         span,
                         persistence: _,
-                        node: Expression::TextLiteral { parts: old_parts },
+                        node: Expression::TextLiteral { parts: old_parts, .. },
                     } if text_parts_match(parts, old_parts) => Some(old_span_id_pairs[span]),
                     _ => None,
                 });

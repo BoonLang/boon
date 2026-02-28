@@ -1137,6 +1137,7 @@ impl Playground {
             .s(Gap::new().x(12).y(8))
             .multiline()
             .item(El::new().s(Align::new().left()).child(self.panel_layout_button()))
+            .item(self.format_button())
             .item(
                 El::new()
                     .s(Font::new().size(12).color(color!("rgba(255, 255, 255, 0.5)")))
@@ -1577,6 +1578,48 @@ impl Playground {
                 let run_command = self.run_command.clone();
                 move || {
                     run_command.set(Some(RunCommand { filename: None }));
+                }
+            })
+    }
+
+    fn format_button(&self) -> impl Element {
+        let hovered = Mutable::new(false);
+        Button::new()
+            .s(Padding::new().x(12).y(7))
+            .s(RoundedCorners::all(22))
+            .s(Borders::all(
+                Border::new()
+                    .color(color!("rgba(108, 162, 255, 0.35)"))
+                    .width(1),
+            ))
+            .s(Background::new().color_signal(
+                hovered
+                    .signal()
+                    .map_bool(
+                        || color!("rgba(108, 162, 255, 0.15)"),
+                        || color!("rgba(108, 162, 255, 0.08)"),
+                    ),
+            ))
+            .s(Font::new()
+                .size(13)
+                .weight(FontWeight::Medium)
+                .color_signal(hovered.signal().map_bool(
+                    || color!("rgba(180, 210, 255, 0.95)"),
+                    || color!("rgba(180, 210, 255, 0.75)"),
+                )))
+            .label(
+                El::new()
+                    .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
+                    .child("Format"),
+            )
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+            .on_press({
+                let source_code = self.source_code.clone();
+                move || {
+                    let current = source_code.get_cloned();
+                    if let Some(formatted) = boon::parser::formatter::format(&current) {
+                        source_code.set_neq(Rc::new(Cow::from(formatted)));
+                    }
                 }
             })
     }

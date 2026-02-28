@@ -362,7 +362,7 @@ impl Compiler {
                 };
                 Self::is_reactive_or_alias(a) || Self::is_reactive_or_alias(b)
             }
-            Expression::TextLiteral { parts } => parts
+            Expression::TextLiteral { parts, .. } => parts
                 .iter()
                 .any(|p| matches!(p, TextPart::Interpolation { .. })),
             Expression::Alias(_) => {
@@ -397,7 +397,7 @@ impl Compiler {
         match &expr.node {
             Expression::Literal(lit) => Ok(Self::eval_literal(lit)),
 
-            Expression::TextLiteral { parts } => {
+            Expression::TextLiteral { parts, .. } => {
                 let mut result = String::new();
                 for part in parts {
                     match part {
@@ -6037,7 +6037,7 @@ impl Compiler {
                 })
             }
 
-            Expression::TextLiteral { parts } => {
+            Expression::TextLiteral { parts, .. } => {
                 let has_reactive = parts.iter().any(|p| match p {
                     TextPart::Interpolation { var, .. } => var.as_str() == reactive_var_name,
                     _ => false,

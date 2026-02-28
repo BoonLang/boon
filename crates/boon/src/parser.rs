@@ -36,6 +36,7 @@ mod source;
 pub use source::{SourceCode, StrSlice};
 
 pub mod static_expression;
+pub mod formatter;
 
 pub use chumsky::prelude::{Input, Parser};
 
@@ -575,7 +576,7 @@ where
                     parts.push(TextPart::Text(&content[current_text_start..]));
                 }
 
-                Expression::TextLiteral { parts }
+                Expression::TextLiteral { parts, hash_count }
             });
 
         // BLOCK { var: value, var2: value2, output_expression }
@@ -879,8 +880,10 @@ pub enum Expression<'code> {
     Comparator(Comparator<'code>),
     ArithmeticOperator(ArithmeticOperator<'code>),
     // TEXT { content with {var} interpolation }
+    // hash_count: 0 for TEXT { }, 1 for TEXT #{ }, 2 for TEXT ##{ }, etc.
     TextLiteral {
         parts: Vec<TextPart<'code>>,
+        hash_count: usize,
     },
     // Hardware types (parse-only for now)
     Bits {
@@ -1099,7 +1102,7 @@ mod tests {
     #[test]
     fn test_text_literal_simple() {
         parse_and_test!("TEXT { hello world }", |expr: &Expression| {
-            if let Expression::TextLiteral { parts } = expr {
+            if let Expression::TextLiteral { parts, .. } = expr {
                 assert_eq!(parts.len(), 1);
                 assert!(matches!(parts[0], TextPart::Text("hello world")));
             } else {
@@ -1111,7 +1114,7 @@ mod tests {
     #[test]
     fn test_text_literal_with_interpolation() {
         parse_and_test!("TEXT { hello {name} }", |expr: &Expression| {
-            if let Expression::TextLiteral { parts } = expr {
+            if let Expression::TextLiteral { parts, .. } = expr {
                 assert_eq!(parts.len(), 2);
                 assert!(matches!(parts[0], TextPart::Text("hello ")));
                 assert!(matches!(
@@ -1129,7 +1132,7 @@ mod tests {
         parse_and_test!(
             "TEXT { Hello {name}! You have {count} messages. }",
             |expr: &Expression| {
-                if let Expression::TextLiteral { parts } = expr {
+                if let Expression::TextLiteral { parts, .. } = expr {
                     assert_eq!(parts.len(), 5);
                     assert!(matches!(parts[0], TextPart::Text("Hello ")));
                     assert!(matches!(

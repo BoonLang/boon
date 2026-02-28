@@ -1524,7 +1524,7 @@ fn schedule_expression(
         // ============================================================
         // TEXT LITERAL (text with interpolations)
         // ============================================================
-        static_expression::Expression::TextLiteral { parts } => {
+        static_expression::Expression::TextLiteral { parts, .. } => {
             let actor = build_text_literal_actor(parts, span, persistence, persistence_id, ctx)?;
             state.store(result_slot, actor);
         }

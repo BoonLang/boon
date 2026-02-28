@@ -2526,7 +2526,7 @@ impl Lowerer {
 
             Expression::Comparator(cmp) => self.lower_comparator(cmp),
 
-            Expression::TextLiteral { parts } => {
+            Expression::TextLiteral { parts, .. } => {
                 let segments: Vec<TextSegment> = parts
                     .iter()
                     .map(|p| match p {

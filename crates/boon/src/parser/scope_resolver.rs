@@ -576,7 +576,7 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
         Expression::Literal(_) => (),
         Expression::Link => (),
         Expression::Skip => (),
-        Expression::TextLiteral { parts } => {
+        Expression::TextLiteral { parts, .. } => {
             // Resolve interpolation variables in the text literal
             // Supports field access paths like "item.text" where "item" is the base variable
             for part in parts.iter_mut() {
