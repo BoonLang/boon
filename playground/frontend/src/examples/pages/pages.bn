@@ -43,10 +43,10 @@ document: Document/new(root: Element/stripe(
             element: []
             style: [width: Fill, height: Fill, padding: 24]
             child: current_page |> WHILE {
-                Home => page(title: TEXT { Welcome Home }, desc: TEXT { This is the home page. Use the navigation above to explore. })
-                About => page(title: TEXT { About }, desc: TEXT { A multi-page Boon app demonstrating Router/route and Router/go_to. })
-                Contact => page(title: TEXT { Contact }, desc: TEXT { Get in touch! URL-driven state and navigation demo. })
-                NotFound => page(title: TEXT { 404 - Not Found }, desc: TEXT { The page you're looking for doesn't exist. })
+                Home => page(title: TEXT { Welcome Home }, description: TEXT { This is the home page. Use the navigation above to explore. })
+                About => page(title: TEXT { About }, description: TEXT { A multi-page Boon app demonstrating Router/route and Router/go_to. })
+                Contact => page(title: TEXT { Contact }, description: TEXT { Get in touch! URL-driven state and navigation demo. })
+                NotFound => page(title: TEXT { 404 - Not Found }, description: TEXT { The page you're looking for doesn't exist. })
             }
         )
     }
@@ -71,7 +71,7 @@ FUNCTION nav_button(label, route) {
     }
 }
 
-FUNCTION page(title, desc) {
+FUNCTION page(title, description) {
     Element/stripe(
         element: []
         direction: Column
@@ -79,7 +79,7 @@ FUNCTION page(title, desc) {
         style: []
         items: LIST {
             Element/label(element: [], style: [font: [size: 32, weight: Bold]], label: title)
-            Element/label(element: [], style: [font: [color: Oklch[lightness: 0.7]]], label: desc)
+            Element/label(element: [], style: [font: [color: Oklch[lightness: 0.7]]], label: description)
         }
     )
 }

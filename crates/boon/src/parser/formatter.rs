@@ -183,17 +183,35 @@ impl<'code> Formatter<'code> {
 
     /// Emit standalone comments whose source position falls before `before_pos`.
     fn emit_comments_before(&mut self, before_pos: usize) {
+        let mut prev_comment_end: Option<usize> = None;
         while self.comment_cursor < self.comments.comments.len() {
             let c = &self.comments.comments[self.comment_cursor];
             if c.start >= before_pos {
                 break;
             }
             if c.is_standalone {
+                // Preserve blank lines between consecutive standalone comments
+                if let Some(prev_end) = prev_comment_end {
+                    let between = &self.source[prev_end..c.start];
+                    let newline_count = between.chars().filter(|&ch| ch == '\n').count();
+                    if newline_count >= 2 {
+                        self.newline();
+                    }
+                }
                 self.write_indent();
                 self.write_comment(c.text);
                 self.newline();
+                prev_comment_end = Some(c.start + c.text.len());
             }
             self.comment_cursor += 1;
+        }
+        // Preserve blank line between last comment and the expression that follows
+        if let Some(prev_end) = prev_comment_end {
+            let between = &self.source[prev_end..before_pos];
+            let newline_count = between.chars().filter(|&ch| ch == '\n').count();
+            if newline_count >= 2 {
+                self.newline();
+            }
         }
     }
 
@@ -239,8 +257,11 @@ impl<'code> Formatter<'code> {
 
     fn format_program(&mut self, expressions: &[Spanned<Expression<'code>>]) {
         for (i, expr) in expressions.iter().enumerate() {
-            // Blank line between top-level declarations (except before the first)
-            if i > 0 {
+            // Blank line when either adjacent item is multiline
+            if i > 0
+                && (self.is_item_multiline(&expressions[i - 1])
+                    || self.is_item_multiline(expr))
+            {
                 self.newline();
             }
             self.emit_comments_before(expr.span.start);
@@ -377,17 +398,21 @@ impl<'code> Formatter<'code> {
             Expression::Then { .. } => ValueLayout::SameLineStart,
             Expression::Flush { .. } => ValueLayout::SameLineStart,
             Expression::Block { .. } => ValueLayout::SameLineStart,
+            Expression::TextLiteral { .. } => ValueLayout::SameLineStart,
             Expression::Pipe { from, .. } => {
-                // Walk to the leftmost segment of the pipe chain
+                // Walk to the leftmost segment and count chain length
                 let mut first: &Spanned<Expression<'code>> = from;
+                let mut chain_len: usize = 2; // at least from + to
                 while let Expression::Pipe { from: inner, .. } = &first.node {
                     first = inner;
+                    chain_len += 1;
                 }
-                // Inline first segment → SameLineStart (hug |> on same line)
-                // Multiline first segment → NextLine (|> on own lines, aligned)
-                if self.estimate_inline(first).is_some() {
+                if self.estimate_inline(first).is_some() && chain_len == 2 {
+                    // Inline first + single continuation: hug on same line
+                    // e.g. `selected_filter: Router/route() |> WHILE { ... }`
                     ValueLayout::SameLineStart
                 } else {
+                    // Multiline first OR 3+ segments: value on next line, |> aligned
                     ValueLayout::NextLine
                 }
             }
@@ -427,7 +452,14 @@ impl<'code> Formatter<'code> {
         self.write("LIST {");
         self.newline();
         self.indent += 1;
-        for item in items {
+        for (i, item) in items.iter().enumerate() {
+            // Blank line when either adjacent item is multiline
+            if i > 0
+                && (self.is_item_multiline(&items[i - 1])
+                    || self.is_item_multiline(item))
+            {
+                self.newline();
+            }
             self.emit_comments_before(item.span.start);
             self.write_indent();
             self.format_expression(item);
@@ -457,11 +489,7 @@ impl<'code> Formatter<'code> {
         self.write("[");
         self.newline();
         self.indent += 1;
-        for var in variables {
-            self.emit_comments_before(var.span.start);
-            self.format_variable(&var.node, &var.span);
-            self.newline();
-        }
+        self.format_object_fields(variables);
         self.indent -= 1;
         self.write_indent();
         self.write("]");
@@ -494,14 +522,25 @@ impl<'code> Formatter<'code> {
         self.write("[");
         self.newline();
         self.indent += 1;
-        for var in variables {
+        self.format_object_fields(variables);
+        self.indent -= 1;
+        self.write_indent();
+        self.write("]");
+    }
+
+    /// Shared logic for object and tagged-object fields with blank line insertion.
+    fn format_object_fields(&mut self, variables: &[Spanned<Variable<'code>>]) {
+        for (i, var) in variables.iter().enumerate() {
+            if i > 0
+                && (self.is_variable_multiline(&variables[i - 1].node)
+                    || self.is_variable_multiline(&var.node))
+            {
+                self.newline();
+            }
             self.emit_comments_before(var.span.start);
             self.format_variable(&var.node, &var.span);
             self.newline();
         }
-        self.indent -= 1;
-        self.write_indent();
-        self.write("]");
     }
 
     // -- Map ----------------------------------------------------------------
@@ -599,6 +638,23 @@ impl<'code> Formatter<'code> {
                 return;
             }
         }
+        // Single named argument with multiline value: keep arg name on opening line.
+        // e.g. `Document/new(root: Element/stripe(...))` instead of extra indent level
+        if arguments.len() == 1 {
+            let arg = &arguments[0].node;
+            if let Some(value) = &arg.value {
+                if self.estimate_inline(value).is_none() {
+                    let prefix_len = arg.name.len() + 2; // "name: "
+                    if self.current_line_width() + prefix_len <= MAX_LINE_WIDTH {
+                        self.write(arg.name);
+                        self.write(": ");
+                        self.format_expression(value);
+                        self.write(")");
+                        return;
+                    }
+                }
+            }
+        }
         // Multi-line
         self.newline();
         self.indent += 1;
@@ -616,8 +672,20 @@ impl<'code> Formatter<'code> {
     fn format_argument(&mut self, arg: &Argument<'code>) {
         self.write(arg.name);
         if let Some(value) = &arg.value {
-            self.write(": ");
-            self.format_expression(value);
+            self.write(":");
+            match self.value_layout(value) {
+                ValueLayout::Inline | ValueLayout::SameLineStart => {
+                    self.write(" ");
+                    self.format_expression(value);
+                }
+                ValueLayout::NextLine => {
+                    self.newline();
+                    self.indent += 1;
+                    self.write_indent();
+                    self.format_expression(value);
+                    self.indent -= 1;
+                }
+            }
         }
     }
 
@@ -652,7 +720,14 @@ impl<'code> Formatter<'code> {
         self.write("LATEST {");
         self.newline();
         self.indent += 1;
-        for input in inputs {
+        for (i, input) in inputs.iter().enumerate() {
+            // Blank line when either adjacent input is multiline
+            if i > 0
+                && (self.is_item_multiline(&inputs[i - 1])
+                    || self.is_item_multiline(input))
+            {
+                self.newline();
+            }
             self.emit_comments_before(input.span.start);
             self.format_body_expression(input);
         }
@@ -763,15 +838,19 @@ impl<'code> Formatter<'code> {
     fn format_arm(&mut self, arm: &Arm<'code>) {
         self.format_pattern(&arm.pattern);
         self.write(" => ");
-        // If the body is multiline, break after => and indent
-        if self.is_multiline(&arm.body) {
-            self.newline();
-            self.indent += 1;
-            self.write_indent();
-            self.format_expression(&arm.body);
-            self.indent -= 1;
-        } else {
-            self.format_expression(&arm.body);
+        // Use value_layout for consistent arm/variable formatting:
+        // Inline/SameLineStart stay on the => line, NextLine breaks after =>
+        match self.value_layout(&arm.body) {
+            ValueLayout::Inline | ValueLayout::SameLineStart => {
+                self.format_expression(&arm.body);
+            }
+            ValueLayout::NextLine => {
+                self.newline();
+                self.indent += 1;
+                self.write_indent();
+                self.format_expression(&arm.body);
+                self.indent -= 1;
+            }
         }
     }
 
@@ -857,8 +936,10 @@ impl<'code> Formatter<'code> {
             }
         }
 
-        // Check if the first segment is single-line
-        let first_is_inline = self.estimate_inline(chain[0]).is_some();
+        // Check if the first segment actually fits inline at the current indent
+        let first_is_inline = self
+            .estimate_inline(chain[0])
+            .is_some_and(|inline| inline.len() + self.current_line_width() <= MAX_LINE_WIDTH);
 
         if first_is_inline && chain.len() == 2 {
             // Single continuation after inline first: hug |> on same line
@@ -876,28 +957,14 @@ impl<'code> Formatter<'code> {
                 self.write(" |> ");
                 self.format_expression(chain[1]);
             } else {
-                // Line too long to hug — fall back to vertical
-                self.indent += 1;
+                // Can't hug — fall to next line, aligned
                 self.newline();
                 self.write_indent();
                 self.write("|> ");
                 self.format_expression(chain[1]);
-                self.indent -= 1;
             }
-        } else if first_is_inline {
-            // Multiple continuations after inline first: vertical with indent+1
-            self.format_expression(chain[0]);
-            self.indent += 1;
-            for segment in &chain[1..] {
-                self.newline();
-                self.write_indent();
-                self.write("|> ");
-                self.format_expression(segment);
-            }
-            self.indent -= 1;
         } else {
-            // Multiline first segment: all |> at same indent (no +1)
-            // e.g. `LATEST { ... }\n|> Math/sum()`
+            // Multiple continuations or multiline first: all |> aligned at same indent
             self.format_expression(chain[0]);
             for segment in &chain[1..] {
                 self.newline();
@@ -931,10 +998,24 @@ impl<'code> Formatter<'code> {
         self.write("BLOCK {");
         self.newline();
         self.indent += 1;
-        for var in variables {
+        for (i, var) in variables.iter().enumerate() {
+            // Blank line when either adjacent variable is multiline
+            if i > 0
+                && (self.is_variable_multiline(&variables[i - 1].node)
+                    || self.is_variable_multiline(&var.node))
+            {
+                self.newline();
+            }
             self.emit_comments_before(var.span.start);
             self.format_variable(&var.node, &var.span);
             self.newline();
+        }
+        // Blank line before output if last variable or output is multiline
+        if !variables.is_empty() {
+            let last_var_multiline = self.is_variable_multiline(&variables.last().unwrap().node);
+            if last_var_multiline || self.is_item_multiline(output) {
+                self.newline();
+            }
         }
         self.emit_comments_before(output.span.start);
         self.format_body_expression(output);
@@ -1001,20 +1082,41 @@ impl<'code> Formatter<'code> {
         } else {
             format!("{}{}", hashes, "{")
         };
-        self.write("TEXT ");
-        self.write(&hashes);
-        self.write("{ ");
+        // Build the content string
+        let mut content = String::new();
         for part in parts {
             match part {
-                TextPart::Text(text) => self.write(text),
+                TextPart::Text(text) => content.push_str(text),
                 TextPart::Interpolation { var, .. } => {
-                    self.write(&interp_prefix);
-                    self.write(var);
-                    self.write("}");
+                    content.push_str(&interp_prefix);
+                    content.push_str(var);
+                    content.push('}');
                 }
             }
         }
-        self.write(" }");
+        // Try inline: TEXT { content }
+        let inline_len = "TEXT ".len() + hashes.len() + "{ ".len() + content.len() + " }".len();
+        if self.current_line_width() + inline_len <= MAX_LINE_WIDTH {
+            self.write("TEXT ");
+            self.write(&hashes);
+            self.write("{ ");
+            self.write(&content);
+            self.write(" }");
+        } else {
+            // Wrap to multiline — safe because dedent strips the formatter's indentation,
+            // producing the same content as inline mode (see docs/language/TEXT_SYNTAX.md)
+            self.write("TEXT ");
+            self.write(&hashes);
+            self.write("{");
+            self.newline();
+            self.indent += 1;
+            self.write_indent();
+            self.write(&content);
+            self.newline();
+            self.indent -= 1;
+            self.write_indent();
+            self.write("}");
+        }
     }
 
     // -- Bytes --------------------------------------------------------------
@@ -1124,6 +1226,30 @@ impl<'code> Formatter<'code> {
             None
         } else {
             Some(result)
+        }
+    }
+
+    /// Check if a variable (name: value) would format to multiple lines at the current indent.
+    fn is_variable_multiline(&self, var: &Variable<'code>) -> bool {
+        let prefix = self.indent * INDENT.len() + var.name.len() + 2; // "    name: "
+        match self.estimate_inline(&var.value) {
+            None => true,
+            Some(inline) => prefix + inline.len() > MAX_LINE_WIDTH,
+        }
+    }
+
+    /// Check if a body item (top-level decl, LIST item, LATEST input, etc.)
+    /// would format to multiple lines at the current indent level.
+    fn is_item_multiline(&self, expr: &Spanned<Expression<'code>>) -> bool {
+        match &expr.node {
+            Expression::Function { .. } => true,
+            Expression::Variable(var) => self.is_variable_multiline(var),
+            _ => match self.estimate_inline(expr) {
+                None => true,
+                Some(inline) => {
+                    self.indent * INDENT.len() + inline.len() > MAX_LINE_WIDTH
+                }
+            },
         }
     }
 
@@ -1266,6 +1392,33 @@ mod tests {
     }
 
     #[test]
+    fn format_pipe_multiline_first_at_indent() {
+        // Reproduce the real todo_mvc case: at deep indent, the function call's inline estimate
+        // fits at indent 0 but wraps at the actual indent, so |> should go on a new line.
+        let input = include_str!("../../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
+        let result = format(input).unwrap();
+        for line in result.lines() {
+            // toggle_all_checkbox(...) |> LINK should not be on the same line
+            if line.contains("toggle_all_checkbox(") && line.contains("|>") {
+                panic!(
+                    "toggle_all_checkbox call and |> should not be on the same line:\n{}",
+                    line
+                );
+            }
+            if line.trim_start().starts_with(") |>") {
+                panic!("Closing paren should not hug |> on the same line:\n{}", line);
+            }
+            // Function arg with NextLine pipe: "items: PASSED..." should not be on same line
+            if line.contains("items: PASSED") {
+                panic!(
+                    "3-segment pipe arg value should use NextLine layout:\n{}",
+                    line
+                );
+            }
+        }
+    }
+
+    #[test]
     fn format_latest() {
         let input = "x: LATEST { 1, 2 }";
         let expected = "x: LATEST {\n    1\n    2\n}\n";
@@ -1303,9 +1456,14 @@ mod tests {
 
     #[test]
     fn format_preserves_standalone_comment() {
+        let input = "-- header\nx: 42";
+        let result = format(input).unwrap();
+        assert_eq!(result, "-- header\nx: 42\n");
+
+        // Blank line between comment and expression is preserved
         let input = "-- header\n\nx: 42";
         let result = format(input).unwrap();
-        assert!(result.contains("-- header"));
+        assert_eq!(result, "-- header\n\nx: 42\n");
     }
 
 
@@ -1316,9 +1474,42 @@ mod tests {
 
     #[test]
     fn format_blank_lines_between_top_level() {
+        // Simple one-liners: no blank line
         let input = "x: 1\ny: 2";
         let result = format(input).unwrap();
-        assert_eq!(result, "x: 1\n\ny: 2\n");
+        assert_eq!(result, "x: 1\ny: 2\n");
+
+        // Multiline item adjacent to anything: blank line inserted
+        let input = "x: 1\ny: LATEST {\n    a\n    b\n}\nz: 3";
+        let result = format(input).unwrap();
+        assert_eq!(result, "x: 1\n\ny: LATEST {\n    a\n    b\n}\n\nz: 3\n");
+    }
+
+    #[test]
+    fn format_single_arg_inline() {
+        // Single named argument with multiline value keeps arg name on opening line
+        let input = "x: outer(\n    name: LATEST {\n        a\n        b\n        c\n    }\n)\n";
+        let expected = "x: outer(name: LATEST {\n    a\n    b\n    c\n})\n";
+        assert_eq!(format(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn format_text_literal_wraps_when_long() {
+        // Short TEXT stays inline
+        let input = "x: TEXT { short }";
+        assert_eq!(format(input).unwrap(), "x: TEXT { short }\n");
+
+        // Long TEXT wraps to multiline — dedent strips formatter indentation
+        let input = "description: TEXT { This is the home page. Use the navigation above to explore other pages and features. }";
+        let result = format(input).unwrap();
+        assert!(
+            result.contains("TEXT {\n"),
+            "Long TEXT should wrap to multiline, got: {result}"
+        );
+        assert!(
+            result.contains("\n}\n"),
+            "Closing brace should be on its own line, got: {result}"
+        );
     }
 
     // -- Idempotency tests --------------------------------------------------
@@ -1351,6 +1542,7 @@ mod tests {
         idempotent_todo_mvc,
         "../../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn"
     );
+
     idempotency_test!(
         idempotent_fibonacci,
         "../../../../playground/frontend/src/examples/fibonacci/fibonacci.bn"
