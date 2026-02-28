@@ -379,7 +379,15 @@ impl<'code> Formatter<'code> {
     /// Determine how a value should be laid out relative to its variable name.
     fn value_layout(&self, expr: &Spanned<Expression<'code>>) -> ValueLayout {
         if self.should_inline_value(expr) {
-            return ValueLayout::Inline;
+            // Verify the inline form actually fits at the current cursor position
+            if let Some(inline) = self.estimate_inline(expr) {
+                if self.current_line_width() + inline.len() <= MAX_LINE_WIDTH {
+                    return ValueLayout::Inline;
+                }
+            } else {
+                return ValueLayout::Inline;
+            }
+            // Doesn't fit — fall through to SameLineStart/NextLine logic
         }
         // Constructs with opening delimiters that should stay on the same line
         match &expr.node {
@@ -399,7 +407,7 @@ impl<'code> Formatter<'code> {
             Expression::Flush { .. } => ValueLayout::SameLineStart,
             Expression::Block { .. } => ValueLayout::SameLineStart,
             Expression::TextLiteral { .. } => ValueLayout::SameLineStart,
-            Expression::Pipe { from, .. } => {
+            Expression::Pipe { from, to } => {
                 // Walk to the leftmost segment and count chain length
                 let mut first: &Spanned<Expression<'code>> = from;
                 let mut chain_len: usize = 2; // at least from + to
@@ -407,12 +415,27 @@ impl<'code> Formatter<'code> {
                     first = inner;
                     chain_len += 1;
                 }
-                if self.estimate_inline(first).is_some() && chain_len == 2 {
-                    // Inline first + single continuation: hug on same line
-                    // e.g. `selected_filter: Router/route() |> WHILE { ... }`
-                    ValueLayout::SameLineStart
+                if chain_len == 2 {
+                    if let Some(first_inline) = self.estimate_inline(first) {
+                        // Check if the pipe can actually hug at the current cursor position
+                        let hug_width = if let Some(to_inline) = self.estimate_inline(to) {
+                            " |> ".len() + to_inline.len()
+                        } else {
+                            " |> ".len() // multiline continuation: just the opener
+                        };
+                        if self.current_line_width() + first_inline.len() + hug_width
+                            <= MAX_LINE_WIDTH
+                        {
+                            ValueLayout::SameLineStart
+                        } else {
+                            // Pipe won't hug — use NextLine to keep it as one unit
+                            ValueLayout::NextLine
+                        }
+                    } else {
+                        ValueLayout::NextLine
+                    }
                 } else {
-                    // Multiline first OR 3+ segments: value on next line, |> aligned
+                    // 3+ segments: value on next line, |> aligned
                     ValueLayout::NextLine
                 }
             }
@@ -658,7 +681,13 @@ impl<'code> Formatter<'code> {
         // Multi-line
         self.newline();
         self.indent += 1;
-        for arg in arguments {
+        for (i, arg) in arguments.iter().enumerate() {
+            if i > 0
+                && (self.is_argument_multiline(&arguments[i - 1].node)
+                    || self.is_argument_multiline(&arg.node))
+            {
+                self.newline();
+            }
             self.emit_comments_before(arg.span.start);
             self.write_indent();
             self.format_argument(&arg.node);
@@ -824,7 +853,13 @@ impl<'code> Formatter<'code> {
         self.write(" {");
         self.newline();
         self.indent += 1;
-        for arm in arms {
+        for (i, arm) in arms.iter().enumerate() {
+            if i > 0
+                && (self.is_arm_multiline(&arms[i - 1])
+                    || self.is_arm_multiline(arm))
+            {
+                self.newline();
+            }
             self.emit_comments_before(arm.body.span.start);
             self.write_indent();
             self.format_arm(arm);
@@ -957,7 +992,7 @@ impl<'code> Formatter<'code> {
                 self.write(" |> ");
                 self.format_expression(chain[1]);
             } else {
-                // Can't hug — fall to next line, aligned
+                // Can't hug — fall to next line, |> aligned with first segment
                 self.newline();
                 self.write_indent();
                 self.write("|> ");
@@ -1217,6 +1252,13 @@ impl<'code> Formatter<'code> {
 
     /// Try to produce a single-line representation of an expression.
     /// Returns `None` if the expression is inherently multiline.
+    fn estimate_pattern_width(&self, pattern: &Pattern<'code>) -> usize {
+        let mut tmp = Formatter::new(self.source, self.comments);
+        tmp.comment_cursor = self.comments.comments.len();
+        tmp.format_pattern(pattern);
+        tmp.buf.len()
+    }
+
     fn estimate_inline(&self, expr: &Spanned<Expression<'code>>) -> Option<String> {
         let mut tmp = Formatter::new(self.source, self.comments);
         tmp.comment_cursor = self.comments.comments.len(); // skip all comments
@@ -1233,6 +1275,31 @@ impl<'code> Formatter<'code> {
     fn is_variable_multiline(&self, var: &Variable<'code>) -> bool {
         let prefix = self.indent * INDENT.len() + var.name.len() + 2; // "    name: "
         match self.estimate_inline(&var.value) {
+            None => true,
+            Some(inline) => prefix + inline.len() > MAX_LINE_WIDTH,
+        }
+    }
+
+    /// Check if a function argument (name: value) would format to multiple lines.
+    fn is_argument_multiline(&self, arg: &Argument<'code>) -> bool {
+        match &arg.value {
+            None => false, // bare positional arg like `item` is always one line
+            Some(value) => {
+                let prefix = self.indent * INDENT.len() + arg.name.len() + 2; // "    name: "
+                match self.estimate_inline(value) {
+                    None => true,
+                    Some(inline) => prefix + inline.len() > MAX_LINE_WIDTH,
+                }
+            }
+        }
+    }
+
+    /// Check if a WHEN/WHILE arm (pattern => body) would format to multiple lines.
+    fn is_arm_multiline(&self, arm: &Arm<'code>) -> bool {
+        // Estimate: "    pattern => body"
+        let pattern_width = self.estimate_pattern_width(&arm.pattern);
+        let prefix = self.indent * INDENT.len() + pattern_width + " => ".len();
+        match self.estimate_inline(&arm.body) {
             None => true,
             Some(inline) => prefix + inline.len() > MAX_LINE_WIDTH,
         }
