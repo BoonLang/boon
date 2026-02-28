@@ -88,6 +88,22 @@ impl CodeEditor {
             drop(closure);
         })
     }
+
+    pub fn on_cursor_change(
+        self,
+        mut on_cursor_change: impl FnMut(u32, u32) + 'static,
+    ) -> Self {
+        let closure = Rc::new(Closure::new(move |line: u32, col: u32| {
+            on_cursor_change(line, col);
+        }));
+        let task = Task::start_droppable(self.controller.wait_for_some_ref(
+            clone!((closure) move |controller| controller.on_cursor_change(&closure)),
+        ));
+        self.after_remove(move |_| {
+            drop(task);
+            drop(closure);
+        })
+    }
 }
 
 mod js_bridge {
@@ -113,5 +129,11 @@ mod js_bridge {
 
         #[wasm_bindgen(method)]
         pub fn on_change(this: &CodeEditorController, on_change: &Closure<dyn FnMut(JsString)>);
+
+        #[wasm_bindgen(method)]
+        pub fn on_cursor_change(
+            this: &CodeEditorController,
+            on_cursor_change: &Closure<dyn FnMut(u32, u32)>,
+        );
     }
 }

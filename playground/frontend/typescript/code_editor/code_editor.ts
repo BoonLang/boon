@@ -11,6 +11,7 @@ export class CodeEditorController {
 
     editor_view: EditorView | null = null
     on_change_handler = new Compartment
+    on_cursor_change_handler = new Compartment
     editor_style = new Compartment
 
     init(parent_element: HTMLElement) {
@@ -29,6 +30,7 @@ export class CodeEditorController {
                 keymap.of([indentWithTab]),
                 indentUnit.of("    "),
                 this.on_change_handler.of([]),
+                this.on_cursor_change_handler.of([]),
             ],
         })
         this.editor_view = new EditorView({
@@ -88,6 +90,19 @@ export class CodeEditorController {
         })
         this.editor_view!.dispatch({
             effects: this.on_change_handler.reconfigure(on_change_extension)
+        })
+    }
+
+    on_cursor_change(on_cursor_change: (line: number, column: number) => void) {
+        const extension = EditorView.updateListener.of(view_update => {
+            if (view_update.selectionSet || view_update.docChanged) {
+                const pos = view_update.state.selection.main.head
+                const line = view_update.state.doc.lineAt(pos)
+                on_cursor_change(line.number, pos - line.from + 1)
+            }
+        })
+        this.editor_view!.dispatch({
+            effects: this.on_cursor_change_handler.reconfigure(extension)
         })
     }
 }

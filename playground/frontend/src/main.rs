@@ -282,6 +282,8 @@ struct Playground {
     force_size_expanded: Mutable<bool>,
     /// Selected engine type (for engine-both feature)
     engine_type: Mutable<EngineType>,
+    /// Cursor position in editor (line, column) — 1-based
+    cursor_position: Mutable<(u32, u32)>,
     _store_files_task: Rc<TaskHandle>,
     _store_current_file_task: Rc<TaskHandle>,
     _store_panel_split_task: Rc<TaskHandle>,
@@ -548,6 +550,7 @@ impl Playground {
             _sync_source_to_files_task,
             _sync_source_to_custom_example_task,
             engine_type,
+            cursor_position: Mutable::new((1, 1)),
         }
         .root()
     }
@@ -1820,11 +1823,34 @@ impl Playground {
     }
 
     fn editor_panel_content(&self) -> impl Element + use<> {
-        Column::new()
+        Stack::new()
             .s(Align::new().top())
             .s(Width::fill())
             .s(Height::fill())
-            .item(self.standard_code_editor_surface())
+            .layer(self.standard_code_editor_surface())
+            .layer(
+                El::new()
+                    .s(Align::new().bottom().right())
+                    .s(Padding::new().right(20).bottom(16))
+                    .child(
+                        El::new()
+                            .s(Padding::new().x(8).y(3))
+                            .s(RoundedCorners::all(6))
+                            .s(Background::new().color(color!("rgba(11, 18, 35, 0.7)")))
+                            .s(Font::new()
+                                .size(11)
+                                .family([FontFamily::new("JetBrains Mono"), FontFamily::Monospace])
+                                .color(color!("rgba(255, 255, 255, 0.5)")))
+                            .update_raw_el(|raw_el| {
+                                raw_el
+                                    .style("pointer-events", "none")
+                                    .style("z-index", "10")
+                            })
+                            .child_signal(self.cursor_position.signal().map(|(line, col)| {
+                                format!("Ln {line}, Col {col}")
+                            })),
+                    ),
+            )
     }
 
     fn snippet_screenshot_surface(&self) -> impl Element + use<> {
@@ -1924,6 +1950,10 @@ impl Playground {
             .on_change({
                 let source_code = self.source_code.clone();
                 move |content| source_code.set_neq(Rc::new(Cow::from(content)))
+            })
+            .on_cursor_change({
+                let cursor_position = self.cursor_position.clone();
+                move |line, col| cursor_position.set((line, col))
             })
     }
 

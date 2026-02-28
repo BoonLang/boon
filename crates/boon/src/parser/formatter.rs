@@ -117,7 +117,10 @@ impl<'code> CommentMap<'code> {
 // ---------------------------------------------------------------------------
 
 const INDENT: &str = "    ";
+/// Max content width (excluding indent) for inline decisions.
 const MAX_WIDTH: usize = 80;
+/// Max total line width (including indent) — the absolute column limit.
+const MAX_LINE_WIDTH: usize = 90;
 
 struct Formatter<'code> {
     source: &'code str,
@@ -374,6 +377,20 @@ impl<'code> Formatter<'code> {
             Expression::Then { .. } => ValueLayout::SameLineStart,
             Expression::Flush { .. } => ValueLayout::SameLineStart,
             Expression::Block { .. } => ValueLayout::SameLineStart,
+            Expression::Pipe { from, .. } => {
+                // Walk to the leftmost segment of the pipe chain
+                let mut first: &Spanned<Expression<'code>> = from;
+                while let Expression::Pipe { from: inner, .. } = &first.node {
+                    first = inner;
+                }
+                // Inline first segment → SameLineStart (hug |> on same line)
+                // Multiline first segment → NextLine (|> on own lines, aligned)
+                if self.estimate_inline(first).is_some() {
+                    ValueLayout::SameLineStart
+                } else {
+                    ValueLayout::NextLine
+                }
+            }
             _ => ValueLayout::NextLine,
         }
     }
@@ -428,15 +445,13 @@ impl<'code> Formatter<'code> {
             self.write("[]");
             return;
         }
-        // Try inline for single short field
-        if variables.len() == 1 {
-            if let Some(inline) = self.try_inline_variable(&variables[0]) {
-                if inline.len() + 2 <= MAX_WIDTH {
-                    self.write("[");
-                    self.write(&inline);
-                    self.write("]");
-                    return;
-                }
+        // Try inline if all fields fit on one line
+        if let Some(inline) = self.try_inline_object(variables) {
+            if inline.len() + 2 + self.current_line_width() <= MAX_LINE_WIDTH {
+                self.write("[");
+                self.write(&inline);
+                self.write("]");
+                return;
             }
         }
         self.write("[");
@@ -467,7 +482,7 @@ impl<'code> Formatter<'code> {
         // Try inline for short tagged objects
         if let Some(inline) = self.try_inline_object(variables) {
             let total = tag.len() + 1 + inline.len() + 1;
-            if total <= MAX_WIDTH {
+            if total + self.current_line_width() <= MAX_LINE_WIDTH {
                 self.write(tag);
                 self.write("[");
                 self.write(&inline);
@@ -577,7 +592,7 @@ impl<'code> Formatter<'code> {
         }
         // Try inline
         if let Some(inline) = self.try_inline_arguments(arguments) {
-            let available = MAX_WIDTH.saturating_sub(self.current_line_width() + 1); // +1 for ')'
+            let available = MAX_LINE_WIDTH.saturating_sub(self.current_line_width() + 1); // +1 for ')'
             if inline.len() <= available {
                 self.write(&inline);
                 self.write(")");
@@ -671,7 +686,7 @@ impl<'code> Formatter<'code> {
         // Try inline for short bodies
         if let Some(inline) = self.estimate_inline(body) {
             let total = "THEN { ".len() + inline.len() + " }".len();
-            if total + self.current_line_width() <= MAX_WIDTH {
+            if total + self.current_line_width() <= MAX_LINE_WIDTH {
                 self.write("THEN { ");
                 self.write(&inline);
                 self.write(" }");
@@ -693,7 +708,7 @@ impl<'code> Formatter<'code> {
     fn format_flush(&mut self, value: &Spanned<Expression<'code>>) {
         if let Some(inline) = self.estimate_inline(value) {
             let total = "FLUSH { ".len() + inline.len() + " }".len();
-            if total + self.current_line_width() <= MAX_WIDTH {
+            if total + self.current_line_width() <= MAX_LINE_WIDTH {
                 self.write("FLUSH { ");
                 self.write(&inline);
                 self.write(" }");
@@ -721,7 +736,7 @@ impl<'code> Formatter<'code> {
         if arms.len() == 1 {
             if let Some(inline) = self.try_inline_arm(&arms[0]) {
                 let total = keyword.len() + " { ".len() + inline.len() + " }".len();
-                if total + self.current_line_width() <= MAX_WIDTH {
+                if total + self.current_line_width() <= MAX_LINE_WIDTH {
                     self.write(keyword);
                     self.write(" { ");
                     self.write(&inline);
@@ -836,22 +851,61 @@ impl<'code> Formatter<'code> {
 
         // Try inline
         if let Some(inline) = self.try_inline_pipe_chain(&chain) {
-            if inline.len() + self.current_line_width() <= MAX_WIDTH {
+            if inline.len() + self.current_line_width() <= MAX_LINE_WIDTH {
                 self.write(&inline);
                 return;
             }
         }
 
-        // Multi-line: first element at current position, rest indented with |>
-        self.format_expression(chain[0]);
-        self.indent += 1;
-        for segment in &chain[1..] {
-            self.newline();
-            self.write_indent();
-            self.write("|> ");
-            self.format_expression(segment);
+        // Check if the first segment is single-line
+        let first_is_inline = self.estimate_inline(chain[0]).is_some();
+
+        if first_is_inline && chain.len() == 2 {
+            // Single continuation after inline first: hug |> on same line
+            // e.g. `selected_filter: Router/route() |> WHILE { ... }`
+            self.format_expression(chain[0]);
+            // Check if |> + continuation fits on this line.
+            // For inline continuations: check full width.
+            // For multiline continuations (WHILE, HOLD, etc.): only the opening needs to fit.
+            let hug_width = if let Some(inline) = self.estimate_inline(chain[1]) {
+                " |> ".len() + inline.len()
+            } else {
+                " |> ".len()
+            };
+            if self.current_line_width() + hug_width <= MAX_LINE_WIDTH {
+                self.write(" |> ");
+                self.format_expression(chain[1]);
+            } else {
+                // Line too long to hug — fall back to vertical
+                self.indent += 1;
+                self.newline();
+                self.write_indent();
+                self.write("|> ");
+                self.format_expression(chain[1]);
+                self.indent -= 1;
+            }
+        } else if first_is_inline {
+            // Multiple continuations after inline first: vertical with indent+1
+            self.format_expression(chain[0]);
+            self.indent += 1;
+            for segment in &chain[1..] {
+                self.newline();
+                self.write_indent();
+                self.write("|> ");
+                self.format_expression(segment);
+            }
+            self.indent -= 1;
+        } else {
+            // Multiline first segment: all |> at same indent (no +1)
+            // e.g. `LATEST { ... }\n|> Math/sum()`
+            self.format_expression(chain[0]);
+            for segment in &chain[1..] {
+                self.newline();
+                self.write_indent();
+                self.write("|> ");
+                self.format_expression(segment);
+            }
         }
-        self.indent -= 1;
     }
 
     fn collect_pipe_chain<'a>(
@@ -1005,14 +1059,10 @@ impl<'code> Formatter<'code> {
                 self.try_inline_arguments(arguments).is_some()
             }
             Expression::TaggedObject { object, .. } => {
-                // Inline short tagged objects
-                object.variables.len() <= 1
-                    && object.variables.iter().all(|v| self.should_inline_value(&v.node.value))
+                self.try_inline_object(&object.variables).is_some()
             }
             Expression::Object(obj) => {
-                obj.variables.is_empty()
-                    || (obj.variables.len() == 1
-                        && self.should_inline_value(&obj.variables[0].node.value))
+                self.try_inline_object(&obj.variables).is_some()
             }
             Expression::Pipe { .. } => {
                 // Try to estimate if the entire pipe chain fits inline
@@ -1041,9 +1091,9 @@ impl<'code> Formatter<'code> {
             Expression::When { arms } | Expression::While { arms } => {
                 arms.len() > 1 || arms.iter().any(|a| self.is_multiline(&a.body))
             }
-            Expression::Object(obj) => obj.variables.len() > 1,
+            Expression::Object(obj) => self.try_inline_object(&obj.variables).is_none(),
             Expression::TaggedObject { object, .. } => {
-                object.variables.len() > 1
+                self.try_inline_object(&object.variables).is_none()
             }
             Expression::List { items } => !items.is_empty(),
             Expression::Map { entries } => !entries.is_empty(),
@@ -1090,7 +1140,12 @@ impl<'code> Formatter<'code> {
         for var in variables {
             parts.push(self.try_inline_variable(var)?);
         }
-        Some(parts.join(", "))
+        let result = parts.join(", ");
+        if result.len() > MAX_WIDTH {
+            None
+        } else {
+            Some(result)
+        }
     }
 
     fn try_inline_arguments(&self, arguments: &[Spanned<Argument<'code>>]) -> Option<String> {
@@ -1192,7 +1247,7 @@ mod tests {
     #[test]
     fn format_object_multi_field() {
         let input = "x: [a: 1, b: 2]";
-        let expected = "x: [\n    a: 1\n    b: 2\n]\n";
+        let expected = "x: [a: 1, b: 2]\n";
         assert_eq!(format(input).unwrap(), expected);
     }
 

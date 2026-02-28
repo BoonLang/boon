@@ -23533,6 +23533,7 @@ var CodeEditorController = class {
 	constructor() {}
 	editor_view = null;
 	on_change_handler = new Compartment();
+	on_cursor_change_handler = new Compartment();
 	editor_style = new Compartment();
 	init(parent_element) {
 		const state = EditorState.create({ extensions: [
@@ -23547,7 +23548,8 @@ var CodeEditorController = class {
 			keymap.of(defaultKeymap),
 			keymap.of([indentWithTab]),
 			indentUnit.of("    "),
-			this.on_change_handler.of([])
+			this.on_change_handler.of([]),
+			this.on_cursor_change_handler.of([])
 		] });
 		this.editor_view = new EditorView({
 			parent: parent_element,
@@ -23596,6 +23598,16 @@ var CodeEditorController = class {
 			}
 		});
 		this.editor_view.dispatch({ effects: this.on_change_handler.reconfigure(on_change_extension) });
+	}
+	on_cursor_change(on_cursor_change) {
+		const extension = EditorView.updateListener.of((view_update) => {
+			if (view_update.selectionSet || view_update.docChanged) {
+				const pos = view_update.state.selection.main.head;
+				const line = view_update.state.doc.lineAt(pos);
+				on_cursor_change(line.number, pos - line.from + 1);
+			}
+		});
+		this.editor_view.dispatch({ effects: this.on_cursor_change_handler.reconfigure(extension) });
 	}
 };
 
