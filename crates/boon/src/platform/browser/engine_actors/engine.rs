@@ -4350,13 +4350,7 @@ impl ActorHandle {
             sender: tx,
             starting_version: 0,
         };
-        if let Err(e) = self.subscription_sender.try_send(setup) {
-            let fallback_setup = e.into_inner();
-            let fallback_sender = self.subscription_sender.clone();
-            Task::start_droppable(async move {
-                let _ = fallback_sender.send(fallback_setup).await;
-            });
-        }
+        self.subscription_sender.send_or_drop(setup);
 
         rx.boxed_local()
     }
@@ -4373,13 +4367,7 @@ impl ActorHandle {
             sender: tx,
             starting_version: current_version,
         };
-        if let Err(e) = self.subscription_sender.try_send(setup) {
-            let fallback_setup = e.into_inner();
-            let fallback_sender = self.subscription_sender.clone();
-            Task::start_droppable(async move {
-                let _ = fallback_sender.send(fallback_setup).await;
-            });
-        }
+        self.subscription_sender.send_or_drop(setup);
 
         rx.boxed_local()
     }

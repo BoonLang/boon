@@ -1707,8 +1707,25 @@ fn element_stripe(
         .update_raw_el(move |raw_el| {
             raw_el
                 .style_signal("line-height", line_height_css_signal)
-                .style_signal("-webkit-font-smoothing", font_smoothing_css_signal)
                 .style_signal("text-shadow", text_shadow_css_signal)
+                // Font-smoothing via raw DOM API — dominator panics on unsupported CSS properties
+                .update_dom_builder(move |dom_builder| {
+                    let element: web_sys::Element = dom_builder.__internal_element().into();
+                    dom_builder.future(font_smoothing_css_signal.for_each(move |value| {
+                        let style = element.unchecked_ref::<web_sys::HtmlElement>().style();
+                        match value {
+                            Some(v) => {
+                                let _ = style.set_property("-webkit-font-smoothing", &v);
+                                let _ = style.set_property("-moz-osx-font-smoothing", "grayscale");
+                            }
+                            None => {
+                                let _ = style.remove_property("-webkit-font-smoothing");
+                                let _ = style.remove_property("-moz-osx-font-smoothing");
+                            }
+                        }
+                        async {}
+                    }))
+                })
         })
         // Keep tagged_object alive for the lifetime of this element
         .after_remove(move |_| {

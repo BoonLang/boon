@@ -9,6 +9,7 @@ use serde_json_any_key::*;
 use ulid::Ulid;
 use zoon::{WebStorage, eprintln, local_storage};
 
+
 /// Hierarchical persistence identity stored as a single u128.
 ///
 /// The ID supports hierarchical derivation:
@@ -180,6 +181,7 @@ pub fn resolve_persistence<'new_code, 'old_code>(
     (
         Vec<Spanned<Expression<'new_code>>>,
         HashMap<Span, PersistenceId>,
+        Vec<PersistenceId>,
     ),
     Vec<ResolveError<'new_code>>,
 > {
@@ -206,6 +208,7 @@ pub fn resolve_persistence<'new_code, 'old_code>(
 
     let mut new_span_id_pairs = HashMap::new();
     let mut errors = Vec::new();
+    let mut changed_variable_ids = Vec::new();
     for new_expression in &mut new_expressions {
         set_persistence(
             new_expression,
@@ -213,10 +216,11 @@ pub fn resolve_persistence<'new_code, 'old_code>(
             &old_span_id_pairs,
             &mut new_span_id_pairs,
             &mut errors,
+            &mut changed_variable_ids,
         );
     }
     if errors.is_empty() {
-        Ok((new_expressions, new_span_id_pairs))
+        Ok((new_expressions, new_span_id_pairs, changed_variable_ids))
     } else {
         Err(errors)
     }
@@ -231,6 +235,7 @@ fn set_persistence<'a, 'code, 'old_code>(
     old_span_id_pairs: &HashMap<Span, PersistenceId>,
     new_span_id_pairs: &mut HashMap<Span, PersistenceId>,
     errors: &mut Vec<ResolveError>,
+    changed_variable_ids: &mut Vec<PersistenceId>,
 ) {
     let Spanned {
         span,
@@ -265,6 +270,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             } else {
                 let id = PersistenceId::new();
@@ -279,6 +285,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             }
             // Set value_changed based on value expression's persistence status
@@ -288,6 +295,11 @@ fn set_persistence<'a, 'code, 'old_code>(
                 .as_ref()
                 .map(|p| p.status == PersistenceStatus::NewOrChanged)
                 .unwrap_or(true); // If no persistence, treat as changed
+            if variable.value_changed {
+                if let Some(p) = persistence.as_ref() {
+                    changed_variable_ids.push(p.id);
+                }
+            }
         }
         Expression::Object(object) => {
             let old_object_variables_and_id =
@@ -338,6 +350,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
+                            changed_variable_ids,
                         );
                     } else {
                         let id = PersistenceId::new();
@@ -352,6 +365,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
+                            changed_variable_ids,
                         );
                     }
                     // Set value_changed based on value expression's persistence status
@@ -361,6 +375,11 @@ fn set_persistence<'a, 'code, 'old_code>(
                         .as_ref()
                         .map(|p| p.status == PersistenceStatus::NewOrChanged)
                         .unwrap_or(true);
+                    if variable.value_changed {
+                        if let Some(p) = persistence.as_ref() {
+                            changed_variable_ids.push(p.id);
+                        }
+                    }
                 }
             } else {
                 let id = PersistenceId::new();
@@ -387,6 +406,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                         &old_span_id_pairs,
                         new_span_id_pairs,
                         errors,
+                        changed_variable_ids,
                     );
                     // Set value_changed based on value expression's persistence status
                     variable.value_changed = variable
@@ -395,6 +415,11 @@ fn set_persistence<'a, 'code, 'old_code>(
                         .as_ref()
                         .map(|p| p.status == PersistenceStatus::NewOrChanged)
                         .unwrap_or(true);
+                    if variable.value_changed {
+                        if let Some(p) = persistence.as_ref() {
+                            changed_variable_ids.push(p.id);
+                        }
+                    }
                 }
             }
         }
@@ -453,6 +478,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
+                            changed_variable_ids,
                         );
                     } else {
                         let id = PersistenceId::new();
@@ -467,6 +493,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
+                            changed_variable_ids,
                         );
                     }
                     // Set value_changed based on value expression's persistence status
@@ -476,6 +503,11 @@ fn set_persistence<'a, 'code, 'old_code>(
                         .as_ref()
                         .map(|p| p.status == PersistenceStatus::NewOrChanged)
                         .unwrap_or(true);
+                    if variable.value_changed {
+                        if let Some(p) = persistence.as_ref() {
+                            changed_variable_ids.push(p.id);
+                        }
+                    }
                 }
             } else {
                 let id = PersistenceId::new();
@@ -502,6 +534,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                         &old_span_id_pairs,
                         new_span_id_pairs,
                         errors,
+                        changed_variable_ids,
                     );
                     // Set value_changed based on value expression's persistence status
                     variable.value_changed = variable
@@ -510,6 +543,11 @@ fn set_persistence<'a, 'code, 'old_code>(
                         .as_ref()
                         .map(|p| p.status == PersistenceStatus::NewOrChanged)
                         .unwrap_or(true);
+                    if variable.value_changed {
+                        if let Some(p) = persistence.as_ref() {
+                            changed_variable_ids.push(p.id);
+                        }
+                    }
                 }
             }
         }
@@ -571,6 +609,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                                     &old_span_id_pairs,
                                     new_span_id_pairs,
                                     errors,
+                                    changed_variable_ids,
                                 )
                             } else {
                                 set_persistence(
@@ -579,6 +618,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                                     &old_span_id_pairs,
                                     new_span_id_pairs,
                                     errors,
+                                    changed_variable_ids,
                                 )
                             }
                         }
@@ -596,6 +636,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                                 &old_span_id_pairs,
                                 new_span_id_pairs,
                                 errors,
+                                changed_variable_ids,
                             )
                         }
                     }
@@ -645,6 +686,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
+                            changed_variable_ids,
                         )
                     }
                 }
@@ -703,6 +745,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
+                            changed_variable_ids,
                         );
                     } else {
                         let id = PersistenceId::new();
@@ -717,6 +760,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
+                            changed_variable_ids,
                         );
                     }
                     // Set value_changed based on value expression's persistence status
@@ -726,6 +770,11 @@ fn set_persistence<'a, 'code, 'old_code>(
                         .as_ref()
                         .map(|p| p.status == PersistenceStatus::NewOrChanged)
                         .unwrap_or(true);
+                    if variable.value_changed {
+                        if let Some(p) = persistence.as_ref() {
+                            changed_variable_ids.push(p.id);
+                        }
+                    }
                 }
                 set_persistence(
                     output,
@@ -733,6 +782,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             } else {
                 let id = PersistenceId::new();
@@ -759,6 +809,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                         &old_span_id_pairs,
                         new_span_id_pairs,
                         errors,
+                        changed_variable_ids,
                     );
                     // Set value_changed based on value expression's persistence status
                     variable.value_changed = variable
@@ -767,8 +818,13 @@ fn set_persistence<'a, 'code, 'old_code>(
                         .as_ref()
                         .map(|p| p.status == PersistenceStatus::NewOrChanged)
                         .unwrap_or(true);
+                    if variable.value_changed {
+                        if let Some(p) = persistence.as_ref() {
+                            changed_variable_ids.push(p.id);
+                        }
+                    }
                 }
-                set_persistence(output, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+                set_persistence(output, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids)
             }
         }
         Expression::List { items } => {
@@ -802,9 +858,10 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
+                            changed_variable_ids,
                         );
                     } else {
-                        set_persistence(item, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+                    set_persistence(item, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids)
                     }
                 }
             } else {
@@ -815,7 +872,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     status: PersistenceStatus::NewOrChanged,
                 });
                 for item in items {
-                    set_persistence(item, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                    set_persistence(item, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids);
                 }
             }
         }
@@ -835,6 +892,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             }
         }
@@ -869,9 +927,10 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
+                            changed_variable_ids,
                         );
                     } else {
-                        set_persistence(input, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+                    set_persistence(input, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids)
                     }
                 }
             } else {
@@ -882,7 +941,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     status: PersistenceStatus::NewOrChanged,
                 });
                 for input in inputs {
-                    set_persistence(input, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                    set_persistence(input, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids);
                 }
             }
         }
@@ -910,6 +969,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             } else {
                 let id = PersistenceId::new();
@@ -918,7 +978,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     id,
                     status: PersistenceStatus::NewOrChanged,
                 });
-                set_persistence(body, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+                set_persistence(body, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids)
             }
         }
         Expression::When { arms } => {
@@ -936,6 +996,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             }
         }
@@ -954,6 +1015,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             }
         }
@@ -985,8 +1047,9 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
-                set_persistence(to, &[old_to], &old_span_id_pairs, new_span_id_pairs, errors);
+                set_persistence(to, &[old_to], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids);
             } else {
                 let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
@@ -994,8 +1057,8 @@ fn set_persistence<'a, 'code, 'old_code>(
                     id,
                     status: PersistenceStatus::NewOrChanged,
                 });
-                set_persistence(from, &[], &old_span_id_pairs, new_span_id_pairs, errors);
-                set_persistence(to, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                set_persistence(from, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids);
+                set_persistence(to, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids);
             }
         }
         Expression::ArithmeticOperator(op) => {
@@ -1008,7 +1071,7 @@ fn set_persistence<'a, 'code, 'old_code>(
             // Recurse into operands
             match op {
                 ArithmeticOperator::Negate { operand } => {
-                    set_persistence(operand, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                    set_persistence(operand, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids);
                 }
                 ArithmeticOperator::Add {
                     operand_a,
@@ -1032,6 +1095,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                         &old_span_id_pairs,
                         new_span_id_pairs,
                         errors,
+                        changed_variable_ids,
                     );
                     set_persistence(
                         operand_b,
@@ -1039,6 +1103,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                         &old_span_id_pairs,
                         new_span_id_pairs,
                         errors,
+                        changed_variable_ids,
                     );
                 }
             }
@@ -1082,6 +1147,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                         &old_span_id_pairs,
                         new_span_id_pairs,
                         errors,
+                        changed_variable_ids,
                     );
                     set_persistence(
                         operand_b,
@@ -1089,6 +1155,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                         &old_span_id_pairs,
                         new_span_id_pairs,
                         errors,
+                        changed_variable_ids,
                     );
                 }
             }
@@ -1126,6 +1193,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             } else {
                 let id = PersistenceId::new();
@@ -1134,7 +1202,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     id,
                     status: PersistenceStatus::NewOrChanged,
                 });
-                set_persistence(body, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+                set_persistence(body, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids)
             }
         }
         Expression::LinkSetter { alias: _ } => {
@@ -1327,6 +1395,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             } else {
                 let id = PersistenceId::new();
@@ -1335,7 +1404,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     id,
                     status: PersistenceStatus::NewOrChanged,
                 });
-                set_persistence(body, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+                set_persistence(body, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids)
             }
         }
         Expression::Flush { value } => {
@@ -1362,6 +1431,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             } else {
                 let id = PersistenceId::new();
@@ -1370,7 +1440,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     id,
                     status: PersistenceStatus::NewOrChanged,
                 });
-                set_persistence(value, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+                set_persistence(value, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids)
             }
         }
         Expression::Spread { value } => {
@@ -1397,6 +1467,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             } else {
                 let id = PersistenceId::new();
@@ -1405,7 +1476,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     id,
                     status: PersistenceStatus::NewOrChanged,
                 });
-                set_persistence(value, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+                set_persistence(value, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids)
             }
         }
         // Hardware types (parse-only for now)
@@ -1433,6 +1504,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             } else {
                 let id = PersistenceId::new();
@@ -1441,7 +1513,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     id,
                     status: PersistenceStatus::NewOrChanged,
                 });
-                set_persistence(size, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+                set_persistence(size, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids)
             }
         }
         Expression::Memory { address } => {
@@ -1471,6 +1543,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
+                    changed_variable_ids,
                 );
             } else {
                 let id = PersistenceId::new();
@@ -1479,7 +1552,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     id,
                     status: PersistenceStatus::NewOrChanged,
                 });
-                set_persistence(address, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+                set_persistence(address, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids)
             }
         }
         Expression::Bytes { data } => {
@@ -1513,9 +1586,10 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
+                            changed_variable_ids,
                         );
                     } else {
-                        set_persistence(item, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+                    set_persistence(item, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids)
                     }
                 }
             } else {
@@ -1526,7 +1600,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     status: PersistenceStatus::NewOrChanged,
                 });
                 for item in data {
-                    set_persistence(item, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                    set_persistence(item, &[], &old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids);
                 }
             }
         }

@@ -2711,7 +2711,6 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                             if let Some(ref mut sender) = existing_sender {
                                 if let Err(e) = sender.send(value.clone()).await {
                                     zoon::println!("[LINK_SETTER] Failed to forward to existing pass-through: {e}");
-                                    existing_sender = None;
                                 }
                             }
                             // Forward to our channel with backpressure (only matters on first evaluation)

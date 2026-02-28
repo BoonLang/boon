@@ -116,9 +116,9 @@ pub fn run(
     // println!("[Abstract Syntax Tree with Reference Data]");
     // println!("{ast:?}");
 
-    let (ast, new_span_id_pairs) =
+    let (ast, new_span_id_pairs, changed_variable_ids) =
         match resolve_persistence(ast, old_ast, &old_span_id_pairs_local_storage_key) {
-            Ok(ast) => ast,
+            Ok(result) => result,
             Err(errors) => {
                 println!("[Persistence Errors]");
                 report_errors(errors, filename, source_code);
@@ -128,6 +128,25 @@ pub fn run(
     if LOG_SOURCE_AND_AST {
         println!("[Abstract Syntax Tree with Reference Data and Persistence]");
         println!("{ast:#?}");
+    }
+
+    // Clean stale persistence values for variables whose source code changed.
+    // This prevents loading wrong values if a previous evaluation was interrupted
+    // (e.g., by a panic) after old source code was stored but before value saves flushed.
+    if !changed_variable_ids.is_empty() {
+        if let Some(Ok(mut states)) = local_storage()
+            .get::<std::collections::BTreeMap<String, serde_json::Value>>(
+                &states_local_storage_key,
+            )
+        {
+            let before = states.len();
+            for id in &changed_variable_ids {
+                states.remove(&id.to_string());
+            }
+            if states.len() != before {
+                let _ = local_storage().insert(&states_local_storage_key, &states);
+            }
+        }
     }
 
     // Convert to static expressions (owned, 'static, no lifetimes)
@@ -280,9 +299,9 @@ pub fn run_with_registry(
         }
     };
 
-    let (ast, new_span_id_pairs) =
+    let (ast, new_span_id_pairs, changed_variable_ids) =
         match resolve_persistence(ast, old_ast, &old_span_id_pairs_local_storage_key) {
-            Ok(ast) => ast,
+            Ok(result) => result,
             Err(errors) => {
                 println!("[Persistence Errors]");
                 report_errors(errors, filename, source_code);
@@ -292,6 +311,25 @@ pub fn run_with_registry(
     if LOG_SOURCE_AND_AST {
         println!("[Abstract Syntax Tree with Reference Data and Persistence]");
         println!("{ast:#?}");
+    }
+
+    // Clean stale persistence values for variables whose source code changed.
+    // This prevents loading wrong values if a previous evaluation was interrupted
+    // (e.g., by a panic) after old source code was stored but before value saves flushed.
+    if !changed_variable_ids.is_empty() {
+        if let Some(Ok(mut states)) = local_storage()
+            .get::<std::collections::BTreeMap<String, serde_json::Value>>(
+                &states_local_storage_key,
+            )
+        {
+            let before = states.len();
+            for id in &changed_variable_ids {
+                states.remove(&id.to_string());
+            }
+            if states.len() != before {
+                let _ = local_storage().insert(&states_local_storage_key, &states);
+            }
+        }
     }
 
     // Convert to static expressions (owned, 'static, no lifetimes)

@@ -932,8 +932,11 @@ fn extract_font_line_style(vm: &Mutable<Arc<Value>>) -> Font<'static> {
 }
 
 /// Apply raw CSS properties that have no Zoon typed equivalent
-/// (line-height, text-shadow, -webkit-font-smoothing).
-fn apply_raw_css_signals<T: RawEl>(raw_el: T, vm: &Mutable<Arc<Value>>) -> T {
+/// (line-height, text-shadow, font-smoothing, cursor).
+fn apply_raw_css_signals<T: RawEl>(raw_el: T, vm: &Mutable<Arc<Value>>) -> T
+where
+    T::DomElement: Clone,
+{
     raw_el
         .style_signal(
             "cursor",
@@ -971,17 +974,35 @@ fn apply_raw_css_signals<T: RawEl>(raw_el: T, vm: &Mutable<Arc<Value>>) -> T {
                 Some(format!("{}px {}px {}px {}", x, y, blur, color_css))
             }),
         )
-        .style_signal(
-            "-webkit-font-smoothing",
-            vm.signal_cloned().map(|v| {
-                let style = get_style_obj(get_fields(&v)?)?;
-                let val = style.get("font_smoothing")?;
-                match val.as_tag()? {
-                    "Antialiased" => Some("antialiased".to_string()),
-                    _ => None,
-                }
-            }),
-        )
+        // Font-smoothing via raw DOM API — dominator panics on unsupported CSS properties
+        .update_dom_builder({
+            let vm = vm.clone();
+            move |dom_builder| {
+                let element: web_sys::Element = dom_builder.__internal_element().into();
+                dom_builder.future(vm.signal_cloned().for_each(move |v| {
+                    let font_smoothing: Option<String> = (|| {
+                        let style = get_style_obj(get_fields(&v)?)?;
+                        let val = style.get("font_smoothing")?;
+                        match val.as_tag()? {
+                            "Antialiased" => Some("antialiased".to_string()),
+                            _ => None,
+                        }
+                    })();
+                    let style = element.unchecked_ref::<web_sys::HtmlElement>().style();
+                    match font_smoothing {
+                        Some(css_val) => {
+                            let _ = style.set_property("-webkit-font-smoothing", &css_val);
+                            let _ = style.set_property("-moz-osx-font-smoothing", "grayscale");
+                        }
+                        None => {
+                            let _ = style.remove_property("-webkit-font-smoothing");
+                            let _ = style.remove_property("-moz-osx-font-smoothing");
+                        }
+                    }
+                    async {}
+                }))
+            }
+        })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
