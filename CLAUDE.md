@@ -94,6 +94,14 @@ This is necessary because on Linux, process hierarchy auto-killing doesn't work 
 
 Do NOT use `cargo build -p frontend` directly - it will fail with type errors because MoonZoon requires special build configuration (wasm-bindgen, wasm-opt, etc.) that only mzoon provides. The mzoon dev server handles all compilation automatically when files change.
 
+**Release build (frontend only):**
+```bash
+cd playground && makers kill          # Stop dev server first
+cd playground && mzoon/bin/mzoon build -r -f   # -r = release, -f = frontend only
+```
+
+The dev server (`makers mzoon start`) must be stopped before running a release build. Use this to verify the frontend compiles in release mode before committing.
+
 ### TypeScript/CodeMirror (separate watcher)
 
 MoonZoon does NOT auto-compile TypeScript. When editing TypeScript files:
