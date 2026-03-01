@@ -76,7 +76,7 @@ FUNCTION new_todo(title) {
             title
 
             todo_elements.editing_todo_title_element.event.change.text |> WHEN {
-                changed_text => 
+                changed_text =>
                     changed_text
                     |> Text/is_not_empty()
                     |> WHEN {
@@ -309,7 +309,7 @@ FUNCTION todo_item(todo) {
             todo_checkbox(todo: todo)
 
             todo.editing |> WHILE {
-                True => 
+                True =>
                     Element/text_input(
                         element: [event: [change: LINK, key_down: LINK, blur: LINK]]
 
@@ -345,7 +345,7 @@ FUNCTION todo_item(todo) {
                     )
                     |> LINK { todo.todo_elements.editing_todo_title_element }
 
-                False => 
+                False =>
                     Element/label(
                         element: [event: [double_click: LINK]]
 
@@ -370,8 +370,9 @@ FUNCTION todo_item(todo) {
             }
 
             element.hovered |> WHILE {
-                True => 
-                    remove_todo_button() |> LINK { todo.todo_elements.remove_todo_button }
+                True =>
+                    remove_todo_button()
+                    |> LINK { todo.todo_elements.remove_todo_button }
 
                 False => NoElement
             }
@@ -527,8 +528,9 @@ FUNCTION panel_footer() {
             footer_section(align: Start, child: active_items_count_text())
             footer_section(align: Center, child: filters_element())
 
-            footer_section(align: End, child: PASSED.store.completed_todos_count > 0 |> WHILE {
-                True => 
+            footer_section(align: End, child: PASSED.store.completed_todos_count > 0
+            |> WHILE {
+                True =>
                     remove_completed_button()
                     |> LINK { PASSED.store.elements.remove_completed_button }
 
@@ -565,15 +567,23 @@ FUNCTION active_items_count_text() {
 }
 
 FUNCTION filters_element() {
-    Element/stripe(element: [], direction: Row, gap: 10, style: [], items: LIST {
-        filter_button(filter: All) |> LINK { PASSED.store.elements.filter_buttons.all }
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: []
 
-        filter_button(filter: Active)
-        |> LINK { PASSED.store.elements.filter_buttons.active }
+        items: LIST {
+            filter_button(filter: All)
+            |> LINK { PASSED.store.elements.filter_buttons.all }
 
-        filter_button(filter: Completed)
-        |> LINK { PASSED.store.elements.filter_buttons.completed }
-    })
+            filter_button(filter: Active)
+            |> LINK { PASSED.store.elements.filter_buttons.active }
+
+            filter_button(filter: Completed)
+            |> LINK { PASSED.store.elements.filter_buttons.completed }
+        }
+    )
 }
 
 FUNCTION filter_button(filter) {

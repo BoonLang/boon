@@ -18,10 +18,9 @@ store: [
         __ => SKIP
     }
 
-    items:
-        LIST {}
-        |> List/append(item: text_to_add)
-        |> List/clear(on: elements.clear_button.event.press)
+    items: LIST {}
+    |> List/append(item: text_to_add)
+    |> List/clear(on: elements.clear_button.event.press)
 ]
 
 document: Document/new(root: root_element(PASS: [store: store]))
@@ -68,30 +67,49 @@ FUNCTION item_input() {
 }
 
 FUNCTION items_list() {
-    Element/stripe(element: [], direction: Column, gap: 4, style: [], items: PASSED.store.items
-    |> List/map(
-        item
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 4
+        style: []
 
-        new: Element/label(
-            element: []
-            style: [font: [color: White]]
-            label: TEXT { - {item} }
+        items: PASSED.store.items |> List/map(
+            item
+
+            new: Element/label(
+                element: []
+                style: [font: [color: White]]
+                label: TEXT { - {item} }
+            )
         )
-    ))
+    )
 }
 
 FUNCTION footer() {
-    Element/stripe(element: [], direction: Row, gap: 16, style: [], items: LIST {
-        item_count_label()
-        clear_button() |> LINK { PASSED.store.elements.clear_button }
-    })
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 16
+        style: []
+
+        items: LIST {
+            item_count_label()
+            clear_button() |> LINK { PASSED.store.elements.clear_button }
+        }
+    )
 }
 
 FUNCTION item_count_label() {
-    Element/label(element: [], style: [font: [color: Oklch[lightness: 0.5]]], label: BLOCK {
-        count: PASSED.store.items |> List/count()
-        TEXT { {count} items }
-    })
+    Element/label(
+        element: []
+        style: [font: [color: Oklch[lightness: 0.5]]]
+
+        label: BLOCK {
+            count: PASSED.store.items |> List/count()
+
+            TEXT { {count} items }
+        }
+    )
 }
 
 FUNCTION clear_button() {

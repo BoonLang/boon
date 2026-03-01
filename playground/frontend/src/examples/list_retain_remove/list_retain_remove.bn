@@ -63,10 +63,17 @@ document: Document/new(root: Element/stripe(
             label: TEXT { Count: {store.items |> List/count()} }
         )
 
-        Element/stripe(element: [], direction: Column, gap: 5, style: [], items: store.items
-        |> List/map(
-            item
-            new: Element/label(element: [], style: [], label: TEXT { - {item} })
-        ))
+        Element/stripe(
+            element: []
+            direction: Column
+            gap: 5
+            style: []
+
+            items: store.items
+            |> List/map(
+                item
+                new: Element/label(element: [], style: [], label: TEXT { - {item} })
+            )
+        )
     }
 ))

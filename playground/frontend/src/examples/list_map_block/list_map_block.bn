@@ -21,25 +21,41 @@ document: Document/new(root: Element/stripe(
         Element/label(element: [], style: [], label: TEXT { Mode: {store.mode} })
 
         -- Test 1: Direct WHEN (should work)
-        Element/stripe(element: [], direction: Row, gap: 5, style: [], items: store.items
-        |> List/map(item, new: store.mode |> WHEN {
-            All => Element/label(element: [], style: [], label: item)
-            __ => NoElement
-        }))
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 5
+            style: []
+
+            items: store.items |> List/map(item, new: store.mode |> WHEN {
+                All => Element/label(element: [], style: [], label: item)
+                __ => NoElement
+            })
+        )
 
         -- Test 2: BLOCK + WHEN (might not work)
-        Element/stripe(element: [], direction: Row, gap: 5, style: [], items: store.items
-        |> List/map(item, new: BLOCK {
-            should_show: store.mode |> WHEN {
-                All => True
-                Even => item == 2 |> Bool/or(that: item == 4)
-                Odd => item == 1 |> Bool/or(that: item == 3) |> Bool/or(that: item == 5)
-            }
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 5
+            style: []
 
-            should_show |> WHILE {
-                True => Element/label(element: [], style: [], label: item)
-                False => NoElement
-            }
-        }))
+            items: store.items |> List/map(item, new: BLOCK {
+                should_show: store.mode |> WHEN {
+                    All => True
+                    Even => item == 2 |> Bool/or(that: item == 4)
+
+                    Odd =>
+                        item == 1
+                        |> Bool/or(that: item == 3)
+                        |> Bool/or(that: item == 5)
+                }
+
+                should_show |> WHILE {
+                    True => Element/label(element: [], style: [], label: item)
+                    False => NoElement
+                }
+            })
+        )
     }
 ))

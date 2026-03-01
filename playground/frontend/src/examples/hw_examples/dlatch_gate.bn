@@ -11,6 +11,7 @@ FUNCTION d_latch(d, e) {
         -- SR latch core (NOR gates)
         q: r |> Bool/not() |> Bool/and(that: nq |> Bool/not())
         nq: s |> Bool/not() |> Bool/and(that: q |> Bool/not())
+
         [q: q, nq: nq]
     }
 }

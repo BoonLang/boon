@@ -117,10 +117,13 @@ impl<'code> CommentMap<'code> {
 // ---------------------------------------------------------------------------
 
 const INDENT: &str = "    ";
-/// Max content width (excluding indent) for inline decisions.
-const MAX_WIDTH: usize = 80;
 /// Max total line width (including indent) — the absolute column limit.
 const MAX_LINE_WIDTH: usize = 90;
+/// Max prefix length for last-arg hugging. If the inline prefix (all preceding
+/// args + last arg name) exceeds this, skip hugging to avoid pipe ambiguity.
+const MAX_LAST_ARG_PREFIX: usize = 40;
+/// Max number of pipe chain segments that can be inlined on a single line.
+const MAX_INLINE_PIPE_PARTS: usize = 3;
 
 struct Formatter<'code> {
     source: &'code str,
@@ -128,6 +131,11 @@ struct Formatter<'code> {
     indent: usize,
     comments: &'code CommentMap<'code>,
     comment_cursor: usize,
+    /// When true, the next `format_pipe` call will skip inline/hug and format
+    /// vertically.  Set by callers that push a Pipe value to NextLine — the pipe
+    /// was already judged "too long" for the original line, so inlining it at the
+    /// wider indented position would create a visually jarring single long row.
+    force_vertical_pipe: bool,
 }
 
 impl<'code> Formatter<'code> {
@@ -138,6 +146,7 @@ impl<'code> Formatter<'code> {
             indent: 0,
             comments,
             comment_cursor: 0,
+            force_vertical_pipe: false,
         }
     }
 
@@ -359,7 +368,7 @@ impl<'code> Formatter<'code> {
         self.write_indent();
         self.write(var.name);
         self.write(":");
-        match self.value_layout(&var.value) {
+        match self.value_layout(&var.value, " ".len()) {
             ValueLayout::Inline => {
                 // name: value (all on one line)
                 self.write(" ");
@@ -376,6 +385,9 @@ impl<'code> Formatter<'code> {
                 self.indent += 1;
                 self.emit_comments_before(var.value.span.start);
                 self.write_indent();
+                if matches!(var.value.node, Expression::Pipe { .. }) {
+                    self.force_vertical_pipe = true;
+                }
                 self.format_expression(&var.value);
                 self.indent -= 1;
             }
@@ -383,11 +395,18 @@ impl<'code> Formatter<'code> {
     }
 
     /// Determine how a value should be laid out relative to its variable name.
-    fn value_layout(&self, expr: &Spanned<Expression<'code>>) -> ValueLayout {
+    /// `separator_width` is the width of the separator that will be written before
+    /// the value (e.g. `" => ".len()` for arms, `" ".len()` for variables/arguments).
+    fn value_layout(
+        &self,
+        expr: &Spanned<Expression<'code>>,
+        separator_width: usize,
+    ) -> ValueLayout {
+        let available = self.current_line_width() + separator_width;
         if self.should_inline_value(expr) {
             // Verify the inline form actually fits at the current cursor position
             if let Some(inline) = self.estimate_inline(expr) {
-                if self.current_line_width() + inline.len() <= MAX_LINE_WIDTH {
+                if available + inline.len() <= MAX_LINE_WIDTH {
                     return ValueLayout::Inline;
                 }
             } else {
@@ -427,11 +446,9 @@ impl<'code> Formatter<'code> {
                         let hug_width = if let Some(to_inline) = self.estimate_inline(to) {
                             " |> ".len() + to_inline.len()
                         } else {
-                            " |> ".len() // multiline continuation: just the opener
+                            " |> ".len() + self.estimate_opening_width(&to.node)
                         };
-                        if self.current_line_width() + first_inline.len() + hug_width
-                            <= MAX_LINE_WIDTH
-                        {
+                        if available + first_inline.len() + hug_width <= MAX_LINE_WIDTH {
                             ValueLayout::SameLineStart
                         } else {
                             // Pipe won't hug — use NextLine to keep it as one unit
@@ -703,7 +720,9 @@ impl<'code> Formatter<'code> {
                     }
                     prefix.push_str(last.name);
                     prefix.push_str(": ");
-                    if self.current_line_width() + prefix.len() <= MAX_LINE_WIDTH {
+                    if prefix.len() <= MAX_LAST_ARG_PREFIX
+                        && self.current_line_width() + prefix.len() <= MAX_LINE_WIDTH
+                    {
                         self.write(&prefix);
                         self.format_expression(last.value.as_ref().unwrap());
                         self.write(")");
@@ -737,7 +756,7 @@ impl<'code> Formatter<'code> {
         self.write(arg.name);
         if let Some(value) = &arg.value {
             self.write(":");
-            match self.value_layout(value) {
+            match self.value_layout(value, " ".len()) {
                 ValueLayout::Inline | ValueLayout::SameLineStart => {
                     self.write(" ");
                     self.format_expression(value);
@@ -746,6 +765,9 @@ impl<'code> Formatter<'code> {
                     self.newline();
                     self.indent += 1;
                     self.write_indent();
+                    if matches!(value.node, Expression::Pipe { .. }) {
+                        self.force_vertical_pipe = true;
+                    }
                     self.format_expression(value);
                     self.indent -= 1;
                 }
@@ -908,17 +930,20 @@ impl<'code> Formatter<'code> {
 
     fn format_arm(&mut self, arm: &Arm<'code>) {
         self.format_pattern(&arm.pattern);
-        self.write(" => ");
-        // Use value_layout for consistent arm/variable formatting:
-        // Inline/SameLineStart stay on the => line, NextLine breaks after =>
-        match self.value_layout(&arm.body) {
+        let layout = self.value_layout(&arm.body, " => ".len());
+        match layout {
             ValueLayout::Inline | ValueLayout::SameLineStart => {
+                self.write(" => ");
                 self.format_expression(&arm.body);
             }
             ValueLayout::NextLine => {
+                self.write(" =>");
                 self.newline();
                 self.indent += 1;
                 self.write_indent();
+                if matches!(arm.body.node, Expression::Pipe { .. }) {
+                    self.force_vertical_pipe = true;
+                }
                 self.format_expression(&arm.body);
                 self.indent -= 1;
             }
@@ -999,11 +1024,21 @@ impl<'code> Formatter<'code> {
         self.collect_pipe_chain(from, &mut chain);
         chain.push(to);
 
-        // Try inline
-        if let Some(inline) = self.try_inline_pipe_chain(&chain) {
-            if inline.len() + self.current_line_width() <= MAX_LINE_WIDTH {
-                self.write(&inline);
-                return;
+        // Consume the force-vertical flag.  When set, the pipe was pushed to
+        // NextLine by its container (variable, argument or arm) — meaning it
+        // was already judged "too long" for the original line.  Inlining it at
+        // the wider indented position would create a jarring single long row,
+        // so we skip the inline and hug attempts and go straight to vertical.
+        let force_vertical = self.force_vertical_pipe;
+        self.force_vertical_pipe = false;
+
+        // Try inline (unless forced vertical)
+        if !force_vertical {
+            if let Some(inline) = self.try_inline_pipe_chain(&chain) {
+                if inline.len() + self.current_line_width() <= MAX_LINE_WIDTH {
+                    self.write(&inline);
+                    return;
+                }
             }
         }
 
@@ -1012,17 +1047,17 @@ impl<'code> Formatter<'code> {
             .estimate_inline(chain[0])
             .is_some_and(|inline| inline.len() + self.current_line_width() <= MAX_LINE_WIDTH);
 
-        if first_is_inline && chain.len() == 2 {
+        if !force_vertical && first_is_inline && chain.len() == 2 {
             // Single continuation after inline first: hug |> on same line
             // e.g. `selected_filter: Router/route() |> WHILE { ... }`
             self.format_expression(chain[0]);
             // Check if |> + continuation fits on this line.
             // For inline continuations: check full width.
-            // For multiline continuations (WHILE, HOLD, etc.): only the opening needs to fit.
+            // For multiline continuations (WHILE, HOLD, etc.): include the opening keyword.
             let hug_width = if let Some(inline) = self.estimate_inline(chain[1]) {
                 " |> ".len() + inline.len()
             } else {
-                " |> ".len()
+                " |> ".len() + self.estimate_opening_width(&chain[1].node)
             };
             if self.current_line_width() + hug_width <= MAX_LINE_WIDTH {
                 self.write(" |> ");
@@ -1081,12 +1116,9 @@ impl<'code> Formatter<'code> {
             self.format_variable(&var.node, &var.span);
             self.newline();
         }
-        // Blank line before output if either last variable or output is multiline
+        // Always blank line before output when there are bindings
         if !variables.is_empty() {
-            let last_var_multiline = self.is_variable_multiline(&variables.last().unwrap().node);
-            if last_var_multiline || self.is_item_multiline(output) {
-                self.newline();
-            }
+            self.newline();
         }
         self.emit_comments_before(output.span.start);
         self.format_body_expression(output);
@@ -1307,6 +1339,31 @@ impl<'code> Formatter<'code> {
         }
     }
 
+    /// Estimate how many characters a multiline expression puts on its opening line.
+    /// Used by pipe hug width to account for keywords like `WHILE {`, `HOLD state {`.
+    fn estimate_opening_width(&self, expr: &Expression<'code>) -> usize {
+        match expr {
+            Expression::While { .. } => "WHILE {".len(),
+            Expression::When { .. } => "WHEN {".len(),
+            Expression::Then { .. } => "THEN {".len(),
+            Expression::Latest { .. } => "LATEST {".len(),
+            Expression::Hold { state_param, .. } => "HOLD ".len() + state_param.len() + " {".len(),
+            Expression::FunctionCall { path, .. } => {
+                path.iter().map(|s| s.len()).sum::<usize>()
+                    + path.len().saturating_sub(1) // "/" separators
+                    + "(".len()
+            }
+            Expression::Object(_) => "[".len(),
+            Expression::TaggedObject { tag, .. } => tag.len() + "[".len(),
+            Expression::List { .. } => "LIST {".len(),
+            Expression::Block { .. } => "BLOCK {".len(),
+            Expression::TextLiteral { .. } => "TEXT {".len(),
+            Expression::Flush { .. } => "FLUSH(".len(),
+            Expression::Map { .. } => "MAP {".len(),
+            _ => 0,
+        }
+    }
+
     /// Check if a variable (name: value) would format to multiple lines at the current indent.
     fn is_variable_multiline(&self, var: &Variable<'code>) -> bool {
         let prefix = self.indent * INDENT.len() + var.name.len() + 2; // "    name: "
@@ -1369,12 +1426,7 @@ impl<'code> Formatter<'code> {
         for var in variables {
             parts.push(self.try_inline_variable(var)?);
         }
-        let result = parts.join(", ");
-        if result.len() > MAX_WIDTH {
-            None
-        } else {
-            Some(result)
-        }
+        Some(parts.join(", "))
     }
 
     fn try_inline_arguments(&self, arguments: &[Spanned<Argument<'code>>]) -> Option<String> {
@@ -1389,12 +1441,7 @@ impl<'code> Formatter<'code> {
             }
             parts.push(s);
         }
-        let result = parts.join(", ");
-        if result.len() > MAX_WIDTH {
-            None
-        } else {
-            Some(result)
-        }
+        Some(parts.join(", "))
     }
 
     fn try_inline_arm(&self, arm: &Arm<'code>) -> Option<String> {
@@ -1410,17 +1457,15 @@ impl<'code> Formatter<'code> {
         &self,
         chain: &[&Spanned<Expression<'code>>],
     ) -> Option<String> {
+        if chain.len() > MAX_INLINE_PIPE_PARTS {
+            return None;
+        }
         let mut parts = Vec::new();
         for expr in chain {
             let inline = self.estimate_inline(expr)?;
             parts.push(inline);
         }
-        let result = parts.join(" |> ");
-        if result.len() > MAX_WIDTH {
-            None
-        } else {
-            Some(result)
-        }
+        Some(parts.join(" |> "))
     }
 
     fn estimate_text_literal_width(&self, parts: &[TextPart<'code>]) -> Option<usize> {

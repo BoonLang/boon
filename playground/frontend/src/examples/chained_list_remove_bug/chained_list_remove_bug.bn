@@ -29,9 +29,8 @@ store: [
         elements.add_button.event.press |> THEN { state + 1 }
     }
 
-    item_to_add:
-        elements.add_button.event.press
-        |> THEN { create_item(id: next_id, name: TEXT { New Item }) }
+    item_to_add: elements.add_button.event.press
+    |> THEN { create_item(id: next_id, name: TEXT { New Item }) }
 
     -- Chained List/remove operations (this is where the bug manifests)
     items:
@@ -96,7 +95,7 @@ FUNCTION render_item(item) {
             )
 
             element.hovered |> WHILE {
-                True => 
+                True =>
                     Element/button(
                         element: [event: [press: LINK]]
 
@@ -127,44 +126,51 @@ document: Document/new(root: Element/stripe(
             label: TEXT { Chained List/remove Bug Test }
         )
 
-        Element/stripe(element: [], direction: Row, gap: 10, style: [], items: LIST {
-            Element/button(
-                element: [event: [press: LINK]]
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: []
 
-                style: [
-                    padding: 10
-                    background: [color: Oklch[lightness: 0.3]]
-                    font: [color: White]
-                ]
+            items: LIST {
+                Element/button(
+                    element: [event: [press: LINK]]
 
-                label: TEXT { Add Item }
-            )
-            |> LINK { store.elements.add_button }
+                    style: [
+                        padding: 10
+                        background: [color: Oklch[lightness: 0.3]]
+                        font: [color: White]
+                    ]
 
-            store.completed_items
-            |> List/is_empty()
-            |> WHILE {
-                True => NoElement
+                    label: TEXT { Add Item }
+                )
+                |> LINK { store.elements.add_button }
 
-                False => 
-                    Element/button(
-                        element: [event: [press: LINK]]
+                store.completed_items
+                |> List/is_empty()
+                |> WHILE {
+                    True => NoElement
 
-                        style: [
-                            padding: 10
+                    False =>
+                        Element/button(
+                            element: [event: [press: LINK]]
 
-                            background: [
-                                color: Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
+                            style: [
+                                padding: 10
+
+                                background: [
+                                    color: Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
+                                ]
+
+                                font: [color: White]
                             ]
 
-                            font: [color: White]
-                        ]
-
-                        label: TEXT { Clear completed }
-                    )
-                    |> LINK { store.elements.clear_completed_button }
+                            label: TEXT { Clear completed }
+                        )
+                        |> LINK { store.elements.clear_completed_button }
+                }
             }
-        })
+        )
 
         Element/stripe(
             element: []
@@ -174,9 +180,14 @@ document: Document/new(root: Element/stripe(
             items: store.items |> List/map(item, new: render_item(item: item))
         )
 
-        Element/label(element: [], style: [font: [color: Oklch[lightness: 0.5]]], label: TEXT {
-            Active: {store.active_items |> List/count()}, Completed: {store.completed_items |> List/count()}
-        })
+        Element/label(
+            element: []
+            style: [font: [color: Oklch[lightness: 0.5]]]
+
+            label: TEXT {
+                Active: {store.active_items |> List/count()}, Completed: {store.completed_items |> List/count()}
+            }
+        )
 
         Element/stripe(
             element: []

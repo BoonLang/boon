@@ -9,6 +9,7 @@ FUNCTION d_latch(d, e) {
         r: e |> Bool/and(that: nd)
         q: r |> Bool/not() |> Bool/and(that: nq |> Bool/not())
         nq: s |> Bool/not() |> Bool/and(that: q |> Bool/not())
+
         [q: q, nq: nq]
     }
 }
@@ -20,6 +21,7 @@ FUNCTION dff_master_slave(clk, d) {
         master: d_latch(d: d, e: clk)
         -- Slave latch (transparent when clk low / nclk high)
         slave: d_latch(d: master.q, e: nclk)
+
         [o: slave.q]
     }
 }

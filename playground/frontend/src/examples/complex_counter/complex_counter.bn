@@ -12,11 +12,18 @@ store: [
 document: Document/new(root: root_element(PASS: store))
 
 FUNCTION root_element() {
-    Element/stripe(element: [], direction: Row, gap: 15, style: [align: Center], items: LIST {
-        counter_button(label: TEXT { - }) |> LINK { PASSED.elements.decrement_button }
-        PASSED.counter
-        counter_button(label: TEXT { + }) |> LINK { PASSED.elements.increment_button }
-    })
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 15
+        style: [align: Center]
+
+        items: LIST {
+            counter_button(label: TEXT { - }) |> LINK { PASSED.elements.decrement_button }
+            PASSED.counter
+            counter_button(label: TEXT { + }) |> LINK { PASSED.elements.increment_button }
+        }
+    )
 }
 
 FUNCTION counter_button(label) {

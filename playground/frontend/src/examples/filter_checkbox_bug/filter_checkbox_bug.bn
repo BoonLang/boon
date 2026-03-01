@@ -46,26 +46,33 @@ FUNCTION create_item(name) {
 
 -- Render a single item
 FUNCTION render_item(item, view_label) {
-    Element/stripe(element: [], direction: Row, gap: 10, style: [], items: LIST {
-        Element/checkbox(
-            element: [event: [click: LINK]]
-            style: []
-            label: Hidden[text: TEXT { toggle }]
-            settings: [checked: item.checked]
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: []
 
-            icon: item.checked |> WHEN {
-                True => Element/label(element: [], style: [], label: TEXT { [X] })
-                False => Element/label(element: [], style: [], label: TEXT { [ ] })
-            }
-        )
-        |> LINK { item.elements.checkbox }
+        items: LIST {
+            Element/checkbox(
+                element: [event: [click: LINK]]
+                style: []
+                label: Hidden[text: TEXT { toggle }]
+                settings: [checked: item.checked]
 
-        Element/label(
-            element: []
-            style: []
-            label: TEXT { {item.name} ({view_label}) - checked: {item.checked} }
-        )
-    })
+                icon: item.checked |> WHEN {
+                    True => Element/label(element: [], style: [], label: TEXT { [X] })
+                    False => Element/label(element: [], style: [], label: TEXT { [ ] })
+                }
+            )
+            |> LINK { item.elements.checkbox }
+
+            Element/label(
+                element: []
+                style: []
+                label: TEXT { {item.name} ({view_label}) - checked: {item.checked} }
+            )
+        }
+    )
 }
 
 document: Document/new(root: Element/stripe(
@@ -81,33 +88,40 @@ document: Document/new(root: Element/stripe(
             label: TEXT { Filter: {store.selected_filter} }
         )
 
-        Element/stripe(element: [], direction: Row, gap: 10, style: [], items: LIST {
-            Element/button(
-                element: [event: [press: LINK]]
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: []
 
-                style: [
-                    padding: 10
-                    background: [color: Oklch[lightness: 0.3]]
-                    font: [color: White]
-                ]
+            items: LIST {
+                Element/button(
+                    element: [event: [press: LINK]]
 
-                label: TEXT { All }
-            )
-            |> LINK { store.filter_buttons.all }
+                    style: [
+                        padding: 10
+                        background: [color: Oklch[lightness: 0.3]]
+                        font: [color: White]
+                    ]
 
-            Element/button(
-                element: [event: [press: LINK]]
+                    label: TEXT { All }
+                )
+                |> LINK { store.filter_buttons.all }
 
-                style: [
-                    padding: 10
-                    background: [color: Oklch[lightness: 0.3]]
-                    font: [color: White]
-                ]
+                Element/button(
+                    element: [event: [press: LINK]]
 
-                label: TEXT { Active }
-            )
-            |> LINK { store.filter_buttons.active }
-        })
+                    style: [
+                        padding: 10
+                        background: [color: Oklch[lightness: 0.3]]
+                        font: [color: White]
+                    ]
+
+                    label: TEXT { Active }
+                )
+                |> LINK { store.filter_buttons.active }
+            }
+        )
 
         -- WHILE that switches based on filter, using filtered lists like todo_mvc
         store.selected_filter |> WHILE {
@@ -131,12 +145,11 @@ document: Document/new(root: Element/stripe(
                 gap: 10
                 style: []
 
-                items:
-                    store.active_items
-                    |> List/map(
-                        item
-                        new: render_item(item: item, view_label: TEXT { ACTIVE })
-                    )
+                items: store.active_items
+                |> List/map(
+                    item
+                    new: render_item(item: item, view_label: TEXT { ACTIVE })
+                )
             )
         }
 

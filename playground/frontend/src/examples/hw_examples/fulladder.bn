@@ -12,6 +12,7 @@ FUNCTION fulladder(a, b, d) {
         ha1: halfadder(a: a, b: b)
         -- Second half adder: (a+b) + carry_in
         ha2: halfadder(a: ha1.o, b: d)
+
         -- Final carry = c1 OR c2
         [o: ha2.o, c: ha1.c |> Bool/or(that: ha2.c)]
     }

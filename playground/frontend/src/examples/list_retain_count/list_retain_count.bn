@@ -17,34 +17,49 @@ store: [
 document: Document/new(root: root_element(PASS: [store: store]))
 
 FUNCTION root_element() {
-    Element/stripe(element: [], direction: Column, gap: 10, style: [padding: 20], items: LIST {
-        Element/text_input(
-            element: [event: [key_down: LINK, change: LINK]]
-            style: []
-            label: Hidden[text: TEXT { Add item }]
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 10
+        style: [padding: 20]
 
-            text: LATEST {
-                Text/empty()
-                element.event.change.text
-            }
+        items: LIST {
+            Element/text_input(
+                element: [event: [key_down: LINK, change: LINK]]
+                style: []
+                label: Hidden[text: TEXT { Add item }]
 
-            placeholder: [text: TEXT { Type and press Enter }]
-            focus: True
-        )
-        |> LINK { PASSED.store.input }
+                text: LATEST {
+                    Text/empty()
+                    element.event.change.text
+                }
 
-        all_count_label()
-        retain_count_label()
+                placeholder: [text: TEXT { Type and press Enter }]
+                focus: True
+            )
+            |> LINK { PASSED.store.input }
 
-        -- Show items
-        Element/stripe(element: [], direction: Column, gap: 5, style: [], items: PASSED.store.items
-        |> List/map(item, new: Element/label(element: [], style: [], label: item)))
-    })
+            all_count_label()
+            retain_count_label()
+
+            -- Show items
+            Element/stripe(
+                element: []
+                direction: Column
+                gap: 5
+                style: []
+
+                items: PASSED.store.items
+                |> List/map(item, new: Element/label(element: [], style: [], label: item))
+            )
+        }
+    )
 }
 
 FUNCTION all_count_label() {
     Element/label(element: [], style: [], label: BLOCK {
         count: PASSED.store.items |> List/count()
+
         TEXT { All count: {count} }
     })
 }
@@ -52,6 +67,7 @@ FUNCTION all_count_label() {
 FUNCTION retain_count_label() {
     Element/label(element: [], style: [], label: BLOCK {
         count: PASSED.store.items |> List/retain(item, if: True) |> List/count()
+
         TEXT { Retain count: {count} }
     })
 }
