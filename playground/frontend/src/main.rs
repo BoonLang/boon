@@ -646,6 +646,27 @@ impl Playground {
                     js_sys::Reflect::set(&api, &"run".into(), run_fn.as_ref()).ok();
                     run_fn.forget();
 
+                    // format() - trigger code formatting
+                    let source_code_for_format = source_code.clone();
+                    let format_fn = Closure::wrap(Box::new(move || {
+                        let current = source_code_for_format.get_cloned();
+                        match boon::parser::formatter::format(&current) {
+                            Some(formatted) => {
+                                if *current == *formatted {
+                                    println!("[Format] Code is already formatted");
+                                } else {
+                                    println!("[Format] Code formatted successfully");
+                                    source_code_for_format.set_neq(Rc::new(Cow::from(formatted)));
+                                }
+                            }
+                            None => {
+                                eprintln!("[Format] Failed: code has syntax errors (fix errors and try again)");
+                            }
+                        }
+                    }) as Box<dyn Fn()>);
+                    js_sys::Reflect::set(&api, &"format".into(), format_fn.as_ref()).ok();
+                    format_fn.forget();
+
                     // getPreview() - get preview panel text content
                     let get_preview = Closure::wrap(Box::new(|| -> String {
                         if let Some(win) = web_sys::window() {
@@ -1620,8 +1641,18 @@ impl Playground {
                 let source_code = self.source_code.clone();
                 move || {
                     let current = source_code.get_cloned();
-                    if let Some(formatted) = boon::parser::formatter::format(&current) {
-                        source_code.set_neq(Rc::new(Cow::from(formatted)));
+                    match boon::parser::formatter::format(&current) {
+                        Some(formatted) => {
+                            if *current == *formatted {
+                                println!("[Format] Code is already formatted");
+                            } else {
+                                println!("[Format] Code formatted successfully");
+                                source_code.set_neq(Rc::new(Cow::from(formatted)));
+                            }
+                        }
+                        None => {
+                            eprintln!("[Format] Failed: code has syntax errors (fix errors and try again)");
+                        }
                     }
                 }
             })

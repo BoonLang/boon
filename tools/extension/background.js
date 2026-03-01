@@ -792,6 +792,15 @@ async function handleCommand(id, command) {
           return { type: 'error', message: e.message };
         }
 
+      case 'format':
+        // Use CDP Runtime.evaluate for playground API
+        try {
+          await cdpEvaluate(tab.id, 'window.boonPlayground.format()');
+          return { type: 'success', data: null };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
+
       case 'getPreviewText':
         // Use CDP Runtime.evaluate
         try {

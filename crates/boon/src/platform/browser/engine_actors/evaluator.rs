@@ -3906,28 +3906,30 @@ fn build_field_access_actor(
     // This prevents stale subscriptions when intermediate elements are recreated.
     for (idx, field_name) in path.iter().enumerate() {
         let field_name = field_name.clone();
-        let path_display_for_log = path_display.clone();
+        let path_display_for_log = if LOG_DEBUG { Some(path_display.clone()) } else { None };
         let field_idx = idx;
 
         value_stream = switch_map(value_stream, move |value| {
             let field_name = field_name.clone();
-            let path_display = path_display_for_log.clone();
 
-            let value_type = match &value {
-                Value::Object(_, _) => "Object",
-                Value::TaggedObject(tagged, _) => tagged.tag(),
-                Value::Tag(tag, _) => tag.tag(),
-                Value::Text(_, _) => "Text",
-                Value::Number(_, _) => "Number",
-                _ => "Other",
-            };
-            zoon::println!(
-                "[FIELD_ACCESS] .{} step {}: received {} for field '{}'",
-                path_display,
-                field_idx,
-                value_type,
-                field_name
-            );
+            if LOG_DEBUG {
+                let path_display = path_display_for_log.as_deref().unwrap_or("");
+                let value_type = match &value {
+                    Value::Object(_, _) => "Object",
+                    Value::TaggedObject(tagged, _) => tagged.tag(),
+                    Value::Tag(tag, _) => tag.tag(),
+                    Value::Text(_, _) => "Text",
+                    Value::Number(_, _) => "Number",
+                    _ => "Other",
+                };
+                zoon::println!(
+                    "[FIELD_ACCESS] .{} step {}: received {} for field '{}'",
+                    path_display,
+                    field_idx,
+                    value_type,
+                    field_name
+                );
+            }
 
             let variable = match &value {
                 Value::Object(object, _) => object.variable(&field_name),
@@ -3937,22 +3939,36 @@ fn build_field_access_actor(
 
             if let Some(var) = variable {
                 let value_actor = var.value_actor();
-                zoon::println!(
-                    "[FIELD_ACCESS] .{} step {}: found field '{}', subscribing to actor",
-                    path_display,
-                    field_idx,
-                    field_name
-                );
+                if LOG_DEBUG {
+                    let path_display = path_display_for_log.as_deref().unwrap_or("");
+                    zoon::println!(
+                        "[FIELD_ACCESS] .{} step {}: found field '{}', subscribing to actor",
+                        path_display,
+                        field_idx,
+                        field_name
+                    );
+                }
                 value_actor.stream()
             } else {
+                if LOG_DEBUG {
+                    let path_display = path_display_for_log.as_deref().unwrap_or("");
+                    let value_type = match &value {
+                        Value::Object(_, _) => "Object",
+                        Value::TaggedObject(tagged, _) => tagged.tag(),
+                        Value::Tag(tag, _) => tag.tag(),
+                        Value::Text(_, _) => "Text",
+                        Value::Number(_, _) => "Number",
+                        _ => "Other",
+                    };
+                    zoon::println!(
+                        "[FIELD_ACCESS] .{} step {}: field '{}' NOT FOUND in {}",
+                        path_display,
+                        field_idx,
+                        field_name,
+                        value_type
+                    );
+                }
                 // Field not found - emit empty stream (switch_map handles this gracefully)
-                zoon::println!(
-                    "[FIELD_ACCESS] .{} step {}: field '{}' NOT FOUND in {}",
-                    path_display,
-                    field_idx,
-                    field_name,
-                    value_type
-                );
                 stream::empty().boxed_local()
             }
         });

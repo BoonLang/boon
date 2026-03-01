@@ -313,6 +313,15 @@ fn get_tools() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "boon_format".to_string(),
+            description: "Format the current Boon code in the playground. Equivalent to clicking the Format button.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        Tool {
             name: "boon_inject".to_string(),
             description: "Inject Boon code into the playground editor. Replaces the current editor content with the provided code.".to_string(),
             input_schema: json!({
@@ -993,6 +1002,7 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
         "boon_status" => Command::GetStatus,
         "boon_screenshot" => Command::Screenshot,
         "boon_run" => Command::TriggerRun,
+        "boon_format" => Command::Format,
         "boon_detach" => Command::Detach,
 
         "boon_select_example" => {

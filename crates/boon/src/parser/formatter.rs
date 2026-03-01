@@ -257,12 +257,18 @@ impl<'code> Formatter<'code> {
 
     fn format_program(&mut self, expressions: &[Spanned<Expression<'code>>]) {
         for (i, expr) in expressions.iter().enumerate() {
-            // Blank line when either adjacent item is multiline
-            if i > 0
-                && (self.is_item_multiline(&expressions[i - 1])
-                    || self.is_item_multiline(expr))
-            {
-                self.newline();
+            // Blank line when either adjacent item is multiline,
+            // or always around Functions (they're visually distinct units)
+            if i > 0 {
+                let prev = &expressions[i - 1];
+                let is_function_boundary = matches!(prev.node, Expression::Function { .. })
+                    || matches!(expr.node, Expression::Function { .. });
+                if is_function_boundary
+                    || self.is_item_multiline(prev)
+                    || self.is_item_multiline(expr)
+                {
+                    self.newline();
+                }
             }
             self.emit_comments_before(expr.span.start);
             self.format_top_level_expression(expr);
@@ -554,6 +560,7 @@ impl<'code> Formatter<'code> {
     /// Shared logic for object and tagged-object fields with blank line insertion.
     fn format_object_fields(&mut self, variables: &[Spanned<Variable<'code>>]) {
         for (i, var) in variables.iter().enumerate() {
+            // Blank line when either adjacent field is multiline
             if i > 0
                 && (self.is_variable_multiline(&variables[i - 1].node)
                     || self.is_variable_multiline(&var.node))
@@ -682,6 +689,7 @@ impl<'code> Formatter<'code> {
         self.newline();
         self.indent += 1;
         for (i, arg) in arguments.iter().enumerate() {
+            // Blank line when either adjacent argument is multiline
             if i > 0
                 && (self.is_argument_multiline(&arguments[i - 1].node)
                     || self.is_argument_multiline(&arg.node))
@@ -854,6 +862,7 @@ impl<'code> Formatter<'code> {
         self.newline();
         self.indent += 1;
         for (i, arm) in arms.iter().enumerate() {
+            // Blank line when either adjacent arm is multiline
             if i > 0
                 && (self.is_arm_multiline(&arms[i - 1])
                     || self.is_arm_multiline(arm))
@@ -1045,7 +1054,7 @@ impl<'code> Formatter<'code> {
             self.format_variable(&var.node, &var.span);
             self.newline();
         }
-        // Blank line before output if last variable or output is multiline
+        // Blank line before output if either last variable or output is multiline
         if !variables.is_empty() {
             let last_var_multiline = self.is_variable_multiline(&variables.last().unwrap().node);
             if last_var_multiline || self.is_item_multiline(output) {
@@ -1550,6 +1559,14 @@ mod tests {
         let input = "x: 1\ny: LATEST {\n    a\n    b\n}\nz: 3";
         let result = format(input).unwrap();
         assert_eq!(result, "x: 1\n\ny: LATEST {\n    a\n    b\n}\n\nz: 3\n");
+
+        // Both multiline: blank line before each
+        let input = "x: LATEST {\n    a\n    b\n}\ny: LATEST {\n    c\n    d\n}";
+        let result = format(input).unwrap();
+        assert_eq!(
+            result,
+            "x: LATEST {\n    a\n    b\n}\n\ny: LATEST {\n    c\n    d\n}\n"
+        );
     }
 
     #[test]

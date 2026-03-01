@@ -25,6 +25,9 @@ pub enum Command {
     /// Trigger run (call boonPlayground.run())
     TriggerRun,
 
+    /// Trigger format (call boonPlayground.format())
+    Format,
+
     /// Take a screenshot
     Screenshot,
 
