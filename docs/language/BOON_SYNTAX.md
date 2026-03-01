@@ -198,21 +198,50 @@ However, **pattern matching is often more idiomatic than explicit comparison:**
 
 ✅ **BEST - Pattern matching (most idiomatic):**
 ```boon
-state.iteration |> WHEN {
-    position => result
-    __ => SKIP
-}
-
+-- Matching against literal tags
 selected_filter |> WHEN {
     Active => show_active_todos()
     __ => show_all_todos()
 }
 
+-- Matching against literal numbers
 count |> WHEN {
     0 => empty_message()
     __ => items_list()
 }
 ```
+
+#### Value Comparison Patterns
+
+When you need to compare the matched value against a **variable's current value** (not a literal), use value comparison patterns:
+
+✅ **Dotted path** — for parent.field access (unambiguous, can never be a binding):
+```boon
+-- Compare against fields of an object
+Router/route() |> WHEN {
+    filter_routes.home => Home
+    filter_routes.active => Active
+    filter_routes.completed => Completed
+    __ => Home
+}
+```
+
+✅ **Braced variable `{var}`** — for single identifiers (borrows TEXT interpolation syntax):
+```boon
+-- Compare against a local variable's value
+target: Active
+
+input |> WHEN {
+    {target} => TEXT { Matched! }
+    __ => TEXT { No match }
+}
+```
+
+**Why two syntaxes?** Dotted paths like `routes.active` are unambiguous in patterns — assigning to a field makes no sense, so the parser knows it must be a comparison. Single identifiers like `target` are ambiguous — they could be a new binding or a comparison — so braces `{target}` explicitly signal "evaluate this, don't bind it", borrowing the same mental model from TEXT interpolation (`TEXT { Value: {target} }`).
+
+**Note:** A bare identifier in a pattern (e.g., `name =>`) is always a **binding** (creates a new variable), never a comparison. Use `{name}` if you want to compare.
+
+#### Explicit Comparison with `==`
 
 ✅ **CORRECT - Explicit comparison with `==`:**
 ```boon

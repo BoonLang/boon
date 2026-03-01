@@ -2651,11 +2651,154 @@ pub fn function_build_fail(
     })
 }
 
+// --- Element/text and Element/block ---
+
+/// Element/text(element?, style, text) -> ElementText[settings[element, style, text]]
+/// Simple text element with optional tag and styling.
+pub fn function_element_text(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let (argument_element, argument_style, argument_text) = match arguments.as_slice() {
+        [element, style, text] => (Some(element), style, text),
+        [style, text] => (None, style, text),
+        _ => panic!("Element/text expects 2 or 3 arguments"),
+    };
+    let scoped_id = function_call_persistence_id;
+
+    let mut vars: Vec<Arc<Variable>> = Vec::new();
+
+    if let Some(argument_element) = argument_element {
+        vars.push(Variable::new_arc(
+            ConstructInfo::new(function_call_id.with_child_id(1), None, "ElementText[element]"),
+            construct_context.clone(),
+            "element",
+            argument_element.clone(),
+            scoped_id.with_child_index(1),
+            actor_context.scope.clone(),
+        ));
+    }
+
+    vars.push(Variable::new_arc(
+        ConstructInfo::new(function_call_id.with_child_id(2), None, "ElementText[settings]"),
+        construct_context.clone(),
+        "settings",
+        Object::new_arc_value_actor(
+            ConstructInfo::new(function_call_id.with_child_id(3), None, "ElementText[settings: [..]]"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            actor_context.clone(),
+            [
+                Variable::new_arc(
+                    ConstructInfo::new(function_call_id.with_child_id(4), None, "ElementText[settings: [style]]"),
+                    construct_context.clone(),
+                    "style",
+                    argument_style.clone(),
+                    scoped_id.with_child_index(4),
+                    actor_context.scope.clone(),
+                ),
+                Variable::new_arc(
+                    ConstructInfo::new(function_call_id.with_child_id(5), None, "ElementText[settings: [text]]"),
+                    construct_context.clone(),
+                    "text",
+                    argument_text.clone(),
+                    scoped_id.with_child_index(5),
+                    actor_context.scope.clone(),
+                ),
+            ],
+        ),
+        scoped_id.with_child_index(2),
+        actor_context.scope,
+    ));
+
+    TaggedObject::new_constant(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "Element/text(..) -> ElementText[..]"),
+        construct_context,
+        ValueIdempotencyKey::new(),
+        "ElementText",
+        vars,
+    )
+}
+
+/// Element/block(element?, style, child) -> ElementBlock[settings[element, style, child]]
+/// Generic block element with a single child.
+pub fn function_element_block(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let (argument_element, argument_style, argument_child) = match arguments.as_slice() {
+        [element, style, child] => (Some(element), style, child),
+        [style, child] => (None, style, child),
+        _ => panic!("Element/block expects 2 or 3 arguments"),
+    };
+    let scoped_id = function_call_persistence_id;
+
+    let mut vars: Vec<Arc<Variable>> = Vec::new();
+
+    if let Some(argument_element) = argument_element {
+        vars.push(Variable::new_arc(
+            ConstructInfo::new(function_call_id.with_child_id(1), None, "ElementBlock[element]"),
+            construct_context.clone(),
+            "element",
+            argument_element.clone(),
+            scoped_id.with_child_index(1),
+            actor_context.scope.clone(),
+        ));
+    }
+
+    vars.push(Variable::new_arc(
+        ConstructInfo::new(function_call_id.with_child_id(2), None, "ElementBlock[settings]"),
+        construct_context.clone(),
+        "settings",
+        Object::new_arc_value_actor(
+            ConstructInfo::new(function_call_id.with_child_id(3), None, "ElementBlock[settings: [..]]"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            actor_context.clone(),
+            [
+                Variable::new_arc(
+                    ConstructInfo::new(function_call_id.with_child_id(4), None, "ElementBlock[settings: [style]]"),
+                    construct_context.clone(),
+                    "style",
+                    argument_style.clone(),
+                    scoped_id.with_child_index(4),
+                    actor_context.scope.clone(),
+                ),
+                Variable::new_arc(
+                    ConstructInfo::new(function_call_id.with_child_id(5), None, "ElementBlock[settings: [child]]"),
+                    construct_context.clone(),
+                    "child",
+                    argument_child.clone(),
+                    scoped_id.with_child_index(5),
+                    actor_context.scope.clone(),
+                ),
+            ],
+        ),
+        scoped_id.with_child_index(2),
+        actor_context.scope,
+    ));
+
+    TaggedObject::new_constant(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "Element/block(..) -> ElementBlock[..]"),
+        construct_context,
+        ValueIdempotencyKey::new(),
+        "ElementBlock",
+        vars,
+    )
+}
+
 // --- Scene functions ---
 
-/// Scene/new(root<INTO_ELEMENT>) -> []
-/// Creates a new scene for DOM rendering (stub - passes through to Document/new behavior)
-/// @TODO: Implement proper scene management when needed
+/// Scene/new(root, lights?, geometry?) -> [root_element, lights?, geometry?]
+/// Creates a new scene for DOM rendering. Accepts 1 or 3 arguments.
+/// With 1 argument: just root element (backward compatible).
+/// With 3 arguments: root element, lights array, and geometry config.
 pub fn function_scene_new(
     arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
@@ -2663,31 +2806,137 @@ pub fn function_scene_new(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [argument_root] = arguments.as_slice() else {
-        panic!("Unexpected argument count for Scene/new")
+    let scoped_id = function_call_persistence_id;
+
+    let (argument_root, argument_lights, argument_geometry) = match arguments.as_slice() {
+        [root] => (root, None, None),
+        [root, lights, geometry] => (root, Some(lights), Some(geometry)),
+        _ => panic!("Scene/new expects 1 or 3 arguments"),
+    };
+
+    let mut vars: Vec<Arc<Variable>> = Vec::new();
+
+    vars.push(Variable::new_arc(
+        ConstructInfo::new(function_call_id.with_child_id(1), None, "Scene/new(..) -> [root_element]"),
+        construct_context.clone(),
+        "root_element",
+        argument_root.clone(),
+        scoped_id.with_child_index(1),
+        actor_context.scope.clone(),
+    ));
+
+    if let Some(argument_lights) = argument_lights {
+        vars.push(Variable::new_arc(
+            ConstructInfo::new(function_call_id.with_child_id(2), None, "Scene/new(..) -> [lights]"),
+            construct_context.clone(),
+            "lights",
+            argument_lights.clone(),
+            scoped_id.with_child_index(2),
+            actor_context.scope.clone(),
+        ));
+    }
+
+    if let Some(argument_geometry) = argument_geometry {
+        vars.push(Variable::new_arc(
+            ConstructInfo::new(function_call_id.with_child_id(3), None, "Scene/new(..) -> [geometry]"),
+            construct_context.clone(),
+            "geometry",
+            argument_geometry.clone(),
+            scoped_id.with_child_index(3),
+            actor_context.scope.clone(),
+        ));
+    }
+
+    Object::new_constant(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "Scene/new(..) -> []"),
+        construct_context,
+        ValueIdempotencyKey::new(),
+        vars,
+    )
+}
+
+// --- Light functions ---
+
+/// Light/directional(azimuth, altitude, spread, intensity, color) -> DirectionalLight[...]
+/// Pure data constructor for directional light configuration.
+pub fn function_light_directional(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [arg_azimuth, arg_altitude, arg_spread, arg_intensity, arg_color] = arguments.as_slice() else {
+        panic!("Light/directional expects 5 arguments")
     };
     let scoped_id = function_call_persistence_id;
-    // Scene/new returns an empty object - the actual rendering is handled by the element tree
-    Object::new_constant(
-        ConstructInfo::new(
-            function_call_id.with_child_id(0),
-            None,
-            "Scene/new(..) -> []",
-        ),
+
+    TaggedObject::new_constant(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "Light/directional(..) -> DirectionalLight[..]"),
         construct_context.clone(),
         ValueIdempotencyKey::new(),
-        [Variable::new_arc(
-            ConstructInfo::new(
-                function_call_id.with_child_id(1),
-                None,
-                "Scene/new(..) -> [root_element]",
+        "DirectionalLight",
+        [
+            Variable::new_arc(
+                ConstructInfo::new(function_call_id.with_child_id(1), None, "DirectionalLight[azimuth]"),
+                construct_context.clone(), "azimuth", arg_azimuth.clone(),
+                scoped_id.with_child_index(1), actor_context.scope.clone(),
             ),
-            construct_context,
-            "root_element",
-            argument_root.clone(),
-            scoped_id.with_child_index(1),
-            actor_context.scope,
-        )],
+            Variable::new_arc(
+                ConstructInfo::new(function_call_id.with_child_id(2), None, "DirectionalLight[altitude]"),
+                construct_context.clone(), "altitude", arg_altitude.clone(),
+                scoped_id.with_child_index(2), actor_context.scope.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(function_call_id.with_child_id(3), None, "DirectionalLight[spread]"),
+                construct_context.clone(), "spread", arg_spread.clone(),
+                scoped_id.with_child_index(3), actor_context.scope.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(function_call_id.with_child_id(4), None, "DirectionalLight[intensity]"),
+                construct_context.clone(), "intensity", arg_intensity.clone(),
+                scoped_id.with_child_index(4), actor_context.scope.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(function_call_id.with_child_id(5), None, "DirectionalLight[color]"),
+                construct_context, "color", arg_color.clone(),
+                scoped_id.with_child_index(5), actor_context.scope,
+            ),
+        ],
+    )
+}
+
+/// Light/ambient(intensity, color) -> AmbientLight[...]
+/// Pure data constructor for ambient light configuration.
+pub fn function_light_ambient(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [arg_intensity, arg_color] = arguments.as_slice() else {
+        panic!("Light/ambient expects 2 arguments")
+    };
+    let scoped_id = function_call_persistence_id;
+
+    TaggedObject::new_constant(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "Light/ambient(..) -> AmbientLight[..]"),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        "AmbientLight",
+        [
+            Variable::new_arc(
+                ConstructInfo::new(function_call_id.with_child_id(1), None, "AmbientLight[intensity]"),
+                construct_context.clone(), "intensity", arg_intensity.clone(),
+                scoped_id.with_child_index(1), actor_context.scope.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(function_call_id.with_child_id(2), None, "AmbientLight[color]"),
+                construct_context, "color", arg_color.clone(),
+                scoped_id.with_child_index(2), actor_context.scope,
+            ),
+        ],
     )
 }
 

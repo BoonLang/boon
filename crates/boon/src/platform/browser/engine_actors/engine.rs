@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::{Pin, pin};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
@@ -1650,6 +1651,10 @@ pub struct ConstructContext {
     /// Registry scope ID for bridge-created actors (event value actors).
     /// Set by the evaluator from the root scope.
     pub bridge_scope_id: Option<ScopeId>,
+    /// Type-erased scene context for physical rendering.
+    /// Set by the bridge when the root object uses `scene:` instead of `document:`.
+    /// Bridge code downcasts this to `SceneContext` via `Rc::downcast_ref()`.
+    pub scene_ctx: Option<Rc<dyn std::any::Any>>,
     // NOTE: `previous_actors` was intentionally REMOVED from here.
     // It should NOT be part of ConstructContext because:
     // 1. It gets captured in stream closures, causing memory leaks
@@ -2857,10 +2862,13 @@ impl VariableOrArgumentReference {
                             .boxed_local()
                         }
                     }
-                    other => panic!(
-                        "Failed to get Object or TaggedObject to create VariableOrArgumentReference: The Value has a different type {}",
-                        other.construct_info()
-                    ),
+                    // Tag, Number, Text, Boolean, etc. don't have fields.
+                    // This occurs transiently when e.g. WHEN arm pattern tags flow through
+                    // a field access chain before switch_map cancels them. Return pending —
+                    // switch_map will cancel this stream when the correct Object arrives.
+                    _non_object => {
+                        stream::pending::<Value>().boxed_local()
+                    }
                 }
             });
         }
@@ -5837,10 +5845,13 @@ impl Object {
         )
     }
 
+    /// Look up a variable by name.
+    /// Uses rposition (last match) so that explicit fields override spread fields
+    /// when both have the same name — spread variables come first in the Vec.
     pub fn variable(&self, name: &str) -> Option<Arc<Variable>> {
         self.variables
             .iter()
-            .position(|variable| variable.name == name)
+            .rposition(|variable| variable.name == name)
             .map(|index| self.variables[index].clone())
     }
 
@@ -5969,10 +5980,12 @@ impl TaggedObject {
         )
     }
 
+    /// Look up a variable by name.
+    /// Uses rposition (last match) so that explicit fields override spread fields.
     pub fn variable(&self, name: &str) -> Option<Arc<Variable>> {
         self.variables
             .iter()
-            .position(|variable| variable.name == name)
+            .rposition(|variable| variable.name == name)
             .map(|index| self.variables[index].clone())
     }
 

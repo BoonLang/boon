@@ -727,6 +727,10 @@ impl Lowerer {
         let mut field_cells = Vec::new();
         let mut saved_short_bindings: Vec<(String, Option<CellId>)> = Vec::new();
         for v in &obj.variables {
+            // Skip spread entries — WASM engine doesn't support runtime spread merging
+            if v.node.name.is_empty() {
+                continue;
+            }
             let field_name = v.node.name.as_str().to_string();
             let dotted_name = format!("{}.{}", parent_name, field_name);
             let field_cell = self.alloc_cell(&dotted_name, v.span);
@@ -747,8 +751,14 @@ impl Lowerer {
         // Dotted names (e.g., "object.title") are available for cross-field references.
         // IMPORTANT: Register the short name AFTER lowering the field's value to avoid
         // self-reference when a field name shadows a parameter (e.g., `title: title |> HOLD`).
-        for (i, v) in obj.variables.iter().enumerate() {
-            let (field_name, field_cell) = &field_cells[i];
+        let mut field_idx = 0;
+        for v in obj.variables.iter() {
+            // Skip spread entries (same as first pass)
+            if v.node.name.is_empty() {
+                continue;
+            }
+            let (field_name, field_cell) = &field_cells[field_idx];
+            field_idx += 1;
 
             if matches!(v.node.value.node, Expression::Link) {
                 // LINK placeholder — pre-allocate events and data cells.
@@ -2625,6 +2635,7 @@ impl Lowerer {
                     let fields: Vec<(String, IrExpr)> = obj
                         .variables
                         .iter()
+                        .filter(|v| !v.node.name.is_empty()) // Skip spread entries
                         .map(|v| {
                             let name = v.node.name.as_str().to_string();
                             let val = self.lower_expr(&v.node.value.node, v.node.value.span);
@@ -2639,6 +2650,7 @@ impl Lowerer {
                 let fields: Vec<(String, IrExpr)> = object
                     .variables
                     .iter()
+                    .filter(|v| !v.node.name.is_empty()) // Skip spread entries
                     .map(|v| {
                         let name = v.node.name.as_str().to_string();
                         let val = self.lower_expr(&v.node.value.node, v.node.value.span);
@@ -2733,6 +2745,15 @@ impl Lowerer {
                 // Standalone field access without pipe source — not valid at this position.
                 self.error(span, "Field access (.field) is only valid in pipe position");
                 IrExpr::Constant(IrValue::Void)
+            }
+
+            Expression::PostfixFieldAccess { expr, field } => {
+                // expr.field — lower the inner expression, then wrap with FieldAccess
+                let inner = self.lower_expr(&expr.node, expr.span);
+                IrExpr::FieldAccess {
+                    object: Box::new(inner),
+                    field: field.as_str().to_string(),
+                }
             }
 
             Expression::Hold { .. }

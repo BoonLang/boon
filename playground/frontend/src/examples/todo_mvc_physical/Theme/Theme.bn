@@ -44,9 +44,9 @@ FUNCTION spring_range(of) {
 
 FUNCTION get(from, of) {
     PASSED.theme_options.name |> WHEN {
-        Professional => Professional/get(from: from, of: of)
-        Glassmorphism => Glassmorphism/get(from: from, of: of)
-        Neobrutalism => Neobrutalism/get(from: from, of: of)
-        Neumorphism => Neumorphism/get(from: from, of: of)
+        Professional => Professional/get(from: from, of: of, PASS: PASSED.theme_options)
+        Glassmorphism => Glassmorphism/get(from: from, of: of, PASS: PASSED.theme_options)
+        Neobrutalism => Neobrutalism/get(from: from, of: of, PASS: PASSED.theme_options)
+        Neumorphism => Neumorphism/get(from: from, of: of, PASS: PASSED.theme_options)
     }
 }

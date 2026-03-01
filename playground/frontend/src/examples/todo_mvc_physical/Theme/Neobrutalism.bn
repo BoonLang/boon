@@ -211,14 +211,14 @@ FUNCTION text(of) {
             ]
 
             ButtonIcon[checked] => [
-                font: font(of: ButtonIcon[checked])
+                font: font(of: ButtonIcon[checked: checked])
             ]
 
             Small => small_base
 
             SmallLink[hovered] => [
                 ...small_base
-                font: font(of: SmallLink[hovered])
+                font: font(of: SmallLink[hovered: hovered])
             ]
         }
     }
@@ -271,13 +271,13 @@ FUNCTION lights() {
             color: Oklch[lightness: 0.7, chroma: 0.0, hue: 0]
         )
         Light/spot(
-            target: FocusedElement,
+            target: FocusedElement
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.9, chroma: 0.25, hue: 200]
                 Dark => Oklch[lightness: 0.85, chroma: 0.25, hue: 200]
-            },
-            intensity: 0.5,
-            radius: 40,
+            }
+            intensity: 0.5
+            radius: 40
             softness: 0.1
         )
     }
@@ -316,8 +316,17 @@ FUNCTION spacing(of) {
 -- Neobrutalism theme uses no spring behavior - bold, static aesthetic
 FUNCTION spring_range(of) {
     of |> WHEN {
-        Button => [extend: 0, compress: 0]
-        ButtonDestructive => [extend: 0, compress: 0]
-        Checkbox => [extend: 0, compress: 0]
+        Button => [
+            extend: 0
+            compress: 0
+        ]
+        ButtonDestructive => [
+            extend: 0
+            compress: 0
+        ]
+        Checkbox => [
+            extend: 0
+            compress: 0
+        ]
     }
 }

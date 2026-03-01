@@ -198,7 +198,17 @@ where
             )
             .map(|items| Expression::List { items });
 
-        let object = variable
+        // Spread entry in object: `...expression` (name="" signals spread)
+        let object_spread = just(Token::Spread)
+            .ignore_then(tracked_expr.clone())
+            .map(|value| Variable {
+                name: "",
+                is_referenced: false,
+                value,
+                value_changed: false,
+            });
+
+        let object = choice((object_spread, variable))
             .map_with(|variable, extra| Spanned {
                 node: variable,
                 span: extra.span(),
@@ -430,7 +440,31 @@ where
             // TEXT { content } pattern - only allows literal text without interpolation
             let pattern_literal_text = select! { Token::TextContent(content, _) => Pattern::Literal(Literal::Text(content)) };
 
-            let pattern_alias = snake_case_identifier.map(|name| Pattern::Alias { name });
+            // Combined alias/dotted-path parser: `x` = binding, `x.y.z` = value comparison
+            let pattern_alias_or_dotted = snake_case_identifier
+                .then(just(Token::Dot).ignore_then(snake_case_identifier.clone()).repeated().collect::<Vec<_>>())
+                .map(|(first, rest): (&str, Vec<&str>)| {
+                    if rest.is_empty() {
+                        Pattern::Alias { name: first }
+                    } else {
+                        let mut path = vec![first];
+                        path.extend(rest);
+                        Pattern::ValueComparison { path, referenced_span: None }
+                    }
+                });
+
+            // Braced value comparison: {var} or {var.field}
+            let pattern_braced_value = bracket_curly_open.clone()
+                .ignore_then(
+                    snake_case_identifier.clone()
+                        .then(just(Token::Dot).ignore_then(snake_case_identifier.clone()).repeated().collect::<Vec<_>>())
+                )
+                .then_ignore(bracket_curly_close.clone())
+                .map(|(first, rest): (&str, Vec<&str>)| {
+                    let mut path = vec![first];
+                    path.extend(rest);
+                    Pattern::ValueComparison { path, referenced_span: None }
+                });
 
             let pattern_variable = snake_case_identifier
                 .then(group((colon.clone(), pattern.clone())).or_not())
@@ -482,7 +516,8 @@ where
                 pattern_literal_number,
                 pattern_literal_tag,
                 pattern_literal_text,
-                pattern_alias,
+                pattern_braced_value,
+                pattern_alias_or_dotted,
             ))
         });
 
@@ -803,6 +838,18 @@ where
                         persistence: None,
                     }
                 }),
+                // Precedence 9 (highest): Postfix field access
+                // e.g., Theme/material(of: Danger).color
+                postfix(9, just(Token::Dot).ignore_then(snake_case_identifier.clone()), |l, field, extra| {
+                    Spanned {
+                        span: extra.span(),
+                        node: Expression::PostfixFieldAccess {
+                            expr: Box::new(l),
+                            field,
+                        },
+                        persistence: None,
+                    }
+                }),
             ))
     })
     .repeated()
@@ -896,6 +943,12 @@ pub enum Expression<'code> {
     // Only valid at pipe position
     FieldAccess {
         path: Vec<&'code str>,
+    },
+    // Postfix field access: expr.field - extracts a field from the result of an expression
+    // e.g., Theme/material(of: Danger).color
+    PostfixFieldAccess {
+        expr: Box<Spanned<Self>>,
+        field: &'code str,
     },
 }
 
@@ -1058,6 +1111,12 @@ pub enum Pattern<'code> {
     },
     Alias {
         name: &'code str,
+    },
+    /// Value comparison pattern: compares the matched value against a variable's value.
+    /// Produced by dotted paths (`parent.field`) or braced variables (`{var}`).
+    ValueComparison {
+        path: Vec<&'code str>,
+        referenced_span: Option<SimpleSpan>,
     },
     WildCard,
 }

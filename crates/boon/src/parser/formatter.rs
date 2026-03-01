@@ -359,6 +359,11 @@ impl<'code> Formatter<'code> {
                 self.write(".");
                 self.write(&path.join("."));
             }
+            Expression::PostfixFieldAccess { expr, field } => {
+                self.format_expression(expr);
+                self.write(".");
+                self.write(field);
+            }
         }
     }
 
@@ -366,6 +371,12 @@ impl<'code> Formatter<'code> {
 
     fn format_variable(&mut self, var: &Variable<'code>, span: &Span) {
         self.write_indent();
+        // Spread entry: name is empty, output `...expr`
+        if var.name.is_empty() {
+            self.write("...");
+            self.format_expression(&var.value);
+            return;
+        }
         self.write(var.name);
         self.write(":");
         match self.value_layout(&var.value, " ".len()) {
@@ -1000,6 +1011,22 @@ impl<'code> Formatter<'code> {
                 self.write(" }");
             }
             Pattern::Alias { name } => self.write(name),
+            Pattern::ValueComparison { path, .. } => {
+                if path.len() == 1 {
+                    // Single identifier: use braced syntax {var}
+                    self.write("{");
+                    self.write(path[0]);
+                    self.write("}");
+                } else {
+                    // Dotted path: parent.field
+                    for (i, part) in path.iter().enumerate() {
+                        if i > 0 {
+                            self.write(".");
+                        }
+                        self.write(part);
+                    }
+                }
+            }
             Pattern::WildCard => self.write("__"),
         }
     }
@@ -1255,6 +1282,7 @@ impl<'code> Formatter<'code> {
             | Expression::Link
             | Expression::Skip
             | Expression::FieldAccess { .. } => true,
+            Expression::PostfixFieldAccess { expr, .. } => self.should_inline_value(expr),
             Expression::TextLiteral { parts, .. } => {
                 // Inline short TEXT literals
                 self.estimate_text_literal_width(parts) <= Some(60)
@@ -1366,7 +1394,12 @@ impl<'code> Formatter<'code> {
 
     /// Check if a variable (name: value) would format to multiple lines at the current indent.
     fn is_variable_multiline(&self, var: &Variable<'code>) -> bool {
-        let prefix = self.indent * INDENT.len() + var.name.len() + 2; // "    name: "
+        // Spread entry: prefix is "    ..." (3 chars for ...)
+        let prefix = if var.name.is_empty() {
+            self.indent * INDENT.len() + 3
+        } else {
+            self.indent * INDENT.len() + var.name.len() + 2 // "    name: "
+        };
         match self.estimate_inline(&var.value) {
             None => true,
             Some(inline) => prefix + inline.len() > MAX_LINE_WIDTH,
@@ -1418,6 +1451,10 @@ impl<'code> Formatter<'code> {
             return None;
         }
         let value_inline = self.estimate_inline(&var.node.value)?;
+        // Spread entry
+        if var.node.name.is_empty() {
+            return Some(format!("...{}", value_inline));
+        }
         Some(format!("{}: {}", var.node.name, value_inline))
     }
 

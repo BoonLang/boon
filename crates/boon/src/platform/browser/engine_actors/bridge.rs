@@ -37,6 +37,664 @@ thread_local! {
 }
 use crate::parser;
 
+// --- SceneContext: pre-computed rendering parameters for physical scenes ---
+
+/// CSS rendering parameters derived from a Scene's lights and geometry.
+/// Built once per scene render (theme changes rebuild the scene).
+/// Used by element functions to apply physical styles (depth→box-shadow,
+/// material→background, gloss→gradient, etc.).
+#[derive(Clone)]
+struct SceneContext {
+    /// Horizontal shadow offset per unit of depth (from directional light azimuth)
+    shadow_dx_per_depth: f64,
+    /// Vertical shadow offset per unit of depth (from directional light altitude)
+    shadow_dy_per_depth: f64,
+    /// Shadow blur per unit of depth (from light spread × intensity)
+    shadow_blur_per_depth: f64,
+    /// Directional light intensity (affects shadow opacity)
+    directional_intensity: f64,
+    /// Ambient light factor (affects shadow darkness: higher ambient = lighter shadows)
+    ambient_factor: f64,
+    /// Angle for specular/bevel gradient (from directional light azimuth)
+    bevel_angle: f64,
+}
+
+impl SceneContext {
+    /// Create a default SceneContext with reasonable values for a top-left light.
+    fn default_scene() -> Self {
+        Self {
+            shadow_dx_per_depth: 1.5,
+            shadow_dy_per_depth: 2.0,
+            shadow_blur_per_depth: 3.0,
+            directional_intensity: 0.8,
+            ambient_factor: 0.3,
+            bevel_angle: 135.0,
+        }
+    }
+}
+
+/// Extract SceneContext from a ConstructContext's type-erased scene_ctx field.
+fn get_scene_ctx(construct_context: &ConstructContext) -> Option<&SceneContext> {
+    construct_context
+        .scene_ctx
+        .as_ref()?
+        .downcast_ref::<SceneContext>()
+}
+
+/// Generate physical CSS properties from a style Value in a scene context.
+/// Must be called from an async context (inside stream filter_map, etc.)
+/// because reading variable values requires `.current_value().await`.
+///
+/// Maps physical Boon properties to CSS:
+/// - `depth: N` → multi-layer box-shadow
+/// - `move: [closer: N]` → elevated box-shadow + subtle scale
+/// - `move: [further: N]` → inset shadow + subtle scale
+/// - `material.color` → background-color (when no background.color set)
+/// - `material.gloss: 0-1` → specular linear-gradient overlay
+/// - `material.glow` → colored outer box-shadow
+/// - `rounded_corners` → border-radius
+/// - `spring_range` → CSS transition
+#[allow(dead_code)]
+async fn physical_css_from_style_value(style_value: &Value, scene_ctx: &SceneContext) -> String {
+    let obj = match style_value {
+        Value::Object(obj, _) => obj,
+        _ => return String::new(),
+    };
+    let mut css = String::new();
+    let mut shadows: Vec<String> = Vec::new();
+
+    /// Helper to read a number from a variable (async).
+    async fn read_number(obj: &Arc<Object>, key: &str) -> Option<f64> {
+        let var = obj.variable(key)?;
+        match var.value_actor().current_value().await {
+            Ok(Value::Number(n, _)) => Some(n.number()),
+            _ => None,
+        }
+    }
+
+    // --- depth → box-shadow layers ---
+    let depth = read_number(obj, "depth").await.unwrap_or(0.0);
+
+    // --- move → elevation/recession adjustment ---
+    let (elevation, is_inset) = if let Some(move_v) = obj.variable("move") {
+        match move_v.value_actor().current_value().await {
+            Ok(Value::Object(move_obj, _)) => {
+                if let Some(closer_v) = move_obj.variable("closer") {
+                    match closer_v.value_actor().current_value().await {
+                        Ok(Value::Number(n, _)) => (n.number(), false),
+                        _ => (0.0, false),
+                    }
+                } else if let Some(further_v) = move_obj.variable("further") {
+                    match further_v.value_actor().current_value().await {
+                        Ok(Value::Number(n, _)) => (n.number(), true),
+                        _ => (0.0, false),
+                    }
+                } else {
+                    (0.0, false)
+                }
+            }
+            _ => (0.0, false),
+        }
+    } else {
+        (0.0, false)
+    };
+
+    let effective_depth = depth + elevation;
+
+    if effective_depth > 0.0 {
+        let dx = effective_depth * scene_ctx.shadow_dx_per_depth;
+        let dy = effective_depth * scene_ctx.shadow_dy_per_depth;
+        let blur = effective_depth * scene_ctx.shadow_blur_per_depth;
+        let opacity = (scene_ctx.directional_intensity * (1.0 - scene_ctx.ambient_factor) * 0.3)
+            .min(0.5);
+
+        if is_inset {
+            shadows.push(format!(
+                "inset {dx:.1}px {dy:.1}px {blur:.1}px rgba(0,0,0,{opacity:.2})"
+            ));
+        } else {
+            // Layer 1: main shadow
+            shadows.push(format!(
+                "{dx:.1}px {dy:.1}px {blur:.1}px rgba(0,0,0,{opacity:.2})"
+            ));
+            // Layer 2: softer ambient shadow
+            let amb_blur = blur * 2.0;
+            let amb_opacity = opacity * 0.4;
+            shadows.push(format!(
+                "0px {:.1}px {amb_blur:.1}px rgba(0,0,0,{amb_opacity:.2})",
+                dy * 0.5
+            ));
+        }
+    }
+
+    // --- material properties ---
+    if let Some(material_v) = obj.variable("material") {
+        if let Ok(Value::Object(mat_obj, _)) = material_v.value_actor().current_value().await {
+            // material.glow → colored outer shadow
+            if let Some(glow_v) = mat_obj.variable("glow") {
+                match glow_v.value_actor().current_value().await {
+                    Ok(Value::Object(glow_obj, _)) => {
+                        let color = match glow_obj.variable("color") {
+                            Some(cv) => match cv.value_actor().current_value().await {
+                                Ok(ref v) => value_to_css_color_async(v)
+                                    .await
+                                    .unwrap_or_else(|| "rgba(100,150,255,0.5)".to_string()),
+                                _ => "rgba(100,150,255,0.5)".to_string(),
+                            },
+                            None => "rgba(100,150,255,0.5)".to_string(),
+                        };
+                        let intensity =
+                            read_number(&glow_obj, "intensity").await.unwrap_or(0.1);
+                        let blur = intensity * 40.0;
+                        let spread = intensity * 10.0;
+                        shadows.push(format!("0 0 {blur:.1}px {spread:.1}px {color}"));
+                    }
+                    // glow: None → no glow (skip)
+                    Ok(Value::Tag(ref tag, _)) if tag.tag() == "None" => {}
+                    _ => {}
+                }
+            }
+
+            // material.color → background-color (fallback when no background.color)
+            if obj.variable("background").is_none() {
+                if let Some(color_v) = mat_obj.variable("color") {
+                    if let Ok(color_val) = color_v.value_actor().current_value().await {
+                        if let Some(color_css) = value_to_css_color_async(&color_val).await {
+                            css.push_str(&format!("background-color:{color_css};"));
+                        }
+                    }
+                }
+            }
+
+            // material.gloss → specular gradient overlay
+            if let Some(gloss_v) = mat_obj.variable("gloss") {
+                if let Ok(Value::Number(n, _)) = gloss_v.value_actor().current_value().await {
+                    let gloss = n.number().clamp(0.0, 1.0);
+                    if gloss > 0.0 {
+                        let alpha = gloss * 0.25;
+                        let angle = scene_ctx.bevel_angle;
+                        css.push_str(&format!(
+                            "background-image:linear-gradient({angle:.0}deg,rgba(255,255,255,{alpha:.2}) 0%,transparent 50%,rgba(0,0,0,{:.2}) 100%);",
+                            alpha * 0.3
+                        ));
+                    }
+                }
+            }
+
+            // material.transparency → opacity
+            if let Some(transp_v) = mat_obj.variable("transparency") {
+                if let Ok(Value::Number(n, _)) = transp_v.value_actor().current_value().await {
+                    let opacity = n.number().clamp(0.0, 1.0);
+                    css.push_str(&format!("opacity:{opacity:.2};"));
+                    // Also add backdrop-filter for glass effect
+                    css.push_str("backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);");
+                }
+            }
+        }
+    }
+
+    // Combine all shadows
+    if !shadows.is_empty() {
+        css.push_str(&format!("box-shadow:{};", shadows.join(",")));
+    }
+
+    // --- rounded_corners → border-radius ---
+    if let Some(rc_v) = obj.variable("rounded_corners") {
+        match rc_v.value_actor().current_value().await {
+            Ok(Value::Number(n, _)) => {
+                css.push_str(&format!("border-radius:{}px;", n.number()));
+            }
+            Ok(Value::Tag(tag, _)) if tag.tag() == "Fully" => {
+                css.push_str("border-radius:9999px;");
+            }
+            _ => {}
+        }
+    }
+
+    // --- spring_range → CSS transition ---
+    if let Some(sr_v) = obj.variable("spring_range") {
+        match sr_v.value_actor().current_value().await {
+            Ok(Value::Object(sr_obj, _)) => {
+                // [extend: N, compress: N] → use max as duration basis
+                let extend = read_number(&sr_obj, "extend").await.unwrap_or(0.0);
+                let compress = read_number(&sr_obj, "compress").await.unwrap_or(0.0);
+                let range = extend.max(compress);
+                if range > 0.0 {
+                    let duration = (range * 0.04).clamp(0.08, 0.5);
+                    css.push_str(&format!(
+                        "transition:all {duration:.2}s cubic-bezier(0.34,1.56,0.64,1);"
+                    ));
+                }
+            }
+            Ok(Value::Number(n, _)) => {
+                let duration = (n.number() * 0.15).clamp(0.05, 0.8);
+                css.push_str(&format!(
+                    "transition:all {duration:.2}s cubic-bezier(0.34,1.56,0.64,1);"
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    // --- subtle scale for elevation ---
+    if elevation > 0.0 && !is_inset {
+        let scale = 1.0 + elevation * 0.001;
+        css.push_str(&format!("transform:scale({scale:.4});"));
+    } else if elevation > 0.0 && is_inset {
+        let scale = 1.0 - elevation * 0.001;
+        css.push_str(&format!("transform:scale({scale:.4});"));
+    }
+
+    css
+}
+
+/// Convert a Boon Value to a CSS color string (async version).
+/// Handles Oklch tagged objects, named color tags, and plain text CSS colors.
+async fn value_to_css_color_async(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(t, _) => Some(t.text().to_string()),
+        Value::TaggedObject(tagged, _) if tagged.tag() == "Oklch" => {
+            // Inline Oklch extraction (avoids reconstructing Value with metadata)
+            async fn get_num(tagged: &TaggedObject, name: &str, default: f64) -> f64 {
+                if let Some(v) = tagged.variable(name) {
+                    match v.value_actor().current_value().await {
+                        Ok(Value::Number(n, _)) => n.number(),
+                        _ => default,
+                    }
+                } else {
+                    default
+                }
+            }
+            let l = get_num(tagged, "lightness", 0.5).await;
+            let c = get_num(tagged, "chroma", 0.0).await;
+            let h = get_num(tagged, "hue", 0.0).await;
+            let a = get_num(tagged, "alpha", 1.0).await;
+            if a < 1.0 {
+                Some(format!("oklch({}% {} {} / {})", l * 100.0, c, h, a))
+            } else {
+                Some(format!("oklch({}% {} {})", l * 100.0, c, h))
+            }
+        }
+        Value::Tag(tag, _) => {
+            let css = match tag.tag() {
+                "White" => "white",
+                "Black" => "black",
+                "Red" => "red",
+                "Green" => "green",
+                "Blue" => "blue",
+                "Transparent" => "transparent",
+                _ => return None,
+            };
+            Some(css.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Helper: create a style → property stream via switch_map.
+/// Returns a stream of Values for a given property name under the style object.
+fn style_property_stream(
+    settings_variable: &Arc<Variable>,
+    property: &'static str,
+) -> LocalBoxStream<'static, Value> {
+    let sv = settings_variable.clone();
+    let style_stream = switch_map(sv.stream(), |value| {
+        value.expect_object().expect_variable("style").stream()
+    });
+    switch_map(style_stream, move |value| {
+        let obj = value.expect_object();
+        match obj.variable(property) {
+            Some(var) => var.stream().left_stream(),
+            None => stream::empty().right_stream(),
+        }
+    })
+    .boxed_local()
+}
+
+/// Helper: create a style → nested property stream (style → parent → child).
+fn style_nested_property_stream(
+    settings_variable: &Arc<Variable>,
+    parent: &'static str,
+    child: &'static str,
+) -> LocalBoxStream<'static, Value> {
+    let sv = settings_variable.clone();
+    let parent_stream = style_property_stream(&sv, parent);
+    switch_map(parent_stream, move |value| {
+        let obj = value.expect_object();
+        match obj.variable(child) {
+            Some(var) => var.stream().left_stream(),
+            None => stream::empty().right_stream(),
+        }
+    })
+    .boxed_local()
+}
+
+/// Apply physical CSS to a raw element if a SceneContext is present.
+/// This is a no-op in document mode.
+///
+/// Uses per-property reactive streams with Zoon's style_signal() API.
+/// Each physical property (depth, material.color, etc.) gets its own
+/// switch_map chain so changes propagate reactively (e.g., dark mode toggle).
+fn apply_physical_css<E: RawEl>(
+    raw_el: E,
+    settings_variable: &Arc<Variable>,
+    construct_context: &ConstructContext,
+) -> E {
+    let scene_ctx = match get_scene_ctx(construct_context) {
+        Some(ctx) => ctx.clone(),
+        None => return raw_el,
+    };
+    let sv = settings_variable.clone();
+
+    // --- 1. background-color ← style.material.color ---
+    let bg_color_css_stream = {
+        let color_stream = style_nested_property_stream(&sv, "material", "color");
+        // Use oklch_to_css_oneshot: reads all Oklch components in one shot via current_value().
+        // The outer switch_map handles reactivity — when dark mode toggles, color_stream
+        // emits a new Oklch, switch_map cancels the old inner stream and creates a new one.
+        switch_map(color_stream, |value| oklch_to_css_oneshot(value)).boxed_local()
+    };
+
+    // --- 2. box-shadow ← style.depth + style.move + style.material.glow ---
+    // Uses select_all + scan to merge three independent reactive sources
+    #[derive(Clone)]
+    enum ShadowComponent {
+        Depth(f64),
+        MoveCloser(f64),
+        MoveFurther(f64),
+        Glow(String), // pre-formatted glow shadow CSS fragment
+    }
+
+    let depth_stream: LocalBoxStream<'static, ShadowComponent> =
+        style_property_stream(&sv, "depth")
+            .filter_map(|v| {
+                future::ready(match v {
+                    Value::Number(n, _) => Some(ShadowComponent::Depth(n.number())),
+                    _ => None,
+                })
+            })
+            .boxed_local();
+
+    let move_stream: LocalBoxStream<'static, ShadowComponent> = {
+        let move_value_stream = style_property_stream(&sv, "move");
+        switch_map(move_value_stream, |value| {
+            let obj = value.expect_object();
+            if let Some(var) = obj.variable("closer") {
+                var.stream()
+                    .filter_map(|v| {
+                        future::ready(match v {
+                            Value::Number(n, _) => Some(ShadowComponent::MoveCloser(n.number())),
+                            _ => None,
+                        })
+                    })
+                    .left_stream()
+                    .left_stream()
+            } else if let Some(var) = obj.variable("further") {
+                var.stream()
+                    .filter_map(|v| {
+                        future::ready(match v {
+                            Value::Number(n, _) => Some(ShadowComponent::MoveFurther(n.number())),
+                            _ => None,
+                        })
+                    })
+                    .right_stream()
+                    .left_stream()
+            } else {
+                stream::once(future::ready(ShadowComponent::MoveCloser(0.0)))
+                    .chain(stream::pending())
+                    .right_stream()
+            }
+        })
+        .boxed_local()
+    };
+
+    let glow_stream: LocalBoxStream<'static, ShadowComponent> = {
+        let glow_value_stream = style_nested_property_stream(&sv, "material", "glow");
+        glow_value_stream
+            .filter_map(|value| async move {
+                match value {
+                    Value::Object(glow_obj, _) => {
+                        // Read glow properties (color + intensity)
+                        let color = match glow_obj.variable("color") {
+                            Some(cv) => match cv.value_actor().current_value().await {
+                                Ok(ref v) => value_to_css_color_async(v)
+                                    .await
+                                    .unwrap_or_else(|| "rgba(100,150,255,0.5)".to_string()),
+                                _ => "rgba(100,150,255,0.5)".to_string(),
+                            },
+                            None => "rgba(100,150,255,0.5)".to_string(),
+                        };
+                        let intensity = if let Some(v) = glow_obj.variable("intensity") {
+                            match v.value_actor().current_value().await {
+                                Ok(Value::Number(n, _)) => n.number(),
+                                _ => 0.1,
+                            }
+                        } else {
+                            0.1
+                        };
+                        let blur = intensity * 40.0;
+                        let spread = intensity * 10.0;
+                        Some(ShadowComponent::Glow(format!(
+                            "0 0 {blur:.1}px {spread:.1}px {color}"
+                        )))
+                    }
+                    // glow: None → no glow
+                    Value::Tag(ref tag, _) if tag.tag() == "None" => {
+                        Some(ShadowComponent::Glow(String::new()))
+                    }
+                    _ => None,
+                }
+            })
+            .boxed_local()
+    };
+
+    let sc_shadow = scene_ctx.clone();
+    let box_shadow_stream = stream::select_all([depth_stream, move_stream, glow_stream])
+        .scan(
+            (0.0_f64, 0.0_f64, false, String::new()),
+            move |state, component| {
+                match component {
+                    ShadowComponent::Depth(d) => state.0 = d,
+                    ShadowComponent::MoveCloser(e) => {
+                        state.1 = e;
+                        state.2 = false;
+                    }
+                    ShadowComponent::MoveFurther(e) => {
+                        state.1 = e;
+                        state.2 = true;
+                    }
+                    ShadowComponent::Glow(g) => state.3 = g,
+                }
+                let (depth, elevation, is_inset, ref glow) = *state;
+                let effective_depth = depth + elevation;
+                let mut shadows: Vec<String> = Vec::new();
+
+                if effective_depth > 0.0 {
+                    let dx = effective_depth * sc_shadow.shadow_dx_per_depth;
+                    let dy = effective_depth * sc_shadow.shadow_dy_per_depth;
+                    let blur = effective_depth * sc_shadow.shadow_blur_per_depth;
+                    let opacity = (sc_shadow.directional_intensity
+                        * (1.0 - sc_shadow.ambient_factor)
+                        * 0.3)
+                        .min(0.5);
+
+                    if is_inset {
+                        shadows.push(format!(
+                            "inset {dx:.1}px {dy:.1}px {blur:.1}px rgba(0,0,0,{opacity:.2})"
+                        ));
+                    } else {
+                        shadows.push(format!(
+                            "{dx:.1}px {dy:.1}px {blur:.1}px rgba(0,0,0,{opacity:.2})"
+                        ));
+                        let amb_blur = blur * 2.0;
+                        let amb_opacity = opacity * 0.4;
+                        shadows.push(format!(
+                            "0px {:.1}px {amb_blur:.1}px rgba(0,0,0,{amb_opacity:.2})",
+                            dy * 0.5
+                        ));
+                    }
+                }
+
+                if !glow.is_empty() {
+                    shadows.push(glow.clone());
+                }
+
+                let css = if shadows.is_empty() {
+                    "none".to_string()
+                } else {
+                    shadows.join(",")
+                };
+                future::ready(Some(css))
+            },
+        )
+        .boxed_local();
+
+    // --- 3. background-image ← style.material.gloss ---
+    let sc_gloss = scene_ctx.clone();
+    let gloss_stream = style_nested_property_stream(&sv, "material", "gloss")
+        .filter_map(move |value| {
+            let angle = sc_gloss.bevel_angle;
+            future::ready(match value {
+                Value::Number(n, _) => {
+                    let gloss = n.number().clamp(0.0, 1.0);
+                    if gloss > 0.0 {
+                        let alpha = gloss * 0.25;
+                        Some(format!(
+                            "linear-gradient({angle:.0}deg,rgba(255,255,255,{alpha:.2}) 0%,transparent 50%,rgba(0,0,0,{:.2}) 100%)",
+                            alpha * 0.3
+                        ))
+                    } else {
+                        Some("none".to_string())
+                    }
+                }
+                _ => None,
+            })
+        })
+        .boxed_local();
+
+    // --- 4. border-radius ← style.rounded_corners ---
+    let radius_stream = style_property_stream(&sv, "rounded_corners")
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                Value::Tag(tag, _) if tag.tag() == "Fully" => Some("9999px".to_string()),
+                _ => None,
+            })
+        })
+        .boxed_local();
+
+    // --- 5. transition ← style.spring_range ---
+    let transition_stream = style_property_stream(&sv, "spring_range")
+        .filter_map(|value| async move {
+            match value {
+                Value::Object(sr_obj, _) => {
+                    async fn read_num(obj: &Object, name: &str) -> f64 {
+                        if let Some(v) = obj.variable(name) {
+                            match v.value_actor().current_value().await {
+                                Ok(Value::Number(n, _)) => n.number(),
+                                _ => 0.0,
+                            }
+                        } else {
+                            0.0
+                        }
+                    }
+                    let extend = read_num(&sr_obj, "extend").await;
+                    let compress = read_num(&sr_obj, "compress").await;
+                    let range = extend.max(compress);
+                    if range > 0.0 {
+                        let duration = (range * 0.04).clamp(0.08, 0.5);
+                        Some(format!(
+                            "all {duration:.2}s cubic-bezier(0.34,1.56,0.64,1)"
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                Value::Number(n, _) => {
+                    let duration = (n.number() * 0.15).clamp(0.05, 0.8);
+                    Some(format!(
+                        "all {duration:.2}s cubic-bezier(0.34,1.56,0.64,1)"
+                    ))
+                }
+                _ => None,
+            }
+        })
+        .boxed_local();
+
+    // --- 6. opacity + backdrop-filter ← style.material.transparency ---
+    let transparency_signal = signal::from_stream(
+        style_nested_property_stream(&sv, "material", "transparency")
+            .filter_map(|value| {
+                future::ready(match value {
+                    Value::Number(n, _) => Some(n.number().clamp(0.0, 1.0)),
+                    _ => None,
+                })
+            })
+            .boxed_local(),
+    )
+    .broadcast();
+    let opacity_signal = transparency_signal.signal_ref(|opt| opt.map(|v| format!("{v:.2}")));
+    let backdrop_signal =
+        transparency_signal.signal_ref(|opt| opt.map(|_| "blur(12px)".to_string()));
+
+    // --- 7. transform: scale ← style.move elevation ---
+    let scale_stream = {
+        let move_value_stream = style_property_stream(&sv, "move");
+        switch_map(move_value_stream, |value| {
+            let obj = value.expect_object();
+            if let Some(var) = obj.variable("closer") {
+                var.stream()
+                    .filter_map(|v| {
+                        future::ready(match v {
+                            Value::Number(n, _) => {
+                                let elev = n.number();
+                                if elev > 0.0 {
+                                    Some(format!("scale({:.4})", 1.0 + elev * 0.001))
+                                } else {
+                                    Some("none".to_string())
+                                }
+                            }
+                            _ => None,
+                        })
+                    })
+                    .left_stream()
+                    .left_stream()
+            } else if let Some(var) = obj.variable("further") {
+                var.stream()
+                    .filter_map(|v| {
+                        future::ready(match v {
+                            Value::Number(n, _) => {
+                                let elev = n.number();
+                                if elev > 0.0 {
+                                    Some(format!("scale({:.4})", 1.0 - elev * 0.001))
+                                } else {
+                                    Some("none".to_string())
+                                }
+                            }
+                            _ => None,
+                        })
+                    })
+                    .right_stream()
+                    .left_stream()
+            } else {
+                stream::pending::<String>().right_stream()
+            }
+        })
+        .boxed_local()
+    };
+
+    // Apply all physical CSS via Zoon's style_signal (reactive, no raw DOM setProperty)
+    raw_el
+        .style_signal("background-color", signal::from_stream(bg_color_css_stream))
+        .style_signal("box-shadow", signal::from_stream(box_shadow_stream))
+        .style_signal("background-image", signal::from_stream(gloss_stream))
+        .style_signal("border-radius", signal::from_stream(radius_stream))
+        .style_signal("transition", signal::from_stream(transition_stream))
+        .style_signal("opacity", opacity_signal)
+        .style_signal("backdrop-filter", backdrop_signal)
+        .style_signal("transform", signal::from_stream(scale_stream))
+}
+
 /// Convert a Boon tag name to a Zoon Tag.
 /// Maps common semantic HTML tags and falls back to Custom for unknown tags.
 /// NOTE: Currently unused - ready for when HTML tag support is implemented.
@@ -101,18 +759,41 @@ pub fn object_with_document_to_element_signal(
     root_object: Arc<Object>,
     construct_context: ConstructContext,
 ) -> impl Signal<Item = Option<RawElOrText>> {
-    let document_variable = root_object.expect_variable("document").clone();
-    let doc_actor = document_variable.value_actor();
+    // Try "scene" key first, fall back to "document"
+    let (root_variable, is_scene) = if let Some(scene_var) = root_object.variable("scene") {
+        (scene_var.clone(), true)
+    } else {
+        (root_object.expect_variable("document").clone(), false)
+    };
+    let root_actor = root_variable.value_actor();
 
     // CRITICAL: Use switch_map (not flat_map) because the inner stream is infinite.
     // When example is switched, the document changes and we MUST switch to the new
     // root_element stream. flat_map would stay subscribed to the old one forever.
-    let element_stream = switch_map(doc_actor.clone().stream(), |value| {
-        let document_object = value.expect_object();
-        let root_element_var = document_object.expect_variable("root_element").clone();
-        root_element_var.value_actor().clone().stream()
+    let element_stream = switch_map(root_actor.clone().stream(), move |value| {
+        let inner_object = value.expect_object();
+
+        // Build SceneContext when rendering a physical scene.
+        // For now use defaults; when the example can fully run, we'll extract
+        // light parameters from the scene object's "lights" and "geometry" variables.
+        let scene_ctx: Option<Rc<dyn std::any::Any>> = if is_scene {
+            Some(Rc::new(SceneContext::default_scene()))
+        } else {
+            None
+        };
+
+        let root_element_var = inner_object.expect_variable("root_element").clone();
+        root_element_var
+            .value_actor()
+            .clone()
+            .stream()
+            .map(move |v| (v, scene_ctx.clone()))
     })
-    .map(move |value| value_to_element(value, construct_context.clone()))
+    .map(move |(value, scene_ctx)| {
+        let mut ctx = construct_context.clone();
+        ctx.scene_ctx = scene_ctx;
+        value_to_element(value, ctx)
+    })
     .boxed_local();
 
     signal::from_stream(element_stream)
@@ -139,18 +820,18 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
             "ElementLabel" => element_label(tagged_object, construct_context).unify(),
             "ElementParagraph" => element_paragraph(tagged_object, construct_context).unify(),
             "ElementLink" => element_link(tagged_object, construct_context).unify(),
+            "ElementText" => element_text(tagged_object, construct_context).unify(),
+            "ElementBlock" => element_block(tagged_object, construct_context).unify(),
             other => panic!("Element cannot be created from the tagged object with tag '{other}'"),
         },
         Value::Flushed(inner, _) => {
             // Unwrap Flushed and recursively handle the inner value
             value_to_element(*inner, construct_context)
         }
-        Value::Object(obj, _) => {
-            // Object can't be rendered as element - render as debug info
-            zoon::eprintln!(
-                "Warning: Object value passed to element context - rendering as empty. Object has {} variables",
-                obj.variables().len()
-            );
+        Value::Object(_obj, _) => {
+            // Transient reactive state — an Object (e.g. a style object) can briefly
+            // reach value_to_element before the full tagged element constructs.
+            // Render as empty; the correct element will replace it on the next update.
             El::new().unify()
         }
         Value::List(_list, _) => {
@@ -191,7 +872,10 @@ fn element_container(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
+    let is_scene = construct_context.scene_ctx.is_some();
     let settings_variable = tagged_object.expect_variable("settings");
+    let sv_physical = settings_variable.clone();
+    let ctx_physical = construct_context.clone();
 
     // Use switch_map (not flat_map) because child stream is infinite.
     // When example switches, we must re-subscribe to the new child element.
@@ -496,7 +1180,10 @@ fn element_container(
 
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
-    let background_signal = signal::from_stream({
+    // In scene mode, physical CSS handles background-color via material.color — skip typed API
+    let background_signal = signal::from_stream(if is_scene {
+        stream::pending::<String>().boxed_local()
+    } else {
         let style_stream = switch_map(sv4.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
         });
@@ -570,8 +1257,10 @@ fn element_container(
     });
 
     // Border radius - produces u32 for typed RoundedCorners API
-    // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
-    let border_radius_signal = signal::from_stream({
+    // In scene mode, physical CSS handles border-radius via rounded_corners — skip typed API
+    let border_radius_signal = signal::from_stream(if is_scene {
+        stream::pending::<u32>().boxed_local()
+    } else {
         let style_stream = switch_map(sv5.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
         });
@@ -588,6 +1277,7 @@ fn element_container(
                 _ => None,
             })
         })
+        .boxed_local()
     });
 
     // Transform: move_right, move_down, and rotate - produces Transform typed values
@@ -710,6 +1400,7 @@ fn element_container(
         .s(Font::with_signal_self(align_font_signal))
         .s(Visible::with_signal(visible_sig))
         .item_signal(signal::from_stream(child_stream))
+        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
         .after_remove(move |_| {
             drop(tagged_object);
         })
@@ -719,6 +1410,10 @@ fn element_stripe(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
+    let is_scene = construct_context.scene_ctx.is_some();
+    let sv_physical = tagged_object.expect_variable("settings");
+    let ctx_physical = construct_context.clone();
+
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
     let (hovered_sender, mut hovered_receiver) =
         NamedChannel::<TimestampedEvent<bool>>::new("element.hovered", BRIDGE_HOVER_CAPACITY);
@@ -935,8 +1630,11 @@ fn element_stripe(
     // Background color
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
+    // In scene mode, physical CSS handles background-color via material.color — skip typed API
     let sv_bg = tagged_object.expect_variable("settings");
-    let background_signal = signal::from_stream({
+    let background_signal = signal::from_stream(if is_scene {
+        stream::pending::<String>().boxed_local()
+    } else {
         let style_stream = switch_map(sv_bg.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
         });
@@ -1018,9 +1716,11 @@ fn element_stripe(
     let padding_left_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, _, _, l)| l));
 
     // Shadows (box-shadow from LIST of shadow objects) - produces Vec<Shadow> for typed Shadows API
-    // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    // In scene mode, physical CSS handles box-shadow via depth/move/glow — skip typed API
     let sv_shadows = tagged_object.expect_variable("settings");
-    let shadows_typed_signal = signal::from_stream({
+    let shadows_typed_signal = signal::from_stream(if is_scene {
+        stream::pending::<Vec<Shadow>>().boxed_local()
+    } else {
         let style_stream = switch_map(sv_shadows.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
         });
@@ -1727,6 +2427,7 @@ fn element_stripe(
                     }))
                 })
         })
+        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
         // Keep tagged_object alive for the lifetime of this element
         .after_remove(move |_| {
             drop(tagged_object);
@@ -1738,7 +2439,10 @@ fn element_stack(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
+    let is_scene = construct_context.scene_ctx.is_some();
     let settings_variable = tagged_object.expect_variable("settings");
+    let sv_physical = settings_variable.clone();
+    let ctx_physical = construct_context.clone();
 
     // NOTE: Arc-wrapped Objects/Variables stay alive through the stream chain.
     // No Mutex needed - expect_variable returns Arc<Variable>, expect_list returns Arc<List>.
@@ -1801,7 +2505,10 @@ fn element_stack(
     });
 
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
-    let background_signal = signal::from_stream({
+    // In scene mode, physical CSS handles background-color via material.color — skip typed API
+    let background_signal = signal::from_stream(if is_scene {
+        stream::pending::<String>().boxed_local()
+    } else {
         let style_stream = switch_map(settings_variable_4.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
         });
@@ -1838,6 +2545,7 @@ fn element_stack(
                 }))
             },
         ))
+        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
         // Keep tagged_object alive for the lifetime of this element
         .after_remove(move |_| {
             drop(tagged_object);
@@ -2090,10 +2798,68 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
     }
 }
 
+/// One-shot Oklch-to-CSS conversion: reads all components via current_value().await.
+/// Returns a stream that emits a single CSS string and then stays alive (pending).
+///
+/// Use this inside `switch_map` on a color stream — the outer switch_map handles
+/// reactivity (when dark mode toggles, a new Oklch is emitted, switch_map cancels
+/// the old inner stream and calls this function with the new Oklch).
+///
+/// This avoids the race condition in `oklch_to_css_stream` where `select_all + scan`
+/// emits intermediate wrong values (oklch(50% 0 0)) before component subscriptions
+/// resolve — and those subscriptions get cancelled by switch_map before resolving.
+fn oklch_to_css_oneshot(value: Value) -> LocalBoxStream<'static, String> {
+    match value {
+        Value::TaggedObject(tagged, _) if tagged.tag() == "Oklch" => {
+            stream::once(async move {
+                async fn read_f64(tagged: &TaggedObject, name: &str, default: f64) -> f64 {
+                    match tagged.variable(name) {
+                        Some(v) => match v.value_actor().current_value().await {
+                            Ok(Value::Number(n, _)) => n.number(),
+                            _ => default,
+                        },
+                        None => default,
+                    }
+                }
+                let l = read_f64(&tagged, "lightness", 0.5).await;
+                let c = read_f64(&tagged, "chroma", 0.0).await;
+                let h = read_f64(&tagged, "hue", 0.0).await;
+                let a = read_f64(&tagged, "alpha", 1.0).await;
+                if a < 1.0 {
+                    format!("oklch({}% {} {} / {})", l * 100.0, c, h, a)
+                } else {
+                    format!("oklch({}% {} {})", l * 100.0, c, h)
+                }
+            })
+            .chain(stream::pending())
+            .boxed_local()
+        }
+        Value::Tag(tag, _) => {
+            let color = match tag.tag() {
+                "White" => "white",
+                "Black" => "black",
+                "Red" => "red",
+                "Green" => "green",
+                "Blue" => "blue",
+                "Transparent" => "transparent",
+                _ => return stream::empty().boxed_local(),
+            };
+            stream::once(future::ready(color.to_string()))
+                .chain(stream::pending())
+                .boxed_local()
+        }
+        _ => stream::empty().boxed_local(),
+    }
+}
+
 fn element_button(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
+    let is_scene = construct_context.scene_ctx.is_some();
+    let sv_physical = tagged_object.expect_variable("settings");
+    let ctx_physical = construct_context.clone();
+
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
     let (press_event_sender, mut press_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new(
         "button.press_event",
@@ -2413,9 +3179,11 @@ fn element_button(
     });
 
     // Rounded corners signal
-    // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    // In scene mode, physical CSS handles border-radius via rounded_corners — skip typed API
     let sv_rounded = settings_variable.clone();
-    let rounded_signal = signal::from_stream({
+    let rounded_signal = signal::from_stream(if is_scene {
+        stream::pending::<u32>().boxed_local()
+    } else {
         let style_stream = switch_map(sv_rounded.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
         });
@@ -2613,10 +3381,11 @@ fn element_button(
     });
 
     // Background color signal
-    // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
-    // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
+    // In scene mode, physical CSS handles background-color via material.color — skip typed API
     let sv_background = settings_variable.clone();
-    let background_signal = signal::from_stream({
+    let background_signal = signal::from_stream(if is_scene {
+        stream::pending::<String>().boxed_local()
+    } else {
         let style_stream = switch_map(sv_background.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
         });
@@ -2816,6 +3585,7 @@ fn element_button(
             align_signal.map(|opt| opt.flatten()),
         ))
         .s(Visible::with_signal(visible_sig))
+        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
         .after_remove(move |_| {
             drop(event_handler_loop);
             drop(tagged_object);
@@ -2826,6 +3596,10 @@ fn element_text_input(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
+    let is_scene = construct_context.scene_ctx.is_some();
+    let sv_physical = tagged_object.expect_variable("settings");
+    let ctx_physical = construct_context.clone();
+
     enum TextInputDomEvent {
         Change(TimestampedEvent<String>),
         KeyDown(TimestampedEvent<String>),
@@ -3385,10 +4159,11 @@ fn element_text_input(
     });
 
     // Background color signal from style
-    // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
-    // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
+    // In scene mode, physical CSS handles background-color via material.color — skip typed API
     let sv_bg_color = tagged_object.expect_variable("settings");
-    let background_color_signal = signal::from_stream({
+    let background_color_signal = signal::from_stream(if is_scene {
+        stream::pending::<String>().boxed_local()
+    } else {
         let style_stream = switch_map(sv_bg_color.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
         });
@@ -3578,6 +4353,7 @@ fn element_text_input(
             .left_signal(padding_left_signal))
         .s(Width::with_signal_self(width_typed_signal))
         .s(Visible::with_signal(visible_sig))
+        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
         .after_remove(move |_| {
             if LOG_DEBUG {
                 zoon::println!("[EVENT:TextInput] Element REMOVED - dropping event handlers");
@@ -3591,6 +4367,9 @@ fn element_checkbox(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
+    let sv_physical = tagged_object.expect_variable("settings");
+    let ctx_physical = construct_context.clone();
+
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
     let (click_event_sender, mut click_event_receiver) =
         NamedChannel::<TimestampedEvent<()>>::new("checkbox.click", BRIDGE_PRESS_EVENT_CAPACITY);
@@ -3795,6 +4574,7 @@ fn element_checkbox(
                 sender.send_or_drop(TimestampedEvent::now(()));
             }
         })
+        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
         .after_remove(move |_| drop(event_handler_loop))
 }
 
@@ -3802,6 +4582,9 @@ fn element_label(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
+    let sv_physical = tagged_object.expect_variable("settings");
+    let ctx_physical = construct_context.clone();
+
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
     let (double_click_sender, mut double_click_receiver) =
         NamedChannel::<TimestampedEvent<()>>::new(
@@ -4065,6 +4848,7 @@ fn element_label(
             }
         })
         .s(Visible::with_signal(visible_sig))
+        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
         .after_remove(move |_| drop(event_handler_loop))
 }
 
@@ -4073,6 +4857,8 @@ fn element_paragraph(
     construct_context: ConstructContext,
 ) -> impl Element {
     let settings_variable = tagged_object.expect_variable("settings");
+    let sv_physical = settings_variable.clone();
+    let ctx_physical = construct_context.clone();
     let sv_visible = tagged_object.expect_variable("settings");
     let visible_sig = visible_signal_from_settings(sv_visible);
 
@@ -4095,12 +4881,16 @@ fn element_paragraph(
             },
         ))
         .s(Visible::with_signal(visible_sig))
+        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
 }
 
 fn element_link(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
+    let sv_physical = tagged_object.expect_variable("settings");
+    let ctx_physical = construct_context.clone();
+
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
     let (hovered_sender, mut hovered_receiver) =
         NamedChannel::<TimestampedEvent<bool>>::new("link.hovered", BRIDGE_HOVER_CAPACITY);
@@ -4241,8 +5031,245 @@ fn element_link(
             FontLine::new().underline_signal(underline_bool_signal.map(|opt| opt.unwrap_or(false))),
         ))
         .s(Visible::with_signal(visible_sig))
+        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
         .after_remove(move |_| {
             drop(event_handler_loop);
+            drop(tagged_object);
+        })
+}
+
+/// Element/text - renders styled text content.
+/// Structure: ElementText[element?, settings[style, text]]
+fn element_text(
+    tagged_object: Arc<TaggedObject>,
+    construct_context: ConstructContext,
+) -> impl Element {
+    let sv_physical = tagged_object.expect_variable("settings");
+    let ctx_physical = construct_context.clone();
+    let settings_variable = tagged_object.expect_variable("settings");
+
+    // Extract text stream from settings
+    let text_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value.expect_object().expect_variable("text").stream()
+    })
+    .filter_map(|value| {
+        future::ready(match value {
+            Value::Text(text, _) => Some(text.text().to_string()),
+            Value::Number(n, _) => Some(n.number().to_string()),
+            _ => None,
+        })
+    });
+
+    // Extract font.size from style
+    let sv_font_size = tagged_object.expect_variable("settings");
+    let font_size_signal = signal::from_stream({
+        let style_stream = switch_map(sv_font_size.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        switch_map(font_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("size") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number() as u32),
+                _ => None,
+            })
+        })
+        .boxed_local()
+    });
+
+    // Extract font.color from style
+    // CRITICAL: Use oklch_to_css_stream (not filter_map for Text only) because
+    // physical themes use Oklch[...] tagged objects for colors.
+    let sv_font_color = tagged_object.expect_variable("settings");
+    let font_color_signal = signal::from_stream({
+        let style_stream = switch_map(sv_font_color.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        switch_map(
+            switch_map(font_stream, |value| {
+                let obj = value.expect_object();
+                match obj.variable("color") {
+                    Some(var) => var.stream().left_stream(),
+                    None => stream::empty().right_stream(),
+                }
+            }),
+            |value| oklch_to_css_stream(value),
+        )
+        .boxed_local()
+    });
+
+    El::new()
+        .s(Font::new()
+            .size_signal(font_size_signal.map(|opt| opt.unwrap_or(16)))
+        )
+        .update_raw_el(|raw_el| {
+            // Use Option<String> so dominator removes the property on None
+            // instead of panicking on empty string
+            raw_el.style_signal(
+                "color",
+                font_color_signal,
+            )
+        })
+        .child_signal(signal::from_stream(text_stream))
+        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
+        .after_remove(move |_| {
+            drop(tagged_object);
+        })
+}
+
+/// Element/block - renders a styled block element with a single child.
+/// Structure: ElementBlock[element?, settings[style, child]]
+fn element_block(
+    tagged_object: Arc<TaggedObject>,
+    construct_context: ConstructContext,
+) -> impl Element {
+    let settings_variable = tagged_object.expect_variable("settings");
+    let sv_physical = settings_variable.clone();
+    let ctx_physical = construct_context.clone();
+
+    // Extract child stream from settings
+    let child_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value.expect_object().expect_variable("child").stream()
+    })
+    .map({
+        let construct_context = construct_context.clone();
+        move |value| value_to_element(value, construct_context.clone())
+    });
+
+    // Extract style as a CSS string via raw_el for simplicity.
+    // This covers padding, height, align, and width from the style object.
+    let sv_style = tagged_object.expect_variable("settings");
+    let style_css_signal = signal::from_stream({
+        let style_stream = switch_map(sv_style.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        style_stream.filter_map(|value| async move {
+            let obj = match value {
+                Value::Object(obj, _) => obj,
+                _ => return None,
+            };
+            let mut css = String::new();
+
+            // Padding
+            if let Some(v) = obj.variable("padding") {
+                match v.value_actor().current_value().await {
+                    Ok(Value::Number(n, _)) => {
+                        css.push_str(&format!("padding:{}px;", n.number()));
+                    }
+                    Ok(Value::Object(pad_obj, _)) => {
+                        let get = |obj: &Arc<Object>, key: &str, fallback: &str| {
+                            let obj = obj.clone();
+                            let key = key.to_string();
+                            let fallback = fallback.to_string();
+                            async move {
+                                if let Some(v) = obj.variable(&key) {
+                                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                                        return n.number();
+                                    }
+                                }
+                                if let Some(v) = obj.variable(&fallback) {
+                                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                                        return n.number();
+                                    }
+                                }
+                                0.0
+                            }
+                        };
+                        let top = get(&pad_obj, "top", "column").await;
+                        let right = get(&pad_obj, "right", "row").await;
+                        let bottom = get(&pad_obj, "bottom", "column").await;
+                        let left = get(&pad_obj, "left", "row").await;
+                        css.push_str(&format!("padding:{}px {}px {}px {}px;", top, right, bottom, left));
+                    }
+                    _ => {}
+                }
+            }
+
+            // Height
+            if let Some(v) = obj.variable("height") {
+                if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                    css.push_str(&format!("height:{}px;", n.number()));
+                }
+            }
+
+            // Width
+            if let Some(v) = obj.variable("width") {
+                match v.value_actor().current_value().await {
+                    Ok(Value::Tag(tag, _)) if tag.tag() == "Fill" => {
+                        css.push_str("width:100%;");
+                    }
+                    Ok(Value::Number(n, _)) => {
+                        css.push_str(&format!("width:{}px;", n.number()));
+                    }
+                    _ => {}
+                }
+            }
+
+            // Align
+            if let Some(v) = obj.variable("align") {
+                if let Ok(Value::Object(align_obj, _)) = v.value_actor().current_value().await {
+                    if let Some(row_v) = align_obj.variable("row") {
+                        if let Ok(Value::Tag(tag, _)) = row_v.value_actor().current_value().await {
+                            match tag.tag() {
+                                "Center" => css.push_str("text-align:center;"),
+                                "Right" => css.push_str("text-align:right;"),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            Some(css)
+        })
+        .boxed_local()
+    });
+
+    El::new()
+        .update_raw_el(|raw_el| {
+            raw_el.update_dom_builder(|dom_builder| {
+                let element: web_sys::Element = dom_builder.__internal_element().into();
+                dom_builder.future(style_css_signal.for_each(move |css_opt| {
+                    let style = element
+                        .unchecked_ref::<web_sys::HtmlElement>()
+                        .style();
+                    async move {
+                        let css = css_opt.unwrap_or_default();
+                        for pair in css.split(';') {
+                            let pair = pair.trim();
+                            if pair.is_empty() {
+                                continue;
+                            }
+                            if let Some((name, value)) = pair.split_once(':') {
+                                let _ = style.set_property(name.trim(), value.trim());
+                            }
+                        }
+                    }
+                }))
+            })
+        })
+        .child_signal(signal::from_stream(child_stream))
+        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
+        .after_remove(move |_| {
             drop(tagged_object);
         })
 }

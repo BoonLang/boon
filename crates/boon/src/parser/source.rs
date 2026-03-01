@@ -231,6 +231,15 @@ pub fn pass_str_slice() -> StrSlice {
         .slice(0, 4)
 }
 
+/// Create a StrSlice for spread entries (empty name marker).
+pub fn spread_str_slice() -> StrSlice {
+    use std::sync::OnceLock;
+    static SPREAD_SOURCE: OnceLock<SourceCode> = OnceLock::new();
+    SPREAD_SOURCE
+        .get_or_init(|| SourceCode::new(String::new()))
+        .slice(0, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

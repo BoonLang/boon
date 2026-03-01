@@ -1613,6 +1613,16 @@ fn set_persistence<'a, 'code, 'old_code>(
                 status: PersistenceStatus::NewOrChanged,
             });
         }
+        // PostfixFieldAccess: recurse into the inner expression, then assign ID
+        Expression::PostfixFieldAccess { expr, .. } => {
+            set_persistence(expr, old_expressions, old_span_id_pairs, new_span_id_pairs, errors, changed_variable_ids);
+            let id = PersistenceId::new();
+            new_span_id_pairs.insert(*span, id);
+            *persistence = Some(Persistence {
+                id,
+                status: PersistenceStatus::NewOrChanged,
+            });
+        }
     }
 }
 

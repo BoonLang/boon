@@ -12,6 +12,7 @@ use boon::platform::browser::{
     bridge::object_with_document_to_element_signal,
     common::{EngineType, available_engines, default_engine},
     engine::VirtualFilesystem,
+    evaluator::{parse_module, FunctionRegistry},
     interpreter,
 };
 
@@ -189,6 +190,38 @@ fn find_example_by_name(name: &str) -> Option<ExampleData> {
     }).copied()
 }
 
+/// Multi-file example data (e.g., todo_mvc_physical with 8 files)
+#[derive(Clone, Copy)]
+struct MultiFileExampleData {
+    name: &'static str,
+    entry_file: &'static str,
+    files: &'static [(&'static str, &'static str)],
+}
+
+static TODO_MVC_PHYSICAL_FILES: [(&str, &str); 8] = [
+    ("RUN.bn", include_str!("examples/todo_mvc_physical/RUN.bn")),
+    ("BUILD.bn", include_str!("examples/todo_mvc_physical/BUILD.bn")),
+    ("Generated/Assets.bn", include_str!("examples/todo_mvc_physical/Generated/Assets.bn")),
+    ("Theme/Theme.bn", include_str!("examples/todo_mvc_physical/Theme/Theme.bn")),
+    ("Theme/Professional.bn", include_str!("examples/todo_mvc_physical/Theme/Professional.bn")),
+    ("Theme/Glassmorphism.bn", include_str!("examples/todo_mvc_physical/Theme/Glassmorphism.bn")),
+    ("Theme/Neobrutalism.bn", include_str!("examples/todo_mvc_physical/Theme/Neobrutalism.bn")),
+    ("Theme/Neumorphism.bn", include_str!("examples/todo_mvc_physical/Theme/Neumorphism.bn")),
+];
+
+static MULTI_FILE_EXAMPLES: [MultiFileExampleData; 1] = [
+    MultiFileExampleData {
+        name: "todo_mvc_physical",
+        entry_file: "RUN.bn",
+        files: &TODO_MVC_PHYSICAL_FILES,
+    },
+];
+
+/// Find multi-file example by name
+fn find_multi_file_example_by_name(name: &str) -> Option<&'static MultiFileExampleData> {
+    MULTI_FILE_EXAMPLES.iter().find(|e| e.name == name)
+}
+
 /// Panel layout mode for screenshot and viewing modes
 #[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(crate = "boon::zoon::serde")]
@@ -337,8 +370,22 @@ impl Playground {
                 });
             let content = stored_files.get(&current).cloned().unwrap_or_default();
             (stored_files, current, content)
+        } else if let Some(multi_example) = get_example_from_url()
+            .as_deref()
+            .and_then(find_multi_file_example_by_name)
+        {
+            // Multi-file example from URL parameter
+            let mut files = BTreeMap::new();
+            for (filename, content) in multi_example.files {
+                files.insert(filename.to_string(), content.to_string());
+            }
+            let entry_content = multi_example.files.iter()
+                .find(|(name, _)| *name == multi_example.entry_file)
+                .map(|(_, content)| content.to_string())
+                .unwrap_or_default();
+            (files, multi_example.entry_file.to_string(), entry_content)
         } else {
-            // Check URL for built-in example parameter
+            // Check URL for built-in single-file example parameter, or use default
             let example_data = get_example_from_url()
                 .and_then(|name| find_example_by_name(&name))
                 .unwrap_or(EXAMPLE_DATAS[0]);
@@ -813,57 +860,87 @@ impl Playground {
                     let selected_custom_example_for_select = selected_custom_example.clone();
                     let engine_type_for_select = engine_type.clone();
                     let select_example = Closure::wrap(Box::new(move |name: String| -> bool {
-                        let Some(example_data) = find_example_by_name(&name) else {
-                            return false;
+                        // Helper closure for common pre-switch logic
+                        let pre_switch = |is_same: bool| {
+                            // Save current code to previously selected custom example before switching
+                            let prev_selected_id = selected_custom_example_for_select.lock_ref().clone();
+                            if let Some(prev_id) = prev_selected_id {
+                                let current_code = source_code_for_select.lock_ref().to_string();
+                                let mut examples = (**custom_examples_for_select.lock_ref()).clone();
+                                if let Some((_, _, code)) = examples.iter_mut().find(|(id, _, _)| id == &prev_id) {
+                                    *code = current_code;
+                                }
+                                custom_examples_for_select.set(Rc::new(examples));
+                            }
+                            selected_custom_example_for_select.set(None);
+
+                            if !is_same {
+                                local_storage().remove(STATES_STORAGE_KEY);
+                                local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
+                                local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+                                clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
+
+                                #[cfg(feature = "engine-dd")]
+                                if engine_type_for_select.get() == EngineType::DifferentialDataflow {
+                                    clear_dd_persisted_states();
+                                }
+
+                                #[cfg(feature = "engine-wasm")]
+                                if engine_type_for_select.get() == EngineType::Wasm {
+                                    clear_wasm_persisted_states();
+                                }
+                            }
                         };
 
-                        let is_same_example = *current_file_for_select.lock_ref() == example_data.filename;
+                        // Try single-file example first
+                        if let Some(example_data) = find_example_by_name(&name) {
+                            let is_same = *current_file_for_select.lock_ref() == example_data.filename;
+                            pre_switch(is_same);
 
-                        // Save current code to previously selected custom example before switching
-                        let prev_selected_id = selected_custom_example_for_select.lock_ref().clone();
-                        if let Some(prev_id) = prev_selected_id {
-                            let current_code = source_code_for_select.lock_ref().to_string();
-                            let mut examples = (**custom_examples_for_select.lock_ref()).clone();
-                            if let Some((_, _, code)) = examples.iter_mut().find(|(id, _, _)| id == &prev_id) {
-                                *code = current_code;
-                            }
-                            custom_examples_for_select.set(Rc::new(examples));
+                            set_example_in_url(example_data.filename.trim_end_matches(".bn"));
+
+                            let mut new_files = BTreeMap::new();
+                            new_files.insert(
+                                example_data.filename.to_string(),
+                                example_data.source_code.to_string(),
+                            );
+                            files_for_select.set(Rc::new(new_files));
+                            current_file_for_select.set(example_data.filename.to_string());
+                            source_code_for_select.set_neq(Rc::new(Cow::from(example_data.source_code)));
+                            run_command_for_select.set(Some(RunCommand {
+                                filename: Some(example_data.filename),
+                            }));
+                            return true;
                         }
 
-                        // Clear custom example selection
-                        selected_custom_example_for_select.set(None);
+                        // Try multi-file example
+                        if let Some(example) = find_multi_file_example_by_name(&name) {
+                            let current_files = files_for_select.lock_ref();
+                            let is_same = current_files.len() == example.files.len()
+                                && current_files.contains_key(example.entry_file);
+                            drop(current_files);
+                            pre_switch(is_same);
 
-                        if !is_same_example {
-                            local_storage().remove(STATES_STORAGE_KEY);
-                            local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
-                            local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
-                            clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
+                            set_example_in_url(example.name);
 
-                            #[cfg(feature = "engine-dd")]
-                            if engine_type_for_select.get() == EngineType::DifferentialDataflow {
-                                clear_dd_persisted_states();
+                            let mut new_files = BTreeMap::new();
+                            for (filename, content) in example.files {
+                                new_files.insert(filename.to_string(), content.to_string());
                             }
-
-                            #[cfg(feature = "engine-wasm")]
-                            if engine_type_for_select.get() == EngineType::Wasm {
-                                clear_wasm_persisted_states();
-                            }
+                            files_for_select.set(Rc::new(new_files));
+                            current_file_for_select.set(example.entry_file.to_string());
+                            let entry_content = example.files.iter()
+                                .find(|(name, _)| *name == example.entry_file)
+                                .map(|(_, content)| *content)
+                                .unwrap_or("");
+                            source_code_for_select.set_neq(Rc::new(Cow::from(entry_content)));
+                            run_command_for_select.set(Some(RunCommand {
+                                filename: Some(example.entry_file),
+                            }));
+                            return true;
                         }
 
-                        set_example_in_url(example_data.filename.trim_end_matches(".bn"));
-
-                        let mut new_files = BTreeMap::new();
-                        new_files.insert(
-                            example_data.filename.to_string(),
-                            example_data.source_code.to_string(),
-                        );
-                        files_for_select.set(Rc::new(new_files));
-                        current_file_for_select.set(example_data.filename.to_string());
-                        source_code_for_select.set_neq(Rc::new(Cow::from(example_data.source_code)));
-                        run_command_for_select.set(Some(RunCommand {
-                            filename: Some(example_data.filename),
-                        }));
-                        true
+                        false
                     }) as Box<dyn Fn(String) -> bool>);
                     js_sys::Reflect::set(&api, &"selectExample".into(), select_example.as_ref()).ok();
                     select_example.forget();
@@ -1060,6 +1137,7 @@ impl Playground {
                     .s(Gap::new().x(10).y(6))
                     .multiline()
                     .items(main_examples.iter().map(|&example_data| self.example_button(example_data)))
+                    .items(MULTI_FILE_EXAMPLES.iter().map(|example| self.multi_file_example_button(example)))
             )
             .item_signal(
                 // Custom examples row (only shown if there are custom examples or always show add button)
@@ -1854,34 +1932,173 @@ impl Playground {
     }
 
     fn editor_panel_content(&self) -> impl Element + use<> {
-        Stack::new()
-            .s(Align::new().top())
+        Column::new()
             .s(Width::fill())
             .s(Height::fill())
-            .layer(self.standard_code_editor_surface())
-            .layer(
-                El::new()
-                    .s(Align::new().bottom().right())
-                    .s(Padding::new().right(20).bottom(16))
-                    .child(
+            .item_signal({
+                let this = self.clone();
+                self.files.signal_cloned()
+                    .map(|files| {
+                        let mut keys: Vec<String> = files.keys().cloned().collect();
+                        keys.sort();
+                        keys
+                    })
+                    .dedupe_cloned()
+                    .map(move |keys| {
+                        if keys.len() <= 1 {
+                            return None;
+                        }
+                        // Sort: RUN.bn first, BUILD.bn second, then alphabetical
+                        let mut sorted_keys = keys;
+                        sorted_keys.sort_by(|a, b| {
+                            let rank = |name: &str| -> u8 {
+                                if name == "RUN.bn" { 0 }
+                                else if name == "BUILD.bn" { 1 }
+                                else { 2 }
+                            };
+                            rank(a).cmp(&rank(b)).then(a.cmp(b))
+                        });
+                        Some(
+                            Row::new()
+                                .s(Width::fill())
+                                .s(Gap::new().x(2).y(2))
+                                .s(Padding::new().x(10).top(6).bottom(0))
+                                .multiline()
+                                .items(sorted_keys.into_iter().map(|filename| {
+                                    this.file_tab(filename)
+                                }))
+                        )
+                    })
+            })
+            .item(
+                Stack::new()
+                    .s(Align::new().top())
+                    .s(Width::fill())
+                    .s(Height::fill())
+                    .layer(self.standard_code_editor_surface())
+                    .layer(
                         El::new()
-                            .s(Padding::new().x(8).y(3))
-                            .s(RoundedCorners::all(6))
-                            .s(Background::new().color(color!("rgba(11, 18, 35, 0.7)")))
-                            .s(Font::new()
-                                .size(11)
-                                .family([FontFamily::new("JetBrains Mono"), FontFamily::Monospace])
-                                .color(color!("rgba(255, 255, 255, 0.5)")))
-                            .update_raw_el(|raw_el| {
-                                raw_el
-                                    .style("pointer-events", "none")
-                                    .style("z-index", "10")
-                            })
-                            .child_signal(self.cursor_position.signal().map(|(line, col)| {
-                                format!("Ln {line}, Col {col}")
-                            })),
+                            .s(Align::new().bottom().right())
+                            .s(Padding::new().right(20).bottom(16))
+                            .child(
+                                El::new()
+                                    .s(Padding::new().x(8).y(3))
+                                    .s(RoundedCorners::all(6))
+                                    .s(Background::new().color(color!("rgba(11, 18, 35, 0.7)")))
+                                    .s(Font::new()
+                                        .size(11)
+                                        .family([FontFamily::new("JetBrains Mono"), FontFamily::Monospace])
+                                        .color(color!("rgba(255, 255, 255, 0.5)")))
+                                    .update_raw_el(|raw_el| {
+                                        raw_el
+                                            .style("pointer-events", "none")
+                                            .style("z-index", "10")
+                                    })
+                                    .child_signal(self.cursor_position.signal().map(|(line, col)| {
+                                        format!("Ln {line}, Col {col}")
+                                    })),
+                            ),
                     ),
             )
+    }
+
+    /// Individual file tab button.
+    fn file_tab(&self, filename: String) -> impl Element {
+        let hovered = Mutable::new(false);
+        let hovered_signal = hovered.signal().broadcast();
+        let current_file_signal = self.current_file.signal_cloned().broadcast();
+        let filename_for_bg = filename.clone();
+        let filename_for_font = filename.clone();
+        let filename_for_label = filename.clone();
+        let filename_for_click = filename;
+
+        Button::new()
+            .s(Padding::new().x(10).y(5))
+            .s(RoundedCorners::new().top(8))
+            .s(Font::new()
+                .size(12)
+                .family([FontFamily::new("JetBrains Mono"), FontFamily::Monospace])
+                .no_wrap())
+            .s(Background::new().color_signal(map_ref! {
+                let hovered = hovered_signal.signal(),
+                let current = current_file_signal.signal_cloned() => {
+                    let is_active = *current == filename_for_bg;
+                    match (is_active, *hovered) {
+                        (true, _) => color!("rgba(11, 18, 35, 0.95)"),
+                        (false, true) => color!("rgba(30, 40, 65, 0.7)"),
+                        (false, false) => color!("rgba(20, 28, 48, 0.5)"),
+                    }
+                }
+            }))
+            .s(Font::new().color_signal(map_ref! {
+                let hovered = hovered_signal.signal(),
+                let current = current_file_signal.signal_cloned() =>
+                if *current == filename_for_font {
+                    color!("#e8ecff")
+                } else if *hovered {
+                    color!("rgba(214, 223, 255, 0.8)")
+                } else {
+                    color!("rgba(180, 192, 230, 0.55)")
+                }
+            }))
+            .label({
+                // Split filename into directory prefix and basename
+                let (prefix, basename) = match filename_for_label.rfind('/') {
+                    Some(idx) => (
+                        Some(filename_for_label[..=idx].to_string()),
+                        filename_for_label[idx + 1..].to_string(),
+                    ),
+                    None => (None, filename_for_label),
+                };
+                Row::new()
+                    .s(Gap::new().x(0))
+                    .items({
+                        let mut items: Vec<RawElOrText> = Vec::new();
+                        if let Some(prefix) = prefix {
+                            items.push(
+                                El::new()
+                                    .s(Font::new()
+                                        .size(12)
+                                        .color(color!("rgba(140, 160, 200, 0.5)")))
+                                    .child(prefix)
+                                    .unify(),
+                            );
+                        }
+                        items.push(
+                            El::new()
+                                .s(Font::new().size(12))
+                                .child(basename)
+                                .unify(),
+                        );
+                        items
+                    })
+            })
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+            .on_press({
+                let files = self.files.clone();
+                let current_file = self.current_file.clone();
+                let source_code = self.source_code.clone();
+                move || {
+                    // Don't switch if already on this tab
+                    if *current_file.lock_ref() == filename_for_click {
+                        return;
+                    }
+                    // Explicitly save current editor content to files map
+                    let current_content = source_code.lock_ref().to_string();
+                    let current_name = current_file.lock_ref().clone();
+                    let mut files_map = (**files.lock_ref()).clone();
+                    files_map.insert(current_name, current_content);
+                    files.set(Rc::new(files_map));
+
+                    // Switch to target file
+                    let target_content = files.lock_ref()
+                        .get(&filename_for_click)
+                        .cloned()
+                        .unwrap_or_default();
+                    current_file.set(filename_for_click.clone());
+                    source_code.set(Rc::new(Cow::from(target_content)));
+                }
+            })
     }
 
     fn snippet_screenshot_surface(&self) -> impl Element + use<> {
@@ -2100,6 +2317,15 @@ impl Playground {
         // Check which engine to use
         #[cfg(feature = "engine-wasm")]
         if engine_type == EngineType::Wasm {
+            if files.len() > 1 {
+                drop(source_code);
+                drop(files);
+                return El::new()
+                    .s(Padding::all(20))
+                    .s(Font::new().size(14).color(color!("LightCoral")))
+                    .child("WASM engine does not support multi-file examples yet. Switch to Actors engine.")
+                    .unify();
+            }
             let element = boon::platform::browser::engine_wasm::run_wasm(&source_code);
             drop(source_code);
             drop(files);
@@ -2108,6 +2334,15 @@ impl Playground {
 
         #[cfg(feature = "engine-dd")]
         if engine_type == EngineType::DifferentialDataflow {
+            if files.len() > 1 {
+                drop(source_code);
+                drop(files);
+                return El::new()
+                    .s(Padding::all(20))
+                    .s(Font::new().size(14).color(color!("LightCoral")))
+                    .child("DD engine does not support multi-file examples yet. Switch to Actors engine.")
+                    .unify();
+            }
             // Run with DD engine (reactive evaluation)
             let result = run_dd_reactive_with_persistence(
                 filename,
@@ -2141,6 +2376,45 @@ impl Playground {
 
         // Check if BUILD.bn exists and run it first
         let build_source = files.get("BUILD.bn").cloned();
+
+        // Pre-parse module files and register their functions for cross-file calls.
+        // This enables calls like `Theme/material()` which resolves to the `material`
+        // function defined in `Theme/Theme.bn`.
+        let mut module_registry: FunctionRegistry = std::collections::HashMap::new();
+        if files.len() > 1 {
+            for (file_path, file_content) in files.iter() {
+                // Skip entry file and build file — they're not importable modules
+                if file_path == filename || file_path == "BUILD.bn" {
+                    continue;
+                }
+                if !file_path.ends_with(".bn") {
+                    continue;
+                }
+                // Module name = basename without .bn extension
+                // e.g., "Theme/Theme.bn" → "Theme", "Theme/Professional.bn" → "Professional"
+                let module_name = file_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(file_path)
+                    .strip_suffix(".bn")
+                    .unwrap_or(file_path);
+
+                if let Some(module_data) = parse_module(file_path, file_content) {
+                    let func_count = module_data.functions.len();
+                    for (func_name, mut func_def) in module_data.functions {
+                        let qualified_name = format!("{}/{}", module_name, func_name);
+                        // Set module_name so intra-module calls resolve correctly
+                        func_def.module_name = Some(module_name.to_string());
+                        module_registry.insert(qualified_name, func_def);
+                    }
+                    println!(
+                        "Pre-loaded module '{}' from '{}' ({} functions)",
+                        module_name, file_path, func_count
+                    );
+                }
+            }
+        }
+
         drop(files);
 
         // Run BUILD.bn if it exists (to write generated files to VirtualFilesystem)
@@ -2158,9 +2432,10 @@ impl Playground {
             println!("BUILD.bn completed");
         }
 
-        // Run the main file (uses ModuleLoader for imports, no shared registry)
+        // Run the main file with pre-registered module functions.
         // We keep reference_connector and link_connector alive to preserve all actors.
         // Dropping them (via after_remove) will trigger cleanup of all actors.
+        let registry = if module_registry.is_empty() { None } else { Some(module_registry) };
         let evaluation_result = interpreter::run_with_registry(
             filename,
             &source_code,
@@ -2168,7 +2443,7 @@ impl Playground {
             OLD_SOURCE_CODE_STORAGE_KEY,
             OLD_SPAN_ID_PAIRS_STORAGE_KEY,
             virtual_fs,
-            None,
+            registry,
         );
         drop(source_code);
         if let Some((object, construct_context, _registry, _module_loader, reference_connector, link_connector, pass_through_connector, root_scope_guard)) = evaluation_result {
@@ -2299,6 +2574,115 @@ impl Playground {
                     source_code.set_neq(Rc::new(Cow::from(example_data.source_code)));
                     run_command.set(Some(RunCommand {
                         filename: Some(example_data.filename),
+                    }));
+                }
+            })
+    }
+
+    fn multi_file_example_button(&self, example: &'static MultiFileExampleData) -> impl Element {
+        let hovered = Mutable::new(false);
+        let hovered_signal = hovered.signal().broadcast();
+        let files_signal = self.files.signal_cloned().broadcast();
+        Button::new()
+            .s(Padding::new().x(14).y(7))
+            .s(RoundedCorners::all(24))
+            .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
+            .s(Background::new().color_signal(map_ref! {
+                let hovered = hovered_signal.signal(),
+                let files = files_signal.signal_cloned() => {
+                    // Active when files map has same number of files and contains the entry file
+                    let is_active = files.len() == example.files.len()
+                        && files.contains_key(example.entry_file);
+                    match (is_active, *hovered) {
+                        (true, _) => color!("rgba(80, 112, 188, 0.55)"),
+                        (false, true) => color!("rgba(36, 48, 72, 0.45)"),
+                        (false, false) => color!("rgba(24, 32, 54, 0.35)"),
+                    }
+                }
+            }))
+            .s(Borders::all(
+                Border::new().color(color!("rgba(88, 126, 194, 0.4)")).width(1),
+            ))
+            .s(Font::new().color_signal(map_ref! {
+                let hovered = hovered_signal.signal(),
+                let files = files_signal.signal_cloned() =>
+                if files.len() == example.files.len() && files.contains_key(example.entry_file) {
+                    color!("#f6f8ff")
+                } else if *hovered {
+                    color!("rgba(214, 223, 255, 0.86)")
+                } else {
+                    muted_text_color()
+                }
+            }))
+            .label(
+                El::new()
+                    .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
+                    .child(example.name),
+            )
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+            .on_press({
+                let files = self.files.clone();
+                let current_file = self.current_file.clone();
+                let source_code = self.source_code.clone();
+                let run_command = self.run_command.clone();
+                let custom_examples = self.custom_examples.clone();
+                let selected_custom_example = self.selected_custom_example.clone();
+                let engine_type = self.engine_type.clone();
+                move || {
+                    // Check if we're re-selecting the same multi-file example
+                    let current_files = files.lock_ref();
+                    let is_same_example = current_files.len() == example.files.len()
+                        && current_files.contains_key(example.entry_file);
+                    drop(current_files);
+
+                    // Save current code to previously selected custom example before switching
+                    let prev_selected_id = selected_custom_example.lock_ref().clone();
+                    if let Some(prev_id) = prev_selected_id {
+                        let current_code = source_code.lock_ref().to_string();
+                        let mut examples = (**custom_examples.lock_ref()).clone();
+                        if let Some((_, _, code)) = examples.iter_mut().find(|(id, _, _)| id == &prev_id) {
+                            *code = current_code;
+                        }
+                        custom_examples.set(Rc::new(examples));
+                    }
+
+                    // Clear custom example selection
+                    selected_custom_example.set(None);
+
+                    if !is_same_example {
+                        // Clear saved state
+                        local_storage().remove(STATES_STORAGE_KEY);
+                        local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
+                        local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+                        clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
+
+                        #[cfg(feature = "engine-dd")]
+                        if engine_type.get() == EngineType::DifferentialDataflow {
+                            clear_dd_persisted_states();
+                        }
+
+                        #[cfg(feature = "engine-wasm")]
+                        if engine_type.get() == EngineType::Wasm {
+                            clear_wasm_persisted_states();
+                        }
+                    }
+
+                    set_example_in_url(example.name);
+
+                    // Populate files map with ALL example files
+                    let mut new_files = BTreeMap::new();
+                    for (filename, content) in example.files {
+                        new_files.insert(filename.to_string(), content.to_string());
+                    }
+                    files.set(Rc::new(new_files));
+                    current_file.set(example.entry_file.to_string());
+                    let entry_content = example.files.iter()
+                        .find(|(name, _)| *name == example.entry_file)
+                        .map(|(_, content)| *content)
+                        .unwrap_or("");
+                    source_code.set_neq(Rc::new(Cow::from(entry_content)));
+                    run_command.set(Some(RunCommand {
+                        filename: Some(example.entry_file),
                     }));
                 }
             })

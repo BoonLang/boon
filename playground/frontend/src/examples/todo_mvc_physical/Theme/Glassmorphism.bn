@@ -227,14 +227,14 @@ FUNCTION text(of) {
             ]
 
             ButtonIcon[checked] => [
-                font: font(of: ButtonIcon[checked])
+                font: font(of: ButtonIcon[checked: checked])
             ]
 
             Small => small_base
 
             SmallLink[hovered] => [
                 ...small_base
-                font: font(of: SmallLink[hovered])
+                font: font(of: SmallLink[hovered: hovered])
             ]
         }
     }
@@ -285,13 +285,13 @@ FUNCTION lights() {
             }
         )
         Light/spot(
-            target: FocusedElement,
+            target: FocusedElement
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.75, chroma: 0.12, hue: 220]
                 Dark => Oklch[lightness: 0.85, chroma: 0.14, hue: 220]
-            },
-            intensity: 0.35,
-            radius: 80,
+            }
+            intensity: 0.35
+            radius: 80
             softness: 0.95
         )
     }
@@ -326,8 +326,17 @@ FUNCTION spacing(of) {
 
 FUNCTION spring_range(of) {
     of |> WHEN {
-        Button => [extend: 0, compress: 0]
-        ButtonDestructive => [extend: 0, compress: 0]
-        Checkbox => [extend: 0, compress: 0]
+        Button => [
+            extend: 0
+            compress: 0
+        ]
+        ButtonDestructive => [
+            extend: 0
+            compress: 0
+        ]
+        Checkbox => [
+            extend: 0
+            compress: 0
+        ]
     }
 }

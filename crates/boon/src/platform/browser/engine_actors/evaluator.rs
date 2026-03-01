@@ -16,7 +16,7 @@ use super::super::api;
 use super::engine::*;
 use crate::parser::{
     Persistence, PersistenceId, PersistenceStatus, Scope, SourceCode, Span, Spanned, Token, lexer,
-    parser, resolve_references, span_at, static_expression,
+    parser, resolve_persistence, resolve_references, span_at, static_expression,
 };
 
 /// Creates a persistence-wrapped stream for a variable.
@@ -222,6 +222,10 @@ pub struct EvaluationContext {
     /// None during main evaluation (uses EvaluationState.function_registry instead).
     /// Some(arc) for nested evaluations with immutable snapshot.
     pub function_registry_snapshot: Option<Arc<HashMap<String, StaticFunctionDefinition>>>,
+    /// Current module context for resolving intra-module function calls.
+    /// When evaluating `Theme/material()` body, this is `Some("Theme")`.
+    /// Unqualified calls like `get()` will try `Theme/get` as fallback.
+    pub current_module: Option<String>,
 }
 
 impl EvaluationContext {
@@ -244,6 +248,7 @@ impl EvaluationContext {
             module_loader,
             source_code,
             function_registry_snapshot: None,
+            current_module: None,
         }
     }
 
@@ -811,6 +816,7 @@ fn schedule_expression(
                 };
                 let item_ctx = EvaluationContext {
                     actor_context: ctx.actor_context.with_child_scope(&scope_id),
+                    current_module: ctx.current_module.clone(),
                     ..ctx.clone()
                 };
                 schedule_expression(state, item, item_ctx, slot)?;
@@ -1040,6 +1046,7 @@ fn schedule_expression(
                     is_snapshot_context: false,
                     ..ctx.actor_context.clone()
                 },
+                current_module: ctx.current_module.clone(),
                 ..ctx.clone()
             };
 
@@ -1088,6 +1095,23 @@ fn schedule_expression(
             for var in object.variables {
                 let var_slot = state.alloc_slot();
                 let name = var.node.name.to_string();
+
+                // Spread entry: just schedule the expression, no LINK/forwarding logic
+                if name.is_empty() {
+                    variable_data.push(ObjectVariableData {
+                        name,
+                        value_slot: var_slot,
+                        is_link: false,
+                        is_referenced: false,
+                        span: var.span,
+                        persistence: var.persistence.clone(),
+                        forwarding_actor: None,
+                        value_changed: false,
+                    });
+                    vars_to_schedule.push((var.node.value, var_slot, false));
+                    continue;
+                }
+
                 let is_link = matches!(&var.node.value.node, static_expression::Expression::Link);
                 let is_referenced = var.node.is_referenced;
                 let var_span = var.span;
@@ -1146,6 +1170,7 @@ fn schedule_expression(
                     object_locals: object_locals.clone(),
                     ..ctx.actor_context.clone()
                 },
+                current_module: ctx.current_module.clone(),
                 ..ctx.clone()
             };
 
@@ -1196,6 +1221,23 @@ fn schedule_expression(
             for var in object.variables {
                 let var_slot = state.alloc_slot();
                 let name = var.node.name.to_string();
+
+                // Spread entry: just schedule the expression, no LINK/forwarding logic
+                if name.is_empty() {
+                    variable_data.push(ObjectVariableData {
+                        name,
+                        value_slot: var_slot,
+                        is_link: false,
+                        is_referenced: false,
+                        span: var.span,
+                        persistence: var.persistence.clone(),
+                        forwarding_actor: None,
+                        value_changed: false,
+                    });
+                    vars_to_schedule.push((var.node.value, var_slot, false));
+                    continue;
+                }
+
                 let is_link = matches!(&var.node.value.node, static_expression::Expression::Link);
                 let is_referenced = var.node.is_referenced;
                 let var_span = var.span;
@@ -1254,6 +1296,7 @@ fn schedule_expression(
                     object_locals: object_locals.clone(),
                     ..ctx.actor_context.clone()
                 },
+                current_module: ctx.current_module.clone(),
                 ..ctx.clone()
             };
 
@@ -1421,8 +1464,8 @@ fn schedule_expression(
                                 passed_slot = Some(arg_slot);
                             } else {
                                 return Err(format!(
-                                    "PASS argument requires piped value at {:?}",
-                                    span
+                                    "PASS argument requires piped value at {:?} (arg '{}', function path: {:?})",
+                                    span, arg_name, path
                                 ));
                             }
                         }
@@ -1436,6 +1479,7 @@ fn schedule_expression(
                             object_locals: arg_locals,
                             ..ctx.actor_context.clone()
                         },
+                        current_module: ctx.current_module.clone(),
                         ..ctx.clone()
                     };
 
@@ -1544,6 +1588,7 @@ fn schedule_expression(
             let func_def = StaticFunctionDefinition {
                 parameters: param_names,
                 body: *body,
+                module_name: None,
             };
 
             state.register_function(func_name.clone(), func_def);
@@ -1582,6 +1627,34 @@ fn schedule_expression(
             let actor =
                 build_field_access_actor(path_strings, span, persistence, persistence_id, ctx)?;
             state.store(result_slot, actor);
+        }
+
+        // ============================================================
+        // POSTFIX FIELD ACCESS (expr.field)
+        // e.g., Theme/material(of: Danger).color
+        // Desugars to: expr |> .field (pipe + field access)
+        // ============================================================
+        static_expression::Expression::PostfixFieldAccess { expr, field } => {
+            // Desugar: schedule inner expression, then pipe its result through field access
+            let inner_slot = state.alloc_slot();
+
+            // Push the EvaluateWithPiped work item FIRST (LIFO - processed second)
+            let field_access_expr = static_expression::Spanned {
+                span,
+                node: static_expression::Expression::FieldAccess {
+                    path: vec![field],
+                },
+                persistence,
+            };
+            state.push(WorkItem::EvaluateWithPiped {
+                expr: field_access_expr,
+                prev_slot: inner_slot,
+                ctx: ctx.clone(),
+                result_slot,
+            });
+
+            // Schedule inner expression LAST (LIFO - processed first)
+            schedule_expression(state, *expr, ctx, inner_slot)?;
         }
 
         // ============================================================
@@ -1929,9 +2002,18 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 .expect("persistence should be set by resolver")
                 .id;
 
-            // Build variables
+            // Build variables, collecting spread actor handles separately
             let mut variables = Vec::new();
+            let mut spread_actors = Vec::new();
             for vd in variable_data.iter() {
+                // Spread entry: collect the actor handle for async resolution
+                if vd.name.is_empty() {
+                    if let Some(actor) = state.get(vd.value_slot) {
+                        spread_actors.push(actor);
+                    }
+                    continue;
+                }
+
                 let var_persistence_id = vd
                     .persistence
                     .as_ref()
@@ -2097,18 +2179,78 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 variables.push(variable);
             }
 
-            let actor = Object::new_arc_value_actor(
-                ConstructInfo::new(
+            if spread_actors.is_empty() {
+                // No spreads — use existing sync path
+                let actor = Object::new_arc_value_actor(
+                    ConstructInfo::new(
+                        format!("PersistenceId: {persistence_id}"),
+                        persistence,
+                        format!("{span}; Object {{..}}"),
+                    ),
+                    ctx.construct_context,
+                    persistence_id,
+                    ctx.actor_context,
+                    variables,
+                );
+                state.store(result_slot, actor);
+            } else {
+                // Has spreads — create async stream that awaits spread values
+                // and merges their variables with the explicit ones.
+                // Spread variables come first so explicit fields override via rposition lookup.
+                let object_construct_info = ConstructInfo::new(
+                    format!("PersistenceId: {persistence_id}; spread-merged Object"),
+                    persistence.clone(),
+                    format!("{span}; Object {{..}} (spread)"),
+                );
+                let actor_construct_info = ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}"),
                     persistence,
-                    format!("{span}; Object {{..}}"),
-                ),
-                ctx.construct_context,
-                persistence_id,
-                ctx.actor_context,
-                variables,
-            );
-            state.store(result_slot, actor);
+                    format!("{span}; Spread object wrapper"),
+                );
+                let construct_context = ctx.construct_context.clone();
+                let scope_id = ctx.actor_context.scope_id();
+
+                let merge_stream = stream::once(async move {
+                    let mut all_variables: Vec<Arc<Variable>> = Vec::new();
+
+                    // Collect variables from each spread source (order preserved)
+                    for spread_actor in &spread_actors {
+                        if let Ok(value) = spread_actor.value().await {
+                            match value {
+                                Value::Object(obj, _) => {
+                                    all_variables
+                                        .extend(obj.variables().iter().cloned());
+                                }
+                                Value::TaggedObject(obj, _) => {
+                                    all_variables
+                                        .extend(obj.variables().iter().cloned());
+                                }
+                                _ => {} // Non-object spread silently ignored
+                            }
+                        }
+                    }
+
+                    // Explicit variables come last — override spread via rposition
+                    all_variables.extend(variables);
+
+                    Object::new_value(
+                        object_construct_info,
+                        construct_context,
+                        persistence_id,
+                        all_variables,
+                    )
+                })
+                .chain(stream::pending());
+
+                let actor = create_actor(
+                    actor_construct_info,
+                    ctx.actor_context,
+                    TypedStream::infinite(merge_stream),
+                    persistence_id,
+                    scope_id,
+                );
+                state.store(result_slot, actor);
+            }
         }
 
         WorkItem::BuildTaggedObject {
@@ -2124,9 +2266,18 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 .expect("persistence should be set by resolver")
                 .id;
 
-            // Build variables
+            // Build variables, collecting spread actor handles separately
             let mut variables = Vec::new();
+            let mut spread_actors = Vec::new();
             for vd in variable_data.iter() {
+                // Spread entry: collect the actor handle for async resolution
+                if vd.name.is_empty() {
+                    if let Some(actor) = state.get(vd.value_slot) {
+                        spread_actors.push(actor);
+                    }
+                    continue;
+                }
+
                 let var_persistence_id = vd
                     .persistence
                     .as_ref()
@@ -2290,19 +2441,76 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 variables.push(variable);
             }
 
-            let actor = TaggedObject::new_arc_value_actor(
-                ConstructInfo::new(
+            if spread_actors.is_empty() {
+                // No spreads — use existing sync path
+                let actor = TaggedObject::new_arc_value_actor(
+                    ConstructInfo::new(
+                        format!("PersistenceId: {persistence_id}"),
+                        persistence,
+                        format!("{span}; {} {{..}}", tag),
+                    ),
+                    ctx.construct_context,
+                    persistence_id,
+                    ctx.actor_context,
+                    tag,
+                    variables,
+                );
+                state.store(result_slot, actor);
+            } else {
+                // Has spreads — async merge (same as BuildObject spread path)
+                let object_construct_info = ConstructInfo::new(
+                    format!("PersistenceId: {persistence_id}; spread-merged TaggedObject"),
+                    persistence.clone(),
+                    format!("{span}; {} {{..}} (spread)", tag),
+                );
+                let actor_construct_info = ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}"),
                     persistence,
-                    format!("{span}; {} {{..}}", tag),
-                ),
-                ctx.construct_context,
-                persistence_id,
-                ctx.actor_context,
-                tag,
-                variables,
-            );
-            state.store(result_slot, actor);
+                    format!("{span}; Spread tagged object wrapper"),
+                );
+                let construct_context = ctx.construct_context.clone();
+                let scope_id = ctx.actor_context.scope_id();
+
+                let merge_stream = stream::once(async move {
+                    let mut all_variables: Vec<Arc<Variable>> = Vec::new();
+
+                    for spread_actor in &spread_actors {
+                        if let Ok(value) = spread_actor.value().await {
+                            match value {
+                                Value::Object(obj, _) => {
+                                    all_variables
+                                        .extend(obj.variables().iter().cloned());
+                                }
+                                Value::TaggedObject(obj, _) => {
+                                    all_variables
+                                        .extend(obj.variables().iter().cloned());
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    all_variables.extend(variables);
+
+                    TaggedObject::new_value(
+                        object_construct_info,
+                        construct_context,
+                        persistence_id,
+                        tag,
+                        all_variables,
+                    )
+                })
+                .chain(stream::pending());
+
+                let actor = create_actor(
+                    actor_construct_info,
+                    ctx.actor_context,
+                    TypedStream::infinite(merge_stream),
+                    persistence_id,
+                    scope_id,
+                );
+                state.store(result_slot, actor);
+            }
         }
 
         WorkItem::BuildLatest {
@@ -2555,8 +2763,8 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                                     passed_slot = Some(arg_slot);
                                 } else {
                                     return Err(format!(
-                                        "PASS argument requires piped value at {:?}",
-                                        span
+                                        "PASS argument requires piped value at {:?} (arg '{}', function path: {:?})",
+                                        span, arg_name, path_strs
                                     ));
                                 }
                             }
@@ -2835,6 +3043,7 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                         link_connector: ctx.link_connector,
                         pass_through_connector: ctx.pass_through_connector,
                         function_registry_snapshot: ctx.function_registry_snapshot,
+                        current_module: ctx.current_module.clone(),
                         module_loader: ctx.module_loader,
                         source_code: ctx.source_code,
                     };
@@ -3129,6 +3338,7 @@ fn build_then_actor(
     let function_registry_for_then = function_registry_snapshot;
     let module_loader_for_then = ctx.module_loader.clone();
     let source_code_for_then = ctx.source_code.clone();
+    let current_module_for_then = ctx.current_module.clone();
     let persistence_for_then = persistence.clone();
     let span_for_then = span;
 
@@ -3150,6 +3360,7 @@ fn build_then_actor(
             let function_registry_clone = function_registry_for_then.clone();
             let module_loader_clone = module_loader_for_then.clone();
             let source_code_clone = source_code_for_then.clone();
+            let current_module_clone = current_module_for_then.clone();
             let persistence_clone = persistence_for_then.clone();
             let body_clone = body.clone();
             let permit_clone = backpressure_permit_for_then.clone();
@@ -3247,6 +3458,7 @@ fn build_then_actor(
                     module_loader: module_loader_clone,
                     source_code: source_code_clone,
                     function_registry_snapshot: Some(function_registry_clone),
+                    current_module: current_module_clone,
                 };
 
                 let body_expr = static_expression::Spanned {
@@ -3393,6 +3605,7 @@ fn build_when_actor(
     let function_registry_for_when = function_registry_snapshot;
     let module_loader_for_when = ctx.module_loader.clone();
     let source_code_for_when = ctx.source_code.clone();
+    let current_module_for_when = ctx.current_module.clone();
     let persistence_for_when = persistence.clone();
     let span_for_when = span;
 
@@ -3411,6 +3624,7 @@ fn build_when_actor(
             let function_registry_clone = function_registry_for_when.clone();
             let module_loader_clone = module_loader_for_when.clone();
             let source_code_clone = source_code_for_when.clone();
+            let current_module_clone = current_module_for_when.clone();
             let persistence_clone = persistence_for_when.clone();
             let arms_clone = arms.clone();
 
@@ -3427,10 +3641,13 @@ fn build_when_actor(
                     zoon::println!("[WHEN] Received value: {}", value_desc);
                 }
 
+                // Pre-resolve ValueComparison patterns from scope
+                let comparison_values = resolve_comparison_values(&arms_clone, &actor_context_clone, &reference_connector_clone).await;
+
                 // Try to match against each arm
                 for arm in &arms_clone {
                     // Use async pattern matching to properly extract bindings from Objects
-                    if let Some(bindings) = match_pattern(&arm.pattern, &value).await {
+                    if let Some(bindings) = match_pattern(&arm.pattern, &value, &comparison_values).await {
                         if LOG_DEBUG {
                             zoon::println!("[WHEN] Pattern MATCHED: {:?}", arm.pattern);
                         }
@@ -3523,6 +3740,7 @@ fn build_when_actor(
                             module_loader: module_loader_clone.clone(),
                             source_code: source_code_clone.clone(),
                             function_registry_snapshot: Some(function_registry_clone.clone()),
+                            current_module: current_module_clone.clone(),
                         };
 
                         match evaluate_expression(arm.body.clone(), new_ctx) {
@@ -3634,6 +3852,7 @@ fn build_while_actor(
     let function_registry_for_while = function_registry_snapshot;
     let module_loader_for_while = ctx.module_loader.clone();
     let source_code_for_while = ctx.source_code.clone();
+    let current_module_for_while = ctx.current_module.clone();
     let persistence_for_while = persistence.clone();
     let span_for_while = span;
 
@@ -3656,6 +3875,7 @@ fn build_while_actor(
         let function_registry_clone = function_registry_for_while.clone();
         let module_loader_clone = module_loader_for_while.clone();
         let source_code_clone = source_code_for_while.clone();
+        let current_module_clone = current_module_for_while.clone();
         let persistence_clone = persistence_for_while.clone();
         let arms_clone = arms.clone();
 
@@ -3663,6 +3883,9 @@ fn build_while_actor(
         // When a new input arrives, switch_map will drop this whole inner stream (cancelling
         // any async work and the forwarded body stream) and start a new one.
         stream::once(async move {
+            // Pre-resolve ValueComparison patterns from scope
+            let comparison_values = resolve_comparison_values(&arms_clone, &actor_context_clone, &reference_connector_clone).await;
+
             // Find matching arm using async pattern matching
             let mut matched_arm_with_bindings: Option<(
                 usize,
@@ -3670,7 +3893,7 @@ fn build_while_actor(
                 HashMap<String, Value>,
             )> = None;
             for (arm_idx, arm) in arms_clone.iter().enumerate() {
-                if let Some(bindings) = match_pattern(&arm.pattern, &value).await {
+                if let Some(bindings) = match_pattern(&arm.pattern, &value, &comparison_values).await {
                     matched_arm_with_bindings = Some((arm_idx, arm, bindings));
                     break;
                 }
@@ -3785,6 +4008,7 @@ fn build_while_actor(
                     module_loader: module_loader_clone,
                     source_code: source_code_clone,
                     function_registry_snapshot: Some(function_registry_clone),
+                    current_module: current_module_clone,
                 };
 
                 match evaluate_expression(arm.body.clone(), new_ctx) {
@@ -4150,6 +4374,7 @@ fn build_hold_actor(
         link_connector: ctx.link_connector.clone(),
         pass_through_connector: ctx.pass_through_connector.clone(),
         function_registry_snapshot: ctx.function_registry_snapshot.clone(),
+        current_module: ctx.current_module.clone(),
         module_loader: ctx.module_loader.clone(),
         source_code: ctx.source_code.clone(),
     };
@@ -4982,6 +5207,7 @@ fn build_list_append_with_recording(
     // Create new evaluation context with the persisting scope
     let item_eval_ctx = EvaluationContext {
         actor_context: child_ctx.clone(),
+        current_module: ctx.current_module.clone(),
         ..ctx.clone()
     };
 
@@ -5099,6 +5325,7 @@ fn build_list_append_with_recording(
                     is_restoring: true,
                     ..child_ctx.with_restoring_child_scope(&recorded_call.id)
                 },
+                current_module: ctx.current_module.clone(),
                 ..ctx.clone()
             };
 
@@ -5333,7 +5560,24 @@ fn call_function(
         .function_registry_snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.get(&full_path).cloned())
-        .or_else(|| function_registry.get(&full_path).cloned());
+        .or_else(|| function_registry.get(&full_path).cloned())
+        // Intra-module fallback: if unqualified lookup fails and we're inside a module,
+        // try qualified name. E.g., `get()` inside Theme module → try `Theme/get`.
+        .or_else(|| {
+            if !full_path.contains('/') {
+                if let Some(module) = &ctx.current_module {
+                    let qualified = format!("{}/{}", module, full_path);
+                    ctx.function_registry_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.get(&qualified).cloned())
+                        .or_else(|| function_registry.get(&qualified).cloned())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
 
     if let Some(func_def) = func_def_opt {
         // Create parameters from arguments
@@ -5367,6 +5611,7 @@ fn call_function(
             let parameters_for_closure = parameters.clone();
             let param_name_for_closure = param_name.clone();
             let func_body = func_def.body.clone();
+            let func_module_name = func_def.module_name.clone();
             let ctx_for_closure = ctx.clone();
             let persistence_for_construct = persistence.clone();
             let span_for_construct = span;
@@ -5480,6 +5725,7 @@ fn call_function(
                     module_loader: ctx_for_closure.module_loader.clone(),
                     source_code: ctx_for_closure.source_code.clone(),
                     function_registry_snapshot: ctx_for_closure.function_registry_snapshot.clone(),
+                    current_module: func_module_name.clone(),
                 };
 
                 // Evaluate the function body with this piped value
@@ -5565,6 +5811,7 @@ fn call_function(
             link_connector: ctx.link_connector,
             pass_through_connector: ctx.pass_through_connector,
             function_registry_snapshot: ctx.function_registry_snapshot,
+            current_module: func_def.module_name.clone(),
             module_loader: ctx.module_loader,
             source_code: ctx.source_code,
         };
@@ -5650,11 +5897,58 @@ fn call_function(
     }
 }
 
+/// Pre-resolve all ValueComparison patterns in arms to concrete values.
+/// Looks up variables from the actor context's parameters, then traverses field paths.
+async fn resolve_comparison_values(
+    arms: &[static_expression::Arm],
+    actor_context: &ActorContext,
+    reference_connector: &Weak<ReferenceConnector>,
+) -> HashMap<String, Value> {
+    let mut resolved = HashMap::new();
+    for arm in arms {
+        if let static_expression::Pattern::ValueComparison { path, referenced_span } = &arm.pattern {
+            let base_name = path[0].as_str().to_string();
+
+            // Try parameters first, then fall back to reference_connector
+            let base_actor = if let Some(actor) = actor_context.parameters.get(&base_name) {
+                Some(actor.clone())
+            } else if let Some(ref_span) = referenced_span {
+                // Look up in object_locals or via reference_connector
+                if let Some(local) = actor_context.object_locals.get(ref_span) {
+                    Some(local.clone())
+                } else if let Some(rc) = reference_connector.upgrade() {
+                    Some(rc.referenceable(*ref_span).await)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(actor) = base_actor {
+                if let Ok(base_value) = actor.current_value().await {
+                    if path.len() == 1 {
+                        resolved.insert(base_name, base_value);
+                    } else {
+                        let field_path: Vec<String> = path[1..].iter().map(|s| s.as_str().to_string()).collect();
+                        if let Some(field_value) = extract_field_path(&base_value, &field_path).await {
+                            let key = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(".");
+                            resolved.insert(key, field_value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    resolved
+}
+
 /// Pattern matching that properly extracts bindings from Objects.
 /// This can handle reactive Object values by awaiting subscriptions to get current field values.
 async fn match_pattern(
     pattern: &static_expression::Pattern,
     value: &Value,
+    comparison_values: &HashMap<String, Value>,
 ) -> Option<HashMap<String, Value>> {
     let mut bindings = HashMap::new();
 
@@ -5708,7 +6002,7 @@ async fn match_pattern(
                                 if let Some(ref nested_pattern) = pattern_var.value {
                                     // Recursively match nested pattern
                                     if let Some(nested_bindings) =
-                                        Box::pin(match_pattern(nested_pattern, &field_value)).await
+                                        Box::pin(match_pattern(nested_pattern, &field_value, comparison_values)).await
                                     {
                                         bindings.extend(nested_bindings);
                                     } else {
@@ -5740,6 +6034,7 @@ async fn match_pattern(
                 variables: &[Arc<Variable>],
                 pattern_vars: &[static_expression::PatternVariable],
                 bindings: &mut HashMap<String, Value>,
+                comparison_values: &HashMap<String, Value>,
             ) -> bool {
                 for pattern_var in pattern_vars {
                     let var_name = pattern_var.name.as_str();
@@ -5752,7 +6047,7 @@ async fn match_pattern(
                             if let Some(ref nested_pattern) = pattern_var.value {
                                 // Recursively match nested pattern
                                 if let Some(nested_bindings) =
-                                    Box::pin(match_pattern(nested_pattern, &field_value)).await
+                                    Box::pin(match_pattern(nested_pattern, &field_value, comparison_values)).await
                                 {
                                     bindings.extend(nested_bindings);
                                 } else {
@@ -5773,13 +6068,13 @@ async fn match_pattern(
             }
 
             if let Value::Object(obj, _) = value {
-                if extract_object_bindings(obj.variables(), variables, &mut bindings).await {
+                if extract_object_bindings(obj.variables(), variables, &mut bindings, comparison_values).await {
                     Some(bindings)
                 } else {
                     None
                 }
             } else if let Value::TaggedObject(to, _) = value {
-                if extract_object_bindings(to.variables(), variables, &mut bindings).await {
+                if extract_object_bindings(to.variables(), variables, &mut bindings, comparison_values).await {
                     Some(bindings)
                 } else {
                     None
@@ -5805,7 +6100,7 @@ async fn match_pattern(
                     if let Some(item_value) = item_actor.clone().current_value().await.ok() {
                         // Recursively match the pattern
                         if let Some(nested_bindings) =
-                            Box::pin(match_pattern(item_pattern, &item_value)).await
+                            Box::pin(match_pattern(item_pattern, &item_value, comparison_values)).await
                         {
                             bindings.extend(nested_bindings);
                         } else {
@@ -5816,6 +6111,21 @@ async fn match_pattern(
                     }
                 }
                 Some(bindings)
+            } else {
+                None
+            }
+        }
+
+        static_expression::Pattern::ValueComparison { path, .. } => {
+            let key = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(".");
+            if let Some(comparison_value) = comparison_values.get(&key) {
+                // Compare like literals: check tag, text, or number equality
+                match (comparison_value, value) {
+                    (Value::Tag(a, _), Value::Tag(b, _)) if a.tag() == b.tag() => Some(bindings),
+                    (Value::Text(a, _), Value::Text(b, _)) if a.text() == b.text() => Some(bindings),
+                    (Value::Number(a, _), Value::Number(b, _)) if (a.number() - b.number()).abs() < f64::EPSILON => Some(bindings),
+                    _ => None,
+                }
             } else {
                 None
             }
@@ -5843,6 +6153,10 @@ pub type FunctionRegistry = HashMap<String, StaticFunctionDefinition>;
 pub struct StaticFunctionDefinition {
     pub parameters: Vec<String>,
     pub body: static_expression::Spanned<static_expression::Expression>,
+    /// Module this function belongs to (e.g., "Theme" for functions in Theme.bn).
+    /// Used to resolve intra-module calls: when `Theme/material()` calls `get()`,
+    /// we try `Theme/get` as a fallback.
+    pub module_name: Option<String>,
 }
 
 /// Cached module data - contains functions and variables from a parsed module file.
@@ -6070,7 +6384,13 @@ impl ModuleLoader {
 }
 
 /// Parse module source code into ModuleData (free function, no state needed).
-fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
+pub fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
+    // Create SourceCode FIRST so all parsing borrows from this Arc'd String.
+    // This is critical: the AST will contain &str slices that point into this allocation.
+    // If we create SourceCode after parsing, the pointers won't match.
+    let source_code_arc = SourceCode::new(source_code.to_string());
+    let source_code = source_code_arc.as_str();
+
     // Lexer
     let (tokens, errors) = lexer().parse(source_code).into_output_errors();
     if !errors.is_empty() {
@@ -6096,11 +6416,13 @@ fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
         ))
         .into_output_errors();
     if !errors.is_empty() {
-        zoon::eprintln!(
-            "[ModuleLoader] Parse errors in '{}': {:?}",
-            filename,
-            errors.len()
-        );
+        for err in &errors {
+            zoon::eprintln!(
+                "[ModuleLoader] Parse error in '{}': {:?}",
+                filename,
+                err
+            );
+        }
         return None;
     }
     let ast = ast?;
@@ -6118,9 +6440,22 @@ fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
         }
     };
 
-    // Convert to static expressions
-    let source_code_arc = SourceCode::new(source_code.to_string());
-    let static_ast = static_expression::convert_expressions(source_code_arc, ast);
+    // Persistence resolution (modules don't persist state, but IDs must be assigned)
+    let (ast, _new_span_id_pairs, _changed_variable_ids) =
+        match resolve_persistence(ast, None::<Vec<Spanned<crate::parser::Expression>>>, "") {
+            Ok(result) => result,
+            Err(errors) => {
+                zoon::eprintln!(
+                    "[ModuleLoader] Persistence errors in '{}': {:?}",
+                    filename,
+                    errors.len()
+                );
+                return None;
+            }
+        };
+
+    // Convert to static expressions (clone SourceCode since it's still borrowed by the AST)
+    let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
 
     // Extract functions and variables
     let mut functions = HashMap::new();
@@ -6143,6 +6478,7 @@ fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
                     StaticFunctionDefinition {
                         parameters: parameters.into_iter().map(|p| p.node.to_string()).collect(),
                         body: *body,
+                        module_name: None,
                     },
                 );
             }
@@ -6220,6 +6556,7 @@ pub fn evaluate_with_registry(
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
         bridge_scope_id: Some(root_scope_id),
+        scene_ctx: None,
     };
     let actor_context = ActorContext {
         registry_scope_id: Some(root_scope_id),
@@ -6256,6 +6593,7 @@ pub fn evaluate_with_registry(
                     StaticFunctionDefinition {
                         parameters: parameters.into_iter().map(|p| p.node.to_string()).collect(),
                         body: *body,
+                        module_name: None,
                     },
                 );
             }
@@ -6498,6 +6836,7 @@ fn static_spanned_expression_into_value_actor(
         module_loader,
         source_code,
         function_registry_snapshot: snapshot,
+        current_module: None,
     };
 
     // Delegate to the stack-safe evaluator
@@ -6890,6 +7229,54 @@ fn static_function_call_path_to_definition(
                 actor_context,
             )
             .boxed_local()
+        },
+        // --- Scene/Element/* aliases (call the same underlying Element/* functions) ---
+        ["Scene", "Element", "stripe"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_stripe(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        ["Scene", "Element", "container"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_container(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        ["Scene", "Element", "stack"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_stack(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        ["Scene", "Element", "button"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_button(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        ["Scene", "Element", "text_input"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_text_input(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        ["Scene", "Element", "checkbox"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_checkbox(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        ["Scene", "Element", "label"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_label(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        ["Scene", "Element", "paragraph"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_paragraph(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        ["Scene", "Element", "link"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_link(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        // --- Element/text and Element/block (new element types) ---
+        ["Element", "text"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_text(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        ["Element", "block"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_block(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        ["Scene", "Element", "text"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_text(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        ["Scene", "Element", "block"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_block(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        // --- Light/* data constructors ---
+        ["Light", "directional"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_light_directional(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+        },
+        ["Light", "ambient"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_light_ambient(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
         },
         ["Theme", "background_color"] => {
             |arguments, id, persistence_id, construct_context, actor_context| {

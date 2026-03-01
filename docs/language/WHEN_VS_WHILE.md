@@ -315,6 +315,66 @@ state \|> HOLD state {
 
 ---
 
+## Value Comparison Patterns
+
+By default, identifiers in pattern arms are **bindings** — they create a new variable with the matched value. To compare against a variable's current value instead, use value comparison patterns.
+
+### Dotted Path (parent.field)
+
+Dotted paths are unambiguous in patterns — assigning to a field makes no sense, so the parser knows it must be a comparison:
+
+```boon
+-- Compare route against stored filter values
+filter_routes: [
+    all: TEXT { / }
+    active: TEXT { /active }
+    completed: TEXT { /completed }
+]
+
+Router/route() |> WHEN {
+    filter_routes.all => All
+    filter_routes.active => Active
+    filter_routes.completed => Completed
+    __ => All
+}
+```
+
+### Braced Variable ({var})
+
+For single identifiers, wrap in braces to compare (borrows TEXT interpolation syntax):
+
+```boon
+target_state: Active
+
+current_state |> WHEN {
+    {target_state} => TEXT { Reached target! }
+    __ => TEXT { Not there yet }
+}
+```
+
+### Binding vs Comparison
+
+```boon
+-- `filter` here is a BINDING (creates new variable)
+input |> WHEN {
+    filter => process(filter)  -- Always matches, binds value to `filter`
+}
+
+-- `{filter}` here is a COMPARISON (checks against variable)
+input |> WHEN {
+    {filter} => process(input)  -- Only matches if input == filter's value
+    __ => skip()
+}
+
+-- `parent.filter` is always a COMPARISON (dotted path, unambiguous)
+input |> WHEN {
+    config.filter => process(input)
+    __ => skip()
+}
+```
+
+---
+
 ## Anti-Patterns
 
 ### ❌ DON'T: Use WHEN for record patterns
@@ -428,6 +488,7 @@ endcase
 
 ## Related Documentation
 
+- [BOON_SYNTAX.md](./BOON_SYNTAX.md) - Syntax reference (including value comparison patterns)
 - [LATEST.md](./LATEST.md) - Reactive state with LATEST
 - [BITS.md](./BITS.md) - Hardware bit manipulation
 - [hw_examples/fsm.bn](../../playground/frontend/src/examples/hw_examples/fsm.bn) - Reference FSM implementation

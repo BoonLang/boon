@@ -6,7 +6,8 @@
 icons_directory: TEXT { ./assets/icons }
 output_file: TEXT { ./Generated/Assets.bn }
 
-svg_files: Directory/entries(icons_directory)
+svg_files: icons_directory
+|> Directory/entries()
 |> List/retain(item, if: item.extension == TEXT { svg })
 |> List/sort_by(item, key: item.path)
 

@@ -854,4 +854,52 @@ The spread operator (`...`) provides a simple, powerful way to compose records i
 
 ---
 
-**Last updated:** 2025-11-16
+## Implementation
+
+### Internal Representation
+
+Spread entries are represented as `Variable` nodes with an **empty name** (`""`) as a sentinel value. This works because real variable names must be valid snake_case identifiers, making `""` an impossible collision.
+
+**Key files:**
+- `parser.rs` — `object_spread` parser creates `Variable { name: "", value: expr }`
+- `source.rs` — `spread_str_slice()` provides a static empty `StrSlice` (similar to `pass_str_slice()`)
+- `formatter.rs` — detects empty name and outputs `...{value}` syntax
+- `scope_resolver.rs` — skips name registration for spread entries, still resolves value references
+- `static_expression.rs` — uses `spread_str_slice()` for the empty name in `convert_variable`
+
+### Actor Engine (Primary)
+
+**Files:** `evaluator.rs`, `engine.rs`
+
+The actor engine builds objects in two phases:
+1. **Schedule phase** (sync): Allocates slots and schedules spread expression evaluation. Spread entries get `ObjectVariableData` with empty name, no LINK/forwarding logic.
+2. **Build phase** (`WorkItem::BuildObject`):
+   - If no spread entries: creates the Object synchronously with `Object::new_arc_value_actor()` (unchanged path)
+   - If spread entries exist: creates an **async stream** via `stream::once(async { ... }).chain(stream::pending())` that:
+     1. Awaits each spread actor's `value()`
+     2. Extracts `Variables` from the resulting Object/TaggedObject
+     3. Prepends spread variables before explicit variables
+     4. Creates the Object with all merged variables
+
+**Last-wins lookup:** `Object::variable()` and `TaggedObject::variable()` use `rposition` (last match) instead of `position` (first match). Since spread variables come first in the Vec and explicit variables come last, explicit fields naturally override spread fields with the same name.
+
+**Limitation:** The merge is done once (constant stream, not reactive). The resulting Object doesn't update when the spread source changes. This matches typical usage where spreads come from constant function returns.
+
+### DD Engine
+
+**Files:** `engine_dd/core/compile.rs`
+
+The DD engine evaluates objects eagerly into `BTreeMap<Arc<str>, Value>`:
+- In `eval_static_with_scope` and `eval_static_tolerant`: when encountering an empty-name variable, evaluates the spread expression, checks if it's `Value::Object` or `Value::Tagged`, and extends the `BTreeMap` with its fields. Since `BTreeMap::insert` replaces existing keys, later explicit fields override spread fields.
+- In `flatten_object_fields`: for simple variable references (`...base` where `base` is a known object literal), looks up the variable in the compiler's variable list and recursively flattens its fields. Function call spreads can't be resolved at compile time and are skipped.
+- `get_var_expr` uses `rfind` (last match) so explicit dotted names override spread-registered ones.
+
+### WASM Engine
+
+**Files:** `engine_wasm/lower.rs`
+
+The WASM engine currently **skips** spread entries during IR lowering (filtered out with `.filter(|v| !v.node.name.is_empty())`). Full spread support in the WASM engine would require runtime object merging in the generated WASM code — a future enhancement.
+
+---
+
+**Last updated:** 2026-03-01

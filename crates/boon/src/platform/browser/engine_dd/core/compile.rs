@@ -183,6 +183,29 @@ impl Compiler {
     fn flatten_object_fields(&mut self, prefix: &str, expr: &Spanned<Expression>) {
         if let Expression::Object(obj) = &expr.node {
             for var in &obj.variables {
+                if var.node.name.is_empty() {
+                    // Spread entry: try to resolve the source's fields statically.
+                    // Handles simple variable references like `...base` where `base`
+                    // is a known object literal.
+                    if let Expression::Alias(crate::parser::static_expression::Alias::WithoutPassed {
+                        parts, ..
+                    }) = &var.node.value.node
+                    {
+                        if parts.len() == 1 {
+                            let var_name = parts[0].as_str();
+                            // Look up the variable's expression in the registered variables
+                            if let Some(source_expr) = self
+                                .variables
+                                .iter()
+                                .find(|(n, _)| n == var_name)
+                                .map(|(_, e)| e.clone())
+                            {
+                                self.flatten_object_fields(prefix, &source_expr);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let field_name = format!("{}.{}", prefix, var.node.name.as_str());
                 self.variables
                     .push((field_name.clone(), var.node.value.clone()));
@@ -192,10 +215,13 @@ impl Compiler {
         }
     }
 
+    /// Look up a variable expression by name.
+    /// Uses rfind (last match) so that explicit fields override spread fields
+    /// when both register the same dotted name.
     fn get_var_expr(&self, name: &str) -> Option<&Spanned<Expression>> {
         self.variables
             .iter()
-            .find(|(n, _)| n == name)
+            .rfind(|(n, _)| n == name)
             .map(|(_, e)| e)
     }
 
@@ -265,6 +291,7 @@ impl Compiler {
                 } => Self::has_external_input(operand_a) || Self::has_external_input(operand_b),
                 ArithmeticOperator::Negate { operand } => Self::has_external_input(operand),
             },
+            Expression::PostfixFieldAccess { expr, .. } => Self::has_external_input(expr),
             _ => false,
         }
     }
@@ -370,6 +397,7 @@ impl Compiler {
                 // But for top-level reactivity check, we look at definitions.
                 false
             }
+            Expression::PostfixFieldAccess { expr, .. } => Self::is_reactive(expr),
             _ => false,
         }
     }
@@ -459,9 +487,23 @@ impl Compiler {
             Expression::Object(obj) => {
                 let mut fields = BTreeMap::new();
                 for var in &obj.variables {
-                    let name = var.node.name.as_str().to_string();
-                    let val = self.eval_static_with_scope(&var.node.value, local_scope)?;
-                    fields.insert(Arc::from(name.as_str()), val);
+                    let name = var.node.name.as_str();
+                    if name.is_empty() {
+                        // Spread: evaluate expression, merge its fields
+                        let val = self.eval_static_with_scope(&var.node.value, local_scope)?;
+                        match val {
+                            Value::Object(spread_fields) => {
+                                fields.extend(spread_fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            }
+                            Value::Tagged { fields: spread_fields, .. } => {
+                                fields.extend(spread_fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            }
+                            _ => {} // Non-object spread ignored
+                        }
+                    } else {
+                        let val = self.eval_static_with_scope(&var.node.value, local_scope)?;
+                        fields.insert(Arc::from(name), val);
+                    }
                 }
                 Ok(Value::Object(Arc::new(fields)))
             }
@@ -469,9 +511,22 @@ impl Compiler {
             Expression::TaggedObject { tag, object } => {
                 let mut fields = BTreeMap::new();
                 for var in &object.variables {
-                    let name = var.node.name.as_str().to_string();
-                    let val = self.eval_static_with_scope(&var.node.value, local_scope)?;
-                    fields.insert(Arc::from(name.as_str()), val);
+                    let name = var.node.name.as_str();
+                    if name.is_empty() {
+                        let val = self.eval_static_with_scope(&var.node.value, local_scope)?;
+                        match val {
+                            Value::Object(spread_fields) => {
+                                fields.extend(spread_fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            }
+                            Value::Tagged { fields: spread_fields, .. } => {
+                                fields.extend(spread_fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        let val = self.eval_static_with_scope(&var.node.value, local_scope)?;
+                        fields.insert(Arc::from(name), val);
+                    }
                 }
                 Ok(Value::Tagged {
                     tag: Arc::from(tag.as_str()),
@@ -527,6 +582,14 @@ impl Compiler {
             // THEN in static context (non-piped): evaluate body
             Expression::Then { body } => self.eval_static_with_scope(body, local_scope),
 
+            // Postfix field access: evaluate expr, then extract field
+            Expression::PostfixFieldAccess { expr, field } => {
+                let val = self.eval_static_with_scope(expr, local_scope)?;
+                val.get_field(field.as_str())
+                    .cloned()
+                    .ok_or_else(|| format!("Field '{}' not found", field.as_str()))
+            }
+
             _ => Err(format!(
                 "Unsupported expression in static eval: {:?}",
                 std::mem::discriminant(&expr.node)
@@ -547,18 +610,44 @@ impl Compiler {
             Expression::Object(obj) => {
                 let mut fields = BTreeMap::new();
                 for var in &obj.variables {
-                    let name = var.node.name.as_str().to_string();
-                    let val = self.eval_static_tolerant(&var.node.value, local_scope);
-                    fields.insert(Arc::from(name.as_str()), val);
+                    let name = var.node.name.as_str();
+                    if name.is_empty() {
+                        let val = self.eval_static_tolerant(&var.node.value, local_scope);
+                        match val {
+                            Value::Object(spread_fields) => {
+                                fields.extend(spread_fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            }
+                            Value::Tagged { fields: spread_fields, .. } => {
+                                fields.extend(spread_fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        let val = self.eval_static_tolerant(&var.node.value, local_scope);
+                        fields.insert(Arc::from(name), val);
+                    }
                 }
                 Value::Object(Arc::new(fields))
             }
             Expression::TaggedObject { tag, object } => {
                 let mut fields = BTreeMap::new();
                 for var in &object.variables {
-                    let name = var.node.name.as_str().to_string();
-                    let val = self.eval_static_tolerant(&var.node.value, local_scope);
-                    fields.insert(Arc::from(name.as_str()), val);
+                    let name = var.node.name.as_str();
+                    if name.is_empty() {
+                        let val = self.eval_static_tolerant(&var.node.value, local_scope);
+                        match val {
+                            Value::Object(spread_fields) => {
+                                fields.extend(spread_fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            }
+                            Value::Tagged { fields: spread_fields, .. } => {
+                                fields.extend(spread_fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        let val = self.eval_static_tolerant(&var.node.value, local_scope);
+                        fields.insert(Arc::from(name), val);
+                    }
                 }
                 Value::Tagged {
                     tag: Arc::from(tag.as_str()),
@@ -1660,6 +1749,10 @@ impl Compiler {
                 Some(bindings)
             }
             Pattern::WildCard => Some(IndexMap::new()),
+            Pattern::ValueComparison { .. } => {
+                // ValueComparison not yet supported in DD engine — no match
+                None
+            }
             _ => {
                 // Unsupported pattern — no match
                 None

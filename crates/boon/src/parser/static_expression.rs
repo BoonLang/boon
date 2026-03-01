@@ -110,6 +110,11 @@ pub enum Expression {
     FieldAccess {
         path: Vec<StrSlice>,
     },
+    // Postfix field access: expr.field - extracts a field from the result of an expression
+    PostfixFieldAccess {
+        expr: Box<Spanned<Self>>,
+        field: StrSlice,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +256,10 @@ pub enum Pattern {
     },
     Alias {
         name: StrSlice,
+    },
+    ValueComparison {
+        path: Vec<StrSlice>,
+        referenced_span: Option<SimpleSpan>,
     },
     WildCard,
 }
@@ -415,12 +424,22 @@ impl ExpressionConverter {
             parser::Expression::FieldAccess { path } => Expression::FieldAccess {
                 path: path.iter().map(|s| self.str_to_slice(s)).collect(),
             },
+            // Postfix field access: expr.field
+            parser::Expression::PostfixFieldAccess { expr, field } => Expression::PostfixFieldAccess {
+                expr: Box::new(self.convert_spanned(expr)),
+                field: self.str_to_slice(field),
+            },
         }
     }
 
     fn convert_variable(&self, var: &parser::Variable) -> Variable {
         Variable {
-            name: self.str_to_slice(var.name),
+            // Spread entries use empty name marker (not from source code)
+            name: if var.name.is_empty() {
+                super::source::spread_str_slice()
+            } else {
+                self.str_to_slice(var.name)
+            },
             is_referenced: var.is_referenced,
             value: self.convert_spanned(&var.value),
             value_changed: var.value_changed,
@@ -532,6 +551,10 @@ impl ExpressionConverter {
             },
             parser::Pattern::Alias { name } => Pattern::Alias {
                 name: self.str_to_slice(name),
+            },
+            parser::Pattern::ValueComparison { path, referenced_span } => Pattern::ValueComparison {
+                path: path.iter().map(|s| self.str_to_slice(s)).collect(),
+                referenced_span: *referenced_span,
             },
             parser::Pattern::WildCard => Pattern::WildCard,
         }

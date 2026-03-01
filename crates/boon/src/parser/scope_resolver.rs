@@ -127,6 +127,10 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                     node: variable,
                     persistence: _,
                 } = variable;
+                // Spread entries (empty name) don't register as referenceables
+                if variable.name.is_empty() {
+                    continue;
+                }
                 let name = &variable.name;
                 reachable_referenceables
                     .entry(name)
@@ -147,7 +151,7 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                     &mut variable.value,
                     reachable_referenceables.clone(),
                     level,
-                    Some(variable.name),
+                    if variable.name.is_empty() { None } else { Some(variable.name) },
                     errors,
                     all_referenced,
                 );
@@ -158,6 +162,10 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                     node: variable,
                     persistence: _,
                 } = variable;
+                // Spread entries can't be referenced by name
+                if variable.name.is_empty() {
+                    continue;
+                }
                 let name = &variable.name;
                 if all_referenced.contains(&Referenceable {
                     name,
@@ -176,6 +184,9 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                     node: variable,
                     persistence: _,
                 } = variable;
+                if variable.name.is_empty() {
+                    continue;
+                }
                 let name = &variable.name;
                 reachable_referenceables
                     .entry(name)
@@ -196,7 +207,7 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                     &mut variable.value,
                     reachable_referenceables.clone(),
                     level,
-                    Some(variable.name),
+                    if variable.name.is_empty() { None } else { Some(variable.name) },
                     errors,
                     all_referenced,
                 );
@@ -207,6 +218,9 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                     node: variable,
                     persistence: _,
                 } = variable;
+                if variable.name.is_empty() {
+                    continue;
+                }
                 let name = &variable.name;
                 if all_referenced.contains(&Referenceable {
                     name,
@@ -368,6 +382,16 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
         }
         Expression::When { arms } => {
             for arm in arms {
+                // Resolve references in patterns (e.g., ValueComparison paths)
+                resolve_pattern_references(
+                    &mut arm.pattern,
+                    *span,
+                    &reachable_referenceables,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
+
                 // Collect pattern bindings to add to scope for the body
                 let body_level = level + 1;
                 let bindings = collect_pattern_bindings(&arm.pattern, *span, body_level);
@@ -391,6 +415,16 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
         }
         Expression::While { arms } => {
             for arm in arms {
+                // Resolve references in patterns (e.g., ValueComparison paths)
+                resolve_pattern_references(
+                    &mut arm.pattern,
+                    *span,
+                    &reachable_referenceables,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
+
                 // Collect pattern bindings to add to scope for the body
                 let body_level = level + 1;
                 let bindings = collect_pattern_bindings(&arm.pattern, *span, body_level);
@@ -699,6 +733,17 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
         }
         // FieldAccess has no sub-expressions to recurse into
         Expression::FieldAccess { .. } => {}
+        // PostfixFieldAccess: recurse into the inner expression
+        Expression::PostfixFieldAccess { expr, .. } => {
+            set_is_referenced_and_alias_referenceables(
+                expr,
+                reachable_referenceables,
+                level,
+                parent_name,
+                errors,
+                all_referenced,
+            );
+        }
     }
 }
 
@@ -751,7 +796,7 @@ fn set_referenced_referenceable<'code>(
 
 /// Resolve references in patterns (for WHEN/WHILE arms)
 fn resolve_pattern_references<'code>(
-    pattern: &Pattern<'code>,
+    pattern: &mut Pattern<'code>,
     span: Span,
     reachable_referenceables: &ReachableReferenceables<'code>,
     parent_name: Option<&str>,
@@ -783,7 +828,7 @@ fn resolve_pattern_references<'code>(
             // because Pattern::Alias can also be used for pattern matching literals
         }
         Pattern::List { items } => {
-            for item in items {
+            for item in items.iter_mut() {
                 resolve_pattern_references(
                     item,
                     span,
@@ -795,8 +840,8 @@ fn resolve_pattern_references<'code>(
             }
         }
         Pattern::Object { variables } => {
-            for var in variables {
-                if let Some(ref value) = var.value {
+            for var in variables.iter_mut() {
+                if let Some(ref mut value) = var.value {
                     resolve_pattern_references(
                         value,
                         span,
@@ -809,8 +854,8 @@ fn resolve_pattern_references<'code>(
             }
         }
         Pattern::TaggedObject { variables, .. } => {
-            for var in variables {
-                if let Some(ref value) = var.value {
+            for var in variables.iter_mut() {
+                if let Some(ref mut value) = var.value {
                     resolve_pattern_references(
                         value,
                         span,
@@ -823,16 +868,16 @@ fn resolve_pattern_references<'code>(
             }
         }
         Pattern::Map { entries } => {
-            for entry in entries {
+            for entry in entries.iter_mut() {
                 resolve_pattern_references(
-                    &entry.key,
+                    &mut entry.key,
                     span,
                     reachable_referenceables,
                     parent_name,
                     errors,
                     all_referenced,
                 );
-                if let Some(ref value) = entry.value {
+                if let Some(ref mut value) = entry.value {
                     resolve_pattern_references(
                         value,
                         span,
@@ -842,6 +887,38 @@ fn resolve_pattern_references<'code>(
                         all_referenced,
                     );
                 }
+            }
+        }
+        Pattern::ValueComparison { path, referenced_span } => {
+            // Resolve the base variable of the path (like TEXT interpolation)
+            let base_var = path[0];
+            let reachable: BTreeMap<&str, Referenceable> =
+                reachable_referenceables
+                    .iter()
+                    .filter_map(|(name, referenceables)| {
+                        referenceables.iter().rev().enumerate().find_map(
+                            |(index, referenceable)| {
+                                if index == 0 && Some(referenceable.name) == parent_name {
+                                    None
+                                } else {
+                                    Some((referenceable.name, *referenceable))
+                                }
+                            },
+                        )
+                    })
+                    .collect();
+            if let Some(referenced) = reachable.get(base_var).copied() {
+                *referenced_span = Some(referenced.span);
+                all_referenced.insert(referenced);
+            } else {
+                let reachable_names: Vec<_> = reachable.keys().collect();
+                errors.push(ResolveError::custom(
+                    span,
+                    format!(
+                        "Cannot find variable '{}' for value comparison pattern. Available: {:?}",
+                        base_var, reachable_names
+                    ),
+                ));
             }
         }
         Pattern::Literal(_) | Pattern::WildCard => {
@@ -911,8 +988,8 @@ fn collect_pattern_bindings<'code>(
                 }
             }
         }
-        Pattern::Literal(_) | Pattern::WildCard => {
-            // Literals and wildcards don't create bindings
+        Pattern::ValueComparison { .. } | Pattern::Literal(_) | Pattern::WildCard => {
+            // Value comparisons, literals and wildcards don't create bindings
         }
     }
     bindings
