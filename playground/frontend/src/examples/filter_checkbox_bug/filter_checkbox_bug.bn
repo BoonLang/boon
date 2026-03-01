@@ -6,42 +6,38 @@
 -- KEY DIFFERENCE: Uses LIST with List/map like todo_mvc
 
 store: [
-    filter_buttons: [
-        all: LINK
-        active: LINK
-    ]
+    filter_buttons: [all: LINK, active: LINK]
     toggle_all_checkbox: LINK
+
     selected_filter: All |> HOLD state {
         LATEST {
             filter_buttons.all.event.press |> THEN { All }
             filter_buttons.active.event.press |> THEN { Active }
         }
     }
+
     -- Toggle all like in todo_mvc (for testing if LATEST is the issue)
     toggle_all_target: toggle_all_checkbox.event.click |> THEN { True }
+
     -- LIST of items like in todo_mvc - use PASS for stream context
     items: LIST {
         create_item(name: TEXT { Item A }, PASS: [toggle_all: toggle_all_target])
         create_item(name: TEXT { Item B }, PASS: [toggle_all: toggle_all_target])
     }
+
     -- List/retain causes the bug when switching WHILE arms
     all_items: items
     active_items: items |> List/retain(item, if: item.checked |> Bool/not())
 ]
 
--- Pattern from todo_mvc: HOLD with LATEST, one arm for checkbox, one for toggle_all
--- toggle_all stream passed via PASSED context
 FUNCTION create_item(name) {
     [
         name: name
-        elements: [
-            checkbox: LINK
-        ]
+        elements: [checkbox: LINK]
+
         checked: False |> HOLD state {
             LATEST {
-                elements.checkbox.event.click |> THEN {
-                    state |> Bool/not()
-                }
+                elements.checkbox.event.click |> THEN { state |> Bool/not() }
                 PASSED.toggle_all
             }
         }
@@ -55,19 +51,26 @@ FUNCTION render_item(item, view_label) {
         direction: Row
         gap: 10
         style: []
+
         items: LIST {
             Element/checkbox(
                 element: [event: [click: LINK]]
                 style: []
                 label: Hidden[text: TEXT { toggle }]
                 settings: [checked: item.checked]
+
                 icon: item.checked |> WHEN {
                     True => Element/label(element: [], style: [], label: TEXT { [X] })
                     False => Element/label(element: [], style: [], label: TEXT { [ ] })
                 }
-            ) |> LINK { item.elements.checkbox }
+            )
+            |> LINK { item.elements.checkbox }
 
-            Element/label(element: [], style: [], label: TEXT { {item.name} ({view_label}) - checked: {item.checked} })
+            Element/label(
+                element: []
+                style: []
+                label: TEXT { {item.name} ({view_label}) - checked: {item.checked} }
+            )
         }
     )
 }
@@ -77,26 +80,46 @@ document: Document/new(root: Element/stripe(
     direction: Column
     gap: 20
     style: [padding: 20]
+
     items: LIST {
-        Element/label(element: [], style: [], label: TEXT { Filter: {store.selected_filter} })
+        Element/label(
+            element: []
+            style: []
+            label: TEXT { Filter: {store.selected_filter} }
+        )
 
         Element/stripe(
             element: []
             direction: Row
             gap: 10
             style: []
+
             items: LIST {
                 Element/button(
                     element: [event: [press: LINK]]
-                    style: [padding: 10, background: [color: Oklch[lightness: 0.3]], font: [color: White]]
+
+                    style: [
+                        padding: 10
+                        background: [color: Oklch[lightness: 0.3]]
+                        font: [color: White]
+                    ]
+
                     label: TEXT { All }
-                ) |> LINK { store.filter_buttons.all }
+                )
+                |> LINK { store.filter_buttons.all }
 
                 Element/button(
                     element: [event: [press: LINK]]
-                    style: [padding: 10, background: [color: Oklch[lightness: 0.3]], font: [color: White]]
+
+                    style: [
+                        padding: 10
+                        background: [color: Oklch[lightness: 0.3]]
+                        font: [color: White]
+                    ]
+
                     label: TEXT { Active }
-                ) |> LINK { store.filter_buttons.active }
+                )
+                |> LINK { store.filter_buttons.active }
             }
         )
 
@@ -107,7 +130,13 @@ document: Document/new(root: Element/stripe(
                 direction: Column
                 gap: 10
                 style: []
-                items: store.all_items |> List/map(item, new: render_item(item: item, view_label: TEXT { ALL }))
+
+                items:
+                    store.all_items
+                    |> List/map(
+                        item
+                        new: render_item(item: item, view_label: TEXT { ALL })
+                    )
             )
 
             Active => Element/stripe(
@@ -115,10 +144,20 @@ document: Document/new(root: Element/stripe(
                 direction: Column
                 gap: 10
                 style: []
-                items: store.active_items |> List/map(item, new: render_item(item: item, view_label: TEXT { ACTIVE }))
+
+                items:
+                    store.active_items
+                    |> List/map(
+                        item
+                        new: render_item(item: item, view_label: TEXT { ACTIVE })
+                    )
             )
         }
 
-        Element/label(element: [], style: [], label: TEXT { Test: Click Active, All, then checkbox 3x })
+        Element/label(
+            element: []
+            style: []
+            label: TEXT { Test: Click Active, All, then checkbox 3x }
+        )
     }
 ))

@@ -1,14 +1,11 @@
 value: LATEST {
-    send_1_button.event.press |> THEN { 1 } 
-    send_2_button.event.press |> THEN { 2 } 
+    send_1_button.event.press |> THEN { 1 }
+    send_2_button.event.press |> THEN { 2 }
     3
     4
-} 
+}
 
 sum: value |> Math/sum()
-
-------------------------------------------------
-
 send_1_button: send_button(label: TEXT { Send 1 })
 send_2_button: send_button(label: TEXT { Send 2 })
 
@@ -16,6 +13,7 @@ document: Document/new(root: Element/stripe(
     element: []
     direction: Column
     style: []
+
     items: LIST {
         send_1_button
         send_2_button
@@ -25,18 +23,9 @@ document: Document/new(root: Element/stripe(
 ))
 
 FUNCTION send_button(label) {
-    Element/button(
-        element: [event: [press: LINK]]
-        style: []
-        label: label
-    )
+    Element/button(element: [event: [press: LINK]], style: [], label: label)
 }
 
 FUNCTION value_container(value) {
-    Element/container(
-        element: []
-        style: [align: [row: Center]]
-        child: value
-    )
+    Element/container(element: [], style: [align: [row: Center]], child: value)
 }
-

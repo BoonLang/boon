@@ -3,18 +3,28 @@
 
 store: [
     input: LINK
+
     text_to_add: input.event.key_down.key |> WHEN {
         Enter => BLOCK {
             trimmed: input.text |> Text/trim()
-            trimmed |> Text/is_not_empty() |> WHEN {
+
+            trimmed
+            |> Text/is_not_empty()
+            |> WHEN {
                 True => trimmed
                 False => SKIP
             }
         }
+
         __ => SKIP
     }
 
-    items: LIST { TEXT { Apple }, TEXT { Banana }, TEXT { Cherry } }
+    items:
+        LIST {
+            TEXT { Apple }
+            TEXT { Banana }
+            TEXT { Cherry }
+        }
         |> List/append(item: text_to_add)
 ]
 
@@ -23,6 +33,7 @@ document: Document/new(root: Element/stripe(
     direction: Column
     gap: 10
     style: [padding: 20]
+
     items: LIST {
         Element/label(
             element: []
@@ -34,10 +45,17 @@ document: Document/new(root: Element/stripe(
             element: [event: [key_down: LINK, change: LINK]]
             style: [width: 300]
             label: Hidden[text: TEXT { Item name }]
-            text: LATEST { Text/empty(), element.event.change.text, store.text_to_add |> THEN { Text/empty() } }
+
+            text: LATEST {
+                Text/empty()
+                element.event.change.text
+                store.text_to_add |> THEN { Text/empty() }
+            }
+
             placeholder: [text: TEXT { Type and press Enter }]
             focus: True
-        ) |> LINK { store.input }
+        )
+        |> LINK { store.input }
 
         Element/label(
             element: []
@@ -50,13 +68,13 @@ document: Document/new(root: Element/stripe(
             direction: Column
             gap: 5
             style: []
-            items: store.items |> List/map(item, new:
-                Element/label(
-                    element: []
-                    style: []
-                    label: TEXT { - {item} }
+
+            items:
+                store.items
+                |> List/map(
+                    item
+                    new: Element/label(element: [], style: [], label: TEXT { - {item} })
                 )
-            )
         )
     }
 ))

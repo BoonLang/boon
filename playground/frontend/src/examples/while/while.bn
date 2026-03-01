@@ -8,16 +8,11 @@ operation: LATEST {
     subtraction_button.event.press |> THEN { Subtraction }
 }
 
----------------------------------------------------
-
 input_a: sum_of_steps(step: 1, seconds: 0.5)
 input_b: sum_of_steps(step: 10, seconds: 1)
 
 FUNCTION sum_of_steps(step, seconds) {
-    Duration[seconds: seconds]
-    |> Timer/interval() 
-    |> THEN { step } 
-    |> Math/sum()
+    Duration[seconds: seconds] |> Timer/interval() |> THEN { step } |> Math/sum()
 }
 
 subtraction_button: TEXT { A - B } |> operation_button()
@@ -27,11 +22,13 @@ document: Document/new(root: Element/stripe(
     element: []
     direction: Column
     style: []
+
     items: LIST {
         input_a |> input_row(name: TEXT { A })
         input_b |> input_row(name: TEXT { B })
         addition_button
         subtraction_button
+
         Element/container(
             element: []
             style: [align: [row: Center]]
@@ -49,10 +46,5 @@ FUNCTION input_row(input, name) {
 }
 
 FUNCTION operation_button(label) {
-    Element/button(
-        element: [event: [press: LINK]]
-        style: []
-        label: label
-    )
+    Element/button(element: [event: [press: LINK]], style: [], label: label)
 }
-

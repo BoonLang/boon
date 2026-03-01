@@ -3,6 +3,7 @@ document: Document/new(root: Element/stripe(
     direction: Column
     gap: 0
     style: []
+
     items: LIST {
         counter
         increment_button

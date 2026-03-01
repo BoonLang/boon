@@ -12,10 +12,9 @@ FUNCTION make_item(name) {
     [
         checkbox_link: LINK
         name: name
+
         checked: False |> HOLD state {
-            checkbox_link.event.click |> THEN {
-                state |> Bool/not()
-            }
+            checkbox_link.event.click |> THEN { state |> Bool/not() }
         }
     ]
 }
@@ -25,35 +24,42 @@ document: Document/new(root: Element/stripe(
     direction: Column
     gap: 10
     style: [padding: 20]
-    items: store.items |> List/map(item, new: Element/stripe(
-        element: []
-        direction: Row
-        gap: 10
-        style: []
-        items: LIST {
-            Element/checkbox(
-                element: [event: [click: LINK]]
-                style: []
-                label: Hidden[text: item.name]
-                checked: item.checked
-                icon: item.checked |> WHEN {
-                    True => TEXT { [X] }
-                    False => TEXT { [ ] }
-                }
-            ) |> LINK { item.checkbox_link }
-            Element/label(
-                element: []
-                style: []
-                label: item.name
-            )
-            Element/label(
-                element: []
-                style: []
-                label: item.checked |> WHEN {
-                    True => TEXT { (checked) }
-                    False => TEXT { (unchecked) }
-                }
-            )
-        }
-    ))
+
+    items: store.items |> List/map(
+        item
+
+        new: Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: []
+
+            items: LIST {
+                Element/checkbox(
+                    element: [event: [click: LINK]]
+                    style: []
+                    label: Hidden[text: item.name]
+                    checked: item.checked
+
+                    icon: item.checked |> WHEN {
+                        True => TEXT { [X] }
+                        False => TEXT { [ ] }
+                    }
+                )
+                |> LINK { item.checkbox_link }
+
+                Element/label(element: [], style: [], label: item.name)
+
+                Element/label(
+                    element: []
+                    style: []
+
+                    label: item.checked |> WHEN {
+                        True => TEXT { (checked) }
+                        False => TEXT { (unchecked) }
+                    }
+                )
+            }
+        )
+    )
 ))

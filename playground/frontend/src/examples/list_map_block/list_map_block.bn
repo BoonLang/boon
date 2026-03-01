@@ -1,7 +1,14 @@
 -- Test: Does WHEN inside BLOCK inside List/map emit?
 store: [
-    mode: All  -- All, Even, Odd
-    items: LIST { 1, 2, 3, 4, 5 }
+    mode: All
+
+    items: LIST {
+        1
+        2
+        3
+        4
+        5
+    }
 ]
 
 document: Document/new(root: Element/stripe(
@@ -9,12 +16,9 @@ document: Document/new(root: Element/stripe(
     direction: Column
     gap: 10
     style: [padding: 20]
+
     items: LIST {
-        Element/label(
-            element: []
-            style: []
-            label: TEXT { Mode: {store.mode} }
-        )
+        Element/label(element: [], style: [], label: TEXT { Mode: {store.mode} })
 
         -- Test 1: Direct WHEN (should work)
         Element/stripe(
@@ -22,13 +26,12 @@ document: Document/new(root: Element/stripe(
             direction: Row
             gap: 5
             style: []
-            items: store.items |> List/map(item, new:
-                store.mode |> WHEN {
-                    All => Element/label(
-                        element: []
-                        style: []
-                        label: item
-                    )
+
+            items: store.items |> List/map(
+                item
+
+                new: store.mode |> WHEN {
+                    All => Element/label(element: [], style: [], label: item)
                     __ => NoElement
                 }
             )
@@ -40,21 +43,27 @@ document: Document/new(root: Element/stripe(
             direction: Row
             gap: 5
             style: []
-            items: store.items |> List/map(item, new: BLOCK {
-                should_show: store.mode |> WHEN {
-                    All => True
-                    Even => item == 2 |> Bool/or(that: item == 4)
-                    Odd => item == 1 |> Bool/or(that: item == 3) |> Bool/or(that: item == 5)
+
+            items: store.items |> List/map(
+                item
+
+                new: BLOCK {
+                    should_show: store.mode |> WHEN {
+                        All => True
+                        Even => item == 2 |> Bool/or(that: item == 4)
+
+                        Odd => 
+                            item == 1
+                            |> Bool/or(that: item == 3)
+                            |> Bool/or(that: item == 5)
+                    }
+
+                    should_show |> WHILE {
+                        True => Element/label(element: [], style: [], label: item)
+                        False => NoElement
+                    }
                 }
-                should_show |> WHILE {
-                    True => Element/label(
-                        element: []
-                        style: []
-                        label: item
-                    )
-                    False => NoElement
-                }
-            })
+            )
         )
     }
 ))

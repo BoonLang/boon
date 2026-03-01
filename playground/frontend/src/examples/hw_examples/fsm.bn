@@ -24,11 +24,17 @@ FUNCTION fsm(rst, a) {
             PASSED.clk |> THEN {
                 rst |> WHILE {
                     True => B
+
                     False => state |> WHEN {
-                        A => C                              -- A -> C
-                        B => D                              -- B -> D
-                        C => a |> WHILE { True => D, False => B }  -- C -> D or B
-                        D => A                              -- D -> A
+                        A => C
+                        B => D
+
+                        C => a |> WHILE {
+                            True => D
+                            False => B
+                        }
+
+                        D => A
                     }
                 }
             }
@@ -38,7 +44,7 @@ FUNCTION fsm(rst, a) {
         b: state |> WHEN {
             A => False
             B => True
-            C => a  -- Output depends on input in state C
+            C => a
             D => False
         }
 

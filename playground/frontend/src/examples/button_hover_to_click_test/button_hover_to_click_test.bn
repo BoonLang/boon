@@ -12,6 +12,7 @@ FUNCTION make_button(name) {
     [
         elements: [button: LINK]
         name: name
+
         clicked: False |> HOLD state {
             elements.button.event.press |> THEN { state |> Bool/not() }
         }
@@ -23,6 +24,7 @@ document: Document/new(root: Element/stripe(
     direction: Column
     gap: 20
     style: [padding: 20]
+
     items: LIST {
         Element/label(
             element: []
@@ -35,67 +37,107 @@ document: Document/new(root: Element/stripe(
             direction: Row
             gap: 10
             style: []
+
             items: LIST {
                 Element/button(
                     element: [event: [press: LINK]]
+
                     style: [
                         padding: [row: 20, column: 10]
                         rounded_corners: 5
-                        background: [color: store.btn_a.clicked |> WHILE {
-                            True => Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
-                            False => Oklch[lightness: 0.25]
-                        }]
+
+                        background: [
+                            color: store.btn_a.clicked |> WHILE {
+                                True => Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
+                                False => Oklch[lightness: 0.25]
+                            }
+                        ]
+
                         font: [color: White]
+
                         outline: store.btn_a.clicked |> WHILE {
-                            True => [thickness: 2, color: Oklch[lightness: 0.6, chroma: 0.25, hue: 25]]
+                            True => [
+                                thickness: 2
+                                color: Oklch[lightness: 0.6, chroma: 0.25, hue: 25]
+                            ]
+
                             False => NoOutline
                         }
                     ]
+
                     label: TEXT { Button {store.btn_a.name} }
-                ) |> LINK { store.btn_a.elements.button }
+                )
+                |> LINK { store.btn_a.elements.button }
 
                 Element/button(
                     element: [event: [press: LINK]]
+
                     style: [
                         padding: [row: 20, column: 10]
                         rounded_corners: 5
-                        background: [color: store.btn_b.clicked |> WHILE {
-                            True => Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
-                            False => Oklch[lightness: 0.25]
-                        }]
+
+                        background: [
+                            color: store.btn_b.clicked |> WHILE {
+                                True => Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
+                                False => Oklch[lightness: 0.25]
+                            }
+                        ]
+
                         font: [color: White]
+
                         outline: store.btn_b.clicked |> WHILE {
-                            True => [thickness: 2, color: Oklch[lightness: 0.6, chroma: 0.25, hue: 25]]
+                            True => [
+                                thickness: 2
+                                color: Oklch[lightness: 0.6, chroma: 0.25, hue: 25]
+                            ]
+
                             False => NoOutline
                         }
                     ]
+
                     label: TEXT { Button {store.btn_b.name} }
-                ) |> LINK { store.btn_b.elements.button }
+                )
+                |> LINK { store.btn_b.elements.button }
 
                 Element/button(
                     element: [event: [press: LINK]]
+
                     style: [
                         padding: [row: 20, column: 10]
                         rounded_corners: 5
-                        background: [color: store.btn_c.clicked |> WHILE {
-                            True => Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
-                            False => Oklch[lightness: 0.25]
-                        }]
+
+                        background: [
+                            color: store.btn_c.clicked |> WHILE {
+                                True => Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
+                                False => Oklch[lightness: 0.25]
+                            }
+                        ]
+
                         font: [color: White]
+
                         outline: store.btn_c.clicked |> WHILE {
-                            True => [thickness: 2, color: Oklch[lightness: 0.6, chroma: 0.25, hue: 25]]
+                            True => [
+                                thickness: 2
+                                color: Oklch[lightness: 0.6, chroma: 0.25, hue: 25]
+                            ]
+
                             False => NoOutline
                         }
                     ]
+
                     label: TEXT { Button {store.btn_c.name} }
-                ) |> LINK { store.btn_c.elements.button }
+                )
+                |> LINK { store.btn_c.elements.button }
             }
         )
 
         Element/label(
             element: []
             style: []
-            label: TEXT { States - A: {store.btn_a.clicked}, B: {store.btn_b.clicked}, C: {store.btn_c.clicked} }
+
+            label: TEXT {
+                States - A: {store.btn_a.clicked}, B: {store.btn_b.clicked}, C: {store.btn_c.clicked}
+            }
         )
     }
 ))

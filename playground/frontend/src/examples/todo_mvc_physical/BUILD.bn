@@ -6,26 +6,34 @@
 icons_directory: TEXT { ./assets/icons }
 output_file: TEXT { ./Generated/Assets.bn }
 
-svg_files: Directory/entries(icons_directory)
+svg_files:
+    Directory/entries(icons_directory)
     |> List/retain(item, if: item.extension == TEXT { svg })
     |> List/sort_by(item, key: item.path)
 
-generation_result: svg_files
-    |> List/map(old, new:
-        old |> icon_code() |> WHEN {
-            Ok[text] => text
-            error => FLUSH { error }
-        }
+generation_result:
+    svg_files
+    |> List/map(
+        old
+
+        new:
+            old
+            |> icon_code()
+            |> WHEN {
+                Ok[text] => text
+                error => FLUSH { error }
+            }
     )
     |> Text/join_lines()
-    |> WHEN { code => TEXT {
-        -- Generated from {icons_directory}
+    |> WHEN {
+        code => TEXT {
+            -- Generated from {icons_directory}
 
         icon: [
             {code}
         ]
-
-    } }
+        }
+    }
     |> File/write_text(path: output_file)
 
 generation_error_handling: generation_result |> WHEN {
@@ -34,31 +42,32 @@ generation_error_handling: generation_result |> WHEN {
         logged: TEXT { Included {count} icons } |> Log/info()
         Build/succeed()
     }
+
     error => BLOCK {
         error_message: error |> WHEN {
             ReadError[message] => TEXT { Cannot read icon: {message} }
             EncodeError[message] => TEXT { Cannot encode icon: {message} }
             WriteError[message] => TEXT { Cannot write {output_file}: {message} }
         }
+
         logged: error_message |> Log/error()
         Build/fail()
     }
 }
 
-
 FUNCTION icon_code(item) {
     item.path
-        |> File/read_text()
-        |> WHEN {
-            Ok[text] => text
-            error => FLUSH { error }
-        }
-        |> Url/encode()
-        |> WHEN {
-            Ok[encoded] => encoded
-            error => FLUSH { error }
-        }
-        |> WHEN { encoded =>
-            Ok[text: TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }]
-        }
+    |> File/read_text()
+    |> WHEN {
+        Ok[text] => text
+        error => FLUSH { error }
+    }
+    |> Url/encode()
+    |> WHEN {
+        Ok[encoded] => encoded
+        error => FLUSH { error }
+    }
+    |> WHEN {
+        encoded => Ok[text: TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }]
+    }
 }

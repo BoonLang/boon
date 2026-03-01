@@ -11,10 +11,6 @@ FUNCTION sr_latch(s, r) {
 
         q: r |> Bool/not() |> Bool/and(that: nq |> Bool/not())
         nq: s |> Bool/not() |> Bool/and(that: q |> Bool/not())
-
-        [
-            q: q
-            nq: nq
-        ]
+        [q: q, nq: nq]
     }
 }

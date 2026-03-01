@@ -1,17 +1,10 @@
-current_sum: 
-    addition_button.event.press
-    |> THEN { input_a + input_b}
-
--------------------------------------
-
+current_sum: addition_button.event.press |> THEN { input_a + input_b }
 input_a: sum_of_steps(step: 1, seconds: 0.5)
 input_b: sum_of_steps(step: 10, seconds: 1)
 
 FUNCTION sum_of_steps(step, seconds) {
     0 |> HOLD sum {
-        Duration[seconds: seconds]
-        |> Timer/interval()
-        |> THEN { sum + step }
+        Duration[seconds: seconds] |> Timer/interval() |> THEN { sum + step }
     }
 }
 
@@ -25,15 +18,12 @@ document: Document/new(root: Element/stripe(
     element: []
     direction: Column
     style: []
+
     items: LIST {
         input_a |> input_row(name: TEXT { A })
         input_b |> input_row(name: TEXT { B })
         addition_button
-        Element/container(
-            element: []
-            style: [align: [row: Center]]
-            child: current_sum
-        )
+        Element/container(element: [], style: [align: [row: Center]], child: current_sum)
     }
 ))
 

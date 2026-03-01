@@ -3,9 +3,11 @@
 
 store: [
     filter_button: LINK
+
     show_filtered: False |> HOLD state {
         filter_button.event.press |> THEN { state |> Bool/not() }
     }
+
     -- Use specific items instead of modulo
     items: LIST {
         [name: TEXT { Apple }, show_when_filtered: True]
@@ -20,6 +22,7 @@ document: Document/new(root: Element/stripe(
     direction: Column
     gap: 10
     style: [padding: 20]
+
     items: LIST {
         Element/label(
             element: []
@@ -31,12 +34,16 @@ document: Document/new(root: Element/stripe(
             element: [event: [press: LINK]]
             style: [padding: 10]
             label: TEXT { Toggle filter }
-        ) |> LINK { store.filter_button }
+        )
+        |> LINK { store.filter_button }
 
         Element/label(
             element: []
             style: []
-            label: TEXT { Expected: When True, show Apple and Cherry. When False, show all. }
+
+            label: TEXT {
+                Expected: When True, show Apple and Cherry. When False, show all.
+            }
         )
 
         Element/stripe(
@@ -44,13 +51,17 @@ document: Document/new(root: Element/stripe(
             direction: Row
             gap: 10
             style: []
+
             -- BUG: This should update when show_filtered changes, but currently doesn't
-            items: store.items |> List/map(item, new:
-                store.show_filtered |> WHILE {
+            items: store.items |> List/map(
+                item
+
+                new: store.show_filtered |> WHILE {
                     True => item.show_when_filtered |> WHILE {
                         True => Element/label(element: [], style: [], label: item.name)
                         False => NoElement
                     }
+
                     False => Element/label(element: [], style: [], label: item.name)
                 }
             )

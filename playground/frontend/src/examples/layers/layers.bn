@@ -1,10 +1,7 @@
 document: Document/new(root: Element/stack(
     element: []
-    style: [
-        width: 300
-        height: 250
-        background: [color: Oklch[lightness: 0.15]]
-    ]
+    style: [width: 300, height: 250, background: [color: Oklch[lightness: 0.15]]]
+
     layers: LIST {
         card(label: TEXT { Red Card }, hue: 25, x: 20, y: 20)
         card(label: TEXT { Green Card }, hue: 150, x: 60, y: 60)
@@ -15,19 +12,17 @@ document: Document/new(root: Element/stack(
 FUNCTION card(label, hue, x, y) {
     Element/container(
         element: []
+
         style: [
             width: 180
             height: 120
             padding: 12
             font: [color: White]
-            background: [color: Oklch[
-                lightness: 0.55
-                chroma: 0.2
-                hue: hue
-            ]]
+            background: [color: Oklch[lightness: 0.55, chroma: 0.2, hue: hue]]
             rounded_corners: 8
             transform: [move_right: x, move_down: y]
         ]
+
         child: label
     )
 }

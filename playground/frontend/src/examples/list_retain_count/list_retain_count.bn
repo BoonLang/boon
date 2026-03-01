@@ -1,11 +1,16 @@
 -- Test: Does List/retain |> List/count update when items are added?
 store: [
     input: LINK
+
     text_to_add: store.input.event.key_down.key |> WHEN {
         Enter => store.input.text
         __ => SKIP
     }
-    items: LIST { TEXT { Initial } }
+
+    items:
+        LIST {
+            TEXT { Initial }
+        }
         |> List/append(item: text_to_add)
 ]
 
@@ -17,15 +22,22 @@ FUNCTION root_element() {
         direction: Column
         gap: 10
         style: [padding: 20]
+
         items: LIST {
             Element/text_input(
                 element: [event: [key_down: LINK, change: LINK]]
                 style: []
                 label: Hidden[text: TEXT { Add item }]
-                text: LATEST { Text/empty(), element.event.change.text }
+
+                text: LATEST {
+                    Text/empty()
+                    element.event.change.text
+                }
+
                 placeholder: [text: TEXT { Type and press Enter }]
                 focus: True
-            ) |> LINK { PASSED.store.input }
+            )
+            |> LINK { PASSED.store.input }
 
             all_count_label()
             retain_count_label()
@@ -36,13 +48,13 @@ FUNCTION root_element() {
                 direction: Column
                 gap: 5
                 style: []
-                items: PASSED.store.items |> List/map(item, new:
-                    Element/label(
-                        element: []
-                        style: []
-                        label: item
+
+                items:
+                    PASSED.store.items
+                    |> List/map(
+                        item
+                        new: Element/label(element: [], style: [], label: item)
                     )
-                )
             )
         }
     )
@@ -52,6 +64,7 @@ FUNCTION all_count_label() {
     Element/label(
         element: []
         style: []
+
         label: BLOCK {
             count: PASSED.store.items |> List/count()
             TEXT { All count: {count} }
@@ -63,10 +76,9 @@ FUNCTION retain_count_label() {
     Element/label(
         element: []
         style: []
+
         label: BLOCK {
-            count: PASSED.store.items
-                |> List/retain(item, if: True)
-                |> List/count()
+            count: PASSED.store.items |> List/retain(item, if: True) |> List/count()
             TEXT { Retain count: {count} }
         }
     )

@@ -23,28 +23,38 @@
 -- state without preserving which items were already marked as removed.
 
 store: [
-    elements: [
-        add_button: LINK
-        clear_completed_button: LINK
-    ]
+    elements: [add_button: LINK, clear_completed_button: LINK]
+
     next_id: 2 |> HOLD state {
         elements.add_button.event.press |> THEN { state + 1 }
     }
-    item_to_add: elements.add_button.event.press |> THEN {
-        create_item(id: next_id, name: TEXT { New Item })
-    }
+
+    item_to_add:
+        elements.add_button.event.press
+        |> THEN { create_item(id: next_id, name: TEXT { New Item }) }
+
     -- Chained List/remove operations (this is where the bug manifests)
-    items: LIST {
-        create_item(id: 0, name: TEXT { Item A })
-        create_item(id: 1, name: TEXT { Item B })
-    }
+    items:
+        LIST {
+            create_item(id: 0, name: TEXT { Item A })
+            create_item(id: 1, name: TEXT { Item B })
+        }
         |> List/append(item: item_to_add)
-        -- First List/remove: individual X button clicks
         |> List/remove(item, on: item.elements.remove_button.event.press)
-        -- Second List/remove: clear completed button
-        |> List/remove(item, on: elements.clear_completed_button.event.press |> THEN {
-            item.completed |> WHEN { True => [], False => SKIP }
-        })
+        |> List/remove(
+            -- First List/remove: individual X button clicks
+
+            -- Second List/remove: clear completed button
+            item
+
+            on: elements.clear_completed_button.event.press |> THEN {
+                item.completed |> WHEN {
+                    True => []
+                    False => SKIP
+                }
+            }
+        )
+
     active_items: items |> List/retain(item, if: item.completed |> Bool/not())
     completed_items: items |> List/retain(item, if: item.completed)
 ]
@@ -53,14 +63,10 @@ FUNCTION create_item(id, name) {
     [
         id: id
         name: name
-        elements: [
-            checkbox: LINK
-            remove_button: LINK
-        ]
+        elements: [checkbox: LINK, remove_button: LINK]
+
         completed: False |> HOLD state {
-            elements.checkbox.event.click |> THEN {
-                state |> Bool/not()
-            }
+            elements.checkbox.event.click |> THEN { state |> Bool/not() }
         }
     ]
 }
@@ -71,30 +77,40 @@ FUNCTION render_item(item) {
         direction: Row
         gap: 10
         style: [padding: [row: 10, column: 5]]
+
         items: LIST {
             Element/checkbox(
                 element: [event: [click: LINK]]
                 style: []
                 label: Hidden[text: TEXT { toggle }]
                 settings: [checked: item.completed]
+
                 icon: item.completed |> WHEN {
                     True => Element/label(element: [], style: [], label: TEXT { [X] })
                     False => Element/label(element: [], style: [], label: TEXT { [ ] })
                 }
-            ) |> LINK { item.elements.checkbox }
+            )
+            |> LINK { item.elements.checkbox }
+
             Element/label(
                 element: []
-                style: [
-                    font: [line: [strikethrough: item.completed]]
-                ]
+                style: [font: [line: [strikethrough: item.completed]]]
                 label: TEXT { {item.name} (id={item.id}) }
             )
+
             element.hovered |> WHILE {
-                True => Element/button(
-                    element: [event: [press: LINK]]
-                    style: [font: [color: Oklch[lightness: 0.5, chroma: 0.15, hue: 25]]]
-                    label: TEXT { X }
-                ) |> LINK { item.elements.remove_button }
+                True => 
+                    Element/button(
+                        element: [event: [press: LINK]]
+
+                        style: [
+                            font: [color: Oklch[lightness: 0.5, chroma: 0.15, hue: 25]]
+                        ]
+
+                        label: TEXT { X }
+                    )
+                    |> LINK { item.elements.remove_button }
+
                 False => NoElement
             }
         }
@@ -106,28 +122,56 @@ document: Document/new(root: Element/stripe(
     direction: Column
     gap: 20
     style: [padding: 20]
+
     items: LIST {
-        Element/label(element: [], style: [font: [size: 18, weight: Bold]], label: TEXT { Chained List/remove Bug Test })
+        Element/label(
+            element: []
+            style: [font: [size: 18, weight: Bold]]
+            label: TEXT { Chained List/remove Bug Test }
+        )
 
         Element/stripe(
             element: []
             direction: Row
             gap: 10
             style: []
+
             items: LIST {
                 Element/button(
                     element: [event: [press: LINK]]
-                    style: [padding: 10, background: [color: Oklch[lightness: 0.3]], font: [color: White]]
-                    label: TEXT { Add Item }
-                ) |> LINK { store.elements.add_button }
 
-                store.completed_items |> List/is_empty() |> WHILE {
+                    style: [
+                        padding: 10
+                        background: [color: Oklch[lightness: 0.3]]
+                        font: [color: White]
+                    ]
+
+                    label: TEXT { Add Item }
+                )
+                |> LINK { store.elements.add_button }
+
+                store.completed_items
+                |> List/is_empty()
+                |> WHILE {
                     True => NoElement
-                    False => Element/button(
-                        element: [event: [press: LINK]]
-                        style: [padding: 10, background: [color: Oklch[lightness: 0.35, chroma: 0.1, hue: 25]], font: [color: White]]
-                        label: TEXT { Clear completed }
-                    ) |> LINK { store.elements.clear_completed_button }
+
+                    False => 
+                        Element/button(
+                            element: [event: [press: LINK]]
+
+                            style: [
+                                padding: 10
+
+                                background: [
+                                    color: Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
+                                ]
+
+                                font: [color: White]
+                            ]
+
+                            label: TEXT { Clear completed }
+                        )
+                        |> LINK { store.elements.clear_completed_button }
                 }
             }
         )
@@ -140,21 +184,65 @@ document: Document/new(root: Element/stripe(
             items: store.items |> List/map(item, new: render_item(item: item))
         )
 
-        Element/label(element: [], style: [font: [color: Oklch[lightness: 0.5]]], label: TEXT { Active: {store.active_items |> List/count()}, Completed: {store.completed_items |> List/count()} })
+        Element/label(
+            element: []
+            style: [font: [color: Oklch[lightness: 0.5]]]
+
+            label: TEXT {
+                Active: {store.active_items |> List/count()}, Completed: {store.completed_items |> List/count()}
+            }
+        )
 
         Element/stripe(
             element: []
             direction: Column
             gap: 5
             style: [font: [size: 12, color: Oklch[lightness: 0.6]]]
+
             items: LIST {
-                Element/label(element: [], style: [font: [weight: Bold]], label: TEXT { Test 1 (pre-created): })
-                Element/label(element: [], style: [], label: TEXT { 1. Check Item A, 2. Clear completed, 3. Add Item, 4. X remove new item })
-                Element/label(element: [], style: [], label: TEXT { Pass: Only Item B remains })
-                Element/label(element: [], style: [], label: TEXT { })
-                Element/label(element: [], style: [font: [weight: Bold]], label: TEXT { Test 2 (dynamic): })
-                Element/label(element: [], style: [], label: TEXT { 1. Add Item, 2. Check new item, 3. Clear, 4. Add Item, 5. X remove })
-                Element/label(element: [], style: [], label: TEXT { Pass: Only Item A and Item B remain })
+                Element/label(
+                    element: []
+                    style: [font: [weight: Bold]]
+                    label: TEXT { Test 1 (pre-created): }
+                )
+
+                Element/label(
+                    element: []
+                    style: []
+
+                    label: TEXT {
+                        1. Check Item A, 2. Clear completed, 3. Add Item, 4. X remove new item
+                    }
+                )
+
+                Element/label(
+                    element: []
+                    style: []
+                    label: TEXT { Pass: Only Item B remains }
+                )
+
+                Element/label(element: [], style: [], label: TEXT {  })
+
+                Element/label(
+                    element: []
+                    style: [font: [weight: Bold]]
+                    label: TEXT { Test 2 (dynamic): }
+                )
+
+                Element/label(
+                    element: []
+                    style: []
+
+                    label: TEXT {
+                        1. Add Item, 2. Check new item, 3. Clear, 4. Add Item, 5. X remove
+                    }
+                )
+
+                Element/label(
+                    element: []
+                    style: []
+                    label: TEXT { Pass: Only Item A and Item B remain }
+                )
             }
         )
     }

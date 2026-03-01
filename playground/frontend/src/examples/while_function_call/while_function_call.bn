@@ -7,6 +7,7 @@ FUNCTION greeting(name) {
 
 store: [
     toggle: LINK
+
     show_greeting: False |> HOLD state {
         toggle.event.press |> THEN { state |> Bool/not() }
     }
@@ -17,15 +18,22 @@ document: Document/new(root: Element/stripe(
     direction: Column
     gap: 10
     style: [padding: 20]
+
     items: LIST {
         Element/button(
             element: [event: [press: LINK]]
             style: [padding: 10]
             label: TEXT { Toggle (show: {store.show_greeting}) }
-        ) |> LINK { store.toggle }
+        )
+        |> LINK { store.toggle }
 
         store.show_greeting |> WHILE {
-            True => Element/label(element: [], style: [], label: greeting(name: TEXT { World }))
+            True => Element/label(
+                element: []
+                style: []
+                label: greeting(name: TEXT { World })
+            )
+
             False => Element/label(element: [], style: [], label: TEXT { Hidden })
         }
     }

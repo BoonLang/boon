@@ -1,14 +1,46 @@
-FUNCTION material(of) { get(from: Material, of: of) }
-FUNCTION font(of) { get(from: Font, of: of) }
-FUNCTION text(of) { get(from: Text, of: of) }
-FUNCTION depth(of) { get(from: Depth, of: of) }
-FUNCTION elevation(of) { get(from: Elevation, of: of) }
-FUNCTION corners(of) { get(from: Corners, of: of) }
-FUNCTION lights() { get(from: Lights, of: []) }
-FUNCTION geometry() { get(from: Geometry, of: []) }
-FUNCTION sizing(of) { get(from: Sizing, of: of) }
-FUNCTION spacing(of) { get(from: Spacing, of: of) }
-FUNCTION spring_range(of) { get(from: SpringRange, of: of) }
+FUNCTION material(of) {
+    get(from: Material, of: of)
+}
+
+FUNCTION font(of) {
+    get(from: Font, of: of)
+}
+
+FUNCTION text(of) {
+    get(from: Text, of: of)
+}
+
+FUNCTION depth(of) {
+    get(from: Depth, of: of)
+}
+
+FUNCTION elevation(of) {
+    get(from: Elevation, of: of)
+}
+
+FUNCTION corners(of) {
+    get(from: Corners, of: of)
+}
+
+FUNCTION lights() {
+    get(from: Lights, of: [])
+}
+
+FUNCTION geometry() {
+    get(from: Geometry, of: [])
+}
+
+FUNCTION sizing(of) {
+    get(from: Sizing, of: of)
+}
+
+FUNCTION spacing(of) {
+    get(from: Spacing, of: of)
+}
+
+FUNCTION spring_range(of) {
+    get(from: SpringRange, of: of)
+}
 
 FUNCTION get(from, of) {
     PASSED.theme_options.name |> WHEN {

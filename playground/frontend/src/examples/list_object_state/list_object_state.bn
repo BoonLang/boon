@@ -2,6 +2,7 @@
 FUNCTION make_counter() {
     [
         button: LINK
+
         count: 0 |> HOLD state {
             button.event.press |> THEN { state + 1 }
         }
@@ -9,7 +10,11 @@ FUNCTION make_counter() {
 }
 
 store: [
-    counters: LIST { make_counter(), make_counter(), make_counter() }
+    counters: LIST {
+        make_counter()
+        make_counter()
+        make_counter()
+    }
 ]
 
 document: Document/new(root: Element/stripe(
@@ -17,6 +22,7 @@ document: Document/new(root: Element/stripe(
     direction: Column
     gap: 10
     style: [padding: 20]
+
     items: LIST {
         Element/label(
             element: []
@@ -29,18 +35,24 @@ document: Document/new(root: Element/stripe(
             direction: Row
             gap: 20
             style: []
-            items: store.counters |> List/map(counter, new:
-                Element/stripe(
+
+            items: store.counters |> List/map(
+                counter
+
+                new: Element/stripe(
                     element: []
                     direction: Column
                     gap: 5
                     style: []
+
                     items: LIST {
                         Element/button(
                             element: [event: [press: LINK]]
                             style: [padding: 10]
                             label: TEXT { Click me }
-                        ) |> LINK { counter.button }
+                        )
+                        |> LINK { counter.button }
+
                         Element/label(
                             element: []
                             style: []

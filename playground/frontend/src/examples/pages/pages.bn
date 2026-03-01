@@ -3,12 +3,15 @@
 
 store: [
     nav: [home: LINK, about: LINK, contact: LINK]
+
     -- Navigate when buttons are pressed (must be inside store to keep actor alive)
-    nav_action: LATEST {
-        nav.home.event.press |> THEN { TEXT { / } }
-        nav.about.event.press |> THEN { TEXT { /about } }
-        nav.contact.event.press |> THEN { TEXT { /contact } }
-    } |> Router/go_to()
+    nav_action:
+        LATEST {
+            nav.home.event.press |> THEN { TEXT { / } }
+            nav.about.event.press |> THEN { TEXT { /about } }
+            nav.contact.event.press |> THEN { TEXT { /contact } }
+        }
+        |> Router/go_to()
 ]
 
 current_route: Router/route()
@@ -25,6 +28,7 @@ document: Document/new(root: Element/stripe(
     direction: Column
     gap: 0
     style: [width: Fill, height: Fill]
+
     items: LIST {
         -- Navigation bar
         Element/stripe(
@@ -32,21 +36,53 @@ document: Document/new(root: Element/stripe(
             direction: Row
             gap: 8
             style: [width: Fill, padding: 16, background: [color: Oklch[lightness: 0.15]]]
+
             items: LIST {
-                nav_button(label: TEXT { Home }, route: TEXT { / }) |> LINK { store.nav.home }
-                nav_button(label: TEXT { About }, route: TEXT { /about }) |> LINK { store.nav.about }
-                nav_button(label: TEXT { Contact }, route: TEXT { /contact }) |> LINK { store.nav.contact }
+                nav_button(label: TEXT { Home }, route: TEXT { / })
+                |> LINK { store.nav.home }
+
+                nav_button(label: TEXT { About }, route: TEXT { /about })
+                |> LINK { store.nav.about }
+
+                nav_button(label: TEXT { Contact }, route: TEXT { /contact })
+                |> LINK { store.nav.contact }
             }
         )
+
         -- Page content
         Element/container(
             element: []
             style: [width: Fill, height: Fill, padding: 24]
+
             child: current_page |> WHILE {
-                Home => page(title: TEXT { Welcome Home }, description: TEXT { This is the home page. Use the navigation above to explore. })
-                About => page(title: TEXT { About }, description: TEXT { A multi-page Boon app demonstrating Router/route and Router/go_to. })
-                Contact => page(title: TEXT { Contact }, description: TEXT { Get in touch! URL-driven state and navigation demo. })
-                NotFound => page(title: TEXT { 404 - Not Found }, description: TEXT { The page you're looking for doesn't exist. })
+                Home => page(
+                    title: TEXT { Welcome Home }
+
+                    description: TEXT {
+                        This is the home page. Use the navigation above to explore.
+                    }
+                )
+
+                About => page(
+                    title: TEXT { About }
+
+                    description: TEXT {
+                        A multi-page Boon app demonstrating Router/route and Router/go_to.
+                    }
+                )
+
+                Contact => page(
+                    title: TEXT { Contact }
+
+                    description: TEXT {
+                        Get in touch! URL-driven state and navigation demo.
+                    }
+                )
+
+                NotFound => page(
+                    title: TEXT { 404 - Not Found }
+                    description: TEXT { The page you're looking for doesn't exist. }
+                )
             }
         )
     }
@@ -55,17 +91,35 @@ document: Document/new(root: Element/stripe(
 FUNCTION nav_button(label, route) {
     BLOCK {
         is_active: current_route == route
+
         Element/button(
             element: [event: [press: LINK]]
+
             style: [
                 padding: [row: 16, column: 8]
-                background: [color: is_active |> WHEN { True => Oklch[lightness: 0.3], False => Oklch[lightness: 0.2] }]
+
+                background: [
+                    color: is_active |> WHEN {
+                        True => Oklch[lightness: 0.3]
+                        False => Oklch[lightness: 0.2]
+                    }
+                ]
+
                 rounded_corners: 4
+
                 font: [
-                    color: is_active |> WHEN { True => White, False => Oklch[lightness: 0.7] }
-                    weight: is_active |> WHEN { True => Bold, False => Regular }
+                    color: is_active |> WHEN {
+                        True => White
+                        False => Oklch[lightness: 0.7]
+                    }
+
+                    weight: is_active |> WHEN {
+                        True => Bold
+                        False => Regular
+                    }
                 ]
             ]
+
             label: label
         )
     }
@@ -77,9 +131,19 @@ FUNCTION page(title, description) {
         direction: Column
         gap: 16
         style: []
+
         items: LIST {
-            Element/label(element: [], style: [font: [size: 32, weight: Bold]], label: title)
-            Element/label(element: [], style: [font: [color: Oklch[lightness: 0.7]]], label: description)
+            Element/label(
+                element: []
+                style: [font: [size: 32, weight: Bold]]
+                label: title
+            )
+
+            Element/label(
+                element: []
+                style: [font: [color: Oklch[lightness: 0.7]]]
+                label: description
+            )
         }
     )
 }
