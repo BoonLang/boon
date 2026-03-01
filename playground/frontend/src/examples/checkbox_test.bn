@@ -25,41 +25,32 @@ document: Document/new(root: Element/stripe(
     gap: 10
     style: [padding: 20]
 
-    items: store.items |> List/map(
-        item
+    items: store.items |> List/map(item, new: Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: []
 
-        new: Element/stripe(
-            element: []
-            direction: Row
-            gap: 10
-            style: []
+        items: LIST {
+            Element/checkbox(
+                element: [event: [click: LINK]]
+                style: []
+                label: Hidden[text: item.name]
+                checked: item.checked
 
-            items: LIST {
-                Element/checkbox(
-                    element: [event: [click: LINK]]
-                    style: []
-                    label: Hidden[text: item.name]
-                    checked: item.checked
+                icon: item.checked |> WHEN {
+                    True => TEXT { [X] }
+                    False => TEXT { [ ] }
+                }
+            )
+            |> LINK { item.checkbox_link }
 
-                    icon: item.checked |> WHEN {
-                        True => TEXT { [X] }
-                        False => TEXT { [ ] }
-                    }
-                )
-                |> LINK { item.checkbox_link }
+            Element/label(element: [], style: [], label: item.name)
 
-                Element/label(element: [], style: [], label: item.name)
-
-                Element/label(
-                    element: []
-                    style: []
-
-                    label: item.checked |> WHEN {
-                        True => TEXT { (checked) }
-                        False => TEXT { (unchecked) }
-                    }
-                )
-            }
-        )
-    )
+            Element/label(element: [], style: [], label: item.checked |> WHEN {
+                True => TEXT { (checked) }
+                False => TEXT { (unchecked) }
+            })
+        }
+    ))
 ))

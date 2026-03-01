@@ -41,19 +41,16 @@ store: [
         }
         |> List/append(item: item_to_add)
         |> List/remove(item, on: item.elements.remove_button.event.press)
-        |> List/remove(
+        |> List/remove(item, on: elements.clear_completed_button.event.press |> THEN {
             -- First List/remove: individual X button clicks
 
             -- Second List/remove: clear completed button
-            item
 
-            on: elements.clear_completed_button.event.press |> THEN {
-                item.completed |> WHEN {
-                    True => []
-                    False => SKIP
-                }
+            item.completed |> WHEN {
+                True => []
+                False => SKIP
             }
-        )
+        })
 
     active_items: items |> List/retain(item, if: item.completed |> Bool/not())
     completed_items: items |> List/retain(item, if: item.completed)
@@ -130,51 +127,44 @@ document: Document/new(root: Element/stripe(
             label: TEXT { Chained List/remove Bug Test }
         )
 
-        Element/stripe(
-            element: []
-            direction: Row
-            gap: 10
-            style: []
+        Element/stripe(element: [], direction: Row, gap: 10, style: [], items: LIST {
+            Element/button(
+                element: [event: [press: LINK]]
 
-            items: LIST {
-                Element/button(
-                    element: [event: [press: LINK]]
+                style: [
+                    padding: 10
+                    background: [color: Oklch[lightness: 0.3]]
+                    font: [color: White]
+                ]
 
-                    style: [
-                        padding: 10
-                        background: [color: Oklch[lightness: 0.3]]
-                        font: [color: White]
-                    ]
+                label: TEXT { Add Item }
+            )
+            |> LINK { store.elements.add_button }
 
-                    label: TEXT { Add Item }
-                )
-                |> LINK { store.elements.add_button }
+            store.completed_items
+            |> List/is_empty()
+            |> WHILE {
+                True => NoElement
 
-                store.completed_items
-                |> List/is_empty()
-                |> WHILE {
-                    True => NoElement
+                False => 
+                    Element/button(
+                        element: [event: [press: LINK]]
 
-                    False => 
-                        Element/button(
-                            element: [event: [press: LINK]]
+                        style: [
+                            padding: 10
 
-                            style: [
-                                padding: 10
-
-                                background: [
-                                    color: Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
-                                ]
-
-                                font: [color: White]
+                            background: [
+                                color: Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
                             ]
 
-                            label: TEXT { Clear completed }
-                        )
-                        |> LINK { store.elements.clear_completed_button }
-                }
+                            font: [color: White]
+                        ]
+
+                        label: TEXT { Clear completed }
+                    )
+                    |> LINK { store.elements.clear_completed_button }
             }
-        )
+        })
 
         Element/stripe(
             element: []
@@ -184,14 +174,9 @@ document: Document/new(root: Element/stripe(
             items: store.items |> List/map(item, new: render_item(item: item))
         )
 
-        Element/label(
-            element: []
-            style: [font: [color: Oklch[lightness: 0.5]]]
-
-            label: TEXT {
-                Active: {store.active_items |> List/count()}, Completed: {store.completed_items |> List/count()}
-            }
-        )
+        Element/label(element: [], style: [font: [color: Oklch[lightness: 0.5]]], label: TEXT {
+            Active: {store.active_items |> List/count()}, Completed: {store.completed_items |> List/count()}
+        })
 
         Element/stripe(
             element: []

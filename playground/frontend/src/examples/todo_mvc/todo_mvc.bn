@@ -43,16 +43,12 @@ store: [
         }
         |> List/append(item: title_to_add |> new_todo())
         |> List/remove(item, on: item.todo_elements.remove_todo_button.event.press)
-        |> List/remove(
-            item
-
-            on: elements.remove_completed_button.event.press |> THEN {
-                item.completed |> WHEN {
-                    True => []
-                    False => SKIP
-                }
+        |> List/remove(item, on: elements.remove_completed_button.event.press |> THEN {
+            item.completed |> WHEN {
+                True => []
+                False => SKIP
             }
-        )
+        })
 
     new_todo_focused: True |> HOLD state {
         LATEST {
@@ -392,15 +388,11 @@ FUNCTION todos_element() {
 
         items:
             PASSED.store.todos
-            |> List/retain(
-                item
-
-                if: PASSED.store.selected_filter |> WHILE {
-                    All => True
-                    Active => item.completed |> Bool/not()
-                    Completed => item.completed
-                }
-            )
+            |> List/retain(item, if: PASSED.store.selected_filter |> WHILE {
+                All => True
+                Active => item.completed |> Bool/not()
+                Completed => item.completed
+            })
             |> List/map(item, new: todo_item(todo: item))
     )
 }
@@ -535,17 +527,13 @@ FUNCTION panel_footer() {
             footer_section(align: Start, child: active_items_count_text())
             footer_section(align: Center, child: filters_element())
 
-            footer_section(
-                align: End
+            footer_section(align: End, child: PASSED.store.completed_todos_count > 0 |> WHILE {
+                True => 
+                    remove_completed_button()
+                    |> LINK { PASSED.store.elements.remove_completed_button }
 
-                child: PASSED.store.completed_todos_count > 0 |> WHILE {
-                    True => 
-                        remove_completed_button()
-                        |> LINK { PASSED.store.elements.remove_completed_button }
-
-                    False => NoElement
-                }
-            )
+                False => NoElement
+            })
         }
     )
 }
@@ -577,23 +565,15 @@ FUNCTION active_items_count_text() {
 }
 
 FUNCTION filters_element() {
-    Element/stripe(
-        element: []
-        direction: Row
-        gap: 10
-        style: []
+    Element/stripe(element: [], direction: Row, gap: 10, style: [], items: LIST {
+        filter_button(filter: All) |> LINK { PASSED.store.elements.filter_buttons.all }
 
-        items: LIST {
-            filter_button(filter: All)
-            |> LINK { PASSED.store.elements.filter_buttons.all }
+        filter_button(filter: Active)
+        |> LINK { PASSED.store.elements.filter_buttons.active }
 
-            filter_button(filter: Active)
-            |> LINK { PASSED.store.elements.filter_buttons.active }
-
-            filter_button(filter: Completed)
-            |> LINK { PASSED.store.elements.filter_buttons.completed }
-        }
-    )
+        filter_button(filter: Completed)
+        |> LINK { PASSED.store.elements.filter_buttons.completed }
+    })
 }
 
 FUNCTION filter_button(filter) {
@@ -653,40 +633,21 @@ FUNCTION footer() {
         ]
 
         items: LIST {
-            Element/paragraph(
-                element: []
-                style: []
+            Element/paragraph(element: [], style: [], contents: LIST {
+                TEXT { Double-click to edit a todo }
+            })
 
-                contents: LIST {
-                    TEXT { Double-click to edit a todo }
-                }
-            )
+            Element/paragraph(element: [], style: [], contents: LIST {
+                TEXT { Created by }
+                Text/space()
+                footer_link(label: TEXT { Martin Kavík }, to: TEXT { https://kavik.cz/ })
+            })
 
-            Element/paragraph(
-                element: []
-                style: []
-
-                contents: LIST {
-                    TEXT { Created by }
-                    Text/space()
-
-                    footer_link(
-                        label: TEXT { Martin Kavík }
-                        to: TEXT { https://kavik.cz/ }
-                    )
-                }
-            )
-
-            Element/paragraph(
-                element: []
-                style: []
-
-                contents: LIST {
-                    TEXT { Part of }
-                    Text/space()
-                    footer_link(label: TEXT { TodoMVC }, to: TEXT { http://todomvc.com })
-                }
-            )
+            Element/paragraph(element: [], style: [], contents: LIST {
+                TEXT { Part of }
+                Text/space()
+                footer_link(label: TEXT { TodoMVC }, to: TEXT { http://todomvc.com })
+            })
         }
     )
 }

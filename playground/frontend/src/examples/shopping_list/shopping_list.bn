@@ -68,48 +68,30 @@ FUNCTION item_input() {
 }
 
 FUNCTION items_list() {
-    Element/stripe(
-        element: []
-        direction: Column
-        gap: 4
-        style: []
+    Element/stripe(element: [], direction: Column, gap: 4, style: [], items: PASSED.store.items
+    |> List/map(
+        item
 
-        items: PASSED.store.items |> List/map(
-            item
-
-            new: Element/label(
-                element: []
-                style: [font: [color: White]]
-                label: TEXT { - {item} }
-            )
+        new: Element/label(
+            element: []
+            style: [font: [color: White]]
+            label: TEXT { - {item} }
         )
-    )
+    ))
 }
 
 FUNCTION footer() {
-    Element/stripe(
-        element: []
-        direction: Row
-        gap: 16
-        style: []
-
-        items: LIST {
-            item_count_label()
-            clear_button() |> LINK { PASSED.store.elements.clear_button }
-        }
-    )
+    Element/stripe(element: [], direction: Row, gap: 16, style: [], items: LIST {
+        item_count_label()
+        clear_button() |> LINK { PASSED.store.elements.clear_button }
+    })
 }
 
 FUNCTION item_count_label() {
-    Element/label(
-        element: []
-        style: [font: [color: Oklch[lightness: 0.5]]]
-
-        label: BLOCK {
-            count: PASSED.store.items |> List/count()
-            TEXT { {count} items }
-        }
-    )
+    Element/label(element: [], style: [font: [color: Oklch[lightness: 0.5]]], label: BLOCK {
+        count: PASSED.store.items |> List/count()
+        TEXT { {count} items }
+    })
 }
 
 FUNCTION clear_button() {

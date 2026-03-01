@@ -13,17 +13,12 @@ svg_files:
 
 generation_result:
     svg_files
-    |> List/map(
-        old
-
-        new:
-            old
-            |> icon_code()
-            |> WHEN {
-                Ok[text] => text
-                error => FLUSH { error }
-            }
-    )
+    |> List/map(old, new: old
+    |> icon_code()
+    |> WHEN {
+        Ok[text] => text
+        error => FLUSH { error }
+    })
     |> Text/join_lines()
     |> WHEN {
         code => TEXT {

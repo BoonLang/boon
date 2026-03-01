@@ -30,37 +30,27 @@ document: Document/new(root: Element/stripe(
             label: TEXT { Click each button - counts should be independent }
         )
 
-        Element/stripe(
+        Element/stripe(element: [], direction: Row, gap: 20, style: [], items: store.counters
+        |> List/map(counter, new: Element/stripe(
             element: []
-            direction: Row
-            gap: 20
+            direction: Column
+            gap: 5
             style: []
 
-            items: store.counters |> List/map(
-                counter
-
-                new: Element/stripe(
-                    element: []
-                    direction: Column
-                    gap: 5
-                    style: []
-
-                    items: LIST {
-                        Element/button(
-                            element: [event: [press: LINK]]
-                            style: [padding: 10]
-                            label: TEXT { Click me }
-                        )
-                        |> LINK { counter.button }
-
-                        Element/label(
-                            element: []
-                            style: []
-                            label: TEXT { Count: {counter.count} }
-                        )
-                    }
+            items: LIST {
+                Element/button(
+                    element: [event: [press: LINK]]
+                    style: [padding: 10]
+                    label: TEXT { Click me }
                 )
-            )
-        )
+                |> LINK { counter.button }
+
+                Element/label(
+                    element: []
+                    style: []
+                    label: TEXT { Count: {counter.count} }
+                )
+            }
+        )))
     }
 ))

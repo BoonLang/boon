@@ -16,14 +16,10 @@ store: [
     }
 
     -- Retain with reactive condition
-    filtered: numbers |> List/retain(
-        n
-
-        if: show_even |> WHEN {
-            True => n == 2 |> Bool/or(that: n == 4) |> Bool/or(that: n == 6)
-            False => True
-        }
-    )
+    filtered: numbers |> List/retain(n, if: show_even |> WHEN {
+        True => n == 2 |> Bool/or(that: n == 4) |> Bool/or(that: n == 6)
+        False => True
+    })
 
     -- Pre-compute count (TEXT interpolation doesn't support pipe expressions)
     filtered_count: filtered |> List/count()

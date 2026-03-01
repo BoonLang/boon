@@ -668,17 +668,44 @@ impl<'code> Formatter<'code> {
                 return;
             }
         }
-        // Single named argument with multiline value: keep arg name on opening line.
-        // e.g. `Document/new(root: Element/stripe(...))` instead of extra indent level
-        if arguments.len() == 1 {
-            let arg = &arguments[0].node;
-            if let Some(value) = &arg.value {
-                if self.estimate_inline(value).is_none() {
-                    let prefix_len = arg.name.len() + 2; // "name: "
-                    if self.current_line_width() + prefix_len <= MAX_LINE_WIDTH {
-                        self.write(arg.name);
-                        self.write(": ");
-                        self.format_expression(value);
+        // Last argument has multiline value, preceding args fit inline:
+        // keep everything up to the last arg's value on the opening line.
+        // e.g. `Document/new(root: Element/stripe(...))` or
+        //      `List/map(item, new: Element/label(...))` instead of extra indent
+        {
+            let last = &arguments.last().unwrap().node;
+            let last_has_multiline_value = last
+                .value
+                .as_ref()
+                .is_some_and(|v| self.estimate_inline(v).is_none());
+            if last_has_multiline_value {
+                // Build the inline prefix: all preceding args + last arg name + ": "
+                let mut prefix_parts = Vec::new();
+                let mut all_preceding_inline = true;
+                for arg in &arguments[..arguments.len() - 1] {
+                    let mut s = String::new();
+                    s.push_str(arg.node.name);
+                    if let Some(value) = &arg.node.value {
+                        s.push_str(": ");
+                        if let Some(inline) = self.estimate_inline(value) {
+                            s.push_str(&inline);
+                        } else {
+                            all_preceding_inline = false;
+                            break;
+                        }
+                    }
+                    prefix_parts.push(s);
+                }
+                if all_preceding_inline {
+                    let mut prefix = prefix_parts.join(", ");
+                    if !prefix.is_empty() {
+                        prefix.push_str(", ");
+                    }
+                    prefix.push_str(last.name);
+                    prefix.push_str(": ");
+                    if self.current_line_width() + prefix.len() <= MAX_LINE_WIDTH {
+                        self.write(&prefix);
+                        self.format_expression(last.value.as_ref().unwrap());
                         self.write(")");
                         return;
                     }

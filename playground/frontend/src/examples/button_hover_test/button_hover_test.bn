@@ -14,18 +14,11 @@ document: Document/new(root: Element/stripe(
             label: TEXT { Hover each button - only hovered one should show border }
         )
 
-        Element/stripe(
-            element: []
-            direction: Row
-            gap: 10
-            style: []
-
-            items: LIST {
-                simple_button(name: TEXT { A })
-                simple_button(name: TEXT { B })
-                simple_button(name: TEXT { C })
-            }
-        )
+        Element/stripe(element: [], direction: Row, gap: 10, style: [], items: LIST {
+            simple_button(name: TEXT { A })
+            simple_button(name: TEXT { B })
+            simple_button(name: TEXT { C })
+        })
     }
 ))
 

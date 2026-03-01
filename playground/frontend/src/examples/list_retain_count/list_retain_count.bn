@@ -17,69 +17,41 @@ store: [
 document: Document/new(root: root_element(PASS: [store: store]))
 
 FUNCTION root_element() {
-    Element/stripe(
-        element: []
-        direction: Column
-        gap: 10
-        style: [padding: 20]
+    Element/stripe(element: [], direction: Column, gap: 10, style: [padding: 20], items: LIST {
+        Element/text_input(
+            element: [event: [key_down: LINK, change: LINK]]
+            style: []
+            label: Hidden[text: TEXT { Add item }]
 
-        items: LIST {
-            Element/text_input(
-                element: [event: [key_down: LINK, change: LINK]]
-                style: []
-                label: Hidden[text: TEXT { Add item }]
+            text: LATEST {
+                Text/empty()
+                element.event.change.text
+            }
 
-                text: LATEST {
-                    Text/empty()
-                    element.event.change.text
-                }
+            placeholder: [text: TEXT { Type and press Enter }]
+            focus: True
+        )
+        |> LINK { PASSED.store.input }
 
-                placeholder: [text: TEXT { Type and press Enter }]
-                focus: True
-            )
-            |> LINK { PASSED.store.input }
+        all_count_label()
+        retain_count_label()
 
-            all_count_label()
-            retain_count_label()
-
-            -- Show items
-            Element/stripe(
-                element: []
-                direction: Column
-                gap: 5
-                style: []
-
-                items:
-                    PASSED.store.items
-                    |> List/map(
-                        item
-                        new: Element/label(element: [], style: [], label: item)
-                    )
-            )
-        }
-    )
+        -- Show items
+        Element/stripe(element: [], direction: Column, gap: 5, style: [], items: PASSED.store.items
+        |> List/map(item, new: Element/label(element: [], style: [], label: item)))
+    })
 }
 
 FUNCTION all_count_label() {
-    Element/label(
-        element: []
-        style: []
-
-        label: BLOCK {
-            count: PASSED.store.items |> List/count()
-            TEXT { All count: {count} }
-        }
-    )
+    Element/label(element: [], style: [], label: BLOCK {
+        count: PASSED.store.items |> List/count()
+        TEXT { All count: {count} }
+    })
 }
 
 FUNCTION retain_count_label() {
-    Element/label(
-        element: []
-        style: []
-
-        label: BLOCK {
-            count: PASSED.store.items |> List/retain(item, if: True) |> List/count()
-            TEXT { Retain count: {count} }
-        }
-    )
+    Element/label(element: [], style: [], label: BLOCK {
+        count: PASSED.store.items |> List/retain(item, if: True) |> List/count()
+        TEXT { Retain count: {count} }
+    })
 }

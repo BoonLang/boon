@@ -46,25 +46,16 @@ document: Document/new(root: Element/stripe(
             }
         )
 
-        Element/stripe(
-            element: []
-            direction: Row
-            gap: 10
-            style: []
-
+        Element/stripe(element: [], direction: Row, gap: 10, style: [], items: store.items
+        |> List/map(item, new: store.show_filtered |> WHILE {
             -- BUG: This should update when show_filtered changes, but currently doesn't
-            items: store.items |> List/map(
-                item
 
-                new: store.show_filtered |> WHILE {
-                    True => item.show_when_filtered |> WHILE {
-                        True => Element/label(element: [], style: [], label: item.name)
-                        False => NoElement
-                    }
+            True => item.show_when_filtered |> WHILE {
+                True => Element/label(element: [], style: [], label: item.name)
+                False => NoElement
+            }
 
-                    False => Element/label(element: [], style: [], label: item.name)
-                }
-            )
-        )
+            False => Element/label(element: [], style: [], label: item.name)
+        }))
     }
 ))

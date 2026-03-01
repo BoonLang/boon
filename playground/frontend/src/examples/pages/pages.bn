@@ -126,24 +126,13 @@ FUNCTION nav_button(label, route) {
 }
 
 FUNCTION page(title, description) {
-    Element/stripe(
-        element: []
-        direction: Column
-        gap: 16
-        style: []
+    Element/stripe(element: [], direction: Column, gap: 16, style: [], items: LIST {
+        Element/label(element: [], style: [font: [size: 32, weight: Bold]], label: title)
 
-        items: LIST {
-            Element/label(
-                element: []
-                style: [font: [size: 32, weight: Bold]]
-                label: title
-            )
-
-            Element/label(
-                element: []
-                style: [font: [color: Oklch[lightness: 0.7]]]
-                label: description
-            )
-        }
-    )
+        Element/label(
+            element: []
+            style: [font: [color: Oklch[lightness: 0.7]]]
+            label: description
+        )
+    })
 }
