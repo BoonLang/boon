@@ -5,6 +5,7 @@ members = [
     "backend",
     "shared",
 ]
+exclude = ["fonts"]
 
 [workspace.package]
 version = "0.1.0"

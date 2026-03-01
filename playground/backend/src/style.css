@@ -5,5 +5,5 @@ html {
 @font-face {
     font-family: 'JetBrains Mono';
     font-weight: 400;
-    src: url('/_api/public/fonts/JetBrainsMono-Regular.woff2') format(woff2)
+    src: url('/_api/public/fonts/JetBrainsMono-Patched.woff2') format(woff2)
 }

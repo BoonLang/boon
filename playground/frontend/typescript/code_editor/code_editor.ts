@@ -54,7 +54,7 @@ export class CodeEditorController {
     set_snippet_screenshot_mode(mode: boolean) {
         const base_content_style = {
             "font-family": "'JetBrains Mono', monospace",
-            fontFeatureSettings: "'zero' 1",
+            fontFeatureSettings: "'zero' 1, 'calt' 1",
             paddingRight: "12px",
         }
         const basic_editor_style = EditorView.theme({

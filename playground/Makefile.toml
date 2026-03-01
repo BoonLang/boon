@@ -84,6 +84,12 @@ else
 fi
 '''
 
+[tasks.patch-font]
+description = "Patch JetBrains Mono with infinite-length dash/equals ligatures"
+script = '''
+cd fonts && cargo run --release
+'''
+
 ######  HELPER TASKS  ######
 
 [tasks.install_wasm_target]

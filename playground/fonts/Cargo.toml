@@ -1,0 +1,9 @@
+[package]
+name = "boon-font-patcher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+read-fonts = "0.37"
+write-fonts = "0.45"
+woff2-patched = "0.4"
