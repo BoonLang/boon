@@ -404,7 +404,9 @@ When debugging with browser automation (`boon-tools exec`):
 
 5. **One browser instance**: Keep a single Chromium instance running. Don't kill it.
 
-6. **Auto-reload**:
+6. **NEVER delete or clear the Chrome profile** (`tools/.chrome-profile/`). Do NOT delete `Sessions/`, `Current Session`, `Current Tabs`, `Local Storage/leveldb/`, or any other profile data. Clearing profile data disables Chrome Developer Mode, which breaks the extension and requires manual re-enabling. If the RwLock is poisoned (from a WASM engine panic), the correct fix is to kill the browser and relaunch — localStorage is auto-cleared on engine switch by the app itself.
+
+7. **Auto-reload**:
    - mzoon auto-reloads WASM when Rust changes
    - WebSocket server `--watch` auto-reloads extension when JS changes
    - No manual restarts needed for most changes

@@ -1105,11 +1105,13 @@ async function handleCommand(id, command) {
                 }
               });
 
-              // Sort by vertical position (top to bottom) for consistent ordering
+              // Sort by vertical position (top to bottom), then horizontal (left to right) as tiebreaker
               allCheckboxes.sort((a, b) => {
                 const rectA = a.getBoundingClientRect();
                 const rectB = b.getBoundingClientRect();
-                return rectA.top - rectB.top;
+                const dy = rectA.top - rectB.top;
+                if (Math.abs(dy) > 2) return dy;  // 2px threshold for "same row"
+                return rectA.left - rectB.left;
               });
 
               const results = [];

@@ -5,9 +5,9 @@
     "cl"
   ],
   "store_prompts": null,
-  "supervisor_prompt": "Don't stop until todo_mvc example in wasm engine works and looks like the one run in actors engine and plan is complete and tools/scripts/test_todo_mvc_wasm.sh passed.",
+  "supervisor_prompt": "Don't stop until todo_mvc_physical example works in all 3 engines and fully works and is correctly styled. Make sure no compiler warning are there and all 3 engines are clean without hacks. Test the example ideally both manually and also with a script similar to one you were using for testing regular todo_mvc example.",
   "completion_condition": "+completed+",
-  "completion_command": "tools/scripts/test_todo_mvc_wasm.sh",
+  "completion_command": null,
   "protected_patterns": [
     "tools/**/*.rs",
     "crates/boon-cli/tests/*.bn.test",

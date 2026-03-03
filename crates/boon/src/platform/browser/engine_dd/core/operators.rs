@@ -18,7 +18,9 @@
 //! - `.distinct()` — deduplication
 //! - `.iterate()` — fixed-point loops
 
-use super::types::ListKey;
+use std::sync::Arc;
+
+use super::types::{LIST_TAG, ListKey};
 use super::value::Value;
 use differential_dataflow::VecCollection;
 use differential_dataflow::collection::AsCollection;
@@ -246,6 +248,153 @@ where
                 });
             }
         })
+        .as_collection()
+}
+
+/// List/latest: keyed list → scalar (most recently changed value).
+///
+/// Takes a keyed `(ListKey, Value)` collection and returns a scalar
+/// collection that always contains the most recently changed item's value.
+/// Similar to `hold_latest` but operates on keyed input.
+pub fn list_latest<G>(
+    list: &VecCollection<G, (ListKey, Value), isize>,
+) -> VecCollection<G, Value, isize>
+where
+    G: Scope<Timestamp = u64>,
+{
+    let mut current: Option<Value> = None;
+
+    list.inner
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
+            Pipeline,
+            "ListLatest",
+            |_cap, _info| {
+                move |input, output| {
+                    input.for_each(|time, data| {
+                        // Find the last positive insertion in batch
+                        if let Some(((_, value), ts, _)) =
+                            data.iter().rev().find(|(_, _, diff)| *diff > 0)
+                        {
+                            let new_val = value.clone();
+                            let mut session = output.session(&time);
+                            if let Some(old) = current.take() {
+                                session.give((old, *ts, -1isize));
+                            }
+                            session.give((new_val.clone(), *ts, 1isize));
+                            current = Some(new_val);
+                        }
+                    });
+                }
+            },
+        )
+        .as_collection()
+}
+
+/// List/every: keyed list → scalar bool (True if all items match predicate).
+///
+/// Maintains a `HashMap<ListKey, bool>` tracking per-item predicate results.
+/// Emits retract/insert only when the aggregate result changes.
+pub fn list_every<G>(
+    list: &VecCollection<G, (ListKey, Value), isize>,
+    predicate: impl Fn(&Value) -> bool + 'static,
+) -> VecCollection<G, Value, isize>
+where
+    G: Scope<Timestamp = u64>,
+{
+    let mut items: std::collections::HashMap<ListKey, bool> = std::collections::HashMap::new();
+    let mut current_result: Option<bool> = None;
+
+    list.inner
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
+            Pipeline,
+            "ListEvery",
+            |_cap, _info| {
+                move |input, output| {
+                    input.for_each(|time, data| {
+                        for ((key, value), _ts, diff) in data.drain(..) {
+                            if diff > 0 {
+                                items.insert(key, predicate(&value));
+                            } else {
+                                items.remove(&key);
+                            }
+                        }
+                        let new_result = !items.is_empty() && items.values().all(|&b| b);
+                        if current_result != Some(new_result) {
+                            let mut session = output.session(&time);
+                            if let Some(old) = current_result {
+                                let old_val = if old {
+                                    Value::tag("True")
+                                } else {
+                                    Value::tag("False")
+                                };
+                                session.give((old_val, *time.time(), -1isize));
+                            }
+                            let new_val = if new_result {
+                                Value::tag("True")
+                            } else {
+                                Value::tag("False")
+                            };
+                            session.give((new_val, *time.time(), 1isize));
+                            current_result = Some(new_result);
+                        }
+                    });
+                }
+            },
+        )
+        .as_collection()
+}
+
+/// List/any: keyed list → scalar bool (True if any item matches predicate).
+///
+/// Maintains a `HashMap<ListKey, bool>` tracking per-item predicate results.
+/// Emits retract/insert only when the aggregate result changes.
+pub fn list_any<G>(
+    list: &VecCollection<G, (ListKey, Value), isize>,
+    predicate: impl Fn(&Value) -> bool + 'static,
+) -> VecCollection<G, Value, isize>
+where
+    G: Scope<Timestamp = u64>,
+{
+    let mut items: std::collections::HashMap<ListKey, bool> = std::collections::HashMap::new();
+    let mut current_result: Option<bool> = None;
+
+    list.inner
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
+            Pipeline,
+            "ListAny",
+            |_cap, _info| {
+                move |input, output| {
+                    input.for_each(|time, data| {
+                        for ((key, value), _ts, diff) in data.drain(..) {
+                            if diff > 0 {
+                                items.insert(key, predicate(&value));
+                            } else {
+                                items.remove(&key);
+                            }
+                        }
+                        let new_result = items.values().any(|&b| b);
+                        if current_result != Some(new_result) {
+                            let mut session = output.session(&time);
+                            if let Some(old) = current_result {
+                                let old_val = if old {
+                                    Value::tag("True")
+                                } else {
+                                    Value::tag("False")
+                                };
+                                session.give((old_val, *time.time(), -1isize));
+                            }
+                            let new_val = if new_result {
+                                Value::tag("True")
+                            } else {
+                                Value::tag("False")
+                            };
+                            session.give((new_val, *time.time(), 1isize));
+                            current_result = Some(new_result);
+                        }
+                    });
+                }
+            },
+        )
         .as_collection()
 }
 
@@ -697,5 +846,60 @@ where
                 });
             }
         })
+        .as_collection()
+}
+
+/// Assemble keyed `(ListKey, Value)` pairs into a scalar `List` value.
+///
+/// Maintains an in-memory `BTreeMap` of all current items. On each change,
+/// emits retract-old/insert-new with the full assembled list.
+/// Used to provide the document template with a real list for aggregation
+/// operations (count, every, any, retain) that need per-item field access.
+pub fn list_assemble<G>(
+    list: &VecCollection<G, (ListKey, Value), isize>,
+) -> VecCollection<G, Value, isize>
+where
+    G: Scope<Timestamp = u64>,
+{
+    let mut items: std::collections::BTreeMap<Arc<str>, Value> = std::collections::BTreeMap::new();
+    let mut current_output: Option<Value> = None;
+
+    list.inner
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
+            Pipeline,
+            "ListAssemble",
+            |_cap, _info| {
+                move |input, output| {
+                    input.for_each(|time, data| {
+                        let mut changed = false;
+                        for ((key, value), _ts, diff) in data.drain(..) {
+                            if diff > 0 {
+                                items.insert(Arc::from(key.0.as_ref()), value);
+                                changed = true;
+                            } else {
+                                items.remove(key.0.as_ref());
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            let new_output = if items.is_empty() {
+                                Value::empty_list()
+                            } else {
+                                Value::Tagged {
+                                    tag: Arc::from(LIST_TAG),
+                                    fields: Arc::new(items.clone()),
+                                }
+                            };
+                            let mut session = output.session(&time);
+                            if let Some(old) = current_output.take() {
+                                session.give((old, *time.time(), -1isize));
+                            }
+                            session.give((new_output.clone(), *time.time(), 1isize));
+                            current_output = Some(new_output);
+                        }
+                    });
+                }
+            },
+        )
         .as_collection()
 }

@@ -4,6 +4,7 @@
 //! functions, and exposes a `fire_event` API for the bridge to call.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use js_sys::{Object, Reflect, Uint8Array, WebAssembly};
@@ -35,6 +36,9 @@ struct CellStoreInner {
     cells: Vec<Mutable<f64>>,
     /// Text values stored separately (not in WASM globals).
     text_cells: RefCell<Vec<String>>,
+    /// Tracks which cells have had text explicitly set (even to "").
+    /// Used to distinguish "no text" from "intentionally empty text".
+    text_initialized: RefCell<HashSet<u32>>,
 }
 
 impl CellStore {
@@ -44,8 +48,13 @@ impl CellStore {
         // cell that should have a visible initial value.
         let cells: Vec<Mutable<f64>> = (0..num_cells).map(|_| Mutable::new(f64::NAN)).collect();
         let text_cells = RefCell::new(vec![String::new(); num_cells]);
+        let text_initialized = RefCell::new(HashSet::new());
         Self {
-            inner: Rc::new(CellStoreInner { cells, text_cells }),
+            inner: Rc::new(CellStoreInner {
+                cells,
+                text_cells,
+                text_initialized,
+            }),
         }
     }
 
@@ -71,6 +80,7 @@ impl CellStore {
         if let Some(entry) = self.inner.text_cells.borrow_mut().get_mut(cell_id as usize) {
             *entry = text;
         }
+        self.inner.text_initialized.borrow_mut().insert(cell_id);
     }
 
     pub fn get_cell_text(&self, cell_id: u32) -> String {
@@ -80,6 +90,11 @@ impl CellStore {
             .get(cell_id as usize)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Check if text was explicitly set for this cell (even to "").
+    pub fn has_text(&self, cell_id: u32) -> bool {
+        self.inner.text_initialized.borrow().contains(&cell_id)
     }
 
     pub fn cell_count(&self) -> usize {
@@ -455,38 +470,88 @@ impl ListStore {
 /// Stores per-item reactive signals and text for template-scoped cells.
 /// Each item gets its own set of Mutable<f64> cells (for signal delivery to Zoon)
 /// and text cells (for variable-length strings).
+///
+/// Supports multiple non-contiguous template cell ranges (one per ListMap).
+/// Each range is a "segment" with its own start/count, mapped to a contiguous
+/// flat array per item via offsets.
 #[derive(Clone)]
 pub struct ItemCellStore {
     inner: Rc<ItemCellStoreInner>,
 }
 
+/// A contiguous range of template cells from one ListMap.
+struct Segment {
+    /// First cell ID in this segment.
+    start: u32,
+    /// Number of cells in this segment.
+    count: u32,
+    /// Offset in the flat per-item array.
+    offset: usize,
+}
+
 struct ItemCellStoreInner {
-    /// [item_idx][local_offset] = Mutable<f64> for signal delivery.
+    /// [item_idx][flat_offset] = Mutable<f64> for signal delivery.
     cells: RefCell<Vec<Vec<Mutable<f64>>>>,
-    /// [item_idx][local_offset] = String for text.
+    /// [item_idx][flat_offset] = String for text.
     text_cells: RefCell<Vec<Vec<String>>>,
-    /// Template cell range start (CellId).
-    template_cell_start: u32,
-    /// Number of template cells.
-    template_cell_count: u32,
+    /// Tracks which (item_idx, cell_id) pairs have had text explicitly set (even to "").
+    text_initialized: RefCell<HashSet<(u32, u32)>>,
+    /// Template cell segments (one per ListMap).
+    segments: Vec<Segment>,
+    /// Total number of slots per item (sum of all segment counts).
+    total_count: usize,
 }
 
 impl ItemCellStore {
-    pub fn new(template_cell_start: u32, template_cell_count: u32) -> Self {
+    /// Create a store covering multiple template cell ranges.
+    /// `ranges` is a list of (start, end) pairs — one per ListMap.
+    pub fn new(ranges: Vec<(u32, u32)>) -> Self {
+        let mut segments = Vec::new();
+        let mut offset = 0usize;
+        for (start, end) in &ranges {
+            let count = end - start;
+            segments.push(Segment {
+                start: *start,
+                count,
+                offset,
+            });
+            offset += count as usize;
+        }
         Self {
             inner: Rc::new(ItemCellStoreInner {
                 cells: RefCell::new(Vec::new()),
                 text_cells: RefCell::new(Vec::new()),
-                template_cell_start,
-                template_cell_count,
+                text_initialized: RefCell::new(HashSet::new()),
+                segments,
+                total_count: offset,
             }),
         }
+    }
+
+    /// Map a cell_id to its flat index in the per-item array.
+    fn local_index(&self, cell_id: u32) -> Option<usize> {
+        for seg in &self.inner.segments {
+            if cell_id >= seg.start && cell_id < seg.start + seg.count {
+                return Some(seg.offset + (cell_id - seg.start) as usize);
+            }
+        }
+        None
+    }
+
+    /// Map a flat local index back to its cell_id.
+    fn cell_id_for_local(&self, local: usize) -> Option<u32> {
+        for seg in &self.inner.segments {
+            if local >= seg.offset && local < seg.offset + seg.count as usize {
+                return Some(seg.start + (local - seg.offset) as u32);
+            }
+        }
+        None
     }
 
     /// Ensure storage exists for the given item index, growing if needed.
     pub fn ensure_item(&self, item_idx: u32) {
         let idx = item_idx as usize;
-        let count = self.inner.template_cell_count as usize;
+        let count = self.inner.total_count;
         let mut cells = self.inner.cells.borrow_mut();
         while cells.len() <= idx {
             cells.push((0..count).map(|_| Mutable::new(f64::NAN)).collect());
@@ -497,15 +562,16 @@ impl ItemCellStore {
         }
     }
 
-    /// Check if a cell_id is in the template range.
+    /// Check if a cell_id is in any template range.
     pub fn is_template_cell(&self, cell_id: u32) -> bool {
-        cell_id >= self.inner.template_cell_start
-            && cell_id < self.inner.template_cell_start + self.inner.template_cell_count
+        self.local_index(cell_id).is_some()
     }
 
     /// Set a per-item cell's f64 value (signal delivery).
     pub fn set_cell(&self, item_idx: u32, cell_id: u32, value: f64) {
-        let local = (cell_id - self.inner.template_cell_start) as usize;
+        let Some(local) = self.local_index(cell_id) else {
+            return;
+        };
         let cells = self.inner.cells.borrow();
         if let Some(item) = cells.get(item_idx as usize) {
             if let Some(cell) = item.get(local) {
@@ -519,7 +585,7 @@ impl ItemCellStore {
 
     /// Get a signal for a per-item cell.
     pub fn get_signal(&self, item_idx: u32, cell_id: u32) -> impl Signal<Item = f64> + use<> {
-        let local = (cell_id - self.inner.template_cell_start) as usize;
+        let local = self.local_index(cell_id).unwrap_or(0);
         let cells = self.inner.cells.borrow();
         if let Some(item) = cells.get(item_idx as usize) {
             if let Some(cell) = item.get(local) {
@@ -532,7 +598,9 @@ impl ItemCellStore {
 
     /// Get a per-item cell's current f64 value.
     pub fn get_value(&self, item_idx: u32, cell_id: u32) -> f64 {
-        let local = (cell_id - self.inner.template_cell_start) as usize;
+        let Some(local) = self.local_index(cell_id) else {
+            return f64::NAN;
+        };
         let cells = self.inner.cells.borrow();
         if let Some(item) = cells.get(item_idx as usize) {
             if let Some(cell) = item.get(local) {
@@ -544,18 +612,34 @@ impl ItemCellStore {
 
     /// Set a per-item cell's text content.
     pub fn set_text(&self, item_idx: u32, cell_id: u32, text: String) {
-        let local = (cell_id - self.inner.template_cell_start) as usize;
+        let Some(local) = self.local_index(cell_id) else {
+            return;
+        };
         let mut text_cells = self.inner.text_cells.borrow_mut();
         if let Some(item) = text_cells.get_mut(item_idx as usize) {
             if let Some(entry) = item.get_mut(local) {
                 *entry = text;
             }
         }
+        self.inner
+            .text_initialized
+            .borrow_mut()
+            .insert((item_idx, cell_id));
+    }
+
+    /// Check if text was explicitly set for this (item, cell) pair (even to "").
+    pub fn has_text(&self, item_idx: u32, cell_id: u32) -> bool {
+        self.inner
+            .text_initialized
+            .borrow()
+            .contains(&(item_idx, cell_id))
     }
 
     /// Get a per-item cell's text content.
     pub fn get_text(&self, item_idx: u32, cell_id: u32) -> String {
-        let local = (cell_id - self.inner.template_cell_start) as usize;
+        let Some(local) = self.local_index(cell_id) else {
+            return String::new();
+        };
         let text_cells = self.inner.text_cells.borrow();
         if let Some(item) = text_cells.get(item_idx as usize) {
             if let Some(entry) = item.get(local) {
@@ -568,7 +652,7 @@ impl ItemCellStore {
     /// Remove an item (clear its cells). Doesn't shrink the vec.
     pub fn remove_item(&self, item_idx: u32) {
         let idx = item_idx as usize;
-        let count = self.inner.template_cell_count as usize;
+        let count = self.inner.total_count;
         let mut cells = self.inner.cells.borrow_mut();
         if let Some(item) = cells.get_mut(idx) {
             *item = (0..count).map(|_| Mutable::new(f64::NAN)).collect();
@@ -577,14 +661,25 @@ impl ItemCellStore {
         if let Some(item) = text_cells.get_mut(idx) {
             *item = vec![String::new(); count];
         }
+        // Clear text_initialized entries for this item.
+        self.inner
+            .text_initialized
+            .borrow_mut()
+            .retain(|&(item, _)| item != item_idx);
     }
 
+    /// First segment's start cell (for backward compatibility with persistence).
     pub fn template_cell_start(&self) -> u32 {
-        self.inner.template_cell_start
+        self.inner
+            .segments
+            .first()
+            .map(|s| s.start)
+            .unwrap_or(0)
     }
 
+    /// Total cell count across all segments.
     pub fn template_cell_count(&self) -> u32 {
-        self.inner.template_cell_count
+        u32::try_from(self.inner.total_count).unwrap_or(0)
     }
 
     /// Number of item slots allocated (including removed items).
@@ -600,8 +695,9 @@ impl ItemCellStore {
             for (local, cell) in item.iter().enumerate() {
                 let val = cell.get();
                 if !val.is_nan() {
-                    let cell_id = self.inner.template_cell_start + local as u32;
-                    result.push((cell_id, val));
+                    if let Some(cell_id) = self.cell_id_for_local(local) {
+                        result.push((cell_id, val));
+                    }
                 }
             }
         }
@@ -615,8 +711,9 @@ impl ItemCellStore {
         if let Some(item) = text_cells.get(item_idx as usize) {
             for (local, text) in item.iter().enumerate() {
                 if !text.is_empty() {
-                    let cell_id = self.inner.template_cell_start + local as u32;
-                    result.push((cell_id, text.clone()));
+                    if let Some(cell_id) = self.cell_id_for_local(local) {
+                        result.push((cell_id, text.clone()));
+                    }
                 }
             }
         }
@@ -666,30 +763,57 @@ pub struct WasmInstance {
     pending_snapshot: Rc<RefCell<Option<Box<persistence::WasmSnapshot>>>>,
 }
 
+/// Intermediate state from `WasmInstance::prepare()`.
+/// Contains the imports object and stores needed for instantiation.
+pub struct WasmInstanceParts {
+    pub imports: Object,
+    cell_store: CellStore,
+    list_store: ListStore,
+    item_cell_store: Option<ItemCellStore>,
+    program: Rc<IrProgram>,
+    text_patterns: Vec<String>,
+}
+
 impl WasmInstance {
-    /// Compile and instantiate the WASM binary with host imports.
+    /// Synchronous constructor: prepares imports and instantiates synchronously.
+    /// Only works for modules under Chrome's 8MB sync instantiation limit.
     pub fn new(
-        wasm_bytes: &[u8],
+        module: &WebAssembly::Module,
         program: Rc<IrProgram>,
         text_patterns: Vec<String>,
     ) -> Result<Self, String> {
+        let parts = Self::prepare(program, text_patterns)?;
+        let instance = WebAssembly::Instance::new(module, &parts.imports)
+            .map_err(|e| format!("WASM instantiate error: {:?}", e))?;
+        Self::from_instance(parts, instance)
+    }
+
+    /// Create stores and host imports object (sync, no WASM instantiation).
+    /// The caller is responsible for using `parts.imports` to instantiate the module
+    /// (sync or async), then passing the Instance to `from_instance()`.
+    pub fn prepare(
+        program: Rc<IrProgram>,
+        text_patterns: Vec<String>,
+    ) -> Result<WasmInstanceParts, String> {
         let cell_store = CellStore::new(program.cells.len());
         let list_store = ListStore::new();
 
-        // Find ListMap template range for ItemCellStore.
-        let mut template_range: Option<(u32, u32)> = None;
+        // Collect ALL ListMap template ranges for ItemCellStore.
+        let mut template_ranges: Vec<(u32, u32)> = Vec::new();
         for node in &program.nodes {
             if let IrNode::ListMap {
                 template_cell_range,
                 ..
             } = node
             {
-                template_range = Some(*template_cell_range);
-                break;
+                template_ranges.push(*template_cell_range);
             }
         }
-        let item_cell_store =
-            template_range.map(|(start, end)| ItemCellStore::new(start, end - start));
+        let item_cell_store = if template_ranges.is_empty() {
+            None
+        } else {
+            Some(ItemCellStore::new(template_ranges))
+        };
 
         // Create import object.
         let imports = Object::new();
@@ -733,7 +857,9 @@ impl WasmInstance {
         // host_list_create() -> f64 (returns list_id)
         let ls_clone = list_store.clone();
         let list_create = Closure::wrap(
-            Box::new(move || -> f64 { ls_clone.create() }) as Box<dyn FnMut() -> f64>
+            Box::new(move || -> f64 {
+                ls_clone.create()
+            }) as Box<dyn FnMut() -> f64>
         );
         Reflect::set(
             &env,
@@ -876,6 +1002,37 @@ impl WasmInstance {
         .map_err(|e| format!("Failed to set host_list_replace: {:?}", e))?;
         list_replace.forget();
 
+        // host_get_cell_f64(cell_id: i32) -> f64
+        // Reads per-item cell value from ItemCellStore when item context is active,
+        // otherwise reads from global CellStore. Used by filter loops to read
+        // per-item field values without WASM linear memory.
+        let cs_clone = cell_store.clone();
+        let ics_clone = item_cell_store.clone();
+        let get_cell_f64 = Closure::wrap(Box::new(move |cell_id: i32| -> f64 {
+            let cid = cell_id as u32;
+            let item_ctx = CURRENT_ITEM_CTX.with(|c| c.get());
+            if let (Some(item_idx), Some(ics)) = (item_ctx, &ics_clone) {
+                if ics.is_template_cell(cid) {
+                    let val = ics.get_value(item_idx, cid);
+                    if !val.is_nan() {
+                        return val;
+                    }
+                    // Fall through to global CellStore when ItemCellStore has NaN.
+                    // Safety net for cells in a template range that were never
+                    // initialized per-item.
+                    return cs_clone.get_cell_value(cid);
+                }
+            }
+            cs_clone.get_cell_value(cid)
+        }) as Box<dyn FnMut(i32) -> f64>);
+        Reflect::set(
+            &env,
+            &"host_get_cell_f64".into(),
+            get_cell_f64.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_get_cell_f64: {:?}", e))?;
+        get_cell_f64.forget();
+
         // host_text_trim(dest_cell: i32, src_cell: i32)
         // Dual-mode: routes to ItemCellStore when item context is active.
         let cs_clone = cell_store.clone();
@@ -939,27 +1096,34 @@ impl WasmInstance {
         let ics_clone = item_cell_store.clone();
         let copy_text = Closure::wrap(Box::new(move |dest_cell: i32, src_cell: i32| {
             let item_ctx = CURRENT_ITEM_CTX.with(|c| c.get());
+            let src_u32 = src_cell as u32;
             let src_text = if let (Some(item_idx), Some(ics)) = (item_ctx, &ics_clone) {
-                if ics.is_template_cell(src_cell as u32) {
-                    ics.get_text(item_idx, src_cell as u32)
+                if ics.is_template_cell(src_u32) {
+                    // Try ICS first; fall back to global if ICS has no text.
+                    let t = ics.get_text(item_idx, src_u32);
+                    if t.is_empty() && !ics.has_text(item_idx, src_u32) {
+                        cs_clone.get_cell_text(src_u32)
+                    } else {
+                        t
+                    }
                 } else {
-                    cs_clone.get_cell_text(src_cell as u32)
+                    cs_clone.get_cell_text(src_u32)
                 }
             } else {
-                cs_clone.get_cell_text(src_cell as u32)
+                cs_clone.get_cell_text(src_u32)
             };
             if let (Some(item_idx), Some(ics)) = (item_ctx, &ics_clone) {
                 if ics.is_template_cell(dest_cell as u32) {
-                    // Don't overwrite non-empty text with empty during per-item
-                    // re-evaluations. HOLD body re-evaluations copy text through
-                    // intermediate cells that may not have text set. The bridge
-                    // sets per-item text before init_item, and re-evaluations
-                    // should preserve it unless the source has actual text.
-                    if src_text.is_empty() {
-                        let existing = ics.get_text(item_idx, dest_cell as u32);
-                        if !existing.is_empty() {
-                            return;
-                        }
+                    // Don't overwrite initialized text with uninitialized source
+                    // during per-item re-evaluations. HOLD body re-evaluations
+                    // copy text through intermediate cells that may not have text
+                    // set. The bridge sets per-item text before init_item, and
+                    // re-evaluations should preserve it unless the source has
+                    // actual text.
+                    let src_has_text = ics.has_text(item_idx, src_cell as u32)
+                        || cs_clone.has_text(src_cell as u32);
+                    if !src_has_text && ics.has_text(item_idx, dest_cell as u32) {
+                        return;
                     }
                     ics.set_text(item_idx, dest_cell as u32, src_text);
                     return;
@@ -1016,11 +1180,12 @@ impl WasmInstance {
             } else {
                 cs_clone.get_cell_text(cell_id as u32)
             };
-            if let Some(pattern) = patterns_clone.get(pattern_idx as usize) {
+            let result = if let Some(pattern) = patterns_clone.get(pattern_idx as usize) {
                 if cell_text == *pattern { 1 } else { 0 }
             } else {
                 0
-            }
+            };
+            result
         }) as Box<dyn FnMut(i32, i32) -> i32>);
         Reflect::set(
             &env,
@@ -1119,30 +1284,52 @@ impl WasmInstance {
         let build_cell = Closure::wrap(Box::new(move |cell_id: i32| {
             let target_cell = *target_clone.borrow();
             let item_ctx = CURRENT_ITEM_CTX.with(|c| c.get());
-            // Read cell text: check item store first for template cells.
-            let cell_text = if let (Some(item_idx), Some(ics)) = (item_ctx, &ics_clone) {
-                if ics.is_template_cell(cell_id as u32) {
-                    ics.get_text(item_idx, cell_id as u32)
+            // Check if text was explicitly set for this cell (even to "").
+            // This distinguishes "text never set" (should fall back to f64)
+            // from "text intentionally empty" (e.g. Text/empty()).
+            //
+            // Template cells may hold values set globally (outside item context)
+            // or per-item (inside item context). We check ICS first, then fall
+            // back to global CellStore when ICS has no data (NaN / uninitialized).
+            let cell_u32 = cell_id as u32;
+            let is_template = item_ctx.is_some()
+                && ics_clone
+                    .as_ref()
+                    .map_or(false, |ics| ics.is_template_cell(cell_u32));
+
+            let (cell_text, text_was_set) = if is_template {
+                let item_idx = item_ctx.unwrap();
+                let ics = ics_clone.as_ref().unwrap();
+                if ics.has_text(item_idx, cell_u32) {
+                    (ics.get_text(item_idx, cell_u32), true)
+                } else if cs_clone.has_text(cell_u32) {
+                    // Fallback: text set globally but not per-item.
+                    (cs_clone.get_cell_text(cell_u32), true)
                 } else {
-                    cs_clone.get_cell_text(cell_id as u32)
+                    (String::new(), false)
                 }
             } else {
-                cs_clone.get_cell_text(cell_id as u32)
+                let has = cs_clone.has_text(cell_u32);
+                (cs_clone.get_cell_text(cell_u32), has)
             };
-            let formatted = if !cell_text.is_empty() {
+
+            let formatted = if text_was_set {
+                // Text was explicitly set — use it even if empty.
                 cell_text
             } else {
-                // Read f64 from correct store: ItemCellStore for template cells,
-                // CellStore for globals. Without this, template cells read NaN
-                // from CellStore (default) and format as empty string.
-                let val = if let (Some(item_idx), Some(ics)) = (item_ctx, &ics_clone) {
-                    if ics.is_template_cell(cell_id as u32) {
-                        ics.get_value(item_idx, cell_id as u32)
+                // Text never set — fall back to f64 numeric formatting.
+                // For template cells, try ICS first; if NaN, fall back to global.
+                let val = if is_template {
+                    let item_idx = item_ctx.unwrap();
+                    let ics = ics_clone.as_ref().unwrap();
+                    let v = ics.get_value(item_idx, cell_u32);
+                    if v.is_nan() {
+                        cs_clone.get_cell_value(cell_u32)
                     } else {
-                        cs_clone.get_cell_value(cell_id as u32)
+                        v
                     }
                 } else {
-                    cs_clone.get_cell_value(cell_id as u32)
+                    cs_clone.get_cell_value(cell_u32)
                 };
                 format_f64_for_text(val)
             };
@@ -1199,16 +1386,23 @@ impl WasmInstance {
         Reflect::set(&imports, &"env".into(), &env)
             .map_err(|e| format!("Failed to set env: {:?}", e))?;
 
-        // Compile WASM module.
-        let wasm_buffer = Uint8Array::from(wasm_bytes);
-        let module = WebAssembly::Module::new(&wasm_buffer.into())
-            .map_err(|e| format!("WASM compile error: {:?}", e))?;
+        Ok(WasmInstanceParts {
+            imports,
+            cell_store,
+            list_store,
+            item_cell_store,
+            program,
+            text_patterns,
+        })
+    }
 
-        // Instantiate.
-        let instance = WebAssembly::Instance::new(&module, &imports)
-            .map_err(|e| format!("WASM instantiate error: {:?}", e))?;
-
-        // Cache exported functions for fast access.
+    /// Finalize a WasmInstance from a pre-instantiated WASM Instance.
+    /// Call after sync `WebAssembly::Instance::new()` or async
+    /// `WebAssembly::instantiate_module().await`.
+    pub fn from_instance(
+        parts: WasmInstanceParts,
+        instance: WebAssembly::Instance,
+    ) -> Result<Self, String> {
         let exports = instance.exports();
         let on_event_fn: js_sys::Function = Reflect::get(&exports, &"on_event".into())
             .map_err(|e| format!("No on_event export: {:?}", e))?
@@ -1236,17 +1430,17 @@ impl WasmInstance {
                 .dyn_into()
                 .map_err(|_| "rerun_retain_filters is not a function".to_string())?;
 
-        let program_tag_table = program.tag_table.clone();
-        let has_per_item_cells = item_cell_store.is_some();
+        let program_tag_table = parts.program.tag_table.clone();
+        let has_per_item_cells = parts.item_cell_store.is_some();
 
         Ok(Self {
             instance,
-            cell_store,
-            list_store,
-            item_cell_store,
-            program,
+            cell_store: parts.cell_store,
+            list_store: parts.list_store,
+            item_cell_store: parts.item_cell_store,
+            program: parts.program,
             tag_table: program_tag_table,
-            text_patterns,
+            text_patterns: parts.text_patterns,
             on_event_fn,
             set_global_fn,
             init_item_fn,
@@ -1342,30 +1536,22 @@ impl WasmInstance {
         );
     }
 
-    /// Set a per-item cell value in WASM linear memory, ItemCellStore, and CellStore.
+    /// Set a per-item cell value in ItemCellStore, WASM global, and CellStore.
     /// Used by bridge event handlers for template-scoped data cells (e.g., key_down.key).
-    /// The WASM `on_item_event` reads template cells from linear memory, so we must
-    /// write there (not just to the global) before firing the event.
+    /// Since per-item cells use WASM globals as workspace (not linear memory),
+    /// we write to the global so subsequent on_item_event reads see the value.
     pub fn set_item_cell_value(&self, item_idx: u32, cell_id: u32, value: f64) {
         // 1. Update ItemCellStore (for reactive bridge signals).
         if let Some(ref ics) = self.item_cell_store {
             ics.set_cell(item_idx, cell_id, value);
-            // Compute WASM linear memory address and write.
-            let cell_start = ics.template_cell_start();
-            let cell_count = ics.template_cell_count();
-            let stride = cell_count * 8;
-            let local_offset = (cell_id - cell_start) * 8;
-            let addr = item_idx * stride + local_offset;
-            // Access WASM memory buffer and write the f64.
-            let exports = self.instance.exports();
-            if let Ok(mem_val) = Reflect::get(&exports, &"memory".into()) {
-                let mem: WebAssembly::Memory = mem_val.unchecked_into();
-                let buffer = mem.buffer();
-                let view = js_sys::Float64Array::new_with_byte_offset_and_length(&buffer, addr, 1);
-                view.set_index(0, value);
-            }
         }
-        // 2. Also update CellStore (host-side signals, e.g. for global cell watchers).
+        // 2. Update WASM global so on_item_event reads the correct value.
+        let _ = self.set_global_fn.call2(
+            &JsValue::NULL,
+            &JsValue::from(cell_id as f64),
+            &JsValue::from(value),
+        );
+        // 3. Also update CellStore (host-side signals, e.g. for global cell watchers).
         self.cell_store.set_cell_f64(cell_id, value);
     }
 
@@ -1422,13 +1608,17 @@ impl WasmInstance {
         self.pending_snapshot.borrow().is_some()
     }
 
-    /// Call `init_item(item_idx)` to initialize per-item template cells.
-    /// If a pending snapshot exists, restores per-item cells and WASM memory
-    /// for this item immediately after init (overwriting defaults with persisted values).
-    pub fn call_init_item(&self, item_idx: u32) -> Result<(), String> {
+    /// Call `init_item(item_idx, map_cell)` to initialize per-item template cells
+    /// for the specified ListMap. If a pending snapshot exists, restores per-item
+    /// cells for this item immediately after init.
+    pub fn call_init_item(&self, item_idx: u32, map_cell: u32) -> Result<(), String> {
         self.init_item_fn
-            .call1(&JsValue::NULL, &JsValue::from(item_idx as f64))
-            .map_err(|e| format!("init_item({}) failed: {:?}", item_idx, e))?;
+            .call2(
+                &JsValue::NULL,
+                &JsValue::from(item_idx as f64),
+                &JsValue::from(map_cell as f64),
+            )
+            .map_err(|e| format!("init_item({}, {}) failed: {:?}", item_idx, map_cell, e))?;
         // Restore per-item state from snapshot if pending.
         if let Some(ref snap) = *self.pending_snapshot.borrow() {
             persistence::restore_single_item(self, item_idx, snap);

@@ -7,7 +7,7 @@
 //! - `on_event(event_id: i32)` — dispatches events, updates cells, re-emits
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use wasm_encoder::{
     CodeSection, ConstExpr, ExportKind, ExportSection, Function, FunctionSection, GlobalSection,
@@ -42,8 +42,9 @@ const IMPORT_HOST_LIST_COPY_ITEM: u32 = 17;
 const IMPORT_HOST_LIST_ITEM_MEMORY_INDEX: u32 = 18;
 const IMPORT_HOST_LIST_GET_ITEM_F64: u32 = 19;
 const IMPORT_HOST_LIST_REPLACE: u32 = 20;
+const IMPORT_HOST_GET_CELL_F64: u32 = 21;
 
-const NUM_IMPORTS: u32 = 21;
+const NUM_IMPORTS: u32 = 22;
 
 // Exported function indices (offset by NUM_IMPORTS)
 const FN_INIT: u32 = NUM_IMPORTS;
@@ -53,6 +54,18 @@ const FN_INIT_ITEM: u32 = NUM_IMPORTS + 3;
 const FN_ON_ITEM_EVENT: u32 = NUM_IMPORTS + 4;
 const FN_GET_ITEM_CELL: u32 = NUM_IMPORTS + 5;
 const FN_RERUN_RETAIN_FILTERS: u32 = NUM_IMPORTS + 6;
+
+/// Number of base (non-chunk) exported functions.
+const NUM_BASE_FUNCTIONS: u32 = 7;
+
+/// Maximum nodes per init chunk function.
+/// Chrome enforces a per-function size limit (~7.6MB). With ~120 bytes per node
+/// on average, 5000 nodes ≈ 600KB — well under the limit even for heavy nodes.
+const INIT_CHUNK_SIZE: usize = 5_000;
+
+/// Maximum cells per set_global br_table. Chrome's V8 enforces a maximum br_table
+/// size. We split set_global into sub-functions with at most this many entries each.
+const SET_GLOBAL_CHUNK_SIZE: usize = 4_096;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -78,16 +91,28 @@ pub fn emit_wasm(program: &IrProgram) -> WasmOutput {
 // Emitter
 // ---------------------------------------------------------------------------
 
-/// Context for memory-based per-item cell access.
-/// When present, template-scoped cells use WASM linear memory
-/// instead of globals.
+/// Info about a ListMap node collected at compile time.
+struct ListMapInfo {
+    /// The ListMap's own cell ID (used as discriminator in init_item dispatch).
+    cell: CellId,
+    /// The source list cell that the ListMap reads from.
+    source: CellId,
+    /// The per-item variable cell (e.g., `todo` in `todos |> List/map(todo => ...)`).
+    item_cell: CellId,
+    /// Template cell range [start, end).
+    cell_range: (u32, u32),
+    /// Template event range [start, end).
+    event_range: (u32, u32),
+}
+
+/// Context for per-item cell access within a ListMap template.
+/// Used as a guard to determine which cells are template-scoped.
+/// Template cells use WASM globals as workspace during init_item/on_item_event
+/// processing (one item at a time), with values persisted to host-side
+/// ItemCellStore via host_set_cell_f64.
 struct MemoryContext {
     /// WASM local index holding item_idx (i32).
     item_idx_local: u32,
-    /// Base address in linear memory for per-item data.
-    memory_base: u32,
-    /// Bytes per item (template_cell_count * 8).
-    stride: u32,
     /// Template cell range start (CellId).
     cell_start: u32,
     /// Template cell range end (CellId, exclusive).
@@ -104,33 +129,219 @@ struct WasmEmitter<'a> {
     /// Set by emit_init / emit_on_event before emitting code that may trigger
     /// the filter loop via emit_downstream_updates.
     filter_locals: RefCell<Option<(u32, u32, u32, u32)>>,
+
+    // --- Precomputed indices (O(1) lookups instead of O(n) scans) ---
+    /// Maps CellId → node index for O(1) find_node_for_cell lookups.
+    cell_to_node_idx: HashMap<CellId, usize>,
+    /// Maps source CellId → consumer node indices for emit_downstream_updates.
+    downstream: HashMap<CellId, Vec<usize>>,
+    /// Maps source CellId → consumer node indices for emit_list_downstream_updates.
+    list_downstream: HashMap<CellId, Vec<usize>>,
+    /// Cells used as source for any list operation (precomputed is_list_source).
+    list_source_set: HashSet<CellId>,
 }
 
 impl<'a> WasmEmitter<'a> {
     fn new(program: &'a IrProgram) -> Self {
+        // Build precomputed indices for O(1) lookups.
+        let mut cell_to_node_idx = HashMap::new();
+        let mut downstream: HashMap<CellId, Vec<usize>> = HashMap::new();
+        let mut list_downstream: HashMap<CellId, Vec<usize>> = HashMap::new();
+        let mut list_source_set = HashSet::new();
+
+        for (i, node) in program.nodes.iter().enumerate() {
+            // 1. cell_to_node_idx: map each node's output cell to its index.
+            if let Some(cell) = Self::node_output_cell(node) {
+                cell_to_node_idx.insert(cell, i);
+            }
+
+            // 2. downstream: map source cells → consumer node indices.
+            //    These are the cells checked by emit_downstream_updates.
+            for source in Self::node_downstream_sources(node) {
+                downstream.entry(source).or_default().push(i);
+            }
+
+            // 3. list_downstream: map list source → consumer node indices.
+            //    These are the cells checked by emit_list_downstream_updates.
+            if let Some(source) = Self::node_list_source(node) {
+                list_downstream.entry(source).or_default().push(i);
+                list_source_set.insert(source);
+            }
+        }
+
         Self {
             program,
             text_patterns: RefCell::new(Vec::new()),
             filter_locals: RefCell::new(None),
+            cell_to_node_idx,
+            downstream,
+            list_downstream,
+            list_source_set,
+        }
+    }
+
+    /// Extract the output cell from a node (for cell_to_node_idx).
+    fn node_output_cell(node: &IrNode) -> Option<CellId> {
+        match node {
+            IrNode::Derived { cell, .. }
+            | IrNode::Hold { cell, .. }
+            | IrNode::Latest { target: cell, .. }
+            | IrNode::Then { cell, .. }
+            | IrNode::When { cell, .. }
+            | IrNode::While { cell, .. }
+            | IrNode::MathSum { cell, .. }
+            | IrNode::PipeThrough { cell, .. }
+            | IrNode::TextInterpolation { cell, .. }
+            | IrNode::CustomCall { cell, .. }
+            | IrNode::Element { cell, .. }
+            | IrNode::ListAppend { cell, .. }
+            | IrNode::ListClear { cell, .. }
+            | IrNode::ListCount { cell, .. }
+            | IrNode::ListMap { cell, .. }
+            | IrNode::ListRemove { cell, .. }
+            | IrNode::ListRetain { cell, .. }
+            | IrNode::ListEvery { cell, .. }
+            | IrNode::ListAny { cell, .. }
+            | IrNode::ListIsEmpty { cell, .. }
+            | IrNode::RouterGoTo { cell, .. }
+            | IrNode::TextTrim { cell, .. }
+            | IrNode::TextIsNotEmpty { cell, .. }
+            | IrNode::HoldLoop { cell, .. } => Some(*cell),
+            IrNode::Document { .. } | IrNode::Timer { .. } => None,
+        }
+    }
+
+    /// Extract all source cells that emit_downstream_updates checks for a node.
+    fn node_downstream_sources(node: &IrNode) -> Vec<CellId> {
+        let mut sources = Vec::new();
+        match node {
+            IrNode::MathSum { input, .. } => sources.push(*input),
+            IrNode::PipeThrough { source, .. } => sources.push(*source),
+            IrNode::Derived { expr: IrExpr::CellRead(source), .. } => sources.push(*source),
+            IrNode::Derived { expr, .. } if !matches!(expr, IrExpr::CellRead(_)) => {
+                Self::collect_expr_cell_refs(expr, &mut sources);
+            }
+            IrNode::When { source, .. } => sources.push(*source),
+            IrNode::While { source, deps, .. } => {
+                sources.push(*source);
+                sources.extend_from_slice(deps);
+            }
+            IrNode::Latest { target, arms, .. } => {
+                // Non-triggered arms: collect all cells referenced in bodies.
+                // The guard is `*target != updated_cell`, so we add all body refs
+                // except target itself (target is excluded at match time).
+                for arm in arms {
+                    if arm.trigger.is_none() {
+                        Self::collect_expr_cell_refs(&arm.body, &mut sources);
+                    }
+                }
+                // Remove target from sources (the guard excludes it).
+                sources.retain(|c| *c != *target);
+            }
+            IrNode::ListIsEmpty { source, .. } => sources.push(*source),
+            IrNode::TextTrim { source, .. } => sources.push(*source),
+            IrNode::TextIsNotEmpty { source, .. } => sources.push(*source),
+            IrNode::ListAppend { item, watch_cell, .. } => {
+                sources.push(*item);
+                if let Some(watch) = watch_cell {
+                    // Only add watch_cell if it differs from item to avoid
+                    // visiting this node twice for the same cell update.
+                    if *watch != *item {
+                        sources.push(*watch);
+                    }
+                }
+            }
+            IrNode::ListRetain { predicate: Some(pred), .. } => sources.push(*pred),
+            IrNode::ListEvery { predicate: Some(pred), .. } => sources.push(*pred),
+            IrNode::ListAny { predicate: Some(pred), .. } => sources.push(*pred),
+            _ => {}
+        }
+        sources
+    }
+
+    /// Extract the list source cell for emit_list_downstream_updates.
+    fn node_list_source(node: &IrNode) -> Option<CellId> {
+        match node {
+            IrNode::ListCount { source, .. }
+            | IrNode::ListMap { source, .. }
+            | IrNode::ListIsEmpty { source, .. }
+            | IrNode::ListAppend { source, .. }
+            | IrNode::ListClear { source, .. }
+            | IrNode::ListRemove { source, .. }
+            | IrNode::ListRetain { source, .. }
+            | IrNode::ListEvery { source, .. }
+            | IrNode::ListAny { source, .. } => Some(*source),
+            _ => None,
+        }
+    }
+
+    /// Recursively collect all CellId references from an expression.
+    fn collect_expr_cell_refs(expr: &IrExpr, out: &mut Vec<CellId>) {
+        match expr {
+            IrExpr::CellRead(c) => out.push(*c),
+            IrExpr::Compare { lhs, rhs, .. } | IrExpr::BinOp { lhs, rhs, .. } => {
+                Self::collect_expr_cell_refs(lhs, out);
+                Self::collect_expr_cell_refs(rhs, out);
+            }
+            IrExpr::UnaryNeg(inner) | IrExpr::Not(inner) => {
+                Self::collect_expr_cell_refs(inner, out);
+            }
+            IrExpr::FieldAccess { object, .. } => {
+                Self::collect_expr_cell_refs(object, out);
+            }
+            IrExpr::TextConcat(segs) => {
+                for seg in segs {
+                    if let TextSegment::Expr(e) = seg {
+                        Self::collect_expr_cell_refs(e, out);
+                    }
+                }
+            }
+            IrExpr::PatternMatch { source, arms, .. } => {
+                out.push(*source);
+                for (_, body) in arms {
+                    Self::collect_expr_cell_refs(body, out);
+                }
+            }
+            IrExpr::FunctionCall { args, .. } => {
+                for arg in args {
+                    Self::collect_expr_cell_refs(arg, out);
+                }
+            }
+            IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => {
+                for (_, val) in fields {
+                    Self::collect_expr_cell_refs(val, out);
+                }
+            }
+            IrExpr::ListConstruct(items) => {
+                for item in items {
+                    Self::collect_expr_cell_refs(item, out);
+                }
+            }
+            IrExpr::Constant(_) => {}
         }
     }
 
     /// Register a text pattern and return its index.
     /// Follow Derived CellRead chains to find the cell that actually holds text.
     /// Used for text pattern matching where an intermediate cell is a pass-through.
+    /// Follow Derived CellRead chains to find the underlying cell.
+    /// Uses precomputed cell_to_node_idx for O(1) lookups.
     fn resolve_text_cell(&self, cell: CellId) -> CellId {
-        for node in &self.program.nodes {
-            if let IrNode::Derived {
-                cell: c,
-                expr: IrExpr::CellRead(target),
-            } = node
-            {
-                if *c == cell {
-                    return self.resolve_text_cell(*target);
+        let mut current = cell;
+        for _ in 0..100 {
+            if let Some(node) = self.find_node_for_cell(current) {
+                if let IrNode::Derived {
+                    expr: IrExpr::CellRead(target),
+                    ..
+                } = node
+                {
+                    current = *target;
+                    continue;
                 }
             }
+            break;
         }
-        cell
+        current
     }
 
     fn register_text_pattern(&self, text: &str) -> u32 {
@@ -287,17 +498,58 @@ impl<'a> WasmEmitter<'a> {
             "host_list_replace",
             wasm_encoder::EntityType::Function(8),
         );
+        // host_get_cell_f64(cell_id: i32) -> f64
+        // Reads per-item cell value from ItemCellStore when item context is active,
+        // otherwise reads from global CellStore. Used by filter loops to read
+        // per-item field values without WASM linear memory.
+        imports.import(
+            "env",
+            "host_get_cell_f64",
+            wasm_encoder::EntityType::Function(5), // Type 5: (i32) -> f64
+        );
         module.section(&imports);
 
         // 3. Function section (declares init, on_event, set_global, init_item, on_item_event, get_item_cell)
+        let num_init_chunks = if self.program.nodes.len() > INIT_CHUNK_SIZE {
+            (self.program.nodes.len() + INIT_CHUNK_SIZE - 1) / INIT_CHUNK_SIZE
+        } else {
+            0 // small program — init() handles everything inline
+        };
+        // Split on_event into per-event handler functions for large programs.
+        let split_events = num_init_chunks > 0;
+        let num_event_fns = if split_events {
+            self.program.events.len()
+        } else {
+            0
+        };
+        // Split set_global into sub-functions when too many cells for a single br_table.
+        let num_cells = self.program.cells.len();
+        let num_set_global_chunks = if num_cells > SET_GLOBAL_CHUNK_SIZE {
+            (num_cells + SET_GLOBAL_CHUNK_SIZE - 1) / SET_GLOBAL_CHUNK_SIZE
+        } else {
+            0
+        };
         let mut functions = FunctionSection::new();
         functions.function(6); // init: () -> ()
         functions.function(7); // on_event: (i32) -> ()
         functions.function(0); // set_global: (i32, f64) -> ()
-        functions.function(7); // init_item: (i32) -> ()
+        functions.function(8); // init_item: (i32, i32) -> ()  [item_idx, map_cell]
         functions.function(8); // on_item_event: (i32, i32) -> ()
         functions.function(10); // get_item_cell: (i32, i32) -> f64
         functions.function(6); // rerun_retain_filters: () -> ()
+        // Init chunk functions (internal, not exported):
+        // Phase 1 chunks (MathSum/Hold init) + Phase 2 chunks (everything else).
+        for _ in 0..(2 * num_init_chunks) {
+            functions.function(6); // init_chunk_N: () -> ()
+        }
+        // Per-event handler functions (internal, not exported).
+        for _ in 0..num_event_fns {
+            functions.function(6); // event_handler_N: () -> ()
+        }
+        // Per-chunk set_global sub-functions: (i32, f64) -> ()
+        for _ in 0..num_set_global_chunks {
+            functions.function(0); // set_global_chunk_N: (i32, f64) -> ()
+        }
         module.section(&functions);
 
         // 4. Memory section (1 page for text data)
@@ -353,16 +605,29 @@ impl<'a> WasmEmitter<'a> {
         // 7. Code section
         let mut code = CodeSection::new();
 
-        // init() body
-        let init_func = self.emit_init();
+        // init() body — Phase 1 inline, Phase 2 either inline or via chunk calls.
+        let init_func = self.emit_init(num_init_chunks);
         code.function(&init_func);
 
         // on_event(event_id) body
-        let on_event_func = self.emit_on_event();
+        let first_event_fn = NUM_IMPORTS + NUM_BASE_FUNCTIONS + 2 * num_init_chunks as u32;
+        let on_event_func = self.emit_on_event(if split_events {
+            Some(first_event_fn)
+        } else {
+            None
+        });
         code.function(&on_event_func);
 
         // set_global(cell_id: i32, value: f64) body
-        let set_global_func = self.emit_set_global();
+        let first_sg_chunk_fn = NUM_IMPORTS
+            + NUM_BASE_FUNCTIONS
+            + 2 * num_init_chunks as u32
+            + num_event_fns as u32;
+        let set_global_func = self.emit_set_global(if num_set_global_chunks > 0 {
+            Some((first_sg_chunk_fn, num_set_global_chunks))
+        } else {
+            None
+        });
         code.function(&set_global_func);
 
         // init_item(item_idx: i32) body
@@ -381,39 +646,167 @@ impl<'a> WasmEmitter<'a> {
         let rerun_retain_func = self.emit_rerun_retain_filters();
         code.function(&rerun_retain_func);
 
+        // Init chunk functions: Phase 1 chunks first, then Phase 2 chunks.
+        for chunk_idx in 0..num_init_chunks {
+            let start = chunk_idx * INIT_CHUNK_SIZE;
+            let end = ((chunk_idx + 1) * INIT_CHUNK_SIZE).min(self.program.nodes.len());
+            let chunk_func = self.emit_init_phase1_chunk(start, end);
+            code.function(&chunk_func);
+        }
+        for chunk_idx in 0..num_init_chunks {
+            let start = chunk_idx * INIT_CHUNK_SIZE;
+            let end = ((chunk_idx + 1) * INIT_CHUNK_SIZE).min(self.program.nodes.len());
+            let chunk_func = self.emit_init_phase2_chunk(start, end);
+            code.function(&chunk_func);
+        }
+
+        // Per-event handler function bodies.
+        for idx in 0..num_event_fns {
+            let event_id = EventId(u32::try_from(idx).unwrap());
+            let handler_func = self.emit_event_handler_func(event_id);
+            code.function(&handler_func);
+        }
+
+        // Per-chunk set_global sub-function bodies.
+        for chunk_idx in 0..num_set_global_chunks {
+            let start = chunk_idx * SET_GLOBAL_CHUNK_SIZE;
+            let end = ((chunk_idx + 1) * SET_GLOBAL_CHUNK_SIZE).min(num_cells);
+            let chunk_func = self.emit_set_global_chunk(start, end);
+            code.function(&chunk_func);
+        }
+
         module.section(&code);
 
         module.finish()
     }
 
     /// Emit the `init()` function body.
-    /// Sets initial cell values and calls host_set_cell_f64 for each cell.
     /// Check if a cell is used as source for any list operation node.
+    /// Uses precomputed list_source_set for O(1) lookup.
     fn is_list_source(&self, cell: CellId) -> bool {
-        self.program.nodes.iter().any(|node| {
-            matches!(node,
-                IrNode::ListAppend { source, .. }
-                | IrNode::ListClear { source, .. }
-                | IrNode::ListRemove { source, .. }
-                | IrNode::ListRetain { source, .. }
-                | IrNode::ListCount { source, .. }
-                | IrNode::ListIsEmpty { source, .. }
-                | IrNode::ListMap { source, .. }
-                if *source == cell
-            )
-        })
+        self.list_source_set.contains(&cell)
     }
 
-    fn emit_init(&self) -> Function {
-        // Count locals needed for HoldLoop nodes (1 counter + N field temps).
+    fn emit_init(&self, num_chunks: usize) -> Function {
+        if num_chunks > 0 {
+            // Large program: init() is a thin dispatcher that calls chunk functions.
+            // Phase 1 chunks run first (MathSum/Hold init), then Phase 2 chunks.
+            let mut func = Function::new(vec![]);
+            let first_chunk_fn = NUM_IMPORTS + NUM_BASE_FUNCTIONS;
+            // Call Phase 1 chunks (indices 0..num_chunks).
+            for i in 0..num_chunks {
+                func.instruction(&Instruction::Call(first_chunk_fn + i as u32));
+            }
+            // Call Phase 2 chunks (indices num_chunks..2*num_chunks).
+            for i in 0..num_chunks {
+                func.instruction(&Instruction::Call(
+                    first_chunk_fn + num_chunks as u32 + i as u32,
+                ));
+            }
+            func.instruction(&Instruction::Call(IMPORT_HOST_NOTIFY_INIT_DONE));
+            func.instruction(&Instruction::End);
+            func
+        } else {
+            // Small program: everything inline in init().
+            let mut num_hold_loop_locals: u32 = 0;
+            for node in &self.program.nodes {
+                if let IrNode::HoldLoop { field_cells, .. } = node {
+                    num_hold_loop_locals =
+                        num_hold_loop_locals.max(1 + field_cells.len() as u32);
+                }
+            }
+            let has_filter = self.has_per_item_filter();
+            let num_f64_locals = num_hold_loop_locals + if has_filter { 1 } else { 0 };
+            let mut locals: Vec<(u32, ValType)> = Vec::new();
+            if num_f64_locals > 0 {
+                locals.push((num_f64_locals, ValType::F64));
+            }
+            if has_filter {
+                locals.push((3, ValType::I32));
+            }
+            let mut func = Function::new(locals);
+
+            // Phase 1: Initialize MathSum/Hold globals.
+            self.emit_init_phase1_nodes(&mut func, &self.program.nodes);
+
+            // Phase 2: Initialize everything else.
+            self.emit_init_phase2_setup_filter_locals(num_hold_loop_locals, num_f64_locals);
+            self.emit_init_phase2_nodes(&mut func, &self.program.nodes);
+
+            func.instruction(&Instruction::Call(IMPORT_HOST_NOTIFY_INIT_DONE));
+            func.instruction(&Instruction::End);
+            *self.filter_locals.borrow_mut() = None;
+            func
+        }
+    }
+
+    /// Set up filter_locals for Phase 2 (used by emit_downstream_updates).
+    fn emit_init_phase2_setup_filter_locals(
+        &self,
+        num_hold_loop_locals: u32,
+        num_f64_locals: u32,
+    ) {
+        if self.has_per_item_filter() {
+            let local_new_list = num_hold_loop_locals;
+            let local_count = num_f64_locals;
+            let local_i = num_f64_locals + 1;
+            let local_mem_idx = num_f64_locals + 2;
+            *self.filter_locals.borrow_mut() =
+                Some((local_new_list, local_count, local_i, local_mem_idx));
+        }
+    }
+
+    /// Emit Phase 1 init code for a slice of nodes (MathSum/Hold only).
+    fn emit_init_phase1_nodes(&self, func: &mut Function, nodes: &[IrNode]) {
+        for node in nodes {
+            match node {
+                IrNode::MathSum { cell, .. } => {
+                    func.instruction(&Instruction::F64Const(0.0));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                }
+                IrNode::Hold { cell, init, .. } => {
+                    self.emit_expr(func, init);
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    if let IrExpr::CellRead(src) = init {
+                        func.instruction(&Instruction::I32Const(cell.0 as i32));
+                        func.instruction(&Instruction::I32Const(src.0 as i32));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                    } else if let Some(text) = self.resolve_expr_text_statically(init) {
+                        if !text.is_empty() {
+                            let pattern_idx = self.register_text_pattern(&text);
+                            func.instruction(&Instruction::I32Const(cell.0 as i32));
+                            func.instruction(&Instruction::I32Const(pattern_idx as i32));
+                            func.instruction(&Instruction::Call(
+                                IMPORT_HOST_SET_CELL_TEXT_PATTERN,
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Emit a Phase 1 chunk function for nodes[start..end].
+    fn emit_init_phase1_chunk(&self, start: usize, end: usize) -> Function {
+        let mut func = Function::new(vec![]);
+        self.emit_init_phase1_nodes(&mut func, &self.program.nodes[start..end]);
+        func.instruction(&Instruction::End);
+        func
+    }
+
+    /// Emit a Phase 2 chunk function for nodes[start..end].
+    fn emit_init_phase2_chunk(&self, start: usize, end: usize) -> Function {
         let mut num_hold_loop_locals: u32 = 0;
-        for node in &self.program.nodes {
+        for node in &self.program.nodes[start..end] {
             if let IrNode::HoldLoop { field_cells, .. } = node {
                 num_hold_loop_locals = num_hold_loop_locals.max(1 + field_cells.len() as u32);
             }
         }
         let has_filter = self.has_per_item_filter();
-        // f64 locals: HoldLoop locals + 1 filter local (new_list_id)
         let num_f64_locals = num_hold_loop_locals + if has_filter { 1 } else { 0 };
         let mut locals: Vec<(u32, ValType)> = Vec::new();
         if num_f64_locals > 0 {
@@ -424,51 +817,17 @@ impl<'a> WasmEmitter<'a> {
         }
         let mut func = Function::new(locals);
 
-        // Phase 1: Initialize all WASM globals to default values.
-        // This must happen before Phase 2 because downstream updates (e.g., MathSum
-        // accumulation) read from globals that might not be initialized yet.
-        for node in &self.program.nodes {
-            match node {
-                IrNode::MathSum { cell, .. } => {
-                    func.instruction(&Instruction::F64Const(0.0));
-                    func.instruction(&Instruction::GlobalSet(cell.0));
-                }
-                IrNode::Hold { cell, init, .. } => {
-                    self.emit_expr(&mut func, init);
-                    func.instruction(&Instruction::GlobalSet(cell.0));
-                    func.instruction(&Instruction::I32Const(cell.0 as i32));
-                    func.instruction(&Instruction::GlobalGet(cell.0));
-                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
-                    // Copy text from init expression (e.g., CellRead from a text cell).
-                    if let IrExpr::CellRead(src) = init {
-                        func.instruction(&Instruction::I32Const(cell.0 as i32));
-                        func.instruction(&Instruction::I32Const(src.0 as i32));
-                        func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
-                    } else if let Some(text) = self.resolve_expr_text_statically(init) {
-                        if !text.is_empty() {
-                            let pattern_idx = self.register_text_pattern(&text);
-                            func.instruction(&Instruction::I32Const(cell.0 as i32));
-                            func.instruction(&Instruction::I32Const(pattern_idx as i32));
-                            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        self.emit_init_phase2_setup_filter_locals(num_hold_loop_locals, num_f64_locals);
+        self.emit_init_phase2_nodes(&mut func, &self.program.nodes[start..end]);
 
-        // Set filter loop locals for init context so emit_downstream_updates can use them.
-        if has_filter {
-            let local_new_list = num_hold_loop_locals;
-            let local_count = num_f64_locals;
-            let local_i = num_f64_locals + 1;
-            let local_mem_idx = num_f64_locals + 2;
-            *self.filter_locals.borrow_mut() =
-                Some((local_new_list, local_count, local_i, local_mem_idx));
-        }
+        func.instruction(&Instruction::End);
+        *self.filter_locals.borrow_mut() = None;
+        func
+    }
 
-        // Phase 2: Evaluate all nodes that may trigger downstream updates.
-        for node in &self.program.nodes {
+    /// Emit Phase 2 init code for a slice of nodes.
+    fn emit_init_phase2_nodes(&self, func: &mut Function, nodes: &[IrNode]) {
+        for node in nodes {
             match node {
                 // Skip MathSum and Hold — already initialized in Phase 1.
                 IrNode::MathSum { .. } | IrNode::Hold { .. } => {}
@@ -484,12 +843,12 @@ impl<'a> WasmEmitter<'a> {
                     for ((_name, field_cell), (_init_name, init_expr)) in
                         field_cells.iter().zip(init_values.iter())
                     {
-                        self.emit_expr(&mut func, init_expr);
+                        self.emit_expr(func, init_expr);
                         func.instruction(&Instruction::GlobalSet(field_cell.0));
                     }
 
                     // 2. Evaluate loop count and store in local 0.
-                    self.emit_expr(&mut func, count_expr);
+                    self.emit_expr(func, count_expr);
                     func.instruction(&Instruction::LocalSet(0));
 
                     // 3. WASM loop: iterate count times.
@@ -505,7 +864,7 @@ impl<'a> WasmEmitter<'a> {
                     // Evaluate each body field expression into temp locals.
                     // All reads see OLD state because we write to temps first.
                     for (i, (_name, body_expr)) in body_fields.iter().enumerate() {
-                        self.emit_expr(&mut func, body_expr);
+                        self.emit_expr(func, body_expr);
                         func.instruction(&Instruction::LocalSet(1 + i as u32));
                     }
 
@@ -547,7 +906,7 @@ impl<'a> WasmEmitter<'a> {
                         // Create a host-side list (overrides emit_expr's 0.0).
                         func.instruction(&Instruction::Call(IMPORT_HOST_LIST_CREATE));
                     } else {
-                        self.emit_expr(&mut func, expr);
+                        self.emit_expr(func, expr);
                     }
                     func.instruction(&Instruction::GlobalSet(cell.0));
                     // Notify host of initial value.
@@ -625,7 +984,7 @@ impl<'a> WasmEmitter<'a> {
                                         // Save list ID: emit_text_build bumps the global,
                                         // which would corrupt the list ID for downstream nodes.
                                         func.instruction(&Instruction::GlobalGet(cell.0));
-                                        self.emit_text_build(&mut func, *cell, segments);
+                                        self.emit_text_build(func, *cell, segments);
                                         // Restore list ID.
                                         func.instruction(&Instruction::GlobalSet(cell.0));
                                         func.instruction(&Instruction::I32Const(cell.0 as i32));
@@ -637,7 +996,7 @@ impl<'a> WasmEmitter<'a> {
                                     _ => {
                                         // host_list_append(list_cell_id, value)
                                         func.instruction(&Instruction::I32Const(cell.0 as i32));
-                                        self.emit_expr(&mut func, item);
+                                        self.emit_expr(func, item);
                                         func.instruction(&Instruction::Call(
                                             IMPORT_HOST_LIST_APPEND,
                                         ));
@@ -651,26 +1010,26 @@ impl<'a> WasmEmitter<'a> {
                     // Initialize with the first static arm (non-triggered).
                     for arm in arms {
                         if arm.trigger.is_none() {
-                            self.emit_expr(&mut func, &arm.body);
+                            self.emit_expr(func, &arm.body);
                             func.instruction(&Instruction::GlobalSet(target.0));
                             func.instruction(&Instruction::I32Const(target.0 as i32));
                             func.instruction(&Instruction::GlobalGet(target.0));
                             func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                             // Propagate downstream (e.g., to MathSum).
-                            self.emit_downstream_updates(&mut func, *target);
+                            self.emit_downstream_updates(func, *target);
                             break;
                         }
                     }
                 }
                 IrNode::When { cell, source, arms } => {
                     // Evaluate initial value by pattern matching on source cell.
-                    self.emit_pattern_match(&mut func, *source, arms, *cell);
+                    self.emit_pattern_match(func, *source, arms, *cell, true);
                 }
                 IrNode::While {
                     cell, source, arms, ..
                 } => {
                     // Same as WHEN for initial evaluation.
-                    self.emit_pattern_match(&mut func, *source, arms, *cell);
+                    self.emit_pattern_match(func, *source, arms, *cell, true);
                 }
                 IrNode::ListAppend { cell, source, .. } => {
                     // Initialize: list cell = source cell (list ID from ListConstruct or
@@ -728,7 +1087,7 @@ impl<'a> WasmEmitter<'a> {
                             (predicate, *self.filter_locals.borrow())
                         {
                             self.emit_filter_loop(
-                                &mut func,
+                                func,
                                 *cell,
                                 *source,
                                 *pred,
@@ -758,6 +1117,49 @@ impl<'a> WasmEmitter<'a> {
                         func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                     } else {
                         func.instruction(&Instruction::GlobalGet(source.0));
+                        func.instruction(&Instruction::GlobalSet(cell.0));
+                        func.instruction(&Instruction::I32Const(cell.0 as i32));
+                        func.instruction(&Instruction::GlobalGet(cell.0));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    }
+                }
+                IrNode::ListEvery {
+                    cell,
+                    source,
+                    predicate,
+                    item_cell,
+                    item_field_cells,
+                }
+                | IrNode::ListAny {
+                    cell,
+                    source,
+                    predicate,
+                    item_cell,
+                    item_field_cells,
+                } => {
+                    let is_every = matches!(node, IrNode::ListEvery { .. });
+                    if item_cell.is_some() {
+                        if let (Some(pred), Some((l0, l1, l2, l3))) =
+                            (predicate, *self.filter_locals.borrow())
+                        {
+                            self.emit_boolean_check_loop(
+                                func,
+                                *cell,
+                                *source,
+                                *pred,
+                                *item_cell,
+                                item_field_cells,
+                                l0,
+                                l1,
+                                l2,
+                                l3,
+                                is_every,
+                            );
+                        }
+                    } else {
+                        // No per-item filtering: every([]) = true, any([]) = false.
+                        let initial = if is_every { 1.0 } else { 0.0 };
+                        func.instruction(&Instruction::F64Const(initial));
                         func.instruction(&Instruction::GlobalSet(cell.0));
                         func.instruction(&Instruction::I32Const(cell.0 as i32));
                         func.instruction(&Instruction::GlobalGet(cell.0));
@@ -822,78 +1224,113 @@ impl<'a> WasmEmitter<'a> {
                 }
             }
         }
+    }
 
-        // Signal that init is complete.
-        func.instruction(&Instruction::Call(IMPORT_HOST_NOTIFY_INIT_DONE));
+    /// Emit the `on_event(event_id: i32)` function body.
+    /// Uses `br_table` for O(1) dispatch. When `first_event_fn` is Some, dispatches
+    /// to per-event handler functions instead of inlining handlers.
+    fn emit_on_event(&self, first_event_fn: Option<u32>) -> Function {
+        let num_events = self.program.events.len();
+
+        if first_event_fn.is_some() {
+            // Large program: dispatch to per-event handler functions.
+            let first_fn = first_event_fn.unwrap();
+            let mut func = Function::new(vec![]);
+
+            if num_events == 0 {
+                func.instruction(&Instruction::End);
+                return func;
+            }
+
+            // br_table dispatches event_id to the correct handler function call.
+            func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            for _ in 0..num_events {
+                func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            }
+
+            let targets: Vec<u32> = (0..num_events as u32).collect();
+            let default_target = num_events as u32;
+            func.instruction(&Instruction::LocalGet(0));
+            func.instruction(&Instruction::BrTable(targets.into(), default_target));
+
+            for idx in 0..num_events {
+                func.instruction(&Instruction::End);
+                // Call the per-event handler function.
+                func.instruction(&Instruction::Call(first_fn + idx as u32));
+                let exit_depth = (num_events - 1 - idx) as u32;
+                func.instruction(&Instruction::Br(exit_depth));
+            }
+
+            func.instruction(&Instruction::End);
+            func.instruction(&Instruction::End);
+            func
+        } else {
+            // Small program: inline all event handlers.
+            let has_filter = self.has_per_item_filter();
+            let locals: Vec<(u32, ValType)> = if has_filter {
+                vec![(1, ValType::F64), (3, ValType::I32)]
+            } else {
+                vec![]
+            };
+            if has_filter {
+                *self.filter_locals.borrow_mut() = Some((1, 2, 3, 4));
+            }
+            let mut func = Function::new(locals);
+
+            if num_events == 0 {
+                func.instruction(&Instruction::End);
+                return func;
+            }
+
+            func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            for _ in 0..num_events {
+                func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            }
+
+            let targets: Vec<u32> = (0..num_events as u32).collect();
+            let default_target = num_events as u32;
+            func.instruction(&Instruction::LocalGet(0));
+            func.instruction(&Instruction::BrTable(targets.into(), default_target));
+
+            for idx in 0..num_events {
+                func.instruction(&Instruction::End);
+                let event_id = EventId(u32::try_from(idx).unwrap());
+                self.emit_event_handler(&mut func, event_id);
+                let exit_depth = (num_events - 1 - idx) as u32;
+                func.instruction(&Instruction::Br(exit_depth));
+            }
+
+            func.instruction(&Instruction::End);
+            func.instruction(&Instruction::End);
+            *self.filter_locals.borrow_mut() = None;
+            func
+        }
+    }
+
+    /// Emit a standalone function for a single event handler.
+    fn emit_event_handler_func(&self, event_id: EventId) -> Function {
+        let has_filter = self.has_per_item_filter();
+        let locals: Vec<(u32, ValType)> = if has_filter {
+            // No param locals (standalone function), so filter locals start at 0.
+            vec![(1, ValType::F64), (3, ValType::I32)]
+        } else {
+            vec![]
+        };
+        if has_filter {
+            // Locals: 0=new_list(f64), 1=count(i32), 2=i(i32), 3=mem_idx(i32)
+            *self.filter_locals.borrow_mut() = Some((0, 1, 2, 3));
+        }
+        let mut func = Function::new(locals);
+        self.emit_event_handler(&mut func, event_id);
         func.instruction(&Instruction::End);
         *self.filter_locals.borrow_mut() = None;
         func
     }
 
-    /// Emit the `on_event(event_id: i32)` function body.
-    /// Uses `br_table` for O(1) dispatch when there are multiple events.
-    fn emit_on_event(&self) -> Function {
-        // on_event has param local 0 (event_id: i32).
-        // Add filter loop locals if needed.
-        let has_filter = self.has_per_item_filter();
-        let locals: Vec<(u32, ValType)> = if has_filter {
-            vec![(1, ValType::F64), (3, ValType::I32)] // new_list_id (f64), count + i + mem_idx (i32 x3)
-        } else {
-            vec![]
-        };
-        if has_filter {
-            // on_event locals: param 0=event_id(i32), local 1=new_list(f64), local 2=count(i32), local 3=i(i32), local 4=mem_idx(i32)
-            *self.filter_locals.borrow_mut() = Some((1, 2, 3, 4));
-        }
-        let mut func = Function::new(locals);
-        let num_events = self.program.events.len();
-
-        if num_events == 0 {
-            func.instruction(&Instruction::End);
-            return func;
-        }
-
-        // Use br_table for O(1) dispatch.
-        // Structure: block $exit { block $0 { block $1 { ... br_table } handler_N-1 } ... handler_0 }
-        // br_table targets are innermost-first: index 0 → $0 (innermost),
-        // which falls through to handler_0 code after its block end.
-
-        // Open outer block ($exit) — br to here skips everything.
-        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
-
-        // Open one nested block per event (innermost = event 0).
-        for _ in 0..num_events {
-            func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
-        }
-
-        // br_table: targets[i] = branch depth for event i.
-        // Event 0 → depth 0 (breaks innermost block, lands at handler 0 code).
-        // Event 1 → depth 1, etc.
-        // Default (out of range) → depth num_events (breaks to $exit).
-        let targets: Vec<u32> = (0..num_events as u32).collect();
-        let default_target = num_events as u32; // $exit
-        func.instruction(&Instruction::LocalGet(0));
-        func.instruction(&Instruction::BrTable(targets.into(), default_target));
-
-        // Emit handlers in order: event 0 first (innermost block ends first).
-        for idx in 0..num_events {
-            func.instruction(&Instruction::End); // end block for event idx
-            let event_id = EventId(u32::try_from(idx).unwrap());
-            self.emit_event_handler(&mut func, event_id);
-            // Branch to $exit after handling.
-            let exit_depth = (num_events - 1 - idx) as u32;
-            func.instruction(&Instruction::Br(exit_depth));
-        }
-
-        func.instruction(&Instruction::End); // end $exit block
-        func.instruction(&Instruction::End); // end function
-        *self.filter_locals.borrow_mut() = None;
-        func
-    }
-
     /// Emit the `set_global(cell_id: i32, value: f64)` function body.
-    /// Uses `br_table` for O(1) dispatch.
-    fn emit_set_global(&self) -> Function {
+    /// When `chunk_info` is Some, dispatches to per-chunk sub-functions to avoid
+    /// exceeding Chrome's br_table size limit.
+    fn emit_set_global(&self, chunk_info: Option<(u32, usize)>) -> Function {
         let mut func = Function::new([]);
         let num_cells = self.program.cells.len();
 
@@ -902,27 +1339,91 @@ impl<'a> WasmEmitter<'a> {
             return func;
         }
 
-        // Same br_table pattern as on_event.
+        if let Some((first_chunk_fn, num_chunks)) = chunk_info {
+            // Two-level dispatch: outer br_table on cell_id / CHUNK_SIZE,
+            // then call the appropriate chunk sub-function with (cell_id, value).
+            func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            for _ in 0..num_chunks {
+                func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            }
+
+            // Compute chunk index: cell_id / CHUNK_SIZE
+            func.instruction(&Instruction::LocalGet(0));
+            func.instruction(&Instruction::I32Const(
+                i32::try_from(SET_GLOBAL_CHUNK_SIZE).unwrap(),
+            ));
+            func.instruction(&Instruction::I32DivU);
+            let targets: Vec<u32> = (0..num_chunks as u32).collect();
+            let default_target = num_chunks as u32;
+            func.instruction(&Instruction::BrTable(targets.into(), default_target));
+
+            for chunk_idx in 0..num_chunks {
+                func.instruction(&Instruction::End);
+                // Call chunk sub-function with original (cell_id, value).
+                func.instruction(&Instruction::LocalGet(0));
+                func.instruction(&Instruction::LocalGet(1));
+                func.instruction(&Instruction::Call(first_chunk_fn + chunk_idx as u32));
+                let exit_depth = (num_chunks - 1 - chunk_idx) as u32;
+                func.instruction(&Instruction::Br(exit_depth));
+            }
+
+            func.instruction(&Instruction::End);
+            func.instruction(&Instruction::End);
+        } else {
+            // Small program: single-level br_table.
+            func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            for _ in 0..num_cells {
+                func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            }
+
+            let targets: Vec<u32> = (0..num_cells as u32).collect();
+            let default_target = num_cells as u32;
+            func.instruction(&Instruction::LocalGet(0));
+            func.instruction(&Instruction::BrTable(targets.into(), default_target));
+
+            for idx in 0..num_cells {
+                func.instruction(&Instruction::End);
+                func.instruction(&Instruction::LocalGet(1));
+                func.instruction(&Instruction::GlobalSet(u32::try_from(idx).unwrap()));
+                let exit_depth = (num_cells - 1 - idx) as u32;
+                func.instruction(&Instruction::Br(exit_depth));
+            }
+
+            func.instruction(&Instruction::End);
+            func.instruction(&Instruction::End);
+        }
+        func
+    }
+
+    /// Emit a set_global chunk sub-function for cells[start..end].
+    /// Signature: (cell_id: i32, value: f64) -> ()
+    fn emit_set_global_chunk(&self, start: usize, end: usize) -> Function {
+        let mut func = Function::new([]);
+        let chunk_len = end - start;
+
         func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
-        for _ in 0..num_cells {
+        for _ in 0..chunk_len {
             func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
         }
 
-        let targets: Vec<u32> = (0..num_cells as u32).collect();
-        let default_target = num_cells as u32;
-        func.instruction(&Instruction::LocalGet(0)); // cell_id
+        // Adjust cell_id to chunk-local index: cell_id - start
+        func.instruction(&Instruction::LocalGet(0));
+        func.instruction(&Instruction::I32Const(i32::try_from(start).unwrap()));
+        func.instruction(&Instruction::I32Sub);
+        let targets: Vec<u32> = (0..chunk_len as u32).collect();
+        let default_target = chunk_len as u32;
         func.instruction(&Instruction::BrTable(targets.into(), default_target));
 
-        for idx in 0..num_cells {
-            func.instruction(&Instruction::End); // end block for cell idx
-            func.instruction(&Instruction::LocalGet(1)); // value
-            func.instruction(&Instruction::GlobalSet(u32::try_from(idx).unwrap()));
-            let exit_depth = (num_cells - 1 - idx) as u32;
+        for idx in 0..chunk_len {
+            func.instruction(&Instruction::End);
+            func.instruction(&Instruction::LocalGet(1));
+            func.instruction(&Instruction::GlobalSet(u32::try_from(start + idx).unwrap()));
+            let exit_depth = (chunk_len - 1 - idx) as u32;
             func.instruction(&Instruction::Br(exit_depth));
         }
 
-        func.instruction(&Instruction::End); // end $exit
-        func.instruction(&Instruction::End); // end function
+        func.instruction(&Instruction::End);
+        func.instruction(&Instruction::End);
         func
     }
 
@@ -1143,7 +1644,10 @@ impl<'a> WasmEmitter<'a> {
 
     /// Check if a body expression is a text expression (any TextConcat).
     fn is_text_body(&self, body: &IrExpr) -> bool {
-        matches!(body, IrExpr::TextConcat(_))
+        matches!(
+            body,
+            IrExpr::TextConcat(_) | IrExpr::Constant(IrValue::Text(_))
+        )
     }
 
     /// If `body` is a TextConcat with all-literal segments, emit a call to
@@ -1151,7 +1655,18 @@ impl<'a> WasmEmitter<'a> {
     /// Also bumps the cell's f64 global by +1 so signal watchers fire even
     /// when the numeric value would otherwise stay constant (0.0 → 0.0).
     fn emit_text_setting(&self, func: &mut Function, cell: CellId, body: &IrExpr) {
-        if let IrExpr::TextConcat(segments) = body {
+        if let IrExpr::Constant(IrValue::Text(t)) = body {
+            // Constant text (e.g., Text/empty(), Text/space()).
+            let pattern_idx = self.register_text_pattern(t);
+            func.instruction(&Instruction::I32Const(cell.0 as i32));
+            func.instruction(&Instruction::I32Const(pattern_idx as i32));
+            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
+            // Bump f64 global so signal fires.
+            func.instruction(&Instruction::GlobalGet(cell.0));
+            func.instruction(&Instruction::F64Const(1.0));
+            func.instruction(&Instruction::F64Add);
+            func.instruction(&Instruction::GlobalSet(cell.0));
+        } else if let IrExpr::TextConcat(segments) = body {
             // Collect all-literal text.
             let mut all_literal = true;
             let mut text = String::new();
@@ -1225,10 +1740,11 @@ impl<'a> WasmEmitter<'a> {
         source: CellId,
         arms: &[(IrPattern, IrExpr)],
         target: CellId,
+        propagate_downstream: bool,
     ) {
         // Emit nested if-else chain so only the FIRST matching arm executes.
         // Without this, wildcards would always overwrite earlier matches.
-        self.emit_pattern_arms(func, source, arms, target, 0);
+        self.emit_pattern_arms(func, source, arms, target, 0, propagate_downstream);
     }
 
     /// Recursively emit pattern match arms as nested if-else blocks.
@@ -1239,6 +1755,7 @@ impl<'a> WasmEmitter<'a> {
         arms: &[(IrPattern, IrExpr)],
         target: CellId,
         idx: usize,
+        propagate_downstream: bool,
     ) {
         if idx >= arms.len() {
             return;
@@ -1262,11 +1779,11 @@ impl<'a> WasmEmitter<'a> {
                 func.instruction(&Instruction::F64Eq);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 if !is_skip {
-                    self.emit_arm_body(func, body, target);
+                    self.emit_arm_body(func, body, target, propagate_downstream);
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms(func, source, arms, target, idx + 1);
+                    self.emit_pattern_arms(func, source, arms, target, idx + 1, propagate_downstream);
                 }
                 func.instruction(&Instruction::End);
             }
@@ -1276,11 +1793,11 @@ impl<'a> WasmEmitter<'a> {
                 func.instruction(&Instruction::F64Eq);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 if !is_skip {
-                    self.emit_arm_body(func, body, target);
+                    self.emit_arm_body(func, body, target, propagate_downstream);
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms(func, source, arms, target, idx + 1);
+                    self.emit_pattern_arms(func, source, arms, target, idx + 1, propagate_downstream);
                 }
                 func.instruction(&Instruction::End);
             }
@@ -1292,18 +1809,18 @@ impl<'a> WasmEmitter<'a> {
                 func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_MATCHES));
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 if !is_skip {
-                    self.emit_arm_body(func, body, target);
+                    self.emit_arm_body(func, body, target, propagate_downstream);
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms(func, source, arms, target, idx + 1);
+                    self.emit_pattern_arms(func, source, arms, target, idx + 1, propagate_downstream);
                 }
                 func.instruction(&Instruction::End);
             }
             IrPattern::Wildcard | IrPattern::Binding(_) => {
                 // Wildcard matches everything — no remaining arms matter.
                 if !is_skip {
-                    self.emit_arm_body(func, body, target);
+                    self.emit_arm_body(func, body, target, propagate_downstream);
                 }
             }
         }
@@ -1315,7 +1832,7 @@ impl<'a> WasmEmitter<'a> {
     /// If the body's dependency chain includes a WHEN that SKIPped, the entire arm body
     /// is skipped (no cell update, no downstream propagation). This implements nested
     /// SKIP propagation: inner WHEN SKIP → outer arm body also skips.
-    fn emit_arm_body(&self, func: &mut Function, body: &IrExpr, target: CellId) {
+    fn emit_arm_body(&self, func: &mut Function, body: &IrExpr, target: CellId, propagate_downstream: bool) {
         let skip_global = self.program.cells.len() as u32;
 
         // Set skip flag = 1.0 (no skip) before re-evaluating the dependency chain.
@@ -1362,7 +1879,9 @@ impl<'a> WasmEmitter<'a> {
         func.instruction(&Instruction::I32Const(target.0 as i32));
         func.instruction(&Instruction::GlobalGet(target.0));
         func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
-        self.emit_downstream_updates(func, target);
+        if propagate_downstream {
+            self.emit_downstream_updates(func, target);
+        }
 
         // Signal that this arm produced a value (for callers checking skip_global).
         func.instruction(&Instruction::F64Const(1.0));
@@ -1443,8 +1962,10 @@ impl<'a> WasmEmitter<'a> {
                     let skip_global = self.program.cells.len() as u32;
                     func.instruction(&Instruction::F64Const(0.0));
                     func.instruction(&Instruction::GlobalSet(skip_global));
-                    // Re-evaluate the pattern match inline.
-                    self.emit_pattern_match(func, *source, arms, cell);
+                    // Re-evaluate the pattern match inline. Don't propagate downstream —
+                    // this is an upstream re-evaluation context (refreshing stale cells),
+                    // not a change propagation. Propagating would cycle through While deps.
+                    self.emit_pattern_match(func, *source, arms, cell, false);
                 }
                 IrNode::PipeThrough { source, .. } => {
                     self.emit_reevaluate_cell_guarded(func, *source, visiting);
@@ -1543,7 +2064,8 @@ impl<'a> WasmEmitter<'a> {
                             );
                         }
                     }
-                    self.emit_pattern_match_ctx(func, *source, arms, cell, Some(mem_ctx));
+                    // Don't propagate downstream — upstream re-evaluation context only.
+                    self.emit_pattern_match_ctx(func, *source, arms, cell, Some(mem_ctx), false);
                 }
                 IrNode::PipeThrough { source, .. } => {
                     self.emit_reevaluate_cell_ctx_guarded(func, *source, mem_ctx, visiting);
@@ -1565,39 +2087,11 @@ impl<'a> WasmEmitter<'a> {
     }
 
     /// Find the IrNode that defines a cell (for re-evaluation).
+    /// Uses precomputed cell_to_node_idx for O(1) lookup.
     fn find_node_for_cell(&self, cell: CellId) -> Option<&IrNode> {
-        for node in &self.program.nodes {
-            match node {
-                IrNode::Derived { cell: c, .. }
-                | IrNode::Hold { cell: c, .. }
-                | IrNode::Latest { target: c, .. }
-                | IrNode::Then { cell: c, .. }
-                | IrNode::When { cell: c, .. }
-                | IrNode::While { cell: c, .. }
-                | IrNode::MathSum { cell: c, .. }
-                | IrNode::PipeThrough { cell: c, .. }
-                | IrNode::TextInterpolation { cell: c, .. }
-                | IrNode::CustomCall { cell: c, .. }
-                | IrNode::Element { cell: c, .. }
-                | IrNode::ListAppend { cell: c, .. }
-                | IrNode::ListClear { cell: c, .. }
-                | IrNode::ListCount { cell: c, .. }
-                | IrNode::ListMap { cell: c, .. }
-                | IrNode::ListRemove { cell: c, .. }
-                | IrNode::ListRetain { cell: c, .. }
-                | IrNode::ListIsEmpty { cell: c, .. }
-                | IrNode::RouterGoTo { cell: c, .. }
-                | IrNode::TextTrim { cell: c, .. }
-                | IrNode::TextIsNotEmpty { cell: c, .. }
-                | IrNode::HoldLoop { cell: c, .. } => {
-                    if *c == cell {
-                        return Some(node);
-                    }
-                }
-                IrNode::Document { .. } | IrNode::Timer { .. } => {}
-            }
-        }
-        None
+        self.cell_to_node_idx
+            .get(&cell)
+            .map(|&idx| &self.program.nodes[idx])
     }
 
     /// Resolve the display text for a cell statically by following CellRead chains
@@ -1863,8 +2357,12 @@ impl<'a> WasmEmitter<'a> {
     }
 
     /// After a list mutation (append/clear), update downstream ListCount and ListMap cells.
+    /// Uses precomputed `list_downstream` index for O(1) consumer lookup.
     fn emit_list_downstream_updates(&self, func: &mut Function, list_cell: CellId) {
-        for node in &self.program.nodes {
+        let empty = Vec::new();
+        let consumer_indices = self.list_downstream.get(&list_cell).unwrap_or(&empty);
+        for &idx in consumer_indices {
+            let node = &self.program.nodes[idx];
             match node {
                 IrNode::ListCount { cell, source } if *source == list_cell => {
                     // Re-read count from host.
@@ -1963,14 +2461,89 @@ impl<'a> WasmEmitter<'a> {
                     }
                     self.emit_list_downstream_updates(func, *cell);
                 }
+                IrNode::ListEvery {
+                    cell,
+                    source,
+                    predicate,
+                    item_cell,
+                    item_field_cells,
+                } if *source == list_cell => {
+                    if let (Some(pred), Some((l0, l1, l2, l3))) =
+                        (predicate, *self.filter_locals.borrow())
+                    {
+                        if item_cell.is_some() {
+                            self.emit_boolean_check_loop(
+                                func, *cell, *source, *pred, *item_cell,
+                                item_field_cells, l0, l1, l2, l3, true,
+                            );
+                        }
+                    }
+                    self.emit_downstream_updates(func, *cell);
+                }
+                IrNode::ListAny {
+                    cell,
+                    source,
+                    predicate,
+                    item_cell,
+                    item_field_cells,
+                } if *source == list_cell => {
+                    if let (Some(pred), Some((l0, l1, l2, l3))) =
+                        (predicate, *self.filter_locals.borrow())
+                    {
+                        if item_cell.is_some() {
+                            self.emit_boolean_check_loop(
+                                func, *cell, *source, *pred, *item_cell,
+                                item_field_cells, l0, l1, l2, l3, false,
+                            );
+                        }
+                    }
+                    self.emit_downstream_updates(func, *cell);
+                }
+                _ => {}
+            }
+        }
+
+        // Follow PipeThrough / Derived(CellRead) chains so list updates propagate
+        // through object-field wrappers (e.g., ListAppend cell=65 → PipeThrough → cell=11
+        // where the ListMap sources from cell=11).
+        let regular_consumers = self.downstream.get(&list_cell).unwrap_or(&empty);
+        for &idx in regular_consumers {
+            let node = &self.program.nodes[idx];
+            match node {
+                IrNode::PipeThrough { cell, source } if *source == list_cell => {
+                    // The list handle flows through a PipeThrough. Copy the value
+                    // and recursively propagate list downstream from the target cell.
+                    func.instruction(&Instruction::GlobalGet(source.0));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    self.emit_list_downstream_updates(func, *cell);
+                }
+                IrNode::Derived {
+                    cell,
+                    expr: IrExpr::CellRead(src),
+                } if *src == list_cell => {
+                    // List handle flows through a Derived(CellRead). Same propagation.
+                    func.instruction(&Instruction::GlobalGet(src.0));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    self.emit_list_downstream_updates(func, *cell);
+                }
                 _ => {}
             }
         }
     }
 
     /// After updating a cell, check for downstream nodes (e.g., MathSum) that need updating.
+    /// Uses precomputed `downstream` index for O(1) consumer lookup instead of O(n) scan.
     fn emit_downstream_updates(&self, func: &mut Function, updated_cell: CellId) {
-        for node in &self.program.nodes {
+        let empty = Vec::new();
+        let consumer_indices = self.downstream.get(&updated_cell).unwrap_or(&empty);
+        for &idx in consumer_indices {
+            let node = &self.program.nodes[idx];
             match node {
                 IrNode::MathSum { cell, input } if *input == updated_cell => {
                     // Accumulate: cell += input.
@@ -2034,7 +2607,7 @@ impl<'a> WasmEmitter<'a> {
                 }
                 // WHEN re-evaluates when source cell changes.
                 IrNode::When { cell, source, arms } if *source == updated_cell => {
-                    self.emit_pattern_match(func, *source, arms, *cell);
+                    self.emit_pattern_match(func, *source, arms, *cell, true);
                 }
                 // WHILE re-evaluates when source OR any dep changes.
                 IrNode::While {
@@ -2043,7 +2616,7 @@ impl<'a> WasmEmitter<'a> {
                     deps,
                     arms,
                 } if *source == updated_cell || deps.contains(&updated_cell) => {
-                    self.emit_pattern_match(func, *source, arms, *cell);
+                    self.emit_pattern_match(func, *source, arms, *cell, true);
                 }
                 // LATEST with non-triggered arms re-evaluates when referenced cells change.
                 IrNode::Latest { target, arms } if *target != updated_cell => {
@@ -2136,9 +2709,12 @@ impl<'a> WasmEmitter<'a> {
                     self.emit_downstream_updates(func, *cell);
                 }
                 // ListAppend triggered by item cell change (downstream propagation).
+                // Guard: skip when watch_cell == item, because the watch_cell handler
+                // (below) already handles append with SKIP sentinel checking.
                 IrNode::ListAppend {
-                    cell, source, item, ..
-                } if *item == updated_cell => {
+                    cell, source, item, watch_cell, ..
+                } if *item == updated_cell
+                    && watch_cell.map_or(true, |w| w != *item) => {
                     // Append text from item cell to the list.
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::I32Const(item.0 as i32));
@@ -2213,6 +2789,41 @@ impl<'a> WasmEmitter<'a> {
                         func.instruction(&Instruction::GlobalGet(cell.0));
                         func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                         self.emit_list_downstream_updates(func, *cell);
+                    }
+                }
+                // ListEvery/ListAny: when predicate cell changes, re-evaluate.
+                IrNode::ListEvery {
+                    cell,
+                    source,
+                    predicate: Some(pred),
+                    item_cell,
+                    item_field_cells,
+                } if *pred == updated_cell => {
+                    if let (true, Some((l0, l1, l2, l3))) =
+                        (item_cell.is_some(), *self.filter_locals.borrow())
+                    {
+                        self.emit_boolean_check_loop(
+                            func, *cell, *source, *pred, *item_cell,
+                            item_field_cells, l0, l1, l2, l3, true,
+                        );
+                        self.emit_downstream_updates(func, *cell);
+                    }
+                }
+                IrNode::ListAny {
+                    cell,
+                    source,
+                    predicate: Some(pred),
+                    item_cell,
+                    item_field_cells,
+                } if *pred == updated_cell => {
+                    if let (true, Some((l0, l1, l2, l3))) =
+                        (item_cell.is_some(), *self.filter_locals.borrow())
+                    {
+                        self.emit_boolean_check_loop(
+                            func, *cell, *source, *pred, *item_cell,
+                            item_field_cells, l0, l1, l2, l3, false,
+                        );
+                        self.emit_downstream_updates(func, *cell);
                     }
                 }
                 // ListRemove: predicate changes don't trigger re-filtering.
@@ -2552,115 +3163,130 @@ impl<'a> WasmEmitter<'a> {
     }
 
     // -----------------------------------------------------------------------
-    // Per-item memory helpers
+    // Per-item cell helpers
     // -----------------------------------------------------------------------
 
     /// Emit instructions to read a cell value (f64) onto the stack.
-    /// If mem_ctx is Some and cell is in template range, reads from linear memory.
-    /// Otherwise, reads from the WASM global.
-    fn emit_cell_get(&self, func: &mut Function, cell: CellId, mem_ctx: Option<&MemoryContext>) {
-        if let Some(ctx) = mem_ctx {
-            if cell.0 >= ctx.cell_start && cell.0 < ctx.cell_end {
-                self.emit_mem_addr(func, ctx, cell);
-                func.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-                    offset: 0,
-                    align: 3, // 2^3 = 8 byte alignment
-                    memory_index: 0,
-                }));
-                return;
-            }
-        }
+    /// Always reads from WASM global (used as workspace for per-item cells).
+    fn emit_cell_get(&self, func: &mut Function, cell: CellId, _mem_ctx: Option<&MemoryContext>) {
         func.instruction(&Instruction::GlobalGet(cell.0));
     }
 
     /// Emit instructions to write a cell value. Value must already be on the stack.
-    /// If mem_ctx is Some and cell is in template range, writes to linear memory.
-    /// Otherwise, writes to the WASM global.
-    ///
-    /// NOTE: For memory writes, the address must be pushed BEFORE the value.
-    /// This method expects the value is already on the stack and pushes addr underneath
-    /// using a temp local. Callers should use `emit_cell_set_with_addr` for the
-    /// push-addr-then-value pattern.
-    fn emit_cell_set(&self, func: &mut Function, cell: CellId, mem_ctx: Option<&MemoryContext>) {
-        if let Some(ctx) = mem_ctx {
-            if cell.0 >= ctx.cell_start && cell.0 < ctx.cell_end {
-                // Value is on stack. Store to global temp, push addr, get value back, store.
-                let temp_global = self.program.cells.len() as u32; // temp global
-                func.instruction(&Instruction::GlobalSet(temp_global));
-                self.emit_mem_addr(func, ctx, cell);
-                func.instruction(&Instruction::GlobalGet(temp_global));
-                func.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
-                    offset: 0,
-                    align: 3,
-                    memory_index: 0,
-                }));
-                return;
-            }
-        }
+    /// Always writes to WASM global (used as workspace for per-item cells).
+    fn emit_cell_set(&self, func: &mut Function, cell: CellId, _mem_ctx: Option<&MemoryContext>) {
         func.instruction(&Instruction::GlobalSet(cell.0));
     }
 
-    /// Emit memory address computation for a per-item cell.
-    /// Pushes i32 address onto the stack.
-    fn emit_mem_addr(&self, func: &mut Function, ctx: &MemoryContext, cell: CellId) {
-        let local_offset = (cell.0 - ctx.cell_start) * 8;
-        func.instruction(&Instruction::LocalGet(ctx.item_idx_local));
-        func.instruction(&Instruction::I32Const(ctx.stride as i32));
-        func.instruction(&Instruction::I32Mul);
-        func.instruction(&Instruction::I32Const(
-            (ctx.memory_base + local_offset) as i32,
-        ));
-        func.instruction(&Instruction::I32Add);
-    }
-
-    /// Find the first ListMap node and return its template ranges.
-    fn find_list_map_info(&self) -> Option<(u32, u32, u32, u32)> {
+    /// Collect info for ALL ListMap nodes in the program.
+    fn find_all_list_map_infos(&self) -> Vec<ListMapInfo> {
+        let mut infos = Vec::new();
         for node in &self.program.nodes {
             if let IrNode::ListMap {
+                cell,
+                source,
+                item_cell,
                 template_cell_range,
                 template_event_range,
                 ..
             } = node
             {
-                return Some((
-                    template_cell_range.0,
-                    template_cell_range.1,
-                    template_event_range.0,
-                    template_event_range.1,
-                ));
+                infos.push(ListMapInfo {
+                    cell: *cell,
+                    source: *source,
+                    item_cell: *item_cell,
+                    cell_range: *template_cell_range,
+                    event_range: *template_event_range,
+                });
             }
         }
-        None
+        infos
     }
 
-    /// Build a MemoryContext for the first ListMap in the program.
-    fn build_memory_context(&self, item_idx_local: u32) -> Option<MemoryContext> {
-        let (cell_start, cell_end, _, _) = self.find_list_map_info()?;
-        let cell_count = cell_end - cell_start;
+    /// Find the first ListMap node and return its template ranges (backward compat).
+    /// Build a MemoryContext for a specific ListMap.
+    fn build_template_context(info: &ListMapInfo, item_idx_local: u32) -> Option<MemoryContext> {
+        let cell_count = info.cell_range.1 - info.cell_range.0;
         if cell_count == 0 {
             return None;
         }
         Some(MemoryContext {
             item_idx_local,
-            memory_base: 0,
-            stride: cell_count * 8,
-            cell_start,
-            cell_end,
+            cell_start: info.cell_range.0,
+            cell_end: info.cell_range.1,
         })
     }
 
+    /// Find which ListMap is downstream of a given list source cell.
+    /// Traces through ListRetain/PipeThrough chains to find the ListMap
+    /// that ultimately reads from this source.
+    fn find_list_map_for_source(&self, source: CellId) -> Option<CellId> {
+        let all_maps = self.find_all_list_map_infos();
+        // Direct match: ListMap.source == source
+        for info in &all_maps {
+            if info.source == source {
+                return Some(info.cell);
+            }
+        }
+        // Trace through ListRetain/PipeThrough/ListMap chains.
+        // Build a mapping: cell → downstream cells.
+        for info in &all_maps {
+            let mut current = info.source;
+            for _ in 0..100 {
+                // safety limit
+                if current == source {
+                    return Some(info.cell);
+                }
+                // Find what produces `current`.
+                let mut found = false;
+                for node in &self.program.nodes {
+                    match node {
+                        IrNode::ListRetain {
+                            cell: output,
+                            source: src,
+                            ..
+                        }
+                        | IrNode::PipeThrough {
+                            cell: output,
+                            source: src,
+                        } if *output == current => {
+                            current = *src;
+                            found = true;
+                            break;
+                        }
+                        IrNode::ListMap {
+                            cell: output,
+                            source: src,
+                            ..
+                        } if *output == current => {
+                            current = *src;
+                            found = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if !found {
+                    break;
+                }
+            }
+        }
+        None
+    }
+
     /// After appending an item, call init_item to initialize the new item's
-    /// WASM memory slot before downstream updates (retain filters) run.
-    /// Without this, retain filters read stale memory values from previously
-    /// cleared items, causing incorrect counts.
+    /// cells before downstream updates (retain filters) run.
+    /// Passes the correct map_cell so init_item initializes the right ListMap.
     fn emit_init_new_item(&self, func: &mut Function, source: CellId) {
-        if self.find_list_map_info().is_some() {
+        if let Some(map_cell) = self.find_list_map_for_source(source) {
             // Get new item's index: count - 1 (item was just appended).
             func.instruction(&Instruction::I32Const(source.0 as i32));
             func.instruction(&Instruction::Call(IMPORT_HOST_LIST_COUNT));
             func.instruction(&Instruction::F64Const(1.0));
             func.instruction(&Instruction::F64Sub);
             func.instruction(&Instruction::I32TruncF64S);
+            // Push map_cell identifier.
+            func.instruction(&Instruction::I32Const(map_cell.0 as i32));
             func.instruction(&Instruction::Call(FN_INIT_ITEM));
         }
     }
@@ -2669,22 +3295,89 @@ impl<'a> WasmEmitter<'a> {
     // Per-item retain (filter loop)
     // -----------------------------------------------------------------------
 
-    /// Check if any ListRetain or ListRemove has per-item filtering.
+    /// Check if any ListRetain, ListEvery, ListAny, or ListRemove has per-item filtering.
     fn has_per_item_filter(&self) -> bool {
         self.program.nodes.iter().any(|node| {
             matches!(node, IrNode::ListRetain { item_cell: Some(_), .. })
+            || matches!(node, IrNode::ListEvery { item_cell: Some(_), .. })
+            || matches!(node, IrNode::ListAny { item_cell: Some(_), .. })
             || matches!(node, IrNode::ListRemove { item_field_cells, .. } if !item_field_cells.is_empty())
         })
     }
 
     /// Find the ListMap's item_cell for looking up template field cells.
-    fn find_list_map_item_cell(&self) -> Option<CellId> {
-        for node in &self.program.nodes {
-            if let IrNode::ListMap { item_cell, .. } = node {
-                return Some(*item_cell);
+    /// If `for_source` is provided, finds ALL ListMaps whose source chain
+    /// includes that cell, then picks the one with the largest template range.
+    /// The largest template is the rendering template — it contains the interactive
+    /// elements (checkboxes, buttons) whose events update per-item field cells.
+    /// When multiple ListMaps exist on the same source (e.g., one for data
+    /// processing, one for rendering), the filter must read from the rendering
+    /// template to see event-driven updates.
+    fn find_list_map_item_cell_for(&self, for_source: Option<CellId>) -> Option<CellId> {
+        let all_maps = self.find_all_list_map_infos();
+
+        if let Some(source) = for_source {
+            // Find ALL ListMaps connected to source (directly or via chains).
+            let mut connected: Vec<&ListMapInfo> = Vec::new();
+
+            for info in &all_maps {
+                // Direct match.
+                if info.source == source {
+                    connected.push(info);
+                    continue;
+                }
+                // Chain match: trace backwards from ListMap.source through
+                // ListRetain/PipeThrough/ListMap to find the original source.
+                let mut current = info.source;
+                for _ in 0..100 {
+                    if current == source {
+                        connected.push(info);
+                        break;
+                    }
+                    let mut found = false;
+                    for node in &self.program.nodes {
+                        match node {
+                            IrNode::ListRetain {
+                                cell: output,
+                                source: src,
+                                ..
+                            }
+                            | IrNode::PipeThrough {
+                                cell: output,
+                                source: src,
+                            }
+                            | IrNode::ListMap {
+                                cell: output,
+                                source: src,
+                                ..
+                            } if *output == current => {
+                                current = *src;
+                                found = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !found {
+                        break;
+                    }
+                }
+            }
+
+            // Prefer the ListMap with the largest template range (rendering template).
+            if let Some(best) = connected
+                .iter()
+                .max_by_key(|info| info.cell_range.1 - info.cell_range.0)
+            {
+                return Some(best.item_cell);
             }
         }
-        None
+
+        // Fallback to largest ListMap (consistent with above preference).
+        all_maps
+            .iter()
+            .max_by_key(|info| info.cell_range.1 - info.cell_range.0)
+            .map(|info| info.item_cell)
     }
 
     /// Emit a WASM filter loop that iterates source list items, evaluates the
@@ -2712,12 +3405,7 @@ impl<'a> WasmEmitter<'a> {
         local_mem_idx: u32,
         invert: bool,
     ) {
-        let (cell_start, cell_end, _, _) = match self.find_list_map_info() {
-            Some(info) => info,
-            None => return,
-        };
-        let stride = (cell_end - cell_start) * 8;
-        let list_map_item_cell = match self.find_list_map_item_cell() {
+        let list_map_item_cell = match self.find_list_map_item_cell_for(Some(source_cell)) {
             Some(c) => c,
             None => return,
         };
@@ -2754,18 +3442,18 @@ impl<'a> WasmEmitter<'a> {
             func.instruction(&Instruction::GlobalSet(predicate.0));
         }
 
-        // Read per-item field values from WASM linear memory into field sub-cell globals.
-        // Use host_list_item_memory_index to get the correct WASM memory slot for each
+        // Read per-item field values from host-side ItemCellStore.
+        // Use host_list_item_memory_index to get the correct item slot index for each
         // list position. After List/remove, the source list becomes index-based — position 0
-        // may map to original memory index 1 if item 0 was removed. Without this lookup,
-        // the filter loop reads stale data from the removed item's memory slot.
-        //
-        // For non-index-based lists (initial state, after append), memory_index == position,
-        // so the lookup is a no-op identity mapping.
+        // may map to original item index 1 if item 0 was removed.
         func.instruction(&Instruction::I32Const(source_cell.0 as i32));
         func.instruction(&Instruction::LocalGet(local_i));
         func.instruction(&Instruction::Call(IMPORT_HOST_LIST_ITEM_MEMORY_INDEX));
         func.instruction(&Instruction::LocalSet(local_mem_idx));
+
+        // Set item context so host_get_cell_f64 reads from per-item store.
+        func.instruction(&Instruction::LocalGet(local_mem_idx));
+        func.instruction(&Instruction::Call(IMPORT_HOST_SET_ITEM_CONTEXT));
 
         for (field_name, sub_cell) in item_field_cells {
             // Find the template field cell for this field name.
@@ -2776,22 +3464,15 @@ impl<'a> WasmEmitter<'a> {
                 .and_then(|fields| fields.get(field_name))
                 .copied();
             if let Some(tfc) = template_field_cell {
-                let field_offset = (tfc.0 - cell_start) * 8;
-                // addr = mem_idx * stride + field_offset
-                func.instruction(&Instruction::LocalGet(local_mem_idx));
-                func.instruction(&Instruction::I32Const(stride as i32));
-                func.instruction(&Instruction::I32Mul);
-                func.instruction(&Instruction::I32Const(field_offset as i32));
-                func.instruction(&Instruction::I32Add);
-                // f64.load from linear memory
-                func.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-                    offset: 0,
-                    align: 3, // 2^3 = 8 byte alignment
-                    memory_index: 0,
-                }));
+                // Read per-item cell value via host import.
+                func.instruction(&Instruction::I32Const(tfc.0 as i32));
+                func.instruction(&Instruction::Call(IMPORT_HOST_GET_CELL_F64));
                 func.instruction(&Instruction::GlobalSet(sub_cell.0));
             }
         }
+
+        // Clear item context after reading field values.
+        func.instruction(&Instruction::Call(IMPORT_HOST_CLEAR_ITEM_CONTEXT));
 
         // For numeric list items (no field cells), load the item value from the host.
         // The item cell's global needs the actual item value for predicates like `n == 2`.
@@ -2871,6 +3552,175 @@ impl<'a> WasmEmitter<'a> {
 
         // 4. Set output cell to new list
         func.instruction(&Instruction::LocalGet(local_new_list));
+        func.instruction(&Instruction::GlobalSet(output_cell.0));
+        func.instruction(&Instruction::I32Const(output_cell.0 as i32));
+        func.instruction(&Instruction::GlobalGet(output_cell.0));
+        func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+    }
+
+    /// Emit a WASM boolean check loop that iterates source list items, evaluates the
+    /// predicate per-item, and returns 1.0 or 0.0.
+    ///
+    /// When `is_every` is true (List/every): starts at 1.0, sets to 0.0 and breaks on first falsy.
+    /// When `is_every` is false (List/any): starts at 0.0, sets to 1.0 and breaks on first truthy.
+    ///
+    /// Shares the per-item field loading and predicate evaluation logic with emit_filter_loop.
+    fn emit_boolean_check_loop(
+        &self,
+        func: &mut Function,
+        output_cell: CellId,
+        source_cell: CellId,
+        predicate: CellId,
+        item_cell: Option<CellId>,
+        item_field_cells: &[(String, CellId)],
+        local_result: u32,
+        local_count: u32,
+        local_i: u32,
+        local_mem_idx: u32,
+        is_every: bool,
+    ) {
+        let list_map_item_cell = match self.find_list_map_item_cell_for(Some(source_cell)) {
+            Some(c) => c,
+            None => {
+                // No ListMap: result depends on whether the list is empty.
+                // every([]) = true, any([]) = false.
+                let initial = if is_every { 1.0 } else { 0.0 };
+                func.instruction(&Instruction::F64Const(initial));
+                func.instruction(&Instruction::GlobalSet(output_cell.0));
+                func.instruction(&Instruction::I32Const(output_cell.0 as i32));
+                func.instruction(&Instruction::GlobalGet(output_cell.0));
+                func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                return;
+            }
+        };
+
+        // 1. Initialize result: every starts true, any starts false.
+        let initial = if is_every { 1.0 } else { 0.0 };
+        func.instruction(&Instruction::F64Const(initial));
+        func.instruction(&Instruction::LocalSet(local_result));
+
+        // 2. Get item count from source list.
+        func.instruction(&Instruction::I32Const(source_cell.0 as i32));
+        func.instruction(&Instruction::Call(IMPORT_HOST_LIST_COUNT));
+        func.instruction(&Instruction::I32TruncF64S);
+        func.instruction(&Instruction::LocalSet(local_count));
+
+        // 3. Loop: i = 0
+        func.instruction(&Instruction::I32Const(0));
+        func.instruction(&Instruction::LocalSet(local_i));
+
+        // block $break { loop $continue { ... } }
+        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+        // if (i >= count) break
+        func.instruction(&Instruction::LocalGet(local_i));
+        func.instruction(&Instruction::LocalGet(local_count));
+        func.instruction(&Instruction::I32GeS);
+        func.instruction(&Instruction::BrIf(1));
+
+        // Read per-item field values from host-side ItemCellStore.
+        func.instruction(&Instruction::I32Const(source_cell.0 as i32));
+        func.instruction(&Instruction::LocalGet(local_i));
+        func.instruction(&Instruction::Call(IMPORT_HOST_LIST_ITEM_MEMORY_INDEX));
+        func.instruction(&Instruction::LocalSet(local_mem_idx));
+
+        // Set item context so host_get_cell_f64 reads from per-item store.
+        func.instruction(&Instruction::LocalGet(local_mem_idx));
+        func.instruction(&Instruction::Call(IMPORT_HOST_SET_ITEM_CONTEXT));
+
+        for (field_name, sub_cell) in item_field_cells {
+            let template_field_cell = self
+                .program
+                .cell_field_cells
+                .get(&list_map_item_cell)
+                .and_then(|fields| fields.get(field_name))
+                .copied();
+            if let Some(tfc) = template_field_cell {
+                // Read per-item cell value via host import.
+                func.instruction(&Instruction::I32Const(tfc.0 as i32));
+                func.instruction(&Instruction::Call(IMPORT_HOST_GET_CELL_F64));
+                func.instruction(&Instruction::GlobalSet(sub_cell.0));
+            }
+        }
+
+        // Clear item context after reading field values.
+        func.instruction(&Instruction::Call(IMPORT_HOST_CLEAR_ITEM_CONTEXT));
+
+        // For numeric list items (no field cells), load item value.
+        if item_field_cells.is_empty() {
+            if let Some(ic) = item_cell {
+                func.instruction(&Instruction::I32Const(source_cell.0 as i32));
+                func.instruction(&Instruction::LocalGet(local_i));
+                func.instruction(&Instruction::Call(IMPORT_HOST_LIST_GET_ITEM_F64));
+                func.instruction(&Instruction::GlobalSet(ic.0));
+            }
+        }
+
+        // Re-evaluate intermediate Derived cells.
+        let mut field_cell_ids: Vec<CellId> = item_field_cells.iter().map(|(_, c)| *c).collect();
+        if item_field_cells.is_empty() {
+            if let Some(ic) = item_cell {
+                field_cell_ids.push(ic);
+            }
+        }
+        for node in &self.program.nodes {
+            if let IrNode::Derived { cell, expr } = node {
+                if field_cell_ids
+                    .iter()
+                    .any(|fc| Self::expr_references_cell(expr, *fc))
+                {
+                    self.emit_expr(func, expr);
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                }
+            }
+        }
+
+        // Evaluate the predicate.
+        let pred_node = self.find_node_for_cell(predicate);
+        match pred_node {
+            Some(IrNode::While { source, arms, .. }) => {
+                self.emit_pattern_arms_no_notify(func, *source, arms, predicate, 0, false);
+            }
+            Some(IrNode::When { source, arms, .. }) => {
+                self.emit_pattern_arms_no_notify(func, *source, arms, predicate, 0, false);
+            }
+            _ => {}
+        }
+
+        // Check predicate and short-circuit.
+        func.instruction(&Instruction::GlobalGet(predicate.0));
+        func.instruction(&Instruction::F64Const(0.0));
+        if is_every {
+            // every: if predicate is falsy → result = 0.0, break
+            func.instruction(&Instruction::F64Eq);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            func.instruction(&Instruction::F64Const(0.0));
+            func.instruction(&Instruction::LocalSet(local_result));
+            func.instruction(&Instruction::Br(2)); // break out of block
+            func.instruction(&Instruction::End);
+        } else {
+            // any: if predicate is truthy → result = 1.0, break
+            func.instruction(&Instruction::F64Ne);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            func.instruction(&Instruction::F64Const(1.0));
+            func.instruction(&Instruction::LocalSet(local_result));
+            func.instruction(&Instruction::Br(2)); // break out of block
+            func.instruction(&Instruction::End);
+        }
+
+        // i++
+        func.instruction(&Instruction::LocalGet(local_i));
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32Add);
+        func.instruction(&Instruction::LocalSet(local_i));
+        func.instruction(&Instruction::Br(0)); // br $continue
+
+        func.instruction(&Instruction::End); // end loop
+        func.instruction(&Instruction::End); // end block
+
+        // 4. Set output cell to result.
+        func.instruction(&Instruction::LocalGet(local_result));
         func.instruction(&Instruction::GlobalSet(output_cell.0));
         func.instruction(&Instruction::I32Const(output_cell.0 as i32));
         func.instruction(&Instruction::GlobalGet(output_cell.0));
@@ -3008,36 +3858,61 @@ impl<'a> WasmEmitter<'a> {
     // Per-item WASM function emitters
     // -----------------------------------------------------------------------
 
-    /// Emit `init_item(item_idx: i32)`.
-    /// Initializes all template cells in WASM memory for a new item.
+    /// Emit `init_item(item_idx: i32, map_cell: i32)`.
+    /// Initializes template cells for a new item in the specified ListMap.
+    /// Dispatches by map_cell to handle multiple ListMaps.
     fn emit_init_item(&self) -> Function {
+        // local 0 = item_idx, local 1 = map_cell
         let mut func = Function::new([]);
-        let mem_ctx = self.build_memory_context(0); // local 0 = item_idx
+        let all_maps = self.find_all_list_map_infos();
 
-        let mem_ctx = match mem_ctx {
-            Some(ctx) => ctx,
-            None => {
-                func.instruction(&Instruction::End);
-                return func;
-            }
-        };
+        if all_maps.is_empty() {
+            func.instruction(&Instruction::End);
+            return func;
+        }
 
         // Set item context so host routes updates to per-item Mutables.
         func.instruction(&Instruction::LocalGet(0)); // item_idx
         func.instruction(&Instruction::Call(IMPORT_HOST_SET_ITEM_CONTEXT));
 
-        // Initialize each template-scoped node.
+        // Dispatch by map_cell: each ListMap gets its own init block.
+        for info in &all_maps {
+            let mem_ctx = match Self::build_template_context(info, 0) {
+                Some(ctx) => ctx,
+                None => continue,
+            };
+
+            // if (local.1 == map_cell_id) { ... init cells ... }
+            func.instruction(&Instruction::LocalGet(1)); // map_cell
+            func.instruction(&Instruction::I32Const(info.cell.0 as i32));
+            func.instruction(&Instruction::I32Eq);
+            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+            // Initialize each template-scoped node for this ListMap.
+            self.emit_init_item_body(&mut func, &mem_ctx);
+
+            func.instruction(&Instruction::End); // end if
+        }
+
+        // Clear item context.
+        func.instruction(&Instruction::Call(IMPORT_HOST_CLEAR_ITEM_CONTEXT));
+        func.instruction(&Instruction::End);
+        func
+    }
+
+    /// Emit the body of init_item for a single ListMap's template range.
+    fn emit_init_item_body(&self, func: &mut Function, mem_ctx: &MemoryContext) {
         for node in &self.program.nodes {
             match node {
                 IrNode::Hold { cell, init, .. }
                     if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
                 {
-                    // Evaluate init expr → store to memory.
-                    self.emit_expr_ctx(&mut func, init, Some(&mem_ctx));
-                    self.emit_cell_set(&mut func, *cell, Some(&mem_ctx));
+                    // Evaluate init expr → store to global workspace.
+                    self.emit_expr_ctx(func, init, Some(mem_ctx));
+                    self.emit_cell_set(func, *cell, Some(mem_ctx));
                     // Notify host of per-item cell value.
                     func.instruction(&Instruction::I32Const(cell.0 as i32));
-                    self.emit_cell_get(&mut func, *cell, Some(&mem_ctx));
+                    self.emit_cell_get(func, *cell, Some(mem_ctx));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                     // Copy text from init source cell to HOLD cell so per-item
                     // text (e.g., todo title) propagates through HOLD.
@@ -3057,10 +3932,10 @@ impl<'a> WasmEmitter<'a> {
                 IrNode::Derived { cell, expr }
                     if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
                 {
-                    self.emit_expr_ctx(&mut func, expr, Some(&mem_ctx));
-                    self.emit_cell_set(&mut func, *cell, Some(&mem_ctx));
+                    self.emit_expr_ctx(func, expr, Some(mem_ctx));
+                    self.emit_cell_set(func, *cell, Some(mem_ctx));
                     func.instruction(&Instruction::I32Const(cell.0 as i32));
-                    self.emit_cell_get(&mut func, *cell, Some(&mem_ctx));
+                    self.emit_cell_get(func, *cell, Some(mem_ctx));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                     // Set text: CellRead copies from source, TextConcat builds
                     // dynamically, static expressions use pattern.
@@ -3073,7 +3948,7 @@ impl<'a> WasmEmitter<'a> {
                             .iter()
                             .any(|s| matches!(s, TextSegment::Expr(IrExpr::CellRead(_))))
                         {
-                            self.emit_text_build_ctx(&mut func, *cell, segments, Some(&mem_ctx));
+                            self.emit_text_build_ctx(func, *cell, segments, Some(mem_ctx));
                         } else if let Some(text) = self.resolve_expr_text_statically(expr) {
                             if !text.is_empty() {
                                 let pattern_idx = self.register_text_pattern(&text);
@@ -3096,33 +3971,31 @@ impl<'a> WasmEmitter<'a> {
                 IrNode::When { cell, source, arms }
                     if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
                 {
-                    self.emit_pattern_match_ctx(&mut func, *source, arms, *cell, Some(&mem_ctx));
+                    self.emit_pattern_match_ctx(func, *source, arms, *cell, Some(mem_ctx), true);
                 }
                 IrNode::While {
                     cell, source, arms, ..
                 } if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end => {
-                    self.emit_pattern_match_ctx(&mut func, *source, arms, *cell, Some(&mem_ctx));
+                    self.emit_pattern_match_ctx(func, *source, arms, *cell, Some(mem_ctx), true);
                 }
                 IrNode::Latest { target, arms }
                     if target.0 >= mem_ctx.cell_start && target.0 < mem_ctx.cell_end =>
                 {
                     // Initialize with the first arm's body (static or triggered).
-                    // For per-item LATEST like `text: LATEST { todo.title, element.event.change.text }`,
-                    // this sets the initial value from the first arm (e.g., copies todo.title text).
                     if let Some(arm) = arms.first() {
                         if self.is_text_body(&arm.body) {
                             self.emit_text_setting_ctx(
-                                &mut func,
+                                func,
                                 *target,
                                 &arm.body,
-                                Some(&mem_ctx),
+                                Some(mem_ctx),
                             );
                         } else {
-                            self.emit_expr_ctx(&mut func, &arm.body, Some(&mem_ctx));
-                            self.emit_cell_set(&mut func, *target, Some(&mem_ctx));
+                            self.emit_expr_ctx(func, &arm.body, Some(mem_ctx));
+                            self.emit_cell_set(func, *target, Some(mem_ctx));
                         }
                         func.instruction(&Instruction::I32Const(target.0 as i32));
-                        self.emit_cell_get(&mut func, *target, Some(&mem_ctx));
+                        self.emit_cell_get(func, *target, Some(mem_ctx));
                         func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                         // Copy text from the body's source cell.
                         if let IrExpr::CellRead(src) = &arm.body {
@@ -3135,15 +4008,11 @@ impl<'a> WasmEmitter<'a> {
                 _ => {}
             }
         }
-
-        // Clear item context.
-        func.instruction(&Instruction::Call(IMPORT_HOST_CLEAR_ITEM_CONTEXT));
-        func.instruction(&Instruction::End);
-        func
     }
 
     /// Emit `on_item_event(item_idx: i32, event_id: i32)`.
     /// Handles per-item events using br_table dispatch.
+    /// Supports multiple ListMaps by using the correct MemoryContext per event.
     fn emit_on_item_event(&self) -> Function {
         // Check if any ListRemove uses per-item events (Case 1: predicate is None,
         // trigger is template-scoped).
@@ -3169,87 +4038,98 @@ impl<'a> WasmEmitter<'a> {
         if has_per_item_remove {
             *self.filter_locals.borrow_mut() = Some((2, 3, 4, 5));
         }
-        let mem_ctx = self.build_memory_context(0); // local 0 = item_idx
 
-        let mem_ctx = match mem_ctx {
-            Some(ctx) => ctx,
-            None => {
-                if has_per_item_remove {
-                    *self.filter_locals.borrow_mut() = None;
-                }
-                func.instruction(&Instruction::End);
-                return func;
+        let all_maps = self.find_all_list_map_infos();
+        if all_maps.is_empty() {
+            if has_per_item_remove {
+                *self.filter_locals.borrow_mut() = None;
             }
-        };
+            func.instruction(&Instruction::End);
+            return func;
+        }
 
-        let (_, _, event_start, event_end) = self.find_list_map_info().unwrap();
+        // Build a map: event_id → MemoryContext (which ListMap owns this event).
+        // An event belongs to the ListMap whose cell range contains the triggered node's cell,
+        // or whose event range contains the event.
+        let mut event_to_mem_ctx: HashMap<u32, MemoryContext> = HashMap::new();
 
-        // Collect ALL event IDs that trigger template-scoped nodes.
-        // This includes both template-local events AND global events that trigger template HOLDs.
-        let mut relevant_events: Vec<u32> = Vec::new();
-        for node in &self.program.nodes {
-            match node {
-                IrNode::Then { trigger, cell, .. }
-                    if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
-                {
-                    if !relevant_events.contains(&trigger.0) {
-                        relevant_events.push(trigger.0);
+        for info in &all_maps {
+            let mem_ctx = match Self::build_template_context(info, 0) {
+                Some(ctx) => ctx,
+                None => continue,
+            };
+
+            // Collect events that trigger template-scoped nodes in this ListMap.
+            for node in &self.program.nodes {
+                match node {
+                    IrNode::Then { trigger, cell, .. }
+                        if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
+                    {
+                        event_to_mem_ctx.entry(trigger.0).or_insert(MemoryContext {
+                            item_idx_local: mem_ctx.item_idx_local,
+                            cell_start: mem_ctx.cell_start,
+                            cell_end: mem_ctx.cell_end,
+                        });
                     }
-                }
-                IrNode::Hold {
-                    trigger_bodies,
-                    cell,
-                    ..
-                } if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end => {
-                    for (t, _) in trigger_bodies {
-                        if !relevant_events.contains(&t.0) {
-                            relevant_events.push(t.0);
+                    IrNode::Hold {
+                        trigger_bodies,
+                        cell,
+                        ..
+                    } if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end => {
+                        for (t, _) in trigger_bodies {
+                            event_to_mem_ctx.entry(t.0).or_insert(MemoryContext {
+                                item_idx_local: mem_ctx.item_idx_local,
+                                cell_start: mem_ctx.cell_start,
+                                cell_end: mem_ctx.cell_end,
+                            });
                         }
                     }
-                }
-                IrNode::Latest { target, arms }
-                    if target.0 >= mem_ctx.cell_start && target.0 < mem_ctx.cell_end =>
-                {
-                    for arm in arms {
-                        if let Some(t) = arm.trigger {
-                            if !relevant_events.contains(&t.0) {
-                                relevant_events.push(t.0);
+                    IrNode::Latest { target, arms }
+                        if target.0 >= mem_ctx.cell_start && target.0 < mem_ctx.cell_end =>
+                    {
+                        for arm in arms {
+                            if let Some(t) = arm.trigger {
+                                event_to_mem_ctx.entry(t.0).or_insert(MemoryContext {
+                                    item_idx_local: mem_ctx.item_idx_local,
+                                    cell_start: mem_ctx.cell_start,
+                                    cell_end: mem_ctx.cell_end,
+                                });
                             }
                         }
                     }
-                }
-                // Per-item ListRemove: trigger is template-scoped, cell is global.
-                IrNode::ListRemove {
-                    trigger,
-                    predicate: None,
-                    ..
-                } if trigger.0 >= event_start && trigger.0 < event_end => {
-                    if !relevant_events.contains(&trigger.0) {
-                        relevant_events.push(trigger.0);
+                    // Per-item ListRemove: trigger is template-scoped, cell is global.
+                    IrNode::ListRemove {
+                        trigger,
+                        predicate: None,
+                        ..
+                    } if trigger.0 >= info.event_range.0 && trigger.0 < info.event_range.1 => {
+                        event_to_mem_ctx.entry(trigger.0).or_insert(MemoryContext {
+                            item_idx_local: mem_ctx.item_idx_local,
+                            cell_start: mem_ctx.cell_start,
+                            cell_end: mem_ctx.cell_end,
+                        });
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
 
-        // Also include events that carry template payload cells (e.g. change.text).
-        // Some dataflow chains (WHEN/WHILE/Derived) are payload-driven without
-        // explicit trigger bindings, but still need on_item_event dispatch so
-        // payload downstream updates can run.
-        for (event_idx, event_info) in self.program.events.iter().enumerate() {
-            let has_template_payload = event_info
-                .payload_cells
-                .iter()
-                .any(|cell| cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end);
-            if has_template_payload {
-                let event_idx = event_idx as u32;
-                if !relevant_events.contains(&event_idx) {
-                    relevant_events.push(event_idx);
+            // Also include events that carry template payload cells.
+            for (event_idx, event_info) in self.program.events.iter().enumerate() {
+                let has_template_payload = event_info
+                    .payload_cells
+                    .iter()
+                    .any(|cell| cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end);
+                if has_template_payload {
+                    event_to_mem_ctx.entry(event_idx as u32).or_insert(MemoryContext {
+                        item_idx_local: mem_ctx.item_idx_local,
+                        cell_start: mem_ctx.cell_start,
+                        cell_end: mem_ctx.cell_end,
+                    });
                 }
             }
         }
 
-        if relevant_events.is_empty() {
+        if event_to_mem_ctx.is_empty() {
             if has_per_item_remove {
                 *self.filter_locals.borrow_mut() = None;
             }
@@ -3260,6 +4140,17 @@ impl<'a> WasmEmitter<'a> {
         // Set item context.
         func.instruction(&Instruction::LocalGet(0)); // item_idx
         func.instruction(&Instruction::Call(IMPORT_HOST_SET_ITEM_CONTEXT));
+
+        // Load all template cells from host into WASM globals.
+        // Globals are shared workspace — they hold the LAST item processed.
+        // We must load the CURRENT item's persisted values before event handling.
+        for info in &all_maps {
+            for cell_id in info.cell_range.0..info.cell_range.1 {
+                func.instruction(&Instruction::I32Const(cell_id as i32));
+                func.instruction(&Instruction::Call(IMPORT_HOST_GET_CELL_F64));
+                func.instruction(&Instruction::GlobalSet(cell_id));
+            }
+        }
 
         // br_table dispatch on event_id (local 1).
         let num_all_events = self.program.events.len();
@@ -3275,8 +4166,8 @@ impl<'a> WasmEmitter<'a> {
         for idx in 0..num_all_events {
             func.instruction(&Instruction::End); // end block for event idx
             let event_id = EventId(u32::try_from(idx).unwrap());
-            if relevant_events.contains(&(idx as u32)) {
-                self.emit_item_event_handler(&mut func, event_id, &mem_ctx);
+            if let Some(mem_ctx) = event_to_mem_ctx.get(&(idx as u32)) {
+                self.emit_item_event_handler(&mut func, event_id, mem_ctx);
             }
             let exit_depth = (num_all_events - 1 - idx) as u32;
             func.instruction(&Instruction::Br(exit_depth));
@@ -3552,7 +4443,18 @@ impl<'a> WasmEmitter<'a> {
         body: &IrExpr,
         mem_ctx: Option<&MemoryContext>,
     ) {
-        if let IrExpr::TextConcat(segments) = body {
+        if let IrExpr::Constant(IrValue::Text(t)) = body {
+            // Constant text (e.g., Text/empty(), Text/space()).
+            let pattern_idx = self.register_text_pattern(t);
+            func.instruction(&Instruction::I32Const(cell.0 as i32));
+            func.instruction(&Instruction::I32Const(pattern_idx as i32));
+            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
+            // Bump cell value so signal fires.
+            self.emit_cell_get(func, cell, mem_ctx);
+            func.instruction(&Instruction::F64Const(1.0));
+            func.instruction(&Instruction::F64Add);
+            self.emit_cell_set(func, cell, mem_ctx);
+        } else if let IrExpr::TextConcat(segments) = body {
             let mut all_literal = true;
             let mut text = String::new();
             for seg in segments {
@@ -3627,8 +4529,9 @@ impl<'a> WasmEmitter<'a> {
         arms: &[(IrPattern, IrExpr)],
         target: CellId,
         mem_ctx: Option<&MemoryContext>,
+        propagate_downstream: bool,
     ) {
-        self.emit_pattern_arms_ctx(func, source, arms, target, 0, mem_ctx);
+        self.emit_pattern_arms_ctx(func, source, arms, target, 0, mem_ctx, propagate_downstream);
     }
 
     fn emit_pattern_arms_ctx(
@@ -3639,6 +4542,7 @@ impl<'a> WasmEmitter<'a> {
         target: CellId,
         idx: usize,
         mem_ctx: Option<&MemoryContext>,
+        propagate_downstream: bool,
     ) {
         if idx >= arms.len() {
             return;
@@ -3661,11 +4565,11 @@ impl<'a> WasmEmitter<'a> {
                 func.instruction(&Instruction::F64Eq);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 if !is_skip {
-                    self.emit_arm_body_ctx(func, body, target, mem_ctx);
+                    self.emit_arm_body_ctx(func, body, target, mem_ctx, propagate_downstream);
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms_ctx(func, source, arms, target, idx + 1, mem_ctx);
+                    self.emit_pattern_arms_ctx(func, source, arms, target, idx + 1, mem_ctx, propagate_downstream);
                 }
                 func.instruction(&Instruction::End);
             }
@@ -3675,11 +4579,11 @@ impl<'a> WasmEmitter<'a> {
                 func.instruction(&Instruction::F64Eq);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 if !is_skip {
-                    self.emit_arm_body_ctx(func, body, target, mem_ctx);
+                    self.emit_arm_body_ctx(func, body, target, mem_ctx, propagate_downstream);
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms_ctx(func, source, arms, target, idx + 1, mem_ctx);
+                    self.emit_pattern_arms_ctx(func, source, arms, target, idx + 1, mem_ctx, propagate_downstream);
                 }
                 func.instruction(&Instruction::End);
             }
@@ -3691,17 +4595,17 @@ impl<'a> WasmEmitter<'a> {
                 func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_MATCHES));
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 if !is_skip {
-                    self.emit_arm_body_ctx(func, body, target, mem_ctx);
+                    self.emit_arm_body_ctx(func, body, target, mem_ctx, propagate_downstream);
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms_ctx(func, source, arms, target, idx + 1, mem_ctx);
+                    self.emit_pattern_arms_ctx(func, source, arms, target, idx + 1, mem_ctx, propagate_downstream);
                 }
                 func.instruction(&Instruction::End);
             }
             IrPattern::Wildcard | IrPattern::Binding(_) => {
                 if !is_skip {
-                    self.emit_arm_body_ctx(func, body, target, mem_ctx);
+                    self.emit_arm_body_ctx(func, body, target, mem_ctx, propagate_downstream);
                 }
             }
         }
@@ -3714,6 +4618,7 @@ impl<'a> WasmEmitter<'a> {
         body: &IrExpr,
         target: CellId,
         mem_ctx: Option<&MemoryContext>,
+        propagate_downstream: bool,
     ) {
         if self.is_text_body(body) {
             self.emit_text_setting_ctx(func, target, body, mem_ctx);
@@ -3729,10 +4634,12 @@ impl<'a> WasmEmitter<'a> {
         func.instruction(&Instruction::I32Const(target.0 as i32));
         self.emit_cell_get(func, target, mem_ctx);
         func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
-        if let Some(ctx) = mem_ctx {
-            self.emit_item_downstream_updates(func, target, ctx);
-        } else {
-            self.emit_downstream_updates(func, target);
+        if propagate_downstream {
+            if let Some(ctx) = mem_ctx {
+                self.emit_item_downstream_updates(func, target, ctx);
+            } else {
+                self.emit_downstream_updates(func, target);
+            }
         }
     }
 
@@ -3800,7 +4707,7 @@ impl<'a> WasmEmitter<'a> {
                         && cell.0 >= mem_ctx.cell_start
                         && cell.0 < mem_ctx.cell_end =>
                 {
-                    self.emit_pattern_match_ctx(func, *source, arms, *cell, Some(mem_ctx));
+                    self.emit_pattern_match_ctx(func, *source, arms, *cell, Some(mem_ctx), true);
                 }
                 IrNode::While {
                     cell,
@@ -3811,7 +4718,7 @@ impl<'a> WasmEmitter<'a> {
                     && cell.0 >= mem_ctx.cell_start
                     && cell.0 < mem_ctx.cell_end =>
                 {
-                    self.emit_pattern_match_ctx(func, *source, arms, *cell, Some(mem_ctx));
+                    self.emit_pattern_match_ctx(func, *source, arms, *cell, Some(mem_ctx), true);
                 }
                 IrNode::Latest { target, arms }
                     if *target != updated_cell
@@ -3898,34 +4805,21 @@ impl<'a> WasmEmitter<'a> {
         }
     }
 
-    /// Emit `get_item_cell(item_idx: i32, cell_offset: i32) -> f64`.
-    /// Reads a per-item cell value from linear memory.
+    /// Emit `get_item_cell(item_idx: i32, cell_id: i32) -> f64`.
+    /// Reads a per-item cell value via host import (globals-as-workspace pattern).
     fn emit_get_item_cell(&self) -> Function {
         let mut func = Function::new([]);
-        let mem_ctx = self.build_memory_context(0); // local 0 = item_idx
 
-        match mem_ctx {
-            Some(ctx) => {
-                // addr = item_idx * stride + cell_offset * 8 + memory_base
-                func.instruction(&Instruction::LocalGet(0)); // item_idx
-                func.instruction(&Instruction::I32Const(ctx.stride as i32));
-                func.instruction(&Instruction::I32Mul);
-                func.instruction(&Instruction::LocalGet(1)); // cell_offset
-                func.instruction(&Instruction::I32Const(8));
-                func.instruction(&Instruction::I32Mul);
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::I32Const(ctx.memory_base as i32));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-                    offset: 0,
-                    align: 3,
-                    memory_index: 0,
-                }));
-            }
-            None => {
-                func.instruction(&Instruction::F64Const(0.0));
-            }
-        }
+        // Set item context so host_get_cell_f64 reads from the correct item.
+        func.instruction(&Instruction::LocalGet(0)); // item_idx
+        func.instruction(&Instruction::Call(IMPORT_HOST_SET_ITEM_CONTEXT));
+
+        // Read via host import.
+        func.instruction(&Instruction::LocalGet(1)); // cell_id
+        func.instruction(&Instruction::Call(IMPORT_HOST_GET_CELL_F64));
+
+        // Clear item context.
+        func.instruction(&Instruction::Call(IMPORT_HOST_CLEAR_ITEM_CONTEXT));
 
         func.instruction(&Instruction::End);
         func
@@ -3971,6 +4865,32 @@ impl<'a> WasmEmitter<'a> {
                         false,
                     );
                     self.emit_list_downstream_updates(&mut func, *cell);
+                }
+                IrNode::ListEvery {
+                    cell,
+                    source,
+                    predicate: Some(pred),
+                    item_cell,
+                    item_field_cells,
+                } if item_cell.is_some() => {
+                    self.emit_boolean_check_loop(
+                        &mut func, *cell, *source, *pred, *item_cell,
+                        item_field_cells, 0, 1, 2, 3, true,
+                    );
+                    self.emit_downstream_updates(&mut func, *cell);
+                }
+                IrNode::ListAny {
+                    cell,
+                    source,
+                    predicate: Some(pred),
+                    item_cell,
+                    item_field_cells,
+                } if item_cell.is_some() => {
+                    self.emit_boolean_check_loop(
+                        &mut func, *cell, *source, *pred, *item_cell,
+                        item_field_cells, 0, 1, 2, 3, false,
+                    );
+                    self.emit_downstream_updates(&mut func, *cell);
                 }
                 IrNode::ListRemove { .. } => {}
                 _ => {}

@@ -113,10 +113,14 @@ impl DdContext {}
 ///
 /// Parses the source, compiles it, builds a DD dataflow if needed,
 /// and returns the result with reactive document output.
+///
+/// `external_functions` provides pre-parsed functions from other module files
+/// for multi-file support. Each entry is (qualified_name, params, body, module_name).
 pub fn run_dd_reactive_with_persistence(
     filename: &str,
     source_code: &str,
     states_storage_key: Option<&str>,
+    external_functions: Option<&[compile::ExternalFunction]>,
 ) -> Option<DdResult> {
     // Clean up from previous program
     reset_save_disabled();
@@ -146,7 +150,7 @@ pub fn run_dd_reactive_with_persistence(
         std::collections::HashMap::new()
     };
 
-    let compiled = match compile::compile(source_code, states_storage_key, &persisted_holds) {
+    let compiled = match compile::compile(source_code, states_storage_key, &persisted_holds, external_functions) {
         Ok(program) => program,
         Err(e) => {
             zoon::eprintln!("DD compilation error: {}", e);
@@ -294,11 +298,11 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                             }
                             let mut ret = retained.borrow_mut();
                             if let Some(tree) = ret.as_mut() {
-                                let diffs = handle.drain_keyed_diffs();
                                 // Update tree first — conditional sections may appear/disappear,
                                 // creating or destroying the keyed Stripe.
                                 tree.update(&value, &handle);
-                                // Then apply keyed diffs to the (now existing) keyed Stripe.
+                                // Then drain and apply keyed diffs to the (now existing) keyed Stripe.
+                                let diffs = handle.drain_keyed_diffs();
                                 if !diffs.is_empty() {
                                     tree.apply_keyed_diffs(&diffs, &handle);
                                 }

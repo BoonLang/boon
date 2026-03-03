@@ -245,12 +245,46 @@ where
             // ---------------------------------------------------------------
             // List operations — real DD operators
             // ---------------------------------------------------------------
+            CollectionSpec::ListAssemble(source) => {
+                let list = collections
+                    .get(source)
+                    .expect("ListAssemble source not found")
+                    .as_keyed();
+                AnyCollection::Scalar(operators::list_assemble(list))
+            }
+
             CollectionSpec::ListCount(source) => {
                 let list = collections
                     .get(source)
                     .expect("ListCount source not found")
                     .as_keyed();
                 AnyCollection::Scalar(operators::list_count(list))
+            }
+
+            CollectionSpec::ListLatest(source) => {
+                let list = collections
+                    .get(source)
+                    .expect("ListLatest source not found")
+                    .as_keyed();
+                AnyCollection::Scalar(operators::list_latest(list))
+            }
+
+            CollectionSpec::ListEvery { source, predicate } => {
+                let list = collections
+                    .get(source)
+                    .expect("ListEvery source not found")
+                    .as_keyed();
+                let predicate = Arc::clone(predicate);
+                AnyCollection::Scalar(operators::list_every(list, move |v| predicate(v)))
+            }
+
+            CollectionSpec::ListAny { source, predicate } => {
+                let list = collections
+                    .get(source)
+                    .expect("ListAny source not found")
+                    .as_keyed();
+                let predicate = Arc::clone(predicate);
+                AnyCollection::Scalar(operators::list_any(list, move |v| predicate(v)))
             }
 
             CollectionSpec::ListRetain { source, predicate } => {

@@ -423,6 +423,11 @@ impl<T> NamedChannel<T> {
         self.capacity
     }
 
+    /// Check if the receiver has been dropped.
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
     /// Async send with optional debug timeout.
     ///
     /// In production (no debug-channels feature): blocks until space is available.
@@ -468,7 +473,7 @@ impl<T> NamedChannel<T> {
     /// Use this when dropping events is acceptable (user input, periodic updates).
     /// Always logs when events are dropped for observability.
     pub fn send_or_drop(&self, value: T) {
-        if self.inner.clone().try_send(value).is_err() {
+        if let Err(e) = self.inner.clone().try_send(value) {
             inc_metric!(CHANNEL_DROPS);
             if LOG_ACTOR_FLOW {
                 zoon::eprintln!(
@@ -478,11 +483,18 @@ impl<T> NamedChannel<T> {
                 );
             }
             #[cfg(feature = "debug-channels")]
-            zoon::eprintln!(
-                "[BACKPRESSURE DROP] '{}' dropped event (full, capacity: {})",
-                self.name,
-                self.capacity
-            );
+            if e.is_full() {
+                zoon::eprintln!(
+                    "[BACKPRESSURE DROP] '{}' channel FULL (capacity: {})",
+                    self.name,
+                    self.capacity
+                );
+            } else {
+                zoon::eprintln!(
+                    "[BACKPRESSURE DROP] '{}' channel DISCONNECTED (receiver dropped)",
+                    self.name,
+                );
+            }
         } else if LOG_ACTOR_FLOW && self.name == "value_actor.subscriptions" {
             zoon::println!(
                 "[FLOW] send_or_drop OK on '{}' (subscription sent)",
@@ -512,11 +524,6 @@ impl<T> NamedChannel<T> {
         result
     }
 
-    /// Check if the channel is closed (receiver dropped).
-    #[allow(dead_code)]
-    pub fn is_closed(&self) -> bool {
-        self.inner.is_closed()
-    }
 }
 
 /// Debug flag to trace actor flow: stream subscriptions, value broadcasts,
@@ -8150,11 +8157,11 @@ impl ListBindingFunction {
                                                         );
                                                         predicates.insert(pid.clone(), pred.clone());
 
-                                                        // Query initial value (use .value() to wait for reactive predicates)
-                                                        if let Ok(value) = pred.clone().value().await {
-                                                            let is_true = matches!(&value, Value::Tag(tag, _) if tag.tag() == "True");
-                                                            predicate_results.insert(pid, is_true);
-                                                        }
+                                                        // Default predicate to true (non-blocking).
+                                                        // Same rationale as Push handler: value().await
+                                                        // deadlocks inside the select loop. The merged
+                                                        // predicate stream will correct if needed.
+                                                        predicate_results.insert(pid, true);
                                                     }
 
                                                     // Use stream_from_now for future updates, keyed by PersistenceId
@@ -8162,6 +8169,7 @@ impl ListBindingFunction {
                                                     let pred_streams: Vec<_> = predicates.iter()
                                                         .map(|(pid, pred)| {
                                                             let pid = pid.clone();
+                                                            let pid_for_log = pid.clone();
                                                             pred.clone().stream_from_now()
                                                                 .map(move |v| {
                                                                     let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
@@ -8212,16 +8220,18 @@ impl ListBindingFunction {
                                                 items.push(item);
                                                 predicates.insert(pid.clone(), pred.clone());
 
-                                                // Query new predicate value (use .value() to wait for reactive predicates)
-                                                let is_true = if let Ok(value) = pred.clone().value().await {
-                                                    matches!(&value, Value::Tag(tag, _) if tag.tag() == "True")
-                                                } else {
-                                                    false
-                                                };
-                                                predicate_results.insert(pid.clone(), is_true);
+                                                // Default predicate to true (non-blocking).
+                                                // We can't use value().await here because it deadlocks:
+                                                // the unfold is inside a select(list, predicates) loop,
+                                                // and blocking here prevents the predicate's LATEST
+                                                // evaluation chain from progressing (circular await).
+                                                // The merged_predicates stream will deliver the actual
+                                                // predicate result and correct if needed.
+                                                predicate_results.insert(pid.clone(), true);
 
                                                 // B3: Incremental merge - only add the new predicate stream, O(1) instead of O(N)
                                                 let new_pid = pid.clone();
+                                                let new_pid_for_log = pid.clone();
                                                 let new_pred_stream: LocalBoxStream<'static, Vec<(parser::PersistenceId, bool)>> = Box::pin(coalesce(
                                                     pred.clone().stream_from_now()
                                                         .map(move |v| {
@@ -8517,9 +8527,12 @@ impl ListBindingFunction {
                                                 predicates.insert(pid.clone(), pred.clone());
 
                                                 // Query initial value (use .value() to wait for reactive predicates)
-                                                if let Ok(value) = pred.clone().value().await {
-                                                    let is_true = matches!(&value, Value::Tag(tag, _) if tag.tag() == "True");
-                                                    predicate_results.insert(pid, is_true);
+                                                match pred.clone().value().await {
+                                                    Ok(value) => {
+                                                        let is_true = matches!(&value, Value::Tag(tag, _) if tag.tag() == "True");
+                                                        predicate_results.insert(pid, is_true);
+                                                    }
+                                                    Err(_e) => {}
                                                 }
                                             }
 
@@ -8553,6 +8566,7 @@ impl ListBindingFunction {
                                                 .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
                                                 .cloned()
                                                 .collect();
+
 
                                             // A2: Update last_emitted_pids for future deduplication
                                             last_emitted_pids = filtered.iter()

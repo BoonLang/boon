@@ -201,6 +201,24 @@ impl Value {
         self.clone()
     }
 
+    pub fn list_every(&self, f: impl Fn(&Value) -> bool) -> bool {
+        if let Value::Tagged { tag, fields } = self {
+            if tag.as_ref() == LIST_TAG {
+                return !fields.is_empty() && fields.values().all(|v| f(v));
+            }
+        }
+        false
+    }
+
+    pub fn list_any(&self, f: impl Fn(&Value) -> bool) -> bool {
+        if let Value::Tagged { tag, fields } = self {
+            if tag.as_ref() == LIST_TAG {
+                return fields.values().any(|v| f(v));
+            }
+        }
+        false
+    }
+
     // ----- Object/field helpers -----
 
     /// Return a new value with one field updated (works on Object and Tagged).

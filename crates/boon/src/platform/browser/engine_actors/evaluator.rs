@@ -3755,7 +3755,9 @@ fn build_when_actor(
                                     stream::once(
                                         async move { result_actor_for_value.value().await },
                                     )
-                                    .filter_map(|v| future::ready(v.ok()))
+                                    .filter_map(move |v| {
+                                        future::ready(v.ok())
+                                    })
                                     .map(
                                         move |mut result_value| {
                                             // Prevent drop: captured by `move` closure, lives as long as stream combinator
@@ -3774,7 +3776,7 @@ fn build_when_actor(
                                 return Box::pin(stream::empty())
                                     as Pin<Box<dyn Stream<Item = Value>>>;
                             }
-                            Err(_) => {
+                            Err(e) => {
                                 return Box::pin(stream::empty())
                                     as Pin<Box<dyn Stream<Item = Value>>>;
                             }

@@ -19,7 +19,17 @@ FUNCTION get(from, of) {
 }
 
 FUNCTION material(material) {
+    -- All materials defined as BLOCK variables so their reactive WHEN actors
+    -- on PASSED.mode are kept alive properly (inline Object literals inside
+    -- WHEN arms can lose reactivity due to engine scoping).
     BLOCK {
+        background_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.96, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.08, chroma: 0.005, hue: 220]
+            }
+        ]
+
         surface_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 1]
@@ -36,25 +46,43 @@ FUNCTION material(material) {
             gloss: 0.25
         ]
 
+        surface_elevated_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.99]
+                Dark => Oklch[lightness: 0.22]
+            }
+            gloss: 0.4
+        ]
+
+        primary_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
+                Dark => Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
+            }
+        ]
+
+        primary_subtle_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36]
+                Dark => Oklch[lightness: 0.25, chroma: 0.08, hue: 25.36]
+            }
+        ]
+
+        danger_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87]
+                Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 18.87]
+            }
+        ]
+
         material |> WHEN {
-            Background => [
-                color: PASSED.mode |> WHEN {
-                    Light => Oklch[lightness: 0.96, chroma: 0.01, hue: 220]
-                    Dark => Oklch[lightness: 0.08, chroma: 0.005, hue: 220]
-                }
-            ]
+            Background => background_base
 
             Surface => surface_base
 
             SurfaceVariant => surface_variant_base
 
-            SurfaceElevated => [
-                color: PASSED.mode |> WHEN {
-                    Light => Oklch[lightness: 0.99]
-                    Dark => Oklch[lightness: 0.22]
-                }
-                gloss: 0.4
-            ]
+            SurfaceElevated => surface_elevated_base
 
             Interactive[hovered] => [
                 ...surface_variant_base
@@ -83,26 +111,11 @@ FUNCTION material(material) {
                 }
             ]
 
-            Primary => [
-                color: PASSED.mode |> WHEN {
-                    Light => Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
-                    Dark => Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
-                }
-            ]
+            Primary => primary_base
 
-            PrimarySubtle => [
-                color: PASSED.mode |> WHEN {
-                    Light => Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36]
-                    Dark => Oklch[lightness: 0.25, chroma: 0.08, hue: 25.36]
-                }
-            ]
+            PrimarySubtle => primary_subtle_base
 
-            Danger => [
-                color: PASSED.mode |> WHEN {
-                    Light => Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87]
-                    Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 18.87]
-                }
-            ]
+            Danger => danger_base
         }
     }
 }

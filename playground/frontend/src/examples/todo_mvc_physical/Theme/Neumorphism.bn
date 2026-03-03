@@ -20,15 +20,15 @@ FUNCTION get(from, of) {
 }
 
 FUNCTION material(material) {
-    material |> WHEN {
-        Background => [
+    BLOCK {
+        background_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.90, chroma: 0.005, hue: 240]
                 Dark => Oklch[lightness: 0.15, chroma: 0.005, hue: 240]
             }
         ]
 
-        Surface => [
+        surface_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.92, chroma: 0.005, hue: 240]
                 Dark => Oklch[lightness: 0.18, chroma: 0.005, hue: 240]
@@ -36,7 +36,7 @@ FUNCTION material(material) {
             gloss: 0.25
         ]
 
-        SurfaceVariant => [
+        surface_variant_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.90, chroma: 0.005, hue: 240]
                 Dark => Oklch[lightness: 0.20, chroma: 0.005, hue: 240]
@@ -44,7 +44,7 @@ FUNCTION material(material) {
             gloss: 0.25
         ]
 
-        SurfaceElevated => [
+        surface_elevated_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.94, chroma: 0.005, hue: 240]
                 Dark => Oklch[lightness: 0.22, chroma: 0.005, hue: 240]
@@ -52,7 +52,7 @@ FUNCTION material(material) {
             gloss: 0.25
         ]
 
-        Interactive[hovered] => [
+        interactive_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.90, chroma: 0.005, hue: 240]
                 Dark => Oklch[lightness: 0.20, chroma: 0.005, hue: 240]
@@ -61,47 +61,62 @@ FUNCTION material(material) {
             metal: 0.03
         ]
 
-        InteractiveRecessed[focus] => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.92, chroma: 0.005, hue: 240]
-                Dark => Oklch[lightness: 0.18, chroma: 0.005, hue: 240]
-            }
-            gloss: focus |> WHEN {
-                False => 0.3
-                True => 0.2
-            }
-            glow: focus |> WHEN {
-                True => [
-                    color: PASSED.mode |> WHEN {
-                        Light => Oklch[lightness: 0.75, chroma: 0.05, hue: 220]
-                        Dark => Oklch[lightness: 0.65, chroma: 0.06, hue: 220]
-                    }
-                    intensity: 0.15
-                ]
-                False => None
-            }
-        ]
-
-        Primary => [
+        primary_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.75, chroma: 0.05, hue: 260]
                 Dark => Oklch[lightness: 0.65, chroma: 0.06, hue: 260]
             }
         ]
 
-        PrimarySubtle => [
+        primary_subtle_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.93, chroma: 0.02, hue: 260]
                 Dark => Oklch[lightness: 0.22, chroma: 0.03, hue: 260]
             }
         ]
 
-        Danger => [
+        danger_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.75, chroma: 0.07, hue: 20]
                 Dark => Oklch[lightness: 0.7, chroma: 0.08, hue: 20]
             }
         ]
+
+        material |> WHEN {
+            Background => background_base
+
+            Surface => surface_base
+
+            SurfaceVariant => surface_variant_base
+
+            SurfaceElevated => surface_elevated_base
+
+            Interactive[hovered] => interactive_base
+
+            InteractiveRecessed[focus] => [
+                ...surface_base
+                gloss: focus |> WHEN {
+                    False => 0.3
+                    True => 0.2
+                }
+                glow: focus |> WHEN {
+                    True => [
+                        color: PASSED.mode |> WHEN {
+                            Light => Oklch[lightness: 0.75, chroma: 0.05, hue: 220]
+                            Dark => Oklch[lightness: 0.65, chroma: 0.06, hue: 220]
+                        }
+                        intensity: 0.15
+                    ]
+                    False => None
+                }
+            ]
+
+            Primary => primary_base
+
+            PrimarySubtle => primary_subtle_base
+
+            Danger => danger_base
+        }
     }
 }
 

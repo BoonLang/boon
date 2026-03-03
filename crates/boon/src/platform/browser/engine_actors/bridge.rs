@@ -389,10 +389,11 @@ fn apply_physical_css<E: RawEl>(
     // --- 1. background-color ← style.material.color ---
     let bg_color_css_stream = {
         let color_stream = style_nested_property_stream(&sv, "material", "color");
-        // Use oklch_to_css_oneshot: reads all Oklch components in one shot via current_value().
-        // The outer switch_map handles reactivity — when dark mode toggles, color_stream
-        // emits a new Oklch, switch_map cancels the old inner stream and creates a new one.
-        switch_map(color_stream, |value| oklch_to_css_oneshot(value)).boxed_local()
+        // oklch_to_css_reactive: reads initial values atomically, then subscribes to
+        // per-component changes via stream_from_now(). When dark mode toggles internal
+        // Oklch components (e.g., lightness 0.96→0.08), the inner subscription fires.
+        // The outer switch_map handles cases where a completely new Oklch object is assigned.
+        switch_map(color_stream, |value| oklch_to_css_reactive(value)).boxed_local()
     };
 
     // --- 2. box-shadow ← style.depth + style.move + style.material.glow ---
@@ -450,42 +451,79 @@ fn apply_physical_css<E: RawEl>(
 
     let glow_stream: LocalBoxStream<'static, ShadowComponent> = {
         let glow_value_stream = style_nested_property_stream(&sv, "material", "glow");
-        glow_value_stream
-            .filter_map(|value| async move {
-                match value {
-                    Value::Object(glow_obj, _) => {
-                        // Read glow properties (color + intensity)
-                        let color = match glow_obj.variable("color") {
-                            Some(cv) => match cv.value_actor().current_value().await {
-                                Ok(ref v) => value_to_css_color_async(v)
-                                    .await
-                                    .unwrap_or_else(|| "rgba(100,150,255,0.5)".to_string()),
-                                _ => "rgba(100,150,255,0.5)".to_string(),
+        // Use switch_map to subscribe reactively to glow sub-properties.
+        // When dark mode changes glow.color's Oklch components, the inner
+        // oklch_to_css_reactive subscription fires and updates the CSS.
+        switch_map(glow_value_stream, |value| {
+            match value {
+                Value::Object(glow_obj, _) => {
+                    #[derive(Clone)]
+                    enum GlowComp {
+                        Color(String),
+                        Intensity(f64),
+                    }
+
+                    let color_sub: LocalBoxStream<'static, GlowComp> =
+                        match glow_obj.variable("color") {
+                            Some(cv) => switch_map(cv.stream(), |v| oklch_to_css_reactive(v))
+                                .map(GlowComp::Color)
+                                .boxed_local(),
+                            None => stream::once(future::ready(GlowComp::Color(
+                                "rgba(100,150,255,0.5)".to_string(),
+                            )))
+                            .chain(stream::pending())
+                            .boxed_local(),
+                        };
+
+                    let intensity_sub: LocalBoxStream<'static, GlowComp> =
+                        match glow_obj.variable("intensity") {
+                            Some(iv) => iv
+                                .stream()
+                                .filter_map(|v| {
+                                    future::ready(match v {
+                                        Value::Number(n, _) => {
+                                            Some(GlowComp::Intensity(n.number()))
+                                        }
+                                        _ => None,
+                                    })
+                                })
+                                .boxed_local(),
+                            None => stream::once(future::ready(GlowComp::Intensity(0.1)))
+                                .chain(stream::pending())
+                                .boxed_local(),
+                        };
+
+                    stream::select_all([color_sub, intensity_sub])
+                        .scan(
+                            ("rgba(100,150,255,0.5)".to_string(), 0.1_f64),
+                            |state, comp| {
+                                match comp {
+                                    GlowComp::Color(c) => state.0 = c,
+                                    GlowComp::Intensity(i) => state.1 = i,
+                                }
+                                let blur = state.1 * 40.0;
+                                let spread = state.1 * 10.0;
+                                let css = format!(
+                                    "0 0 {blur:.1}px {spread:.1}px {}",
+                                    state.0
+                                );
+                                future::ready(Some(ShadowComponent::Glow(css)))
                             },
-                            None => "rgba(100,150,255,0.5)".to_string(),
-                        };
-                        let intensity = if let Some(v) = glow_obj.variable("intensity") {
-                            match v.value_actor().current_value().await {
-                                Ok(Value::Number(n, _)) => n.number(),
-                                _ => 0.1,
-                            }
-                        } else {
-                            0.1
-                        };
-                        let blur = intensity * 40.0;
-                        let spread = intensity * 10.0;
-                        Some(ShadowComponent::Glow(format!(
-                            "0 0 {blur:.1}px {spread:.1}px {color}"
-                        )))
-                    }
-                    // glow: None → no glow
-                    Value::Tag(ref tag, _) if tag.tag() == "None" => {
-                        Some(ShadowComponent::Glow(String::new()))
-                    }
-                    _ => None,
+                        )
+                        .left_stream()
+                        .left_stream()
                 }
-            })
-            .boxed_local()
+                // glow: None → no glow
+                Value::Tag(tag, _) if tag.tag() == "None" => {
+                    stream::once(future::ready(ShadowComponent::Glow(String::new())))
+                        .chain(stream::pending())
+                        .right_stream()
+                        .left_stream()
+                }
+                _ => stream::pending::<ShadowComponent>().right_stream(),
+            }
+        })
+        .boxed_local()
     };
 
     let sc_shadow = scene_ctx.clone();
@@ -1378,7 +1416,6 @@ fn element_container(
     // The helper function boon_tag_to_zoon_tag() is already implemented and ready.
     Stripe::new()
         .direction(Direction::Column)
-        .s(AlignContent::new().center_x()) // Center children horizontally (not the element itself)
         .s(Width::exact_signal(width_signal))
         .s(Width::exact_signal(size_signal)) // size overrides width
         .s(Height::exact_signal(height_signal))
@@ -2798,20 +2835,20 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
     }
 }
 
-/// One-shot Oklch-to-CSS conversion: reads all components via current_value().await.
-/// Returns a stream that emits a single CSS string and then stays alive (pending).
+/// Hybrid reactive Oklch-to-CSS conversion.
 ///
-/// Use this inside `switch_map` on a color stream — the outer switch_map handles
-/// reactivity (when dark mode toggles, a new Oklch is emitted, switch_map cancels
-/// the old inner stream and calls this function with the new Oklch).
+/// 1. Reads all 4 Oklch components atomically via `current_value().await` → correct initial CSS
+/// 2. Subscribes to each component via `stream_from_now()` → only future updates, no replay
+/// 3. `select_all + scan` initialized with the correct values from step 1
 ///
-/// This avoids the race condition in `oklch_to_css_stream` where `select_all + scan`
-/// emits intermediate wrong values (oklch(50% 0 0)) before component subscriptions
-/// resolve — and those subscriptions get cancelled by switch_map before resolving.
-fn oklch_to_css_oneshot(value: Value) -> LocalBoxStream<'static, String> {
+/// This avoids both problems:
+/// - `oklch_to_css_stream`: race condition from `scan` starting at wrong defaults (0.5, 0, 0, 1.0)
+/// - `oklch_to_css_oneshot`: not reactive (reads once, then goes pending)
+fn oklch_to_css_reactive(value: Value) -> LocalBoxStream<'static, String> {
     match value {
         Value::TaggedObject(tagged, _) if tagged.tag() == "Oklch" => {
             stream::once(async move {
+                // Step 1: Read current values atomically
                 async fn read_f64(tagged: &TaggedObject, name: &str, default: f64) -> f64 {
                     match tagged.variable(name) {
                         Some(v) => match v.value_actor().current_value().await {
@@ -2825,13 +2862,47 @@ fn oklch_to_css_oneshot(value: Value) -> LocalBoxStream<'static, String> {
                 let c = read_f64(&tagged, "chroma", 0.0).await;
                 let h = read_f64(&tagged, "hue", 0.0).await;
                 let a = read_f64(&tagged, "alpha", 1.0).await;
-                if a < 1.0 {
-                    format!("oklch({}% {} {} / {})", l * 100.0, c, h, a)
-                } else {
-                    format!("oklch({}% {} {})", l * 100.0, c, h)
+
+                let initial_css = format_oklch(l, c, h, a);
+
+                // Step 2: Subscribe to future changes via stream_from_now()
+                #[derive(Clone, Copy)]
+                enum Comp { L, C, H, A }
+
+                fn comp_stream(tagged: &TaggedObject, name: &str, comp: Comp)
+                    -> LocalBoxStream<'static, (Comp, f64)>
+                {
+                    match tagged.variable(name) {
+                        Some(v) => v.stream_from_now()
+                            .filter_map(move |val| future::ready(match val {
+                                Value::Number(n, _) => Some((comp, n.number())),
+                                _ => None,
+                            }))
+                            .boxed_local(),
+                        None => stream::pending().boxed_local(),
+                    }
                 }
+
+                let updates = stream::select_all([
+                    comp_stream(&tagged, "lightness", Comp::L),
+                    comp_stream(&tagged, "chroma", Comp::C),
+                    comp_stream(&tagged, "hue", Comp::H),
+                    comp_stream(&tagged, "alpha", Comp::A),
+                ])
+                .scan((l, c, h, a), move |state, (comp, value)| {
+                    match comp {
+                        Comp::L => state.0 = value,
+                        Comp::C => state.1 = value,
+                        Comp::H => state.2 = value,
+                        Comp::A => state.3 = value,
+                    }
+                    future::ready(Some(format_oklch(state.0, state.1, state.2, state.3)))
+                });
+
+                // Step 3: Chain initial + reactive updates
+                stream::once(future::ready(initial_css)).chain(updates)
             })
-            .chain(stream::pending())
+            .flatten()
             .boxed_local()
         }
         Value::Tag(tag, _) => {
@@ -2849,6 +2920,14 @@ fn oklch_to_css_oneshot(value: Value) -> LocalBoxStream<'static, String> {
                 .boxed_local()
         }
         _ => stream::empty().boxed_local(),
+    }
+}
+
+fn format_oklch(l: f64, c: f64, h: f64, a: f64) -> String {
+    if a < 1.0 {
+        format!("oklch({}% {} {} / {})", l * 100.0, c, h, a)
+    } else {
+        format!("oklch({}% {} {})", l * 100.0, c, h)
     }
 }
 
@@ -4220,7 +4299,7 @@ fn element_text_input(
         .text_signal(signal::from_stream(text_stream).map(|t| t.unwrap_or_default()))
         .placeholder(
             Placeholder::with_signal(placeholder_signal.map(|t| t.unwrap_or_default()))
-                .s(Font::new().italic().color_signal(placeholder_color_signal)),
+                .s(Font::new().color_signal(placeholder_color_signal)),
         )
         .update_raw_el({
             let dom_input_el_ref = dom_input_el.clone();
@@ -4448,6 +4527,31 @@ fn element_checkbox(
     let sv_visible = tagged_object.expect_variable("settings");
     let visible_sig = visible_signal_from_settings(sv_visible);
 
+    // Size support for checkbox element (reads style.size → CSS width+height)
+    let sv_size = tagged_object.expect_variable("settings");
+    let size_signal = signal::from_stream({
+        let style_stream = switch_map(sv_size.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("size") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            })
+        })
+        .boxed_local()
+    })
+    .broadcast();
+    let width_signal = size_signal.signal_cloned();
+    let height_signal = size_signal.signal_cloned();
+
     // CRITICAL: Use switch_map (not flat_map) because variable streams are infinite.
     let checked_stream = switch_map(settings_variable.clone().stream(), |value| {
         value.expect_object().expect_variable("checked").stream()
@@ -4567,6 +4671,11 @@ fn element_checkbox(
             .right_signal(padding_right_signal)
             .bottom_signal(padding_bottom_signal)
             .left_signal(padding_left_signal))
+        .update_raw_el(|raw_el| {
+            raw_el
+                .style_signal("width", width_signal)
+                .style_signal("height", height_signal)
+        })
         .on_click({
             let sender = click_event_sender.clone();
             move || {
@@ -4709,6 +4818,50 @@ fn element_label(
         })
     });
 
+    // Font weight - produces FontWeight typed values
+    // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    let sv_font_weight = tagged_object.expect_variable("settings");
+    let font_weight_signal = signal::from_stream({
+        let style_stream = switch_map(sv_font_weight.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        switch_map(font_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("weight") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            let result = match value {
+                Value::Tag(tag, _) => match tag.tag() {
+                    "Hairline" => Some(FontWeight::Hairline),
+                    "ExtraLight" | "UltraLight" => Some(FontWeight::ExtraLight),
+                    "Light" => Some(FontWeight::Light),
+                    "Regular" | "Normal" => Some(FontWeight::Regular),
+                    "Medium" => Some(FontWeight::Medium),
+                    "SemiBold" | "DemiBold" => Some(FontWeight::SemiBold),
+                    "Bold" => Some(FontWeight::Bold),
+                    "ExtraBold" | "UltraBold" => Some(FontWeight::ExtraBold),
+                    "Black" | "Heavy" => Some(FontWeight::Heavy),
+                    "ExtraHeavy" => Some(FontWeight::ExtraHeavy),
+                    _ => None,
+                },
+                Value::Number(n, _) => Some(FontWeight::Number(n.number() as u32)),
+                _ => None,
+            };
+            future::ready(result)
+        })
+        .boxed_local()
+    });
+
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let font_color_signal = signal::from_stream({
@@ -4831,6 +4984,7 @@ fn element_label(
         .s(Font::new()
             .size_signal(font_size_signal)
             .color_signal(font_color_signal)
+            .weight_signal(font_weight_signal)
             .line(
                 FontLine::new()
                     .strike_signal(strikethrough_bool_signal.map(|opt| opt.unwrap_or(false))),
@@ -5155,8 +5309,61 @@ fn element_block(
         move |value| value_to_element(value, construct_context.clone())
     });
 
+    // Reactive width signal: subscribes to style.width or style.size
+    let sv_width = tagged_object.expect_variable("settings");
+    let width_signal = signal::from_stream({
+        let style_stream = switch_map(sv_width.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            if let Some(var) = obj.variable("width") {
+                var.stream().boxed_local()
+            } else if let Some(var) = obj.variable("size") {
+                var.stream().boxed_local()
+            } else {
+                stream::empty().boxed_local()
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Tag(tag, _) if tag.tag() == "Fill" => Some("100%".to_owned()),
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            })
+        })
+        .boxed_local()
+    });
+
+    // Reactive height signal: subscribes to style.height or style.size
+    let sv_height = tagged_object.expect_variable("settings");
+    let height_signal = signal::from_stream({
+        let style_stream = switch_map(sv_height.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            if let Some(var) = obj.variable("height") {
+                var.stream().boxed_local()
+            } else if let Some(var) = obj.variable("size") {
+                var.stream().boxed_local()
+            } else {
+                stream::empty().boxed_local()
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Tag(tag, _) if tag.tag() == "Fill" => Some("100%".to_owned()),
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            })
+        })
+        .boxed_local()
+    });
+
     // Extract style as a CSS string via raw_el for simplicity.
-    // This covers padding, height, align, and width from the style object.
+    // This covers padding and align from the style object.
+    // Width and height are handled by separate reactive signals above.
     let sv_style = tagged_object.expect_variable("settings");
     let style_css_signal = signal::from_stream({
         let style_stream = switch_map(sv_style.stream(), |value| {
@@ -5204,26 +5411,6 @@ fn element_block(
                 }
             }
 
-            // Height
-            if let Some(v) = obj.variable("height") {
-                if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                    css.push_str(&format!("height:{}px;", n.number()));
-                }
-            }
-
-            // Width
-            if let Some(v) = obj.variable("width") {
-                match v.value_actor().current_value().await {
-                    Ok(Value::Tag(tag, _)) if tag.tag() == "Fill" => {
-                        css.push_str("width:100%;");
-                    }
-                    Ok(Value::Number(n, _)) => {
-                        css.push_str(&format!("width:{}px;", n.number()));
-                    }
-                    _ => {}
-                }
-            }
-
             // Align
             if let Some(v) = obj.variable("align") {
                 if let Ok(Value::Object(align_obj, _)) = v.value_actor().current_value().await {
@@ -5240,6 +5427,35 @@ fn element_block(
             }
 
             Some(css)
+        })
+        .boxed_local()
+    });
+
+    // Reactive background-image from style.background.url
+    let sv_bg = settings_variable.clone();
+    let bg_image_signal = signal::from_stream({
+        let style_stream = switch_map(sv_bg.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        let bg_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("background") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        switch_map(bg_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("url") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Text(text, _) => Some(format!("url({})", text.text())),
+                _ => None,
+            })
         })
         .boxed_local()
     });
@@ -5266,6 +5482,15 @@ fn element_block(
                     }
                 }))
             })
+        })
+        .update_raw_el(|raw_el| {
+            raw_el
+                .style_signal("width", width_signal)
+                .style_signal("height", height_signal)
+                .style_signal("background-image", bg_image_signal)
+                .style("background-size", "contain")
+                .style("background-repeat", "no-repeat")
+                .style("background-position", "center")
         })
         .child_signal(signal::from_stream(child_stream))
         .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))

@@ -1,16 +1,6 @@
 -- TodoMVC - Physical 3D UI Example
 
 ------------------------------------------------------------------------
--- FILTER ROUTES
-------------------------------------------------------------------------
-
-filter_routes: [
-    all: TEXT { / }
-    active: TEXT { /active }
-    completed: TEXT { /completed }
-]
-
-------------------------------------------------------------------------
 -- STORE AND STATE
 ------------------------------------------------------------------------
 
@@ -32,16 +22,17 @@ store: [
             mode_toggle: LINK
         ]
     ]
-    selected_filter: Router/route() |> WHEN {
-        filter_routes.active => Active
-        filter_routes.completed => Completed
+    selected_filter: Router/route() |> WHILE {
+        TEXT { / } => All
+        TEXT { /active } => Active
+        TEXT { /completed } => Completed
         __ => All
     }
     go_to_result:
         LATEST {
-            elements.filter_buttons.all.event.press |> THEN { filter_routes.all }
-            elements.filter_buttons.active.event.press |> THEN { filter_routes.active }
-            elements.filter_buttons.completed.event.press |> THEN { filter_routes.completed }
+            elements.filter_buttons.all.event.press |> THEN { TEXT { / } }
+            elements.filter_buttons.active.event.press |> THEN { TEXT { /active } }
+            elements.filter_buttons.completed.event.press |> THEN { TEXT { /completed } }
         }
         |> Router/go_to()
     title_to_save: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
@@ -419,34 +410,39 @@ FUNCTION new_todo_title_text_input() {
 ------------------------------------------------------------------------
 
 FUNCTION todos_element() {
-    Scene/Element/stack(
+    Scene/Element/stripe(
         element: []
-        style: [width: Fill]
-        layers: LIST {
-            Scene/Element/stripe(
-                element: []
-                direction: Column
-                gap: Theme/spacing(of: None)
-                style: [
-                    material: Theme/material(of: SurfaceVariant)
-                ]
-                items: PASSED.store.todos
-                    |> List/retain(item, if: PASSED.store.selected_filter |> WHILE {
-                        All => True
-                        Active => item.completed |> Bool/not()
-                        Completed => item.completed
-                    })
-                    |> List/map(old, new: old |> todo_element())
-            )
+        direction: Row
+        gap: Theme/spacing(of: None)
+        style: [
+            width: Fill
+            material: Theme/material(of: SurfaceVariant)
+        ]
+        items: LIST {
             Scene/Element/block(
                 element: []
                 style: [
                     width: Theme/sizing(of: ToggleControl)
-                    height: Fill
                     align: [row: Left, column: Top]
                 ]
                 child: toggle_all_checkbox()
                     |> LINK { PASSED.store.elements.toggle_all_checkbox }
+            )
+            Scene/Element/stripe(
+                element: []
+                direction: Column
+                gap: Theme/spacing(of: None)
+                style: [width: Fill]
+                items: PASSED.store.todos
+                    |> List/retain(
+                        item
+                        if: PASSED.store.selected_filter |> WHILE {
+                            All => True
+                            Active => item.completed |> Bool/not()
+                            Completed => item.completed
+                        }
+                    )
+                    |> List/map(old, new: old |> todo_element())
             )
         }
     )
@@ -650,18 +646,24 @@ FUNCTION panel_footer() {
             material: Theme/material(of: SurfaceElevated)
         ]
         items: LIST {
-            active_items_count_text()
-            filters_element
-            PASSED.store.todos |> List/any(item, if: item.completed) |> WHILE {
-                True => remove_completed_button()
-                    |> LINK { PASSED.store.elements.remove_completed_button }
-                False => NoElement
-            }
-        } |> List/map(old, new: Scene/Element/block(
-            element: []
-            style: [width: Fill]
-            child: old
-        ))
+            footer_section(child: active_items_count_text())
+            footer_section(child: filters_element())
+            footer_section(child: PASSED.store.todos
+                |> List/any(item, if: item.completed) |> WHILE {
+                    True => remove_completed_button()
+                        |> LINK { PASSED.store.elements.remove_completed_button }
+                    False => NoElement
+                }
+            )
+        }
+    )
+}
+
+FUNCTION footer_section(child) {
+    Scene/Element/block(
+        element: []
+        style: [width: Fill]
+        child: child
     )
 }
 
@@ -694,11 +696,11 @@ FUNCTION filters_element() {
         gap: Theme/spacing(of: Standard)
         style: []
         items: LIST {
-            filter_button(All)
+            filter_button(filter: All)
                 |> LINK { PASSED.store.elements.filter_buttons.all }
-            filter_button(Active)
+            filter_button(filter: Active)
                 |> LINK { PASSED.store.elements.filter_buttons.active }
-            filter_button(Completed)
+            filter_button(filter: Completed)
                 |> LINK { PASSED.store.elements.filter_buttons.completed }
         }
     )

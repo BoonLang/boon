@@ -1559,47 +1559,50 @@ pub fn function_bool_toggle(
     construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    // Clone to avoid lifetime issues
     let argument_value = arguments[0].clone();
     let argument_when = arguments[1].clone();
 
-    // Get initial value and toggle on each 'when' event
-    let initial = argument_value.clone();
-    let when_stream = argument_when.stream();
+    // Two independent streams merged via select:
+    // - value_stream: pipe input (initial bool + updates from toggle-all)
+    // - when_stream: toggle trigger (individual checkbox click)
+    enum Msg {
+        SetValue(bool),
+        Toggle,
+    }
 
-    stream::once(async move {
-        // Get initial boolean state
-        let _current = true; // Will be set by first value
-        initial
-    })
-    .chain(when_stream.map(move |_| {
-        // This is a simplified implementation - real implementation would need state
-        argument_value.clone()
-    }))
-    .then(|actor| async move { actor.stream() })
-    .flatten()
-    .scan(None::<bool>, move |state, value| {
-        let is_true = match &value {
-            Value::Tag(tag, _) => tag.tag() == "True",
-            _ => false,
-        };
-        let new_value = match state {
-            None => is_true,            // First value sets initial state
-            Some(_) => !state.unwrap(), // Toggle on subsequent values
-        };
-        *state = Some(new_value);
-        let result_tag = if new_value { "True" } else { "False" };
-        future::ready(Some(Tag::new_value(
-            ConstructInfo::new(
-                function_call_id.with_child_id(0),
-                None,
-                "Bool/toggle result",
-            ),
-            construct_context.clone(),
-            ValueIdempotencyKey::new(),
-            result_tag.to_string(),
-        )))
-    })
+    let value_stream = argument_value.stream().filter_map(|value| {
+        future::ready(match &value {
+            Value::Tag(tag, _) => Some(Msg::SetValue(tag.tag() == "True")),
+            _ => None,
+        })
+    });
+
+    let when_stream = argument_when.stream().map(|_| Msg::Toggle);
+
+    stream::select(value_stream, when_stream).scan(
+        None::<bool>,
+        move |state, msg| {
+            match msg {
+                Msg::SetValue(v) => *state = Some(v),
+                Msg::Toggle => {
+                    let current = state.unwrap_or(false);
+                    *state = Some(!current);
+                }
+            }
+            let is_true = state.unwrap_or(false);
+            let result_tag = if is_true { "True" } else { "False" };
+            future::ready(Some(Tag::new_value(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(0),
+                    None,
+                    "Bool/toggle result",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                result_tag.to_string(),
+            )))
+        },
+    )
 }
 
 /// Bool/or(this, that) -> Tag (True/False)

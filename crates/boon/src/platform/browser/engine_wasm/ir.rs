@@ -254,6 +254,25 @@ pub enum IrNode {
         item_field_cells: Vec<(String, CellId)>,
     },
 
+    /// List every: check if all items match predicate. Output bool (1.0/0.0).
+    /// Uses the same per-item iteration pattern as ListRetain but produces a boolean.
+    ListEvery {
+        cell: CellId,
+        source: CellId,
+        predicate: Option<CellId>,
+        item_cell: Option<CellId>,
+        item_field_cells: Vec<(String, CellId)>,
+    },
+
+    /// List any: check if any item matches predicate. Output bool (1.0/0.0).
+    ListAny {
+        cell: CellId,
+        source: CellId,
+        predicate: Option<CellId>,
+        item_cell: Option<CellId>,
+        item_field_cells: Vec<(String, CellId)>,
+    },
+
     /// List is_empty: output bool (1.0/0.0) whether list is empty.
     ListIsEmpty { cell: CellId, source: CellId },
 
@@ -353,6 +372,14 @@ pub enum ElementKind {
     },
     Paragraph {
         content: IrExpr,
+        style: IrExpr,
+    },
+    Block {
+        child: CellId,
+        style: IrExpr,
+    },
+    Text {
+        label: IrExpr,
         style: IrExpr,
     },
 }
@@ -541,6 +568,40 @@ pub fn node_debug_short(node: &IrNode) -> String {
                 .map(|(n, c)| format!("{}:{}", n, c.0))
                 .collect::<Vec<_>>()
         ),
+        IrNode::ListEvery {
+            cell,
+            source,
+            predicate,
+            item_cell,
+            item_field_cells,
+        } => format!(
+            "ListEvery(cell={}, source={}, pred={:?}, item={:?}, fields={:?})",
+            cell.0,
+            source.0,
+            predicate.map(|p| p.0),
+            item_cell.map(|c| c.0),
+            item_field_cells
+                .iter()
+                .map(|(n, c)| format!("{}:{}", n, c.0))
+                .collect::<Vec<_>>()
+        ),
+        IrNode::ListAny {
+            cell,
+            source,
+            predicate,
+            item_cell,
+            item_field_cells,
+        } => format!(
+            "ListAny(cell={}, source={}, pred={:?}, item={:?}, fields={:?})",
+            cell.0,
+            source.0,
+            predicate.map(|p| p.0),
+            item_cell.map(|c| c.0),
+            item_field_cells
+                .iter()
+                .map(|(n, c)| format!("{}:{}", n, c.0))
+                .collect::<Vec<_>>()
+        ),
         IrNode::ListIsEmpty { cell, source } => {
             format!("ListIsEmpty(cell={}, source={})", cell.0, source.0)
         }
@@ -587,5 +648,7 @@ fn element_kind_name(kind: &ElementKind) -> &'static str {
         ElementKind::Stack { .. } => "Stack",
         ElementKind::Link { .. } => "Link",
         ElementKind::Paragraph { .. } => "Paragraph",
+        ElementKind::Block { .. } => "Block",
+        ElementKind::Text { .. } => "Text",
     }
 }

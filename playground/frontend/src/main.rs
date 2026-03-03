@@ -222,6 +222,55 @@ fn find_multi_file_example_by_name(name: &str) -> Option<&'static MultiFileExamp
     MULTI_FILE_EXAMPLES.iter().find(|e| e.name == name)
 }
 
+/// Parse module files and return external function definitions in the universal tuple format.
+/// Used by DD and WASM engines. The Actors engine converts these to `FunctionRegistry`.
+///
+/// Returns: Vec of (qualified_name, params, body, module_name)
+fn parse_module_files(
+    files: &BTreeMap<String, String>,
+    entry_filename: &str,
+) -> Vec<(
+    String,
+    Vec<String>,
+    boon::parser::static_expression::Spanned<boon::parser::static_expression::Expression>,
+    Option<String>,
+)> {
+    let mut result = Vec::new();
+    if files.len() <= 1 {
+        return result;
+    }
+    for (file_path, file_content) in files.iter() {
+        // Skip entry file and build file — they're not importable modules
+        if file_path == entry_filename || file_path == "BUILD.bn" {
+            continue;
+        }
+        if !file_path.ends_with(".bn") {
+            continue;
+        }
+        // Module name = basename without .bn extension
+        // e.g., "Theme/Theme.bn" → "Theme", "Theme/Professional.bn" → "Professional"
+        let module_name = file_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(file_path)
+            .strip_suffix(".bn")
+            .unwrap_or(file_path);
+
+        if let Some(module_data) = parse_module(file_path, file_content) {
+            for (func_name, func_def) in module_data.functions {
+                let qualified_name = format!("{}/{}", module_name, func_name);
+                result.push((
+                    qualified_name,
+                    func_def.parameters,
+                    func_def.body,
+                    Some(module_name.to_string()),
+                ));
+            }
+        }
+    }
+    result
+}
+
 /// Panel layout mode for screenshot and viewing modes
 #[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(crate = "boon::zoon::serde")]
@@ -2317,16 +2366,9 @@ impl Playground {
         // Check which engine to use
         #[cfg(feature = "engine-wasm")]
         if engine_type == EngineType::Wasm {
-            if files.len() > 1 {
-                drop(source_code);
-                drop(files);
-                return El::new()
-                    .s(Padding::all(20))
-                    .s(Font::new().size(14).color(color!("LightCoral")))
-                    .child("WASM engine does not support multi-file examples yet. Switch to Actors engine.")
-                    .unify();
-            }
-            let element = boon::platform::browser::engine_wasm::run_wasm(&source_code);
+            let external_fns = parse_module_files(&files, filename);
+            let ext = if external_fns.is_empty() { None } else { Some(external_fns.as_slice()) };
+            let element = boon::platform::browser::engine_wasm::run_wasm(&source_code, ext);
             drop(source_code);
             drop(files);
             return element;
@@ -2334,20 +2376,14 @@ impl Playground {
 
         #[cfg(feature = "engine-dd")]
         if engine_type == EngineType::DifferentialDataflow {
-            if files.len() > 1 {
-                drop(source_code);
-                drop(files);
-                return El::new()
-                    .s(Padding::all(20))
-                    .s(Font::new().size(14).color(color!("LightCoral")))
-                    .child("DD engine does not support multi-file examples yet. Switch to Actors engine.")
-                    .unify();
-            }
+            let external_fns = parse_module_files(&files, filename);
+            let ext = if external_fns.is_empty() { None } else { Some(external_fns.as_slice()) };
             // Run with DD engine (reactive evaluation)
             let result = run_dd_reactive_with_persistence(
                 filename,
                 &source_code,
                 Some(STATES_STORAGE_KEY),
+                ext,
             );
             drop(source_code);
             drop(files);
@@ -2374,63 +2410,30 @@ impl Playground {
                 .collect(),
         );
 
-        // Check if BUILD.bn exists and run it first
-        let build_source = files.get("BUILD.bn").cloned();
+        // Pre-parse module files for cross-file calls (e.g., `Theme/material()`).
+        // Uses shared parse_module_files() — same data feeds Actors, DD, and WASM engines.
+        let external_fns = parse_module_files(&files, filename);
 
-        // Pre-parse module files and register their functions for cross-file calls.
-        // This enables calls like `Theme/material()` which resolves to the `material`
-        // function defined in `Theme/Theme.bn`.
+        // Convert to Actors' FunctionRegistry format
         let mut module_registry: FunctionRegistry = std::collections::HashMap::new();
-        if files.len() > 1 {
-            for (file_path, file_content) in files.iter() {
-                // Skip entry file and build file — they're not importable modules
-                if file_path == filename || file_path == "BUILD.bn" {
-                    continue;
-                }
-                if !file_path.ends_with(".bn") {
-                    continue;
-                }
-                // Module name = basename without .bn extension
-                // e.g., "Theme/Theme.bn" → "Theme", "Theme/Professional.bn" → "Professional"
-                let module_name = file_path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(file_path)
-                    .strip_suffix(".bn")
-                    .unwrap_or(file_path);
-
-                if let Some(module_data) = parse_module(file_path, file_content) {
-                    let func_count = module_data.functions.len();
-                    for (func_name, mut func_def) in module_data.functions {
-                        let qualified_name = format!("{}/{}", module_name, func_name);
-                        // Set module_name so intra-module calls resolve correctly
-                        func_def.module_name = Some(module_name.to_string());
-                        module_registry.insert(qualified_name, func_def);
-                    }
-                    println!(
-                        "Pre-loaded module '{}' from '{}' ({} functions)",
-                        module_name, file_path, func_count
-                    );
-                }
-            }
+        for (qualified_name, params, body, module_name) in &external_fns {
+            use boon::platform::browser::evaluator::StaticFunctionDefinition;
+            module_registry.insert(
+                qualified_name.clone(),
+                StaticFunctionDefinition {
+                    parameters: params.clone(),
+                    body: body.clone(),
+                    module_name: module_name.clone(),
+                },
+            );
         }
 
         drop(files);
 
-        // Run BUILD.bn if it exists (to write generated files to VirtualFilesystem)
-        if let Some(build_code) = build_source {
-            println!("Running BUILD.bn first...");
-            let _ = interpreter::run_with_registry(
-                "BUILD.bn",
-                &build_code,
-                "boon-playground-build-states",
-                "boon-playground-build-old-code",
-                "boon-playground-build-span-id-pairs",
-                virtual_fs.clone(),
-                None,
-            );
-            println!("BUILD.bn completed");
-        }
+        // BUILD.bn is a build script (generates Assets.bn from SVG files).
+        // In the playground, generated files are already statically included,
+        // so we skip running BUILD.bn (its build-time functions like
+        // Directory/entries, File/read_text aren't available in the browser).
 
         // Run the main file with pre-registered module functions.
         // We keep reference_connector and link_connector alive to preserve all actors.
@@ -3183,3 +3186,5 @@ fn force_size_toggle_button(force_size_expanded: Mutable<bool>) -> impl Element 
             force_size_expanded.set(true);
         })
 }
+
+

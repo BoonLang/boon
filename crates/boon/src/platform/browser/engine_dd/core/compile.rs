@@ -7,7 +7,7 @@
 //! Uses the existing Boon parser. The compiler walks the static AST
 //! and evaluates/compiles expressions.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -21,8 +21,8 @@ use crate::parser::{
 
 use super::types::{
     BroadcastHandlerFn, CollectionSpec, DEP_FIELD_PREFIX, DataflowGraph, HOVER_PATH_FIELD,
-    HOVERED_FIELD, InputId, InputKind, InputSpec, KeyedListOutput, LINK_PATH_FIELD, LIST_TAG,
-    ListKey, PASSED_VAR, ROUTER_INPUT, SideEffectKind, VarId,
+    HOVERED_FIELD, InputId, InputKind, InputSpec, KEYED_LIST_NAME_FIELD, KeyedListOutput,
+    LINK_PATH_FIELD, LIST_TAG, ListKey, PASSED_VAR, ROUTER_INPUT, SideEffectKind, VarId,
 };
 use super::value::Value;
 
@@ -44,13 +44,25 @@ enum ListChainOp<'a> {
     Remove(&'a [Spanned<Argument>]),
     /// `List/clear(on: event_source)`
     Clear(&'a [Spanned<Argument>]),
+    /// `List/retain(item, if: predicate_expr)`
+    Retain(&'a [Spanned<Argument>]),
 }
+
+/// External function definition for multi-file support.
+/// (qualified_name, params, body, module_name)
+pub type ExternalFunction = (
+    String,
+    Vec<String>,
+    Spanned<Expression>,
+    Option<String>,
+);
 
 /// Compile Boon source code into a program.
 pub fn compile(
     source_code: &str,
     storage_key: Option<&str>,
     persisted_holds: &std::collections::HashMap<String, Value>,
+    external_functions: Option<&[ExternalFunction]>,
 ) -> Result<CompiledProgram, String> {
     let ast = parse_source(source_code)?;
 
@@ -58,10 +70,18 @@ pub fn compile(
     let mut compiler = Compiler::new();
     compiler.register_top_level(&ast);
 
-    // Find the document variable
+    // Register external functions from other module files
+    if let Some(ext_fns) = external_functions {
+        compiler.register_external_functions(ext_fns);
+    }
+
+    // Find the output variable: try "scene" first, then "document".
+    // When "scene" is used, the value is a Scene/new(...) call — the DD renderer
+    // will extract the root element from it (physical CSS properties are ignored for now).
     let doc_expr = compiler
-        .get_var_expr("document")
-        .ok_or_else(|| "No 'document' variable found".to_string())?
+        .get_var_expr("scene")
+        .or_else(|| compiler.get_var_expr("document"))
+        .ok_or_else(|| "No 'scene' or 'document' variable found".to_string())?
         .clone();
 
     // Check if program is reactive
@@ -140,6 +160,12 @@ struct Compiler {
     variables: Vec<(String, Spanned<Expression>)>,
     /// Function definitions: name → (params, body)
     functions: Vec<(String, Vec<String>, Spanned<Expression>)>,
+    /// Module name for each qualified function (e.g., "Theme/get" → "Theme").
+    /// Used for intra-module resolution: when inside Theme/get, an unqualified
+    /// call to material() resolves to Theme/material.
+    function_modules: HashMap<String, String>,
+    /// Current module context during function body evaluation.
+    current_module: Option<String>,
 }
 
 impl Compiler {
@@ -147,6 +173,144 @@ impl Compiler {
         Self {
             variables: Vec::new(),
             functions: Vec::new(),
+            function_modules: HashMap::new(),
+            current_module: None,
+        }
+    }
+
+    /// Register external functions from parsed module files.
+    fn register_external_functions(&mut self, ext_fns: &[ExternalFunction]) {
+        for (qualified_name, params, body, module_name) in ext_fns {
+            self.functions
+                .push((qualified_name.clone(), params.clone(), body.clone()));
+            if let Some(module) = module_name {
+                self.function_modules
+                    .insert(qualified_name.clone(), module.clone());
+            }
+        }
+    }
+
+    /// Look up a function by name, with intra-module fallback.
+    /// First tries an exact match, then tries module-qualified name
+    /// if we're currently inside a module function.
+    fn find_function(
+        &self,
+        name: &str,
+    ) -> Option<(String, Vec<String>, Spanned<Expression>)> {
+        // Try exact match
+        if let Some(f) = self.functions.iter().find(|(n, _, _)| n == name) {
+            return Some(f.clone());
+        }
+        // Intra-module resolution: try current_module/name
+        if let Some(module) = &self.current_module {
+            let qualified = format!("{}/{}", module, name);
+            if let Some(f) = self.functions.iter().find(|(n, _, _)| n == &qualified) {
+                return Some(f.clone());
+            }
+        }
+        None
+    }
+
+    /// Create a scoped clone with the current_module set for the given function.
+    fn with_module_context(&self, qualified_fn_name: &str) -> Compiler {
+        let mut c = self.clone();
+        c.current_module = self.function_modules.get(qualified_fn_name).cloned();
+        c
+    }
+
+    /// Check if a function path is a known built-in piped function.
+    fn is_builtin_piped_fn(&self, path: &[String]) -> bool {
+        let strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+        matches!(
+            strs.as_slice(),
+            ["Bool", "not"]
+                | ["Bool", "or"]
+                | ["Bool", "and"]
+                | ["Text", "trim"]
+                | ["Text", "is_not_empty"]
+                | ["Text", "is_empty"]
+                | ["List", "count"]
+                | ["List", "is_empty"]
+                | ["Log", "info"]
+        )
+    }
+
+    /// Evaluate a built-in piped function with a runtime Value input.
+    /// Mirrors the static evaluator's piped dispatch but takes a Value directly.
+    fn eval_builtin_piped(
+        &self,
+        input: &Value,
+        path: &[String],
+        arguments: &[(String, Option<Spanned<Expression>>)],
+    ) -> Result<Value, String> {
+        let strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+        match strs.as_slice() {
+            ["Log", "info"] => Ok(input.clone()),
+            ["Text", "trim"] => {
+                let s = input.as_text().unwrap_or("");
+                Ok(Value::text(s.trim()))
+            }
+            ["Text", "is_not_empty"] => {
+                let s = input.as_text().unwrap_or("");
+                Ok(if !s.is_empty() {
+                    Value::tag("True")
+                } else {
+                    Value::tag("False")
+                })
+            }
+            ["Text", "is_empty"] => {
+                let s = input.as_text().unwrap_or("");
+                Ok(if s.is_empty() {
+                    Value::tag("True")
+                } else {
+                    Value::tag("False")
+                })
+            }
+            ["Bool", "not"] => {
+                let b = input.as_bool().unwrap_or(false);
+                Ok(if b {
+                    Value::tag("False")
+                } else {
+                    Value::tag("True")
+                })
+            }
+            ["Bool", "or"] => {
+                let a = input.as_bool().unwrap_or(false);
+                let b = arguments
+                    .iter()
+                    .find(|(name, _)| name == "that")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Ok(if a || b {
+                    Value::tag("True")
+                } else {
+                    Value::tag("False")
+                })
+            }
+            ["Bool", "and"] => {
+                let a = input.as_bool().unwrap_or(false);
+                let b = arguments
+                    .iter()
+                    .find(|(name, _)| name == "that")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Ok(if a && b {
+                    Value::tag("True")
+                } else {
+                    Value::tag("False")
+                })
+            }
+            ["List", "count"] => Ok(Value::number(input.list_count() as f64)),
+            ["List", "is_empty"] => Ok(if input.list_is_empty() {
+                Value::tag("True")
+            } else {
+                Value::tag("False")
+            }),
+            _ => Err(format!("Not a built-in piped function: {}", path.join("/"))),
         }
     }
 
@@ -315,11 +479,16 @@ impl Compiler {
                         | ["Router", "route"]
                         | ["Router", "go_to"]
                         | ["List", "count"]
+                        | ["List", "latest"]
+                        | ["List", "every"]
+                        | ["List", "any"]
+                        | ["List", "is_not_empty"]
                         | ["List", "retain"]
                         | ["List", "map"]
                         | ["List", "append"]
                         | ["List", "clear"]
                         | ["List", "remove"]
+                        | ["Bool", "toggle"]
                 ) {
                     return true;
                 }
@@ -486,23 +655,44 @@ impl Compiler {
 
             Expression::Object(obj) => {
                 let mut fields = BTreeMap::new();
+                // Build a sibling scope so that fields can reference previously-
+                // evaluated siblings (e.g., `text_to_add` referencing `elements`
+                // inside a `store` object).  Reactive fields that can't be
+                // evaluated statically get a Unit placeholder — the document
+                // closure replaces them with live values at runtime.
+                let mut sibling_scope = local_scope.clone();
                 for var in &obj.variables {
                     let name = var.node.name.as_str();
                     if name.is_empty() {
                         // Spread: evaluate expression, merge its fields
-                        let val = self.eval_static_with_scope(&var.node.value, local_scope)?;
-                        match val {
-                            Value::Object(spread_fields) => {
-                                fields.extend(spread_fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        if let Ok(val) = self.eval_static_with_scope(&var.node.value, &sibling_scope) {
+                            match val {
+                                Value::Object(spread_fields) => {
+                                    for (k, v) in spread_fields.iter() {
+                                        sibling_scope.insert(k.to_string(), v.clone());
+                                        fields.insert(k.clone(), v.clone());
+                                    }
+                                }
+                                Value::Tagged { fields: spread_fields, .. } => {
+                                    for (k, v) in spread_fields.iter() {
+                                        sibling_scope.insert(k.to_string(), v.clone());
+                                        fields.insert(k.clone(), v.clone());
+                                    }
+                                }
+                                _ => {} // Non-object spread ignored
                             }
-                            Value::Tagged { fields: spread_fields, .. } => {
-                                fields.extend(spread_fields.iter().map(|(k, v)| (k.clone(), v.clone())));
-                            }
-                            _ => {} // Non-object spread ignored
                         }
                     } else {
-                        let val = self.eval_static_with_scope(&var.node.value, local_scope)?;
-                        fields.insert(Arc::from(name), val);
+                        match self.eval_static_with_scope(&var.node.value, &sibling_scope) {
+                            Ok(val) => {
+                                sibling_scope.insert(name.to_string(), val.clone());
+                                fields.insert(Arc::from(name), val);
+                            }
+                            Err(_) => {
+                                // Reactive field — use placeholder
+                                fields.insert(Arc::from(name), Value::Unit);
+                            }
+                        }
                     }
                 }
                 Ok(Value::Object(Arc::new(fields)))
@@ -745,6 +935,81 @@ impl Compiler {
                                         from_val
                                     }
                                 }
+                                // Piped user function: `value |> fn_name()`
+                                [fn_name] => {
+                                    if let Some((qualified_name, params, body)) =
+                                        self.find_function(fn_name)
+                                    {
+                                        let scoped = self.with_module_context(&qualified_name);
+                                        let mut fn_scope = local_scope.clone();
+                                        if let Some(first_param) = params.first() {
+                                            fn_scope
+                                                .insert(first_param.clone(), from_val.clone());
+                                        }
+                                        for arg in arguments {
+                                            let arg_name = arg.node.name.as_str();
+                                            if arg_name == "PASS" {
+                                                if let Some(ref val_expr) = arg.node.value {
+                                                    let val = self.eval_static_tolerant(
+                                                        val_expr,
+                                                        local_scope,
+                                                    );
+                                                    fn_scope
+                                                        .insert(PASSED_VAR.to_string(), val);
+                                                }
+                                                continue;
+                                            }
+                                            if let Some(ref val_expr) = arg.node.value {
+                                                let val = self.eval_static_tolerant(
+                                                    val_expr,
+                                                    local_scope,
+                                                );
+                                                fn_scope.insert(arg_name.to_string(), val);
+                                            }
+                                        }
+                                        scoped.eval_static_tolerant(&body, &fn_scope)
+                                    } else {
+                                        from_val
+                                    }
+                                }
+                                // Module-qualified piped function: `value |> Module/fn()`
+                                [module, fn_name] => {
+                                    let qualified = format!("{}/{}", module, fn_name);
+                                    if let Some((qualified_name, params, body)) =
+                                        self.find_function(&qualified)
+                                    {
+                                        let scoped = self.with_module_context(&qualified_name);
+                                        let mut fn_scope = local_scope.clone();
+                                        if let Some(first_param) = params.first() {
+                                            fn_scope
+                                                .insert(first_param.clone(), from_val.clone());
+                                        }
+                                        for arg in arguments {
+                                            let arg_name = arg.node.name.as_str();
+                                            if arg_name == "PASS" {
+                                                if let Some(ref val_expr) = arg.node.value {
+                                                    let val = self.eval_static_tolerant(
+                                                        val_expr,
+                                                        local_scope,
+                                                    );
+                                                    fn_scope
+                                                        .insert(PASSED_VAR.to_string(), val);
+                                                }
+                                                continue;
+                                            }
+                                            if let Some(ref val_expr) = arg.node.value {
+                                                let val = self.eval_static_tolerant(
+                                                    val_expr,
+                                                    local_scope,
+                                                );
+                                                fn_scope.insert(arg_name.to_string(), val);
+                                            }
+                                        }
+                                        scoped.eval_static_tolerant(&body, &fn_scope)
+                                    } else {
+                                        from_val
+                                    }
+                                }
                                 _ => from_val,
                             }
                         }
@@ -786,8 +1051,20 @@ impl Compiler {
                 // Tolerant fallback based on function type
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                 match path_strs.as_slice() {
-                    // Element functions: evaluate arguments tolerantly
-                    ["Element", kind] => {
+                    // Scene/new: extract the root element (ignore lights/geometry for now)
+                    ["Scene", "new"] => {
+                        let mut root = Value::Unit;
+                        for arg in arguments {
+                            if arg.node.name.as_str() == "root" {
+                                if let Some(ref val_expr) = arg.node.value {
+                                    root = self.eval_static_tolerant(val_expr, local_scope);
+                                }
+                            }
+                        }
+                        return root;
+                    }
+                    // Scene/Element/* — aliases for Element/*
+                    ["Scene", "Element", kind] | ["Element", kind] => {
                         let tag = match *kind {
                             "stripe" => "ElementStripe",
                             "stack" => "ElementStack",
@@ -886,6 +1163,11 @@ impl Compiler {
                     }
                     // User-defined function: try tolerant body evaluation
                     [fn_name] => self.eval_user_function_tolerant(fn_name, arguments, local_scope),
+                    // Module-qualified function: Theme/material(), Professional/get(), etc.
+                    [module, fn_name] => {
+                        let qualified = format!("{}/{}", module, fn_name);
+                        self.eval_user_function_tolerant(&qualified, arguments, local_scope)
+                    }
                     _ => Value::Unit,
                 }
             }
@@ -908,6 +1190,37 @@ impl Compiler {
                     _ => Value::Unit,
                 }
             }
+            // Comparators: evaluate both operands tolerantly and compare.
+            // When an operand evaluates to Unit (reactive/unavailable), default to False
+            // for equality and True for inequality (assume unknown values differ).
+            Expression::Comparator(cmp) => {
+                if let Ok(val) = self.eval_comparator_static(cmp, local_scope) {
+                    return val;
+                }
+                use static_expression::Comparator;
+                let (a_expr, b_expr, is_equality) = match cmp {
+                    Comparator::Equal { operand_a, operand_b } => (operand_a, operand_b, true),
+                    Comparator::NotEqual { operand_a, operand_b } => (operand_a, operand_b, false),
+                    Comparator::Greater { operand_a, operand_b }
+                    | Comparator::GreaterOrEqual { operand_a, operand_b }
+                    | Comparator::Less { operand_a, operand_b }
+                    | Comparator::LessOrEqual { operand_a, operand_b } => {
+                        (operand_a, operand_b, false)
+                    }
+                };
+                let a = self.eval_static_tolerant(a_expr, local_scope);
+                let b = self.eval_static_tolerant(b_expr, local_scope);
+                if matches!(&a, Value::Unit) || matches!(&b, Value::Unit) {
+                    // Can't evaluate one side — default to "not equal"
+                    if is_equality { Value::tag("False") } else { Value::tag("True") }
+                } else if is_equality {
+                    if a == b { Value::tag("True") } else { Value::tag("False") }
+                } else {
+                    // For ordering comparisons with both values available, re-try strict
+                    self.eval_comparator_static(cmp, local_scope)
+                        .unwrap_or(Value::tag("False"))
+                }
+            }
             // For anything else, try strict eval and fall back to Unit
             _ => self
                 .eval_static_with_scope(expr, local_scope)
@@ -922,12 +1235,13 @@ impl Compiler {
         arguments: &[Spanned<Argument>],
         local_scope: &IndexMap<String, Value>,
     ) -> Value {
-        let func = match self.functions.iter().find(|(name, _, _)| name == fn_name) {
-            Some(f) => f.clone(),
+        let (qualified_name, params, body) = match self.find_function(fn_name) {
+            Some(f) => f,
             None => return Value::Unit,
         };
 
-        let (_, params, body) = func;
+        // Set up module context for intra-module resolution in the function body
+        let scoped = self.with_module_context(&qualified_name);
         let mut fn_scope = local_scope.clone();
 
         for arg in arguments {
@@ -954,7 +1268,7 @@ impl Compiler {
             }
         }
 
-        self.eval_static_tolerant(&body, &fn_scope)
+        scoped.eval_static_tolerant(&body, &fn_scope)
     }
 
     fn eval_literal(lit: &Literal) -> Value {
@@ -1009,6 +1323,41 @@ impl Compiler {
                 })
             }
 
+            // Scene/new: extract root element (ignore lights/geometry for now)
+            ["Scene", "new"] => {
+                for arg in arguments {
+                    if arg.node.name.as_str() == "root" {
+                        if let Some(ref val_expr) = arg.node.value {
+                            return self.eval_static_with_scope(val_expr, local_scope);
+                        }
+                    }
+                }
+                Err("Scene/new requires a 'root' argument".to_string())
+            }
+
+            // Lights functions — stubs (values unused without physical CSS)
+            ["Lights", "basic"] | ["Lights", "directional"] | ["Lights", "ambient"]
+            | ["Light", "directional"] | ["Light", "ambient"] => Ok(Value::Unit),
+
+            // Scene/Element/* — aliases for Element/*
+            ["Scene", "Element", kind] => {
+                let tag = match *kind {
+                    "button" => "ElementButton",
+                    "stripe" => "ElementStripe",
+                    "container" => "ElementContainer",
+                    "stack" => "ElementStack",
+                    "paragraph" => "ElementParagraph",
+                    "text_input" => "ElementTextInput",
+                    "label" => "ElementLabel",
+                    "link" => "ElementLink",
+                    "checkbox" => "ElementCheckbox",
+                    "block" => "ElementBlock",
+                    "text" => "ElementText",
+                    _ => return Err(format!("Unknown Scene/Element type: {}", kind)),
+                };
+                self.eval_element_static(tag, arguments, local_scope)
+            }
+
             ["Element", "button"] => {
                 self.eval_element_static("ElementButton", arguments, local_scope)
             }
@@ -1043,9 +1392,23 @@ impl Compiler {
                 self.eval_element_static("ElementCheckbox", arguments, local_scope)
             }
 
+            ["Element", "text"] => {
+                self.eval_element_static("ElementText", arguments, local_scope)
+            }
+
+            ["Element", "block"] => {
+                self.eval_element_static("ElementBlock", arguments, local_scope)
+            }
+
             ["Math", "sum"] => {
                 // Static Math/sum — meaningless without reactive input
                 Ok(Value::number(0.0))
+            }
+
+            // Ulid
+            ["Ulid", "generate"] => {
+                let id = ulid::Ulid::new();
+                Ok(Value::text(id.to_string()))
             }
 
             // Text utilities
@@ -1074,6 +1437,12 @@ impl Compiler {
             [fn_name] => {
                 // User-defined function call
                 self.eval_user_function_static(fn_name, arguments, local_scope)
+            }
+
+            // Module-qualified function: Theme/material(), Professional/get(), etc.
+            [module, fn_name] => {
+                let qualified = format!("{}/{}", module, fn_name);
+                self.eval_user_function_static(&qualified, arguments, local_scope)
             }
 
             _ => Err(format!("Unknown function: {}", path_strs.join("/"))),
@@ -1122,13 +1491,43 @@ impl Compiler {
                 }
             }
         }
+        // Detect keyed Stripe: scope carries __keyed_list_name__ from the document
+        // closure when a keyed list is active. Check if this Stripe's items expression
+        // references PASSED.store.<keyed_list_name>, meaning its items come from the
+        // DD keyed list and should be managed via keyed diffs, not the Value tree.
+        let is_keyed_stripe = tag == "ElementStripe"
+            && local_scope
+                .get(KEYED_LIST_NAME_FIELD)
+                .and_then(|v| v.as_text())
+                .map(|keyed_name| {
+                    arguments
+                        .iter()
+                        .find(|a| a.node.name.as_str() == "items")
+                        .and_then(|items_arg| items_arg.node.value.as_ref())
+                        .map(|val_expr| {
+                            self.expr_references_passed_store(val_expr, keyed_name)
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+
         let mut fields = BTreeMap::new();
         for arg in arguments {
             let name = arg.node.name.as_str();
             if let Some(ref val_expr) = arg.node.value {
+                // For keyed Stripes, skip evaluating items entirely — the bridge
+                // populates them from keyed diffs. This is both correct (avoids
+                // stale data in the Value tree) and efficient (no per-item eval).
+                if is_keyed_stripe && name == "items" {
+                    fields.insert(Arc::from("items"), Value::empty_list());
+                    continue;
+                }
                 let val = self.eval_static_with_scope(val_expr, &elem_scope)?;
                 fields.insert(Arc::from(name), val);
             }
+        }
+        if is_keyed_stripe {
+            fields.insert(Arc::from("__keyed__"), Value::tag("True"));
         }
         // Inject __hover_path__ for the bridge to extract
         if let Some(ref path) = hover_path {
@@ -1183,14 +1582,12 @@ impl Compiler {
         arguments: &[Spanned<Argument>],
         local_scope: &IndexMap<String, Value>,
     ) -> Result<Value, String> {
-        let func = self
-            .functions
-            .iter()
-            .find(|(name, _, _)| name == fn_name)
-            .ok_or_else(|| format!("Function '{}' not found", fn_name))?
-            .clone();
+        let (qualified_name, params, body) = self
+            .find_function(fn_name)
+            .ok_or_else(|| format!("Function '{}' not found", fn_name))?;
 
-        let (_, params, body) = func;
+        // Set up module context for intra-module resolution in the function body
+        let scoped = self.with_module_context(&qualified_name);
 
         let mut fn_scope = local_scope.clone();
 
@@ -1219,7 +1616,7 @@ impl Compiler {
             }
         }
 
-        self.eval_static_with_scope(&body, &fn_scope)
+        scoped.eval_static_with_scope(&body, &fn_scope)
     }
 
     fn eval_pipe_static(
@@ -1345,8 +1742,83 @@ impl Compiler {
                         })
                     }
 
+                    // Bool/toggle in static context — just return the initial value
+                    ["Bool", "toggle"] => Ok(from_val),
+
                     // List utilities (piped)
                     ["List", "count"] => Ok(Value::number(from_val.list_count() as f64)),
+                    ["List", "latest"] => {
+                        // Static: return last list element
+                        if let Value::Tagged { tag, fields } = &from_val {
+                            if tag.as_ref() == LIST_TAG {
+                                if let Some(last) = fields.values().last() {
+                                    return Ok(last.clone());
+                                }
+                            }
+                        }
+                        Ok(Value::Unit)
+                    }
+                    ["List", "every"] => {
+                        // Static: check all items match predicate
+                        let item_param = arguments
+                            .first()
+                            .map(|a| a.node.name.as_str().to_string())
+                            .unwrap_or_else(|| "item".to_string());
+                        let if_expr = arguments
+                            .iter()
+                            .find(|a| a.node.name.as_str() == "if")
+                            .and_then(|a| a.node.value.as_ref());
+                        if let Some(pred) = if_expr {
+                            let pred = pred.clone();
+                            let all = from_val.list_every(|item_val| {
+                                let mut scope = local_scope.clone();
+                                scope.insert(item_param.clone(), item_val.clone());
+                                self.eval_static_tolerant(&pred, &scope)
+                                    .as_bool()
+                                    .unwrap_or(false)
+                            });
+                            Ok(if all {
+                                Value::tag("True")
+                            } else {
+                                Value::tag("False")
+                            })
+                        } else {
+                            Ok(Value::tag("True"))
+                        }
+                    }
+                    ["List", "any"] => {
+                        // Static: check any item matches predicate
+                        let item_param = arguments
+                            .first()
+                            .map(|a| a.node.name.as_str().to_string())
+                            .unwrap_or_else(|| "item".to_string());
+                        let if_expr = arguments
+                            .iter()
+                            .find(|a| a.node.name.as_str() == "if")
+                            .and_then(|a| a.node.value.as_ref());
+                        if let Some(pred) = if_expr {
+                            let pred = pred.clone();
+                            let any = from_val.list_any(|item_val| {
+                                let mut scope = local_scope.clone();
+                                scope.insert(item_param.clone(), item_val.clone());
+                                self.eval_static_tolerant(&pred, &scope)
+                                    .as_bool()
+                                    .unwrap_or(false)
+                            });
+                            Ok(if any {
+                                Value::tag("True")
+                            } else {
+                                Value::tag("False")
+                            })
+                        } else {
+                            Ok(Value::tag("False"))
+                        }
+                    }
+                    ["List", "is_not_empty"] => Ok(if !from_val.list_is_empty() {
+                        Value::tag("True")
+                    } else {
+                        Value::tag("False")
+                    }),
                     ["List", "is_empty"] => Ok(if from_val.list_is_empty() {
                         Value::tag("True")
                     } else {
@@ -1409,8 +1881,8 @@ impl Compiler {
 
                     [fn_name] => {
                         // Piped user function call: `value |> fn()` → fn(value)
-                        if let Some(func) = self.functions.iter().find(|(n, _, _)| n == fn_name) {
-                            let (_, params, body) = func.clone();
+                        if let Some((qualified_name, params, body)) = self.find_function(fn_name) {
+                            let scoped = self.with_module_context(&qualified_name);
                             let mut fn_scope = local_scope.clone();
                             // Bind piped value to first parameter
                             if let Some(first_param) = params.first() {
@@ -1424,9 +1896,29 @@ impl Compiler {
                                     fn_scope.insert(arg_name.to_string(), val);
                                 }
                             }
-                            return self.eval_static_with_scope(&body, &fn_scope);
+                            return scoped.eval_static_with_scope(&body, &fn_scope);
                         }
                         Err(format!("Unknown piped function: {}", fn_name))
+                    }
+                    // Module-qualified piped function: `value |> Theme/material()`
+                    [module, fn_name] => {
+                        let qualified = format!("{}/{}", module, fn_name);
+                        if let Some((qualified_name, params, body)) = self.find_function(&qualified) {
+                            let scoped = self.with_module_context(&qualified_name);
+                            let mut fn_scope = local_scope.clone();
+                            if let Some(first_param) = params.first() {
+                                fn_scope.insert(first_param.clone(), from_val.clone());
+                            }
+                            for arg in arguments {
+                                let arg_name = arg.node.name.as_str();
+                                if let Some(ref val_expr) = arg.node.value {
+                                    let val = self.eval_static_with_scope(val_expr, local_scope)?;
+                                    fn_scope.insert(arg_name.to_string(), val);
+                                }
+                            }
+                            return scoped.eval_static_with_scope(&body, &fn_scope);
+                        }
+                        Err(format!("Unknown piped module function: {}", qualified))
                     }
                     _ => self.eval_function_call_static(path, arguments, local_scope),
                 }
@@ -1966,6 +2458,10 @@ struct GraphBuilder<'a> {
     /// empty list for `items:` expressions that reference this list,
     /// so the bridge can populate items via keyed diffs instead.
     keyed_display_list_name: Option<String>,
+    /// Initial PASSED context captured from the document expression's PASS argument.
+    /// Used by the display pipeline closure so Theme functions can resolve
+    /// colors/styles using the program's initial theme configuration.
+    initial_passed: Value,
 }
 
 impl<'a> GraphBuilder<'a> {
@@ -1987,6 +2483,7 @@ impl<'a> GraphBuilder<'a> {
             storage_key: storage_key.map(|s| s.to_string()),
             persisted_holds,
             keyed_display_list_name: None,
+            initial_passed: Value::Unit,
         }
     }
 
@@ -2021,8 +2518,8 @@ impl<'a> GraphBuilder<'a> {
         // Pass 1: Find all reactive variables and compile them
         let vars: Vec<(String, Spanned<Expression>)> = self.compiler.variables.clone();
         for (name, expr) in &vars {
-            if name == "document" {
-                continue; // Handle document separately
+            if name == "document" || name == "scene" {
+                continue; // Handle document/scene separately
             }
             if Compiler::is_reactive(expr) {
                 // Derive scope prefix from dotted variable names
@@ -2032,10 +2529,17 @@ impl<'a> GraphBuilder<'a> {
                 } else {
                     self.scope_prefix = None;
                 }
-                self.compile_reactive_var(name, expr)?;
+                self.compile_reactive_var(name, expr).map_err(|e| {
+                    format!("Failed compiling '{}': {}", name, e)
+                })?;
             }
         }
         self.scope_prefix = None;
+
+        // Capture initial PASSED context from the document expression's PASS argument.
+        // This is needed by the keyed display pipeline so Theme functions can resolve
+        // colors/styles using the program's initial configuration.
+        self.initial_passed = self.extract_initial_passed(doc_expr);
 
         // Between Pass 1 and Pass 2: Build keyed display pipeline.
         // Scans function bodies for `PASSED.store.<keyed_name> |> List/retain(...) |> List/map(...)`
@@ -2103,8 +2607,20 @@ impl<'a> GraphBuilder<'a> {
                 if let Some(var_id) = self.reactive_vars.get(&path) {
                     return Ok(var_id.clone());
                 }
-                // Not a reactive var — try to evaluate statically and create a Literal
-                match self.compiler.eval_static(expr) {
+                // Not a reactive var — try scope-prefixed static lookup, then plain static
+                match {
+                    if let Some(ref prefix) = self.scope_prefix {
+                        let prefixed_name = format!("{}.{}", prefix, path);
+                        if let Some(prefixed_expr) = self.compiler.get_var_expr(&prefixed_name) {
+                            let prefixed_expr = prefixed_expr.clone();
+                            self.compiler.eval_static_with_scope(&prefixed_expr, &IndexMap::new())
+                        } else {
+                            self.compiler.eval_static(expr)
+                        }
+                    } else {
+                        self.compiler.eval_static(expr)
+                    }
+                } {
                     Ok(value) => {
                         let var = self.fresh_var(&format!("{}_literal", name));
                         self.collections
@@ -2146,6 +2662,11 @@ impl<'a> GraphBuilder<'a> {
 
             // Pattern: `reactive_a == reactive_b` (or !=, <, >, <=, >=)
             Expression::Comparator(cmp) => self.compile_reactive_comparison(name, cmp),
+
+            // Objects with reactive fields: individual fields are compiled via
+            // flattened dotted-name variables (e.g., "theme_options.name").
+            // The parent Object itself doesn't need a DD collection.
+            Expression::Object(_) => Ok(VarId::new(name)),
 
             _ => {
                 // Check if this is an element with LINK bindings
@@ -2489,6 +3010,25 @@ impl<'a> GraphBuilder<'a> {
                     // Pattern: `source |> List/count()`
                     ["List", "count"] => self.compile_list_count(name, from),
 
+                    // Pattern: `source |> List/latest()`
+                    ["List", "latest"] => self.compile_list_latest(name, from),
+
+                    // Pattern: `source |> List/every(item, if: predicate)`
+                    ["List", "every"] => self.compile_list_every(name, from, arguments),
+
+                    // Pattern: `source |> List/any(item, if: predicate)`
+                    ["List", "any"] => self.compile_list_any(name, from, arguments),
+
+                    // Pattern: `source |> List/is_not_empty()`
+                    ["List", "is_not_empty"] => {
+                        self.compile_list_emptiness_check(name, from, true)
+                    }
+
+                    // Pattern: `source |> List/is_empty()`
+                    ["List", "is_empty"] => {
+                        self.compile_list_emptiness_check(name, from, false)
+                    }
+
                     // Pattern: `source |> List/retain(item, if: predicate)`
                     ["List", "retain"] => self.compile_list_retain(name, from, arguments),
 
@@ -2498,84 +3038,133 @@ impl<'a> GraphBuilder<'a> {
                     // Pattern: `source |> List/remove(on: event)`
                     ["List", "remove"] => self.compile_list_remove(name, from, arguments),
 
+                    // Pattern: `initial |> Bool/toggle(when: event_source)`
+                    ["Bool", "toggle"] => self.compile_bool_toggle(name, from, arguments),
+
                     _ => {
                         // Try user-defined function: `source |> my_function()`
+                        // or module-qualified: `source |> Theme/material()`
                         // Compiled as a Map that evaluates the function body per input.
-                        if path.len() == 1 {
-                            let fn_name = path[0].as_str().to_string();
-                            if self
-                                .compiler
-                                .functions
-                                .iter()
-                                .any(|(n, _, _)| n == &fn_name)
-                            {
-                                let source_var = self.resolve_reactive_source(from)?;
-                                let compiler = self.compiler.clone();
-                                let args_clone: Vec<(String, Option<Spanned<Expression>>)> =
-                                    arguments
-                                        .iter()
-                                        .map(|a| {
-                                            (a.node.name.as_str().to_string(), a.node.value.clone())
-                                        })
-                                        .collect();
-                                let map_var = VarId::new(name);
-                                self.collections.insert(
-                                    map_var.clone(),
-                                    CollectionSpec::Map {
-                                        source: source_var,
-                                        f: Arc::new(move |input: &Value| {
-                                            // Build scope: first positional param = piped input
-                                            let func = compiler
-                                                .functions
-                                                .iter()
-                                                .find(|(n, _, _)| n == &fn_name);
-                                            if let Some((_, params, body)) = func {
-                                                let mut scope = IndexMap::new();
-                                                // Bind the piped value to the first parameter
-                                                if let Some(first_param) = params.first() {
-                                                    scope
-                                                        .insert(first_param.clone(), input.clone());
+                        let qualified_fn_name = if path.len() == 1 {
+                            let name = path[0].as_str().to_string();
+                            // Try exact match, then intra-module resolution
+                            if self.compiler.find_function(&name).is_some() {
+                                Some(name)
+                            } else {
+                                None
+                            }
+                        } else if path.len() == 2 {
+                            let qualified = format!("{}/{}", path[0].as_str(), path[1].as_str());
+                            if self.compiler.find_function(&qualified).is_some() {
+                                Some(qualified)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(fn_name) = qualified_fn_name {
+                            let source_var = self.resolve_reactive_source(from)?;
+                            let mut compiler = self.compiler.clone();
+                            // Set module context for intra-module resolution in the closure
+                            compiler.current_module = compiler.function_modules.get(&fn_name).cloned();
+                            let args_clone: Vec<(String, Option<Spanned<Expression>>)> =
+                                arguments
+                                    .iter()
+                                    .map(|a| {
+                                        (a.node.name.as_str().to_string(), a.node.value.clone())
+                                    })
+                                    .collect();
+                            let map_var = VarId::new(name);
+                            self.collections.insert(
+                                map_var.clone(),
+                                CollectionSpec::Map {
+                                    source: source_var,
+                                    f: Arc::new(move |input: &Value| {
+                                        // Build scope: first positional param = piped input
+                                        let func = compiler.find_function(&fn_name);
+                                        if let Some((_, params, body)) = func {
+                                            let mut scope = IndexMap::new();
+                                            // Bind the piped value to the first parameter
+                                            if let Some(first_param) = params.first() {
+                                                scope
+                                                    .insert(first_param.clone(), input.clone());
+                                            }
+                                            // Bind explicit arguments
+                                            for (arg_name, arg_val) in &args_clone {
+                                                if let Some(val_expr) = arg_val {
+                                                    if let Ok(v) = compiler
+                                                        .eval_static_with_scope(
+                                                            val_expr, &scope,
+                                                        )
+                                                    {
+                                                        scope.insert(arg_name.clone(), v);
+                                                    }
                                                 }
-                                                // Bind explicit arguments
-                                                for (arg_name, arg_val) in &args_clone {
-                                                    if let Some(val_expr) = arg_val {
+                                            }
+                                            // Bind by parameter position
+                                            for (i, p) in params.iter().enumerate().skip(1) {
+                                                if i - 1 < args_clone.len() {
+                                                    if let Some(val_expr) = &args_clone[i - 1].1
+                                                    {
                                                         if let Ok(v) = compiler
                                                             .eval_static_with_scope(
                                                                 val_expr, &scope,
                                                             )
                                                         {
-                                                            scope.insert(arg_name.clone(), v);
+                                                            scope.insert(p.clone(), v);
                                                         }
                                                     }
                                                 }
-                                                // Bind by parameter position
-                                                for (i, p) in params.iter().enumerate().skip(1) {
-                                                    if i - 1 < args_clone.len() {
-                                                        if let Some(val_expr) = &args_clone[i - 1].1
-                                                        {
-                                                            if let Ok(v) = compiler
-                                                                .eval_static_with_scope(
-                                                                    val_expr, &scope,
-                                                                )
-                                                            {
-                                                                scope.insert(p.clone(), v);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                compiler
-                                                    .eval_static_with_scope(body, &scope)
-                                                    .unwrap_or(Value::Unit)
-                                            } else {
-                                                Value::Unit
                                             }
-                                        }),
-                                    },
-                                );
-                                self.reactive_vars.insert(name.to_string(), map_var.clone());
-                                return Ok(map_var);
-                            }
+                                            compiler
+                                                .eval_static_tolerant(&body, &scope)
+                                        } else {
+                                            Value::Unit
+                                        }
+                                    }),
+                                },
+                            );
+                            self.reactive_vars.insert(name.to_string(), map_var.clone());
+                            return Ok(map_var);
                         }
+
+                        // Fallback: try built-in function as a Map
+                        // (e.g., Bool/not, Text/trim, Text/is_not_empty, List/is_empty)
+                        let fn_path: Vec<String> =
+                            path.iter().map(|s| s.as_str().to_string()).collect();
+                        let args_for_builtin: Vec<(String, Option<Spanned<Expression>>)> =
+                            arguments
+                                .iter()
+                                .map(|a| {
+                                    (a.node.name.as_str().to_string(), a.node.value.clone())
+                                })
+                                .collect();
+                        if self.compiler.is_builtin_piped_fn(&fn_path) {
+                            let source_var = self.resolve_reactive_source(from)?;
+                            let compiler = self.compiler.clone();
+                            let map_var = VarId::new(name);
+                            self.collections.insert(
+                                map_var.clone(),
+                                CollectionSpec::Map {
+                                    source: source_var,
+                                    f: Arc::new(move |input: &Value| {
+                                        compiler
+                                            .eval_builtin_piped(
+                                                input,
+                                                &fn_path,
+                                                &args_for_builtin,
+                                            )
+                                            .unwrap_or(Value::Unit)
+                                    }),
+                                },
+                            );
+                            self.reactive_vars
+                                .insert(name.to_string(), map_var.clone());
+                            return Ok(map_var);
+                        }
+
                         Err(format!(
                             "Unsupported function in reactive pipe for '{}': {}",
                             name,
@@ -2885,12 +3474,22 @@ impl<'a> GraphBuilder<'a> {
                 }
 
                 // Build the effective path (with scope prefix if needed)
-                // Avoid double-prepend if the path already starts with the prefix
+                // Avoid double-prepend if the path already starts with the prefix.
+                // Also skip prepend when the first segment is already a known top-level
+                // scope (e.g., `store.elements...` referenced from `theme_options.mode`).
                 let effective_path = if let Some(ref prefix) = self.scope_prefix {
                     if path_str.starts_with(&format!("{}.", prefix)) {
                         path_str.clone()
                     } else {
-                        format!("{}.{}", prefix, path_str)
+                        let first_seg_is_known = self.compiler.variables.iter().any(|(n, _)| {
+                            n == var_name || n.starts_with(&format!("{}.", var_name))
+                        });
+                        if first_seg_is_known {
+                            // Path already starts with a known scope — use as-is
+                            path_str.clone()
+                        } else {
+                            format!("{}.{}", prefix, path_str)
+                        }
                     }
                 } else {
                     path_str.clone()
@@ -2978,35 +3577,27 @@ impl<'a> GraphBuilder<'a> {
         index: usize,
         expr: &Spanned<Expression>,
     ) -> Result<VarId, String> {
-        match &expr.node {
-            Expression::Literal(lit) => {
-                let val = Compiler::eval_literal(lit);
-                let var = self.fresh_var(&format!("{}_lit{}", parent_name, index));
-                self.collections
-                    .insert(var.clone(), CollectionSpec::Literal(val));
-                Ok(var)
-            }
-            Expression::Pipe { from, to } => match &to.node {
-                Expression::Then { body } => {
-                    let (source_var, _) = self.compile_event_source(from)?;
-                    let transform = self.build_then_transform(body);
-                    let then_var = self.fresh_var(&format!("{}_then{}", parent_name, index));
-                    self.collections.insert(
-                        then_var.clone(),
-                        CollectionSpec::Then {
-                            source: source_var,
-                            body: transform,
-                        },
-                    );
-                    Ok(then_var)
-                }
-                _ => Err(format!("Unsupported LATEST input pipe")),
-            },
-            _ => Err(format!(
-                "Unsupported LATEST input: {:?}",
-                std::mem::discriminant(&expr.node)
-            )),
+        // Direct literals (tags like None/True/False, numbers, strings)
+        if let Expression::Literal(lit) = &expr.node {
+            let val = Compiler::eval_literal(lit);
+            let var = self.fresh_var(&format!("{}_lit{}", parent_name, index));
+            self.collections
+                .insert(var.clone(), CollectionSpec::Literal(val));
+            return Ok(var);
         }
+
+        // Try static evaluation for constant expressions (e.g., Text/empty(), tagged objects)
+        if let Ok(val) = self.compiler.eval_static(expr) {
+            let var = self.fresh_var(&format!("{}_const{}", parent_name, index));
+            self.collections
+                .insert(var.clone(), CollectionSpec::Literal(val));
+            return Ok(var);
+        }
+
+        // Delegate to general reactive compilation for everything else
+        // (pipes with THEN/WHEN/WHILE/FunctionCall, aliases, nested LATEST, etc.)
+        let var_name = format!("{}_input{}", parent_name, index);
+        self.compile_reactive_var(&var_name, expr)
     }
 
     /// Compile `LATEST { initial, events... } |> Math/sum()`.
@@ -3124,7 +3715,19 @@ impl<'a> GraphBuilder<'a> {
         let reactive_deps: Vec<String> = self
             .reactive_vars
             .iter()
-            .filter(|(_, var_id)| self.has_initial_value(var_id))
+            .filter(|(name, var_id)| {
+                // Must have an initial value at runtime
+                if !self.has_initial_value(var_id) {
+                    return false;
+                }
+                // Only include user-defined variables (from parser), not compiler-generated
+                // intermediates like LATEST arm inputs (*_input0, *_input1) or internal
+                // pipe stages (__pipe_source_*). System vars (__router) are kept.
+                if name.starts_with("__") {
+                    return true;
+                }
+                self.compiler.get_var_expr(name).is_some()
+            })
             .map(|(name, _)| name.clone())
             .collect();
 
@@ -3145,18 +3748,26 @@ impl<'a> GraphBuilder<'a> {
             let dep_name = &reactive_deps[0];
             let dep_var = self.reactive_vars.get(dep_name).unwrap().clone();
 
-            // Build a document template closure
-            let doc_closure = self.build_document_closure(dep_name, expr)?;
-
-            let doc_var = self.fresh_var("document");
-            self.collections.insert(
-                doc_var.clone(),
-                CollectionSpec::Map {
-                    source: dep_var,
-                    f: doc_closure,
-                },
-            );
-            return Ok(doc_var);
+            // Build a document template closure.
+            // Falls back to closure-based evaluation when the template can't
+            // interpolate the reactive value (e.g., used via PASSED inside
+            // a user function call like root_element).
+            match self.build_document_closure(dep_name, expr) {
+                Ok(doc_closure) => {
+                    let doc_var = self.fresh_var("document");
+                    self.collections.insert(
+                        doc_var.clone(),
+                        CollectionSpec::Map {
+                            source: dep_var,
+                            f: doc_closure,
+                        },
+                    );
+                    return Ok(doc_var);
+                }
+                Err(_) => {
+                    return self.compile_multi_dep_document(expr, &reactive_deps);
+                }
+            }
         }
 
         // Multiple reactive dependencies — try find root and derive others first
@@ -3315,6 +3926,12 @@ impl<'a> GraphBuilder<'a> {
             doc_expr,
             self.keyed_display_list_name.as_deref(),
         )?;
+        // If the template has no ReactiveRef, the reactive value can't be
+        // interpolated (e.g., it's used inside a user function body via PASSED).
+        // Signal the caller to fall back to the closure-based approach.
+        if !doc_template.has_reactive_ref() {
+            return Err("Template has no reactive reference".to_string());
+        }
         Ok(Arc::new(move |reactive_value: &Value| {
             doc_template.instantiate(reactive_value)
         }))
@@ -3424,7 +4041,9 @@ impl<'a> GraphBuilder<'a> {
             doc_var.clone(),
             CollectionSpec::Map {
                 source: current_var,
-                f: doc_closure,
+                f: Arc::new(move |combined: &Value| {
+                    doc_closure(combined)
+                }),
             },
         );
         Ok(doc_var)
@@ -3439,7 +4058,7 @@ impl<'a> GraphBuilder<'a> {
         let compiler = self.compiler.clone();
         let doc_expr = doc_expr.clone();
         let dep_names: Vec<String> = dep_names.to_vec();
-
+        let keyed_list_short_name = self.keyed_display_list_name.clone();
         // Also collect internal state vars that provide display text etc.
         let mut state_var_names: Vec<(String, String)> = Vec::new();
         for name in &dep_names {
@@ -3487,22 +4106,37 @@ impl<'a> GraphBuilder<'a> {
         Ok(Arc::new(move |combined: &Value| {
             let mut scope = IndexMap::new();
 
-            // Reconstruct the scope from combined deps
-            // For store-style programs, the deps are like "store.text_to_add" and "store.items"
-            // We need to build the "store" object with these fields
-            let mut store_fields: BTreeMap<Arc<str>, Value> = BTreeMap::new();
+            // Reconstruct the scope from combined deps.
+            // Deps like "store.todos", "theme_options.mode" are grouped into parent
+            // objects ("store", "theme_options") for the static evaluator.
+            let mut object_fields: std::collections::HashMap<String, BTreeMap<Arc<str>, Value>> =
+                std::collections::HashMap::new();
 
             for (i, name) in dep_names.iter().enumerate() {
                 let dep_key = format!("{DEP_FIELD_PREFIX}{i}");
                 let val = combined.get_field(&dep_key).cloned().unwrap_or(Value::Unit);
 
-                // Parse dotted names: "store.items" → insert into store.items
+                // Parse dotted names: "store.items" → group into parent "store"
                 let parts: Vec<&str> = name.split('.').collect();
-                if parts.len() == 2 && parts[0] == "store" {
-                    store_fields.insert(Arc::from(parts[1]), val.clone());
+                if parts.len() == 2 {
+                    object_fields
+                        .entry(parts[0].to_string())
+                        .or_default()
+                        .insert(Arc::from(parts[1]), val.clone());
                 }
                 scope.insert(name.clone(), val);
             }
+
+            // Build composite objects for each parent prefix
+            for (parent_name, fields) in &object_fields {
+                if parent_name == "store" {
+                    // store gets special handling below (LINK stubs, link path injection)
+                    continue;
+                }
+                scope.insert(parent_name.clone(), Value::Object(Arc::new(fields.clone())));
+            }
+
+            let mut store_fields = object_fields.remove("store").unwrap_or_default();
 
             // If we built store fields, also insert the full store object
             if !store_fields.is_empty() {
@@ -3562,9 +4196,19 @@ impl<'a> GraphBuilder<'a> {
                 scope.insert("store".to_string(), store_value);
             }
 
-            compiler
-                .eval_static_with_scope(&doc_expr, &scope)
-                .unwrap_or(Value::Unit)
+            // Propagate keyed list name through the scope so that eval_element_static
+            // can mark the matching Stripe with __keyed__: True at evaluation time.
+            if let Some(ref kln) = keyed_list_short_name {
+                scope.insert(
+                    KEYED_LIST_NAME_FIELD.to_string(),
+                    Value::text(kln.as_str()),
+                );
+            }
+
+            match compiler.eval_static_with_scope(&doc_expr, &scope) {
+                Ok(val) => val,
+                Err(_) => Value::Unit,
+            }
         }))
     }
 
@@ -3758,6 +4402,41 @@ impl<'a> GraphBuilder<'a> {
                 }
             }
             Value::Unit
+        })
+    }
+
+    /// Build a WHEN pattern-matching closure for FlatMap collections.
+    /// Returns `Some(value)` for matching arms, `None` for SKIP arms.
+    /// Used inside LATEST to avoid updating the held value on SKIP.
+    fn build_when_flatmap_fn(
+        &self,
+        arms: &[static_expression::Arm],
+    ) -> Arc<dyn Fn(Value) -> Option<Value> + 'static> {
+        // Pre-compile arms: (pattern_value, body_value, is_skip).
+        let mut compiled_arms: Vec<(Option<Value>, Value, bool)> = Vec::new();
+
+        for arm in arms {
+            let pattern_val = self.try_eval_pattern_to_value(&arm.pattern);
+            let is_skip = matches!(arm.body.node, Expression::Skip);
+            let body_val = self.compiler.eval_static(&arm.body).unwrap_or(Value::Unit);
+            compiled_arms.push((pattern_val, body_val, is_skip));
+        }
+
+        Arc::new(move |input: Value| {
+            for (pattern_val, body_val, is_skip) in &compiled_arms {
+                match pattern_val {
+                    Some(pv) => {
+                        if input == *pv {
+                            return if *is_skip { None } else { Some(body_val.clone()) };
+                        }
+                    }
+                    None => {
+                        // Wildcard — always matches
+                        return if *is_skip { None } else { Some(body_val.clone()) };
+                    }
+                }
+            }
+            None // No arm matched — suppress value
         })
     }
 
@@ -4134,6 +4813,275 @@ impl<'a> GraphBuilder<'a> {
         Ok(count_var)
     }
 
+    /// Compile `source |> List/latest()`.
+    ///
+    /// Reduces a keyed `(ListKey, Value)` collection to a scalar `Value`
+    /// that always holds the most recently changed item.
+    fn compile_list_latest(
+        &mut self,
+        name: &str,
+        from: &Spanned<Expression>,
+    ) -> Result<VarId, String> {
+        // Try keyed source (e.g., `todos |> List/latest()`)
+        if let Some(keyed_var) = self.resolve_keyed_source(from) {
+            let latest_var = VarId::new(name);
+            self.collections
+                .insert(latest_var.clone(), CollectionSpec::ListLatest(keyed_var));
+            self.reactive_vars
+                .insert(name.to_string(), latest_var.clone());
+            return Ok(latest_var);
+        }
+
+        // Keyed source through pipe chain:
+        // `keyed |> List/retain(...) |> List/latest()`
+        // `keyed |> List/map(...) |> List/latest()`
+        if let Expression::Pipe {
+            from: inner_from,
+            to: inner_to,
+        } = &from.node
+        {
+            if let Expression::FunctionCall { path, arguments } = &inner_to.node {
+                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                match path_strs.as_slice() {
+                    ["List", "retain"] => {
+                        if let Some(keyed_var) = self.resolve_keyed_source(inner_from) {
+                            let retain_var =
+                                self.compile_inline_keyed_retain(keyed_var, arguments)?;
+                            let latest_var = VarId::new(name);
+                            self.collections.insert(
+                                latest_var.clone(),
+                                CollectionSpec::ListLatest(retain_var),
+                            );
+                            self.reactive_vars
+                                .insert(name.to_string(), latest_var.clone());
+                            return Ok(latest_var);
+                        }
+                    }
+                    ["List", "map"] => {
+                        if let Some(keyed_var) = self.resolve_keyed_source(inner_from) {
+                            let map_var =
+                                self.compile_inline_keyed_map(keyed_var, arguments)?;
+                            let latest_var = VarId::new(name);
+                            self.collections.insert(
+                                latest_var.clone(),
+                                CollectionSpec::ListLatest(map_var),
+                            );
+                            self.reactive_vars
+                                .insert(name.to_string(), latest_var.clone());
+                            return Ok(latest_var);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Err(format!(
+            "List/latest() requires a keyed list source for '{}'",
+            name,
+        ))
+    }
+
+    /// Compile `source |> List/every(item, if: predicate)`.
+    ///
+    /// Reduces a keyed list to a scalar bool — True if all items match.
+    fn compile_list_every(
+        &mut self,
+        name: &str,
+        from: &Spanned<Expression>,
+        arguments: &[Spanned<Argument>],
+    ) -> Result<VarId, String> {
+        self.compile_list_aggregate_bool(name, from, arguments, true)
+    }
+
+    /// Compile `source |> List/any(item, if: predicate)`.
+    ///
+    /// Reduces a keyed list to a scalar bool — True if any item matches.
+    fn compile_list_any(
+        &mut self,
+        name: &str,
+        from: &Spanned<Expression>,
+        arguments: &[Spanned<Argument>],
+    ) -> Result<VarId, String> {
+        self.compile_list_aggregate_bool(name, from, arguments, false)
+    }
+
+    /// Shared implementation for List/every and List/any.
+    /// `is_every=true` → ListEvery, `is_every=false` → ListAny.
+    fn compile_list_aggregate_bool(
+        &mut self,
+        name: &str,
+        from: &Spanned<Expression>,
+        arguments: &[Spanned<Argument>],
+        is_every: bool,
+    ) -> Result<VarId, String> {
+        let item_param: String = arguments
+            .iter()
+            .find(|a| a.node.value.is_none())
+            .map(|a| a.node.name.as_str().to_string())
+            .unwrap_or_else(|| "item".to_string());
+
+        let predicate_expr = arguments
+            .iter()
+            .find(|a| a.node.name.as_str() == "if")
+            .and_then(|a| a.node.value.as_ref())
+            .ok_or_else(|| {
+                format!(
+                    "List/{} missing 'if' argument for '{}'",
+                    if is_every { "every" } else { "any" },
+                    name
+                )
+            })?;
+
+        // Resolve keyed source
+        let keyed_var = self.resolve_keyed_source(from).ok_or_else(|| {
+            format!(
+                "List/{} requires a keyed list source for '{}'",
+                if is_every { "every" } else { "any" },
+                name
+            )
+        })?;
+
+        // Build predicate closure
+        let compiler = self.compiler.clone();
+        let pred_expr = predicate_expr.clone();
+        let param_name = item_param;
+        let predicate: Arc<dyn Fn(&Value) -> bool + 'static> =
+            Arc::new(move |item: &Value| {
+                let mut scope = indexmap::IndexMap::new();
+                scope.insert(param_name.clone(), item.clone());
+                compiler
+                    .eval_static_with_scope(&pred_expr, &scope)
+                    .and_then(|v| Ok(v.as_bool().unwrap_or(false)))
+                    .unwrap_or(false)
+            });
+
+        let result_var = VarId::new(name);
+        let spec = if is_every {
+            CollectionSpec::ListEvery {
+                source: keyed_var,
+                predicate,
+            }
+        } else {
+            CollectionSpec::ListAny {
+                source: keyed_var,
+                predicate,
+            }
+        };
+        self.collections.insert(result_var.clone(), spec);
+        self.reactive_vars
+            .insert(name.to_string(), result_var.clone());
+        Ok(result_var)
+    }
+
+    /// Compile `source |> List/is_not_empty()` or `source |> List/is_empty()`.
+    ///
+    /// Composes from ListCount + Map to produce True/False.
+    fn compile_list_emptiness_check(
+        &mut self,
+        name: &str,
+        from: &Spanned<Expression>,
+        is_not_empty: bool,
+    ) -> Result<VarId, String> {
+        // Try keyed source first
+        if let Some(keyed_var) = self.resolve_keyed_source(from) {
+            // ListCount → Map(count → True/False)
+            let count_var = self.fresh_var(&format!("{}_count", name));
+            self.collections
+                .insert(count_var.clone(), CollectionSpec::ListCount(keyed_var));
+
+            let result_var = VarId::new(name);
+            self.collections.insert(
+                result_var.clone(),
+                CollectionSpec::Map {
+                    source: count_var,
+                    f: Arc::new(move |v: &Value| {
+                        let count = v.as_number().unwrap_or(0.0) as i64;
+                        let check = if is_not_empty { count > 0 } else { count == 0 };
+                        if check {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        }
+                    }),
+                },
+            );
+            self.reactive_vars
+                .insert(name.to_string(), result_var.clone());
+            return Ok(result_var);
+        }
+
+        // Scalar fallback: compile source and use Map
+        let source_var = self.resolve_reactive_source(from)?;
+        let result_var = VarId::new(name);
+        self.collections.insert(
+            result_var.clone(),
+            CollectionSpec::Map {
+                source: source_var,
+                f: Arc::new(move |v: &Value| {
+                    let empty = v.list_is_empty();
+                    let check = if is_not_empty { !empty } else { empty };
+                    if check {
+                        Value::tag("True")
+                    } else {
+                        Value::tag("False")
+                    }
+                }),
+            },
+        );
+        self.reactive_vars
+            .insert(name.to_string(), result_var.clone());
+        Ok(result_var)
+    }
+
+    /// Compile `initial |> Bool/toggle(when: event_source)`.
+    ///
+    /// Desugars to: `HoldState { initial, events, transform: |state, _| !state }`.
+    fn compile_bool_toggle(
+        &mut self,
+        name: &str,
+        from: &Spanned<Expression>,
+        arguments: &[Spanned<Argument>],
+    ) -> Result<VarId, String> {
+        // Extract `when:` argument
+        let when_expr = arguments
+            .iter()
+            .find(|a| a.node.name.as_str() == "when")
+            .and_then(|a| a.node.value.as_ref())
+            .ok_or_else(|| format!("Bool/toggle missing 'when' argument for '{}'", name))?;
+
+        // Compile initial value
+        let initial_var = self.compile_reactive_var(&format!("{}_initial", name), from)?;
+
+        // Evaluate initial value statically for HoldState
+        let initial_value = self.compiler.eval_static(from).unwrap_or(Value::tag("False"));
+
+        // Compile the `when:` event source
+        let (events_var, _) = self.compile_event_source(when_expr)?;
+
+        // Build HoldState that toggles on each event
+        let toggle_var = VarId::new(name);
+        self.collections.insert(
+            toggle_var.clone(),
+            CollectionSpec::HoldState {
+                initial: initial_var,
+                events: events_var,
+                initial_value,
+                transform: Arc::new(|state: &Value, _event: &Value| {
+                    let b = state.as_bool().unwrap_or(false);
+                    if b {
+                        Value::tag("False")
+                    } else {
+                        Value::tag("True")
+                    }
+                }),
+            },
+        );
+        self.reactive_vars
+            .insert(name.to_string(), toggle_var.clone());
+        Ok(toggle_var)
+    }
+
     /// Build a keyed ListCount with HoldState for empty-safety.
     ///
     /// Creates: `HoldState(initial=Literal(0), events=ListCount(keyed_var))`.
@@ -4280,6 +5228,46 @@ impl<'a> GraphBuilder<'a> {
         Ok(retain_var)
     }
 
+    /// Inline-compile a `List/map(item, new: expr)` on a keyed source.
+    ///
+    /// Produces a `CollectionSpec::ListMap` that transforms each keyed item.
+    fn compile_inline_keyed_map(
+        &mut self,
+        keyed_var: VarId,
+        arguments: &[Spanned<Argument>],
+    ) -> Result<VarId, String> {
+        let item_param: String = arguments
+            .iter()
+            .find(|a| a.node.value.is_none())
+            .map(|a| a.node.name.as_str().to_string())
+            .unwrap_or_else(|| "item".to_string());
+
+        let new_expr = arguments
+            .iter()
+            .find(|a| a.node.name.as_str() == "new")
+            .and_then(|a| a.node.value.as_ref())
+            .ok_or_else(|| "List/map missing 'new' argument".to_string())?;
+
+        let compiler = self.compiler.clone();
+        let new_expr = new_expr.clone();
+        let param_name = item_param;
+
+        let map_var = self.fresh_var("keyed_map");
+        self.collections.insert(
+            map_var.clone(),
+            CollectionSpec::ListMap {
+                source: keyed_var,
+                f: Arc::new(move |item: &Value| {
+                    let mut scope = indexmap::IndexMap::new();
+                    scope.insert(param_name.clone(), item.clone());
+                    compiler.eval_static_tolerant(&new_expr, &scope)
+                }),
+            },
+        );
+        self.keyed_collection_vars.insert(map_var.clone());
+        Ok(map_var)
+    }
+
     /// Build the keyed display pipeline for a list.
     ///
     /// Scans function bodies for the pattern:
@@ -4311,6 +5299,7 @@ impl<'a> GraphBuilder<'a> {
         let compiler = self.compiler.clone();
         let map_new_expr = pipeline.map_new_expr.clone();
         let map_item_param = pipeline.map_item_param.clone();
+        let initial_passed = self.initial_passed.clone();
         let list_path = format!(
             "store.{}",
             list_name.strip_prefix("store.").unwrap_or(list_name)
@@ -4326,6 +5315,11 @@ impl<'a> GraphBuilder<'a> {
                         inject_item_link_paths_with_key(item, &list_path, key.0.as_ref());
                     let mut scope = IndexMap::new();
                     scope.insert(map_item_param.clone(), item_with_links);
+                    // Inject initial PASSED context captured from the program's
+                    // PASS argument so Theme functions can resolve colors/styles.
+                    if !matches!(&initial_passed, Value::Unit) {
+                        scope.insert(PASSED_VAR.to_string(), initial_passed.clone());
+                    }
                     // Use tolerant eval — the map function body may contain
                     // WHILE, WHEN, LINK patterns that need tolerance
                     compiler.eval_static_tolerant(&map_new_expr, &scope)
@@ -4334,6 +5328,42 @@ impl<'a> GraphBuilder<'a> {
         );
         self.keyed_collection_vars.insert(display_var.clone());
         Ok(display_var)
+    }
+
+    /// Extract the initial PASSED context from the document expression.
+    ///
+    /// Follows the doc expression (which may be an alias like `scene` pointing
+    /// to a function call like `main_scene(PASS: [store: store, theme_options: theme_options])`)
+    /// and evaluates the PASS argument tolerantly to capture the initial program state.
+    fn extract_initial_passed(&self, doc_expr: &Spanned<Expression>) -> Value {
+        // Resolve the doc expression — it may be an alias pointing to a function call
+        let resolved = match &doc_expr.node {
+            Expression::Alias(Alias::WithoutPassed { parts, .. }) if parts.len() == 1 => {
+                self.compiler.get_var_expr(parts[0].as_str()).cloned()
+            }
+            _ => Some(doc_expr.clone()),
+        };
+        let resolved = match resolved {
+            Some(expr) => expr,
+            None => return Value::Unit,
+        };
+        // Extract the PASS argument from the function call
+        let pass_expr = match &resolved.node {
+            Expression::FunctionCall { arguments, .. } => {
+                arguments.iter().find_map(|arg| {
+                    if arg.node.name.as_str() == "PASS" {
+                        arg.node.value.as_ref().cloned()
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        };
+        match pass_expr {
+            Some(expr) => self.compiler.eval_static_tolerant(&expr, &IndexMap::new()),
+            None => Value::Unit,
+        }
     }
 
     /// Scan function bodies for the display pipeline pattern on a keyed list.
@@ -4362,7 +5392,7 @@ impl<'a> GraphBuilder<'a> {
             // Check Element/stripe calls for items: argument with the pattern
             Expression::FunctionCall { path, arguments } => {
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                if matches!(path_strs.as_slice(), ["Element", "stripe"]) {
+                if matches!(path_strs.as_slice(), ["Element", "stripe"] | ["Scene", "Element", "stripe"]) {
                     // Check the items: argument
                     if let Some(items_arg) =
                         arguments.iter().find(|a| a.node.name.as_str() == "items")
@@ -4527,6 +5557,25 @@ impl<'a> GraphBuilder<'a> {
         from: &Spanned<Expression>,
         arguments: &[Spanned<Argument>],
     ) -> Result<VarId, String> {
+        // Check if this is part of a list chain (e.g., LIST {} |> List/append(...) |> List/retain(...))
+        // If the predicate references per-item data ("item"), route through the keyed holdstate path
+        // so that downstream operators (List/latest, List/every, etc.) get keyed collections.
+        let predicate_has_item = arguments
+            .iter()
+            .find(|a| a.node.name.as_str() == "if")
+            .and_then(|a| a.node.value.as_ref())
+            .map(|e| Self::expr_references_name(e, "item"))
+            .unwrap_or(false);
+
+        if predicate_has_item {
+            // Try to walk the pipe chain backward to find a list initializer
+            let mut ops = Vec::new();
+            ops.push(ListChainOp::Retain(arguments));
+            if let Ok(initial_list_expr) = self.collect_list_chain_ops(from, &mut ops) {
+                return self.build_unified_list_holdstate(name, initial_list_expr, &ops);
+            }
+        }
+
         // Extract the item parameter name (e.g., "n" from `List/retain(n, if: ...)`)
         let item_param: String = arguments
             .iter()
@@ -4718,6 +5767,10 @@ impl<'a> GraphBuilder<'a> {
                             ops.push(ListChainOp::Clear(arguments));
                             self.collect_list_chain_ops(from, ops)
                         }
+                        ["List", "retain"] => {
+                            ops.push(ListChainOp::Retain(arguments));
+                            self.collect_list_chain_ops(from, ops)
+                        }
                         _ => Ok(expr),
                     }
                 }
@@ -4737,18 +5790,31 @@ impl<'a> GraphBuilder<'a> {
         initial_list_expr: &Spanned<Expression>,
         ops: &[ListChainOp],
     ) -> Result<VarId, String> {
-        // Pre-check: if any Remove op references "item", use keyed pipeline
+        // Pre-check: if any Remove/Retain op references "item", use keyed pipeline
         let has_wildcard_ops = ops.iter().rev().any(|op| {
-            if let ListChainOp::Remove(arguments) = op {
-                let on_arg = arguments
-                    .iter()
-                    .find(|a| a.node.name.as_str() == "on")
-                    .and_then(|a| a.node.value.as_ref());
-                if let Some(on_expr) = on_arg {
-                    return Self::expr_references_name(on_expr, "item");
+            match op {
+                ListChainOp::Remove(arguments) => {
+                    let on_arg = arguments
+                        .iter()
+                        .find(|a| a.node.name.as_str() == "on")
+                        .and_then(|a| a.node.value.as_ref());
+                    if let Some(on_expr) = on_arg {
+                        return Self::expr_references_name(on_expr, "item");
+                    }
+                    false
                 }
+                ListChainOp::Retain(arguments) => {
+                    let if_arg = arguments
+                        .iter()
+                        .find(|a| a.node.name.as_str() == "if")
+                        .and_then(|a| a.node.value.as_ref());
+                    if let Some(if_expr) = if_arg {
+                        return Self::expr_references_name(if_expr, "item");
+                    }
+                    false
+                }
+                _ => false,
             }
-            false
         });
 
         if has_wildcard_ops {
@@ -4833,6 +5899,11 @@ impl<'a> GraphBuilder<'a> {
                         },
                     );
                     event_vars.push(clear_then_var);
+                }
+
+                ListChainOp::Retain(_) => {
+                    // Retain with per-item predicates is handled by build_keyed_list_holdstate.
+                    // This arm should not be reached in the scalar path.
                 }
             }
         }
@@ -5118,7 +6189,7 @@ impl<'a> GraphBuilder<'a> {
             }
         }
 
-        // Remove-completed: detect from ops
+        // Remove-completed: detect from Remove ops
         for op in ops.iter().rev() {
             if let ListChainOp::Remove(arguments) = op {
                 let on_arg = arguments
@@ -5141,6 +6212,57 @@ impl<'a> GraphBuilder<'a> {
                                     );
                                     broadcast_vars.push(remove_then_var);
                                     has_broadcasts = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove-completed: detect from Retain ops (LATEST predicate arms)
+        //
+        // A Retain predicate like:
+        //   List/retain(item, if: LATEST {
+        //       True
+        //       item.remove_button.event.press |> THEN { False }           ← per-item (wildcard)
+        //       global_button.event.press |> THEN { item.completed |> ... } ← broadcast
+        //   })
+        //
+        // The third arm is a broadcast: a global event that conditionally removes items.
+        // We detect it the same way as Remove: Pipe(from, Then { ... }) where `from`
+        // doesn't reference "item" but the whole arm does.
+        for op in ops.iter().rev() {
+            if let ListChainOp::Retain(arguments) = op {
+                let if_arg = arguments
+                    .iter()
+                    .find(|a| a.node.name.as_str() == "if")
+                    .and_then(|a| a.node.value.as_ref());
+                if let Some(if_expr) = if_arg {
+                    // If the predicate is a LATEST block, check each arm
+                    if let Expression::Latest { inputs } = &if_expr.node {
+                        for arm in inputs {
+                            if let Expression::Pipe { from, to } = &arm.node {
+                                if matches!(&to.node, Expression::Then { .. }) {
+                                    if Self::expr_references_name(arm, "item")
+                                        && !Self::expr_references_name(from, "item")
+                                    {
+                                        let (event_var, _) =
+                                            self.compile_event_source(from)?;
+                                        let remove_then_var =
+                                            self.fresh_var("remove_completed_then");
+                                        self.collections.insert(
+                                            remove_then_var.clone(),
+                                            CollectionSpec::Then {
+                                                source: event_var,
+                                                body: Arc::new(|_| {
+                                                    Value::tag("remove_completed")
+                                                }),
+                                            },
+                                        );
+                                        broadcast_vars.push(remove_then_var);
+                                        has_broadcasts = true;
+                                    }
                                 }
                             }
                         }
@@ -5317,37 +6439,27 @@ impl<'a> GraphBuilder<'a> {
             },
         );
 
-        // 7. Stub list for document closure (Phase 2).
+        // 7. Assembled list for document closure.
         // Items render via keyed diffs from the display pipeline — O(1) per item change.
-        // The document closure only needs the list for structural checks like
-        // List/is_empty(). We derive a "stub list" from ListCount on the keyed hold:
-        //   keyed_hold → ListCount → Map(count_to_stub_list) → reactive_var
-        // This is O(1) per add/remove (count changes), NOT O(N) per item change.
-        let count_var = self.fresh_var(&format!("{}_count_for_stub", name));
-        self.collections
-            .insert(count_var.clone(), CollectionSpec::ListCount(keyed_hold_var));
+        // The document closure also needs the assembled list for aggregation operations
+        // (List/count, List/every, List/any, List/retain |> List/count) that access
+        // per-item fields (e.g., item.completed). ListAssemble converts the keyed
+        // collection into a scalar List value with real per-item data.
+        // HoldLatest ensures an initial empty list value even before any items arrive.
+        let assemble_raw_var = self.fresh_var(&format!("{}_assemble_raw", name));
+        self.collections.insert(
+            assemble_raw_var.clone(),
+            CollectionSpec::ListAssemble(keyed_hold_var),
+        );
+        let assemble_default_var = self.fresh_var(&format!("{}_assemble_default", name));
+        self.collections.insert(
+            assemble_default_var.clone(),
+            CollectionSpec::Literal(Value::empty_list()),
+        );
         let list_var = VarId::new(name);
         self.collections.insert(
             list_var.clone(),
-            CollectionSpec::Map {
-                source: count_var,
-                f: Arc::new(|count_val: &Value| {
-                    let count = count_val.as_number().unwrap_or(0.0) as usize;
-                    if count == 0 {
-                        Value::empty_list()
-                    } else {
-                        // Single placeholder — O(1) regardless of list size.
-                        // Just enough for List/is_empty() to return False.
-                        // Actual count comes from ListCount DD operator; items via keyed diffs.
-                        let mut fields = std::collections::BTreeMap::new();
-                        fields.insert(Arc::from("0000"), Value::Unit);
-                        Value::Tagged {
-                            tag: Arc::from(LIST_TAG),
-                            fields: Arc::new(fields),
-                        }
-                    }
-                }),
-            },
+            CollectionSpec::HoldLatest(vec![assemble_default_var, assemble_raw_var]),
         );
         self.reactive_vars
             .insert(name.to_string(), list_var.clone());
@@ -5406,6 +6518,9 @@ impl<'a> GraphBuilder<'a> {
                     .iter()
                     .any(|v| Self::expr_references_name(&v.node.value, name))
                     || Self::expr_references_name(output, name)
+            }
+            Expression::Latest { inputs } => {
+                inputs.iter().any(|e| Self::expr_references_name(e, name))
             }
             _ => false,
         }
@@ -5619,6 +6734,7 @@ impl<'a> GraphBuilder<'a> {
             }
             Some(CollectionSpec::Skip { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::SideEffect { source, .. }) => self.has_initial_value(source),
+            Some(CollectionSpec::ListAssemble(source)) => self.has_initial_value(source),
             Some(CollectionSpec::ListCount(source)) => self.has_initial_value(source),
             Some(CollectionSpec::ListRetain { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::ListRetainReactive {
@@ -5628,6 +6744,18 @@ impl<'a> GraphBuilder<'a> {
             Some(CollectionSpec::ListMapWithKey { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::ListAppend { list, .. }) => self.has_initial_value(list),
             Some(CollectionSpec::ListRemove { list, .. }) => self.has_initial_value(list),
+            Some(CollectionSpec::ListLatest(source)) => {
+                // ListLatest only emits when the source list has items.
+                // For literal non-empty lists, it has an initial value.
+                // For dynamic lists (KeyedHoldState, etc.) starting empty, it won't emit.
+                if let Some(CollectionSpec::LiteralList(items)) = self.collections.get(source) {
+                    !items.is_empty()
+                } else {
+                    false
+                }
+            }
+            Some(CollectionSpec::ListEvery { source, .. }) => self.has_initial_value(source),
+            Some(CollectionSpec::ListAny { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::MapToKeyed { .. }) => false, // Event stream, no initial value
             Some(CollectionSpec::AppendNewKeyed { .. }) => false, // Event stream, no initial value
             None => false,
@@ -5944,6 +7072,17 @@ enum TextPartTemplate {
 }
 
 impl DocTemplate {
+    fn has_reactive_ref(&self) -> bool {
+        match self {
+            DocTemplate::ReactiveRef => true,
+            DocTemplate::Static(_) => false,
+            DocTemplate::Tagged { fields, .. } => fields.iter().any(|(_, t)| t.has_reactive_ref()),
+            DocTemplate::TextInterpolation(parts) => {
+                parts.iter().any(|p| matches!(p, TextPartTemplate::ReactiveRef))
+            }
+        }
+    }
+
     fn instantiate(&self, reactive_value: &Value) -> Value {
         match self {
             DocTemplate::Static(v) => v.clone(),
@@ -6039,7 +7178,7 @@ impl Compiler {
                             fields: field_templates,
                         })
                     }
-                    ["Element", elem_type] => {
+                    ["Element", elem_type] | ["Scene", "Element", elem_type] => {
                         let tag = format!("Element{}", capitalize(elem_type));
                         let mut field_templates = Vec::new();
                         for arg in arguments {
@@ -6051,6 +7190,11 @@ impl Compiler {
                                 let tmpl = if name == "items" && *elem_type == "stripe" {
                                     if let Some(kln) = keyed_list_name {
                                         if self.expr_references_passed_store(val_expr, kln) {
+                                            // Mark this Stripe as keyed so the bridge can identify it
+                                            field_templates.push((
+                                                "__keyed__".to_string(),
+                                                DocTemplate::Static(Value::tag("True")),
+                                            ));
                                             DocTemplate::Static(Value::empty_list())
                                         } else {
                                             self.build_doc_template_inner(
@@ -6243,7 +7387,11 @@ impl Compiler {
         match &expr.node {
             Expression::FunctionCall { path, arguments } => {
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                if let ["Element", "stripe"] = path_strs.as_slice() {
+                let is_stripe = matches!(
+                    path_strs.as_slice(),
+                    ["Element", "stripe"] | ["Scene", "Element", "stripe"]
+                );
+                if is_stripe {
                     // Check if items: references the keyed list
                     let has_keyed_items = arguments.iter().any(|arg| {
                         arg.node.name.as_str() == "items"
@@ -6252,7 +7400,7 @@ impl Compiler {
                             })
                     });
                     if has_keyed_items {
-                        // Extract tag from element: [tag: X]
+                        // Extract tag from element: [tag: X], or use empty string if no tag
                         for arg in arguments {
                             if arg.node.name.as_str() == "element" {
                                 if let Some(ref val_expr) = arg.node.value {
@@ -6264,8 +7412,12 @@ impl Compiler {
                                         }
                                     }
                                 }
+                                // element: [] or element: [no tag] — use empty sentinel
+                                return Some(String::new());
                             }
                         }
+                        // No element arg at all — use empty sentinel
+                        return Some(String::new());
                     }
                 }
                 // Recurse into arguments
@@ -6335,3 +7487,4 @@ fn capitalize(s: &str) -> String {
         Some(f) => f.to_uppercase().to_string() + c.as_str(),
     }
 }
+

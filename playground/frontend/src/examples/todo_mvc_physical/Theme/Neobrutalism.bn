@@ -19,15 +19,15 @@ FUNCTION get(from, of) {
 }
 
 FUNCTION material(material) {
-    material |> WHEN {
-        Background => [
+    BLOCK {
+        background_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.95, chroma: 0.05, hue: 90]
                 Dark => Oklch[lightness: 0.05, chroma: 0.03, hue: 280]
             }
         ]
 
-        Surface => [
+        surface_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 1.0]
                 Dark => Oklch[lightness: 0.0]
@@ -35,7 +35,7 @@ FUNCTION material(material) {
             gloss: 0.05
         ]
 
-        SurfaceVariant => [
+        surface_variant_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.98]
                 Dark => Oklch[lightness: 0.08]
@@ -43,7 +43,7 @@ FUNCTION material(material) {
             gloss: 0.08
         ]
 
-        SurfaceElevated => [
+        surface_elevated_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 1.0]
                 Dark => Oklch[lightness: 0.12]
@@ -51,7 +51,7 @@ FUNCTION material(material) {
             gloss: 0.12
         ]
 
-        Interactive[hovered] => [
+        interactive_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.98]
                 Dark => Oklch[lightness: 0.08]
@@ -60,47 +60,62 @@ FUNCTION material(material) {
             metal: 0.03
         ]
 
-        InteractiveRecessed[focus] => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 1.0]
-                Dark => Oklch[lightness: 0.0]
-            }
-            gloss: focus |> WHEN {
-                False => 0.15
-                True => 0.08
-            }
-            glow: focus |> WHEN {
-                True => [
-                    color: PASSED.mode |> WHEN {
-                        Light => Oklch[lightness: 0.7, chroma: 0.2, hue: 200]
-                        Dark => Oklch[lightness: 0.85, chroma: 0.25, hue: 200]
-                    }
-                    intensity: 0.15
-                ]
-                False => None
-            }
-        ]
-
-        Primary => [
+        primary_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.55, chroma: 0.25, hue: 350]
                 Dark => Oklch[lightness: 0.7, chroma: 0.28, hue: 350]
             }
         ]
 
-        PrimarySubtle => [
+        primary_subtle_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 1.0]
                 Dark => Oklch[lightness: 0.0]
             }
         ]
 
-        Danger => [
+        danger_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.7, chroma: 0.25, hue: 330]
                 Dark => Oklch[lightness: 0.85, chroma: 0.3, hue: 330]
             }
         ]
+
+        material |> WHEN {
+            Background => background_base
+
+            Surface => surface_base
+
+            SurfaceVariant => surface_variant_base
+
+            SurfaceElevated => surface_elevated_base
+
+            Interactive[hovered] => interactive_base
+
+            InteractiveRecessed[focus] => [
+                ...surface_base
+                gloss: focus |> WHEN {
+                    False => 0.15
+                    True => 0.08
+                }
+                glow: focus |> WHEN {
+                    True => [
+                        color: PASSED.mode |> WHEN {
+                            Light => Oklch[lightness: 0.7, chroma: 0.2, hue: 200]
+                            Dark => Oklch[lightness: 0.85, chroma: 0.25, hue: 200]
+                        }
+                        intensity: 0.15
+                    ]
+                    False => None
+                }
+            ]
+
+            Primary => primary_base
+
+            PrimarySubtle => primary_subtle_base
+
+            Danger => danger_base
+        }
     }
 }
 

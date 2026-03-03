@@ -90,6 +90,9 @@ pub const ROUTER_INPUT: &str = "__router";
 pub const PASSED_VAR: &str = "__passed";
 /// Field name prefix for multi-dependency document closures (e.g., "__dep_0", "__dep_1").
 pub const DEP_FIELD_PREFIX: &str = "__dep_";
+/// Scope variable that propagates the keyed list name through function call evaluation.
+/// When present, `eval_element_static` marks the matching Stripe with `__keyed__: True`.
+pub const KEYED_LIST_NAME_FIELD: &str = "__keyed_list_name__";
 
 // ===========================================================================
 // KeyedDiff — incremental diffs from DD keyed collections
@@ -240,6 +243,21 @@ pub enum CollectionSpec {
     /// List element count (scalar output).
     ListCount(VarId),
 
+    /// List/latest: keyed list → scalar (most recently changed value).
+    ListLatest(VarId),
+
+    /// List/every: keyed list → scalar bool (all items match predicate).
+    ListEvery {
+        source: VarId,
+        predicate: Arc<dyn Fn(&Value) -> bool + 'static>,
+    },
+
+    /// List/any: keyed list → scalar bool (any item matches predicate).
+    ListAny {
+        source: VarId,
+        predicate: Arc<dyn Fn(&Value) -> bool + 'static>,
+    },
+
     /// List retain with static predicate.
     ListRetain {
         source: VarId,
@@ -289,6 +307,10 @@ pub enum CollectionSpec {
         f: TransformFn,
         initial_counter: usize,
     },
+
+    /// Assemble keyed `(ListKey, Value)` pairs into a scalar `List` value.
+    /// Used to provide real per-item data to the document template.
+    ListAssemble(VarId),
 
     /// Skip first N positive diffs from a collection.
     Skip { source: VarId, count: usize },
