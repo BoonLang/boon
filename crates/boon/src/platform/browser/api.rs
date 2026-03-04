@@ -883,6 +883,639 @@ pub fn function_element_checkbox(
 }
 
 /// ```text
+/// Element/slider(
+///     element<[event?<[change?: LINK]>]>
+///     style<[]>
+///     label<Hidden[text: Text]>
+///     value<Number>
+///     min<Number>
+///     max<Number>
+///     step<Number>
+/// ) -> ELEMENT_SLIDER
+/// ```
+pub fn function_element_slider(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [
+        argument_element,
+        argument_style,
+        argument_label,
+        argument_value,
+        argument_min,
+        argument_max,
+        argument_step,
+    ] = arguments.as_slice()
+    else {
+        panic!("Element/slider expects 7 arguments")
+    };
+    let scoped_id = function_call_persistence_id;
+
+    let event_stream = stream::once({
+        let argument_element = argument_element.clone();
+        async move {
+            let element_value = argument_element.current_value().await.ok()?;
+            let event_variable = element_value.expect_object().variable("event")?;
+            Some(event_variable.value_actor().stream())
+        }
+    })
+    .filter_map(future::ready)
+    .flatten();
+
+    let event_actor = create_actor(
+        ConstructInfo::new(
+            function_call_id.with_child_id(10),
+            None,
+            "ElementSlider[event] (derived)",
+        ),
+        actor_context.clone(),
+        TypedStream::infinite(event_stream.chain(stream::pending())),
+        PersistenceId::new(),
+        actor_context.scope_id(),
+    );
+
+    TaggedObject::new_constant(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/slider(..) -> ElementSlider[..]",
+        ),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        "ElementSlider",
+        [
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(1),
+                    None,
+                    "ElementSlider[element]",
+                ),
+                construct_context.clone(),
+                "element",
+                argument_element.clone(),
+                scoped_id.with_child_index(1),
+                actor_context.scope.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(11),
+                    None,
+                    "ElementSlider[event]",
+                ),
+                construct_context.clone(),
+                "event",
+                event_actor,
+                scoped_id.with_child_index(11),
+                actor_context.scope.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "ElementSlider[settings]",
+                ),
+                construct_context.clone(),
+                "settings",
+                Object::new_arc_value_actor(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(3),
+                        None,
+                        "ElementSlider[settings: [..]]",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    actor_context.clone(),
+                    [
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(4),
+                                None,
+                                "ElementSlider[settings: [style]]",
+                            ),
+                            construct_context.clone(),
+                            "style",
+                            argument_style.clone(),
+                            scoped_id.with_child_index(4),
+                            actor_context.scope.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(5),
+                                None,
+                                "ElementSlider[settings: [label]]",
+                            ),
+                            construct_context.clone(),
+                            "label",
+                            argument_label.clone(),
+                            scoped_id.with_child_index(5),
+                            actor_context.scope.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(6),
+                                None,
+                                "ElementSlider[settings: [value]]",
+                            ),
+                            construct_context.clone(),
+                            "value",
+                            argument_value.clone(),
+                            scoped_id.with_child_index(6),
+                            actor_context.scope.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(7),
+                                None,
+                                "ElementSlider[settings: [min]]",
+                            ),
+                            construct_context.clone(),
+                            "min",
+                            argument_min.clone(),
+                            scoped_id.with_child_index(7),
+                            actor_context.scope.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(8),
+                                None,
+                                "ElementSlider[settings: [max]]",
+                            ),
+                            construct_context.clone(),
+                            "max",
+                            argument_max.clone(),
+                            scoped_id.with_child_index(8),
+                            actor_context.scope.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(9),
+                                None,
+                                "ElementSlider[settings: [step]]",
+                            ),
+                            construct_context,
+                            "step",
+                            argument_step.clone(),
+                            scoped_id.with_child_index(9),
+                            actor_context.scope.clone(),
+                        ),
+                    ],
+                ),
+                scoped_id.with_child_index(2),
+                actor_context.scope,
+            ),
+        ],
+    )
+}
+
+/// ```text
+/// Element/select(
+///     element<[event?<[change?: LINK]>]>
+///     style<[]>
+///     label<Hidden[text: Text]>
+///     options<LIST { [value: Text, label: Text] }>
+///     selected<Text>
+/// ) -> ELEMENT_SELECT
+/// ```
+pub fn function_element_select(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [
+        argument_element,
+        argument_style,
+        argument_label,
+        argument_options,
+        argument_selected,
+    ] = arguments.as_slice()
+    else {
+        panic!("Element/select expects 5 arguments")
+    };
+    let scoped_id = function_call_persistence_id;
+
+    let event_stream = stream::once({
+        let argument_element = argument_element.clone();
+        async move {
+            let element_value = argument_element.current_value().await.ok()?;
+            let event_variable = element_value.expect_object().variable("event")?;
+            Some(event_variable.value_actor().stream())
+        }
+    })
+    .filter_map(future::ready)
+    .flatten();
+
+    let event_actor = create_actor(
+        ConstructInfo::new(
+            function_call_id.with_child_id(10),
+            None,
+            "ElementSelect[event] (derived)",
+        ),
+        actor_context.clone(),
+        TypedStream::infinite(event_stream.chain(stream::pending())),
+        PersistenceId::new(),
+        actor_context.scope_id(),
+    );
+
+    TaggedObject::new_constant(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/select(..) -> ElementSelect[..]",
+        ),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        "ElementSelect",
+        [
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(1),
+                    None,
+                    "ElementSelect[element]",
+                ),
+                construct_context.clone(),
+                "element",
+                argument_element.clone(),
+                scoped_id.with_child_index(1),
+                actor_context.scope.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(9),
+                    None,
+                    "ElementSelect[event]",
+                ),
+                construct_context.clone(),
+                "event",
+                event_actor,
+                scoped_id.with_child_index(9),
+                actor_context.scope.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "ElementSelect[settings]",
+                ),
+                construct_context.clone(),
+                "settings",
+                Object::new_arc_value_actor(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(3),
+                        None,
+                        "ElementSelect[settings: [..]]",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    actor_context.clone(),
+                    [
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(4),
+                                None,
+                                "ElementSelect[settings: [style]]",
+                            ),
+                            construct_context.clone(),
+                            "style",
+                            argument_style.clone(),
+                            scoped_id.with_child_index(4),
+                            actor_context.scope.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(5),
+                                None,
+                                "ElementSelect[settings: [label]]",
+                            ),
+                            construct_context.clone(),
+                            "label",
+                            argument_label.clone(),
+                            scoped_id.with_child_index(5),
+                            actor_context.scope.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(6),
+                                None,
+                                "ElementSelect[settings: [options]]",
+                            ),
+                            construct_context.clone(),
+                            "options",
+                            argument_options.clone(),
+                            scoped_id.with_child_index(6),
+                            actor_context.scope.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(7),
+                                None,
+                                "ElementSelect[settings: [selected]]",
+                            ),
+                            construct_context,
+                            "selected",
+                            argument_selected.clone(),
+                            scoped_id.with_child_index(7),
+                            actor_context.scope.clone(),
+                        ),
+                    ],
+                ),
+                scoped_id.with_child_index(2),
+                actor_context.scope,
+            ),
+        ],
+    )
+}
+
+/// ```text
+/// Element/svg(
+///     element<[event?<[click?: LINK]>]>
+///     style<[width?: N, height?: N]>
+///     children<List<INTO_ELEMENT>>
+/// ) -> ELEMENT_SVG
+/// ```
+pub fn function_element_svg(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_element, argument_style, argument_children] = arguments.as_slice() else {
+        panic!("Element/svg expects 3 arguments")
+    };
+    let scoped_id = function_call_persistence_id;
+
+    // Create a derived actor that extracts `event` from argument_element
+    // This allows direct access via `.event` instead of `.element.event`
+    let event_stream = stream::once({
+        let argument_element = argument_element.clone();
+        async move {
+            let element_value = argument_element.current_value().await.ok()?;
+            let event_variable = element_value.expect_object().variable("event")?;
+            Some(event_variable.value_actor().stream())
+        }
+    })
+    .filter_map(future::ready)
+    .flatten();
+
+    let event_actor = create_actor(
+        ConstructInfo::new(
+            function_call_id.with_child_id(6),
+            None,
+            "ElementSvg[event] (derived)",
+        ),
+        actor_context.clone(),
+        TypedStream::infinite(event_stream.chain(stream::pending())),
+        PersistenceId::new(),
+        actor_context.scope_id(),
+    );
+
+    TaggedObject::new_constant(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/svg(..) -> ElementSvg[..]",
+        ),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        "ElementSvg",
+        [
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(1),
+                    None,
+                    "ElementSvg[element]",
+                ),
+                construct_context.clone(),
+                "element",
+                argument_element.clone(),
+                scoped_id.with_child_index(1),
+                actor_context.scope.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(7),
+                    None,
+                    "ElementSvg[event]",
+                ),
+                construct_context.clone(),
+                "event",
+                event_actor,
+                scoped_id.with_child_index(7),
+                actor_context.scope.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "ElementSvg[settings]",
+                ),
+                construct_context.clone(),
+                "settings",
+                Object::new_arc_value_actor(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(3),
+                        None,
+                        "ElementSvg[settings: [..]]",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    actor_context.clone(),
+                    [
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(4),
+                                None,
+                                "ElementSvg[settings: [style]]",
+                            ),
+                            construct_context.clone(),
+                            "style",
+                            argument_style.clone(),
+                            scoped_id.with_child_index(4),
+                            actor_context.scope.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(5),
+                                None,
+                                "ElementSvg[settings: [children]]",
+                            ),
+                            construct_context,
+                            "children",
+                            argument_children.clone(),
+                            scoped_id.with_child_index(5),
+                            actor_context.scope.clone(),
+                        ),
+                    ],
+                ),
+                scoped_id.with_child_index(2),
+                actor_context.scope,
+            ),
+        ],
+    )
+}
+
+/// ```text
+/// Element/svg_circle(
+///     element<[event?<[click?: LINK, context_menu?: LINK]>]>
+///     cx<Number>
+///     cy<Number>
+///     r<Number>
+///     style<[fill?: Text, stroke?: Text, stroke_width?: N]>
+/// ) -> ELEMENT_SVG_CIRCLE
+/// ```
+pub fn function_element_svg_circle(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_element, argument_cx, argument_cy, argument_r, argument_style] =
+        arguments.as_slice()
+    else {
+        panic!("Element/svg_circle expects 5 arguments")
+    };
+    let scoped_id = function_call_persistence_id;
+
+    // Create a derived actor that extracts `event` from argument_element
+    let event_stream = stream::once({
+        let argument_element = argument_element.clone();
+        async move {
+            let element_value = argument_element.current_value().await.ok()?;
+            let event_variable = element_value.expect_object().variable("event")?;
+            Some(event_variable.value_actor().stream())
+        }
+    })
+    .filter_map(future::ready)
+    .flatten();
+
+    let event_actor = create_actor(
+        ConstructInfo::new(
+            function_call_id.with_child_id(8),
+            None,
+            "ElementSvgCircle[event] (derived)",
+        ),
+        actor_context.clone(),
+        TypedStream::infinite(event_stream.chain(stream::pending())),
+        PersistenceId::new(),
+        actor_context.scope_id(),
+    );
+
+    TaggedObject::new_constant(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/svg_circle(..) -> ElementSvgCircle[..]",
+        ),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        "ElementSvgCircle",
+        [
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(1),
+                    None,
+                    "ElementSvgCircle[element]",
+                ),
+                construct_context.clone(),
+                "element",
+                argument_element.clone(),
+                scoped_id.with_child_index(1),
+                actor_context.scope.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(9),
+                    None,
+                    "ElementSvgCircle[event]",
+                ),
+                construct_context.clone(),
+                "event",
+                event_actor,
+                scoped_id.with_child_index(9),
+                actor_context.scope.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "ElementSvgCircle[settings]",
+                ),
+                construct_context.clone(),
+                "settings",
+                Object::new_arc_value_actor(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(3),
+                        None,
+                        "ElementSvgCircle[settings: [..]]",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    actor_context.clone(),
+                    [
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(4),
+                                None,
+                                "ElementSvgCircle[settings: [cx]]",
+                            ),
+                            construct_context.clone(),
+                            "cx",
+                            argument_cx.clone(),
+                            scoped_id.with_child_index(4),
+                            actor_context.scope.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(5),
+                                None,
+                                "ElementSvgCircle[settings: [cy]]",
+                            ),
+                            construct_context.clone(),
+                            "cy",
+                            argument_cy.clone(),
+                            scoped_id.with_child_index(5),
+                            actor_context.scope.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(6),
+                                None,
+                                "ElementSvgCircle[settings: [r]]",
+                            ),
+                            construct_context.clone(),
+                            "r",
+                            argument_r.clone(),
+                            scoped_id.with_child_index(6),
+                            actor_context.scope.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(7),
+                                None,
+                                "ElementSvgCircle[settings: [style]]",
+                            ),
+                            construct_context,
+                            "style",
+                            argument_style.clone(),
+                            scoped_id.with_child_index(7),
+                            actor_context.scope.clone(),
+                        ),
+                    ],
+                ),
+                scoped_id.with_child_index(2),
+                actor_context.scope,
+            ),
+        ],
+    )
+}
+
+/// ```text
 /// Element/label(
 ///     element<[event?<[double_click?: LINK]>, hovered?: LINK, nearby_element?: ...]>
 ///     style<[]>
@@ -1326,6 +1959,111 @@ pub fn function_math_sum(
     })
 }
 
+/// Math/round(number) -> Number
+pub fn function_math_round(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_number] = arguments.as_slice() else {
+        panic!("Math/round expects 1 argument")
+    };
+    argument_number.clone().stream().map(move |value| {
+        let number = match &value {
+            Value::Number(n, _) => n.number(),
+            _ => panic!("Math/round expects a Number value"),
+        };
+        Number::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Math/round result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            number.round(),
+        )
+    })
+}
+
+/// Math/min(a, b) -> Number
+pub fn function_math_min(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_a, argument_b] = arguments.as_slice() else {
+        panic!("Math/min expects 2 arguments")
+    };
+    enum Input { A(f64), B(f64) }
+    let a_stream = argument_a.clone().stream().map(|v| match &v {
+        Value::Number(n, _) => Input::A(n.number()),
+        _ => panic!("Math/min expects Number arguments"),
+    });
+    let b_stream = argument_b.clone().stream().map(|v| match &v {
+        Value::Number(n, _) => Input::B(n.number()),
+        _ => panic!("Math/min expects Number arguments"),
+    });
+    stream::select(a_stream, b_stream)
+        .scan((None::<f64>, None::<f64>), move |(last_a, last_b), input| {
+            match input {
+                Input::A(val) => *last_a = Some(val),
+                Input::B(val) => *last_b = Some(val),
+            }
+            if let (Some(a), Some(b)) = (*last_a, *last_b) {
+                future::ready(Some(Some(Number::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "Math/min result"),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    a.min(b),
+                ))))
+            } else {
+                future::ready(Some(None))
+            }
+        })
+        .filter_map(future::ready)
+}
+
+/// Math/max(a, b) -> Number
+pub fn function_math_max(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_a, argument_b] = arguments.as_slice() else {
+        panic!("Math/max expects 2 arguments")
+    };
+    enum Input { A(f64), B(f64) }
+    let a_stream = argument_a.clone().stream().map(|v| match &v {
+        Value::Number(n, _) => Input::A(n.number()),
+        _ => panic!("Math/max expects Number arguments"),
+    });
+    let b_stream = argument_b.clone().stream().map(|v| match &v {
+        Value::Number(n, _) => Input::B(n.number()),
+        _ => panic!("Math/max expects Number arguments"),
+    });
+    stream::select(a_stream, b_stream)
+        .scan((None::<f64>, None::<f64>), move |(last_a, last_b), input| {
+            match input {
+                Input::A(val) => *last_a = Some(val),
+                Input::B(val) => *last_b = Some(val),
+            }
+            if let (Some(a), Some(b)) = (*last_a, *last_b) {
+                future::ready(Some(Some(Number::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "Math/max result"),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    a.max(b),
+                ))))
+            } else {
+                future::ready(Some(None))
+            }
+        })
+        .filter_map(future::ready)
+}
+
 // @TODO remember configuration?
 /// ```text
 /// Timer/interval(duration<Duration[seconds<Number> | milliseconds<Number>]>) -> []
@@ -1519,6 +2257,93 @@ pub fn function_text_is_not_empty(
                 future::ready(Some(None))
             }
         })
+        .filter_map(future::ready)
+}
+
+/// Text/to_number(text) -> Number | NaN tag
+/// Parses text to f64. Returns Number on success, NaN tag on failure.
+pub fn function_text_to_number(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_text] = arguments.as_slice() else {
+        panic!("Text/to_number expects 1 argument")
+    };
+    argument_text.clone().stream().map(move |value| {
+        let text = match &value {
+            Value::Text(t, _) => t.text(),
+            _ => panic!("Text/to_number expects a Text value"),
+        };
+        match text.trim().parse::<f64>() {
+            Ok(number) => Number::new_value(
+                ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/to_number result"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                number,
+            ),
+            Err(_) => Tag::new_value(
+                ConstructInfo::new(function_call_id.with_child_id(1), None, "Text/to_number NaN"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "NaN".to_string(),
+            ),
+        }
+    })
+}
+
+/// Text/starts_with(text, prefix) -> Tag (True/False)
+/// Deduplicated: only emits when the result actually changes
+pub fn function_text_starts_with(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_text, argument_prefix] = arguments.as_slice() else {
+        panic!("Text/starts_with expects 2 arguments")
+    };
+    enum Input { Text(String), Prefix(String) }
+    let text_stream = argument_text.clone().stream().map(|v| match &v {
+        Value::Text(t, _) => Input::Text(t.text().to_string()),
+        _ => panic!("Text/starts_with expects Text for first argument"),
+    });
+    let prefix_stream = argument_prefix.clone().stream().map(|v| match &v {
+        Value::Text(t, _) => Input::Prefix(t.text().to_string()),
+        _ => panic!("Text/starts_with expects Text for second argument"),
+    });
+    stream::select(text_stream, prefix_stream)
+        .scan(
+            (None::<String>, None::<String>, None::<bool>),
+            move |(last_text, last_prefix, last_result), input| {
+                match input {
+                    Input::Text(t) => *last_text = Some(t),
+                    Input::Prefix(p) => *last_prefix = Some(p),
+                }
+                // Only compute when both inputs have arrived
+                if let (Some(text), Some(prefix)) = (last_text.as_ref(), last_prefix.as_ref()) {
+                    let current_result = text.starts_with(prefix.as_str());
+                    if *last_result != Some(current_result) {
+                        *last_result = Some(current_result);
+                        let tag = if current_result { "True" } else { "False" };
+                        future::ready(Some(Some(Tag::new_value(
+                            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/starts_with result"),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            tag.to_string(),
+                        ))))
+                    } else {
+                        future::ready(Some(None))
+                    }
+                } else {
+                    // Don't emit until both inputs are available
+                    future::ready(Some(None))
+                }
+            },
+        )
         .filter_map(future::ready)
 }
 
@@ -2103,6 +2928,149 @@ fn clear_source_storage_for_items(items: &[ActorHandle]) {
         }
         local_storage().remove(&key);
     }
+}
+
+/// List/last() -> Value
+/// Returns the current value of the last item in the list.
+/// Re-emits whenever the last item changes (list grows/shrinks or item value updates).
+/// Emits nothing (stream pending) when the list is empty.
+pub fn function_list_last(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let list_actor = arguments[0].clone();
+    // Get the last item's ActorHandle, re-emitting whenever the list changes
+    let last_item_stream = switch_map(
+        list_actor.stream().filter_map(|value| {
+            future::ready(match value {
+                Value::List(list, _) => Some(list),
+                _ => None,
+            })
+        }),
+        |list| {
+            list.stream()
+                .scan(Vec::<ActorHandle>::new(), |items, change| {
+                    change.apply_to_vec(items);
+                    future::ready(Some(items.last().cloned()))
+                })
+                .filter_map(future::ready)
+        },
+    );
+    // switch_map: when the last item changes identity, cancel old subscription and start new
+    switch_map(last_item_stream, |actor| actor.stream())
+}
+
+/// List/remove_last() -> List
+/// Removes the last item from the list when triggered (piped value is the trigger).
+/// Returns the modified list.
+pub fn function_list_remove_last(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    // arguments[0] = the list (piped)
+    // arguments[1] = the trigger stream
+    let list_actor = arguments[0].clone();
+
+    if arguments.len() < 2 {
+        return list_actor.stream().left_stream();
+    }
+
+    let trigger_actor = arguments[1].clone();
+
+    let change_stream = {
+        enum TaggedChange {
+            FromList(ListChange),
+            RemoveLast,
+        }
+
+        let list_changes = list_actor
+            .clone()
+            .stream()
+            .filter_map(|value| {
+                future::ready(match value {
+                    Value::List(list, _) => Some(list),
+                    _ => None,
+                })
+            })
+            .flat_map(|list| list.stream())
+            .map(TaggedChange::FromList);
+
+        let remove_changes = trigger_actor
+            .clone()
+            .stream()
+            .map(|_value| TaggedChange::RemoveLast);
+
+        stream::select(list_changes, remove_changes)
+            .scan(
+                (false, false, Vec::<ActorHandle>::new()),
+                |state, tagged_change| {
+                    let (has_received_first, has_pending_remove, tracked_items) = state;
+
+                    let change_to_emit = match tagged_change {
+                        TaggedChange::FromList(change) => {
+                            change.clone().apply_to_vec(tracked_items);
+                            if !*has_received_first {
+                                *has_received_first = true;
+                                // If we had a pending remove, apply it now
+                                if *has_pending_remove {
+                                    *has_pending_remove = false;
+                                    if !tracked_items.is_empty() {
+                                        tracked_items.pop();
+                                        Some(vec![change, ListChange::Pop])
+                                    } else {
+                                        Some(vec![change])
+                                    }
+                                } else {
+                                    Some(vec![change])
+                                }
+                            } else {
+                                Some(vec![change])
+                            }
+                        }
+                        TaggedChange::RemoveLast => {
+                            if !*has_received_first {
+                                *has_pending_remove = true;
+                                None
+                            } else if !tracked_items.is_empty() {
+                                tracked_items.pop();
+                                Some(vec![ListChange::Pop])
+                            } else {
+                                None
+                            }
+                        }
+                    };
+
+                    future::ready(Some(change_to_emit))
+                },
+            )
+            .filter_map(future::ready)
+            .flat_map(stream::iter)
+    };
+
+    let list = List::new_with_change_stream_and_persistence(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "List/remove_last result list",
+        ),
+        construct_context,
+        actor_context,
+        change_stream,
+        (list_actor, trigger_actor),
+        function_call_persistence_id,
+    );
+
+    constant(Value::List(
+        Arc::new(list),
+        ValueMetadata::new(ValueIdempotencyKey::new()),
+    ))
+    .right_stream()
 }
 
 /// List/latest() -> Value
@@ -3620,4 +4588,663 @@ pub fn function_directory_entries(
             )
         }
     })
+}
+
+// --- Text functions (Cells spreadsheet) ---
+
+/// Text/length(text) -> Number
+/// Returns the number of characters in the text
+pub fn function_text_length(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_text] = arguments.as_slice() else {
+        panic!("Text/length expects 1 argument")
+    };
+    argument_text.clone().stream().map(move |value| {
+        let text = match &value {
+            Value::Text(t, _) => t.text(),
+            _ => panic!("Text/length expects a Text value"),
+        };
+        Number::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/length result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            text.chars().count() as f64,
+        )
+    })
+}
+
+/// Text/char_at(text, index) -> Text
+/// Returns the character at the given index as a single-character text
+pub fn function_text_char_at(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_text, argument_index] = arguments.as_slice() else {
+        panic!("Text/char_at expects 2 arguments")
+    };
+    enum Input { Text(String), Index(f64) }
+    let text_stream = argument_text.clone().stream().map(|v| match &v {
+        Value::Text(t, _) => Input::Text(t.text().to_string()),
+        _ => panic!("Text/char_at expects Text for first argument"),
+    });
+    let index_stream = argument_index.clone().stream().map(|v| match &v {
+        Value::Number(n, _) => Input::Index(n.number()),
+        _ => panic!("Text/char_at expects Number for index argument"),
+    });
+    stream::select(text_stream, index_stream)
+        .scan((None::<String>, None::<f64>), move |(last_text, last_index), input| {
+            match input {
+                Input::Text(t) => *last_text = Some(t),
+                Input::Index(i) => *last_index = Some(i),
+            }
+            if let (Some(text), Some(index)) = (last_text.as_ref(), *last_index) {
+                let idx = index as usize;
+                let ch = text.chars().nth(idx).map(|c| c.to_string()).unwrap_or_default();
+                future::ready(Some(Some(Text::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/char_at result"),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    ch,
+                ))))
+            } else {
+                future::ready(Some(None))
+            }
+        })
+        .filter_map(future::ready)
+}
+
+/// Text/find(text, search) -> Number
+/// Returns the character index of the first occurrence of search in text, or -1 if not found
+pub fn function_text_find(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_text, argument_search] = arguments.as_slice() else {
+        panic!("Text/find expects 2 arguments")
+    };
+    enum Input { Text(String), Search(String) }
+    let text_stream = argument_text.clone().stream().map(|v| match &v {
+        Value::Text(t, _) => Input::Text(t.text().to_string()),
+        _ => panic!("Text/find expects Text for first argument"),
+    });
+    let search_stream = argument_search.clone().stream().map(|v| match &v {
+        Value::Text(t, _) => Input::Search(t.text().to_string()),
+        _ => panic!("Text/find expects Text for search argument"),
+    });
+    stream::select(text_stream, search_stream)
+        .scan((None::<String>, None::<String>), move |(last_text, last_search), input| {
+            match input {
+                Input::Text(t) => *last_text = Some(t),
+                Input::Search(s) => *last_search = Some(s),
+            }
+            if let (Some(text), Some(search)) = (last_text.as_ref(), last_search.as_ref()) {
+                // Find byte offset, then convert to char index
+                let result = match text.find(search.as_str()) {
+                    Some(byte_offset) => text[..byte_offset].chars().count() as f64,
+                    None => -1.0,
+                };
+                future::ready(Some(Some(Number::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/find result"),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    result,
+                ))))
+            } else {
+                future::ready(Some(None))
+            }
+        })
+        .filter_map(future::ready)
+}
+
+/// Text/find_closing(text, open, close, start) -> Number
+/// Scans text from position `start` forward, counting nesting depth.
+/// Each `open` char increments depth, each `close` char decrements depth.
+/// Returns position of matching closing delimiter when depth reaches 0, or -1 if not found.
+pub fn function_text_find_closing(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_text, argument_open, argument_close, argument_start] = arguments.as_slice() else {
+        panic!("Text/find_closing expects 4 arguments")
+    };
+    enum Input { Text(String), Open(String), Close(String), Start(f64) }
+    let text_stream = argument_text.clone().stream().map(|v| match &v {
+        Value::Text(t, _) => Input::Text(t.text().to_string()),
+        _ => panic!("Text/find_closing expects Text for first argument"),
+    });
+    let open_stream = argument_open.clone().stream().map(|v| match &v {
+        Value::Text(t, _) => Input::Open(t.text().to_string()),
+        _ => panic!("Text/find_closing expects Text for open argument"),
+    });
+    let close_stream = argument_close.clone().stream().map(|v| match &v {
+        Value::Text(t, _) => Input::Close(t.text().to_string()),
+        _ => panic!("Text/find_closing expects Text for close argument"),
+    });
+    let start_stream = argument_start.clone().stream().map(|v| match &v {
+        Value::Number(n, _) => Input::Start(n.number()),
+        _ => panic!("Text/find_closing expects Number for start argument"),
+    });
+    stream::select(
+        stream::select(text_stream, open_stream),
+        stream::select(close_stream, start_stream),
+    )
+    .scan(
+        (None::<String>, None::<String>, None::<String>, None::<f64>),
+        move |(last_text, last_open, last_close, last_start), input| {
+            match input {
+                Input::Text(t) => *last_text = Some(t),
+                Input::Open(o) => *last_open = Some(o),
+                Input::Close(c) => *last_close = Some(c),
+                Input::Start(s) => *last_start = Some(s),
+            }
+            if let (Some(text), Some(open), Some(close), Some(start)) =
+                (last_text.as_ref(), last_open.as_ref(), last_close.as_ref(), *last_start)
+            {
+                let start_idx = start as usize;
+                let open_char = open.chars().next().unwrap_or('(');
+                let close_char = close.chars().next().unwrap_or(')');
+                let mut depth: i32 = 0;
+                let mut result = -1.0f64;
+                for (i, ch) in text.chars().enumerate() {
+                    if i < start_idx {
+                        continue;
+                    }
+                    if ch == open_char {
+                        depth += 1;
+                    } else if ch == close_char {
+                        depth -= 1;
+                        if depth == 0 {
+                            result = i as f64;
+                            break;
+                        }
+                    }
+                }
+                future::ready(Some(Some(Number::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/find_closing result"),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    result,
+                ))))
+            } else {
+                future::ready(Some(None))
+            }
+        },
+    )
+    .filter_map(future::ready)
+}
+
+/// Text/substring(text, start, length) -> Text
+/// Returns a substring starting at char index `start` with `length` characters
+pub fn function_text_substring(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_text, argument_start, argument_length] = arguments.as_slice() else {
+        panic!("Text/substring expects 3 arguments")
+    };
+    enum Input { Text(String), Start(f64), Length(f64) }
+    let text_stream = argument_text.clone().stream().map(|v| match &v {
+        Value::Text(t, _) => Input::Text(t.text().to_string()),
+        _ => panic!("Text/substring expects Text for first argument"),
+    });
+    let start_stream = argument_start.clone().stream().map(|v| match &v {
+        Value::Number(n, _) => Input::Start(n.number()),
+        _ => panic!("Text/substring expects Number for start argument"),
+    });
+    let length_stream = argument_length.clone().stream().map(|v| match &v {
+        Value::Number(n, _) => Input::Length(n.number()),
+        _ => panic!("Text/substring expects Number for length argument"),
+    });
+    stream::select(text_stream, stream::select(start_stream, length_stream))
+        .scan(
+            (None::<String>, None::<f64>, None::<f64>),
+            move |(last_text, last_start, last_length), input| {
+                match input {
+                    Input::Text(t) => *last_text = Some(t),
+                    Input::Start(s) => *last_start = Some(s),
+                    Input::Length(l) => *last_length = Some(l),
+                }
+                if let (Some(text), Some(start), Some(length)) =
+                    (last_text.as_ref(), *last_start, *last_length)
+                {
+                    let start_idx = (start as isize).max(0) as usize;
+                    let len = (length as isize).max(0) as usize;
+                    let result: String = text.chars().skip(start_idx).take(len).collect();
+                    future::ready(Some(Some(Text::new_value(
+                        ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/substring result"),
+                        construct_context.clone(),
+                        ValueIdempotencyKey::new(),
+                        result,
+                    ))))
+                } else {
+                    future::ready(Some(None))
+                }
+            },
+        )
+        .filter_map(future::ready)
+}
+
+/// Text/to_uppercase(text) -> Text
+pub fn function_text_to_uppercase(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_text] = arguments.as_slice() else {
+        panic!("Text/to_uppercase expects 1 argument")
+    };
+    argument_text.clone().stream().map(move |value| {
+        let text = match &value {
+            Value::Text(t, _) => t.text(),
+            _ => panic!("Text/to_uppercase expects a Text value"),
+        };
+        Text::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/to_uppercase result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            text.to_uppercase(),
+        )
+    })
+}
+
+/// Text/char_code(text) -> Number
+/// Returns the Unicode code point of the first character
+pub fn function_text_char_code(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_text] = arguments.as_slice() else {
+        panic!("Text/char_code expects 1 argument")
+    };
+    argument_text.clone().stream().map(move |value| {
+        let text = match &value {
+            Value::Text(t, _) => t.text(),
+            _ => panic!("Text/char_code expects a Text value"),
+        };
+        let code = text.chars().next().map(|c| c as u32 as f64).unwrap_or(0.0);
+        Number::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/char_code result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            code,
+        )
+    })
+}
+
+/// Text/from_char_code(number) -> Text
+/// Creates a single-character text from a Unicode code point
+pub fn function_text_from_char_code(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_code] = arguments.as_slice() else {
+        panic!("Text/from_char_code expects 1 argument")
+    };
+    argument_code.clone().stream().map(move |value| {
+        let code = match &value {
+            Value::Number(n, _) => n.number(),
+            _ => panic!("Text/from_char_code expects a Number value"),
+        };
+        let ch = char::from_u32(code as u32).unwrap_or('\0');
+        Text::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/from_char_code result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            ch.to_string(),
+        )
+    })
+}
+
+// --- List functions (Cells spreadsheet) ---
+
+/// List/get(list, index) -> Value
+/// Returns the item at the given 1-based index in the list.
+/// Index 1 = first element, index 2 = second, etc.
+/// Re-emits whenever the item at that index changes.
+pub fn function_list_get(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_list, argument_index] = arguments.as_slice() else {
+        panic!("List/get expects 2 arguments, got {}", arguments.len())
+    };
+    let list_actor = argument_list.clone();
+    let index_actor = argument_index.clone();
+
+    enum Input {
+        List(Arc<List>),
+        Index(f64),
+    }
+    let list_stream = list_actor.stream().filter_map(|value| {
+        future::ready(match value {
+            Value::List(list, _) => Some(Input::List(list)),
+            _ => None,
+        })
+    });
+    let index_stream = index_actor.stream().filter_map(|value| {
+        future::ready(match value {
+            Value::Number(n, _) => Some(Input::Index(n.number())),
+            _ => None,
+        })
+    });
+
+    // When list or index changes, get item at index and subscribe to its values
+    let item_stream = stream::select(list_stream, index_stream)
+        .scan(
+            (None::<Arc<List>>, None::<f64>),
+            move |(last_list, last_index), input| {
+                match input {
+                    Input::List(l) => *last_list = Some(l),
+                    Input::Index(i) => *last_index = Some(i),
+                }
+                future::ready(Some((last_list.clone(), *last_index)))
+            },
+        )
+        .filter_map(|(list_opt, index_opt)| {
+            future::ready(match (list_opt, index_opt) {
+                (Some(list), Some(index)) => Some((list, index)),
+                _ => None,
+            })
+        });
+
+    let construct_context_for_oob = _construct_context.clone();
+    switch_map(item_stream, move |(list, index)| {
+        // Convert 1-based Boon index to 0-based Rust index
+        let idx = if index >= 1.0 { (index as usize) - 1 } else { usize::MAX };
+        let function_call_id = function_call_id.clone();
+        let construct_context = construct_context_for_oob.clone();
+        list.stream()
+            .scan(Vec::<ActorHandle>::new(), move |items, change| {
+                change.apply_to_vec(items);
+                future::ready(Some(items.get(idx).cloned()))
+            })
+            .flat_map(move |item_opt| -> LocalBoxStream<'static, Value> {
+                match item_opt {
+                    Some(actor) => Box::pin(actor.stream()),
+                    None => Box::pin(stream::once(future::ready(
+                        Tag::new_value(
+                            ConstructInfo::new(function_call_id.with_child_id(0), None, "List/get OutOfBounds"),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            "OutOfBounds".to_string(),
+                        ),
+                    ))),
+                }
+            })
+    })
+}
+
+/// List/range(from, to) -> List {from, from+1, ..., to}
+/// Creates a static list of numbers from `from` to `to` (inclusive).
+pub fn function_list_range(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_from, argument_to] = arguments.as_slice() else {
+        panic!("List/range expects 2 arguments, got {}", arguments.len())
+    };
+    let argument_from = argument_from.clone();
+    let argument_to = argument_to.clone();
+
+    enum Input {
+        From(f64),
+        To(f64),
+    }
+    let from_stream = argument_from.stream().filter_map(|value| {
+        future::ready(match value {
+            Value::Number(n, _) => Some(Input::From(n.number())),
+            _ => None,
+        })
+    });
+    let to_stream = argument_to.stream().filter_map(|value| {
+        future::ready(match value {
+            Value::Number(n, _) => Some(Input::To(n.number())),
+            _ => None,
+        })
+    });
+    let combined = stream::select(from_stream, to_stream)
+        .scan(
+            (None::<f64>, None::<f64>),
+            move |(last_from, last_to), input| {
+                match input {
+                    Input::From(f) => *last_from = Some(f),
+                    Input::To(t) => *last_to = Some(t),
+                }
+                future::ready(Some((*last_from, *last_to)))
+            },
+        )
+        .filter_map(|(from_opt, to_opt)| {
+            future::ready(match (from_opt, to_opt) {
+                (Some(from), Some(to)) => Some((from, to)),
+                _ => None,
+            })
+        });
+
+    switch_map(combined, move |(from, to)| {
+        let from_i = from as i64;
+        let to_i = to as i64;
+        let items: Vec<ActorHandle> = (from_i..=to_i)
+            .enumerate()
+            .map(|(i, n)| {
+                Number::new_arc_value_actor(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(i as u32),
+                        None,
+                        "List/range item",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    actor_context.clone(),
+                    n as f64,
+                )
+            })
+            .collect();
+        constant(List::new_value(
+            ConstructInfo::new(
+                function_call_id.with_child_id("list"),
+                None,
+                "List/range result",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            actor_context.clone(),
+            items,
+        ))
+    })
+}
+
+/// List/sum(list) -> Number
+/// Returns the sum of all Number items in the list. Empty list → 0.
+/// Re-emits whenever any item value changes.
+pub fn function_list_sum(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let list_actor = arguments[0].clone();
+    list_actor
+        .stream()
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::List(list, _) => Some(list),
+                _ => None,
+            })
+        })
+        .flat_map(move |list| {
+            let construct_context = construct_context.clone();
+            let function_call_id = function_call_id.clone();
+            list.stream()
+                .scan(Vec::<ActorHandle>::new(), move |items, change| {
+                    change.apply_to_vec(items);
+                    future::ready(Some(items.clone()))
+                })
+                .flat_map(move |items| {
+                    let construct_context = construct_context.clone();
+                    let function_call_id = function_call_id.clone();
+                    if items.is_empty() {
+                        return stream::once(future::ready(Number::new_value(
+                            ConstructInfo::new(function_call_id.with_child_id(0), None, "List/sum empty"),
+                            construct_context,
+                            ValueIdempotencyKey::new(),
+                            0.0,
+                        )))
+                        .left_stream();
+                    }
+                    let streams: Vec<_> = items.iter().enumerate().map(|(i, item)| {
+                        item.clone().stream().map(move |v| (i, v))
+                    }).collect();
+                    let item_count = items.len();
+                    stream::select_all(streams)
+                        .scan(vec![0.0f64; item_count], move |values, (i, value)| {
+                            if let Value::Number(n, _) = &value {
+                                values[i] = n.number();
+                            }
+                            let sum: f64 = values.iter().sum();
+                            future::ready(Some(Number::new_value(
+                                ConstructInfo::new(function_call_id.with_child_id(0), None, "List/sum result"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                sum,
+                            )))
+                        })
+                        .right_stream()
+                })
+        })
+}
+
+/// List/product(list) -> Number
+/// Returns the product of all Number items in the list. Empty list → 1.
+/// Re-emits whenever any item value changes.
+pub fn function_list_product(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let list_actor = arguments[0].clone();
+    list_actor
+        .stream()
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::List(list, _) => Some(list),
+                _ => None,
+            })
+        })
+        .flat_map(move |list| {
+            let construct_context = construct_context.clone();
+            let function_call_id = function_call_id.clone();
+            list.stream()
+                .scan(Vec::<ActorHandle>::new(), move |items, change| {
+                    change.apply_to_vec(items);
+                    future::ready(Some(items.clone()))
+                })
+                .flat_map(move |items| {
+                    let construct_context = construct_context.clone();
+                    let function_call_id = function_call_id.clone();
+                    if items.is_empty() {
+                        return stream::once(future::ready(Number::new_value(
+                            ConstructInfo::new(function_call_id.with_child_id(0), None, "List/product empty"),
+                            construct_context,
+                            ValueIdempotencyKey::new(),
+                            1.0,
+                        )))
+                        .left_stream();
+                    }
+                    let streams: Vec<_> = items.iter().enumerate().map(|(i, item)| {
+                        item.clone().stream().map(move |v| (i, v))
+                    }).collect();
+                    let item_count = items.len();
+                    stream::select_all(streams)
+                        .scan(vec![1.0f64; item_count], move |values, (i, value)| {
+                            if let Value::Number(n, _) = &value {
+                                values[i] = n.number();
+                            }
+                            let product: f64 = values.iter().product();
+                            future::ready(Some(Number::new_value(
+                                ConstructInfo::new(function_call_id.with_child_id(0), None, "List/product result"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                product,
+                            )))
+                        })
+                        .right_stream()
+                })
+        })
+}
+
+// --- Math functions (Cells spreadsheet) ---
+
+/// Math/modulo(a, divisor) -> Number
+/// Returns a % divisor (remainder)
+pub fn function_math_modulo(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_a, argument_divisor] = arguments.as_slice() else {
+        panic!("Math/modulo expects 2 arguments")
+    };
+    enum Input { A(f64), Divisor(f64) }
+    let a_stream = argument_a.clone().stream().map(|v| match &v {
+        Value::Number(n, _) => Input::A(n.number()),
+        _ => panic!("Math/modulo expects Number arguments"),
+    });
+    let divisor_stream = argument_divisor.clone().stream().map(|v| match &v {
+        Value::Number(n, _) => Input::Divisor(n.number()),
+        _ => panic!("Math/modulo expects Number arguments"),
+    });
+    stream::select(a_stream, divisor_stream)
+        .scan((None::<f64>, None::<f64>), move |(last_a, last_divisor), input| {
+            match input {
+                Input::A(val) => *last_a = Some(val),
+                Input::Divisor(val) => *last_divisor = Some(val),
+            }
+            if let (Some(a), Some(divisor)) = (*last_a, *last_divisor) {
+                future::ready(Some(Some(Number::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "Math/modulo result"),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    a % divisor,
+                ))))
+            } else {
+                future::ready(Some(None))
+            }
+        })
+        .filter_map(future::ready)
 }

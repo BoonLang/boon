@@ -1009,7 +1009,6 @@ fn schedule_expression(
                     );
                     // Store in object_locals for local resolution
                     object_locals.insert(var_span, actor.clone());
-                    // Also register with ReferenceConnector for backward compatibility
                     if let Some(ref_connector) = ctx.try_reference_connector() {
                         ref_connector.register_referenceable(var_span, actor.clone());
                     }
@@ -1138,7 +1137,6 @@ fn schedule_expression(
                     );
                     // Store in object_locals for local resolution
                     object_locals.insert(var_span, actor.clone());
-                    // Also register with ReferenceConnector for backward compatibility
                     if let Some(ref_connector) = ctx.try_reference_connector() {
                         ref_connector.register_referenceable(var_span, actor.clone());
                     }
@@ -1264,7 +1262,6 @@ fn schedule_expression(
                     );
                     // Store in object_locals for local resolution
                     object_locals.insert(var_span, actor.clone());
-                    // Also register with ReferenceConnector for backward compatibility
                     if let Some(ref_connector) = ctx.try_reference_connector() {
                         ref_connector.register_referenceable(var_span, actor.clone());
                     }
@@ -4627,35 +4624,42 @@ fn build_text_literal_actor(
                     if let Some(var_actor) = ctx.actor_context.parameters.get(base_name) {
                         Some(var_actor.clone())
                     } else if let Some(ref_span) = referenced_span {
-                        // Use reference_connector for outer scope
-                        let ref_connector = ctx.try_reference_connector().ok_or_else(|| {
-                            "ReferenceConnector dropped - program shutting down".to_string()
-                        })?;
-                        let ref_span_copy = *ref_span;
+                        // First check object_locals for instance-specific resolution
+                        // This prevents span-based overwrites when multiple Objects are created
+                        // from the same function definition (e.g., BLOCK inside List/map)
+                        if let Some(local_actor) = ctx.actor_context.object_locals.get(ref_span).cloned() {
+                            Some(local_actor)
+                        } else {
+                            // Fall back to async lookup via ReferenceConnector for outer scope
+                            let ref_connector = ctx.try_reference_connector().ok_or_else(|| {
+                                "ReferenceConnector dropped - program shutting down".to_string()
+                            })?;
+                            let ref_span_copy = *ref_span;
 
-                        // Create forwarding actor for the base variable
-                        let (base_ref_actor, base_sender) = create_actor_forwarding(
-                            ConstructInfo::new(
-                                format!("TextInterpolation:{}:base", var_name),
-                                None,
-                                format!("{span}; TextInterpolation base for '{}'", base_name),
-                            ),
-                            ctx.actor_context.clone(),
-                            PersistenceId::new(),
-                            ctx.actor_context.scope_id(),
-                        );
+                            // Create forwarding actor for the base variable
+                            let (base_ref_actor, base_sender) = create_actor_forwarding(
+                                ConstructInfo::new(
+                                    format!("TextInterpolation:{}:base", var_name),
+                                    None,
+                                    format!("{span}; TextInterpolation base for '{}'", base_name),
+                                ),
+                                ctx.actor_context.clone(),
+                                PersistenceId::new(),
+                                ctx.actor_context.scope_id(),
+                            );
 
-                        let actor_loop = ActorLoop::new(async move {
-                            let actor = ref_connector.referenceable(ref_span_copy).await;
-                            let mut subscription = actor.stream();
-                            while let Some(value) = subscription.next().await {
-                                if base_sender.send(value).await.is_err() {
-                                    break;
+                            let actor_loop = ActorLoop::new(async move {
+                                let actor = ref_connector.referenceable(ref_span_copy).await;
+                                let mut subscription = actor.stream();
+                                while let Some(value) = subscription.next().await {
+                                    if base_sender.send(value).await.is_err() {
+                                        break;
+                                    }
                                 }
-                            }
-                        });
-                        forwarding_loops.push(actor_loop);
-                        Some(base_ref_actor)
+                            });
+                            forwarding_loops.push(actor_loop);
+                            Some(base_ref_actor)
+                        }
                     } else {
                         None
                     };
@@ -6872,6 +6876,36 @@ fn static_function_call_path_to_definition(
             )
             .boxed_local()
         },
+        ["Math", "round"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_math_round(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["Math", "min"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_math_min(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["Math", "max"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_math_max(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
         ["Text", "empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
             api::function_text_empty(
                 arguments,
@@ -6917,6 +6951,30 @@ fn static_function_call_path_to_definition(
         ["Text", "is_not_empty"] => {
             |arguments, id, persistence_id, construct_context, actor_context| {
                 api::function_text_is_not_empty(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Text", "to_number"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_text_to_number(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Text", "starts_with"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_text_starts_with(
                     arguments,
                     id,
                     persistence_id,
@@ -6996,6 +7054,26 @@ fn static_function_call_path_to_definition(
             )
             .boxed_local()
         },
+        ["List", "last"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_list_last(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["List", "remove_last"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_list_remove_last(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
         ["List", "is_empty"] => {
             |arguments, id, persistence_id, construct_context, actor_context| {
                 api::function_list_is_empty(
@@ -7020,6 +7098,136 @@ fn static_function_call_path_to_definition(
                 .boxed_local()
             }
         }
+        ["List", "get"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_list_get(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["List", "range"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_list_range(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["List", "sum"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_list_sum(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["List", "product"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_list_product(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["Text", "length"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_length(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["Text", "char_at"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_char_at(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["Text", "find"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_find(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["Text", "find_closing"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_find_closing(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["Text", "substring"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_substring(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["Text", "to_uppercase"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_to_uppercase(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["Text", "char_code"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_char_code(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["Text", "from_char_code"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_from_char_code(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
+        ["Math", "modulo"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_math_modulo(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
         ["Router", "route"] => |arguments, id, persistence_id, construct_context, actor_context| {
             api::function_router_route(
                 arguments,
@@ -7125,6 +7333,54 @@ fn static_function_call_path_to_definition(
         ["Element", "checkbox"] => {
             |arguments, id, persistence_id, construct_context, actor_context| {
                 api::function_element_checkbox(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Element", "slider"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_slider(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Element", "select"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_select(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Element", "svg"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_svg(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Element", "svg_circle"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_svg_circle(
                     arguments,
                     id,
                     persistence_id,

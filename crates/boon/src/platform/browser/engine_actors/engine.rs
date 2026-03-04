@@ -8526,22 +8526,23 @@ impl ListBindingFunction {
                                                 );
                                                 predicates.insert(pid.clone(), pred.clone());
 
-                                                // Query initial value (use .value() to wait for reactive predicates)
-                                                match pred.clone().value().await {
-                                                    Ok(value) => {
-                                                        let is_true = matches!(&value, Value::Tag(tag, _) if tag.tag() == "True");
-                                                        predicate_results.insert(pid, is_true);
-                                                    }
-                                                    Err(_e) => {}
-                                                }
+                                                // Default predicate to true (non-blocking).
+                                                // Same rationale as Replace/Push handlers: value().await
+                                                // has timing issues with multi-arg pipe predicates
+                                                // (e.g., Text/starts_with) where the predicate actor
+                                                // can be dropped before resolving all its inputs.
+                                                // The merged_predicates stream will correct if needed.
+                                                predicate_results.insert(pid, true);
                                             }
 
-                                            // Use stream_from_now for future updates, keyed by PersistenceId
+                                            // Use stream() to replay initial values — predicates may have
+                                            // already emitted before this subscription is created, so
+                                            // stream_from_now() would miss those initial values.
                                             // B2: Add boolean deduplication to each predicate stream
                                             let pred_streams: Vec<_> = predicates.iter()
                                                 .map(|(pid, pred)| {
                                                     let pid = pid.clone();
-                                                    pred.clone().stream_from_now()
+                                                    pred.clone().stream()
                                                         .map(move |v| {
                                                             let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
                                                             (pid.clone(), is_true)

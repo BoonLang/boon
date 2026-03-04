@@ -31,6 +31,8 @@ The sections below marked **(Old Engine)** document the current engine and will 
   - For pointer casting in FFI: `as` is appropriate but rare in Boon
 - **When fixing subtle bugs, document the architectural principle in `docs/new_boon/`.** The fix itself solves the immediate problem, but documenting *why* the code must be structured that way prevents the bug from being reintroduced. For example, the "Wire Transparency Principle" (§2.3.6.1) explains why Wire nodes must always follow their source chain instead of returning cached values - a subtle invariant that, if violated, breaks HOLD state updates.
 - **Use `switch_map` instead of `flat_map` when inner streams are infinite.** When a `flat_map` closure contains branching (match/if) that returns inner streams with `stream::pending()`, use `switch_map` instead. `flat_map` waits for inner streams to complete before processing new outer values - since `stream::pending()` never completes, subsequent values are silently ignored. `switch_map` cancels the previous inner stream when a new outer value arrives, which is the correct behavior for reactive UI updates. See `bridge.rs` outline_signal for an example.
+- **Boon uses 1-based indexing.** `List/get(index: 1)` returns the first element. `List/range(from: 1, to: 10)` generates `[1, 2, ..., 10]` (inclusive). There is no `List/generate` or `List/new` — only `List/range(from: to:)` for creating number sequences.
+- **No abbreviations in Boon code.** Write `column` not `col`, `row` not `r`, `start_row` not `sr`, `elapsed_display` not `eld`. Variable and field names should be full, readable English words.
 
 ## Project Structure
 

@@ -1,0 +1,349 @@
+-- 7GUIs Task 7: Cells (Spreadsheet)
+-- 26 columns (A-Z) x 100 rows (1-100), row-major storage
+--
+-- Supported formulas:
+--   42            plain number
+--   =42           literal number
+--   =A1           cell reference (column letter + row number)
+--   =add(A1, 5)   binary ops: add, sub, mul, div, mod
+--   =mul(2, A1)   nested: =add(mul(2, A1), B1)
+--   =sum(A1:A3)   range ops: sum, prod (single column)
+--
+-- Double-click a cell to edit. Enter confirms, Escape cancels.
+-- Click elsewhere to blur-deselect. Formulas auto-update reactively.
+
+-- ─── Formula Helpers ──────────────────────────────────────────────
+
+FUNCTION is_uppercase(char_code) {
+    char_code >= 65 |> WHILE {
+        True => char_code <= 90
+        False => False
+    }
+}
+
+FUNCTION is_digit(char_code) {
+    char_code >= 48 |> WHILE {
+        True => char_code <= 57
+        False => False
+    }
+}
+
+FUNCTION is_cell_ref(text) {
+    BLOCK {
+        first_code: text |> Text/char_at(index: 0) |> Text/char_code()
+        second_code: text |> Text/char_at(index: 1) |> Text/char_code()
+        first_upper: is_uppercase(char_code: first_code)
+        second_digit: is_digit(char_code: second_code)
+        first_upper |> WHILE {
+            True => second_digit
+            False => False
+        }
+    }
+}
+
+FUNCTION find_comma_depth(text, position, depth) {
+    BLOCK {
+        char: text |> Text/char_at(index: position)
+        char_code: char |> Text/char_code()
+        is_comma: char_code == 44
+        is_open: char_code == 40
+        is_close: char_code == 41
+
+        is_comma |> WHILE {
+            True => depth == 0 |> WHILE {
+                True => position
+                False => find_comma_depth(text: text, position: position + 1, depth: depth)
+            }
+            False => BLOCK {
+                new_depth: is_open |> WHILE {
+                    True => depth + 1
+                    False => is_close |> WHILE {
+                        True => depth - 1
+                        False => depth
+                    }
+                }
+                find_comma_depth(text: text, position: position + 1, depth: new_depth)
+            }
+        }
+    }
+}
+
+-- ─── Formula Evaluation ───────────────────────────────────────────
+
+FUNCTION cell_lookup(column, row, all_cells) {
+    BLOCK {
+        cell: all_cells |> List/get(index: row) |> List/get(index: column)
+        cell |> WHILE { c => c.value }
+    }
+}
+
+FUNCTION apply_binary(name, left, right) {
+    name == TEXT { add } |> WHILE {
+        True => left + right
+        False => name == TEXT { sub } |> WHILE {
+            True => left - right
+            False => name == TEXT { mul } |> WHILE {
+                True => left * right
+                False => name == TEXT { div } |> WHILE {
+                    True => left / right
+                    False => name == TEXT { mod } |> WHILE {
+                        True => left |> Math/modulo(divisor: right)
+                        False => 0
+                    }
+                }
+            }
+        }
+    }
+}
+
+FUNCTION apply_range(name, values) {
+    name == TEXT { sum } |> WHILE {
+        True => values |> List/sum()
+        False => name == TEXT { prod } |> WHILE {
+            True => values |> List/product()
+            False => 0
+        }
+    }
+}
+
+FUNCTION parse_cell_ref(text, all_cells) {
+    BLOCK {
+        first_code: text |> Text/char_at(index: 0) |> Text/char_code()
+        column_number: first_code - 64
+        rest_length: text |> Text/length() |> WHILE { length => length - 1 }
+        rest: text |> Text/substring(start: 1, length: rest_length)
+        row_number: rest |> Text/to_number()
+        cell_lookup(column: column_number, row: row_number, all_cells: all_cells)
+    }
+}
+
+FUNCTION parse_function_call(text, all_cells) {
+    BLOCK {
+        text_length: text |> Text/length()
+        paren_pos: text |> Text/find(search: TEXT { ( })
+        func_name: text |> Text/substring(start: 0, length: paren_pos)
+        args_start: paren_pos + 1
+        args_length: text_length - args_start - 1
+        args_text: text |> Text/substring(start: args_start, length: args_length)
+        colon_pos: args_text |> Text/find(search: TEXT { : })
+        has_colon: colon_pos >= 0
+
+        has_colon |> WHILE {
+            True => BLOCK {
+                start_ref: args_text |> Text/substring(start: 0, length: colon_pos) |> Text/trim()
+                end_start: colon_pos + 1
+                end_length: args_text |> Text/length() |> WHILE { length => length - end_start }
+                end_ref: args_text |> Text/substring(start: end_start, length: end_length) |> Text/trim()
+
+                start_col: start_ref |> Text/char_at(index: 0) |> Text/char_code() |> WHILE { code => code - 64 }
+                start_rest_len: start_ref |> Text/length() |> WHILE { length => length - 1 }
+                start_row: start_ref |> Text/substring(start: 1, length: start_rest_len) |> Text/to_number()
+
+                end_rest_len: end_ref |> Text/length() |> WHILE { length => length - 1 }
+                end_row: end_ref |> Text/substring(start: 1, length: end_rest_len) |> Text/to_number()
+
+                range_values: List/range(from: start_row, to: end_row) |> List/map(old, new:
+                    cell_lookup(column: start_col, row: old, all_cells: all_cells)
+                )
+                apply_range(name: func_name, values: range_values)
+            }
+            False => BLOCK {
+                comma_pos: find_comma_depth(text: args_text, position: 0, depth: 0)
+                left_text: args_text |> Text/substring(start: 0, length: comma_pos)
+                right_start: comma_pos + 1
+                right_length: args_text |> Text/length() |> WHILE { length => length - right_start }
+                right_text: args_text |> Text/substring(start: right_start, length: right_length)
+                left_val: evaluate_expression(text: left_text, all_cells: all_cells)
+                right_val: evaluate_expression(text: right_text, all_cells: all_cells)
+                apply_binary(name: func_name, left: left_val, right: right_val)
+            }
+        }
+    }
+}
+
+FUNCTION evaluate_expression(text, all_cells) {
+    BLOCK {
+        trimmed: text |> Text/trim()
+        as_number: trimmed |> Text/to_number()
+        is_number: as_number |> WHEN { NaN => False, __ => True }
+
+        is_number |> WHILE {
+            True => as_number
+            False => is_cell_ref(text: trimmed) |> WHILE {
+                True => parse_cell_ref(text: trimmed, all_cells: all_cells)
+                False => parse_function_call(text: trimmed, all_cells: all_cells)
+            }
+        }
+    }
+}
+
+FUNCTION compute_value(formula_text, all_cells) {
+    formula_text |> Text/starts_with(prefix: TEXT { = }) |> WHILE {
+        False => formula_text |> Text/to_number() |> WHILE {
+            NaN => 0
+            number => number
+        }
+        True => BLOCK {
+            full_length: formula_text |> Text/length()
+            expr_length: full_length |> WHILE { length => length - 1 }
+            expression: formula_text |> Text/substring(start: 1, length: expr_length)
+            evaluate_expression(text: expression, all_cells: all_cells)
+        }
+    }
+}
+
+-- ─── Cell ─────────────────────────────────────────────────────────
+
+FUNCTION new_cell(initial_formula, all_cells) {
+    [
+        cell_elements: [display: LINK, editing: LINK]
+        is_editing: False |> HOLD state {
+            LATEST {
+                cell_elements.display.event.double_click |> THEN { True }
+                cell_elements.editing.event.blur |> THEN { False }
+                cell_elements.editing.event.key_down.key
+                    |> WHEN { Escape => False, Enter => False, __ => SKIP }
+            }
+        }
+        editing_text: formula |> HOLD state {
+            LATEST {
+                cell_elements.editing.event.change.text
+                cell_elements.editing.event.key_down.key
+                    |> WHEN { Escape => formula, __ => SKIP }
+            }
+        }
+        confirmed_text: cell_elements.editing.event.key_down.key
+            |> WHEN { Enter => editing_text, __ => SKIP }
+        formula: LATEST { initial_formula, confirmed_text }
+        value: compute_value(formula_text: formula, all_cells: all_cells)
+    ]
+}
+
+-- ─── Default Formulas ─────────────────────────────────────────────
+
+FUNCTION default_formula(column, row) {
+    column == 1 |> WHEN {
+        True => row |> WHEN {
+            1 => TEXT { 5 }
+            2 => TEXT { 10 }
+            3 => TEXT { 15 }
+            __ => Text/empty()
+        }
+        __ => column == 2 |> WHEN {
+            True => row == 1 |> WHEN {
+                True => TEXT { =add(A1, A2) }
+                __ => Text/empty()
+            }
+            __ => column == 3 |> WHEN {
+                True => row == 1 |> WHEN {
+                    True => TEXT { =sum(A1:A3) }
+                    __ => Text/empty()
+                }
+                __ => Text/empty()
+            }
+        }
+    }
+}
+
+FUNCTION make_row_cells(row, all_cells) {
+    List/range(from: 1, to: 26) |> List/map(old, new:
+        new_cell(
+            initial_formula: default_formula(column: old, row: row)
+            all_cells: all_cells
+        )
+    )
+}
+
+-- ─── Store ────────────────────────────────────────────────────────
+
+cells: List/range(from: 1, to: 100) |> List/map(old, new:
+    make_row_cells(row: old, all_cells: cells)
+)
+
+-- ─── Grid Rendering ───────────────────────────────────────────────
+
+FUNCTION make_cell_element(cell) {
+    cell.is_editing |> WHILE {
+        True => Element/text_input(
+            element: [event: [change: LINK, key_down: LINK, blur: LINK]]
+            style: [width: 80]
+            label: Hidden[text: TEXT { cell }]
+            text: cell.editing_text
+            placeholder: [text: Text/empty()]
+            focus: True
+        ) |> LINK { cell.cell_elements.editing }
+
+        False => Element/label(
+            element: [event: [double_click: LINK]]
+            style: [width: 80, height: 22]
+            label: cell.formula |> Text/is_empty() |> WHILE {
+                True => TEXT { . }
+                __ => TEXT { {cell.value} }
+            }
+        ) |> LINK { cell.cell_elements.display }
+    }
+}
+
+FUNCTION num_to_column(column_index) {
+    column_index + 64 |> Text/from_char_code()
+}
+
+FUNCTION make_row(row_index) {
+    BLOCK {
+        row: cells |> List/get(index: row_index)
+        Element/stripe(
+            element: [], direction: Row, gap: 0, style: []
+            items: LIST {
+                Element/label(
+                    element: [], style: [width: 40, height: 22]
+                    label: TEXT { {row_index} }
+                )
+                Element/stripe(
+                    element: [], direction: Row, gap: 0, style: []
+                    items: row |> List/map(old, new:
+                        make_cell_element(cell: old)
+                    )
+                )
+            }
+        )
+    }
+}
+
+-- ─── Document ─────────────────────────────────────────────────────
+
+document: Document/new(root:
+    Element/stripe(
+        element: [], direction: Column, gap: 0
+        style: [padding: 20]
+        items: LIST {
+            Element/label(
+                element: []
+                style: [font: [size: 22, weight: Bold]]
+                label: TEXT { Cells }
+            )
+            Element/stripe(
+                element: [], direction: Row, gap: 0, style: []
+                items: LIST {
+                    Element/label(element: [], style: [width: 40], label: TEXT {  })
+                    Element/stripe(
+                        element: [], direction: Row, gap: 0, style: []
+                        items: List/range(from: 1, to: 26) |> List/map(old, new:
+                            Element/label(
+                                element: []
+                                style: [width: 80]
+                                label: num_to_column(column_index: old)
+                            )
+                        )
+                    )
+                }
+            )
+            Element/stripe(
+                element: [], direction: Column, gap: 0
+                style: [scrollbars: True, height: 500]
+                items: List/range(from: 1, to: 100) |> List/map(old, new:
+                    make_row(row_index: old)
+                )
+            )
+        }
+    )
+)

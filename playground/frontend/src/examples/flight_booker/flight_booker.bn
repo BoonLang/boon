@@ -1,0 +1,118 @@
+-- Flight Booker (7GUIs Task 3)
+-- Select flight type, enter dates, validate, book.
+
+store: [
+    elements: [
+        flight_select: LINK
+        departure_input: LINK
+        return_input: LINK
+        book_button: LINK
+    ]
+
+    flight_type: TEXT { one-way } |> HOLD state {
+        elements.flight_select.event.change.value
+    }
+
+    departure_date: TEXT { 2026-03-03 } |> HOLD state {
+        elements.departure_input.event.change.text
+    }
+
+    return_date: TEXT { 2026-03-03 } |> HOLD state {
+        elements.return_input.event.change.text
+    }
+
+    is_return: flight_type |> WHEN {
+        TEXT { return } => True
+        __ => False
+    }
+
+    is_valid: is_return |> WHEN {
+        False => True
+        True => return_date >= departure_date
+    }
+
+    booked: TEXT { } |> HOLD state {
+        elements.book_button.event.press |> THEN {
+            is_return |> WHEN {
+                False => TEXT { Booked one-way flight on {departure_date} }
+                True => TEXT { Booked return flight: {departure_date} to {return_date} }
+            }
+        }
+    }
+]
+
+document: Document/new(root: root_element(PASS: [store: store]))
+
+FUNCTION root_element() {
+    BLOCK {
+        store: PASSED.store
+        departure_date: store.departure_date
+        return_date: store.return_date
+        is_return: store.is_return
+        is_valid: store.is_valid
+        booked: store.booked
+
+        Element/stripe(
+            element: []
+            direction: Column
+            gap: 12
+            style: [padding: 20, width: 300]
+
+            items: LIST {
+                Element/label(
+                    element: []
+                    style: [font: [size: 22, weight: Bold]]
+                    label: TEXT { Flight Booker }
+                )
+                Element/select(
+                    element: [event: [change: LINK]]
+                    style: [width: Fill]
+                    label: Hidden[text: TEXT { Flight type }]
+                    options: LIST {
+                        [value: TEXT { one-way }, label: TEXT { One-way flight }]
+                        [value: TEXT { return }, label: TEXT { Return flight }]
+                    }
+                    selected: TEXT { one-way }
+                ) |> LINK { store.elements.flight_select }
+                Element/text_input(
+                    element: [event: [change: LINK]]
+                    style: [width: Fill]
+                    label: Hidden[text: TEXT { Departure date }]
+                    text: departure_date
+                    placeholder: [text: TEXT { YYYY-MM-DD }]
+                    focus: False
+                ) |> LINK { store.elements.departure_input }
+                Element/text_input(
+                    element: [event: [change: LINK]]
+                    style: [
+                        width: Fill
+                        disabled: is_return |> WHEN {
+                            True => False
+                            __ => True
+                        }
+                    ]
+                    label: Hidden[text: TEXT { Return date }]
+                    text: return_date
+                    placeholder: [text: TEXT { YYYY-MM-DD }]
+                    focus: False
+                ) |> LINK { store.elements.return_input }
+                Element/button(
+                    element: [event: [press: LINK]]
+                    style: [
+                        width: Fill
+                        disabled: is_valid |> WHEN {
+                            True => False
+                            __ => True
+                        }
+                    ]
+                    label: TEXT { Book }
+                ) |> LINK { store.elements.book_button }
+                Element/label(
+                    element: []
+                    style: []
+                    label: booked
+                )
+            }
+        )
+    }
+}

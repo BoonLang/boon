@@ -185,7 +185,7 @@ fn save_engine_to_storage(engine: EngineType) {
 
 /// Find example data by name (filename without .bn extension)
 fn find_example_by_name(name: &str) -> Option<ExampleData> {
-    EXAMPLE_DATAS.iter().find(|e| {
+    EXAMPLE_DATAS.iter().chain(OTHER_EXAMPLE_DATAS.iter()).find(|e| {
         e.filename.trim_end_matches(".bn") == name || e.filename == name
     }).copied()
 }
@@ -217,9 +217,13 @@ static MULTI_FILE_EXAMPLES: [MultiFileExampleData; 1] = [
     },
 ];
 
+static OTHER_MULTI_FILE_EXAMPLES: [MultiFileExampleData; 0] = [];
+
 /// Find multi-file example by name
 fn find_multi_file_example_by_name(name: &str) -> Option<&'static MultiFileExampleData> {
-    MULTI_FILE_EXAMPLES.iter().find(|e| e.name == name)
+    MULTI_FILE_EXAMPLES.iter()
+        .chain(OTHER_MULTI_FILE_EXAMPLES.iter())
+        .find(|e| e.name == name)
 }
 
 /// Parse module files and return external function definitions in the universal tuple format.
@@ -299,7 +303,7 @@ macro_rules! make_example_data {
     }};
 }
 
-static EXAMPLE_DATAS: [ExampleData; 24] = [
+static EXAMPLE_DATAS: [ExampleData; MAIN_EXAMPLES_COUNT] = [
     make_example_data!("minimal"),
     make_example_data!("hello_world"),
     make_example_data!("interval"),
@@ -311,19 +315,31 @@ static EXAMPLE_DATAS: [ExampleData; 24] = [
     make_example_data!("shopping_list"),
     make_example_data!("pages"),
     make_example_data!("todo_mvc"),
-    make_example_data!("list_retain_count"),
-    make_example_data!("list_map_block"),
-    make_example_data!("list_object_state"),
-    make_example_data!("list_retain_reactive"),
-    make_example_data!("list_retain_remove"),
-    make_example_data!("while_function_call"),
-    make_example_data!("list_map_external_dep"),
-    make_example_data!("text_interpolation_update"),
-    make_example_data!("button_hover_test"),
-    make_example_data!("button_hover_to_click_test"),
-    make_example_data!("switch_hold_test"),
-    make_example_data!("filter_checkbox_bug"),
-    make_example_data!("chained_list_remove_bug"),
+    // Debug examples (commented out — use custom examples for ad-hoc testing)
+    // make_example_data!("list_retain_count"),
+    // make_example_data!("list_map_block"),
+    // make_example_data!("list_object_state"),
+    // make_example_data!("list_retain_reactive"),
+    // make_example_data!("list_retain_remove"),
+    // make_example_data!("while_function_call"),
+    // make_example_data!("list_map_external_dep"),
+    // make_example_data!("text_interpolation_update"),
+    // make_example_data!("button_hover_test"),
+    // make_example_data!("button_hover_to_click_test"),
+    // make_example_data!("switch_hold_test"),
+    // make_example_data!("filter_checkbox_bug"),
+    // make_example_data!("chained_list_remove_bug"),
+];
+
+// 7GUIs benchmark examples (shown in "Other" expandable section)
+// Added incrementally as each task is implemented.
+static OTHER_EXAMPLE_DATAS: [ExampleData; 6] = [
+    make_example_data!("temperature_converter"),
+    make_example_data!("crud"),
+    make_example_data!("timer"),
+    make_example_data!("flight_booker"),
+    make_example_data!("circle_drawer"),
+    make_example_data!("cells"),
 ];
 
 #[derive(Clone, Copy)]
@@ -1122,14 +1138,7 @@ impl Playground {
                     .spread(-12),
             ]))
             .update_raw_el(|raw_el| raw_el.style("backdrop-filter", "blur(24px)"))
-            .child(
-                Row::new()
-                    .s(Width::fill())
-                    .s(Align::new().center_y())
-                    .s(Gap::new().x(12))
-                    .item(self.header_title())
-                    .item(self.example_tabs()),
-            )
+            .child(self.example_tabs())
     }
 
     fn header_title(&self) -> impl Element + use<> {
@@ -1172,40 +1181,55 @@ impl Playground {
     }
 
     fn example_tabs(&self) -> impl Element + use<> {
-        let main_examples = &EXAMPLE_DATAS[..MAIN_EXAMPLES_COUNT];
-        let debug_examples = &EXAMPLE_DATAS[MAIN_EXAMPLES_COUNT..];
-
         Column::new()
             .s(Width::fill())
             .s(Gap::new().y(8))
             .item(
-                // Main examples row
+                // Main row: [logo] [examples...] [todo_mvc_physical] [+] [Other ▸]
                 Row::new()
                     .s(Width::fill())
                     .s(Align::new().center_y())
                     .s(Gap::new().x(10).y(6))
                     .multiline()
-                    .items(main_examples.iter().map(|&example_data| self.example_button(example_data)))
+                    .item(self.header_title())
+                    .items(EXAMPLE_DATAS.iter().map(|&example_data| self.example_button(example_data)))
                     .items(MULTI_FILE_EXAMPLES.iter().map(|example| self.multi_file_example_button(example)))
+                    .item(self.add_custom_example_button())
+                    .item(self.other_section_toggle())
             )
             .item_signal(
-                // Custom examples row (only shown if there are custom examples or always show add button)
+                // "Other" expandable section: 7GUIs examples + custom examples
+                self.debug_collapsed.signal().map({
+                    let this = self.clone();
+                    move |collapsed| {
+                        if collapsed {
+                            None
+                        } else {
+                            Some(this.other_section_content())
+                        }
+                    }
+                })
+            )
+    }
+
+    fn other_section_content(&self) -> impl Element + use<> {
+        Row::new()
+            .s(Width::fill())
+            .s(Align::new().center_y())
+            .s(Gap::new().x(10).y(6))
+            .s(Padding::new().left(10))
+            .multiline()
+            // 7GUIs examples (items() on empty array is a no-op)
+            .items(OTHER_EXAMPLE_DATAS.iter().map(|&example_data| self.example_button(example_data)))
+            .items(OTHER_MULTI_FILE_EXAMPLES.iter().map(|example| self.multi_file_example_button(example)))
+            // Custom examples row (only shown when custom examples exist)
+            .item_signal(
                 self.custom_examples.signal_cloned().map({
                     let this = self.clone();
                     move |custom_examples| {
                         if custom_examples.is_empty() {
-                            // Just show the add button when no custom examples
-                            Some(
-                                Row::new()
-                                    .s(Width::fill())
-                                    .s(Align::new().center_y())
-                                    .s(Gap::new().x(10).y(6))
-                                    .multiline()
-                                    .item(this.add_custom_example_button())
-                            )
+                            None
                         } else {
-                            // Show custom examples with add button at the end (Vec preserves order)
-                            // Pass (id, name) tuples for button creation
                             let id_names: Vec<(String, String)> = custom_examples.iter().map(|(id, name, _)| (id.clone(), name.clone())).collect();
                             Some(
                                 Row::new()
@@ -1214,47 +1238,19 @@ impl Playground {
                                     .s(Gap::new().x(10).y(6))
                                     .multiline()
                                     .items(id_names.into_iter().map(|(id, name)| this.custom_example_button(id, name)))
-                                    .item(this.add_custom_example_button())
                             )
                         }
                     }
                 })
             )
-            .item(
-                // Debug section with toggle header
-                Column::new()
-                    .s(Width::fill())
-                    .s(Gap::new().y(6))
-                    .item(self.debug_section_header())
-                    .item_signal(
-                        self.debug_collapsed.signal().map({
-                            let this = self.clone();
-                            let debug_examples = debug_examples.to_vec();
-                            move |collapsed| {
-                                if collapsed {
-                                    None
-                                } else {
-                                    Some(
-                                        Row::new()
-                                            .s(Width::fill())
-                                            .s(Align::new().center_y())
-                                            .s(Gap::new().x(10).y(6))
-                                            .multiline()
-                                            .items(debug_examples.iter().map(|&example_data| this.example_button(example_data)))
-                                    )
-                                }
-                            }
-                        })
-                    )
-            )
     }
 
-    fn debug_section_header(&self) -> impl Element + use<> {
+    fn other_section_toggle(&self) -> impl Element + use<> {
         let hovered = Mutable::new(false);
         Button::new()
-            .s(Padding::new().x(10).y(5))
-            .s(RoundedCorners::all(12))
-            .s(Font::new().size(12).weight(FontWeight::Medium))
+            .s(Padding::new().x(10).y(7))
+            .s(RoundedCorners::all(24))
+            .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
             .s(Background::new().color_signal(
                 hovered.signal().map(|h| {
                     if h {
@@ -1264,12 +1260,15 @@ impl Playground {
                     }
                 })
             ))
+            .s(Borders::all(
+                Border::new().color(color!("rgba(88, 126, 194, 0.25)")).width(1),
+            ))
             .s(Font::new().color(muted_text_color()))
             .label_signal(self.debug_collapsed.signal().map(|collapsed| {
                 if collapsed {
-                    "▶  Debug examples"
+                    "Other \u{25B8}"
                 } else {
-                    "▼  Debug examples"
+                    "Other \u{25BE}"
                 }
             }))
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
@@ -1874,6 +1873,8 @@ impl Playground {
                 local_storage().remove(STATES_STORAGE_KEY);
                 local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                 local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+                local_storage().remove(PROJECT_FILES_STORAGE_KEY);
+                local_storage().remove(CURRENT_FILE_STORAGE_KEY);
                 // Clear dynamically-keyed persistence data (list calls, removed sets, DD engine state)
                 clear_prefixed_storage_keys(&["list_calls:", "list_removed:", "dd_", "wasm_"]);
             })

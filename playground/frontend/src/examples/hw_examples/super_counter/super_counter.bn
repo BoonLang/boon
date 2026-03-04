@@ -295,7 +295,7 @@ FUNCTION btn_message(rst, btn_pressed, tx_busy) {
             bcd: [BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }]
             msg: LIST[10] { BITS[8] { 10u0 } }
             msg_len: BITS[4] { 10u6 }
-            msg_idx: BITS[4] { 10u0 }
+            msg_idx: BITS[4] { 10u1 }
             tx_data: BITS[8] { 10u0 }
             tx_start: False
         ] |> HOLD st {
@@ -305,7 +305,7 @@ FUNCTION btn_message(rst, btn_pressed, tx_busy) {
                         fsm: Idle, seq: BITS[17] { 10u0 },
                         bcd: [BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }],
                         msg: LIST[10] { BITS[8] { 10u0 } },
-                        msg_len: BITS[4] { 10u6 }, msg_idx: BITS[4] { 10u0 },
+                        msg_len: BITS[4] { 10u6 }, msg_idx: BITS[4] { 10u1 },
                         tx_data: BITS[8] { 10u0 }, tx_start: False
                     ]
                     False => st.fsm |> WHEN {
@@ -320,13 +320,13 @@ FUNCTION btn_message(rst, btn_pressed, tx_busy) {
                                 new_bcd: bcd_increment(st.bcd)
 
                                 -- Count significant digits
-                                n_digits: new_bcd |> List/get(index: 4) |> Bits/not_equal(BITS[4] { 10u0 }) |> WHILE {
+                                n_digits: new_bcd |> List/get(index: 5) |> Bits/not_equal(BITS[4] { 10u0 }) |> WHILE {
                                     True => 5
-                                    False => new_bcd |> List/get(index: 3) |> Bits/not_equal(BITS[4] { 10u0 }) |> WHILE {
+                                    False => new_bcd |> List/get(index: 4) |> Bits/not_equal(BITS[4] { 10u0 }) |> WHILE {
                                         True => 4
-                                        False => new_bcd |> List/get(index: 2) |> Bits/not_equal(BITS[4] { 10u0 }) |> WHILE {
+                                        False => new_bcd |> List/get(index: 3) |> Bits/not_equal(BITS[4] { 10u0 }) |> WHILE {
                                             True => 3
-                                            False => new_bcd |> List/get(index: 1) |> Bits/not_equal(BITS[4] { 10u0 }) |> WHILE {
+                                            False => new_bcd |> List/get(index: 2) |> Bits/not_equal(BITS[4] { 10u0 }) |> WHILE {
                                                 True => 2
                                                 False => 1
                                             }
@@ -343,7 +343,7 @@ FUNCTION btn_message(rst, btn_pressed, tx_busy) {
                                     bcd: new_bcd
                                     msg: new_msg.msg
                                     msg_len: new_msg.len
-                                    msg_idx: BITS[4] { 10u0 }
+                                    msg_idx: BITS[4] { 10u1 }
                                     tx_data: BITS[8] { 10u0 }
                                     tx_start: False
                                 ]
@@ -363,10 +363,10 @@ FUNCTION btn_message(rst, btn_pressed, tx_busy) {
 
                         Wait => tx_busy |> WHILE {
                             False => st  -- Wait for TX to start
-                            True => st.msg_idx |> Bits/equal(st.msg_len |> Bits/subtract(BITS[4] { 10u1 })) |> WHILE {
+                            True => st.msg_idx |> Bits/equal(st.msg_len) |> WHILE {
                                 True => [
                                     fsm: Idle, seq: st.seq, bcd: st.bcd, msg: st.msg,
-                                    msg_len: st.msg_len, msg_idx: BITS[4] { 10u0 },
+                                    msg_len: st.msg_len, msg_idx: BITS[4] { 10u1 },
                                     tx_data: st.tx_data, tx_start: False
                                 ]
                                 False => [
@@ -389,44 +389,44 @@ FUNCTION btn_message(rst, btn_pressed, tx_busy) {
 FUNCTION bcd_increment(bcd) {
     BLOCK {
         -- Ripple carry BCD increment
-        d0_next: bcd |> List/get(index: 0) |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
+        d0_next: bcd |> List/get(index: 1) |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
             True => BITS[4] { 10u0 }
-            False => bcd |> List/get(index: 0) |> Bits/add(BITS[4] { 10u1 })
+            False => bcd |> List/get(index: 1) |> Bits/add(BITS[4] { 10u1 })
         }
-        c0: bcd |> List/get(index: 0) |> Bits/equal(BITS[4] { 10u9 })
+        c0: bcd |> List/get(index: 1) |> Bits/equal(BITS[4] { 10u9 })
 
         d1_next: c0 |> WHILE {
-            False => bcd |> List/get(index: 1)
-            True => bcd |> List/get(index: 1) |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
-                True => BITS[4] { 10u0 }
-                False => bcd |> List/get(index: 1) |> Bits/add(BITS[4] { 10u1 })
-            }
-        }
-        c1: c0 |> Bool/and(that: bcd |> List/get(index: 1) |> Bits/equal(BITS[4] { 10u9 }))
-
-        d2_next: c1 |> WHILE {
             False => bcd |> List/get(index: 2)
             True => bcd |> List/get(index: 2) |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
                 True => BITS[4] { 10u0 }
                 False => bcd |> List/get(index: 2) |> Bits/add(BITS[4] { 10u1 })
             }
         }
-        c2: c1 |> Bool/and(that: bcd |> List/get(index: 2) |> Bits/equal(BITS[4] { 10u9 }))
+        c1: c0 |> Bool/and(that: bcd |> List/get(index: 2) |> Bits/equal(BITS[4] { 10u9 }))
 
-        d3_next: c2 |> WHILE {
+        d2_next: c1 |> WHILE {
             False => bcd |> List/get(index: 3)
             True => bcd |> List/get(index: 3) |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
                 True => BITS[4] { 10u0 }
                 False => bcd |> List/get(index: 3) |> Bits/add(BITS[4] { 10u1 })
             }
         }
-        c3: c2 |> Bool/and(that: bcd |> List/get(index: 3) |> Bits/equal(BITS[4] { 10u9 }))
+        c2: c1 |> Bool/and(that: bcd |> List/get(index: 3) |> Bits/equal(BITS[4] { 10u9 }))
 
-        d4_next: c3 |> WHILE {
+        d3_next: c2 |> WHILE {
             False => bcd |> List/get(index: 4)
             True => bcd |> List/get(index: 4) |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
                 True => BITS[4] { 10u0 }
                 False => bcd |> List/get(index: 4) |> Bits/add(BITS[4] { 10u1 })
+            }
+        }
+        c3: c2 |> Bool/and(that: bcd |> List/get(index: 4) |> Bits/equal(BITS[4] { 10u9 }))
+
+        d4_next: c3 |> WHILE {
+            False => bcd |> List/get(index: 5)
+            True => bcd |> List/get(index: 5) |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
+                True => BITS[4] { 10u0 }
+                False => bcd |> List/get(index: 5) |> Bits/add(BITS[4] { 10u1 })
             }
         }
 
@@ -448,44 +448,44 @@ FUNCTION build_btn_message(bcd, n_digits) {
         n_digits |> WHEN {
             5 => [
                 msg: [B, T, N, SPACE,
+                      d2a(bcd |> List/get(index: 5)),
                       d2a(bcd |> List/get(index: 4)),
                       d2a(bcd |> List/get(index: 3)),
                       d2a(bcd |> List/get(index: 2)),
                       d2a(bcd |> List/get(index: 1)),
-                      d2a(bcd |> List/get(index: 0)),
                       NEWLINE]
                 len: BITS[4] { 10u10 }
             ]
             4 => [
                 msg: [B, T, N, SPACE,
+                      d2a(bcd |> List/get(index: 4)),
                       d2a(bcd |> List/get(index: 3)),
                       d2a(bcd |> List/get(index: 2)),
                       d2a(bcd |> List/get(index: 1)),
-                      d2a(bcd |> List/get(index: 0)),
                       NEWLINE,
                       BITS[8] { 10u0 }]
                 len: BITS[4] { 10u9 }
             ]
             3 => [
                 msg: [B, T, N, SPACE,
+                      d2a(bcd |> List/get(index: 3)),
                       d2a(bcd |> List/get(index: 2)),
                       d2a(bcd |> List/get(index: 1)),
-                      d2a(bcd |> List/get(index: 0)),
                       NEWLINE,
                       BITS[8] { 10u0 }, BITS[8] { 10u0 }]
                 len: BITS[4] { 10u8 }
             ]
             2 => [
                 msg: [B, T, N, SPACE,
+                      d2a(bcd |> List/get(index: 2)),
                       d2a(bcd |> List/get(index: 1)),
-                      d2a(bcd |> List/get(index: 0)),
                       NEWLINE,
                       BITS[8] { 10u0 }, BITS[8] { 10u0 }, BITS[8] { 10u0 }]
                 len: BITS[4] { 10u7 }
             ]
             __ => [
                 msg: [B, T, N, SPACE,
-                      d2a(bcd |> List/get(index: 0)),
+                      d2a(bcd |> List/get(index: 1)),
                       NEWLINE,
                       BITS[8] { 10u0 }, BITS[8] { 10u0 }, BITS[8] { 10u0 }, BITS[8] { 10u0 }]
                 len: BITS[4] { 10u6 }

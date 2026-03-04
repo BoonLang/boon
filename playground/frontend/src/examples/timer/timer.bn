@@ -1,0 +1,146 @@
+-- Timer (7GUIs Task 4)
+-- Elapsed time gauge, numeric display, adjustable duration, reset.
+
+store: [
+    elements: [
+        duration_slider: LINK
+        reset_button: LINK
+    ]
+
+    max_duration: 15 |> HOLD state {
+        elements.duration_slider.event.change.value
+    }
+
+    elapsed: 0 |> HOLD state {
+        LATEST {
+            tick |> THEN {
+                state < max_duration |> WHEN {
+                    True => BLOCK {
+                        next: state + 0.1
+                        next |> Math/min(b: max_duration)
+                    }
+                    __ => SKIP
+                }
+            }
+            elements.reset_button.event.press |> THEN { 0 }
+        }
+    }
+
+    -- Display value: round to 1 decimal place
+    elapsed_display: BLOCK {
+        tenths: elapsed * 10 |> Math/round()
+        tenths / 10
+    }
+
+    -- Progress percentage (0 to 100)
+    progress_percent: elapsed / max_duration * 100
+        |> Math/min(b: 100)
+        |> Math/round()
+]
+
+tick: Duration[milliseconds: 100] |> Timer/interval()
+
+document: Document/new(root: root_element(PASS: [store: store]))
+
+FUNCTION root_element() {
+    BLOCK {
+        elapsed_display: PASSED.store.elapsed_display
+        max_duration: PASSED.store.max_duration
+        progress_percent: PASSED.store.progress_percent
+
+        Element/stripe(
+            element: []
+            direction: Column
+            gap: 16
+            style: [padding: 20, width: 400]
+
+            items: LIST {
+                Element/label(
+                    element: []
+                    style: [font: [size: 22, weight: Bold]]
+                    label: TEXT { Timer }
+                )
+                gauge_row(PASS: [progress_percent: progress_percent])
+                elapsed_row(PASS: [elapsed_display: elapsed_display])
+                duration_row(PASS: [store: PASSED.store, max_duration: max_duration])
+                Element/button(
+                    element: [event: [press: LINK]]
+                    style: [width: Fill]
+                    label: TEXT { Reset }
+                ) |> LINK { PASSED.store.elements.reset_button }
+            }
+        )
+    }
+}
+
+FUNCTION gauge_row() {
+    BLOCK {
+        progress_percent: PASSED.progress_percent
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: []
+
+            items: LIST {
+                Element/label(element: [], style: [], label: TEXT { Elapsed Time: })
+                Element/label(
+                    element: []
+                    style: []
+                    label: TEXT { {progress_percent}% }
+                )
+            }
+        )
+    }
+}
+
+FUNCTION elapsed_row() {
+    BLOCK {
+        elapsed_display: PASSED.elapsed_display
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: []
+
+            items: LIST {
+                Element/label(
+                    element: []
+                    style: []
+                    label: TEXT { {elapsed_display}s }
+                )
+            }
+        )
+    }
+}
+
+FUNCTION duration_row() {
+    BLOCK {
+        max_duration: PASSED.max_duration
+
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: []
+
+            items: LIST {
+                Element/label(element: [], style: [], label: TEXT { Duration: })
+                Element/slider(
+                    element: [event: [change: LINK]]
+                    style: [width: 200]
+                    label: Hidden[text: TEXT { Duration }]
+                    value: max_duration
+                    min: 1
+                    max: 30
+                    step: 0.1
+                ) |> LINK { PASSED.store.elements.duration_slider }
+                Element/label(
+                    element: []
+                    style: []
+                    label: TEXT { {max_duration}s }
+                )
+            }
+        )
+    }
+}

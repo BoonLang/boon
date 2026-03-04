@@ -1,0 +1,256 @@
+-- CRUD (7GUIs Task 5)
+-- Filterable list of names with create, update, delete.
+
+store: [
+    elements: [
+        filter_input: LINK
+        name_input: LINK
+        surname_input: LINK
+        create_button: LINK
+        update_button: LINK
+        delete_button: LINK
+    ]
+
+    person_to_add: elements.create_button.event.press |> THEN {
+        new_person(
+            name: elements.name_input.text
+            surname: elements.surname_input.text
+        )
+    }
+
+    selected_id: None |> HOLD state {
+        LATEST {
+            people
+                |> List/map(item, new: item.person_elements.row.event.press |> THEN { item.id })
+                |> List/latest()
+            elements.delete_button.event.press |> THEN { None }
+        }
+    }
+
+    people: LIST {
+        new_person(name: TEXT { Hans }, surname: TEXT { Emil })
+        new_person(name: TEXT { Max }, surname: TEXT { Mustermann })
+        new_person(name: TEXT { Roman }, surname: TEXT { Tansen })
+    }
+    |> List/append(item: store.person_to_add)
+    |> List/remove(item, on: elements.delete_button.event.press |> THEN {
+        store.selected_id == item.id |> WHEN {
+            True => []
+            __ => SKIP
+        }
+    })
+]
+
+document: Document/new(root: root_element(PASS: [store: store]))
+
+FUNCTION root_element() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 16
+        style: [padding: 20, width: 500]
+
+        items: LIST {
+            Element/label(
+                element: []
+                style: [font: [size: 22, weight: Bold]]
+                label: TEXT { CRUD }
+            )
+            filter_row()
+            content_row()
+            button_row()
+        }
+    )
+}
+
+FUNCTION filter_row() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: []
+
+        items: LIST {
+            Element/label(element: [], style: [], label: TEXT { Filter prefix: })
+            filter_input() |> LINK { PASSED.store.elements.filter_input }
+        }
+    )
+}
+
+FUNCTION filter_input() {
+    Element/text_input(
+        element: [event: [change: LINK]]
+        style: [width: 200]
+        label: Hidden[text: TEXT { Filter }]
+        text: LATEST {
+            Text/empty()
+            element.event.change.text
+        }
+        placeholder: [text: TEXT { Filter by surname }]
+        focus: False
+    )
+}
+
+FUNCTION content_row() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 16
+        style: []
+
+        items: LIST {
+            people_list()
+            form_section()
+        }
+    )
+}
+
+FUNCTION people_list() {
+    BLOCK {
+        filter_text: PASSED.store.elements.filter_input.text
+        Element/stripe(
+            element: []
+            direction: Column
+            gap: 2
+            style: [width: 250]
+
+            items: PASSED.store.people
+                |> List/retain(item, if:
+                    item.surname |> Text/starts_with(prefix: filter_text)
+                )
+                |> List/map(item, new: person_row(person: item))
+        )
+    }
+}
+
+FUNCTION person_row(person) {
+    Element/button(
+        element: [event: [press: LINK]]
+        style: [width: Fill]
+        label: TEXT { {person.surname}, {person.name} }
+    ) |> LINK { person.person_elements.row }
+}
+
+FUNCTION form_section() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 10
+        style: []
+
+        items: LIST {
+            name_row()
+            surname_row()
+        }
+    )
+}
+
+FUNCTION name_row() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: []
+
+        items: LIST {
+            Element/label(element: [], style: [], label: TEXT { Name: })
+            name_input() |> LINK { PASSED.store.elements.name_input }
+        }
+    )
+}
+
+FUNCTION surname_row() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: []
+
+        items: LIST {
+            Element/label(element: [], style: [], label: TEXT { Surname: })
+            surname_input() |> LINK { PASSED.store.elements.surname_input }
+        }
+    )
+}
+
+FUNCTION name_input() {
+    Element/text_input(
+        element: [event: [change: LINK]]
+        style: [width: 150]
+        label: Hidden[text: TEXT { Name }]
+        text: LATEST {
+            Text/empty()
+            element.event.change.text
+            PASSED.store.person_to_add |> THEN { Text/empty() }
+        }
+        placeholder: [text: TEXT { Name }]
+        focus: False
+    )
+}
+
+FUNCTION surname_input() {
+    Element/text_input(
+        element: [event: [change: LINK]]
+        style: [width: 150]
+        label: Hidden[text: TEXT { Surname }]
+        text: LATEST {
+            Text/empty()
+            element.event.change.text
+            PASSED.store.person_to_add |> THEN { Text/empty() }
+        }
+        placeholder: [text: TEXT { Surname }]
+        focus: False
+    )
+}
+
+FUNCTION button_row() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: []
+
+        items: LIST {
+            Element/button(
+                element: [event: [press: LINK]]
+                style: []
+                label: TEXT { Create }
+            ) |> LINK { PASSED.store.elements.create_button }
+            Element/button(
+                element: [event: [press: LINK]]
+                style: []
+                label: TEXT { Update }
+            ) |> LINK { PASSED.store.elements.update_button }
+            Element/button(
+                element: [event: [press: LINK]]
+                style: []
+                label: TEXT { Delete }
+            ) |> LINK { PASSED.store.elements.delete_button }
+        }
+    )
+}
+
+FUNCTION new_person(name, surname) {
+    [
+        person_elements: [
+            row: LINK
+        ]
+        id: PersonId[id: Ulid/generate()]
+        name: name |> HOLD state {
+            store.elements.update_button.event.press |> THEN {
+                store.selected_id == id |> WHEN {
+                    True => store.elements.name_input.text
+                    __ => SKIP
+                }
+            }
+        }
+        surname: surname |> HOLD state {
+            store.elements.update_button.event.press |> THEN {
+                store.selected_id == id |> WHEN {
+                    True => store.elements.surname_input.text
+                    __ => SKIP
+                }
+            }
+        }
+    ]
+}

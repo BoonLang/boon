@@ -1,0 +1,76 @@
+-- Circle Drawer (7GUIs Task 6)
+-- Click the canvas to create circles. Undo removes the last circle.
+
+store: [
+    elements: [
+        canvas: LINK
+        undo_button: LINK
+    ]
+
+    circles: LIST {}
+        |> List/append(on: elements.canvas.event.click |> THEN {
+            [x: elements.canvas.event.click.x, y: elements.canvas.event.click.y]
+        })
+        |> List/remove_last(on: elements.undo_button.event.press)
+
+    count: circles |> List/count()
+]
+
+document: Document/new(root: root_element(PASS: [store: store]))
+
+FUNCTION root_element() {
+    BLOCK {
+        store: PASSED.store
+
+        Element/stripe(
+            element: []
+            direction: Column
+            gap: 12
+            style: [padding: 20, width: 500]
+
+            items: LIST {
+                Element/label(
+                    element: []
+                    style: [font: [size: 22, weight: Bold]]
+                    label: TEXT { Circle Drawer }
+                )
+                Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 10
+                    style: []
+                    items: LIST {
+                        Element/button(
+                            element: [event: [press: LINK]]
+                            style: []
+                            label: TEXT { Undo }
+                        ) |> LINK { store.elements.undo_button }
+                        Element/label(
+                            element: []
+                            style: []
+                            label: TEXT { Circles: {store.count} }
+                        )
+                    }
+                )
+                Element/svg(
+                    element: [event: [click: LINK]]
+                    style: [width: 460, height: 300]
+                    children: store.circles |> List/map(
+                        circle
+                        new: Element/svg_circle(
+                            element: [event: [click: LINK]]
+                            cx: circle.x
+                            cy: circle.y
+                            r: 20
+                            style: [
+                                fill: TEXT { #3498db }
+                                stroke: TEXT { #2c3e50 }
+                                stroke_width: 2
+                            ]
+                        )
+                    )
+                ) |> LINK { store.elements.canvas }
+            }
+        )
+    }
+}

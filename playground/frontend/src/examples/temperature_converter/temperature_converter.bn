@@ -1,0 +1,98 @@
+-- Temperature Converter (7GUIs Task 2)
+-- Two text inputs with bidirectional Celsius/Fahrenheit conversion.
+
+store: [
+    elements: [celsius_input: LINK, fahrenheit_input: LINK]
+]
+
+document: Document/new(root: root_element(PASS: [store: store]))
+
+FUNCTION root_element() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 16
+        style: [padding: 20, width: 400]
+
+        items: LIST {
+            Element/label(
+                element: []
+                style: [font: [size: 22, weight: Bold]]
+                label: TEXT { Temperature Converter }
+            )
+            converter_row()
+        }
+    )
+}
+
+FUNCTION converter_row() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: []
+
+        items: LIST {
+            celsius_input() |> LINK { PASSED.store.elements.celsius_input }
+            Element/label(element: [], style: [], label: TEXT { Celsius = })
+            fahrenheit_input() |> LINK { PASSED.store.elements.fahrenheit_input }
+            Element/label(element: [], style: [], label: TEXT { Fahrenheit })
+        }
+    )
+}
+
+FUNCTION celsius_input() {
+    Element/text_input(
+        element: [event: [change: LINK]]
+        style: []
+        label: Hidden[text: TEXT { Celsius }]
+
+        text: LATEST {
+            Text/empty()
+            element.event.change.text
+            PASSED.store.elements.fahrenheit_input.event.change.text |> THEN {
+                BLOCK {
+                    fahrenheit: PASSED.store.elements.fahrenheit_input.text |> Text/to_number()
+                    fahrenheit |> WHEN {
+                        NaN => SKIP
+                        number => BLOCK {
+                            converted: (number - 32) * 5 / 9 |> Math/round()
+                            TEXT { {converted} }
+                        }
+                    }
+                }
+            }
+        }
+
+        placeholder: [text: TEXT { Celsius }]
+        focus: False
+    )
+}
+
+FUNCTION fahrenheit_input() {
+    Element/text_input(
+        element: [event: [change: LINK]]
+        style: []
+        label: Hidden[text: TEXT { Fahrenheit }]
+
+        text: LATEST {
+            Text/empty()
+            element.event.change.text
+            PASSED.store.elements.celsius_input.event.change.text |> THEN {
+                BLOCK {
+                    celsius: PASSED.store.elements.celsius_input.text |> Text/to_number()
+                    celsius |> WHEN {
+                        NaN => SKIP
+                        number => BLOCK {
+                            converted: number * 9 / 5 + 32 |> Math/round()
+                            TEXT { {converted} }
+                        }
+                    }
+                }
+            }
+        }
+
+        placeholder: [text: TEXT { Fahrenheit }]
+        focus: False
+    )
+}

@@ -11,9 +11,9 @@ use super::engine::{
     BRIDGE_HOVER_CAPACITY, BRIDGE_KEY_DOWN_CAPACITY, BRIDGE_PENDING_BLUR_CAP,
     BRIDGE_PENDING_FOCUS_CAP, BRIDGE_PENDING_KEY_DOWN_CAP, BRIDGE_PRESS_EVENT_CAPACITY,
     BRIDGE_TEXT_CHANGE_CAPACITY, ConstructContext, ConstructInfo, ConstructInfoComplete,
-    ConstructType, LOG_DEBUG, ListChange, NamedChannel, Object, ScopeId, Tag as EngineTag,
-    TaggedObject, Text as EngineText, TimestampedEvent, TypedStream, Value, ValueIdempotencyKey,
-    Variable, create_actor, inc_metric, switch_map,
+    ConstructType, LOG_DEBUG, ListChange, NamedChannel, Number as EngineNumber, Object, ScopeId,
+    Tag as EngineTag, TaggedObject, Text as EngineText, TimestampedEvent, TypedStream, Value,
+    ValueIdempotencyKey, ValueMetadata, Variable, create_actor, inc_metric, switch_map,
 };
 
 // --- Cached ConstructInfoComplete for hot bridge paths ---
@@ -855,6 +855,10 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
             "ElementButton" => element_button(tagged_object, construct_context).unify(),
             "ElementTextInput" => element_text_input(tagged_object, construct_context).unify(),
             "ElementCheckbox" => element_checkbox(tagged_object, construct_context).unify(),
+            "ElementSlider" => element_slider(tagged_object, construct_context).unify(),
+            "ElementSelect" => element_select(tagged_object, construct_context).unify(),
+            "ElementSvg" => element_svg(tagged_object, construct_context).unify(),
+            "ElementSvgCircle" => element_svg_circle(tagged_object, construct_context).unify(),
             "ElementLabel" => element_label(tagged_object, construct_context).unify(),
             "ElementParagraph" => element_paragraph(tagged_object, construct_context).unify(),
             "ElementLink" => element_link(tagged_object, construct_context).unify(),
@@ -903,6 +907,36 @@ fn visible_signal_from_settings(
                 _ => None,
             })
         })
+    })
+}
+
+/// Create a reactive disabled signal from a settings variable.
+/// Returns a signal that emits `Option<&str>` for the HTML `disabled` attribute.
+/// Some("") means disabled, None means enabled (attribute removed).
+fn disabled_signal_from_settings(
+    settings_variable: Arc<Variable>,
+) -> impl Signal<Item = Option<&'static str>> + 'static {
+    signal::from_stream({
+        let style_stream = switch_map(settings_variable.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("disabled") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Tag(tag, _) => Some(tag.tag() == "True"),
+                _ => None,
+            })
+        })
+    })
+    .map(|opt| match opt {
+        Some(true) => Some(""),
+        _ => None,
     })
 }
 
@@ -2030,6 +2064,28 @@ fn element_stripe(
         .boxed_local()
     });
 
+    // Scrollbars - produces CSS overflow value ("auto" when True, "visible" otherwise)
+    let sv_scrollbars = tagged_object.expect_variable("settings");
+    let scrollbars_css_signal = signal::from_stream({
+        let style_stream = switch_map(sv_scrollbars.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("scrollbars") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Tag(tag, _) if tag.tag() == "True" => Some("auto"),
+                _ => None,
+            })
+        })
+        .boxed_local()
+    });
+
     // Borders (supports [top: [color: Oklch[...]]]) - produces Border for typed Borders API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_borders = tagged_object.expect_variable("settings");
@@ -2443,6 +2499,7 @@ fn element_stripe(
         // Raw CSS properties without Zoon typed equivalents
         .update_raw_el(move |raw_el| {
             raw_el
+                .style_signal("overflow", scrollbars_css_signal)
                 .style_signal("line-height", line_height_css_signal)
                 .style_signal("text-shadow", text_shadow_css_signal)
                 // Font-smoothing via raw DOM API — dominator panics on unsupported CSS properties
@@ -2938,6 +2995,7 @@ fn element_button(
     let is_scene = construct_context.scene_ctx.is_some();
     let sv_physical = tagged_object.expect_variable("settings");
     let ctx_physical = construct_context.clone();
+    let disabled_sig = disabled_signal_from_settings(tagged_object.expect_variable("settings"));
 
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
     let (press_event_sender, mut press_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new(
@@ -3664,7 +3722,13 @@ fn element_button(
             align_signal.map(|opt| opt.flatten()),
         ))
         .s(Visible::with_signal(visible_sig))
-        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
+        .update_raw_el(move |raw_el| {
+            apply_physical_css(
+                raw_el.attr_signal("disabled", disabled_sig),
+                &sv_physical,
+                &ctx_physical,
+            )
+        })
         .after_remove(move |_| {
             drop(event_handler_loop);
             drop(tagged_object);
@@ -3678,6 +3742,7 @@ fn element_text_input(
     let is_scene = construct_context.scene_ctx.is_some();
     let sv_physical = tagged_object.expect_variable("settings");
     let ctx_physical = construct_context.clone();
+    let disabled_sig = disabled_signal_from_settings(tagged_object.expect_variable("settings"));
 
     enum TextInputDomEvent {
         Change(TimestampedEvent<String>),
@@ -4432,7 +4497,13 @@ fn element_text_input(
             .left_signal(padding_left_signal))
         .s(Width::with_signal_self(width_typed_signal))
         .s(Visible::with_signal(visible_sig))
-        .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
+        .update_raw_el(move |raw_el| {
+            apply_physical_css(
+                raw_el.attr_signal("disabled", disabled_sig),
+                &sv_physical,
+                &ctx_physical,
+            )
+        })
         .after_remove(move |_| {
             if LOG_DEBUG {
                 zoon::println!("[EVENT:TextInput] Element REMOVED - dropping event handlers");
@@ -4684,6 +4755,770 @@ fn element_checkbox(
             }
         })
         .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
+        .after_remove(move |_| drop(event_handler_loop))
+}
+
+fn element_slider(
+    tagged_object: Arc<TaggedObject>,
+    construct_context: ConstructContext,
+) -> impl Element {
+    let sv_physical = tagged_object.expect_variable("settings");
+    let ctx_physical = construct_context.clone();
+
+    // Channel capacity constant - slider "input" events fire frequently during drag
+    const SLIDER_INPUT_CAPACITY: usize = 64;
+
+    let (input_event_sender, mut input_event_receiver) =
+        NamedChannel::<TimestampedEvent<f64>>::new("slider.input", SLIDER_INPUT_CAPACITY);
+
+    let element_variable = tagged_object.expect_variable("element");
+
+    // Use switch_map (not flat_map) because variable.stream() is infinite
+    let event_stream = switch_map(
+        element_variable
+            .stream()
+            .filter_map(|value| future::ready(value.expect_object().variable("event"))),
+        |variable| variable.stream(),
+    );
+
+    let change_var_stream =
+        event_stream.filter_map(|value| future::ready(value.expect_object().variable("change")));
+
+    let change_sender_stream =
+        change_var_stream.map(move |variable| variable.expect_link_value_sender());
+
+    let mut change_sender_stream = change_sender_stream.chain(stream::pending()).fuse();
+
+    let event_handler_loop = ActorLoop::new({
+        let construct_context = construct_context.clone();
+        async move {
+            let scope_id = construct_context
+                .bridge_scope_id
+                .expect("Bug: bridge_scope_id not set for slider event handler");
+            let mut change_link_value_sender: Option<NamedChannel<Value>> = None;
+
+            loop {
+                select! {
+                    result = change_sender_stream.next() => {
+                        if let Some(sender) = result {
+                            change_link_value_sender = Some(sender);
+                        }
+                    }
+                    event = input_event_receiver.select_next_some() => {
+                        if let Some(sender) = change_link_value_sender.as_ref() {
+                            let number_value = super::engine::Number::new_value(
+                                ConstructInfo::new("slider::change_number", None, "Slider change number"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                event.data,
+                            );
+                            let event_value = Object::new_value_with_lamport_time(
+                                ConstructInfo::new("slider::change_event", None, "Slider change event"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                event.lamport_time,
+                                [Variable::new_arc(
+                                    ConstructInfo::new("slider::change_value", None, "Slider change value"),
+                                    construct_context.clone(),
+                                    "value",
+                                    create_actor(
+                                        ConstructInfo::new("slider::change_value_actor", None, "Slider change value actor"),
+                                        ActorContext::default(),
+                                        TypedStream::infinite(
+                                            stream::once(future::ready(number_value)).chain(stream::pending()),
+                                        ),
+                                        parser::PersistenceId::new(),
+                                        scope_id,
+                                    ),
+                                    parser::PersistenceId::default(),
+                                    parser::Scope::Root,
+                                )],
+                            );
+                            sender.send_or_drop(event_value);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let settings_variable = tagged_object.expect_variable("settings");
+
+    // Reactive value signal for the slider's current position
+    let value_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value.expect_object().expect_variable("value").stream()
+    })
+    .filter_map(|value| {
+        future::ready(match value {
+            Value::Number(n, _) => Some(n.number().to_string()),
+            _ => None,
+        })
+    });
+    let value_signal = signal::from_stream(value_stream);
+
+    // Reactive min signal
+    let min_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value.expect_object().expect_variable("min").stream()
+    })
+    .filter_map(|value| {
+        future::ready(match value {
+            Value::Number(n, _) => Some(n.number().to_string()),
+            _ => None,
+        })
+    });
+    let min_signal = signal::from_stream(min_stream);
+
+    // Reactive max signal
+    let max_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value.expect_object().expect_variable("max").stream()
+    })
+    .filter_map(|value| {
+        future::ready(match value {
+            Value::Number(n, _) => Some(n.number().to_string()),
+            _ => None,
+        })
+    });
+    let max_signal = signal::from_stream(max_stream);
+
+    // Reactive step signal
+    let step_stream = switch_map(settings_variable.stream(), |value| {
+        value.expect_object().expect_variable("step").stream()
+    })
+    .filter_map(|value| {
+        future::ready(match value {
+            Value::Number(n, _) => Some(n.number().to_string()),
+            _ => None,
+        })
+    });
+    let step_signal = signal::from_stream(step_stream);
+
+    // Width signal from style
+    let sv_width = tagged_object.expect_variable("settings");
+    let width_signal = signal::from_stream({
+        let style_stream = switch_map(sv_width.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("width") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                Value::Tag(tag, _) if tag.tag() == "Fill" => Some("100%".to_string()),
+                _ => None,
+            })
+        })
+        .boxed_local()
+    });
+
+    apply_physical_css(
+        RawHtmlEl::new("input")
+            .attr("type", "range")
+            .attr_signal("value", value_signal)
+            .attr_signal("min", min_signal)
+            .attr_signal("max", max_signal)
+            .attr_signal("step", step_signal)
+            .style_signal("width", width_signal)
+            .event_handler(move |event: events::Input| {
+                let target: web_sys::HtmlInputElement = event.target().unwrap().unchecked_into();
+                if let Ok(value) = target.value().parse::<f64>() {
+                    input_event_sender.send_or_drop(TimestampedEvent::now(value));
+                }
+            })
+            .after_remove(move |_| drop(event_handler_loop)),
+        &sv_physical,
+        &ctx_physical,
+    )
+}
+
+fn element_select(
+    tagged_object: Arc<TaggedObject>,
+    construct_context: ConstructContext,
+) -> impl Element {
+    let sv_physical = tagged_object.expect_variable("settings");
+    let ctx_physical = construct_context.clone();
+    let disabled_sig = disabled_signal_from_settings(tagged_object.expect_variable("settings"));
+
+    let (change_event_sender, mut change_event_receiver) =
+        NamedChannel::<TimestampedEvent<String>>::new("select.change", BRIDGE_TEXT_CHANGE_CAPACITY);
+
+    let element_variable = tagged_object.expect_variable("element");
+
+    // Use switch_map (not flat_map) because variable.stream() is infinite
+    let event_stream = switch_map(
+        element_variable
+            .stream()
+            .filter_map(|value| future::ready(value.expect_object().variable("event"))),
+        |variable| variable.stream(),
+    );
+
+    let change_var_stream =
+        event_stream.filter_map(|value| future::ready(value.expect_object().variable("change")));
+
+    let change_sender_stream =
+        change_var_stream.map(move |variable| variable.expect_link_value_sender());
+
+    let mut change_sender_stream = change_sender_stream.chain(stream::pending()).fuse();
+
+    let event_handler_loop = ActorLoop::new({
+        let construct_context = construct_context.clone();
+        async move {
+            let scope_id = construct_context
+                .bridge_scope_id
+                .expect("Bug: bridge_scope_id not set for select event handler");
+            let mut change_link_value_sender: Option<NamedChannel<Value>> = None;
+
+            loop {
+                select! {
+                    result = change_sender_stream.next() => {
+                        if let Some(sender) = result {
+                            change_link_value_sender = Some(sender);
+                        }
+                    }
+                    event = change_event_receiver.select_next_some() => {
+                        if let Some(sender) = change_link_value_sender.as_ref() {
+                            let text_value = super::engine::Text::new_value(
+                                ConstructInfo::new("select::change_text", None, "Select change text"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                event.data.clone(),
+                            );
+                            let event_value = Object::new_value_with_lamport_time(
+                                ConstructInfo::new("select::change_event", None, "Select change event"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                event.lamport_time,
+                                [Variable::new_arc(
+                                    ConstructInfo::new("select::change_value", None, "Select change value"),
+                                    construct_context.clone(),
+                                    "value",
+                                    create_actor(
+                                        ConstructInfo::new("select::change_value_actor", None, "Select change value actor"),
+                                        ActorContext::default(),
+                                        TypedStream::infinite(
+                                            stream::once(future::ready(text_value)).chain(stream::pending()),
+                                        ),
+                                        parser::PersistenceId::new(),
+                                        scope_id,
+                                    ),
+                                    parser::PersistenceId::default(),
+                                    parser::Scope::Root,
+                                )],
+                            );
+                            sender.send_or_drop(event_value);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let settings_variable = tagged_object.expect_variable("settings");
+
+    // Reactive selected value signal
+    let selected_stream = switch_map(settings_variable.clone().stream(), |value| {
+        value.expect_object().expect_variable("selected").stream()
+    })
+    .filter_map(|value| {
+        future::ready(match value {
+            Value::Text(t, _) => Some(t.text().to_string()),
+            _ => None,
+        })
+    });
+    let selected_signal = signal::from_stream(selected_stream);
+
+    // Reactive options signal — extract list of (value, label) pairs
+    // Options arrive as a List of Objects with "value" and "label" variables
+    let options_stream = switch_map(settings_variable.stream(), |value| {
+        value.expect_object().expect_variable("options").stream()
+    })
+    .then(move |value| {
+        async move {
+            match value {
+                Value::List(list, _) => {
+                    let snapshot = list.snapshot().await;
+                    let mut pairs = Vec::new();
+                    for (_item_id, actor) in snapshot {
+                        if let Ok(Value::Object(obj, _)) = actor.current_value().await {
+                            let val = if let Some(var) = obj.variable("value") {
+                                if let Ok(Value::Text(t, _)) = var.value_actor().current_value().await {
+                                    t.text().to_string()
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            };
+                            let label = if let Some(var) = obj.variable("label") {
+                                if let Ok(Value::Text(t, _)) = var.value_actor().current_value().await {
+                                    t.text().to_string()
+                                } else {
+                                    val.clone()
+                                }
+                            } else {
+                                val.clone()
+                            };
+                            pairs.push((val, label));
+                        }
+                    }
+                    pairs
+                }
+                _ => Vec::new(),
+            }
+        }
+    });
+    let options_signal = signal::from_stream(options_stream.boxed_local());
+
+    // Width signal from style
+    let sv_width = tagged_object.expect_variable("settings");
+    let width_signal = signal::from_stream({
+        let style_stream = switch_map(sv_width.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("width") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                Value::Tag(tag, _) if tag.tag() == "Fill" => Some("100%".to_string()),
+                _ => None,
+            })
+        })
+        .boxed_local()
+    });
+
+    // Build the <select> element with reactive options and selected value
+    // inner_markup_signal rebuilds <option> HTML whenever the options list changes
+    apply_physical_css(
+        RawHtmlEl::new("select")
+            .style_signal("width", width_signal)
+            .attr_signal("value", selected_signal)
+            .attr_signal("disabled", disabled_sig)
+            .inner_markup_signal(
+                options_signal.map(|opt| {
+                    let pairs = opt.unwrap_or_default();
+                    let mut html = String::new();
+                    for (val, label) in pairs {
+                        html.push_str(&format!(
+                            "<option value=\"{}\">{}</option>",
+                            val, label
+                        ));
+                    }
+                    html
+                }),
+            )
+            .event_handler(move |event: events::Input| {
+                let target: web_sys::HtmlInputElement = event.target().unwrap().unchecked_into();
+                let value = target.value();
+                change_event_sender.send_or_drop(TimestampedEvent::now(value));
+            })
+            .after_remove(move |_| drop(event_handler_loop)),
+        &sv_physical,
+        &ctx_physical,
+    )
+}
+
+fn element_svg(
+    tagged_object: Arc<TaggedObject>,
+    construct_context: ConstructContext,
+) -> impl Element {
+    let settings_variable = tagged_object.expect_variable("settings");
+
+    // Click event with coordinates
+    let (click_sender, mut click_receiver) =
+        NamedChannel::<TimestampedEvent<(f64, f64)>>::new("svg.click", BRIDGE_PRESS_EVENT_CAPACITY);
+
+    let element_variable = tagged_object.expect_variable("element");
+    let mut click_stream = switch_map(
+        element_variable
+            .clone()
+            .stream()
+            .filter_map(|value| future::ready(value.expect_object().variable("event"))),
+        |variable| variable.stream(),
+    )
+    .filter_map(|value| future::ready(value.expect_object().variable("click")))
+    .map(move |variable| variable.expect_link_value_sender())
+    .chain(stream::pending())
+    .fuse();
+
+    let event_handler_loop = ActorLoop::new({
+        let construct_context = construct_context.clone();
+        async move {
+            let scope_id = construct_context
+                .bridge_scope_id
+                .expect("Bug: bridge_scope_id not set for svg event handler");
+            let mut click_link_sender: Option<NamedChannel<Value>> = None;
+            loop {
+                select! {
+                    link = click_stream.next() => {
+                        if let Some(link) = link {
+                            click_link_sender = Some(link);
+                        }
+                    }
+                    event = click_receiver.next() => {
+                        if let Some(event) = event {
+                            if let Some(ref sender) = click_link_sender {
+                                let (x, y) = event.data;
+                                let x_value = Value::Number(
+                                    EngineNumber::new_arc(
+                                        ConstructInfo::new("svg::click_x_num", None, "svg click x number"),
+                                        construct_context.clone(),
+                                        x,
+                                    ),
+                                    ValueMetadata::with_lamport_time(ValueIdempotencyKey::new(), event.lamport_time),
+                                );
+                                let y_value = Value::Number(
+                                    EngineNumber::new_arc(
+                                        ConstructInfo::new("svg::click_y_num", None, "svg click y number"),
+                                        construct_context.clone(),
+                                        y,
+                                    ),
+                                    ValueMetadata::with_lamport_time(ValueIdempotencyKey::new(), event.lamport_time),
+                                );
+                                let event_value = Object::new_value_with_lamport_time(
+                                    ConstructInfo::new("svg::click_event", None, "svg click event [x, y]"),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    event.lamport_time,
+                                    [
+                                        Variable::new_arc(
+                                            ConstructInfo::new("svg::click_x", None, "svg click x"),
+                                            construct_context.clone(),
+                                            "x",
+                                            create_actor(
+                                                ConstructInfo::new("svg::click_x_actor", None, "svg click x actor"),
+                                                ActorContext::default(),
+                                                TypedStream::infinite(
+                                                    stream::once(future::ready(x_value)).chain(stream::pending()),
+                                                ),
+                                                parser::PersistenceId::new(),
+                                                scope_id,
+                                            ),
+                                            parser::PersistenceId::default(),
+                                            parser::Scope::Root,
+                                        ),
+                                        Variable::new_arc(
+                                            ConstructInfo::new("svg::click_y", None, "svg click y"),
+                                            construct_context.clone(),
+                                            "y",
+                                            create_actor(
+                                                ConstructInfo::new("svg::click_y_actor", None, "svg click y actor"),
+                                                ActorContext::default(),
+                                                TypedStream::infinite(
+                                                    stream::once(future::ready(y_value)).chain(stream::pending()),
+                                                ),
+                                                parser::PersistenceId::new(),
+                                                scope_id,
+                                            ),
+                                            parser::PersistenceId::default(),
+                                            parser::Scope::Root,
+                                        ),
+                                    ],
+                                );
+                                sender.send_or_drop(event_value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Width/height signals from style
+    let width_signal = signal::from_stream({
+        let style_stream = switch_map(settings_variable.clone().stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("width") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number().to_string()),
+                _ => None,
+            })
+        })
+    });
+
+    let height_signal = signal::from_stream({
+        let style_stream = switch_map(settings_variable.clone().stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("height") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number().to_string()),
+                _ => None,
+            })
+        })
+    });
+
+    // Children — render list items as SVG child elements
+    let children_vec_diff_stream = switch_map(
+        switch_map(settings_variable.stream(), |value| {
+            value.expect_object().expect_variable("children").stream()
+        }),
+        |value| list_change_to_vec_diff_stream(value.expect_list().stream()),
+    );
+
+    RawSvgEl::new("svg")
+        .attr_signal("width", width_signal)
+        .attr_signal("height", height_signal)
+        .style("overflow", "visible")
+        .event_handler(move |event: events::Click| {
+            let x = f64::from(event.offset_x());
+            let y = f64::from(event.offset_y());
+            click_sender.send_or_drop(TimestampedEvent::now((x, y)));
+        })
+        .children_signal_vec(
+            VecDiffStreamSignalVec(children_vec_diff_stream).map_signal(
+                move |value_actor| {
+                    signal::from_stream(value_actor.stream().map({
+                        let construct_context = construct_context.clone();
+                        move |value| value_to_element(value, construct_context.clone())
+                    }))
+                },
+            ),
+        )
+        .after_remove(move |_| drop(event_handler_loop))
+}
+
+fn element_svg_circle(
+    tagged_object: Arc<TaggedObject>,
+    construct_context: ConstructContext,
+) -> impl Element {
+    let settings_variable = tagged_object.expect_variable("settings");
+
+    // Click event with coordinates
+    let (click_sender, mut click_receiver) =
+        NamedChannel::<TimestampedEvent<(f64, f64)>>::new(
+            "svg_circle.click",
+            BRIDGE_PRESS_EVENT_CAPACITY,
+        );
+
+    let element_variable = tagged_object.expect_variable("element");
+    let mut click_stream = switch_map(
+        element_variable
+            .clone()
+            .stream()
+            .filter_map(|value| future::ready(value.expect_object().variable("event"))),
+        |variable| variable.stream(),
+    )
+    .filter_map(|value| future::ready(value.expect_object().variable("click")))
+    .map(move |variable| variable.expect_link_value_sender())
+    .chain(stream::pending())
+    .fuse();
+
+    let event_handler_loop = ActorLoop::new({
+        let construct_context = construct_context.clone();
+        async move {
+            let scope_id = construct_context
+                .bridge_scope_id
+                .expect("Bug: bridge_scope_id not set for svg_circle event handler");
+            let mut click_link_sender: Option<NamedChannel<Value>> = None;
+            loop {
+                select! {
+                    link = click_stream.next() => {
+                        if let Some(link) = link {
+                            click_link_sender = Some(link);
+                        }
+                    }
+                    event = click_receiver.next() => {
+                        if let Some(event) = event {
+                            if let Some(ref sender) = click_link_sender {
+                                let (x, y) = event.data;
+                                let x_value = Value::Number(
+                                    EngineNumber::new_arc(
+                                        ConstructInfo::new("svg_circle::click_x_num", None, "svg_circle click x number"),
+                                        construct_context.clone(),
+                                        x,
+                                    ),
+                                    ValueMetadata::with_lamport_time(ValueIdempotencyKey::new(), event.lamport_time),
+                                );
+                                let y_value = Value::Number(
+                                    EngineNumber::new_arc(
+                                        ConstructInfo::new("svg_circle::click_y_num", None, "svg_circle click y number"),
+                                        construct_context.clone(),
+                                        y,
+                                    ),
+                                    ValueMetadata::with_lamport_time(ValueIdempotencyKey::new(), event.lamport_time),
+                                );
+                                let event_value = Object::new_value_with_lamport_time(
+                                    ConstructInfo::new("svg_circle::click_event", None, "svg_circle click event [x, y]"),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    event.lamport_time,
+                                    [
+                                        Variable::new_arc(
+                                            ConstructInfo::new("svg_circle::click_x", None, "svg_circle click x"),
+                                            construct_context.clone(),
+                                            "x",
+                                            create_actor(
+                                                ConstructInfo::new("svg_circle::click_x_actor", None, "svg_circle click x actor"),
+                                                ActorContext::default(),
+                                                TypedStream::infinite(
+                                                    stream::once(future::ready(x_value)).chain(stream::pending()),
+                                                ),
+                                                parser::PersistenceId::new(),
+                                                scope_id,
+                                            ),
+                                            parser::PersistenceId::default(),
+                                            parser::Scope::Root,
+                                        ),
+                                        Variable::new_arc(
+                                            ConstructInfo::new("svg_circle::click_y", None, "svg_circle click y"),
+                                            construct_context.clone(),
+                                            "y",
+                                            create_actor(
+                                                ConstructInfo::new("svg_circle::click_y_actor", None, "svg_circle click y actor"),
+                                                ActorContext::default(),
+                                                TypedStream::infinite(
+                                                    stream::once(future::ready(y_value)).chain(stream::pending()),
+                                                ),
+                                                parser::PersistenceId::new(),
+                                                scope_id,
+                                            ),
+                                            parser::PersistenceId::default(),
+                                            parser::Scope::Root,
+                                        ),
+                                    ],
+                                );
+                                sender.send_or_drop(event_value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Reactive SVG attributes: cx, cy, r
+    let cx_signal = signal::from_stream(
+        switch_map(settings_variable.clone().stream(), |value| {
+            value.expect_object().expect_variable("cx").stream()
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number().to_string()),
+                _ => None,
+            })
+        }),
+    );
+
+    let cy_signal = signal::from_stream(
+        switch_map(settings_variable.clone().stream(), |value| {
+            value.expect_object().expect_variable("cy").stream()
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number().to_string()),
+                _ => None,
+            })
+        }),
+    );
+
+    let r_signal = signal::from_stream(
+        switch_map(settings_variable.clone().stream(), |value| {
+            value.expect_object().expect_variable("r").stream()
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number().to_string()),
+                _ => None,
+            })
+        }),
+    );
+
+    // Style: fill, stroke, stroke_width
+    let fill_signal = signal::from_stream({
+        let style_stream = switch_map(settings_variable.clone().stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("fill") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Text(t, _) => Some(t.text().to_string()),
+                _ => None,
+            })
+        })
+    });
+
+    let stroke_signal = signal::from_stream({
+        let style_stream = switch_map(settings_variable.clone().stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("stroke") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Text(t, _) => Some(t.text().to_string()),
+                _ => None,
+            })
+        })
+    });
+
+    let stroke_width_signal = signal::from_stream({
+        let style_stream = switch_map(settings_variable.stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("stroke_width") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(n.number().to_string()),
+                _ => None,
+            })
+        })
+    });
+
+    RawSvgEl::new("circle")
+        .attr_signal("cx", cx_signal)
+        .attr_signal("cy", cy_signal)
+        .attr_signal("r", r_signal)
+        .attr_signal("fill", fill_signal)
+        .attr_signal("stroke", stroke_signal)
+        .attr_signal("stroke-width", stroke_width_signal)
+        .style("cursor", "pointer")
+        .event_handler(move |event: events::Click| {
+            let x = f64::from(event.offset_x());
+            let y = f64::from(event.offset_y());
+            click_sender.send_or_drop(TimestampedEvent::now((x, y)));
+        })
         .after_remove(move |_| drop(event_handler_loop))
 }
 
