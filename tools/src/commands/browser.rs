@@ -186,8 +186,9 @@ pub fn launch_browser(opts: LaunchOptions) -> Result<Child> {
         cmd.arg("--headless=new");
     }
 
-    // Open the playground URL
-    cmd.arg(&format!("http://localhost:{}", opts.playground_port));
+    // Open the playground URL with safe defaults to avoid loading a heavy example
+    // on DD/Wasm engine from a previous session (which can hang the page).
+    cmd.arg(&format!("http://localhost:{}/?engine=actors&example=counter", opts.playground_port));
 
     // Suppress browser output unless in debug mode
     if std::env::var("RUST_LOG").is_err() {

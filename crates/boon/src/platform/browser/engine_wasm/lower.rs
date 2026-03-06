@@ -305,6 +305,57 @@ impl Lowerer {
         }
     }
 
+    /// Find the list item constructor for a cell by following CellRead/Derived chains.
+    /// This handles cases where PASSED or alias resolution creates intermediate cells
+    /// that don't have list_item_constructor propagated directly.
+    fn find_list_constructor(&self, cell: CellId) -> Option<String> {
+        let mut current = cell;
+        for _ in 0..20 {
+            if let Some(name) = self.list_item_constructor.get(&current) {
+                return Some(name.clone());
+            }
+            // Follow through Derived(CellRead) or PipeThrough chains.
+            let mut found_source = None;
+            for node in &self.nodes {
+                match node {
+                    IrNode::Derived {
+                        cell: c,
+                        expr: IrExpr::CellRead(src),
+                    } if *c == current => {
+                        found_source = Some(*src);
+                        break;
+                    }
+                    IrNode::PipeThrough { cell: c, source } if *c == current => {
+                        found_source = Some(*source);
+                        break;
+                    }
+                    IrNode::ListRetain { cell: c, source, .. } if *c == current => {
+                        found_source = Some(*source);
+                        break;
+                    }
+                    IrNode::ListRemove { cell: c, source, .. } if *c == current => {
+                        found_source = Some(*source);
+                        break;
+                    }
+                    IrNode::ListAppend { cell: c, source, .. } if *c == current => {
+                        found_source = Some(*source);
+                        break;
+                    }
+                    IrNode::ListClear { cell: c, source, .. } if *c == current => {
+                        found_source = Some(*source);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            match found_source {
+                Some(src) => current = src,
+                None => return None,
+            }
+        }
+        None
+    }
+
     fn propagate_list_constructor(&mut self, source: CellId, target: CellId) {
         if let Some(c) = self.list_item_constructor.get(&source).cloned() {
             self.list_item_constructor.insert(target, c);
@@ -330,13 +381,20 @@ impl Lowerer {
         item_name: &str,
         span: Span,
     ) -> bool {
-        let constructor_name = match self.list_item_constructor.get(&source_cell).cloned() {
+        // Look up constructor, following CellRead/Derived chains through aliases
+        // (e.g., PASSED.store.people creates Derived(CellRead(X)) without propagating
+        // list_item_constructor). Trace back to find the original constructor.
+        let constructor_name = match self.find_list_constructor(source_cell) {
             Some(name) => name,
-            None => return false,
+            None => {
+                return false;
+            }
         };
         let func_def = match self.func_defs.get(&constructor_name).cloned() {
             Some(def) => def,
-            None => return false,
+            None => {
+                return false;
+            }
         };
 
         // Save bindings for constructor params.
@@ -860,6 +918,96 @@ impl Lowerer {
                 self.nodes.push(IrNode::Element {
                     cell,
                     kind: ElementKind::Text { label, style },
+                    links,
+                    hovered_cell,
+                });
+            }
+            ["Element", "slider"] => {
+                let style = self.find_arg_expr_or_default(arguments, "style");
+                let value_cell = arguments
+                    .iter()
+                    .find(|a| a.node.name.as_str() == "value")
+                    .and_then(|a| a.node.value.as_ref())
+                    .and_then(|v| {
+                        let expr = self.lower_expr(&v.node, v.span);
+                        match expr {
+                            IrExpr::CellRead(c) => Some(c),
+                            _ => None,
+                        }
+                    });
+                let min = self.find_arg_number(arguments, "min").unwrap_or(0.0);
+                let max = self.find_arg_number(arguments, "max").unwrap_or(100.0);
+                let step = self.find_arg_number(arguments, "step").unwrap_or(1.0);
+                self.nodes.push(IrNode::Element {
+                    cell,
+                    kind: ElementKind::Slider {
+                        style,
+                        value_cell,
+                        min,
+                        max,
+                        step,
+                    },
+                    links,
+                    hovered_cell,
+                });
+            }
+            ["Element", "select"] => {
+                let style = self.find_arg_expr_or_default(arguments, "style");
+                let options = self.extract_select_options(arguments);
+                let selected = arguments
+                    .iter()
+                    .find(|a| a.node.name.as_str() == "selected")
+                    .and_then(|a| a.node.value.as_ref())
+                    .map(|v| self.lower_expr(&v.node, v.span));
+                self.nodes.push(IrNode::Element {
+                    cell,
+                    kind: ElementKind::Select {
+                        style,
+                        options,
+                        selected,
+                    },
+                    links,
+                    hovered_cell,
+                });
+            }
+            ["Element", "svg"] => {
+                let style = self.find_arg_expr_or_default(arguments, "style");
+                let children_expr = self.find_arg_expr_or_default(arguments, "children");
+                let children_cell = self.alloc_cell("svg_children", span);
+                self.nodes.push(IrNode::Derived {
+                    cell: children_cell,
+                    expr: children_expr,
+                });
+                self.nodes.push(IrNode::Element {
+                    cell,
+                    kind: ElementKind::Svg {
+                        style,
+                        children: children_cell,
+                    },
+                    links,
+                    hovered_cell,
+                });
+            }
+            ["Element", "svg_circle"] => {
+                let cx = self.find_arg_expr_or(
+                    arguments,
+                    "cx",
+                    IrExpr::Constant(IrValue::Number(0.0)),
+                );
+                let cy = self.find_arg_expr_or(
+                    arguments,
+                    "cy",
+                    IrExpr::Constant(IrValue::Number(0.0)),
+                );
+                let r = self.find_arg_expr_or(
+                    arguments,
+                    "r",
+                    IrExpr::Constant(IrValue::Number(20.0)),
+                );
+                let style = self.find_arg_expr_or_default(arguments, "style");
+                self.nodes.push(IrNode::Element {
+                    cell,
+                    kind: ElementKind::SvgCircle { cx, cy, r, style },
                     links,
                     hovered_cell,
                 });
@@ -1798,6 +1946,45 @@ impl Lowerer {
                 });
             }
 
+            // --- `source |> Text/to_number()` ---
+            ["Text", "to_number"] => {
+                let source_cell = self.lower_expr_to_cell(source, "to_number_source");
+                let nan_tag_value = self.intern_tag("NaN");
+                self.nodes.push(IrNode::TextToNumber {
+                    cell: target,
+                    source: source_cell,
+                    nan_tag_value,
+                });
+            }
+
+            // --- `source |> Math/round()` ---
+            ["Math", "round"] => {
+                let source_cell = self.lower_expr_to_cell(source, "round_source");
+                self.nodes.push(IrNode::MathRound {
+                    cell: target,
+                    source: source_cell,
+                });
+            }
+
+            // --- `source |> Text/starts_with(prefix: ...)` ---
+            ["Text", "starts_with"] => {
+                let source_cell = self.lower_expr_to_cell(source, "starts_with_source");
+                let prefix_cell = if let Some(prefix_arg) = arguments.iter().find(|a| a.node.name.as_str() == "prefix") {
+                    if let Some(ref val) = prefix_arg.node.value {
+                        self.lower_expr_to_cell(val, "starts_with_prefix")
+                    } else {
+                        self.alloc_cell("starts_with_prefix_empty", call_span)
+                    }
+                } else {
+                    self.alloc_cell("starts_with_prefix_empty", call_span)
+                };
+                self.nodes.push(IrNode::TextStartsWith {
+                    cell: target,
+                    source: source_cell,
+                    prefix: prefix_cell,
+                });
+            }
+
             // --- `source |> Text/is_not_empty()` ---
             ["Text", "is_not_empty"] => {
                 let source_cell = self.lower_expr_to_cell(source, "is_not_empty_source");
@@ -2520,9 +2707,16 @@ impl Lowerer {
                 }
                 trigger_bodies
             }
-            // Plain expression — no event trigger, use synthetic
+            // Plain expression — try to resolve an event from the expression itself.
+            // This handles bare alias paths like `elements.celsius_input.event.change.text`
+            // where the expression references an event payload directly (the HOLD should
+            // trigger on that event and read the payload as its new value).
             _ => {
-                let trigger = self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span);
+                let trigger = self
+                    .resolve_event_from_expr(body)
+                    .unwrap_or_else(|| {
+                        self.alloc_event("hold_trigger", EventSource::Synthetic, hold_span)
+                    });
                 let expr = self.lower_expr(body, body_span);
                 vec![(trigger, expr)]
             }
@@ -3565,7 +3759,6 @@ impl Lowerer {
             // --- Element/text(text: ..., style: [...]) ---
             ["Element", "text"] => {
                 let saved_elem = self.process_element_self_ref(arguments, span);
-                // DEBUG: log the text argument expression before lowering
                 let label = self.find_arg_expr(arguments, "text", span);
                 let style = self.find_arg_expr_or_default(arguments, "style");
 
@@ -3577,6 +3770,140 @@ impl Lowerer {
                 self.nodes.push(IrNode::Element {
                     cell,
                     kind: ElementKind::Text { label, style },
+                    links,
+                    hovered_cell,
+                });
+                self.restore_element_self_ref(saved_elem);
+                IrExpr::CellRead(cell)
+            }
+
+            // --- Element/slider(element: [...], value: ..., min: ..., max: ..., step: ...) ---
+            ["Element", "slider"] => {
+                let saved_elem = self.process_element_self_ref(arguments, span);
+                let style = self.find_arg_expr_or_default(arguments, "style");
+                let value_cell = arguments
+                    .iter()
+                    .find(|a| a.node.name.as_str() == "value")
+                    .and_then(|a| a.node.value.as_ref())
+                    .and_then(|v| {
+                        let expr = self.lower_expr(&v.node, v.span);
+                        match expr {
+                            IrExpr::CellRead(c) => Some(c),
+                            _ => None,
+                        }
+                    });
+                let min = self.find_arg_number(arguments, "min").unwrap_or(0.0);
+                let max = self.find_arg_number(arguments, "max").unwrap_or(100.0);
+                let step = self.find_arg_number(arguments, "step").unwrap_or(1.0);
+
+                let cell = self.alloc_cell("slider", span);
+                let links =
+                    self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
+                let hovered_cell = saved_elem.hovered_cell;
+
+                self.nodes.push(IrNode::Element {
+                    cell,
+                    kind: ElementKind::Slider {
+                        style,
+                        value_cell,
+                        min,
+                        max,
+                        step,
+                    },
+                    links,
+                    hovered_cell,
+                });
+                self.restore_element_self_ref(saved_elem);
+                IrExpr::CellRead(cell)
+            }
+
+            // --- Element/select(element: [...], options: LIST { ... }, selected: ...) ---
+            ["Element", "select"] => {
+                let saved_elem = self.process_element_self_ref(arguments, span);
+                let style = self.find_arg_expr_or_default(arguments, "style");
+                let options = self.extract_select_options(arguments);
+                let selected = arguments
+                    .iter()
+                    .find(|a| a.node.name.as_str() == "selected")
+                    .and_then(|a| a.node.value.as_ref())
+                    .map(|v| self.lower_expr(&v.node, v.span));
+
+                let cell = self.alloc_cell("select", span);
+                let links =
+                    self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
+                let hovered_cell = saved_elem.hovered_cell;
+
+                self.nodes.push(IrNode::Element {
+                    cell,
+                    kind: ElementKind::Select {
+                        style,
+                        options,
+                        selected,
+                    },
+                    links,
+                    hovered_cell,
+                });
+                self.restore_element_self_ref(saved_elem);
+                IrExpr::CellRead(cell)
+            }
+
+            // --- Element/svg(element: [...], children: ..., style: [...]) ---
+            ["Element", "svg"] => {
+                let saved_elem = self.process_element_self_ref(arguments, span);
+                let style = self.find_arg_expr_or_default(arguments, "style");
+                let children_expr = self.find_arg_expr_or_default(arguments, "children");
+                let children_cell = self.alloc_cell("svg_children", span);
+                self.nodes.push(IrNode::Derived {
+                    cell: children_cell,
+                    expr: children_expr,
+                });
+
+                let cell = self.alloc_cell("svg", span);
+                let links =
+                    self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
+                let hovered_cell = saved_elem.hovered_cell;
+
+                self.nodes.push(IrNode::Element {
+                    cell,
+                    kind: ElementKind::Svg {
+                        style,
+                        children: children_cell,
+                    },
+                    links,
+                    hovered_cell,
+                });
+                self.restore_element_self_ref(saved_elem);
+                IrExpr::CellRead(cell)
+            }
+
+            // --- Element/svg_circle(element: [...], cx: ..., cy: ..., r: ..., style: [...]) ---
+            ["Element", "svg_circle"] => {
+                let saved_elem = self.process_element_self_ref(arguments, span);
+                let cx = self.find_arg_expr_or(
+                    arguments,
+                    "cx",
+                    IrExpr::Constant(IrValue::Number(0.0)),
+                );
+                let cy = self.find_arg_expr_or(
+                    arguments,
+                    "cy",
+                    IrExpr::Constant(IrValue::Number(0.0)),
+                );
+                let r = self.find_arg_expr_or(
+                    arguments,
+                    "r",
+                    IrExpr::Constant(IrValue::Number(20.0)),
+                );
+                let style = self.find_arg_expr_or_default(arguments, "style");
+
+                let cell = self.alloc_cell("svg_circle", span);
+                let links =
+                    self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
+                let hovered_cell = saved_elem.hovered_cell;
+
+                self.nodes.push(IrNode::Element {
+                    cell,
+                    kind: ElementKind::SvgCircle { cx, cy, r, style },
                     links,
                     hovered_cell,
                 });
@@ -5360,6 +5687,72 @@ impl Lowerer {
         default
     }
 
+    /// Extract a numeric literal from a named argument.
+    fn find_arg_number(&self, arguments: &[Spanned<Argument>], name: &str) -> Option<f64> {
+        let arg = arguments.iter().find(|a| a.node.name.as_str() == name)?;
+        let val = arg.node.value.as_ref()?;
+        match &val.node {
+            Expression::Literal(Literal::Number(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Extract static option pairs from Element/select's `options: LIST { ... }`.
+    fn extract_select_options(&self, arguments: &[Spanned<Argument>]) -> Vec<(String, String)> {
+        let mut options = Vec::new();
+        let arg = match arguments.iter().find(|a| a.node.name.as_str() == "options") {
+            Some(a) => a,
+            None => return options,
+        };
+        let val = match arg.node.value.as_ref() {
+            Some(v) => v,
+            None => return options,
+        };
+        if let Expression::List { items } = &val.node {
+            for item in items {
+                if let Expression::Object(obj) = &item.node {
+                    let mut value = String::new();
+                    let mut label = String::new();
+                    for field in &obj.variables {
+                        let field_name = field.node.name.as_str();
+                        if field_name == "value" {
+                            if let Some(t) = Self::extract_static_text(&field.node.value.node) {
+                                value = t;
+                            }
+                        } else if field_name == "label" {
+                            if let Some(t) = Self::extract_static_text(&field.node.value.node) {
+                                label = t;
+                            }
+                        }
+                    }
+                    if label.is_empty() {
+                        label = value.clone();
+                    }
+                    options.push((value, label));
+                }
+            }
+        }
+        options
+    }
+
+    /// Try to extract a static text string from an expression.
+    fn extract_static_text(expr: &Expression) -> Option<String> {
+        match expr {
+            Expression::TextLiteral { parts, .. } => {
+                let mut result = String::new();
+                for part in parts {
+                    match part {
+                        TextPart::Text(s) => result.push_str(s.as_str()),
+                        _ => return None,
+                    }
+                }
+                Some(result)
+            }
+            Expression::Literal(Literal::Text(s)) => Some(s.as_str().to_string()),
+            _ => None,
+        }
+    }
+
     /// Find a named argument and ensure it's a cell.
     fn find_arg_cell(
         &mut self,
@@ -6120,6 +6513,36 @@ impl Lowerer {
                     }
                     ["Text", "is_not_empty"] => {
                         self.nodes.push(IrNode::TextIsNotEmpty {
+                            cell: target,
+                            source: source_cell,
+                        });
+                    }
+                    ["Text", "starts_with"] => {
+                        let prefix_cell = if let Some(prefix_arg) = arguments.iter().find(|a| a.node.name.as_str() == "prefix") {
+                            if let Some(ref val) = prefix_arg.node.value {
+                                self.lower_expr_to_cell(val, "starts_with_prefix")
+                            } else {
+                                self.alloc_cell("starts_with_prefix_empty", var_span)
+                            }
+                        } else {
+                            self.alloc_cell("starts_with_prefix_empty", var_span)
+                        };
+                        self.nodes.push(IrNode::TextStartsWith {
+                            cell: target,
+                            source: source_cell,
+                            prefix: prefix_cell,
+                        });
+                    }
+                    ["Text", "to_number"] => {
+                        let nan_tag_value = self.intern_tag("NaN");
+                        self.nodes.push(IrNode::TextToNumber {
+                            cell: target,
+                            source: source_cell,
+                            nan_tag_value,
+                        });
+                    }
+                    ["Math", "round"] => {
+                        self.nodes.push(IrNode::MathRound {
                             cell: target,
                             source: source_cell,
                         });

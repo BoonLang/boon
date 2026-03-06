@@ -21,12 +21,12 @@ store: [
         elements.return_input.event.change.text
     }
 
-    is_return: flight_type |> WHEN {
+    is_return: flight_type |> WHILE {
         TEXT { return } => True
         __ => False
     }
 
-    is_valid: is_return |> WHEN {
+    is_valid: is_return |> WHILE {
         False => True
         True => return_date >= departure_date
     }
@@ -86,7 +86,7 @@ FUNCTION root_element() {
                     element: [event: [change: LINK]]
                     style: [
                         width: Fill
-                        disabled: is_return |> WHEN {
+                        disabled: is_return |> WHILE {
                             True => False
                             __ => True
                         }
@@ -100,7 +100,7 @@ FUNCTION root_element() {
                     element: [event: [press: LINK]]
                     style: [
                         width: Fill
-                        disabled: is_valid |> WHEN {
+                        disabled: is_valid |> WHILE {
                             True => False
                             __ => True
                         }

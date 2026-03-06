@@ -1,0 +1,49 @@
+# Cells (7GUIs Task 7) - spreadsheet with formulas and change propagation
+
+[test]
+category = "interactive"
+description = "7GUIs Task 7: spreadsheet with formulas and change propagation"
+# 10x10 grid (100 cells) renders fast on Actors. DD/Wasm not yet supported.
+skip_engines = ["DD", "Wasm"]
+
+[output]
+text = "Cells"
+match = "contains"
+
+[timing]
+timeout = 15000
+poll_interval = 500
+initial_delay = 2000
+
+# SPEC: Title visible
+[[sequence]]
+description = "Title visible"
+actions = [["assert_contains", "Cells"]]
+expect = "Cells"
+
+# SPEC: Column headers visible
+[[sequence]]
+description = "Column A header visible"
+actions = [["assert_contains", "A"]]
+expect = "Cells"
+
+# SPEC: Grid renders with default formulas
+[[sequence]]
+description = "Default A1=5 visible"
+actions = [["assert_contains", "5"]]
+expect = "Cells"
+
+[[sequence]]
+description = "Default A2=10 visible"
+actions = [["assert_contains", "10"]]
+expect = "Cells"
+
+[[sequence]]
+description = "Default B1=15 visible (add(A1,A2) = 5+10)"
+actions = [["assert_contains", "15"]]
+expect = "Cells"
+
+[[sequence]]
+description = "Default C1=30 visible (sum(A1:A3) = 5+10+15)"
+actions = [["assert_contains", "30"]]
+expect = "Cells"

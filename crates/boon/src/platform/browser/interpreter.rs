@@ -133,7 +133,8 @@ pub fn run(
     // Clean stale persistence values for variables whose source code changed.
     // This prevents loading wrong values if a previous evaluation was interrupted
     // (e.g., by a panic) after old source code was stored but before value saves flushed.
-    if !changed_variable_ids.is_empty() {
+    // Skip when persistence is disabled (empty key).
+    if !changed_variable_ids.is_empty() && !states_local_storage_key.is_empty() {
         if let Some(Ok(mut states)) = local_storage()
             .get::<std::collections::BTreeMap<String, serde_json::Value>>(
                 &states_local_storage_key,
@@ -316,7 +317,8 @@ pub fn run_with_registry(
     // Clean stale persistence values for variables whose source code changed.
     // This prevents loading wrong values if a previous evaluation was interrupted
     // (e.g., by a panic) after old source code was stored but before value saves flushed.
-    if !changed_variable_ids.is_empty() {
+    // Skip when persistence is disabled (empty key).
+    if !changed_variable_ids.is_empty() && !states_local_storage_key.is_empty() {
         if let Some(Ok(mut states)) = local_storage()
             .get::<std::collections::BTreeMap<String, serde_json::Value>>(
                 &states_local_storage_key,

@@ -285,6 +285,15 @@ pub enum IrNode {
     /// Text/is_not_empty: check if text is non-empty.
     TextIsNotEmpty { cell: CellId, source: CellId },
 
+    /// Text/to_number: parse text to number. Returns NaN tag index if invalid.
+    TextToNumber { cell: CellId, source: CellId, nan_tag_value: f64 },
+
+    /// Text/starts_with: check if source text starts with prefix text.
+    TextStartsWith { cell: CellId, source: CellId, prefix: CellId },
+
+    /// Math/round: round number to nearest integer.
+    MathRound { cell: CellId, source: CellId },
+
     /// HOLD with object state and Stream/pulses loop.
     /// Computes N iterations at init time, updating per-field cells.
     /// Used for patterns like:
@@ -380,6 +389,28 @@ pub enum ElementKind {
     },
     Text {
         label: IrExpr,
+        style: IrExpr,
+    },
+    Slider {
+        style: IrExpr,
+        value_cell: Option<CellId>,
+        min: f64,
+        max: f64,
+        step: f64,
+    },
+    Select {
+        style: IrExpr,
+        options: Vec<(String, String)>,
+        selected: Option<IrExpr>,
+    },
+    Svg {
+        style: IrExpr,
+        children: CellId,
+    },
+    SvgCircle {
+        cx: IrExpr,
+        cy: IrExpr,
+        r: IrExpr,
         style: IrExpr,
     },
 }
@@ -614,6 +645,15 @@ pub fn node_debug_short(node: &IrNode) -> String {
         IrNode::TextIsNotEmpty { cell, source } => {
             format!("TextIsNotEmpty(cell={}, source={})", cell.0, source.0)
         }
+        IrNode::TextToNumber { cell, source, .. } => {
+            format!("TextToNumber(cell={}, source={})", cell.0, source.0)
+        }
+        IrNode::TextStartsWith { cell, source, prefix } => {
+            format!("TextStartsWith(cell={}, source={}, prefix={})", cell.0, source.0, prefix.0)
+        }
+        IrNode::MathRound { cell, source } => {
+            format!("MathRound(cell={}, source={})", cell.0, source.0)
+        }
         IrNode::HoldLoop {
             cell, field_cells, ..
         } => format!(
@@ -650,5 +690,9 @@ fn element_kind_name(kind: &ElementKind) -> &'static str {
         ElementKind::Paragraph { .. } => "Paragraph",
         ElementKind::Block { .. } => "Block",
         ElementKind::Text { .. } => "Text",
+        ElementKind::Slider { .. } => "Slider",
+        ElementKind::Select { .. } => "Select",
+        ElementKind::Svg { .. } => "Svg",
+        ElementKind::SvgCircle { .. } => "SvgCircle",
     }
 }

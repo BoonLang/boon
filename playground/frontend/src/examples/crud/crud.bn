@@ -124,11 +124,26 @@ FUNCTION people_list() {
 }
 
 FUNCTION person_row(person) {
-    Element/button(
-        element: [event: [press: LINK]]
-        style: [width: Fill]
-        label: TEXT { {person.surname}, {person.name} }
-    ) |> LINK { person.person_elements.row }
+    BLOCK {
+        is_selected: PASSED.store.selected_id |> WHILE {
+            selected => selected == person.id |> WHILE {
+                True => True
+                __ => False
+            }
+        }
+        label: is_selected |> WHILE {
+            True => TEXT { ► {person.surname}, {person.name} }
+            __ => TEXT { {person.surname}, {person.name} }
+        }
+        Element/button(
+            element: [event: [press: LINK]]
+            style: [
+                width: Fill
+                font: [weight: is_selected |> WHILE { True => Bold, __ => Regular }]
+            ]
+            label: label
+        ) |> LINK { person.person_elements.row }
+    }
 }
 
 FUNCTION form_section() {

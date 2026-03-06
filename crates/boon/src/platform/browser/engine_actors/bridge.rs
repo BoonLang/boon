@@ -5272,6 +5272,26 @@ fn element_svg(
         })
     });
 
+    // Background style (CSS background on SVG element)
+    let background_signal = signal::from_stream({
+        let style_stream = switch_map(settings_variable.clone().stream(), |value| {
+            value.expect_object().expect_variable("style").stream()
+        });
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("background") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Text(t, _) => Some(t.text().to_string()),
+                _ => None,
+            })
+        })
+    });
+
     // Children — render list items as SVG child elements
     let children_vec_diff_stream = switch_map(
         switch_map(settings_variable.stream(), |value| {
@@ -5284,6 +5304,7 @@ fn element_svg(
         .attr_signal("width", width_signal)
         .attr_signal("height", height_signal)
         .style("overflow", "visible")
+        .style_signal("background", background_signal)
         .event_handler(move |event: events::Click| {
             let x = f64::from(event.offset_x());
             let y = f64::from(event.offset_y());

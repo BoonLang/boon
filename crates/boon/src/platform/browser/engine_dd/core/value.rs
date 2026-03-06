@@ -168,6 +168,26 @@ impl Value {
         self.clone()
     }
 
+    /// Remove the last item from a list (highest key in the BTreeMap).
+    pub fn list_remove_last(&self) -> Self {
+        if let Value::Tagged { tag, fields } = self {
+            if tag.as_ref() == LIST_TAG {
+                if fields.is_empty() {
+                    return self.clone();
+                }
+                let mut new_fields = (**fields).clone();
+                if let Some(last_key) = new_fields.keys().last().cloned() {
+                    new_fields.remove(&last_key);
+                }
+                return Value::Tagged {
+                    tag: tag.clone(),
+                    fields: Arc::new(new_fields),
+                };
+            }
+        }
+        self.clone()
+    }
+
     /// Map a function over list items.
     pub fn list_map(&self, f: impl Fn(&Value) -> Value) -> Self {
         if let Value::Tagged { tag, fields } = self {

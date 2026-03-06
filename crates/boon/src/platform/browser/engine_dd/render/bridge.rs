@@ -193,6 +193,20 @@ fn extract_sorted_list_items(fields: &Fields, field_name: &str) -> Vec<Value> {
     Vec::new()
 }
 
+/// Extract sorted list items from a Value directly.
+fn extract_sorted_list_items_from_value(value: &Value) -> Vec<Value> {
+    if let Value::Tagged {
+        tag,
+        fields: list_fields,
+    } = value
+    {
+        if tag.as_ref() == LIST_TAG {
+            return list_fields.values().cloned().collect();
+        }
+    }
+    Vec::new()
+}
+
 /// Extract effective link path for event handlers.
 fn extract_effective_link(fields: &Fields, parent_link_path: &str) -> String {
     fields
@@ -1565,8 +1579,316 @@ fn build_retained_tagged(
                 },
             )
         }
+        "ElementSelect" => build_retained_select_placeholder(fields, full_value, handle, link_path),
+        "ElementSlider" => build_retained_slider_placeholder(fields, full_value, handle, link_path),
+        "ElementSvg" => build_retained_svg_placeholder(fields, full_value, handle, link_path),
+        "ElementSvgCircle" => build_retained_primitive(&Value::text("")),
         _ => build_retained_primitive(&Value::text(format!("{}[...]", tag))),
     }
+}
+
+/// Real Element/select — renders as a `<select>` dropdown with event wiring.
+fn build_retained_select_placeholder(
+    fields: &Fields,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    let vm = Mutable::new(Arc::new(full_value.clone()));
+    // Select uses __link_path__ directly (NOT press_link from extract_effective_link).
+    // press_link is "{path}.event.press" which corrupts the change event path.
+    let effective_link = fields
+        .get(LINK_PATH_FIELD)
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| link_path.to_string());
+    let link_ref = Rc::new(RefCell::new(effective_link));
+
+    // Extract options and selected value
+    let options = extract_sorted_list_items(fields, "options");
+    let selected = fields
+        .get("selected")
+        .and_then(|v| v.as_text())
+        .unwrap_or("")
+        .to_string();
+
+    let el = El::new()
+        .update_raw_el({
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
+            let options = options.clone();
+            let selected = selected.clone();
+            move |raw_el| {
+                raw_el.after_insert(move |el: web_sys::HtmlElement| {
+                    // Create a real <select> element
+                    let doc = web_sys::window().unwrap().document().unwrap();
+                    let select = doc.create_element("select").unwrap();
+                    let select_html: web_sys::HtmlElement = select.clone().dyn_into().unwrap();
+                    select_html.style().set_property("font-size", "16px").ok();
+                    select_html.style().set_property("padding", "4px 8px").ok();
+                    select_html.style().set_property("width", "100%").ok();
+
+                    // Add options
+                    for opt_val in &options {
+                        let value = opt_val
+                            .get_field("value")
+                            .and_then(|v| v.as_text())
+                            .unwrap_or("")
+                            .to_string();
+                        let label = opt_val
+                            .get_field("label")
+                            .and_then(|v| v.as_text())
+                            .unwrap_or(&value)
+                            .to_string();
+                        let option = doc.create_element("option").unwrap();
+                        option.set_attribute("value", &value).ok();
+                        option.set_text_content(Some(&label));
+                        if value == selected {
+                            option.set_attribute("selected", "").ok();
+                        }
+                        select.append_child(&option).ok();
+                    }
+
+                    // Wire input event — read value via JS interop
+                    let select_el = select.clone();
+                    let input_closure =
+                        wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                            let base = lp.borrow().clone();
+                            if base.is_empty() {
+                                return;
+                            }
+                            // Get value via js_sys::Reflect
+                            let value = js_sys::Reflect::get(&select_el, &"value".into())
+                                .ok()
+                                .and_then(|v| v.as_string())
+                                .unwrap_or_default();
+                            let path = format!("{}.event.change", base);
+                            handle_ref.inject_dd_event(Event::TextChange {
+                                link_path: path,
+                                text: value,
+                            });
+                        });
+                    select
+                        .add_event_listener_with_callback(
+                            "input",
+                            input_closure.as_ref().unchecked_ref(),
+                        )
+                        .ok();
+                    input_closure.forget();
+
+                    el.append_child(&select).ok();
+                })
+            }
+        });
+
+    (el.unify(), RetainedNode::Label { value: vm, link_path: link_ref })
+}
+
+/// Real Element/slider — renders as `<input type="range">` with event wiring.
+fn build_retained_slider_placeholder(
+    fields: &Fields,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    let vm = Mutable::new(Arc::new(full_value.clone()));
+    // Slider uses __link_path__ directly (NOT press_link from extract_effective_link).
+    // press_link is "{path}.event.press" which corrupts the change event path.
+    let effective_link = fields
+        .get(LINK_PATH_FIELD)
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| link_path.to_string());
+    let link_ref = Rc::new(RefCell::new(effective_link));
+
+    let value = fields
+        .get("value")
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+    let min = fields
+        .get("min")
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+    let max = fields
+        .get("max")
+        .and_then(|v| v.as_number())
+        .unwrap_or(100.0);
+    let step = fields
+        .get("step")
+        .and_then(|v| v.as_number())
+        .unwrap_or(1.0);
+
+    let el = El::new()
+        .update_raw_el({
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
+            move |raw_el| {
+                raw_el.after_insert(move |el: web_sys::HtmlElement| {
+                    let doc = web_sys::window().unwrap().document().unwrap();
+                    let input: web_sys::HtmlInputElement = doc
+                        .create_element("input")
+                        .unwrap()
+                        .dyn_into()
+                        .unwrap();
+                    input.set_type("range");
+                    input.set_value(&format!("{}", value));
+                    input.set_min(&format!("{}", min));
+                    input.set_max(&format!("{}", max));
+                    input.set_step(&format!("{}", step));
+                    input.style().set_property("width", "100%").ok();
+
+                    // Wire input event
+                    let input_clone = input.clone();
+                    let input_closure =
+                        wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                            let base = lp.borrow().clone();
+                            if base.is_empty() {
+                                return;
+                            }
+                            let value_str = input_clone.value();
+                            let path = format!("{}.event.change", base);
+                            // Slider values are always numeric
+                            let numeric = value_str.parse::<f64>().unwrap_or(0.0);
+                            handle_ref.inject_dd_event(Event::NumberChange {
+                                link_path: path,
+                                value: numeric,
+                            });
+                        });
+                    input
+                        .add_event_listener_with_callback(
+                            "input",
+                            input_closure.as_ref().unchecked_ref(),
+                        )
+                        .ok();
+                    input_closure.forget();
+
+                    el.append_child(&input).ok();
+                })
+            }
+        });
+
+    (el.unify(), RetainedNode::Label { value: vm, link_path: link_ref })
+}
+
+/// Element/svg — renders as `<svg>` with click events carrying (x, y) coordinates.
+fn build_retained_svg_placeholder(
+    fields: &Fields,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    let vm = Mutable::new(Arc::new(full_value.clone()));
+    // SVG uses __link_path__ directly (same as slider/select)
+    let effective_link = fields
+        .get(LINK_PATH_FIELD)
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| link_path.to_string());
+    let link_ref = Rc::new(RefCell::new(effective_link));
+
+    // Extract width/height from style
+    let style = fields.get("style");
+    let width = style
+        .and_then(|s| s.get_field("width"))
+        .and_then(|v| v.as_number())
+        .unwrap_or(400.0);
+    let height = style
+        .and_then(|s| s.get_field("height"))
+        .and_then(|v| v.as_number())
+        .unwrap_or(300.0);
+    let background = style
+        .and_then(|s| s.get_field("background"))
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    // Extract children (circles list)
+    let children = fields.get("children");
+    let child_items = children
+        .map(|c| extract_sorted_list_items_from_value(c))
+        .unwrap_or_default();
+
+    let el = El::new()
+        .update_raw_el({
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
+            let child_items = child_items.clone();
+            move |raw_el| {
+                raw_el.after_insert(move |el: web_sys::HtmlElement| {
+                    let doc = web_sys::window().unwrap().document().unwrap();
+                    let svg = doc
+                        .create_element_ns(Some("http://www.w3.org/2000/svg"), "svg")
+                        .unwrap();
+                    svg.set_attribute("width", &format!("{}", width)).ok();
+                    svg.set_attribute("height", &format!("{}", height)).ok();
+                    svg.set_attribute("style", &format!("overflow: visible; background: {};", background)).ok();
+
+                    // Render circle children
+                    for item in &child_items {
+                        if let Value::Tagged { tag, fields } = item {
+                            if tag.as_ref() == "ElementSvgCircle" {
+                                let cx = fields.get("cx").and_then(|v| v.as_number()).unwrap_or(0.0);
+                                let cy = fields.get("cy").and_then(|v| v.as_number()).unwrap_or(0.0);
+                                let r = fields.get("r").and_then(|v| v.as_number()).unwrap_or(20.0);
+                                let style_fields = fields.get("style");
+                                let fill = style_fields
+                                    .and_then(|s| s.get_field("fill"))
+                                    .and_then(|v| v.as_text())
+                                    .unwrap_or("gray");
+                                let stroke = style_fields
+                                    .and_then(|s| s.get_field("stroke"))
+                                    .and_then(|v| v.as_text())
+                                    .unwrap_or("black");
+                                let stroke_width = style_fields
+                                    .and_then(|s| s.get_field("stroke_width"))
+                                    .and_then(|v| v.as_number())
+                                    .unwrap_or(1.0);
+
+                                let circle = doc
+                                    .create_element_ns(Some("http://www.w3.org/2000/svg"), "circle")
+                                    .unwrap();
+                                circle.set_attribute("cx", &format!("{}", cx)).ok();
+                                circle.set_attribute("cy", &format!("{}", cy)).ok();
+                                circle.set_attribute("r", &format!("{}", r)).ok();
+                                circle.set_attribute("fill", fill).ok();
+                                circle.set_attribute("stroke", stroke).ok();
+                                circle.set_attribute("stroke-width", &format!("{}", stroke_width)).ok();
+                                svg.append_child(&circle).ok();
+                            }
+                        }
+                    }
+
+                    // Wire click event with coordinates
+                    let svg_clone = svg.clone();
+                    let click_closure =
+                        wasm_bindgen::closure::Closure::<dyn Fn(web_sys::MouseEvent)>::new(move |event: web_sys::MouseEvent| {
+                            let base = lp.borrow().clone();
+                            if base.is_empty() {
+                                return;
+                            }
+                            let rect = svg_clone.get_bounding_client_rect();
+                            let x = f64::from(event.client_x()) - rect.left();
+                            let y = f64::from(event.client_y()) - rect.top();
+                            let path = format!("{}.event.click", base);
+                            handle_ref.inject_dd_event(Event::SvgClick {
+                                link_path: path,
+                                x,
+                                y,
+                            });
+                        });
+                    svg.add_event_listener_with_callback(
+                        "click",
+                        click_closure.as_ref().unchecked_ref(),
+                    )
+                    .ok();
+                    click_closure.forget();
+
+                    el.append_child(&svg).ok();
+                })
+            }
+        });
+
+    (el.unify(), RetainedNode::Label { value: vm, link_path: link_ref })
 }
 
 /// Create a hover change handler for Zoon's `.on_hovered_change()`.
@@ -3336,6 +3658,20 @@ fn render_tagged_static(tag: &str, fields: &Arc<Fields>) -> RawElOrText {
             } else {
                 El::new().child("Empty document").unify()
             }
+        }
+        "ElementSelect" => {
+            let selected = fields.get("selected").and_then(|v| v.as_text()).unwrap_or("").to_string();
+            zoon::Text::new(format!("[select: {}]", selected)).unify()
+        }
+        "ElementSlider" => {
+            let val = fields.get("value").and_then(|v| v.as_number()).unwrap_or(0.0);
+            zoon::Text::new(format!("[slider: {}]", val)).unify()
+        }
+        "ElementSvg" => {
+            zoon::Text::new("[SVG canvas]").unify()
+        }
+        "ElementSvgCircle" => {
+            El::new().unify()
         }
         _ => zoon::Text::new(format!("{}[...]", tag)).unify(),
     }

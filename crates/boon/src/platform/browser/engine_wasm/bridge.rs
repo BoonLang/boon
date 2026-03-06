@@ -2,11 +2,19 @@
 //! them to the WASM runtime instance.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use zoon::*;
+
+#[wasm_bindgen]
+extern "C" {
+    #[allow(dead_code)]
+    #[wasm_bindgen(js_namespace = console, js_name = log)]
+    fn console_log(s: &str);
+}
 
 use super::ir::*;
 use super::runtime::{CellStore, WasmInstance};
@@ -203,7 +211,10 @@ fn build_element(
             | IrNode::ListEvery { .. }
             | IrNode::ListAny { .. }
             | IrNode::TextTrim { .. }
-            | IrNode::TextIsNotEmpty { .. } => build_reactive_text_ctx(instance, ctx, cell),
+            | IrNode::TextIsNotEmpty { .. }
+            | IrNode::TextToNumber { .. }
+            | IrNode::MathRound { .. }
+            | IrNode::TextStartsWith { .. } => build_reactive_text_ctx(instance, ctx, cell),
             IrNode::ListAppend { source, .. }
             | IrNode::ListClear { source, .. }
             | IrNode::ListRemove { source, .. }
@@ -282,10 +293,11 @@ fn format_number(n: f64) -> String {
 /// Format a cell's display value: prefer text content if set, else format f64.
 /// Text cells store their content in the text store, with f64 used only as a
 /// signal trigger. Number cells have meaningful f64 values.
+/// Uses `has_text()` (not `!text.is_empty()`) to distinguish "intentionally
+/// empty text" (e.g. Text/empty()) from "no text set" (pure numeric cell).
 fn format_cell_value(store: &super::runtime::CellStore, cell_id: u32) -> String {
-    let text = store.get_cell_text(cell_id);
-    if !text.is_empty() {
-        text
+    if store.has_text(cell_id) {
+        store.get_cell_text(cell_id)
     } else {
         format_number(store.get_cell_value(cell_id))
     }
@@ -423,7 +435,7 @@ fn build_element_node(
             placeholder,
             style,
             focus,
-            ..
+            text_cell,
         } => build_text_input(
             program,
             instance,
@@ -432,6 +444,7 @@ fn build_element_node(
             links,
             *focus,
             hovered_cell,
+            *text_cell,
         ),
         ElementKind::Checkbox {
             checked,
@@ -495,6 +508,54 @@ fn build_element_node(
             label,
             style,
             hovered_cell,
+        ),
+        ElementKind::Slider {
+            style,
+            value_cell,
+            min,
+            max,
+            step,
+        } => build_slider(
+            program,
+            instance,
+            style,
+            links,
+            *value_cell,
+            *min,
+            *max,
+            *step,
+            hovered_cell,
+        ),
+        ElementKind::Select {
+            style,
+            options,
+            selected,
+        } => build_select(
+            program,
+            instance,
+            style,
+            links,
+            options,
+            selected.as_ref(),
+            hovered_cell,
+        ),
+        ElementKind::Svg { style, children } => build_svg(
+            program,
+            instance,
+            &BuildContext::Global,
+            style,
+            *children,
+            links,
+            hovered_cell,
+        ),
+        ElementKind::SvgCircle { cx, cy, r, style } => build_svg_circle(
+            program,
+            instance,
+            &BuildContext::Global,
+            cx,
+            cy,
+            r,
+            style,
         ),
     };
     // Attach remaining event handlers (blur, focus, click, double_click).
@@ -619,13 +680,14 @@ fn resolve_label_segments<'a>(
 fn build_label_child(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
     label: &IrExpr,
 ) -> RawElOrText {
     // Check if label is a CellRead pointing to an Element node (e.g. Scene/Element/text).
     // In that case, build the element directly instead of trying to extract text.
     if let IrExpr::CellRead(cell) = label {
         if matches!(find_node_for_cell(program, *cell), Some(IrNode::Element { .. })) {
-            let el = build_element(program, instance, &BuildContext::Global, *cell);
+            let el = build_element(program, instance, ctx, *cell);
             // pointer-events:none so clicks pass through to the button div.
             return match el {
                 RawElOrText::RawHtmlEl(el) => {
@@ -634,12 +696,31 @@ fn build_label_child(
                 other => other,
             };
         }
+        // For per-item labels: if label CellRead points to a template cell,
+        // use per-item reactive text that reads from ICS. This handles
+        // labels computed by WHILE/WHEN arms with TEXT interpolation
+        // (e.g., TEXT { {person.surname}, {person.name} }) whose text
+        // was set during init_item.
+        if let BuildContext::Item(item_ctx) = ctx {
+            if item_ctx.is_template_cell(*cell) {
+                let el = build_item_reactive_text(instance, item_ctx, *cell);
+                return match el {
+                    RawElOrText::RawHtmlEl(el) => {
+                        RawElOrText::RawHtmlEl(el.style("pointer-events", "none"))
+                    }
+                    other => other,
+                };
+            }
+        }
     }
     let el = if let Some(segs) = resolve_label_segments(program, label) {
         if segs
             .iter()
             .any(|s| matches!(s, TextSegment::Expr(IrExpr::CellRead(_))))
         {
+            if let BuildContext::Item(item_ctx) = ctx {
+                return build_item_text_from_segments(instance, item_ctx, segs);
+            }
             return build_text_from_segments(instance, segs);
         }
         zoon::Text::new(resolve_static_text(program, label)).unify()
@@ -670,7 +751,7 @@ fn build_button(
         .find(|(name, _)| name == "press")
         .map(|(_, eid)| *eid);
 
-    let label_child = build_label_child(program, instance, label);
+    let label_child = build_label_child(program, instance, ctx, label);
     let inst_press = instance.clone();
     let is_template_event = press_event
         .map(|e| ctx.is_template_event(e))
@@ -882,6 +963,7 @@ fn build_text_input(
     links: &[(String, EventId)],
     focus: bool,
     hovered_cell: Option<CellId>,
+    boon_text_cell: Option<CellId>,
 ) -> RawElOrText {
     // Find events from links.
     let key_down_event = links
@@ -953,6 +1035,31 @@ fn build_text_input(
                 });
             }
 
+            // Reactively bind the Boon `text:` argument cell to the DOM value.
+            // This is separate from the LINK `.text` cell above: the LINK cell
+            // tracks user-typed text, while boon_text_cell carries the Boon-computed
+            // value (e.g., a conversion result) that should control the display.
+            // Uses get_cell_text (not format_cell_value) so empty text = empty input
+            // (showing placeholder) rather than formatting f64 counter as "0".
+            if let Some(btc) = boon_text_cell {
+                let btc_id = btc.0;
+                let inst = instance.clone();
+                raw_el = raw_el.after_insert(move |input_el: web_sys::HtmlInputElement| {
+                    let store = inst.cell_store.clone();
+                    let read_store = store.clone();
+                    let handle =
+                        Task::start_droppable(store.get_cell_signal(btc_id).for_each_sync(
+                            move |_| {
+                                let text = read_store.get_cell_text(btc_id);
+                                if input_el.value() != text {
+                                    input_el.set_value(&text);
+                                }
+                            },
+                        ));
+                    std::mem::forget(handle);
+                });
+            }
+
             raw_el = apply_raw_css(raw_el, style, program, instance, None, false);
             raw_el = apply_physical_css(raw_el, style, program, instance, None);
 
@@ -1011,6 +1118,417 @@ fn build_text_input(
             }
         })
         .into_raw_unchecked()
+}
+
+/// Build a slider (`<input type="range">`) element with change event.
+fn build_slider(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    style: &IrExpr,
+    links: &[(String, EventId)],
+    value_cell: Option<CellId>,
+    min: f64,
+    max: f64,
+    step: f64,
+    hovered_cell: Option<CellId>,
+) -> RawElOrText {
+    let change_event = links
+        .iter()
+        .find(|(name, _)| name == "change")
+        .map(|(_, eid)| *eid);
+    let change_value_cell = find_data_cell_for_event(program, links, "change", "value");
+
+    let mut raw_el = RawHtmlEl::new("input")
+        .attr("type", "range")
+        .attr("min", &min.to_string())
+        .attr("max", &max.to_string())
+        .attr("step", &step.to_string());
+
+    // Set initial value from the value_cell if available.
+    if let Some(vc) = value_cell {
+        let inst = instance.clone();
+        raw_el = raw_el.after_insert(move |el: web_sys::HtmlElement| {
+            let input_el: web_sys::HtmlInputElement = el.unchecked_into();
+            let store = inst.cell_store.clone();
+            let val = store.get_cell_value(vc.0);
+            if val.is_finite() {
+                input_el.set_value(&val.to_string());
+            }
+            // Reactively update from the cell.
+            let read_store = store.clone();
+            let input_for_signal = input_el.clone();
+            let handle =
+                Task::start_droppable(store.get_cell_signal(vc.0).for_each_sync(move |_| {
+                    let v = read_store.get_cell_value(vc.0);
+                    if v.is_finite() {
+                        let new_val = v.to_string();
+                        if input_for_signal.value() != new_val {
+                            input_for_signal.set_value(&new_val);
+                        }
+                    }
+                }));
+            std::mem::forget(handle);
+        });
+    }
+
+    // Apply style (width etc.).
+    raw_el = apply_raw_css(raw_el, style, program, instance, None, false);
+
+    // Handle hover.
+    if let Some(cell) = hovered_cell {
+        let inst = instance.clone();
+        raw_el = raw_el.event_handler(move |_: events::MouseEnter| {
+            inst.set_cell_value(cell.0, 1.0);
+        });
+        let inst = instance.clone();
+        raw_el = raw_el.event_handler(move |_: events::MouseLeave| {
+            inst.set_cell_value(cell.0, 0.0);
+        });
+    }
+
+    // Handle change event — fires on input to give live updates.
+    if let Some(event_id) = change_event {
+        let inst = instance.clone();
+        raw_el = raw_el.event_handler(move |event: events::Input| {
+            if let Some(target) = event.target() {
+                if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
+                    let val: f64 = input.value().parse().unwrap_or(0.0);
+                    if let Some(cell_id) = change_value_cell {
+                        inst.set_cell_value(cell_id, val);
+                    }
+                }
+            }
+            let _ = inst.fire_event(event_id.0);
+        });
+    }
+
+    raw_el.into_raw_unchecked()
+}
+
+/// Build a select (`<select>`) element with static options and change event.
+fn build_select(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    style: &IrExpr,
+    links: &[(String, EventId)],
+    options: &[(String, String)],
+    selected: Option<&IrExpr>,
+    hovered_cell: Option<CellId>,
+) -> RawElOrText {
+    let change_event = links
+        .iter()
+        .find(|(name, _)| name == "change")
+        .map(|(_, eid)| *eid);
+    let change_value_cell = find_data_cell_for_event(program, links, "change", "value");
+
+    let initial_selected = selected
+        .and_then(|s| match s {
+            IrExpr::Constant(IrValue::Text(t)) => Some(t.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let mut raw_el = RawHtmlEl::new("select");
+
+    // Build option children.
+    for (value, label) in options {
+        let opt = RawHtmlEl::new("option")
+            .attr("value", value)
+            .child(zoon::Text::new(label.clone()));
+        if *value == initial_selected {
+            raw_el = raw_el.child(opt.attr("selected", ""));
+        } else {
+            raw_el = raw_el.child(opt);
+        }
+    }
+
+    // Apply style.
+    raw_el = apply_raw_css(raw_el, style, program, instance, None, false);
+
+    // Handle hover.
+    if let Some(cell) = hovered_cell {
+        let inst = instance.clone();
+        raw_el = raw_el.event_handler(move |_: events::MouseEnter| {
+            inst.set_cell_value(cell.0, 1.0);
+        });
+        let inst = instance.clone();
+        raw_el = raw_el.event_handler(move |_: events::MouseLeave| {
+            inst.set_cell_value(cell.0, 0.0);
+        });
+    }
+
+    // Handle change event — dispatches `input` event to match Element/select convention.
+    if let Some(event_id) = change_event {
+        let inst = instance.clone();
+        raw_el = raw_el.event_handler(move |event: events::Input| {
+            if let Some(target) = event.target() {
+                // HtmlSelectElement feature not enabled in web_sys, so get value via js_sys.
+                let value_key = wasm_bindgen::JsValue::from_str("value");
+                if let Ok(val) = js_sys::Reflect::get(&target, &value_key) {
+                    let selected_value = val.as_string().unwrap_or_default();
+                    if let Some(cell_id) = change_value_cell {
+                        inst.cell_store.set_cell_text(cell_id, selected_value);
+                    }
+                }
+            }
+            let _ = inst.fire_event(event_id.0);
+        });
+    }
+
+    raw_el.into_raw_unchecked()
+}
+
+/// Build an SVG container element with click event carrying x/y coordinates.
+fn build_svg(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
+    style: &IrExpr,
+    children_cell: CellId,
+    links: &[(String, EventId)],
+    hovered_cell: Option<CellId>,
+) -> RawElOrText {
+    let click_event = links
+        .iter()
+        .find(|(name, _)| name == "click")
+        .map(|(_, eid)| *eid);
+    let click_x_cell = find_data_cell_for_event(program, links, "click", "x");
+    let click_y_cell = find_data_cell_for_event(program, links, "click", "y");
+
+    // Extract width/height/background from style.
+    let (width, height, background) = extract_svg_style(style, program);
+
+    let mut svg = RawSvgEl::new("svg")
+        .attr("width", &width.to_string())
+        .attr("height", &height.to_string())
+        .style("overflow", "visible");
+
+    if !background.is_empty() {
+        svg = svg.style("background", &background);
+    }
+
+    // Add SVG children (circles etc.).
+    let children = collect_svg_children(program, instance, ctx, children_cell);
+    for child in children {
+        svg = svg.child(child);
+    }
+
+    // Handle hover.
+    if let Some(cell) = hovered_cell {
+        let inst = instance.clone();
+        svg = svg.event_handler(move |_: events::MouseEnter| {
+            inst.set_cell_value(cell.0, 1.0);
+        });
+        let inst = instance.clone();
+        svg = svg.event_handler(move |_: events::MouseLeave| {
+            inst.set_cell_value(cell.0, 0.0);
+        });
+    }
+
+    // Handle click event with coordinates.
+    if let Some(event_id) = click_event {
+        let inst = instance.clone();
+        svg = svg.event_handler(move |event: events::Click| {
+            let x = f64::from(event.offset_x());
+            let y = f64::from(event.offset_y());
+            if let Some(cell_id) = click_x_cell {
+                inst.set_cell_value(cell_id, x);
+            }
+            if let Some(cell_id) = click_y_cell {
+                inst.set_cell_value(cell_id, y);
+            }
+            let _ = inst.fire_event(event_id.0);
+        });
+    }
+
+    svg.into_raw_unchecked()
+}
+
+/// Extract width, height, and background from an SVG style expression.
+fn extract_svg_style(style: &IrExpr, program: &IrProgram) -> (f64, f64, String) {
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match style {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
+        _ => return (300.0, 150.0, String::new()),
+    };
+    let mut width = 300.0;
+    let mut height = 150.0;
+    let mut background = String::new();
+    for (name, value) in fields {
+        match name.as_str() {
+            "width" => {
+                if let IrExpr::Constant(IrValue::Number(n)) = value {
+                    width = *n;
+                }
+            }
+            "height" => {
+                if let IrExpr::Constant(IrValue::Number(n)) = value {
+                    height = *n;
+                }
+            }
+            "background" => {
+                if let IrExpr::Constant(IrValue::Text(t)) = value {
+                    background = t.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    (width, height, background)
+}
+
+/// Collect SVG child elements from a children cell.
+fn collect_svg_children(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
+    children_cell: CellId,
+) -> Vec<RawElOrText> {
+    match find_node_for_cell(program, children_cell) {
+        Some(IrNode::Derived { expr, .. }) => match expr {
+            IrExpr::ListConstruct(items) => {
+                let mut children = Vec::new();
+                for item in items {
+                    if let IrExpr::CellRead(child_cell) = item {
+                        children.push(build_element(program, instance, ctx, *child_cell));
+                    }
+                }
+                children
+            }
+            IrExpr::CellRead(source) => collect_svg_children(program, instance, ctx, *source),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Build an SVG circle element.
+fn build_svg_circle(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    ctx: &BuildContext,
+    cx: &IrExpr,
+    cy: &IrExpr,
+    r: &IrExpr,
+    style: &IrExpr,
+) -> RawElOrText {
+    let cx_val = resolve_number_expr(cx, program, instance, ctx);
+    let cy_val = resolve_number_expr(cy, program, instance, ctx);
+    let r_val = resolve_number_expr(r, program, instance, ctx);
+
+    let (fill, stroke, stroke_width) = extract_svg_circle_style(style, program);
+
+    let mut circle = RawSvgEl::new("circle")
+        .attr("fill", &fill)
+        .attr("stroke", &stroke)
+        .attr("stroke-width", &stroke_width.to_string());
+
+    // Apply cx, cy, r — either static or reactive.
+    match cx_val {
+        NumberOrSignal::Static(v) => {
+            circle = circle.attr("cx", &v.to_string());
+        }
+        NumberOrSignal::Signal(cell_id) => {
+            let store = instance.cell_store.clone();
+            circle = circle.attr_signal(
+                "cx",
+                store
+                    .get_cell_signal(cell_id)
+                    .map(move |_| store.get_cell_value(cell_id).to_string()),
+            );
+        }
+    }
+    match cy_val {
+        NumberOrSignal::Static(v) => {
+            circle = circle.attr("cy", &v.to_string());
+        }
+        NumberOrSignal::Signal(cell_id) => {
+            let store = instance.cell_store.clone();
+            circle = circle.attr_signal(
+                "cy",
+                store
+                    .get_cell_signal(cell_id)
+                    .map(move |_| store.get_cell_value(cell_id).to_string()),
+            );
+        }
+    }
+    match r_val {
+        NumberOrSignal::Static(v) => {
+            circle = circle.attr("r", &v.to_string());
+        }
+        NumberOrSignal::Signal(cell_id) => {
+            let store = instance.cell_store.clone();
+            circle = circle.attr_signal(
+                "r",
+                store
+                    .get_cell_signal(cell_id)
+                    .map(move |_| store.get_cell_value(cell_id).to_string()),
+            );
+        }
+    }
+
+    circle.into_raw_unchecked()
+}
+
+/// Either a static number or a cell ID for a reactive signal.
+enum NumberOrSignal {
+    Static(f64),
+    Signal(u32),
+}
+
+/// Resolve a number expression to either a static value or a cell signal source.
+fn resolve_number_expr(
+    expr: &IrExpr,
+    _program: &IrProgram,
+    _instance: &Rc<WasmInstance>,
+    _ctx: &BuildContext,
+) -> NumberOrSignal {
+    match expr {
+        IrExpr::Constant(IrValue::Number(n)) => NumberOrSignal::Static(*n),
+        IrExpr::CellRead(cell) => NumberOrSignal::Signal(cell.0),
+        _ => NumberOrSignal::Static(0.0),
+    }
+}
+
+/// Extract fill, stroke, and stroke_width from an SVG circle style.
+fn extract_svg_circle_style(style: &IrExpr, program: &IrProgram) -> (String, String, f64) {
+    let reconstructed;
+    let fields: &[(String, IrExpr)] = match style {
+        IrExpr::ObjectConstruct(fields) => fields,
+        IrExpr::CellRead(cell) => {
+            reconstructed = reconstruct_object_fields(program, *cell);
+            &reconstructed
+        }
+        _ => return ("blue".into(), "none".into(), 0.0),
+    };
+    let mut fill = "blue".to_string();
+    let mut stroke = "none".to_string();
+    let mut stroke_width = 0.0;
+    for (name, value) in fields {
+        match name.as_str() {
+            "fill" => {
+                if let IrExpr::Constant(IrValue::Text(t)) = value {
+                    fill = t.clone();
+                }
+            }
+            "stroke" => {
+                if let IrExpr::Constant(IrValue::Text(t)) = value {
+                    stroke = t.clone();
+                }
+            }
+            "stroke_width" => {
+                if let IrExpr::Constant(IrValue::Number(n)) = value {
+                    stroke_width = *n;
+                }
+            }
+            _ => {}
+        }
+    }
+    (fill, stroke, stroke_width)
 }
 
 fn style_defines_font_color(style: &IrExpr, program: &IrProgram) -> bool {
@@ -2025,6 +2543,33 @@ fn build_list_map(
         }
     });
 
+    // Build a map: field_name → HOLD init source cell for each field in item_cell.
+    // This allows us to seed the correct text on the HOLD's source cell BEFORE
+    // init_item runs, so that host_copy_text propagates the right text through
+    // the entire template (including derived text interpolations like labels).
+    let field_hold_sources: HashMap<String, CellId> = program
+        .cell_field_cells
+        .get(&item_cell)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|(name, field_cell)| {
+                    // Find the Hold node for this field cell.
+                    program.nodes.iter().find_map(|node| {
+                        if let IrNode::Hold { cell, init, .. } = node {
+                            if *cell == *field_cell {
+                                if let IrExpr::CellRead(src) = init {
+                                    return Some((name.clone(), *src));
+                                }
+                            }
+                        }
+                        None
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Build a container that reactively re-renders children when the list changes.
     RawHtmlEl::new("div")
         .style("display", "contents")
@@ -2085,22 +2630,25 @@ fn build_list_map(
                         }
                     }
 
-                    // Copy item text to template-local namespace field cells.
-                    if let Some(ref ics) = inst.item_cell_store {
-                        if let Some(fields) = program.cell_field_cells.get(&item_cell) {
-                            let item_text = ics.get_text(item_idx, item_cell.0);
-                            if !item_text.is_empty() {
-                                for (_name, field_cell) in fields {
-                                    let in_range = field_cell.0 >= template_cell_range.0
-                                        && field_cell.0 < template_cell_range.1;
-                                    let is_namespace =
-                                        program.cell_field_cells.contains_key(field_cell);
-                                    if in_range
-                                        && !is_namespace
-                                        && (!has_pending_snapshot
-                                            || ics.get_text(item_idx, field_cell.0).is_empty())
-                                    {
-                                        ics.set_text(item_idx, field_cell.0, item_text.clone());
+                    // Seed HOLD source cells BEFORE init_item. For multi-field
+                    // objects (e.g., new_person with name + surname), the template's
+                    // HOLD inits copy text from param source cells via host_copy_text.
+                    // The first param is bound to item_cell (already seeded above).
+                    // Remaining params are bound to default (False) cells. We set
+                    // the correct per-field texts on those source cells so init_item
+                    // propagates them through the entire template, including derived
+                    // text interpolations (e.g., label = TEXT { {surname}, {name} }).
+                    if !initialized_indices.borrow().contains(&item_idx) {
+                        if let Some(ref ics) = inst.item_cell_store {
+                            let field_texts = inst.list_store.field_texts_for_mem_idx(item_idx);
+                            if !field_texts.is_empty() {
+                                for (name, source_cell) in &field_hold_sources {
+                                    if let Some(text) = field_texts.get(name) {
+                                        if !text.is_empty() {
+                                            // Set on ICS — init_item's host_copy_text
+                                            // reads template cells from ICS.
+                                            ics.set_text(item_idx, source_cell.0, text.clone());
+                                        }
                                     }
                                 }
                             }
@@ -2110,7 +2658,7 @@ fn build_list_map(
                     // Initialize per-item template cells for this ListMap.
                     // Only init NEW items — existing items keep their HOLD state
                     // (e.g. completed toggle) across re-renders.
-                    // Runs AFTER text seeding so host_copy_text can read item text.
+                    // Runs AFTER text seeding so host_copy_text reads correct texts.
                     if !initialized_indices.borrow().contains(&item_idx) {
                         let _ = inst.call_init_item(item_idx, map_cell.0);
                         initialized_indices.borrow_mut().insert(item_idx);
@@ -2491,6 +3039,54 @@ fn build_item_element_node(
             label,
             style,
             hovered_cell,
+        ),
+        ElementKind::Slider {
+            style,
+            value_cell,
+            min,
+            max,
+            step,
+        } => build_slider(
+            program,
+            instance,
+            style,
+            links,
+            *value_cell,
+            *min,
+            *max,
+            *step,
+            hovered_cell,
+        ),
+        ElementKind::Select {
+            style,
+            options,
+            selected,
+        } => build_select(
+            program,
+            instance,
+            style,
+            links,
+            options,
+            selected.as_ref(),
+            hovered_cell,
+        ),
+        ElementKind::Svg { style, children } => build_svg(
+            program,
+            instance,
+            &BuildContext::Item(ctx),
+            style,
+            *children,
+            links,
+            hovered_cell,
+        ),
+        ElementKind::SvgCircle { cx, cy, r, style } => build_svg_circle(
+            program,
+            instance,
+            &BuildContext::Item(ctx),
+            cx,
+            cy,
+            r,
+            style,
         ),
     };
     // Attach remaining event handlers (blur, focus, click, double_click, and hover for Checkbox/Link/Paragraph).
@@ -2989,6 +3585,9 @@ fn find_node_for_cell(program: &IrProgram, cell: CellId) -> Option<&IrNode> {
             | IrNode::RouterGoTo { cell: c, .. }
             | IrNode::TextTrim { cell: c, .. }
             | IrNode::TextIsNotEmpty { cell: c, .. }
+            | IrNode::TextToNumber { cell: c, .. }
+            | IrNode::MathRound { cell: c, .. }
+            | IrNode::TextStartsWith { cell: c, .. }
             | IrNode::HoldLoop { cell: c, .. } => {
                 if *c == cell {
                     return Some(node);

@@ -1,5 +1,5 @@
 -- 7GUIs Task 7: Cells (Spreadsheet)
--- 26 columns (A-Z) x 100 rows (1-100), row-major storage
+-- 10 columns (A-J) x 10 rows (1-10), row-major storage
 --
 -- Supported formulas:
 --   42            plain number
@@ -246,7 +246,7 @@ FUNCTION default_formula(column, row) {
 }
 
 FUNCTION make_row_cells(row, all_cells) {
-    List/range(from: 1, to: 26) |> List/map(old, new:
+    List/range(from: 1, to: 10) |> List/map(old, new:
         new_cell(
             initial_formula: default_formula(column: old, row: row)
             all_cells: all_cells
@@ -256,7 +256,7 @@ FUNCTION make_row_cells(row, all_cells) {
 
 -- ─── Store ────────────────────────────────────────────────────────
 
-cells: List/range(from: 1, to: 100) |> List/map(old, new:
+cells: List/range(from: 1, to: 10) |> List/map(old, new:
     make_row_cells(row: old, all_cells: cells)
 )
 
@@ -327,7 +327,7 @@ document: Document/new(root:
                     Element/label(element: [], style: [width: 40], label: TEXT {  })
                     Element/stripe(
                         element: [], direction: Row, gap: 0, style: []
-                        items: List/range(from: 1, to: 26) |> List/map(old, new:
+                        items: List/range(from: 1, to: 10) |> List/map(old, new:
                             Element/label(
                                 element: []
                                 style: [width: 80]
@@ -340,7 +340,7 @@ document: Document/new(root:
             Element/stripe(
                 element: [], direction: Column, gap: 0
                 style: [scrollbars: True, height: 500]
-                items: List/range(from: 1, to: 100) |> List/map(old, new:
+                items: List/range(from: 1, to: 10) |> List/map(old, new:
                     make_row(row_index: old)
                 )
             )

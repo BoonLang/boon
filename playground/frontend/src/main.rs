@@ -378,6 +378,8 @@ struct Playground {
     forced_preview_size: Mutable<Option<(u32, u32)>>,
     /// Whether the force size UI is expanded
     force_size_expanded: Mutable<bool>,
+    /// Whether persistence (localStorage state saving) is enabled
+    persistence_enabled: Mutable<bool>,
     /// Selected engine type (for engine-both feature)
     engine_type: Mutable<EngineType>,
     /// Cursor position in editor (line, column) — 1-based
@@ -661,6 +663,7 @@ impl Playground {
             _store_engine_type_task,
             _sync_source_to_files_task,
             _sync_source_to_custom_example_task,
+            persistence_enabled: Mutable::new(false),
             engine_type,
             cursor_position: Mutable::new((1, 1)),
         }
@@ -706,6 +709,7 @@ impl Playground {
                 let forced_preview_size = self.forced_preview_size.clone();
                 let panel_layout = self.panel_layout.clone();
                 let engine_type = self.engine_type.clone();
+                let persistence_enabled = self.persistence_enabled.clone();
                 move |raw_el| {
                     use wasm_bindgen::prelude::*;
                     use wasm_bindgen::JsCast;
@@ -1010,6 +1014,23 @@ impl Playground {
                     js_sys::Reflect::set(&api, &"selectExample".into(), select_example.as_ref()).ok();
                     select_example.forget();
 
+                    // setPersistence(enabled) - enable/disable localStorage persistence
+                    let persistence_enabled_for_set = persistence_enabled.clone();
+                    let set_persistence = Closure::wrap(Box::new(move |enabled: bool| -> bool {
+                        persistence_enabled_for_set.set(enabled);
+                        enabled
+                    }) as Box<dyn Fn(bool) -> bool>);
+                    js_sys::Reflect::set(&api, &"setPersistence".into(), set_persistence.as_ref()).ok();
+                    set_persistence.forget();
+
+                    // getPersistence() - get current persistence state
+                    let persistence_enabled_for_get = persistence_enabled.clone();
+                    let get_persistence = Closure::wrap(Box::new(move || -> bool {
+                        persistence_enabled_for_get.get()
+                    }) as Box<dyn Fn() -> bool>);
+                    js_sys::Reflect::set(&api, &"getPersistence".into(), get_persistence.as_ref()).ok();
+                    get_persistence.forget();
+
                     // Set window.boonPlayground
                     js_sys::Reflect::set(&window, &"boonPlayground".into(), &api).ok();
 
@@ -1296,6 +1317,7 @@ impl Playground {
             .item(self.engine_button_group())
             .item(El::new().s(Align::new().center_x()).child(self.run_button()))
             .item(self.force_size_controls())
+            .item(self.persistence_toggle_button())
             .item(El::new().s(Align::new().right()).child(self.clear_saved_states_button()))
     }
 
@@ -1833,6 +1855,60 @@ impl Playground {
             })
     }
 
+    fn persistence_toggle_button(&self) -> impl Element + use<> {
+        let hovered = Mutable::new(false);
+        let persistence_enabled = self.persistence_enabled.clone();
+        let persistence_enabled_for_label = self.persistence_enabled.clone();
+        let persistence_enabled_for_bg = self.persistence_enabled.clone();
+        let persistence_enabled_for_border = self.persistence_enabled.clone();
+        let persistence_enabled_for_font = self.persistence_enabled.clone();
+        Button::new()
+            .s(Padding::new().x(12).y(7))
+            .s(RoundedCorners::all(22))
+            .s(Borders::all_signal(
+                persistence_enabled_for_border.signal().map(|enabled| {
+                    if enabled {
+                        Border::new().color(color!("rgba(134, 255, 134, 0.45)")).width(1)
+                    } else {
+                        Border::new().color(color!("rgba(255, 255, 255, 0.2)")).width(1)
+                    }
+                })
+            ))
+            .s(Background::new().color_signal(map_ref! {
+                let enabled = persistence_enabled_for_bg.signal(),
+                let hovered = hovered.signal() =>
+                {
+                    match (*enabled, *hovered) {
+                        (true, true) => color!("rgba(134, 255, 134, 0.15)"),
+                        (true, false) => color!("rgba(134, 255, 134, 0.08)"),
+                        (false, true) => color!("rgba(255, 255, 255, 0.08)"),
+                        (false, false) => color!("rgba(255, 255, 255, 0.04)"),
+                    }
+                }
+            }))
+            .s(Font::new()
+                .size(13)
+                .weight(FontWeight::Medium)
+                .color_signal(persistence_enabled_for_font.signal().map(|enabled| {
+                    if enabled {
+                        color!("rgba(134, 255, 134, 0.95)")
+                    } else {
+                        color!("rgba(255, 255, 255, 0.6)")
+                    }
+                })))
+            .label(
+                El::new()
+                    .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
+                    .child_signal(persistence_enabled_for_label.signal().map(|enabled| {
+                        if enabled { "Persistence: On" } else { "Persistence: Off" }
+                    })),
+            )
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+            .on_press(move || {
+                persistence_enabled.update(|enabled| !enabled);
+            })
+    }
+
     fn clear_saved_states_button(&self) -> impl Element {
         let hovered = Mutable::new(false);
         Button::new()
@@ -2363,6 +2439,7 @@ impl Playground {
         let filename = run_command.filename.unwrap_or(&current_file_name);
         let source_code = self.source_code.lock_ref();
         let engine_type = self.engine_type.get();
+        let persistence_enabled = self.persistence_enabled.get();
 
         // Check which engine to use
         #[cfg(feature = "engine-wasm")]
@@ -2380,10 +2457,11 @@ impl Playground {
             let external_fns = parse_module_files(&files, filename);
             let ext = if external_fns.is_empty() { None } else { Some(external_fns.as_slice()) };
             // Run with DD engine (reactive evaluation)
+            let dd_storage_key = if persistence_enabled { Some(STATES_STORAGE_KEY) } else { None };
             let result = run_dd_reactive_with_persistence(
                 filename,
                 &source_code,
-                Some(STATES_STORAGE_KEY),
+                dd_storage_key,
                 ext,
             );
             drop(source_code);
@@ -2440,10 +2518,11 @@ impl Playground {
         // We keep reference_connector and link_connector alive to preserve all actors.
         // Dropping them (via after_remove) will trigger cleanup of all actors.
         let registry = if module_registry.is_empty() { None } else { Some(module_registry) };
+        let actors_storage_key = if persistence_enabled { STATES_STORAGE_KEY } else { "" };
         let evaluation_result = interpreter::run_with_registry(
             filename,
             &source_code,
-            STATES_STORAGE_KEY,
+            actors_storage_key,
             OLD_SOURCE_CODE_STORAGE_KEY,
             OLD_SPAN_ID_PAIRS_STORAGE_KEY,
             virtual_fs,
@@ -3187,5 +3266,3 @@ fn force_size_toggle_button(force_size_expanded: Mutable<bool>) -> impl Element 
             force_size_expanded.set(true);
         })
 }
-
-

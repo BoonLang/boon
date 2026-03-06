@@ -202,6 +202,15 @@ pub enum Command {
         engine: String,
     },
 
+    /// Get the current persistence state (enabled/disabled)
+    GetPersistence,
+
+    /// Set the persistence state (enable/disable localStorage state saving)
+    SetPersistence {
+        /// Whether to enable persistence
+        enabled: bool,
+    },
+
     /// Evaluate arbitrary JavaScript in the page context via CDP Runtime.evaluate
     EvalJs {
         /// JavaScript expression to evaluate

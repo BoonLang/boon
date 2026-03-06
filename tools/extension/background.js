@@ -2510,6 +2510,48 @@ async function handleCommand(id, command) {
           return { type: 'error', message: 'SetEngine failed: ' + e.message };
         }
 
+      case 'getPersistence':
+        // Get persistence state from boonPlayground API
+        try {
+          const persistResult = await cdpEvaluate(tab.id, `
+            (function() {
+              if (typeof window.boonPlayground === 'undefined' ||
+                  typeof window.boonPlayground.getPersistence !== 'function') {
+                return { error: 'getPersistence API not available' };
+              }
+              return { enabled: window.boonPlayground.getPersistence() };
+            })()
+          `);
+          if (persistResult && persistResult.error) {
+            return { type: 'error', message: persistResult.error };
+          }
+          return { type: 'success', data: { enabled: persistResult.enabled } };
+        } catch (e) {
+          return { type: 'error', message: 'GetPersistence failed: ' + e.message };
+        }
+
+      case 'setPersistence':
+        // Set persistence state via boonPlayground API
+        try {
+          const enabledVal = command.enabled ? 'true' : 'false';
+          const setPersistResult = await cdpEvaluate(tab.id, `
+            (function() {
+              if (typeof window.boonPlayground === 'undefined' ||
+                  typeof window.boonPlayground.setPersistence !== 'function') {
+                return { error: 'setPersistence API not available' };
+              }
+              const result = window.boonPlayground.setPersistence(${enabledVal});
+              return { enabled: result };
+            })()
+          `);
+          if (setPersistResult && setPersistResult.error) {
+            return { type: 'error', message: setPersistResult.error };
+          }
+          return { type: 'success', data: { enabled: setPersistResult.enabled } };
+        } catch (e) {
+          return { type: 'error', message: 'SetPersistence failed: ' + e.message };
+        }
+
       case 'getElementStyle':
         // Get computed CSS styles of an element found by text content
         try {

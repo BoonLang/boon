@@ -382,6 +382,10 @@ enum ExecAction {
         /// Never launch browser automatically; require an existing connected extension
         #[arg(long)]
         no_launch: bool,
+
+        /// Engine to test against: Actors, DD, or Wasm (default: use current engine)
+        #[arg(long)]
+        engine: Option<String>,
     },
 
     /// Smoke-run all built-in playground examples from EXAMPLE_DATAS
@@ -416,6 +420,21 @@ enum ExecAction {
     SetEngine {
         /// Engine to use: "Actors", "DD", or "Wasm"
         engine: String,
+    },
+
+    /// Control persistence (localStorage state saving)
+    Persistence {
+        /// Enable persistence
+        #[clap(long)]
+        enable: bool,
+
+        /// Disable persistence
+        #[clap(long)]
+        disable: bool,
+
+        /// Show current persistence status
+        #[clap(long)]
+        status: bool,
     },
 
     /// Get the currently focused element in the preview panel
@@ -998,8 +1017,19 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             verbose,
             examples_dir,
             no_launch,
+            engine,
         } => {
             use commands::test_examples::{run_tests, TestOptions};
+
+            // Validate engine if provided
+            if let Some(ref eng) = engine {
+                if eng != "Actors" && eng != "DD" && eng != "Wasm" {
+                    anyhow::bail!(
+                        "Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'",
+                        eng
+                    );
+                }
+            }
 
             let opts = TestOptions {
                 port,
@@ -1010,6 +1040,7 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                 verbose,
                 examples_dir,
                 no_launch,
+                engine,
             };
 
             let results = run_tests(opts).await?;
@@ -1089,6 +1120,40 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                     }
                 }
                 _ => print_response(response),
+            }
+        }
+
+        ExecAction::Persistence { enable, disable, status } => {
+            if enable {
+                let response = send_command_to_server(port, WsCommand::SetPersistence { enabled: true }).await?;
+                match response {
+                    WsResponse::Success { data } => {
+                        println!("Persistence: enabled");
+                    }
+                    _ => print_response(response),
+                }
+            } else if disable {
+                let response = send_command_to_server(port, WsCommand::SetPersistence { enabled: false }).await?;
+                match response {
+                    WsResponse::Success { data } => {
+                        println!("Persistence: disabled");
+                    }
+                    _ => print_response(response),
+                }
+            } else {
+                // Default: --status or no flag
+                let response = send_command_to_server(port, WsCommand::GetPersistence).await?;
+                match response {
+                    WsResponse::Success { data } => {
+                        if let Some(d) = data {
+                            let enabled = d.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                            println!("Persistence: {}", if enabled { "enabled" } else { "disabled" });
+                        } else {
+                            println!("Persistence: unknown");
+                        }
+                    }
+                    _ => print_response(response),
+                }
             }
         }
 

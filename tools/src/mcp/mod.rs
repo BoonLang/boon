@@ -664,6 +664,29 @@ fn get_tools() -> Vec<Tool> {
                 "required": ["engine"]
             }),
         },
+        Tool {
+            name: "boon_get_persistence".to_string(),
+            description: "Get the current persistence state. Returns whether localStorage state saving is enabled or disabled.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        Tool {
+            name: "boon_set_persistence".to_string(),
+            description: "Enable or disable localStorage persistence for Boon playground state. When disabled, HOLD state values are not saved/restored from localStorage.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "true to enable persistence, false to disable"
+                    }
+                },
+                "required": ["enabled"]
+            }),
+        },
     ]
 }
 
@@ -1078,6 +1101,16 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
                 return Err(format!("Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'", engine));
             }
             Command::SetEngine { engine }
+        }
+
+        "boon_get_persistence" => Command::GetPersistence,
+
+        "boon_set_persistence" => {
+            let enabled = args
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .ok_or("enabled parameter required (boolean)")?;
+            Command::SetPersistence { enabled }
         }
 
         _ => return Err(format!("Unknown tool: {}", name)),

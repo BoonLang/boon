@@ -4,7 +4,7 @@
 //! functions, and exposes a `fire_event` API for the bridge to call.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use js_sys::{Object, Reflect, Uint8Array, WebAssembly};
@@ -19,6 +19,10 @@ use super::persistence;
 extern "C" {
     #[wasm_bindgen(js_name = setInterval)]
     fn js_set_interval(handler: &js_sys::Function, timeout: i32) -> f64;
+
+    #[allow(dead_code)]
+    #[wasm_bindgen(js_namespace = console, js_name = log)]
+    fn console_log(s: &str);
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +121,10 @@ struct ListStoreInner {
     lists: RefCell<Vec<Vec<f64>>>,
     /// Text items stored separately (parallel to `lists`).
     text_lists: RefCell<Vec<Vec<String>>>,
+    /// Per-field texts keyed by memory index (stable across retain/filter).
+    /// Populated during list construction for objects with multiple text fields
+    /// (e.g., new_person with name + surname).
+    field_texts_by_mem_idx: RefCell<HashMap<u32, HashMap<String, String>>>,
     /// Version counter per list, incremented on each mutation.
     /// Used to trigger reactive updates.
     versions: RefCell<Vec<Mutable<f64>>>,
@@ -136,6 +144,7 @@ impl ListStore {
             inner: Rc::new(ListStoreInner {
                 lists: RefCell::new(Vec::new()),
                 text_lists: RefCell::new(Vec::new()),
+                field_texts_by_mem_idx: RefCell::new(HashMap::new()),
                 versions: RefCell::new(Vec::new()),
                 index_based: RefCell::new(Vec::new()),
                 next_memory_index: RefCell::new(Vec::new()),
@@ -229,6 +238,25 @@ impl ListStore {
         if let Some(ver) = versions.get(idx) {
             ver.set(ver.get() + 1.0);
         }
+    }
+
+    /// Store field texts keyed by memory index.
+    /// Called after `append_text` to store per-field texts for structured objects.
+    pub fn store_field_texts(&self, mem_idx: u32, fields: HashMap<String, String>) {
+        self.inner
+            .field_texts_by_mem_idx
+            .borrow_mut()
+            .insert(mem_idx, fields);
+    }
+
+    /// Get the field texts for a specific item by memory index.
+    pub fn field_texts_for_mem_idx(&self, mem_idx: u32) -> HashMap<String, String> {
+        self.inner
+            .field_texts_by_mem_idx
+            .borrow()
+            .get(&mem_idx)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Append an f64 item with the next available memory index.
@@ -1090,6 +1118,77 @@ impl WasmInstance {
         .map_err(|e| format!("Failed to set host_text_is_not_empty: {:?}", e))?;
         text_is_not_empty.forget();
 
+        // host_text_to_number(src_cell: i32, nan_tag_value: f64) -> f64
+        // Parses text from src_cell as f64. Returns the number if valid,
+        // or nan_tag_value (tag index for "NaN") if parsing fails.
+        // Dual-mode: reads from ItemCellStore when item context is active.
+        let cs_clone = cell_store.clone();
+        let ics_clone = item_cell_store.clone();
+        let text_to_number =
+            Closure::wrap(Box::new(move |src_cell: i32, nan_tag_value: f64| -> f64 {
+                let item_ctx = CURRENT_ITEM_CTX.with(|c| c.get());
+                let text = if let (Some(item_idx), Some(ics)) = (item_ctx, &ics_clone) {
+                    if ics.is_template_cell(src_cell as u32) {
+                        ics.get_text(item_idx, src_cell as u32)
+                    } else {
+                        cs_clone.get_cell_text(src_cell as u32)
+                    }
+                } else {
+                    cs_clone.get_cell_text(src_cell as u32)
+                };
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return nan_tag_value;
+                }
+                match trimmed.parse::<f64>() {
+                    Ok(n) if n.is_finite() => n,
+                    _ => nan_tag_value,
+                }
+            }) as Box<dyn FnMut(i32, f64) -> f64>);
+        Reflect::set(
+            &env,
+            &"host_text_to_number".into(),
+            text_to_number.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_text_to_number: {:?}", e))?;
+        text_to_number.forget();
+
+        // host_text_starts_with(source_cell: i32, prefix_cell: i32) -> f64
+        // Returns 1.0 if text in source_cell starts with text in prefix_cell, else 0.0.
+        // Dual-mode: reads from ItemCellStore when item context is active.
+        let cs_clone = cell_store.clone();
+        let ics_clone = item_cell_store.clone();
+        let text_starts_with =
+            Closure::wrap(Box::new(move |source_cell: i32, prefix_cell: i32| -> f64 {
+                let item_ctx = CURRENT_ITEM_CTX.with(|c| c.get());
+                let source_text = if let (Some(item_idx), Some(ics)) = (item_ctx, &ics_clone) {
+                    if ics.is_template_cell(source_cell as u32) {
+                        ics.get_text(item_idx, source_cell as u32)
+                    } else {
+                        cs_clone.get_cell_text(source_cell as u32)
+                    }
+                } else {
+                    cs_clone.get_cell_text(source_cell as u32)
+                };
+                let prefix_text = if let (Some(item_idx), Some(ics)) = (item_ctx, &ics_clone) {
+                    if ics.is_template_cell(prefix_cell as u32) {
+                        ics.get_text(item_idx, prefix_cell as u32)
+                    } else {
+                        cs_clone.get_cell_text(prefix_cell as u32)
+                    }
+                } else {
+                    cs_clone.get_cell_text(prefix_cell as u32)
+                };
+                if source_text.starts_with(&prefix_text) { 1.0 } else { 0.0 }
+            }) as Box<dyn FnMut(i32, i32) -> f64>);
+        Reflect::set(
+            &env,
+            &"host_text_starts_with".into(),
+            text_starts_with.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| format!("Failed to set host_text_starts_with: {:?}", e))?;
+        text_starts_with.forget();
+
         // host_copy_text(dest_cell: i32, src_cell: i32)
         // Dual-mode: routes to ItemCellStore when item context is active.
         let cs_clone = cell_store.clone();
@@ -1129,7 +1228,13 @@ impl WasmInstance {
                     return;
                 }
             }
-            cs_clone.set_cell_text(dest_cell as u32, src_text);
+            // Only propagate text_initialized if the source actually had text set.
+            // Without this guard, copying from a pure-numeric cell (e.g., MathRound)
+            // poisons the dest with empty text, causing host_text_build_cell to return
+            // "" instead of formatting the f64 value.
+            if cs_clone.has_text(src_u32) {
+                cs_clone.set_cell_text(dest_cell as u32, src_text);
+            }
         }) as Box<dyn FnMut(i32, i32)>);
         Reflect::set(
             &env,
@@ -1147,14 +1252,34 @@ impl WasmInstance {
         // f64 items and text items in sync for correct count() results.
         let ls_clone = list_store.clone();
         let cs_clone = cell_store.clone();
+        let prog_clone = program.clone();
         let list_append_text =
             Closure::wrap(Box::new(move |list_cell_id: i32, item_cell_id: i32| {
                 let list_id = cs_clone.get_cell_value(list_cell_id as u32);
                 let text = cs_clone.get_cell_text(item_cell_id as u32);
-                ls_clone.append_text(list_id, text);
+                ls_clone.append_text(list_id, text.clone());
                 // For index-based lists, also add an f64 item with the next memory index
                 // to keep f64 items and text items in sync.
                 ls_clone.append_with_next_memory_index(list_id);
+                // The memory index for this item is position-based (sequential
+                // during initial construction). Use text_items count - 1.
+                let mem_idx = ls_clone.items_text(list_id).len().saturating_sub(1) as u32;
+                // Capture per-field texts for structured objects (e.g., new_person
+                // with name + surname). Keyed by memory index so they survive
+                // retain/filter operations that create derived lists.
+                let item_cell = super::ir::CellId(item_cell_id as u32);
+                if let Some(fields) = prog_clone.cell_field_cells.get(&item_cell) {
+                    let mut field_texts = HashMap::new();
+                    for (name, field_cell) in fields {
+                        let ft = cs_clone.get_cell_text(field_cell.0);
+                        if !ft.is_empty() {
+                            field_texts.insert(name.clone(), ft);
+                        }
+                    }
+                    if !field_texts.is_empty() {
+                        ls_clone.store_field_texts(mem_idx, field_texts);
+                    }
+                }
             }) as Box<dyn FnMut(i32, i32)>);
         Reflect::set(
             &env,
@@ -1205,7 +1330,14 @@ impl WasmInstance {
                 let item_ctx = CURRENT_ITEM_CTX.with(|c| c.get());
                 if let (Some(item_idx), Some(ics)) = (item_ctx, &ics_clone) {
                     if ics.is_template_cell(cell_id as u32) {
-                        ics.set_text(item_idx, cell_id as u32, pattern.clone());
+                        // Don't overwrite bridge-seeded text. The bridge
+                        // seeds per-field texts on HOLD source cells before
+                        // init_item. Default-param Derived nodes (which run
+                        // first in program order) would overwrite those
+                        // seeds with "False". Skip if ICS already has text.
+                        if !ics.has_text(item_idx, cell_id as u32) {
+                            ics.set_text(item_idx, cell_id as u32, pattern.clone());
+                        }
                         return;
                     }
                 }

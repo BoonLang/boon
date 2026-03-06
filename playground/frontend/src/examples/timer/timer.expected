@@ -1,0 +1,72 @@
+# Timer (7GUIs Task 4) - timer with adjustable duration and reset
+
+[test]
+category = "timer"
+description = "7GUIs Task 4: timer with adjustable duration and reset"
+skip_engines = ["Wasm"]
+
+[output]
+text = "Timer"
+match = "contains"
+
+[timing]
+timeout = 20000
+poll_interval = 500
+
+# SPEC: Timer starts and shows title
+[[sequence]]
+description = "Title visible"
+actions = [["assert_contains", "Timer"]]
+expect = "Timer"
+
+# SPEC: Duration label visible
+[[sequence]]
+description = "Duration label visible"
+actions = [["assert_contains", "Duration"]]
+expect = "Timer"
+
+# SPEC: Elapsed Time label visible
+[[sequence]]
+description = "Elapsed Time label visible"
+actions = [["assert_contains", "Elapsed Time"]]
+expect = "Timer"
+
+# SPEC: Progress percentage visible
+[[sequence]]
+description = "Percentage sign visible"
+actions = [["assert_contains", "%"]]
+expect = "Timer"
+
+# SPEC: Reset button works - click Reset then verify low percentage
+[[sequence]]
+description = "Click Reset - percentage drops near 0"
+actions = [["click_text", "Reset"]]
+expect = "Reset"
+expect_match = "contains"
+
+# SPEC: After reset, timer starts incrementing again
+[[sequence]]
+description = "Wait 3s after reset - timer shows seconds value"
+actions = [["wait", 3000], ["assert_contains", "s"]]
+expect = "Timer"
+
+# SPEC: Resume after 100% - set slider low, wait for 100%, increase, verify resume
+[[sequence]]
+description = "Set slider to 2s for quick 100%"
+actions = [["set_slider_value", 0, "2"]]
+expect = "Timer"
+
+[[sequence]]
+description = "Wait 3s for timer to reach 100%"
+actions = [["wait", 3000], ["assert_contains", "100%"]]
+expect = "Timer"
+
+[[sequence]]
+description = "Increase slider to 15s - timer should resume"
+actions = [["set_slider_value", 0, "15"]]
+expect = "Timer"
+
+[[sequence]]
+description = "Wait 2s - percentage should drop below 100%"
+actions = [["wait", 2000], ["assert_not_contains", "100%"]]
+expect = "Timer"

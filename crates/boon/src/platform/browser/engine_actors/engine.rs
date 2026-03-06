@@ -29,6 +29,16 @@ use zoon::{WebStorage, local_storage};
 use smallvec::SmallVec;
 use std::cell::Cell;
 
+// --- Live Actor Count (always-on, not behind feature flag) ---
+// Used to detect actor leaks when switching examples.
+thread_local! {
+    static LIVE_ACTOR_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+pub fn live_actor_count() -> u64 {
+    LIVE_ACTOR_COUNT.with(|c| c.get())
+}
+
 // --- Performance Metrics ---
 //
 // Compile-time instrumentation counters for profiling the actors engine.
@@ -1706,12 +1716,17 @@ impl ConstructStorage {
             state_inserter_sender,
             state_getter_sender,
             actor_loop: ActorLoop::new(async move {
-                let mut states: BTreeMap<String, serde_json::Value> = match local_storage()
-                    .get::<BTreeMap<String, serde_json::Value>>(&states_local_storage_key)
-                {
-                    None => BTreeMap::new(),
-                    Some(Ok(states)) => states,
-                    Some(Err(error)) => panic!("Failed to deserialize states: {error:#}"),
+                let persistence_disabled = states_local_storage_key.is_empty();
+                let mut states: BTreeMap<String, serde_json::Value> = if persistence_disabled {
+                    BTreeMap::new()
+                } else {
+                    match local_storage()
+                        .get::<BTreeMap<String, serde_json::Value>>(&states_local_storage_key)
+                    {
+                        None => BTreeMap::new(),
+                        Some(Ok(states)) => states,
+                        Some(Err(error)) => panic!("Failed to deserialize states: {error:#}"),
+                    }
                 };
                 let mut dirty = false;
                 loop {
@@ -1724,10 +1739,13 @@ impl ConstructStorage {
                             states.insert(key, json_value);
                         }
                         inc_metric!(PERSISTENCE_WRITES);
-                        if let Err(error) =
-                            local_storage().insert(&states_local_storage_key, &states)
-                        {
-                            zoon::eprintln!("Failed to save states: {error:#}");
+                        // Skip localStorage write when persistence is disabled
+                        if !persistence_disabled {
+                            if let Err(error) =
+                                local_storage().insert(&states_local_storage_key, &states)
+                            {
+                                zoon::eprintln!("Failed to save states: {error:#}");
+                            }
                         }
                         dirty = false;
                     }
@@ -1982,9 +2000,15 @@ impl ScopeDestroyGuard {
 impl Drop for ScopeDestroyGuard {
     fn drop(&mut self) {
         if let Some(scope_id) = self.scope_id {
+            let before = live_actor_count();
             REGISTRY.with(|reg| {
                 reg.borrow_mut().destroy_scope(scope_id);
             });
+            let after = live_actor_count();
+            zoon::println!(
+                "[actors] ScopeDestroyGuard: destroyed scope {:?}, actors {} → {} (freed {})",
+                scope_id, before, after, before - after
+            );
         }
     }
 }
@@ -4035,6 +4059,7 @@ struct ChannelKeepalive {
 impl Drop for OwnedActor {
     fn drop(&mut self) {
         inc_metric!(ACTORS_DROPPED);
+        LIVE_ACTOR_COUNT.with(|c| c.set(c.get() - 1));
     }
 }
 
@@ -4467,6 +4492,7 @@ fn create_actor_arc_info<S: Stream<Item = Value> + 'static>(
     scope_id: ScopeId,
 ) -> ActorHandle {
     inc_metric!(ACTORS_CREATED);
+    LIVE_ACTOR_COUNT.with(|c| c.set(c.get() + 1));
     let (message_sender, message_receiver) =
         NamedChannel::new("value_actor.messages", VALUE_ACTOR_MESSAGE_CAPACITY);
     let current_version = Arc::new(AtomicU64::new(0));
@@ -4703,6 +4729,7 @@ pub fn create_actor_with_initial_value<S: Stream<Item = Value> + 'static>(
     scope_id: ScopeId,
 ) -> ActorHandle {
     inc_metric!(ACTORS_CREATED);
+    LIVE_ACTOR_COUNT.with(|c| c.set(c.get() + 1));
     let value_stream = value_stream.inner;
     let construct_info = Arc::new(construct_info.complete(ConstructType::ValueActor));
     let (message_sender, message_receiver) =
@@ -4926,6 +4953,7 @@ pub fn create_actor_lazy<S: Stream<Item = Value> + 'static>(
     scope_id: ScopeId,
 ) -> ActorHandle {
     inc_metric!(ACTORS_CREATED);
+    LIVE_ACTOR_COUNT.with(|c| c.set(c.get() + 1));
     let lazy_actor = Arc::new(LazyValueActor::new(construct_info.clone(), value_stream));
 
     let construct_info = Arc::new(construct_info);

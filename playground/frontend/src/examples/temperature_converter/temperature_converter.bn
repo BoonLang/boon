@@ -1,8 +1,25 @@
 -- Temperature Converter (7GUIs Task 2)
 -- Two text inputs with bidirectional Celsius/Fahrenheit conversion.
+-- Store-level HOLD captures raw text from each input, enabling
+-- both Actors and DD engines to handle event data flow.
 
 store: [
     elements: [celsius_input: LINK, fahrenheit_input: LINK]
+
+    celsius_raw: Text/empty() |> HOLD state {
+        elements.celsius_input.event.change.text
+    }
+
+    fahrenheit_raw: Text/empty() |> HOLD state {
+        elements.fahrenheit_input.event.change.text
+    }
+
+    last_edited: None |> HOLD state {
+        LATEST {
+            elements.celsius_input.event.change.text |> THEN { Celsius }
+            elements.fahrenheit_input.event.change.text |> THEN { Fahrenheit }
+        }
+    }
 ]
 
 document: Document/new(root: root_element(PASS: [store: store]))
@@ -26,73 +43,58 @@ FUNCTION root_element() {
 }
 
 FUNCTION converter_row() {
-    Element/stripe(
-        element: []
-        direction: Row
-        gap: 10
-        style: []
+    BLOCK {
+        store: PASSED.store
 
-        items: LIST {
-            celsius_input() |> LINK { PASSED.store.elements.celsius_input }
-            Element/label(element: [], style: [], label: TEXT { Celsius = })
-            fahrenheit_input() |> LINK { PASSED.store.elements.fahrenheit_input }
-            Element/label(element: [], style: [], label: TEXT { Fahrenheit })
-        }
-    )
-}
-
-FUNCTION celsius_input() {
-    Element/text_input(
-        element: [event: [change: LINK]]
-        style: []
-        label: Hidden[text: TEXT { Celsius }]
-
-        text: LATEST {
-            Text/empty()
-            element.event.change.text
-            PASSED.store.elements.fahrenheit_input.event.change.text |> THEN {
-                BLOCK {
-                    fahrenheit: PASSED.store.elements.fahrenheit_input.text |> Text/to_number()
-                    fahrenheit |> WHEN {
-                        NaN => SKIP
-                        number => BLOCK {
-                            converted: (number - 32) * 5 / 9 |> Math/round()
-                            TEXT { {converted} }
-                        }
-                    }
+        celsius_text: store.last_edited |> WHILE {
+            Fahrenheit => store.fahrenheit_raw |> Text/to_number() |> WHILE {
+                NaN => store.celsius_raw
+                number => BLOCK {
+                    converted: (number - 32) * 5 / 9 |> Math/round()
+                    TEXT { {converted} }
                 }
             }
+            __ => store.celsius_raw
         }
 
-        placeholder: [text: TEXT { Celsius }]
-        focus: False
-    )
-}
-
-FUNCTION fahrenheit_input() {
-    Element/text_input(
-        element: [event: [change: LINK]]
-        style: []
-        label: Hidden[text: TEXT { Fahrenheit }]
-
-        text: LATEST {
-            Text/empty()
-            element.event.change.text
-            PASSED.store.elements.celsius_input.event.change.text |> THEN {
-                BLOCK {
-                    celsius: PASSED.store.elements.celsius_input.text |> Text/to_number()
-                    celsius |> WHEN {
-                        NaN => SKIP
-                        number => BLOCK {
-                            converted: number * 9 / 5 + 32 |> Math/round()
-                            TEXT { {converted} }
-                        }
-                    }
+        fahrenheit_text: store.last_edited |> WHILE {
+            Celsius => store.celsius_raw |> Text/to_number() |> WHILE {
+                NaN => store.fahrenheit_raw
+                number => BLOCK {
+                    converted: number * 9 / 5 + 32 |> Math/round()
+                    TEXT { {converted} }
                 }
             }
+            __ => store.fahrenheit_raw
         }
 
-        placeholder: [text: TEXT { Fahrenheit }]
-        focus: False
-    )
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: [align: [cross: Center]]
+
+            items: LIST {
+                Element/text_input(
+                    element: [event: [change: LINK]]
+                    style: [width: 120]
+                    label: Hidden[text: TEXT { Celsius }]
+                    text: celsius_text
+                    placeholder: [text: TEXT { Celsius }]
+                    focus: False
+                ) |> LINK { PASSED.store.elements.celsius_input }
+                Element/label(element: [], style: [], label: TEXT { Celsius })
+                Element/label(element: [], style: [], label: TEXT { = })
+                Element/text_input(
+                    element: [event: [change: LINK]]
+                    style: [width: 120]
+                    label: Hidden[text: TEXT { Fahrenheit }]
+                    text: fahrenheit_text
+                    placeholder: [text: TEXT { Fahrenheit }]
+                    focus: False
+                ) |> LINK { PASSED.store.elements.fahrenheit_input }
+                Element/label(element: [], style: [], label: TEXT { Fahrenheit })
+            }
+        )
+    }
 }

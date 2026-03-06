@@ -1,6 +1,8 @@
 -- Timer (7GUIs Task 4)
 -- Elapsed time gauge, numeric display, adjustable duration, reset.
 
+tick: Duration[milliseconds: 100] |> Timer/interval()
+
 store: [
     elements: [
         duration_slider: LINK
@@ -11,34 +13,27 @@ store: [
         elements.duration_slider.event.change.value
     }
 
-    elapsed: 0 |> HOLD state {
+    -- Raw elapsed: increments on tick, reset sets to 0.
+    -- Capped by Math/min in `elapsed` for display.
+    raw_elapsed: 0 |> HOLD state {
         LATEST {
-            tick |> THEN {
-                state < max_duration |> WHEN {
-                    True => BLOCK {
-                        next: state + 0.1
-                        next |> Math/min(b: max_duration)
-                    }
-                    __ => SKIP
-                }
-            }
+            tick |> THEN { state + 0.1 }
             elements.reset_button.event.press |> THEN { 0 }
         }
     }
 
+    -- Capped elapsed for display (never exceeds max_duration)
+    elapsed: raw_elapsed |> Math/min(b: max_duration)
+
     -- Display value: round to 1 decimal place
-    elapsed_display: BLOCK {
-        tenths: elapsed * 10 |> Math/round()
-        tenths / 10
-    }
+    elapsed_tenths: elapsed * 10 |> Math/round()
+    elapsed_display: elapsed_tenths / 10
 
     -- Progress percentage (0 to 100)
     progress_percent: elapsed / max_duration * 100
         |> Math/min(b: 100)
         |> Math/round()
 ]
-
-tick: Duration[milliseconds: 100] |> Timer/interval()
 
 document: Document/new(root: root_element(PASS: [store: store]))
 

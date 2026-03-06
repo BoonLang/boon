@@ -1,0 +1,33 @@
+# Circle Drawer (7GUIs Task 6) - circle drawer with undo
+
+[test]
+category = "interactive"
+description = "7GUIs Task 6: circle drawer with undo"
+skip_engines = []
+
+[output]
+text = "Circles: 0"
+match = "contains"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+# SPEC: Initial state - no circles
+[[sequence]]
+description = "Initial: 0 circles"
+actions = [["assert_contains", "Circles: 0"]]
+expect = "Circle Drawer"
+
+# SPEC: Undo button visible
+[[sequence]]
+description = "Undo button visible"
+actions = [["assert_contains", "Undo"]]
+expect = "Circle Drawer"
+
+# SPEC: Click Undo with no circles (should be no-op)
+[[sequence]]
+description = "Undo with 0 circles - still 0"
+actions = [["click_text", "Undo"]]
+expect = "Circles: 0"
+expect_match = "contains"

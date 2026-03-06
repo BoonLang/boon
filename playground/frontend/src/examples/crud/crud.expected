@@ -1,0 +1,125 @@
+# CRUD (7GUIs Task 5) - CRUD with filter, create, update, delete
+
+[test]
+category = "interactive"
+description = "7GUIs Task 5: CRUD with filter, create, update, delete"
+skip_engines = ["DD", "Wasm"]
+
+[output]
+text = "Emil"
+match = "contains"
+
+[timing]
+timeout = 8000
+poll_interval = 200
+
+# SPEC: Initial state - 3 people
+[[sequence]]
+description = "Initial: Emil listed"
+actions = [["assert_contains", "Emil"]]
+expect = "CRUD"
+
+[[sequence]]
+description = "Initial: Mustermann listed"
+actions = [["assert_contains", "Mustermann"]]
+expect = "CRUD"
+
+[[sequence]]
+description = "Initial: Tansen listed"
+actions = [["assert_contains", "Tansen"]]
+expect = "CRUD"
+
+# SPEC: All 3 initial people visible
+[[sequence]]
+description = "Initial: Hans listed"
+actions = [["assert_contains", "Hans"]]
+expect = "CRUD"
+
+# SPEC: Create button visible
+[[sequence]]
+description = "Create button visible"
+actions = [["assert_contains", "Create"]]
+expect = "CRUD"
+
+# SPEC: Update button visible
+[[sequence]]
+description = "Update button visible"
+actions = [["assert_contains", "Update"]]
+expect = "CRUD"
+
+# SPEC: Delete button visible
+[[sequence]]
+description = "Delete button visible"
+actions = [["assert_contains", "Delete"]]
+expect = "CRUD"
+
+# SPEC: Filter by surname prefix
+[[sequence]]
+description = "Filter by M -> only Mustermann"
+actions = [["focus_input", 0], ["type", "M"]]
+expect = "Mustermann"
+expect_match = "contains"
+
+[[sequence]]
+description = "Filter by M -> Hans NOT visible"
+actions = [["assert_not_contains", "Hans"]]
+expect = "Mustermann"
+
+# SPEC: Clear filter -> all people shown
+[[sequence]]
+description = "Clear filter -> all people"
+actions = [["focus_input", 0], ["key", "Backspace"]]
+expect = "Emil"
+expect_match = "contains"
+
+# SPEC: Create new person
+[[sequence]]
+description = "Type name for new person"
+actions = [["focus_input", 1], ["type", "John"]]
+expect = "CRUD"
+
+[[sequence]]
+description = "Type surname for new person"
+actions = [["focus_input", 2], ["type", "Doe"]]
+expect = "CRUD"
+
+[[sequence]]
+description = "Click Create"
+actions = [["click_text", "Create"]]
+expect = "Doe"
+expect_match = "contains"
+
+# SPEC: Select original person - shows arrow indicator
+[[sequence]]
+description = "Click on Tansen to select - shows arrow indicator"
+actions = [["click_text", "Tansen"]]
+expect = "► Tansen"
+expect_match = "contains"
+
+# SPEC: Delete selected person
+[[sequence]]
+description = "Click Delete to remove Tansen"
+actions = [["click_text", "Delete"]]
+expect = "CRUD"
+
+[[sequence]]
+description = "Tansen should be gone"
+actions = [["assert_not_contains", "Tansen"]]
+expect = "Emil"
+
+# SPEC: Other people still there after delete
+[[sequence]]
+description = "Emil still present"
+actions = [["assert_contains", "Emil"]]
+expect = "CRUD"
+
+[[sequence]]
+description = "Mustermann still present"
+actions = [["assert_contains", "Mustermann"]]
+expect = "CRUD"
+
+# SPEC: Created person (Doe) still present after delete
+[[sequence]]
+description = "Doe still present"
+actions = [["assert_contains", "Doe"]]
+expect = "CRUD"

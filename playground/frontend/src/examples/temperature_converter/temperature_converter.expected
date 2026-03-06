@@ -1,0 +1,64 @@
+# Temperature Converter (7GUIs Task 2) - bidirectional conversion test
+
+[test]
+category = "interactive"
+description = "7GUIs Task 2: bidirectional Celsius/Fahrenheit conversion"
+skip_engines = []
+
+[output]
+text = "Temperature Converter"
+match = "contains"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+# SPEC: Title visible
+[[sequence]]
+description = "Title visible"
+actions = [["assert_contains", "Temperature Converter"]]
+expect = "Temperature Converter"
+
+# SPEC: Celsius label visible
+[[sequence]]
+description = "Celsius label visible"
+actions = [["assert_contains", "Celsius"]]
+expect = "Temperature Converter"
+
+# SPEC: Fahrenheit label visible
+[[sequence]]
+description = "Fahrenheit label visible"
+actions = [["assert_contains", "Fahrenheit"]]
+expect = "Temperature Converter"
+
+# SPEC: Type number in Celsius -> Fahrenheit updates (C=0 -> F=32)
+[[sequence]]
+description = "Type 0 in Celsius -> F shows 32"
+actions = [["focus_input", 0], ["type", "0"], ["assert_input_value", 1, "32"]]
+expect = "Temperature Converter"
+
+# SPEC: C=100 -> F=212
+[[sequence]]
+description = "Clear, type 100 in Celsius -> F shows 212"
+actions = [["focus_input", 0], ["key", "Backspace"], ["type", "100"], ["assert_input_value", 1, "212"]]
+expect = "Temperature Converter"
+
+# SPEC: BUG CHECK - C=1000 -> F must show 1832 (not stuck at 34)
+[[sequence]]
+description = "Clear, type 1000 in Celsius -> F shows 1832"
+actions = [["focus_input", 0], ["key", "Backspace"], ["key", "Backspace"], ["key", "Backspace"], ["key", "Backspace"], ["type", "1000"], ["assert_input_value", 1, "1832"]]
+expect = "Temperature Converter"
+
+# SPEC: Type number in Fahrenheit -> Celsius updates (F=32 -> C=0)
+# After previous step, F has "1832" — need 4 backspaces to clear
+[[sequence]]
+description = "Clear F, type 32 in Fahrenheit -> C shows 0"
+actions = [["focus_input", 1], ["key", "Backspace"], ["key", "Backspace"], ["key", "Backspace"], ["key", "Backspace"], ["type", "32"], ["assert_input_value", 0, "0"]]
+expect = "Temperature Converter"
+
+# SPEC: F=212 -> C=100
+# After previous step, F has "32" — need 2 backspaces to clear
+[[sequence]]
+description = "Clear F, type 212 -> C shows 100"
+actions = [["focus_input", 1], ["key", "Backspace"], ["key", "Backspace"], ["type", "212"], ["assert_input_value", 0, "100"]]
+expect = "Temperature Converter"

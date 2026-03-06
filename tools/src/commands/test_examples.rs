@@ -21,6 +21,7 @@ pub struct TestOptions {
     pub verbose: bool,
     pub examples_dir: Option<PathBuf>,
     pub no_launch: bool,
+    pub engine: Option<String>,
 }
 
 /// Options for smoke-examples command
@@ -507,6 +508,22 @@ pub async fn run_tests(opts: TestOptions) -> Result<Vec<TestResult>> {
 
 /// Inner test runner (separated for cleanup handling)
 async fn run_tests_inner(opts: &TestOptions) -> Result<Vec<TestResult>> {
+    // Switch engine if requested
+    if let Some(ref engine) = opts.engine {
+        // Select a lightweight example before switching engines to avoid the new engine
+        // choking on whatever heavy example was loaded (e.g. cells on DD causes hang).
+        let _ = send_command_to_server(opts.port, WsCommand::SelectExample { name: "counter".to_string() }).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        println!("Setting engine to: {}", engine);
+        let response = send_command_to_server(opts.port, WsCommand::SetEngine { engine: engine.clone() }).await?;
+        if let WsResponse::Error { message } = response {
+            anyhow::bail!("Failed to set engine to '{}': {}", engine, message);
+        }
+        // Wait for engine switch and recompilation
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     // Find examples directory
     let examples_dir = if let Some(ref dir) = opts.examples_dir {
         dir.clone()
@@ -531,7 +548,8 @@ async fn run_tests_inner(opts: &TestOptions) -> Result<Vec<TestResult>> {
         }
     }
 
-    println!("Boon Example Tests");
+    let engine_label = opts.engine.as_deref().unwrap_or("(current)");
+    println!("Boon Example Tests [engine: {}]", engine_label);
     println!("==================\n");
     println!("Running {} example(s)...\n", examples.len());
 
@@ -609,6 +627,38 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
             expected_output: None,
             steps,
         });
+    }
+
+    // Check engine-specific skip
+    if let Some(ref engine) = opts.engine {
+        if let Some(ref engines) = spec.test.engines {
+            if !engines.iter().any(|e| e == engine) {
+                return Ok(TestResult {
+                    name: example.name.clone(),
+                    passed: true,
+                    skipped: Some(format!("not in engines list (requires {:?})", engines)),
+                    duration: start.elapsed(),
+                    error: None,
+                    actual_output: None,
+                    expected_output: None,
+                    steps,
+                });
+            }
+        }
+        if let Some(ref skip_engines) = spec.test.skip_engines {
+            if skip_engines.iter().any(|e| e == engine) {
+                return Ok(TestResult {
+                    name: example.name.clone(),
+                    passed: true,
+                    skipped: Some(format!("skipped for engine {}", engine)),
+                    duration: start.elapsed(),
+                    error: None,
+                    actual_output: None,
+                    expected_output: None,
+                    steps,
+                });
+            }
+        }
     }
 
     // Navigate to root route first - critical for Router/route() based apps like todo_mvc
@@ -1445,6 +1495,89 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 }
                 _ => anyhow::bail!("Unexpected response for GetElementStyle"),
             }
+        }
+        ParsedAction::AssertInputValue { index, expected } => {
+            let response = send_command_to_server(port, WsCommand::GetInputProperties { index: *index }).await?;
+            match response {
+                WsResponse::InputProperties { found, value, .. } => {
+                    if !found {
+                        anyhow::bail!("Assert input value failed: input {} not found", index);
+                    }
+                    let actual = value.unwrap_or_default();
+                    if actual != *expected {
+                        anyhow::bail!(
+                            "Assert input value failed: expected '{}' in input {}, got '{}'",
+                            expected, index, actual
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert input value failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetInputProperties"),
+            }
+        }
+        ParsedAction::SetSliderValue { index, value } => {
+            // Use EvalJs to set the slider value and dispatch input+change events
+            let js = format!(
+                r#"(function() {{
+                    var sliders = document.querySelectorAll('[data-boon-panel="preview"] input[type="range"]');
+                    if ({index} >= sliders.length) return 'ERROR: slider index {index} not found (have ' + sliders.length + ')';
+                    var slider = sliders[{index}];
+                    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    nativeInputValueSetter.call(slider, '{value}');
+                    slider.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    slider.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return 'OK';
+                }})()"#,
+                index = index,
+                value = value,
+            );
+            let response = send_command_to_server(port, WsCommand::EvalJs { expression: js }).await?;
+            match response {
+                WsResponse::Success { data } => {
+                    if let Some(serde_json::Value::String(ref d)) = data {
+                        if d.starts_with("ERROR") {
+                            anyhow::bail!("Set slider value failed: {}", d);
+                        }
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Set slider value failed: {}", message);
+                }
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        ParsedAction::SelectOption { index, value } => {
+            // Use EvalJs to change select value and dispatch change event
+            let js = format!(
+                r#"(function() {{
+                    var selects = document.querySelectorAll('[data-boon-panel="preview"] select');
+                    if ({index} >= selects.length) return 'ERROR: select index {index} not found (have ' + selects.length + ')';
+                    var sel = selects[{index}];
+                    sel.value = '{value}';
+                    sel.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    return 'OK';
+                }})()"#,
+                index = index,
+                value = value,
+            );
+            let response = send_command_to_server(port, WsCommand::EvalJs { expression: js }).await?;
+            match response {
+                WsResponse::Success { data } => {
+                    if let Some(serde_json::Value::String(ref d)) = data {
+                        if d.starts_with("ERROR") {
+                            anyhow::bail!("Select option failed: {}", d);
+                        }
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Select option failed: {}", message);
+                }
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
     Ok(())

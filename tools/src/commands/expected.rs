@@ -42,6 +42,14 @@ pub struct TestMeta {
     /// Skip reason (if set, test will be skipped)
     #[serde(default)]
     pub skip: Option<String>,
+
+    /// Only run on these engines (e.g., ["Actors", "DD"])
+    #[serde(default)]
+    pub engines: Option<Vec<String>>,
+
+    /// Skip on these engines (e.g., ["Wasm"])
+    #[serde(default)]
+    pub skip_engines: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -342,6 +350,49 @@ impl Action {
                             .to_string();
                         Ok(ParsedAction::AssertElementStyle { target, property, expected })
                     }
+                    "assert_input_value" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_input_value requires index (0-indexed)")?;
+                        let expected = arr
+                            .get(2)
+                            .and_then(|v| v.as_str())
+                            .context("assert_input_value requires expected value")?
+                            .to_string();
+                        Ok(ParsedAction::AssertInputValue { index: index as u32, expected })
+                    }
+                    "set_slider_value" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("set_slider_value requires slider index (0-indexed among range inputs)")?;
+                        let raw = arr
+                            .get(2)
+                            .context("set_slider_value requires value")?;
+                        // Handle both string and number values from TOML
+                        let value_str = if let Some(s) = raw.as_str() {
+                            s.to_string()
+                        } else if let Some(n) = raw.as_f64() {
+                            format!("{}", n)
+                        } else {
+                            raw.to_string()
+                        };
+                        Ok(ParsedAction::SetSliderValue { index: index as u32, value: value_str })
+                    }
+                    "select_option" => {
+                        // ["select_option", index, "value"] - select dropdown option by value
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("select_option requires select index (0-indexed)")?;
+                        let value = arr
+                            .get(2)
+                            .and_then(|v| v.as_str())
+                            .context("select_option requires option value")?
+                            .to_string();
+                        Ok(ParsedAction::SelectOption { index: index as u32, value })
+                    }
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -381,6 +432,9 @@ pub enum ParsedAction {
     AssertContains { text: String },  // Assert preview contains text
     AssertCheckboxClickable { index: u32 },  // Assert checkbox is clickable by real user (not obscured)
     AssertElementStyle { target: String, property: String, expected: String },  // Assert computed CSS style on element found by text
+    AssertInputValue { index: u32, expected: String },  // Assert input's current value
+    SetSliderValue { index: u32, value: String },  // Set range input value
+    SelectOption { index: u32, value: String },  // Select dropdown option by value
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,5 +1,5 @@
 -- Circle Drawer (7GUIs Task 6)
--- Click the canvas to create circles. Undo removes the last circle.
+-- Click canvas to create circles. Undo removes last circle.
 
 store: [
     elements: [
@@ -8,8 +8,8 @@ store: [
     ]
 
     circles: LIST {}
-        |> List/append(on: elements.canvas.event.click |> THEN {
-            [x: elements.canvas.event.click.x, y: elements.canvas.event.click.y]
+        |> List/append(on: elements.canvas.event.click |> WHEN {
+            click => [x: click.x, y: click.y]
         })
         |> List/remove_last(on: elements.undo_button.event.press)
 
@@ -54,13 +54,12 @@ FUNCTION root_element() {
                 )
                 Element/svg(
                     element: [event: [click: LINK]]
-                    style: [width: 460, height: 300]
-                    children: store.circles |> List/map(
-                        circle
-                        new: Element/svg_circle(
-                            element: [event: [click: LINK]]
-                            cx: circle.x
-                            cy: circle.y
+                    style: [width: 460, height: 300, background: TEXT { rgba(255,255,255,0.1) }]
+                    children: store.circles |> List/map(item, new:
+                        Element/svg_circle(
+                            element: []
+                            cx: item.x
+                            cy: item.y
                             r: 20
                             style: [
                                 fill: TEXT { #3498db }

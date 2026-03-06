@@ -38,9 +38,11 @@ pub enum Event {
     LinkClick { link_path: String },
     KeyDown { link_path: String, key: String },
     TextChange { link_path: String, text: String },
+    NumberChange { link_path: String, value: f64 },
     Blur { link_path: String },
     Focus { link_path: String },
     DoubleClick { link_path: String },
+    SvgClick { link_path: String, x: f64, y: f64 },
     HoverChange { link_path: String, hovered: bool },
     TimerTick { var_name: String },
     RouterChange { path: String },
@@ -336,6 +338,10 @@ impl DdWorkerHandle {
             Event::LinkClick { link_path } => (link_path, Value::tag("Click")),
             Event::KeyDown { link_path, key } => (link_path, Value::text(key)),
             Event::TextChange { link_path, text } => (link_path, Value::text(text)),
+            Event::NumberChange { link_path, value } => (link_path, Value::number(value)),
+            Event::SvgClick { link_path, x, y } => {
+                (link_path, Value::object([("x", Value::number(x)), ("y", Value::number(y))]))
+            }
             Event::Blur { link_path } => (link_path, Value::tag("Blur")),
             Event::Focus { link_path } => (link_path, Value::tag("Focus")),
             Event::DoubleClick { link_path } => (link_path, Value::tag("DoubleClick")),
@@ -349,7 +355,6 @@ impl DdWorkerHandle {
 
         {
             let mut inner = self.inner.borrow_mut();
-
             let input_id = match inner.link_path_to_input.get(&link_path) {
                 Some(id) => *id,
                 None => {
@@ -389,8 +394,15 @@ impl DdWorkerHandle {
             inner.epoch += 1;
             let epoch = inner.epoch;
 
+            // Insert event into the target input
             if let Some(session) = inner.inputs.get_mut(&input_id) {
                 session.update(event_value, 1);
+            }
+
+            // Advance ALL input sessions to the new epoch.
+            // Timely requires all input frontiers to advance past a timestamp
+            // before data at that timestamp can propagate through operators.
+            for session in inner.inputs.values_mut() {
                 session.advance_to(epoch);
                 session.flush();
             }

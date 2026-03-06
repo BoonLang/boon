@@ -42,6 +42,8 @@ enum ListChainOp<'a> {
     Append(&'a [Spanned<Argument>]),
     /// `List/remove(item, on: condition_expr)`
     Remove(&'a [Spanned<Argument>]),
+    /// `List/remove_last(on: event_source)`
+    RemoveLast(&'a [Spanned<Argument>]),
     /// `List/clear(on: event_source)`
     Clear(&'a [Spanned<Argument>]),
     /// `List/retain(item, if: predicate_expr)`
@@ -229,8 +231,26 @@ impl Compiler {
                 | ["Text", "trim"]
                 | ["Text", "is_not_empty"]
                 | ["Text", "is_empty"]
+                | ["Text", "to_number"]
+                | ["Text", "starts_with"]
+                | ["Text", "length"]
+                | ["Text", "char_at"]
+                | ["Text", "char_code"]
+                | ["Text", "from_char_code"]
+                | ["Text", "find"]
+                | ["Text", "find_closing"]
+                | ["Text", "substring"]
+                | ["Text", "to_uppercase"]
+                | ["Math", "round"]
+                | ["Math", "min"]
+                | ["Math", "max"]
+                | ["Math", "modulo"]
                 | ["List", "count"]
                 | ["List", "is_empty"]
+                | ["List", "sum"]
+                | ["List", "product"]
+                | ["List", "last"]
+                | ["List", "get"]
                 | ["Log", "info"]
         )
     }
@@ -310,6 +330,200 @@ impl Compiler {
             } else {
                 Value::tag("False")
             }),
+            ["Text", "to_number"] => {
+                let s = input.as_text().unwrap_or("");
+                match s.trim().parse::<f64>() {
+                    Ok(n) => Ok(Value::number(n)),
+                    Err(_) => Ok(Value::tag("NaN")),
+                }
+            }
+            ["Text", "starts_with"] => {
+                let s = input.as_text().unwrap_or("");
+                let prefix = arguments
+                    .iter()
+                    .find(|(name, _)| name == "prefix")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_text().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                Ok(if s.starts_with(&prefix) {
+                    Value::tag("True")
+                } else {
+                    Value::tag("False")
+                })
+            }
+            ["Text", "length"] => {
+                let s = input.as_text().unwrap_or("");
+                Ok(Value::number(s.len() as f64))
+            }
+            ["Text", "char_at"] => {
+                let s = input.as_text().unwrap_or("");
+                let index = arguments
+                    .iter()
+                    .find(|(name, _)| name == "index")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
+                match s.chars().nth(index) {
+                    Some(c) => Ok(Value::text(c.to_string())),
+                    None => Ok(Value::text("")),
+                }
+            }
+            ["Text", "char_code"] => {
+                let s = input.as_text().unwrap_or("");
+                match s.chars().next() {
+                    Some(c) => Ok(Value::number(c as u32 as f64)),
+                    None => Ok(Value::number(0.0)),
+                }
+            }
+            ["Text", "from_char_code"] => {
+                let n = input.as_number().unwrap_or(0.0) as u32;
+                match char::from_u32(n) {
+                    Some(c) => Ok(Value::text(c.to_string())),
+                    None => Ok(Value::text("")),
+                }
+            }
+            ["Text", "find"] => {
+                let s = input.as_text().unwrap_or("");
+                let search = arguments
+                    .iter()
+                    .find(|(name, _)| name == "search")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_text().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                match s.find(&search) {
+                    Some(pos) => Ok(Value::number(pos as f64)),
+                    None => Ok(Value::number(-1.0)),
+                }
+            }
+            ["Text", "find_closing"] => {
+                let s = input.as_text().unwrap_or("");
+                let open = arguments
+                    .iter()
+                    .find(|(name, _)| name == "open")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_text().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "(".to_string());
+                let close = arguments
+                    .iter()
+                    .find(|(name, _)| name == "close")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_text().map(|s| s.to_string()))
+                    .unwrap_or_else(|| ")".to_string());
+                let open_char = open.chars().next().unwrap_or('(');
+                let close_char = close.chars().next().unwrap_or(')');
+                let mut depth = 0i32;
+                let mut result = -1i32;
+                for (i, c) in s.chars().enumerate() {
+                    if c == open_char {
+                        depth += 1;
+                    } else if c == close_char {
+                        depth -= 1;
+                        if depth == 0 {
+                            result = i as i32;
+                            break;
+                        }
+                    }
+                }
+                Ok(Value::number(result as f64))
+            }
+            ["Text", "substring"] => {
+                let s = input.as_text().unwrap_or("");
+                let start = arguments
+                    .iter()
+                    .find(|(name, _)| name == "start")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
+                let length = arguments
+                    .iter()
+                    .find(|(name, _)| name == "length")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as usize;
+                let chars: Vec<char> = s.chars().collect();
+                let end = (start + length).min(chars.len());
+                let start = start.min(chars.len());
+                let result: String = chars[start..end].iter().collect();
+                Ok(Value::text(result))
+            }
+            ["Text", "to_uppercase"] => {
+                let s = input.as_text().unwrap_or("");
+                Ok(Value::text(s.to_uppercase()))
+            }
+            ["Math", "round"] => {
+                let n = input.as_number().unwrap_or(0.0);
+                Ok(Value::number(n.round()))
+            }
+            ["Math", "min"] => {
+                let a = input.as_number().unwrap_or(0.0);
+                let b = arguments
+                    .iter()
+                    .find(|(name, _)| name == "b")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0);
+                Ok(Value::number(a.min(b)))
+            }
+            ["Math", "max"] => {
+                let a = input.as_number().unwrap_or(0.0);
+                let b = arguments
+                    .iter()
+                    .find(|(name, _)| name == "b")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0);
+                Ok(Value::number(a.max(b)))
+            }
+            ["Math", "modulo"] => {
+                let a = input.as_number().unwrap_or(0.0);
+                let b = arguments
+                    .iter()
+                    .find(|(name, _)| name == "divisor")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(1.0);
+                Ok(Value::number(a % b))
+            }
+            ["List", "sum"] => {
+                let items = input.list_items();
+                let sum: f64 = items.iter().filter_map(|v| v.as_number()).sum();
+                Ok(Value::number(sum))
+            }
+            ["List", "product"] => {
+                let items = input.list_items();
+                let prod: f64 = items.iter().filter_map(|v| v.as_number()).product();
+                Ok(Value::number(prod))
+            }
+            ["List", "last"] => {
+                let items = input.list_items();
+                Ok(items.last().cloned().cloned().unwrap_or(Value::Unit))
+            }
+            ["List", "get"] => {
+                let index = arguments
+                    .iter()
+                    .find(|(name, _)| name == "index")
+                    .and_then(|(_, val_expr)| val_expr.as_ref())
+                    .and_then(|v| self.eval_static(v).ok())
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(1.0) as usize;
+                // 1-based indexing
+                let items = input.list_items();
+                Ok(if index >= 1 && index <= items.len() {
+                    items[index - 1].clone()
+                } else {
+                    Value::Unit
+                })
+            }
             _ => Err(format!("Not a built-in piped function: {}", path.join("/"))),
         }
     }
@@ -468,7 +682,7 @@ impl Compiler {
             Expression::Then { .. } => true,
             Expression::While { .. } => true,
             Expression::Variable(var) => Self::is_reactive(&var.value),
-            Expression::Pipe { from, to } => Self::is_reactive(from) || Self::is_reactive(to),
+            Expression::Pipe { from, to } => Self::is_reactive_or_alias(from) || Self::is_reactive(to),
             Expression::When { .. } => true,
             Expression::FunctionCall { path, arguments } => {
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
@@ -587,6 +801,31 @@ impl Compiler {
     }
 
     fn eval_static_with_scope(
+        &self,
+        expr: &Spanned<Expression>,
+        local_scope: &IndexMap<String, Value>,
+    ) -> Result<Value, String> {
+        use std::cell::Cell;
+        thread_local! {
+            static EVAL_DEPTH: Cell<usize> = const { Cell::new(0) };
+        }
+        const MAX_EVAL_DEPTH: usize = 150;
+
+        let depth = EVAL_DEPTH.with(|d| {
+            let current = d.get();
+            d.set(current + 1);
+            current
+        });
+        if depth >= MAX_EVAL_DEPTH {
+            EVAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            return Err("Maximum evaluation depth exceeded".to_string());
+        }
+        let result = self.eval_static_with_scope_inner(expr, local_scope);
+        EVAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        result
+    }
+
+    fn eval_static_with_scope_inner(
         &self,
         expr: &Spanned<Expression>,
         local_scope: &IndexMap<String, Value>,
@@ -1433,6 +1672,65 @@ impl Compiler {
             // List utilities (non-piped)
             ["List", "count"] => Ok(Value::number(0.0)),
             ["List", "is_empty"] => Ok(Value::tag("True")),
+            ["List", "range"] => {
+                let from = arguments
+                    .iter()
+                    .find(|a| a.node.name.as_str() == "from")
+                    .and_then(|a| a.node.value.as_ref())
+                    .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(1.0) as i64;
+                let to = arguments
+                    .iter()
+                    .find(|a| a.node.name.as_str() == "to")
+                    .and_then(|a| a.node.value.as_ref())
+                    .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(1.0) as i64;
+                let mut fields = std::collections::BTreeMap::new();
+                for i in from..=to {
+                    let key: Arc<str> = Arc::from(format!("_{}", i - from));
+                    fields.insert(key, Value::number(i as f64));
+                }
+                Ok(Value::Tagged {
+                    tag: Arc::from(super::types::LIST_TAG),
+                    fields: Arc::new(fields),
+                })
+            }
+            ["List", "sum"] => Ok(Value::number(0.0)),
+            ["List", "product"] => Ok(Value::number(1.0)),
+            ["List", "last"] => Ok(Value::Unit),
+            ["List", "get"] => Ok(Value::Unit),
+
+            // New element types for 7GUIs
+            ["Element", "select"] => {
+                self.eval_element_static("ElementSelect", arguments, local_scope)
+            }
+            ["Element", "slider"] => {
+                self.eval_element_static("ElementSlider", arguments, local_scope)
+            }
+            ["Element", "svg"] => {
+                self.eval_element_static("ElementSvg", arguments, local_scope)
+            }
+            ["Element", "svg_circle"] => {
+                self.eval_element_static("ElementSvgCircle", arguments, local_scope)
+            }
+
+            // New text/math functions (non-piped forms)
+            ["Text", "to_number"] => Ok(Value::number(0.0)),
+            ["Text", "starts_with"] => Ok(Value::tag("False")),
+            ["Text", "length"] => Ok(Value::number(0.0)),
+            ["Text", "char_at"] => Ok(Value::text("")),
+            ["Text", "char_code"] => Ok(Value::number(0.0)),
+            ["Text", "from_char_code"] => Ok(Value::text("")),
+            ["Text", "find"] => Ok(Value::number(-1.0)),
+            ["Text", "find_closing"] => Ok(Value::number(-1.0)),
+            ["Text", "substring"] => Ok(Value::text("")),
+            ["Text", "to_uppercase"] => Ok(Value::text("")),
+            ["Math", "round"] => Ok(Value::number(0.0)),
+            ["Math", "min"] => Ok(Value::number(0.0)),
+            ["Math", "max"] => Ok(Value::number(0.0)),
+            ["Math", "modulo"] => Ok(Value::number(0.0)),
 
             [fn_name] => {
                 // User-defined function call
@@ -1900,8 +2198,202 @@ impl Compiler {
                         }
                         Err(format!("Unknown piped function: {}", fn_name))
                     }
-                    // Module-qualified piped function: `value |> Theme/material()`
+                    // Module-qualified piped function: builtins first, then user functions
                     [module, fn_name] => {
+                        // Built-in Text/ functions
+                        if *module == "Text" {
+                            match *fn_name {
+                                "to_number" => {
+                                    let s = from_val.as_text().unwrap_or("");
+                                    return match s.parse::<f64>() {
+                                        Ok(n) if n.is_finite() => Ok(Value::number(n)),
+                                        _ => Ok(Value::tag("NaN")),
+                                    };
+                                }
+                                "starts_with" => {
+                                    let s = from_val.as_text().unwrap_or("");
+                                    let prefix = arguments.iter()
+                                        .find(|a| a.node.name.as_str() == "prefix")
+                                        .and_then(|a| a.node.value.as_ref())
+                                        .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                                        .and_then(|v| v.as_text().map(|s| s.to_string()))
+                                        .unwrap_or_default();
+                                    return Ok(if s.starts_with(&prefix) { Value::tag("True") } else { Value::tag("False") });
+                                }
+                                "length" => {
+                                    let s = from_val.as_text().unwrap_or("");
+                                    return Ok(Value::number(s.len() as f64));
+                                }
+                                "to_uppercase" => {
+                                    let s = from_val.as_text().unwrap_or("");
+                                    return Ok(Value::text(s.to_uppercase()));
+                                }
+                                "char_at" => {
+                                    let s = from_val.as_text().unwrap_or("");
+                                    let idx = arguments.iter()
+                                        .find(|a| a.node.name.as_str() == "index")
+                                        .and_then(|a| a.node.value.as_ref())
+                                        .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                                        .and_then(|v| v.as_number())
+                                        .unwrap_or(0.0) as usize;
+                                    return Ok(s.chars().nth(idx).map(|c| Value::text(c.to_string())).unwrap_or(Value::text("")));
+                                }
+                                "char_code" => {
+                                    let s = from_val.as_text().unwrap_or("");
+                                    return Ok(Value::number(s.chars().next().map(|c| c as u32 as f64).unwrap_or(0.0)));
+                                }
+                                "from_char_code" => {
+                                    let n = from_val.as_number().unwrap_or(0.0) as u32;
+                                    return Ok(char::from_u32(n).map(|c| Value::text(c.to_string())).unwrap_or(Value::text("")));
+                                }
+                                "find" => {
+                                    let s = from_val.as_text().unwrap_or("");
+                                    let search = arguments.iter()
+                                        .find(|a| a.node.name.as_str() == "search")
+                                        .and_then(|a| a.node.value.as_ref())
+                                        .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                                        .and_then(|v| v.as_text().map(|s| s.to_string()))
+                                        .unwrap_or_default();
+                                    return Ok(Value::number(s.find(&search).map(|i| i as f64).unwrap_or(-1.0)));
+                                }
+                                "find_closing" => {
+                                    let s = from_val.as_text().unwrap_or("");
+                                    let start = arguments.iter()
+                                        .find(|a| a.node.name.as_str() == "start")
+                                        .and_then(|a| a.node.value.as_ref())
+                                        .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                                        .and_then(|v| v.as_number())
+                                        .unwrap_or(0.0) as usize;
+                                    let open = arguments.iter()
+                                        .find(|a| a.node.name.as_str() == "open")
+                                        .and_then(|a| a.node.value.as_ref())
+                                        .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                                        .and_then(|v| v.as_text().map(|s| s.to_string()))
+                                        .and_then(|s| s.chars().next())
+                                        .unwrap_or('(');
+                                    let close = arguments.iter()
+                                        .find(|a| a.node.name.as_str() == "close")
+                                        .and_then(|a| a.node.value.as_ref())
+                                        .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                                        .and_then(|v| v.as_text().map(|s| s.to_string()))
+                                        .and_then(|s| s.chars().next())
+                                        .unwrap_or(')');
+                                    let mut depth = 1i64;
+                                    let chars: Vec<char> = s.chars().collect();
+                                    for i in start..chars.len() {
+                                        if chars[i] == open { depth += 1; }
+                                        else if chars[i] == close { depth -= 1; if depth == 0 { return Ok(Value::number(i as f64)); } }
+                                    }
+                                    return Ok(Value::number(-1.0));
+                                }
+                                "substring" => {
+                                    let s = from_val.as_text().unwrap_or("");
+                                    let start = arguments.iter()
+                                        .find(|a| a.node.name.as_str() == "start")
+                                        .and_then(|a| a.node.value.as_ref())
+                                        .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                                        .and_then(|v| v.as_number())
+                                        .unwrap_or(0.0) as usize;
+                                    let length = arguments.iter()
+                                        .find(|a| a.node.name.as_str() == "length")
+                                        .and_then(|a| a.node.value.as_ref())
+                                        .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                                        .and_then(|v| v.as_number());
+                                    let chars: Vec<char> = s.chars().collect();
+                                    let end = length.map(|l| start + l as usize).unwrap_or(chars.len());
+                                    let result: String = chars[start.min(chars.len())..end.min(chars.len())].iter().collect();
+                                    return Ok(Value::text(result));
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Built-in Math/ functions
+                        if *module == "Math" {
+                            let n = from_val.as_number().unwrap_or(0.0);
+                            match *fn_name {
+                                "round" => return Ok(Value::number(n.round())),
+                                "min" => {
+                                    let b = arguments.iter()
+                                        .find(|a| a.node.name.as_str() == "b")
+                                        .and_then(|a| a.node.value.as_ref())
+                                        .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                                        .and_then(|v| v.as_number())
+                                        .unwrap_or(f64::INFINITY);
+                                    return Ok(Value::number(n.min(b)));
+                                }
+                                "max" => {
+                                    let b = arguments.iter()
+                                        .find(|a| a.node.name.as_str() == "b")
+                                        .and_then(|a| a.node.value.as_ref())
+                                        .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                                        .and_then(|v| v.as_number())
+                                        .unwrap_or(f64::NEG_INFINITY);
+                                    return Ok(Value::number(n.max(b)));
+                                }
+                                "modulo" => {
+                                    let divisor = arguments.iter()
+                                        .find(|a| a.node.name.as_str() == "divisor")
+                                        .and_then(|a| a.node.value.as_ref())
+                                        .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                                        .and_then(|v| v.as_number())
+                                        .unwrap_or(1.0);
+                                    return Ok(Value::number(n % divisor));
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Built-in List/ functions
+                        if *module == "List" {
+                            match *fn_name {
+                                "sum" => {
+                                    let mut sum = 0.0;
+                                    if let Value::Tagged { tag, fields } = &from_val {
+                                        if tag.as_ref() == LIST_TAG {
+                                            for v in fields.values() { sum += v.as_number().unwrap_or(0.0); }
+                                        }
+                                    }
+                                    return Ok(Value::number(sum));
+                                }
+                                "product" => {
+                                    let mut prod = 1.0;
+                                    if let Value::Tagged { tag, fields } = &from_val {
+                                        if tag.as_ref() == LIST_TAG {
+                                            for v in fields.values() { prod *= v.as_number().unwrap_or(1.0); }
+                                        }
+                                    }
+                                    return Ok(Value::number(prod));
+                                }
+                                "last" => {
+                                    if let Value::Tagged { tag, fields } = &from_val {
+                                        if tag.as_ref() == LIST_TAG {
+                                            if let Some(last) = fields.values().last() {
+                                                return Ok(last.clone());
+                                            }
+                                        }
+                                    }
+                                    return Ok(Value::Unit);
+                                }
+                                "get" => {
+                                    let index = arguments.iter()
+                                        .find(|a| a.node.name.as_str() == "index")
+                                        .and_then(|a| a.node.value.as_ref())
+                                        .and_then(|v| self.eval_static_with_scope(v, local_scope).ok())
+                                        .and_then(|v| v.as_number())
+                                        .unwrap_or(1.0) as usize;
+                                    // 1-based indexing
+                                    if let Value::Tagged { tag, fields } = &from_val {
+                                        if tag.as_ref() == LIST_TAG {
+                                            if let Some(val) = fields.values().nth(index.saturating_sub(1)) {
+                                                return Ok(val.clone());
+                                            }
+                                        }
+                                    }
+                                    return Ok(Value::Unit);
+                                }
+                                _ => {}
+                            }
+                        }
+                        // User-defined piped function: `value |> Theme/material()`
                         let qualified = format!("{}/{}", module, fn_name);
                         if let Some((qualified_name, params, body)) = self.find_function(&qualified) {
                             let scoped = self.with_module_context(&qualified_name);
@@ -2503,6 +2995,14 @@ impl<'a> GraphBuilder<'a> {
         link_path: Option<String>,
         timer_interval_secs: Option<f64>,
     ) -> InputId {
+        // Deduplicate: reuse existing input if same kind + link_path
+        if let Some(ref path) = link_path {
+            for existing in &self.inputs {
+                if existing.kind == kind && existing.link_path.as_ref() == Some(path) {
+                    return existing.id;
+                }
+            }
+        }
         let id = InputId(self.next_input_id);
         self.next_input_id += 1;
         self.inputs.push(InputSpec {
@@ -2631,6 +3131,19 @@ impl<'a> GraphBuilder<'a> {
                         "Alias '{}' is not a reactive var and cannot be evaluated statically: {}",
                         path, e
                     )),
+                }
+            }
+
+            // Literal values (e.g., `10` as an operand in arithmetic)
+            Expression::Literal(_) => {
+                match self.compiler.eval_static(expr) {
+                    Ok(value) => {
+                        let var = self.fresh_var(&format!("{}_literal", name));
+                        self.collections
+                            .insert(var.clone(), CollectionSpec::Literal(value));
+                        Ok(var)
+                    }
+                    Err(e) => Err(format!("Cannot evaluate literal for '{}': {}", name, e)),
                 }
             }
 
@@ -3004,6 +3517,14 @@ impl<'a> GraphBuilder<'a> {
                     // The `from` is typically `LIST {} |> List/append(item: X)`
                     ["List", "clear"] => self.compile_list_chain(name, from, arguments),
 
+                    // Pattern: `... |> List/remove_last(on: event_source)`
+                    ["List", "remove_last"] => {
+                        let mut ops = Vec::new();
+                        ops.push(ListChainOp::RemoveLast(arguments));
+                        let initial_list_expr = self.collect_list_chain_ops(from, &mut ops)?;
+                        self.build_unified_list_holdstate(name, initial_list_expr, &ops)
+                    }
+
                     // Pattern: `LIST {} |> List/append(item: X)` (without clear)
                     ["List", "append"] => self.compile_list_append_only(name, from, arguments),
 
@@ -3143,6 +3664,85 @@ impl<'a> GraphBuilder<'a> {
                                 .collect();
                         if self.compiler.is_builtin_piped_fn(&fn_path) {
                             let source_var = self.resolve_reactive_source(from)?;
+
+                            // Check if any argument references a reactive variable.
+                            // If so, use Join to combine source and arg, then Map.
+                            let reactive_arg =
+                                self.find_first_reactive_argument(&args_for_builtin);
+
+                            if let Some((_arg_name, arg_var)) = reactive_arg {
+                                // Reactive argument: Join source + arg, then Map
+                                let join_var =
+                                    self.fresh_var(&format!("{}_builtin_join", name));
+                                self.collections.insert(
+                                    join_var.clone(),
+                                    CollectionSpec::Join {
+                                        left: source_var,
+                                        right: arg_var,
+                                        combine: Arc::new(|a: &Value, b: &Value| {
+                                            Value::object([
+                                                ("__src", a.clone()),
+                                                ("__arg", b.clone()),
+                                            ])
+                                        }),
+                                    },
+                                );
+                                let fn_path_for_closure = fn_path.clone();
+                                let map_var = VarId::new(name);
+                                self.collections.insert(
+                                    map_var.clone(),
+                                    CollectionSpec::Map {
+                                        source: join_var,
+                                        f: Arc::new(move |joined: &Value| {
+                                            let src = joined
+                                                .get_field("__src")
+                                                .cloned()
+                                                .unwrap_or(Value::Unit);
+                                            let arg = joined
+                                                .get_field("__arg")
+                                                .cloned()
+                                                .unwrap_or(Value::Unit);
+                                            let strs: Vec<&str> = fn_path_for_closure
+                                                .iter()
+                                                .map(|s| s.as_str())
+                                                .collect();
+                                            match strs.as_slice() {
+                                                ["Math", "min"] => Value::number(
+                                                    src.as_number()
+                                                        .unwrap_or(0.0)
+                                                        .min(arg.as_number().unwrap_or(0.0)),
+                                                ),
+                                                ["Math", "max"] => Value::number(
+                                                    src.as_number()
+                                                        .unwrap_or(0.0)
+                                                        .max(arg.as_number().unwrap_or(0.0)),
+                                                ),
+                                                ["Math", "modulo"] => Value::number(
+                                                    src.as_number().unwrap_or(0.0)
+                                                        % arg.as_number().unwrap_or(1.0),
+                                                ),
+                                                ["Text", "starts_with"] => {
+                                                    let s =
+                                                        src.as_text().unwrap_or("");
+                                                    let prefix =
+                                                        arg.as_text().unwrap_or("");
+                                                    if s.starts_with(prefix) {
+                                                        Value::tag("True")
+                                                    } else {
+                                                        Value::tag("False")
+                                                    }
+                                                }
+                                                _ => src.clone(),
+                                            }
+                                        }),
+                                    },
+                                );
+                                self.reactive_vars
+                                    .insert(name.to_string(), map_var.clone());
+                                return Ok(map_var);
+                            }
+
+                            // All args are static: use simple Map
                             let compiler = self.compiler.clone();
                             let map_var = VarId::new(name);
                             self.collections.insert(
@@ -3271,8 +3871,15 @@ impl<'a> GraphBuilder<'a> {
                                     .ok_or_else(|| "Duration seconds must be a number".to_string())
                             });
                         }
+                        if var.node.name.as_str() == "milliseconds" {
+                            return self.compiler.eval_static(&var.node.value).and_then(|v| {
+                                v.as_number()
+                                    .map(|ms| ms / 1000.0)
+                                    .ok_or_else(|| "Duration milliseconds must be a number".to_string())
+                            });
+                        }
                     }
-                    Err("Duration missing 'seconds' field".to_string())
+                    Err("Duration missing 'seconds' or 'milliseconds' field".to_string())
                 } else {
                     Err(format!("Expected Duration, got {}", tag.as_str()))
                 }
@@ -3419,6 +4026,10 @@ impl<'a> GraphBuilder<'a> {
                 );
                 Ok((latest_var, None))
             }
+
+            // Bare alias referencing an event path: event value replaces state.
+            // e.g., `Text/empty() |> HOLD state { elements.input.event.change.text }`
+            Expression::Alias(_) => self.compile_event_source(body),
 
             _ => Err(format!("Unsupported HOLD body pattern for '{}'", hold_name)),
         }
@@ -4248,10 +4859,46 @@ impl<'a> GraphBuilder<'a> {
                                 Value::number(current + 1.0)
                             })
                     })
-                } else if matches!(&body.node, Expression::Latest { .. }) {
-                    // LATEST body: each LATEST input produces the new state via THEN.
-                    // The event value IS the new state — just replace.
-                    Arc::new(|_state: &Value, event: &Value| event.clone())
+                } else if let Expression::Latest { inputs } = &body.node {
+                    // LATEST body: merge multiple event sources.
+                    // Constant THEN bodies produce the new value directly.
+                    // State-dependent THEN bodies produce Value::tag("Event") markers.
+                    // For markers, we evaluate THEN bodies with state in scope.
+                    let then_bodies: Vec<Spanned<Expression>> = inputs
+                        .iter()
+                        .filter_map(|input| {
+                            if let Expression::Pipe { to, .. } = &input.node {
+                                if let Expression::Then { body } = &to.node {
+                                    return Some(body.as_ref().clone());
+                                }
+                            }
+                            None
+                        })
+                        .collect();
+                    let compiler = self.compiler.clone();
+                    let sname = state_name.to_string();
+                    Arc::new(move |state: &Value, event: &Value| {
+                        // If event is a concrete value (not marker), use it directly
+                        if event.get_tag() != Some("Event") {
+                            return event.clone();
+                        }
+                        // Event marker: evaluate state-dependent THEN bodies with state
+                        let mut scope = IndexMap::new();
+                        scope.insert(sname.clone(), state.clone());
+                        for then_body in &then_bodies {
+                            if let Ok(result) =
+                                compiler.eval_static_with_scope(then_body, &scope)
+                            {
+                                // SKIP means don't update state
+                                if result.get_tag() == Some("SKIP") {
+                                    return state.clone();
+                                }
+                                return result;
+                            }
+                        }
+                        // Fallback: keep current state
+                        state.clone()
+                    })
                 } else {
                     // No THEN body found — event replaces state
                     Arc::new(|_state: &Value, event: &Value| event.clone())
@@ -4323,6 +4970,34 @@ impl<'a> GraphBuilder<'a> {
     }
 
     /// Resolve an alias expression to its reactive VarId.
+    /// Check if any argument in a built-in piped function references a reactive variable.
+    /// Returns the first reactive argument's name and VarId, if any.
+    fn find_first_reactive_argument(
+        &self,
+        args: &[(String, Option<Spanned<Expression>>)],
+    ) -> Option<(String, VarId)> {
+        for (arg_name, arg_expr_opt) in args {
+            if let Some(arg_expr) = arg_expr_opt {
+                if let Expression::Alias(Alias::WithoutPassed { parts, .. }) = &arg_expr.node {
+                    if parts.len() == 1 {
+                        let name = parts[0].as_str();
+                        if let Some(var_id) = self.reactive_vars.get(name) {
+                            return Some((arg_name.clone(), var_id.clone()));
+                        }
+                        // Try with scope prefix
+                        if let Some(prefix) = &self.scope_prefix {
+                            let prefixed = format!("{}.{}", prefix, name);
+                            if let Some(var_id) = self.reactive_vars.get(&prefixed) {
+                                return Some((arg_name.clone(), var_id.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn resolve_reactive_source(&mut self, expr: &Spanned<Expression>) -> Result<VarId, String> {
         if let Expression::Alias(Alias::WithoutPassed { parts, .. }) = &expr.node {
             if parts.len() == 1 {
@@ -4366,6 +5041,18 @@ impl<'a> GraphBuilder<'a> {
             let var_id = self.compile_reactive_pipe(temp_name.as_str(), from, to)?;
             return Ok(var_id);
         }
+        // Handle ArithmeticOperator as reactive source (e.g., `elapsed * 10` in a pipe)
+        if let Expression::ArithmeticOperator(op) = &expr.node {
+            let temp_name = self.fresh_var("__arith_source");
+            let var_id = self.compile_reactive_arithmetic(temp_name.as_str(), op)?;
+            return Ok(var_id);
+        }
+        // Handle Comparator as reactive source (e.g., `a < b` in a pipe)
+        if let Expression::Comparator(cmp) = &expr.node {
+            let temp_name = self.fresh_var("__cmp_source");
+            let var_id = self.compile_reactive_comparison(temp_name.as_str(), cmp)?;
+            return Ok(var_id);
+        }
         Err(format!(
             "Cannot resolve reactive source: {:?} (expr: {:?})",
             std::mem::discriminant(&expr.node),
@@ -4396,7 +5083,13 @@ impl<'a> GraphBuilder<'a> {
                         }
                     }
                     None => {
-                        // Wildcard or binding — always matches
+                        // Wildcard or named binding — always matches.
+                        // If the body couldn't be statically evaluated (is Unit),
+                        // return the input value (pass-through for binding patterns
+                        // like `click => [x: click.x, y: click.y]`).
+                        if *body_val == Value::Unit {
+                            return input.clone();
+                        }
                         return body_val.clone();
                     }
                 }
@@ -5763,6 +6456,10 @@ impl<'a> GraphBuilder<'a> {
                             ops.push(ListChainOp::Remove(arguments));
                             self.collect_list_chain_ops(from, ops)
                         }
+                        ["List", "remove_last"] => {
+                            ops.push(ListChainOp::RemoveLast(arguments));
+                            self.collect_list_chain_ops(from, ops)
+                        }
                         ["List", "clear"] => {
                             ops.push(ListChainOp::Clear(arguments));
                             self.collect_list_chain_ops(from, ops)
@@ -5834,11 +6531,12 @@ impl<'a> GraphBuilder<'a> {
         for op in ops.iter().rev() {
             match op {
                 ListChainOp::Append(arguments) => {
+                    // Accept both `item:` and `on:` — `on:` is event-triggered append
                     let item_arg = arguments
                         .iter()
-                        .find(|a| a.node.name.as_str() == "item")
+                        .find(|a| a.node.name.as_str() == "item" || a.node.name.as_str() == "on")
                         .and_then(|a| a.node.value.as_ref())
-                        .ok_or_else(|| "List/append missing 'item' argument".to_string())?;
+                        .ok_or_else(|| "List/append missing 'item' or 'on' argument".to_string())?;
                     let item_source = self.resolve_reactive_source(item_arg)?;
 
                     let append_then_var = self.fresh_var("append_event");
@@ -5878,6 +6576,27 @@ impl<'a> GraphBuilder<'a> {
                         },
                     );
                     event_vars.push(tagged_remove);
+                }
+
+                ListChainOp::RemoveLast(arguments) => {
+                    let on_arg = arguments
+                        .iter()
+                        .find(|a| a.node.name.as_str() == "on")
+                        .and_then(|a| a.node.value.as_ref())
+                        .ok_or_else(|| "List/remove_last missing 'on' argument".to_string())?;
+
+                    let (event_var, _) = self.compile_event_source(on_arg)?;
+                    let tagged_remove_last = self.fresh_var("tagged_remove_last");
+                    self.collections.insert(
+                        tagged_remove_last.clone(),
+                        CollectionSpec::Then {
+                            source: event_var,
+                            body: Arc::new(|_v: &Value| {
+                                Value::object([("__t", Value::text("remove_last"))])
+                            }),
+                        },
+                    );
+                    event_vars.push(tagged_remove_last);
                 }
 
                 ListChainOp::Clear(arguments) => {
@@ -5955,6 +6674,7 @@ impl<'a> GraphBuilder<'a> {
                             let count = state.list_count();
                             state.list_append(item, count)
                         }
+                        "remove_last" => state.list_remove_last(),
                         "clear" => Value::empty_list(),
                         _ => state.clone(),
                     }
@@ -6041,9 +6761,9 @@ impl<'a> GraphBuilder<'a> {
             if let ListChainOp::Append(arguments) = op {
                 let item_arg = arguments
                     .iter()
-                    .find(|a| a.node.name.as_str() == "item")
+                    .find(|a| a.node.name.as_str() == "item" || a.node.name.as_str() == "on")
                     .and_then(|a| a.node.value.as_ref())
-                    .ok_or_else(|| "List/append missing 'item' argument".to_string())?;
+                    .ok_or_else(|| "List/append missing 'item' or 'on' argument".to_string())?;
                 append_source = Some(self.resolve_reactive_source(item_arg)?);
                 break;
             }
@@ -6797,9 +7517,9 @@ impl<'a> GraphBuilder<'a> {
                         // Extract the `item:` argument (the reactive var to append)
                         let item_arg = arguments
                             .iter()
-                            .find(|a| a.node.name.as_str() == "item")
+                            .find(|a| a.node.name.as_str() == "item" || a.node.name.as_str() == "on")
                             .and_then(|a| a.node.value.as_ref())
-                            .ok_or_else(|| "List/append missing 'item' argument".to_string())?;
+                            .ok_or_else(|| "List/append missing 'item' or 'on' argument".to_string())?;
 
                         // Resolve the item source (should be a reactive var like text_to_add)
                         self.resolve_reactive_source(item_arg)?
@@ -6879,6 +7599,7 @@ impl<'a> GraphBuilder<'a> {
                             let count = state.list_count();
                             state.list_append(item, count)
                         }
+                        "remove_last" => state.list_remove_last(),
                         "clear" => Value::empty_list(),
                         _ => state.clone(),
                     }
@@ -6917,9 +7638,9 @@ impl<'a> GraphBuilder<'a> {
         // Extract item source
         let item_arg = arguments
             .iter()
-            .find(|a| a.node.name.as_str() == "item")
+            .find(|a| a.node.name.as_str() == "item" || a.node.name.as_str() == "on")
             .and_then(|a| a.node.value.as_ref())
-            .ok_or_else(|| "List/append missing 'item' argument".to_string())?;
+            .ok_or_else(|| "List/append missing 'item' or 'on' argument".to_string())?;
         let item_source = self.resolve_reactive_source(item_arg)?;
 
         // Create Then wrapper for append events

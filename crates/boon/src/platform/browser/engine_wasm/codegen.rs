@@ -43,8 +43,10 @@ const IMPORT_HOST_LIST_ITEM_MEMORY_INDEX: u32 = 18;
 const IMPORT_HOST_LIST_GET_ITEM_F64: u32 = 19;
 const IMPORT_HOST_LIST_REPLACE: u32 = 20;
 const IMPORT_HOST_GET_CELL_F64: u32 = 21;
+const IMPORT_HOST_TEXT_TO_NUMBER: u32 = 22;
+const IMPORT_HOST_TEXT_STARTS_WITH: u32 = 23;
 
-const NUM_IMPORTS: u32 = 22;
+const NUM_IMPORTS: u32 = 24;
 
 // Exported function indices (offset by NUM_IMPORTS)
 const FN_INIT: u32 = NUM_IMPORTS;
@@ -206,6 +208,9 @@ impl<'a> WasmEmitter<'a> {
             | IrNode::RouterGoTo { cell, .. }
             | IrNode::TextTrim { cell, .. }
             | IrNode::TextIsNotEmpty { cell, .. }
+            | IrNode::TextToNumber { cell, .. }
+            | IrNode::TextStartsWith { cell, .. }
+            | IrNode::MathRound { cell, .. }
             | IrNode::HoldLoop { cell, .. } => Some(*cell),
             IrNode::Document { .. } | IrNode::Timer { .. } => None,
         }
@@ -241,6 +246,9 @@ impl<'a> WasmEmitter<'a> {
             IrNode::ListIsEmpty { source, .. } => sources.push(*source),
             IrNode::TextTrim { source, .. } => sources.push(*source),
             IrNode::TextIsNotEmpty { source, .. } => sources.push(*source),
+            IrNode::TextToNumber { source, .. } => sources.push(*source),
+            IrNode::TextStartsWith { source, prefix, .. } => { sources.push(*source); sources.push(*prefix); },
+            IrNode::MathRound { source, .. } => sources.push(*source),
             IrNode::ListAppend { item, watch_cell, .. } => {
                 sources.push(*item);
                 if let Some(watch) = watch_cell {
@@ -389,6 +397,10 @@ impl<'a> WasmEmitter<'a> {
         types
             .ty()
             .function([ValType::F64, ValType::I32, ValType::I32], []);
+        // Type 12: (i32, f64) -> f64 [host_text_to_number]
+        types
+            .ty()
+            .function([ValType::I32, ValType::F64], [ValType::F64]);
         module.section(&types);
 
         // 2. Import section
@@ -506,6 +518,23 @@ impl<'a> WasmEmitter<'a> {
             "env",
             "host_get_cell_f64",
             wasm_encoder::EntityType::Function(5), // Type 5: (i32) -> f64
+        );
+        // host_text_to_number(src_cell: i32, nan_tag_value: f64) -> f64
+        // Parses text from src_cell as f64. Returns the number if valid,
+        // or nan_tag_value (tag index for "NaN") if parsing fails.
+        imports.import(
+            "env",
+            "host_text_to_number",
+            wasm_encoder::EntityType::Function(12), // Type 12: (i32, f64) -> f64
+        );
+        // host_text_starts_with(source_cell: i32, prefix_cell: i32) -> f64
+        // Checks if text in source_cell starts with text in prefix_cell.
+        // Returns 1.0 (true) or 0.0 (false). Dual-mode: uses ItemCellStore
+        // when item context is active (for per-item filter evaluation).
+        imports.import(
+            "env",
+            "host_text_starts_with",
+            wasm_encoder::EntityType::Function(10), // Type 10: (i32, i32) -> f64
         );
         module.section(&imports);
 
@@ -775,14 +804,14 @@ impl<'a> WasmEmitter<'a> {
                         func.instruction(&Instruction::I32Const(src.0 as i32));
                         func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
                     } else if let Some(text) = self.resolve_expr_text_statically(init) {
-                        if !text.is_empty() {
-                            let pattern_idx = self.register_text_pattern(&text);
-                            func.instruction(&Instruction::I32Const(cell.0 as i32));
-                            func.instruction(&Instruction::I32Const(pattern_idx as i32));
-                            func.instruction(&Instruction::Call(
-                                IMPORT_HOST_SET_CELL_TEXT_PATTERN,
-                            ));
-                        }
+                        // Register even empty text — marks cell as text-initialized
+                        // so format_cell_value returns "" instead of formatting f64.
+                        let pattern_idx = self.register_text_pattern(&text);
+                        func.instruction(&Instruction::I32Const(cell.0 as i32));
+                        func.instruction(&Instruction::I32Const(pattern_idx as i32));
+                        func.instruction(&Instruction::Call(
+                            IMPORT_HOST_SET_CELL_TEXT_PATTERN,
+                        ));
                     }
                 }
                 _ => {}
@@ -919,12 +948,10 @@ impl<'a> WasmEmitter<'a> {
                     // Router/route() |> WHILE { TEXT { / } => ... }) fails because
                     // the cell has empty text during init.
                     if let Some(text) = self.resolve_expr_text_statically(expr) {
-                        if !text.is_empty() {
-                            let pattern_idx = self.register_text_pattern(&text);
-                            func.instruction(&Instruction::I32Const(cell.0 as i32));
-                            func.instruction(&Instruction::I32Const(pattern_idx as i32));
-                            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
-                        }
+                        let pattern_idx = self.register_text_pattern(&text);
+                        func.instruction(&Instruction::I32Const(cell.0 as i32));
+                        func.instruction(&Instruction::I32Const(pattern_idx as i32));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
                     }
                     // If this is a reactive list with initial items, append them now.
                     if is_reactive_list {
@@ -934,6 +961,38 @@ impl<'a> WasmEmitter<'a> {
                                     IrExpr::CellRead(item_cell)
                                         if self.is_namespace_cell(*item_cell) =>
                                     {
+                                        // Set text on EACH field cell individually.
+                                        // HOLD Phase 1 runs before Derived Phase 2,
+                                        // so host_copy_text in HOLD init fails when
+                                        // source param cells aren't initialized yet.
+                                        // Setting field texts here (Phase 2) ensures
+                                        // host_list_append_text can capture them.
+                                        if let Some(fields) =
+                                            self.program.cell_field_cells.get(item_cell)
+                                        {
+                                            for (_name, field_cell) in fields {
+                                                if let Some(text) =
+                                                    self.resolve_cell_text_statically(*field_cell)
+                                                {
+                                                    if !text.is_empty()
+                                                        && text != "True"
+                                                        && text != "False"
+                                                    {
+                                                        let pattern_idx =
+                                                            self.register_text_pattern(&text);
+                                                        func.instruction(&Instruction::I32Const(
+                                                            field_cell.0 as i32,
+                                                        ));
+                                                        func.instruction(&Instruction::I32Const(
+                                                            pattern_idx as i32,
+                                                        ));
+                                                        func.instruction(&Instruction::Call(
+                                                            IMPORT_HOST_SET_CELL_TEXT_PATTERN,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
                                         // Namespace cell (object): resolve text from field cells.
                                         let ns_text =
                                             self.resolve_namespace_text_statically(*item_cell);
@@ -949,23 +1008,14 @@ impl<'a> WasmEmitter<'a> {
                                             func.instruction(&Instruction::Call(
                                                 IMPORT_HOST_SET_CELL_TEXT_PATTERN,
                                             ));
-                                            func.instruction(&Instruction::I32Const(cell.0 as i32));
-                                            func.instruction(&Instruction::I32Const(
-                                                item_cell.0 as i32,
-                                            ));
-                                            func.instruction(&Instruction::Call(
-                                                IMPORT_HOST_LIST_APPEND_TEXT,
-                                            ));
-                                        } else {
-                                            // Fallback: append as-is (empty text).
-                                            func.instruction(&Instruction::I32Const(cell.0 as i32));
-                                            func.instruction(&Instruction::I32Const(
-                                                item_cell.0 as i32,
-                                            ));
-                                            func.instruction(&Instruction::Call(
-                                                IMPORT_HOST_LIST_APPEND_TEXT,
-                                            ));
                                         }
+                                        func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                        func.instruction(&Instruction::I32Const(
+                                            item_cell.0 as i32,
+                                        ));
+                                        func.instruction(&Instruction::Call(
+                                            IMPORT_HOST_LIST_APPEND_TEXT,
+                                        ));
                                     }
                                     IrExpr::CellRead(item_cell) => {
                                         // host_list_append_text(list_cell_id, item_cell_id)
@@ -1213,6 +1263,35 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::GlobalGet(cell.0));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
+                IrNode::TextToNumber { cell, source, nan_tag_value } => {
+                    // Call host to parse text → number. Returns number or NaN tag value.
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::F64Const(*nan_tag_value));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_TO_NUMBER));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                }
+                IrNode::TextStartsWith { cell, source, prefix } => {
+                    // Call host to check if source text starts with prefix text.
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::I32Const(prefix.0 as i32));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_STARTS_WITH));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                }
+                IrNode::MathRound { cell, source } => {
+                    // Round source f64 to nearest integer using Wasm's native instruction.
+                    func.instruction(&Instruction::GlobalGet(source.0));
+                    func.instruction(&Instruction::F64Nearest);
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                }
                 IrNode::Document { .. }
                 | IrNode::Element { .. }
                 | IrNode::Timer { .. }
@@ -1436,11 +1515,24 @@ impl<'a> WasmEmitter<'a> {
                     trigger,
                     body,
                 } if *trigger == event_id => {
+                    let text_source = Self::extract_text_source_cell(body);
+                    if let Some(src) = text_source {
+                        self.emit_reevaluate_cell(func, src);
+                    }
                     if self.is_text_body(body) {
                         // Text body: set text first, then bump counter.
                         self.emit_text_setting(func, *cell, body);
+                    } else if let Some(src) = text_source {
+                        // Text source: copy text and bump counter to force signal.
+                        func.instruction(&Instruction::I32Const(cell.0 as i32));
+                        func.instruction(&Instruction::I32Const(src.0 as i32));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                        func.instruction(&Instruction::GlobalGet(cell.0));
+                        func.instruction(&Instruction::F64Const(1.0));
+                        func.instruction(&Instruction::F64Add);
+                        func.instruction(&Instruction::GlobalSet(cell.0));
                     } else {
-                        // Evaluate body and store to cell.
+                        // Numeric body: evaluate and store.
                         self.emit_expr(func, body);
                         func.instruction(&Instruction::GlobalSet(cell.0));
                     }
@@ -1458,20 +1550,87 @@ impl<'a> WasmEmitter<'a> {
                 } => {
                     for (trigger, body) in trigger_bodies {
                         if *trigger == event_id {
-                            // Evaluate body (which reads current state via GlobalGet).
-                            self.emit_expr(func, body);
-                            func.instruction(&Instruction::GlobalSet(cell.0));
-                            // Notify host.
-                            func.instruction(&Instruction::I32Const(cell.0 as i32));
-                            func.instruction(&Instruction::GlobalGet(cell.0));
-                            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
-                            // Update text for boolean-producing bodies so downstream
-                            // TextConcat interpolation reads correct "True"/"False".
-                            if Self::expr_produces_bool(body) {
-                                self.emit_bool_text_update(func, *cell);
+                            let may_skip = matches!(body, IrExpr::PatternMatch { .. });
+                            let text_source = Self::extract_text_source_cell(body);
+                            // Re-evaluate the text dependency chain before reading.
+                            if let Some(src) = text_source {
+                                self.emit_reevaluate_cell(func, src);
                             }
-                            // Propagate to downstream nodes (e.g., PipeThrough, MathSum).
-                            self.emit_downstream_updates(func, *cell);
+                            if self.is_text_body(body) {
+                                self.emit_text_setting(func, *cell, body);
+                                func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                func.instruction(&Instruction::GlobalGet(cell.0));
+                                func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                                self.emit_downstream_updates(func, *cell);
+                            } else if may_skip {
+                                let skip_global = self.program.cells.len() as u32;
+                                self.emit_expr(func, body);
+                                func.instruction(&Instruction::GlobalSet(skip_global));
+                                func.instruction(&Instruction::GlobalGet(skip_global));
+                                func.instruction(&Instruction::I64ReinterpretF64);
+                                func.instruction(&Instruction::I64Const(SKIP_SENTINEL_BITS as i64));
+                                func.instruction(&Instruction::I64Ne);
+                                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                                func.instruction(&Instruction::GlobalGet(skip_global));
+                                func.instruction(&Instruction::GlobalSet(cell.0));
+                                if let Some(src) = text_source {
+                                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                    func.instruction(&Instruction::I32Const(src.0 as i32));
+                                    func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                                    // Bump f64 counter to force signal fire.
+                                    func.instruction(&Instruction::GlobalGet(cell.0));
+                                    func.instruction(&Instruction::F64Const(1.0));
+                                    func.instruction(&Instruction::F64Add);
+                                    func.instruction(&Instruction::GlobalSet(cell.0));
+                                }
+                                func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                func.instruction(&Instruction::GlobalGet(cell.0));
+                                func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                                // Update text for boolean-producing bodies.
+                                if Self::expr_produces_bool(body) {
+                                    self.emit_bool_text_update(func, *cell);
+                                }
+                                self.emit_downstream_updates(func, *cell);
+                                func.instruction(&Instruction::End);
+                            } else if let Some(src) = text_source {
+                                // Text source: copy text string and bump f64 counter
+                                // to force signal fire (text cells use 0.0, which
+                                // would be deduped by set_cell_f64 without a bump).
+                                func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                func.instruction(&Instruction::I32Const(src.0 as i32));
+                                func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                                // Bump f64 counter.
+                                func.instruction(&Instruction::GlobalGet(cell.0));
+                                func.instruction(&Instruction::F64Const(1.0));
+                                func.instruction(&Instruction::F64Add);
+                                func.instruction(&Instruction::GlobalSet(cell.0));
+                                // Notify host.
+                                func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                func.instruction(&Instruction::GlobalGet(cell.0));
+                                func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                                self.emit_downstream_updates(func, *cell);
+                            } else {
+                                self.emit_expr(func, body);
+                                func.instruction(&Instruction::GlobalSet(cell.0));
+                                // Notify host.
+                                func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                func.instruction(&Instruction::GlobalGet(cell.0));
+                                func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                                // Update text for boolean-producing bodies.
+                                if Self::expr_produces_bool(body) {
+                                    self.emit_bool_text_update(func, *cell);
+                                } else if let IrExpr::Constant(IrValue::Tag(tag)) = body {
+                                    // Tag constant: set cell text to the tag name so
+                                    // format_cell_value displays the tag, not the f64 index.
+                                    let pattern_idx = self.register_text_pattern(tag);
+                                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                                    func.instruction(&Instruction::I32Const(pattern_idx as i32));
+                                    func.instruction(&Instruction::Call(
+                                        IMPORT_HOST_SET_CELL_TEXT_PATTERN,
+                                    ));
+                                }
+                                self.emit_downstream_updates(func, *cell);
+                            }
                         }
                     }
                 }
@@ -1503,20 +1662,34 @@ impl<'a> WasmEmitter<'a> {
                                     func.instruction(&Instruction::I32Const(target.0 as i32));
                                     func.instruction(&Instruction::I32Const(src.0 as i32));
                                     func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                                    // Bump f64 counter to force signal fire.
+                                    func.instruction(&Instruction::GlobalGet(target.0));
+                                    func.instruction(&Instruction::F64Const(1.0));
+                                    func.instruction(&Instruction::F64Add);
+                                    func.instruction(&Instruction::GlobalSet(target.0));
                                 }
                                 func.instruction(&Instruction::I32Const(target.0 as i32));
                                 func.instruction(&Instruction::GlobalGet(target.0));
                                 func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                                 self.emit_downstream_updates(func, *target);
                                 func.instruction(&Instruction::End);
+                            } else if let Some(src) = text_source {
+                                // Text source: copy text and bump counter to force signal.
+                                func.instruction(&Instruction::I32Const(target.0 as i32));
+                                func.instruction(&Instruction::I32Const(src.0 as i32));
+                                func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+                                func.instruction(&Instruction::GlobalGet(target.0));
+                                func.instruction(&Instruction::F64Const(1.0));
+                                func.instruction(&Instruction::F64Add);
+                                func.instruction(&Instruction::GlobalSet(target.0));
+                                // Notify host of the target cell update.
+                                func.instruction(&Instruction::I32Const(target.0 as i32));
+                                func.instruction(&Instruction::GlobalGet(target.0));
+                                func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                                self.emit_downstream_updates(func, *target);
                             } else {
                                 self.emit_expr(func, &arm.body);
                                 func.instruction(&Instruction::GlobalSet(target.0));
-                                if let Some(src) = text_source {
-                                    func.instruction(&Instruction::I32Const(target.0 as i32));
-                                    func.instruction(&Instruction::I32Const(src.0 as i32));
-                                    func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
-                                }
                                 // Notify host of the target cell update.
                                 func.instruction(&Instruction::I32Const(target.0 as i32));
                                 func.instruction(&Instruction::GlobalGet(target.0));
@@ -1857,22 +2030,24 @@ impl<'a> WasmEmitter<'a> {
             // Text body: build text and bump f64 BEFORE notifying host,
             // so the signal fires with the bumped value.
             self.emit_text_setting(func, target, body);
+        } else if let Some(src) = Self::extract_text_source_cell(body) {
+            // Text source: copy text and bump f64 counter to force signal.
+            func.instruction(&Instruction::I32Const(target.0 as i32));
+            func.instruction(&Instruction::I32Const(src.0 as i32));
+            func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+            func.instruction(&Instruction::GlobalGet(target.0));
+            func.instruction(&Instruction::F64Const(1.0));
+            func.instruction(&Instruction::F64Add);
+            func.instruction(&Instruction::GlobalSet(target.0));
         } else {
             self.emit_expr(func, body);
             func.instruction(&Instruction::GlobalSet(target.0));
-            // Copy text from source cell if body is CellRead.
-            if let IrExpr::CellRead(src) = body {
+            if let Some(text) = self.resolve_expr_text_statically(body) {
+                // Set text for constant expressions (tags, text literals, empty text).
+                let pattern_idx = self.register_text_pattern(&text);
                 func.instruction(&Instruction::I32Const(target.0 as i32));
-                func.instruction(&Instruction::I32Const(src.0 as i32));
-                func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
-            } else if let Some(text) = self.resolve_expr_text_statically(body) {
-                // Set text for constant expressions (tags, text literals).
-                if !text.is_empty() {
-                    let pattern_idx = self.register_text_pattern(&text);
-                    func.instruction(&Instruction::I32Const(target.0 as i32));
-                    func.instruction(&Instruction::I32Const(pattern_idx as i32));
-                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
-                }
+                func.instruction(&Instruction::I32Const(pattern_idx as i32));
+                func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
             }
         }
         // Notify host of the cell update.
@@ -1955,6 +2130,36 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::GlobalGet(cell.0));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
+                IrNode::TextToNumber { source, nan_tag_value, .. } => {
+                    self.emit_reevaluate_cell_guarded(func, *source, visiting);
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::F64Const(*nan_tag_value));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_TO_NUMBER));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                }
+                IrNode::TextStartsWith { source, prefix, .. } => {
+                    self.emit_reevaluate_cell_guarded(func, *source, visiting);
+                    self.emit_reevaluate_cell_guarded(func, *prefix, visiting);
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::I32Const(prefix.0 as i32));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_STARTS_WITH));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                }
+                IrNode::MathRound { source, .. } => {
+                    self.emit_reevaluate_cell_guarded(func, *source, visiting);
+                    func.instruction(&Instruction::GlobalGet(source.0));
+                    func.instruction(&Instruction::F64Nearest);
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                }
                 IrNode::When { source, arms, .. } => {
                     self.emit_reevaluate_cell_guarded(func, *source, visiting);
                     // Set skip flag = 0.0 before re-evaluation.
@@ -1965,6 +2170,15 @@ impl<'a> WasmEmitter<'a> {
                     // Re-evaluate the pattern match inline. Don't propagate downstream —
                     // this is an upstream re-evaluation context (refreshing stale cells),
                     // not a change propagation. Propagating would cycle through While deps.
+                    self.emit_pattern_match(func, *source, arms, cell, false);
+                }
+                IrNode::While { source, deps, arms, .. } => {
+                    // Re-evaluate source and all dependency cells first.
+                    self.emit_reevaluate_cell_guarded(func, *source, visiting);
+                    for dep in deps {
+                        self.emit_reevaluate_cell_guarded(func, *dep, visiting);
+                    }
+                    // Re-evaluate the pattern match inline (no downstream propagation).
                     self.emit_pattern_match(func, *source, arms, cell, false);
                 }
                 IrNode::PipeThrough { source, .. } => {
@@ -2047,6 +2261,36 @@ impl<'a> WasmEmitter<'a> {
                     self.emit_reevaluate_cell_ctx_guarded(func, *source, mem_ctx, visiting);
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_IS_NOT_EMPTY));
+                    self.emit_cell_set(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    self.emit_cell_get(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                }
+                IrNode::TextToNumber { source, nan_tag_value, .. } => {
+                    self.emit_reevaluate_cell_ctx_guarded(func, *source, mem_ctx, visiting);
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::F64Const(*nan_tag_value));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_TO_NUMBER));
+                    self.emit_cell_set(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    self.emit_cell_get(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                }
+                IrNode::TextStartsWith { source, prefix, .. } => {
+                    self.emit_reevaluate_cell_ctx_guarded(func, *source, mem_ctx, visiting);
+                    self.emit_reevaluate_cell_ctx_guarded(func, *prefix, mem_ctx, visiting);
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::I32Const(prefix.0 as i32));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_STARTS_WITH));
+                    self.emit_cell_set(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    self.emit_cell_get(func, cell, Some(mem_ctx));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                }
+                IrNode::MathRound { source, .. } => {
+                    self.emit_reevaluate_cell_ctx_guarded(func, *source, mem_ctx, visiting);
+                    self.emit_cell_get(func, *source, Some(mem_ctx));
+                    func.instruction(&Instruction::F64Nearest);
                     self.emit_cell_set(func, cell, Some(mem_ctx));
                     func.instruction(&Instruction::I32Const(cell.0 as i32));
                     self.emit_cell_get(func, cell, Some(mem_ctx));
@@ -2702,6 +2946,38 @@ impl<'a> WasmEmitter<'a> {
                 IrNode::TextIsNotEmpty { cell, source } if *source == updated_cell => {
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_IS_NOT_EMPTY));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    self.emit_downstream_updates(func, *cell);
+                }
+                // TextToNumber re-evaluates when source text changes.
+                IrNode::TextToNumber { cell, source, nan_tag_value } if *source == updated_cell => {
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::F64Const(*nan_tag_value));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_TO_NUMBER));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    self.emit_downstream_updates(func, *cell);
+                }
+                // TextStartsWith re-evaluates when source or prefix changes.
+                IrNode::TextStartsWith { cell, source, prefix } if *source == updated_cell || *prefix == updated_cell => {
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::I32Const(prefix.0 as i32));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_STARTS_WITH));
+                    func.instruction(&Instruction::GlobalSet(cell.0));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    func.instruction(&Instruction::GlobalGet(cell.0));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    self.emit_downstream_updates(func, *cell);
+                }
+                // MathRound re-evaluates when source changes.
+                IrNode::MathRound { cell, source } if *source == updated_cell => {
+                    func.instruction(&Instruction::GlobalGet(source.0));
+                    func.instruction(&Instruction::F64Nearest);
                     func.instruction(&Instruction::GlobalSet(cell.0));
                     func.instruction(&Instruction::I32Const(cell.0 as i32));
                     func.instruction(&Instruction::GlobalGet(cell.0));
@@ -3471,8 +3747,9 @@ impl<'a> WasmEmitter<'a> {
             }
         }
 
-        // Clear item context after reading field values.
-        func.instruction(&Instruction::Call(IMPORT_HOST_CLEAR_ITEM_CONTEXT));
+        // NOTE: Item context is kept active until after predicate evaluation.
+        // Text-based predicates (e.g., TextStartsWith) need item context to read
+        // per-item text from ItemCellStore via template field cells.
 
         // For numeric list items (no field cells), load the item value from the host.
         // The item cell's global needs the actual item value for predicates like `n == 2`.
@@ -3508,7 +3785,7 @@ impl<'a> WasmEmitter<'a> {
         }
 
         // Evaluate the predicate.
-        // Find if the predicate is defined by a WHILE or WHEN node.
+        // Find if the predicate is defined by a WHILE, WHEN, or pipe node.
         let pred_node = self.find_node_for_cell(predicate);
         match pred_node {
             Some(IrNode::While { source, arms, .. }) => {
@@ -3517,11 +3794,33 @@ impl<'a> WasmEmitter<'a> {
             Some(IrNode::When { source, arms, .. }) => {
                 self.emit_pattern_arms_no_notify(func, *source, arms, predicate, 0, invert);
             }
+            Some(IrNode::TextStartsWith { source, prefix, .. }) => {
+                // Text-based predicate: map retain sub-cell back to template field cell
+                // so host_text_starts_with can read per-item text from ItemCellStore.
+                let template_source = item_field_cells
+                    .iter()
+                    .find(|(_, sc)| *sc == *source)
+                    .and_then(|(field_name, _)| {
+                        self.program
+                            .cell_field_cells
+                            .get(&list_map_item_cell)
+                            .and_then(|fields| fields.get(field_name))
+                            .copied()
+                    })
+                    .unwrap_or(*source);
+                func.instruction(&Instruction::I32Const(template_source.0 as i32));
+                func.instruction(&Instruction::I32Const(prefix.0 as i32));
+                func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_STARTS_WITH));
+                func.instruction(&Instruction::GlobalSet(predicate.0));
+            }
             _ => {
                 // Predicate is directly a field sub-cell or simple derived —
                 // already set by the field read or derived re-evaluation above.
             }
         }
+
+        // Clear item context after predicate evaluation.
+        func.instruction(&Instruction::Call(IMPORT_HOST_CLEAR_ITEM_CONTEXT));
 
         // Retain: copy items where predicate is truthy (non-zero).
         // Remove (invert): copy items where predicate is falsy (zero).
@@ -3921,12 +4220,10 @@ impl<'a> WasmEmitter<'a> {
                         func.instruction(&Instruction::I32Const(src.0 as i32));
                         func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
                     } else if let Some(text) = self.resolve_expr_text_statically(init) {
-                        if !text.is_empty() {
-                            let pattern_idx = self.register_text_pattern(&text);
-                            func.instruction(&Instruction::I32Const(cell.0 as i32));
-                            func.instruction(&Instruction::I32Const(pattern_idx as i32));
-                            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
-                        }
+                        let pattern_idx = self.register_text_pattern(&text);
+                        func.instruction(&Instruction::I32Const(cell.0 as i32));
+                        func.instruction(&Instruction::I32Const(pattern_idx as i32));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
                     }
                 }
                 IrNode::Derived { cell, expr }
@@ -3950,22 +4247,18 @@ impl<'a> WasmEmitter<'a> {
                         {
                             self.emit_text_build_ctx(func, *cell, segments, Some(mem_ctx));
                         } else if let Some(text) = self.resolve_expr_text_statically(expr) {
-                            if !text.is_empty() {
-                                let pattern_idx = self.register_text_pattern(&text);
-                                func.instruction(&Instruction::I32Const(cell.0 as i32));
-                                func.instruction(&Instruction::I32Const(pattern_idx as i32));
-                                func.instruction(&Instruction::Call(
-                                    IMPORT_HOST_SET_CELL_TEXT_PATTERN,
-                                ));
-                            }
-                        }
-                    } else if let Some(text) = self.resolve_expr_text_statically(expr) {
-                        if !text.is_empty() {
                             let pattern_idx = self.register_text_pattern(&text);
                             func.instruction(&Instruction::I32Const(cell.0 as i32));
                             func.instruction(&Instruction::I32Const(pattern_idx as i32));
-                            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
+                            func.instruction(&Instruction::Call(
+                                IMPORT_HOST_SET_CELL_TEXT_PATTERN,
+                            ));
                         }
+                    } else if let Some(text) = self.resolve_expr_text_statically(expr) {
+                        let pattern_idx = self.register_text_pattern(&text);
+                        func.instruction(&Instruction::I32Const(cell.0 as i32));
+                        func.instruction(&Instruction::I32Const(pattern_idx as i32));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
                     }
                 }
                 IrNode::When { cell, source, arms }
@@ -4622,14 +4915,18 @@ impl<'a> WasmEmitter<'a> {
     ) {
         if self.is_text_body(body) {
             self.emit_text_setting_ctx(func, target, body, mem_ctx);
+        } else if let Some(src) = Self::extract_text_source_cell(body) {
+            // Text source: copy text and bump f64 counter to force signal.
+            func.instruction(&Instruction::I32Const(target.0 as i32));
+            func.instruction(&Instruction::I32Const(src.0 as i32));
+            func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+            self.emit_cell_get(func, target, mem_ctx);
+            func.instruction(&Instruction::F64Const(1.0));
+            func.instruction(&Instruction::F64Add);
+            self.emit_cell_set(func, target, mem_ctx);
         } else {
             self.emit_expr_ctx(func, body, mem_ctx);
             self.emit_cell_set(func, target, mem_ctx);
-            if let IrExpr::CellRead(src) = body {
-                func.instruction(&Instruction::I32Const(target.0 as i32));
-                func.instruction(&Instruction::I32Const(src.0 as i32));
-                func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
-            }
         }
         func.instruction(&Instruction::I32Const(target.0 as i32));
         self.emit_cell_get(func, target, mem_ctx);
@@ -4794,6 +5091,47 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_TRIM));
                     self.emit_cell_get(func, updated_cell, Some(mem_ctx));
+                    self.emit_cell_set(func, *cell, Some(mem_ctx));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    self.emit_cell_get(func, *cell, Some(mem_ctx));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    self.emit_item_downstream_updates(func, *cell, mem_ctx);
+                }
+                IrNode::TextToNumber { cell, source, nan_tag_value }
+                    if *source == updated_cell
+                        && cell.0 >= mem_ctx.cell_start
+                        && cell.0 < mem_ctx.cell_end =>
+                {
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::F64Const(*nan_tag_value));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_TO_NUMBER));
+                    self.emit_cell_set(func, *cell, Some(mem_ctx));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    self.emit_cell_get(func, *cell, Some(mem_ctx));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    self.emit_item_downstream_updates(func, *cell, mem_ctx);
+                }
+                IrNode::TextStartsWith { cell, source, prefix }
+                    if (*source == updated_cell || *prefix == updated_cell)
+                        && cell.0 >= mem_ctx.cell_start
+                        && cell.0 < mem_ctx.cell_end =>
+                {
+                    func.instruction(&Instruction::I32Const(source.0 as i32));
+                    func.instruction(&Instruction::I32Const(prefix.0 as i32));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_STARTS_WITH));
+                    self.emit_cell_set(func, *cell, Some(mem_ctx));
+                    func.instruction(&Instruction::I32Const(cell.0 as i32));
+                    self.emit_cell_get(func, *cell, Some(mem_ctx));
+                    func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+                    self.emit_item_downstream_updates(func, *cell, mem_ctx);
+                }
+                IrNode::MathRound { cell, source }
+                    if *source == updated_cell
+                        && cell.0 >= mem_ctx.cell_start
+                        && cell.0 < mem_ctx.cell_end =>
+                {
+                    self.emit_cell_get(func, *source, Some(mem_ctx));
+                    func.instruction(&Instruction::F64Nearest);
                     self.emit_cell_set(func, *cell, Some(mem_ctx));
                     func.instruction(&Instruction::I32Const(cell.0 as i32));
                     self.emit_cell_get(func, *cell, Some(mem_ctx));
