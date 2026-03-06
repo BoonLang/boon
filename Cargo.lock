@@ -130,6 +130,9 @@ name = "boon"
 version = "0.1.0"
 dependencies = [
  "ariadne",
+ "boon-monitor-protocol",
+ "boon-renderer-zoon",
+ "boon-scene",
  "chumsky",
  "differential-dataflow",
  "futures-channel",
@@ -158,6 +161,29 @@ dependencies = [
  "clap",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "boon-monitor-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "boon-renderer-zoon"
+version = "0.1.0"
+dependencies = [
+ "boon-scene",
+ "zoon",
+]
+
+[[package]]
+name = "boon-scene"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "ulid",
 ]
 
 [[package]]

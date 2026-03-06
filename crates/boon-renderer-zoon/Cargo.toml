@@ -1,0 +1,8 @@
+[package]
+name = "boon-renderer-zoon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+boon-scene = { path = "../boon-scene" }
+zoon = { git = "https://github.com/MoonZoon/MoonZoon", rev = "19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d" }
