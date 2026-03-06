@@ -4,7 +4,10 @@
 //! 1. Registration: Walk top-level expressions, collect variable and function definitions.
 //! 2. Lowering: Walk each variable's expression tree, emit IrNodes, allocate CellIds/EventIds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::env;
+
+use boon_scene::RenderSurface;
 
 use crate::parser::Span;
 use crate::parser::static_expression::{
@@ -47,6 +50,8 @@ struct SavedElementBindings {
     /// which would cause mouseleave on the child to incorrectly reset the parent's
     /// hovered state.
     hovered_cell: Option<CellId>,
+    /// The `.text` property cell allocated for this element self-ref, when present.
+    text_cell: Option<CellId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +74,7 @@ struct Lowerer {
     nodes: Vec<IrNode>,
     functions: Vec<IrFunction>,
     document: Option<CellId>,
+    render_surface: Option<RenderSurface>,
     errors: Vec<CompileError>,
 
     /// Map from variable name → CellId for name resolution.
@@ -114,6 +120,9 @@ struct Lowerer {
     /// Function inlining depth guard.
     inline_depth: usize,
 
+    /// Active user-defined call stack for recursion detection.
+    active_function_calls: Vec<String>,
+
     /// Map from CellId → field sub-cells for object-typed HOLD cells.
     /// Propagated through PipeThrough/CustomCall chains so field access
     /// (e.g., `.current`) resolves to the correct sub-cell.
@@ -134,6 +143,10 @@ struct Lowerer {
     /// even if the fields aren't reactive. Set during list constructor template inlining
     /// so that field access resolves to actual cells instead of ObjectConstruct.
     force_object_store: bool,
+
+    /// When true, preserve user-defined function calls as runtime IR instead of
+    /// aggressively inlining them during expression lowering.
+    preserve_runtime_function_calls: bool,
 
     /// Cells known to hold constant values at compile time.
     /// Used for constant folding of WHEN/WHILE arms during function inlining:
@@ -171,6 +184,7 @@ impl Lowerer {
             nodes: Vec::new(),
             functions: Vec::new(),
             document: None,
+            render_surface: None,
             errors: Vec::new(),
             name_to_cell: HashMap::new(),
             name_to_func: HashMap::new(),
@@ -188,7 +202,9 @@ impl Lowerer {
             current_passed: None,
             passed_resolve_depth: 0,
             inline_depth: 0,
+            active_function_calls: Vec::new(),
             force_object_store: false,
+            preserve_runtime_function_calls: false,
             constant_cells: HashMap::new(),
             pending_per_item_removes: HashMap::new(),
         }
@@ -305,6 +321,33 @@ impl Lowerer {
         }
     }
 
+    fn extract_list_constructor_from_value_expr(&self, expr: &Expression) -> Option<String> {
+        match expr {
+            Expression::List { items } => items
+                .iter()
+                .find_map(|item| self.extract_constructor_from_expr(&item.node)),
+            Expression::Pipe { from, to } => {
+                if let Expression::FunctionCall { path, arguments } = &to.node {
+                    let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                    if path_strs.as_slice() == ["List", "append"] {
+                        if let Some(arg) = arguments.iter().find(|a| a.node.name.as_str() == "item")
+                        {
+                            if let Some(value) = &arg.node.value {
+                                if let Some(name) =
+                                    self.extract_constructor_from_expr(&value.node)
+                                {
+                                    return Some(name);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.extract_list_constructor_from_value_expr(&from.node)
+            }
+            _ => None,
+        }
+    }
+
     /// Find the list item constructor for a cell by following CellRead/Derived chains.
     /// This handles cases where PASSED or alias resolution creates intermediate cells
     /// that don't have list_item_constructor propagated directly.
@@ -386,9 +429,7 @@ impl Lowerer {
         // list_item_constructor). Trace back to find the original constructor.
         let constructor_name = match self.find_list_constructor(source_cell) {
             Some(name) => name,
-            None => {
-                return false;
-            }
+            None => return false,
         };
         let func_def = match self.func_defs.get(&constructor_name).cloned() {
             Some(def) => def,
@@ -403,13 +444,54 @@ impl Lowerer {
             saved_bindings.push((param.clone(), self.name_to_cell.get(param).copied()));
         }
 
-        // Bind first param (title) to item_cell.
-        if let Some(first) = func_def.params.first() {
-            self.name_to_cell.insert(first.clone(), item_cell);
+        let mut bound_params = HashSet::new();
+        let body_fields = match &func_def.body.node {
+            Expression::Object(object) => Some(&object.variables),
+            Expression::TaggedObject { object, .. } => Some(&object.variables),
+            _ => None,
+        };
+        if let Some(body_fields) = body_fields {
+            for field in body_fields {
+                let field_name = field.node.name.as_str().to_string();
+                let Some(param_name) = (match &field.node.value.node {
+                    Expression::Alias(Alias::WithoutPassed { parts, .. }) if parts.len() == 1 => {
+                        Some(parts[0].as_str().to_string())
+                    }
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                if !func_def.params.iter().any(|param| param == &param_name) {
+                    continue;
+                }
+
+                let field_cell = self.alloc_cell(&param_name, span);
+                self.nodes.push(IrNode::Derived {
+                    cell: field_cell,
+                    expr: IrExpr::FieldAccess {
+                        object: Box::new(IrExpr::CellRead(item_cell)),
+                        field: field_name,
+                    },
+                });
+                self.name_to_cell.insert(param_name.clone(), field_cell);
+                bound_params.insert(param_name);
+            }
         }
 
-        // Bind remaining params to defaults (False).
-        for param in func_def.params.iter().skip(1) {
+        // Fallback for simple single-parameter constructors: bind the first
+        // parameter to the whole current item when no field-based mapping applies.
+        if bound_params.is_empty() {
+            if let Some(first) = func_def.params.first() {
+                self.name_to_cell.insert(first.clone(), item_cell);
+                bound_params.insert(first.clone());
+            }
+        }
+
+        // Bind unhandled params to defaults (False).
+        for param in &func_def.params {
+            if bound_params.contains(param) {
+                continue;
+            }
             let default_cell = self.alloc_cell(param, span);
             self.nodes.push(IrNode::Derived {
                 cell: default_cell,
@@ -420,22 +502,30 @@ impl Lowerer {
 
         // Lower constructor body — creates namespace cells in template range.
         // Force objects to use lower_object_store so field cells are always created.
+        let cell_start = self.cells.len() as u32;
         let saved_force = self.force_object_store;
         self.force_object_store = true;
-        let result = self.lower_expr(&func_def.body.node, func_def.body.span);
+        let result_cell = self.lower_expr_to_cell(&func_def.body, item_name);
         self.force_object_store = saved_force;
+        let item_root_cell = if self.resolve_cell_field_cells(result_cell).is_some() {
+            result_cell
+        } else {
+            (cell_start..self.cells.len() as u32)
+                .rev()
+                .map(CellId)
+                .find(|cell| self.resolve_cell_field_cells(*cell).is_some())
+                .unwrap_or(result_cell)
+        };
 
-        // If result is a namespace cell, bind item_name to it and propagate field cells.
-        if let IrExpr::CellRead(result_cell) = &result {
-            // Bind item name to the constructor's result cell so template
-            // can resolve field accesses (e.g., todo.editing) through it.
-            self.name_to_cell
-                .insert(item_name.to_string(), *result_cell);
+        // Bind item name to the constructor's result cell so template
+        // can resolve field accesses (e.g., todo.editing) through it.
+        self.name_to_cell
+            .insert(item_name.to_string(), item_root_cell);
 
-            // Also propagate cell_field_cells to item_cell for bridge use.
-            if let Some(fields) = self.cell_field_cells.get(result_cell).cloned() {
-                self.cell_field_cells.insert(item_cell, fields);
-            }
+        // Also propagate cell_field_cells to item_cell for bridge use.
+        if let Some(fields) = self.resolve_cell_field_cells(item_root_cell) {
+            self.cell_field_cells.insert(item_root_cell, fields.clone());
+            self.cell_field_cells.insert(item_cell, fields);
         }
 
         // Restore constructor param bindings.
@@ -461,10 +551,28 @@ impl Lowerer {
             events: self.events,
             nodes: self.nodes,
             document: self.document,
+            render_surface: self.render_surface,
             functions: self.functions,
             tag_table: self.tag_table,
             cell_field_cells: self.cell_field_cells,
         })
+    }
+
+    fn set_render_root(
+        &mut self,
+        kind: RenderSurface,
+        root: CellId,
+        lights: Option<CellId>,
+        geometry: Option<CellId>,
+    ) {
+        self.nodes.push(IrNode::Document {
+            kind,
+            root,
+            lights,
+            geometry,
+        });
+        self.document = Some(root);
+        self.render_surface = Some(kind);
     }
 }
 
@@ -560,9 +668,14 @@ pub fn lower(
     }
 
     // --- Pass 2: Lower each variable ---
+    let lower_trace = env::var("BOON_WASM_LOWER_TRACE").is_ok();
     for (var, span) in &top_level_vars {
         let name = var.name.as_str();
         let cell = ctx.name_to_cell[name];
+
+        if lower_trace {
+            eprintln!("[wasm-lower] var start {name}");
+        }
 
         // Check for function definitions — lower the body into IrFunction.
         if let Expression::Function {
@@ -577,15 +690,21 @@ pub fn lower(
                 cell,
                 expr: IrExpr::Constant(IrValue::Void),
             });
+            if lower_trace {
+                eprintln!("[wasm-lower] var done {name} (fn placeholder)");
+            }
             continue;
         }
 
         ctx.lower_variable(cell, &var.value, *span);
+        if lower_trace {
+            eprintln!("[wasm-lower] var done {name}");
+        }
     }
 
-    // Bare top-level functions are inlined at call sites.
-    // Don't eagerly lower their bodies here — PASS/PASSED context
-    // is only available at the call site during inlining.
+    // Lower user-defined functions into IrFunction bodies so recursive calls
+    // can be represented as IrExpr::FunctionCall instead of infinitely inlined.
+    ctx.lower_function_bodies();
 
     ctx.finish()
 }
@@ -595,6 +714,87 @@ pub fn lower(
 // ---------------------------------------------------------------------------
 
 impl Lowerer {
+    fn lower_function_bodies(&mut self) {
+        let function_count = self.name_to_func.len();
+        if function_count == 0 {
+            return;
+        }
+
+        let lower_trace = env::var("BOON_WASM_LOWER_TRACE").is_ok();
+
+        let mut lowered: Vec<Option<IrFunction>> = (0..function_count).map(|_| None).collect();
+        let func_defs: Vec<(String, FuncDef)> = self
+            .func_defs
+            .iter()
+            .map(|(name, def)| (name.clone(), def.clone()))
+            .collect();
+
+        for (fn_name, func_def) in func_defs {
+            let Some(&func_id) = self.name_to_func.get(&fn_name) else {
+                continue;
+            };
+
+            if lower_trace {
+                eprintln!("[wasm-lower] fn start {fn_name}");
+            }
+
+            let saved_names = self.name_to_cell.clone();
+            let saved_module = self.current_module.clone();
+            let saved_passed = self.current_passed.take();
+
+            let param_cells: Vec<CellId> = func_def
+                .params
+                .iter()
+                .map(|param| {
+                    let cell = self.alloc_cell(&format!("__fn.{}.{}", fn_name, param), func_def.body.span);
+                    self.name_to_cell.insert(param.clone(), cell);
+                    cell
+                })
+                .collect();
+
+            self.current_module = self.function_modules.get(&fn_name).cloned();
+            let body = self.with_preserved_runtime_function_calls(|this| {
+                this.lower_expr(&func_def.body.node, func_def.body.span)
+            });
+
+            lowered[func_id.0 as usize] = Some(IrFunction {
+                name: fn_name.clone(),
+                params: func_def.params.clone(),
+                param_cells,
+                body,
+            });
+
+            if lower_trace {
+                eprintln!("[wasm-lower] fn done {fn_name}");
+            }
+
+            self.name_to_cell = saved_names;
+            self.current_module = saved_module;
+            self.current_passed = saved_passed;
+        }
+
+        self.functions = lowered
+            .into_iter()
+            .enumerate()
+            .map(|(idx, maybe)| {
+                maybe.unwrap_or(IrFunction {
+                    name: format!("__missing_{idx}"),
+                    params: Vec::new(),
+                    param_cells: Vec::new(),
+                    body: IrExpr::Constant(IrValue::Void),
+                })
+            })
+            .collect();
+    }
+
+    fn with_preserved_runtime_function_calls<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = self.preserve_runtime_function_calls;
+        self.preserve_runtime_function_calls = true;
+        let result = f(self);
+        self.preserve_runtime_function_calls = saved;
+        result
+    }
+
     /// Lower a top-level variable's value expression and emit the appropriate IrNode.
     fn lower_variable(&mut self, cell: CellId, value: &Spanned<Expression>, var_span: Span) {
         // Get variable name for LINK resolution.
@@ -704,13 +904,7 @@ impl Lowerer {
                     .iter()
                     .find(|a| a.node.name.as_str() == "text")
                     .and_then(|a| a.node.value.as_ref())
-                    .and_then(|v| {
-                        let expr = self.lower_expr(&v.node, v.span);
-                        match expr {
-                            IrExpr::CellRead(c) => Some(c),
-                            _ => None,
-                        }
-                    });
+                    .map(|v| self.lower_expr_to_cell(v, "text_input_text"));
                 self.nodes.push(IrNode::Element {
                     cell,
                     kind: ElementKind::TextInput {
@@ -871,21 +1065,23 @@ impl Lowerer {
             }
             ["Element", "paragraph"] => {
                 // Accept both "content" (singular) and "contents" (plural).
-                let content = arguments
-                    .iter()
-                    .find(|a| {
-                        let n = a.node.name.as_str();
-                        n == "content" || n == "contents"
-                    })
-                    .and_then(|a| a.node.value.as_ref())
-                    .map(|v| self.lower_expr(&v.node, v.span))
-                    .unwrap_or_else(|| {
-                        self.error(
-                            span,
-                            "Element/paragraph requires a 'content' or 'contents' argument",
-                        );
-                        IrExpr::Constant(IrValue::Void)
-                    });
+                let content = self.with_preserved_runtime_function_calls(|this| {
+                    arguments
+                        .iter()
+                        .find(|a| {
+                            let n = a.node.name.as_str();
+                            n == "content" || n == "contents"
+                        })
+                        .and_then(|a| a.node.value.as_ref())
+                        .map(|v| this.lower_expr(&v.node, v.span))
+                        .unwrap_or_else(|| {
+                            this.error(
+                                span,
+                                "Element/paragraph requires a 'content' or 'contents' argument",
+                            );
+                            IrExpr::Constant(IrValue::Void)
+                        })
+                });
                 let style = self.find_arg_expr_or_default(arguments, "style");
                 self.nodes.push(IrNode::Element {
                     cell,
@@ -913,7 +1109,9 @@ impl Lowerer {
                 });
             }
             ["Element", "text"] => {
-                let label = self.find_arg_expr(arguments, "text", span);
+                let label = self.with_preserved_runtime_function_calls(|this| {
+                    this.find_arg_expr(arguments, "text", span)
+                });
                 let style = self.find_arg_expr_or_default(arguments, "style");
                 self.nodes.push(IrNode::Element {
                     cell,
@@ -1108,10 +1306,22 @@ impl Lowerer {
             saved_short_bindings.push((field_name.clone(), saved));
 
             // Only register the dotted name in the first pass.
-            // Short name will be registered after value lowering.
+            // Short names without an outer binding are pre-registered so
+            // sibling fields can forward-reference them. The current field's
+            // own short name is temporarily removed during its lowering below
+            // to avoid accidental self-reference.
             self.name_to_cell.insert(dotted_name, field_cell);
+            if saved.is_none() {
+                self.name_to_cell.insert(field_name.clone(), field_cell);
+            }
+            if let Some(constructor_name) =
+                self.extract_list_constructor_from_value_expr(&v.node.value.node)
+            {
+                self.list_item_constructor
+                    .insert(field_cell, constructor_name);
+            }
 
-            field_cells.push((field_name, field_cell));
+            field_cells.push((field_name, field_cell, saved.is_none()));
         }
 
         // Second pass: lower each field's value, then register short name.
@@ -1124,8 +1334,12 @@ impl Lowerer {
             if v.node.name.is_empty() {
                 continue; // Skip spread entries
             }
-            let (field_name, field_cell) = &field_cells[field_idx];
+            let (field_name, field_cell, pre_registered_short) = &field_cells[field_idx];
             field_idx += 1;
+
+            if *pre_registered_short {
+                self.name_to_cell.remove(field_name);
+            }
 
             if matches!(v.node.value.node, Expression::Link) {
                 // LINK placeholder — pre-allocate events and data cells.
@@ -1145,7 +1359,7 @@ impl Lowerer {
         // Register field cells: merge spread fields (first) and explicit fields (override).
         let mut field_map: HashMap<String, CellId> =
             spread_field_cells.iter().cloned().collect();
-        for (name, cell) in &field_cells {
+        for (name, cell, _) in &field_cells {
             field_map.insert(name.clone(), *cell);
         }
         self.cell_field_cells.insert(parent_cell, field_map);
@@ -1174,29 +1388,39 @@ impl Lowerer {
             "focus",
             "double_click",
         ];
-        let mut events = HashMap::new();
-        for event_name in &common_events {
-            let event_id = self.alloc_event(
-                &format!("{}.{}", cell_name, event_name),
-                EventSource::Link {
-                    element: cell,
-                    event_name: event_name.to_string(),
-                },
-                span,
-            );
-            events.insert(event_name.to_string(), event_id);
-        }
-        self.element_events.insert(cell_name.clone(), events);
+        let events = if let Some(existing) = self.element_events.get(&cell_name).cloned() {
+            existing
+        } else {
+            let mut events = HashMap::new();
+            for event_name in &common_events {
+                let event_id = self.alloc_event(
+                    &format!("{}.{}", cell_name, event_name),
+                    EventSource::Link {
+                        element: cell,
+                        event_name: event_name.to_string(),
+                    },
+                    span,
+                );
+                events.insert(event_name.to_string(), event_id);
+            }
+            self.element_events.insert(cell_name.clone(), events.clone());
+            events
+        };
 
         // Pre-allocate data cells for event payloads.
         // key_down.key → CellId (stores the key tag, e.g., Enter, Escape)
         let key_cell_name = format!("{}.event.key_down.key", cell_name);
-        let key_cell = self.alloc_cell(&key_cell_name, span);
-        self.name_to_cell.insert(key_cell_name, key_cell);
-        self.nodes.push(IrNode::Derived {
-            cell: key_cell,
-            expr: IrExpr::Constant(IrValue::Void),
-        });
+        let key_cell = if let Some(&cell) = self.name_to_cell.get(&key_cell_name) {
+            cell
+        } else {
+            let cell = self.alloc_cell(&key_cell_name, span);
+            self.name_to_cell.insert(key_cell_name, cell);
+            self.nodes.push(IrNode::Derived {
+                cell,
+                expr: IrExpr::Constant(IrValue::Void),
+            });
+            cell
+        };
         // Register event for the key cell so WHEN can trigger on key changes.
         if let Some(&event_id) = self
             .element_events
@@ -1210,34 +1434,61 @@ impl Lowerer {
                 .push(key_cell);
         }
 
-        // change.text → CellId (stores the changed text)
+        // change.text / change.value → CellIds (stores the changed payload)
         let change_text_name = format!("{}.event.change.text", cell_name);
-        let change_text_cell = self.alloc_cell(&change_text_name, span);
-        self.name_to_cell.insert(change_text_name, change_text_cell);
-        self.nodes.push(IrNode::Derived {
-            cell: change_text_cell,
-            expr: IrExpr::Constant(IrValue::Void),
-        });
-        // Add change_text_cell as payload for the change event.
+        let change_text_cell = if let Some(&cell) = self.name_to_cell.get(&change_text_name) {
+            cell
+        } else {
+            let cell = self.alloc_cell(&change_text_name, span);
+            self.name_to_cell.insert(change_text_name, cell);
+            self.nodes.push(IrNode::Derived {
+                cell,
+                expr: IrExpr::Constant(IrValue::Void),
+            });
+            cell
+        };
+        let change_value_name = format!("{}.event.change.value", cell_name);
+        let change_value_cell = if let Some(&cell) = self.name_to_cell.get(&change_value_name) {
+            cell
+        } else {
+            let cell = self.alloc_cell(&change_value_name, span);
+            self.name_to_cell.insert(change_value_name, cell);
+            self.nodes.push(IrNode::Derived {
+                cell,
+                expr: IrExpr::Constant(IrValue::Void),
+            });
+            cell
+        };
+        // Add both payload cells for the change event so text inputs and sliders
+        // can read the same event through different field names.
         if let Some(&event_id) = self
             .element_events
             .get(&cell_name)
             .and_then(|evts| evts.get("change"))
         {
             self.cell_events.insert(change_text_cell, event_id);
+            self.cell_events.insert(change_value_cell, event_id);
             self.events[event_id.0 as usize]
                 .payload_cells
                 .push(change_text_cell);
+            self.events[event_id.0 as usize]
+                .payload_cells
+                .push(change_value_cell);
         }
 
         // .text → CellId (current text value of the input)
         let text_name = format!("{}.text", cell_name);
-        let text_cell = self.alloc_cell(&text_name, span);
-        self.name_to_cell.insert(text_name, text_cell);
-        self.nodes.push(IrNode::Derived {
-            cell: text_cell,
-            expr: IrExpr::Constant(IrValue::Void),
-        });
+        let text_cell = if let Some(&cell) = self.name_to_cell.get(&text_name) {
+            cell
+        } else {
+            let cell = self.alloc_cell(&text_name, span);
+            self.name_to_cell.insert(text_name, cell);
+            self.nodes.push(IrNode::Derived {
+                cell,
+                expr: IrExpr::Constant(IrValue::Void),
+            });
+            cell
+        };
     }
 
     /// Process the `element` argument of an Element/* call to enable self-references.
@@ -1288,6 +1539,7 @@ impl Lowerer {
                     bindings: saved_bindings,
                     events: saved_events,
                     hovered_cell: None,
+                    text_cell: None,
                 };
             }
         };
@@ -1298,6 +1550,7 @@ impl Lowerer {
                     bindings: saved_bindings,
                     events: saved_events,
                     hovered_cell: None,
+                    text_cell: None,
                 };
             }
         };
@@ -1381,10 +1634,21 @@ impl Lowerer {
                                         cell: text_cell,
                                         expr: IrExpr::Constant(IrValue::Void),
                                     });
+                                    let value_name = format!("element.event.change.value");
+                                    let value_cell = self.alloc_cell(&value_name, span);
+                                    self.name_to_cell.insert(value_name, value_cell);
+                                    self.nodes.push(IrNode::Derived {
+                                        cell: value_cell,
+                                        expr: IrExpr::Constant(IrValue::Void),
+                                    });
                                     self.cell_events.insert(text_cell, event_id);
+                                    self.cell_events.insert(value_cell, event_id);
                                     self.events[event_id.0 as usize]
                                         .payload_cells
                                         .push(text_cell);
+                                    self.events[event_id.0 as usize]
+                                        .payload_cells
+                                        .push(value_cell);
                                 }
                                 if event_name == "blur"
                                     || event_name == "focus"
@@ -1458,11 +1722,13 @@ impl Lowerer {
 
         // Only return hovered_cell if THIS element declared its own `hovered: LINK`.
         let hovered_cell = self.name_to_cell.get("element.hovered").copied();
+        let text_cell = self.name_to_cell.get("element.text").copied();
 
         SavedElementBindings {
             bindings: saved_bindings,
             events: saved_events,
             hovered_cell,
+            text_cell,
         }
     }
 
@@ -1573,6 +1839,10 @@ impl Lowerer {
             } else {
                 self.name_to_cell.remove(&state_name);
             }
+            self.propagate_expr_field_cells(target, &init_expr);
+            for (_trigger, body) in &trigger_bodies {
+                self.propagate_expr_field_cells(target, body);
+            }
             self.nodes.push(IrNode::Hold {
                 cell: target,
                 init: init_expr,
@@ -1601,6 +1871,35 @@ impl Lowerer {
             }
         }
 
+        if let Expression::Then { body } = &to.node {
+            if let Some(trigger) = self
+                .resolve_event_from_expr(&from.node)
+                .or_else(|| {
+                    let source_cell = self.lower_expr_to_cell(from, "pipe_from");
+                    self.resolve_event_from_cell(source_cell)
+                })
+            {
+                let body_expr = self.lower_expr(&body.node, body.span);
+                if let IrExpr::CellRead(result_cell) = &body_expr {
+                    if let Some(fields) = self.cell_field_cells.get(result_cell).cloned() {
+                        self.cell_field_cells.insert(target, fields);
+                    }
+                    if let Some(constructor) =
+                        self.list_item_constructor.get(result_cell).cloned()
+                    {
+                        self.list_item_constructor.insert(target, constructor);
+                    }
+                }
+                self.nodes.push(IrNode::Then {
+                    cell: target,
+                    trigger,
+                    body: body_expr,
+                });
+                self.cell_events.insert(target, trigger);
+                return;
+            }
+        }
+
         // Special case: LinkSetter needs to set current_var_name BEFORE
         // lowering `from`, so the element picks up the LINK target's events.
         if let Expression::LinkSetter { alias } = &to.node {
@@ -1609,6 +1908,7 @@ impl Lowerer {
                 let saved_var_name = self.current_var_name.take();
                 self.current_var_name = Some(name.clone());
                 let source_cell = self.lower_expr_to_cell(from, "pipe_from");
+                self.rebind_element_links_to_target(source_cell, name);
                 // Note: event propagation to LINK target name is handled by
                 // process_element_self_ref (which stores events under current_var_name).
                 // Do NOT copy from "element" here — restore_element_self_ref has
@@ -1638,6 +1938,7 @@ impl Lowerer {
                     let source_cell = self.lower_expr_to_cell(from, "pipe_from");
                     let mid_cell = self.alloc_cell("pipe_mid", to.span);
                     self.lower_pipe_with_source_cell(mid_cell, source_cell, mid, var_span);
+                    self.rebind_element_links_to_target(mid_cell, name);
                     // Note: event propagation handled by process_element_self_ref.
                     self.nodes.push(IrNode::PipeThrough {
                         cell: target,
@@ -1694,11 +1995,9 @@ impl Lowerer {
 
             // --- `source |> Document/new(...)` ---
             ["Document", "new"] => {
-                let root_cell = self.lower_expr_to_cell(source, "doc_root");
                 // Also check for a `root:` argument.
                 let root = self.find_arg_cell(arguments, "root", source, call_span);
-                self.nodes.push(IrNode::Document { root });
-                self.document = Some(root);
+                self.set_render_root(RenderSurface::Document, root, None, None);
                 // The target cell = the document root.
                 self.nodes.push(IrNode::PipeThrough {
                     cell: target,
@@ -1917,6 +2216,17 @@ impl Lowerer {
                     source: source_cell,
                 });
             }
+            ["List", "latest"] => {
+                let source_cell = self.lower_expr_to_cell(source, "list_source");
+                if let Some(arms) = self.lower_list_latest_from_source(source_cell) {
+                    self.nodes.push(IrNode::Latest { target, arms });
+                } else {
+                    self.nodes.push(IrNode::PipeThrough {
+                        cell: target,
+                        source: source_cell,
+                    });
+                }
+            }
 
             // --- `source |> Stream/pulses()` ---
             ["Stream", "pulses"] => {
@@ -1931,10 +2241,33 @@ impl Lowerer {
             // --- `source |> Stream/skip(count: N)` ---
             ["Stream", "skip"] => {
                 let source_cell = self.lower_expr_to_cell(source, "skip_source");
-                self.nodes.push(IrNode::PipeThrough {
+                let skip_count = arguments
+                    .iter()
+                    .find(|arg| arg.node.name.as_str() == "count")
+                    .and_then(|arg| arg.node.value.as_ref())
+                    .and_then(|value| match &value.node {
+                        Expression::Literal(crate::parser::static_expression::Literal::Number(n))
+                            if *n >= 0.0 =>
+                        {
+                            Some(*n as usize)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                let seen_cell = self.alloc_cell("stream_skip_seen", call_span);
+                self.nodes.push(IrNode::Derived {
+                    cell: seen_cell,
+                    expr: IrExpr::Constant(IrValue::Number(0.0)),
+                });
+                self.nodes.push(IrNode::StreamSkip {
                     cell: target,
                     source: source_cell,
+                    count: skip_count,
+                    seen_cell,
                 });
+                if let Some(fields) = self.cell_field_cells.get(&source_cell).cloned() {
+                    self.cell_field_cells.insert(target, fields);
+                }
             }
 
             // --- `source |> Text/trim()` ---
@@ -1963,6 +2296,44 @@ impl Lowerer {
                 self.nodes.push(IrNode::MathRound {
                     cell: target,
                     source: source_cell,
+                });
+            }
+
+            // --- `source |> Math/min(b: ...)` ---
+            ["Math", "min"] => {
+                let source_cell = self.lower_expr_to_cell(source, "min_source");
+                let b_cell = if let Some(b_arg) = arguments.iter().find(|a| a.node.name.as_str() == "b") {
+                    if let Some(ref val) = b_arg.node.value {
+                        self.lower_expr_to_cell(val, "min_b")
+                    } else {
+                        self.alloc_cell("min_b_empty", call_span)
+                    }
+                } else {
+                    self.alloc_cell("min_b_empty", call_span)
+                };
+                self.nodes.push(IrNode::MathMin {
+                    cell: target,
+                    source: source_cell,
+                    b: b_cell,
+                });
+            }
+
+            // --- `source |> Math/max(b: ...)` ---
+            ["Math", "max"] => {
+                let source_cell = self.lower_expr_to_cell(source, "max_source");
+                let b_cell = if let Some(b_arg) = arguments.iter().find(|a| a.node.name.as_str() == "b") {
+                    if let Some(ref val) = b_arg.node.value {
+                        self.lower_expr_to_cell(val, "max_b")
+                    } else {
+                        self.alloc_cell("max_b_empty", call_span)
+                    }
+                } else {
+                    self.alloc_cell("max_b_empty", call_span)
+                };
+                self.nodes.push(IrNode::MathMax {
+                    cell: target,
+                    source: source_cell,
+                    b: b_cell,
                 });
             }
 
@@ -2414,10 +2785,13 @@ impl Lowerer {
                 };
                 if let Some(fn_name) = resolved_fn {
                     let func_def = self.find_func_def(&fn_name).unwrap();
+                    let func_id = self.name_to_func[&fn_name];
                     // Set module context for intra-module resolution during body inlining
                     self.current_module = self.function_modules.get(&fn_name).cloned();
                     let source_cell = self.lower_expr_to_cell(source, "pipe_fn_arg");
                     let result = self.inline_function_call_with_pipe(
+                        &fn_name,
+                        func_id,
                         &func_def,
                         source_cell,
                         arguments,
@@ -2521,7 +2895,156 @@ impl Lowerer {
                 }
             }
         }
+        for arm in &arms {
+            self.propagate_expr_field_cells(target, &arm.body);
+        }
         self.nodes.push(IrNode::Latest { target, arms });
+    }
+
+    fn lower_list_latest_from_source(&self, source_cell: CellId) -> Option<Vec<LatestArm>> {
+        let mut current = source_cell;
+        for _ in 0..100 {
+            let mut next_source = None;
+            for node in self.nodes.iter().rev() {
+                match node {
+                    IrNode::ListMap {
+                        cell,
+                        template,
+                        template_cell_range,
+                        ..
+                    } if *cell == current => {
+                        return self.extract_latest_arms_from_template_node(
+                            template,
+                            *template_cell_range,
+                        );
+                    }
+                    IrNode::PipeThrough { cell, source }
+                    | IrNode::ListRetain { cell, source, .. }
+                    | IrNode::ListRemove { cell, source, .. }
+                        if *cell == current =>
+                    {
+                        next_source = Some(*source);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            current = next_source?;
+        }
+        None
+    }
+
+    fn extract_latest_arms_from_template_node(
+        &self,
+        node: &IrNode,
+        template_cell_range: (u32, u32),
+    ) -> Option<Vec<LatestArm>> {
+        match node {
+            IrNode::Derived { expr, .. } => {
+                self.extract_latest_arms_from_expr(expr, template_cell_range)
+            }
+            IrNode::Then { trigger, body, .. } => Some(vec![LatestArm {
+                trigger: Some(*trigger),
+                body: body.clone(),
+            }]),
+            IrNode::Hold { trigger_bodies, .. } => Some(
+                trigger_bodies
+                    .iter()
+                    .map(|(trigger, body)| LatestArm {
+                        trigger: Some(*trigger),
+                        body: body.clone(),
+                    })
+                    .collect(),
+            ),
+            IrNode::Latest { arms, .. } => Some(arms.clone()),
+            _ => None,
+        }
+    }
+
+    fn extract_latest_arms_from_expr(
+        &self,
+        expr: &IrExpr,
+        template_cell_range: (u32, u32),
+    ) -> Option<Vec<LatestArm>> {
+        match expr {
+            IrExpr::CellRead(cell) => {
+                self.extract_latest_arms_from_cell(*cell, template_cell_range)
+            }
+            _ => Some(vec![LatestArm {
+                trigger: None,
+                body: expr.clone(),
+            }]),
+        }
+    }
+
+    fn extract_latest_arms_from_cell(
+        &self,
+        cell: CellId,
+        template_cell_range: (u32, u32),
+    ) -> Option<Vec<LatestArm>> {
+        let (cell_start, cell_end) = template_cell_range;
+        let node = self.nodes.iter().rev().find(|node| match node {
+            IrNode::Derived { cell: c, .. }
+            | IrNode::Hold { cell: c, .. }
+            | IrNode::Latest { target: c, .. }
+            | IrNode::Then { cell: c, .. }
+            | IrNode::When { cell: c, .. }
+            | IrNode::While { cell: c, .. }
+            | IrNode::TextInterpolation { cell: c, .. }
+            | IrNode::MathSum { cell: c, .. }
+            | IrNode::PipeThrough { cell: c, .. }
+            | IrNode::StreamSkip { cell: c, .. }
+            | IrNode::CustomCall { cell: c, .. }
+            | IrNode::Element { cell: c, .. }
+            | IrNode::ListAppend { cell: c, .. }
+            | IrNode::ListClear { cell: c, .. }
+            | IrNode::ListCount { cell: c, .. }
+            | IrNode::ListMap { cell: c, .. }
+            | IrNode::ListRemove { cell: c, .. }
+            | IrNode::ListRetain { cell: c, .. }
+            | IrNode::ListEvery { cell: c, .. }
+            | IrNode::ListAny { cell: c, .. }
+            | IrNode::ListIsEmpty { cell: c, .. }
+            | IrNode::RouterGoTo { cell: c, .. }
+            | IrNode::TextTrim { cell: c, .. }
+            | IrNode::TextIsNotEmpty { cell: c, .. }
+            | IrNode::TextToNumber { cell: c, .. }
+            | IrNode::TextStartsWith { cell: c, .. }
+            | IrNode::MathRound { cell: c, .. }
+            | IrNode::MathMin { cell: c, .. }
+            | IrNode::MathMax { cell: c, .. }
+            | IrNode::HoldLoop { cell: c, .. } => {
+                *c == cell && c.0 >= cell_start && c.0 < cell_end
+            }
+            IrNode::Document { .. } | IrNode::Timer { .. } => false,
+        })?;
+
+        match node {
+            IrNode::Then { trigger, body, .. } => Some(vec![LatestArm {
+                trigger: Some(*trigger),
+                body: body.clone(),
+            }]),
+            IrNode::Hold { trigger_bodies, .. } => Some(
+                trigger_bodies
+                    .iter()
+                    .map(|(trigger, body)| LatestArm {
+                        trigger: Some(*trigger),
+                        body: body.clone(),
+                    })
+                    .collect(),
+            ),
+            IrNode::Latest { arms, .. } => Some(arms.clone()),
+            IrNode::Derived { expr, .. } => {
+                self.extract_latest_arms_from_expr(expr, template_cell_range)
+            }
+            IrNode::PipeThrough { source, .. } => {
+                self.extract_latest_arms_from_cell(*source, template_cell_range)
+            }
+            _ => Some(vec![LatestArm {
+                trigger: None,
+                body: IrExpr::CellRead(cell),
+            }]),
+        }
     }
 
     /// Lower a HOLD body expression, extracting trigger events.
@@ -2697,6 +3220,23 @@ impl Lowerer {
                                 arms: ir_arms,
                             };
                             trigger_bodies.push((trigger, body_expr));
+                        } else {
+                            let expr = self.lower_pipe_to_expr(from, to);
+                            if let IrExpr::CellRead(cell) = &expr {
+                                if let Some(IrNode::Latest { arms, .. }) =
+                                    self.nodes.iter().rev().find(|node| {
+                                        matches!(node, IrNode::Latest { target, .. } if *target == *cell)
+                                    })
+                                {
+                                    for arm in arms {
+                                        if let Some(trigger) = arm.trigger {
+                                            trigger_bodies.push((trigger, arm.body.clone()));
+                                        }
+                                    }
+                                } else if let Some(trigger) = self.resolve_event_from_cell(*cell) {
+                                    trigger_bodies.push((trigger, expr));
+                                }
+                            }
                         }
                     }
                 }
@@ -2857,6 +3397,13 @@ impl Lowerer {
                         if let Some(events) = self.element_events.get(&element_name) {
                             return events.get(event_name).copied();
                         }
+                        if let Some(resolved_name) =
+                            self.resolve_link_alias_through_cells(&parts[..event_idx])
+                        {
+                            if let Some(events) = self.element_events.get(&resolved_name) {
+                                return events.get(event_name).copied();
+                            }
+                        }
                         // Try resolving through alias → global name.
                         // E.g., "elements.clear_button" → cell with global name
                         // "store.elements.clear_button", then look up element_events.
@@ -2965,9 +3512,11 @@ impl Lowerer {
                 let passed = self.current_passed.clone()?;
                 let mut current_expr = &passed.node;
                 let mut parts_iter = extra_parts.iter();
+                let mut walked_parts: Vec<String> = Vec::new();
 
                 while let Some(part) = parts_iter.next() {
                     let field = part.as_str();
+                    walked_parts.push(field.to_string());
                     match current_expr {
                         Expression::Object(obj) => {
                             let found =
@@ -2979,22 +3528,18 @@ impl Lowerer {
                             }
                         }
                         Expression::Alias(inner_alias) => {
-                            // Resolve alias to get cell name, then append remaining parts.
-                            if let Alias::WithoutPassed {
-                                parts: alias_parts, ..
-                            } = inner_alias
+                            // Resolve nested aliases (including nested PASSED paths)
+                            // to a concrete base name, then append remaining parts.
+                            if let Some(mut name) =
+                                self.resolve_link_target_name(inner_alias, span)
                             {
-                                if let Some(&cell) = self.name_to_cell.get(alias_parts[0].as_str())
-                                {
-                                    let mut name = self.cells[cell.0 as usize].name.clone();
+                                name.push('.');
+                                name.push_str(field);
+                                for remaining in parts_iter {
                                     name.push('.');
-                                    name.push_str(field);
-                                    for remaining in parts_iter {
-                                        name.push('.');
-                                        name.push_str(remaining.as_str());
-                                    }
-                                    return Some(name);
+                                    name.push_str(remaining.as_str());
                                 }
+                                return Some(name);
                             }
                             return None;
                         }
@@ -3004,10 +3549,7 @@ impl Lowerer {
 
                 // If we consumed all parts and landed on a Link placeholder, find its cell name.
                 if matches!(current_expr, Expression::Link) {
-                    // We've navigated to a LINK node. We need to find which cell this is.
-                    // The cell was created during object flattening. Try to find it
-                    // by checking the lowered alias.
-                    None
+                    self.resolve_link_target_name_from_parts(&walked_parts)
                 } else if let Expression::Alias(inner) = current_expr {
                     if let Alias::WithoutPassed { parts, .. } = inner {
                         if let Some(&cell) = self.name_to_cell.get(parts[0].as_str()) {
@@ -3046,6 +3588,30 @@ impl Lowerer {
         }
     }
 
+    fn resolve_link_target_name_from_parts(&self, parts: &[String]) -> Option<String> {
+        let first = parts.first()?;
+        let mut current_cell = self.name_to_cell.get(first).copied()?;
+
+        for field in &parts[1..] {
+            if let Some(fields) = self.resolve_cell_field_cells(current_cell) {
+                if let Some(&field_cell) = fields.get(field) {
+                    current_cell = field_cell;
+                    continue;
+                }
+            }
+
+            let cell_name = &self.cells[current_cell.0 as usize].name;
+            let global_path = format!("{}.{}", cell_name, field);
+            if let Some(&cell) = self.name_to_cell.get(&global_path) {
+                current_cell = cell;
+            } else {
+                return None;
+            }
+        }
+
+        Some(self.cells[current_cell.0 as usize].name.clone())
+    }
+
     /// Resolve a multi-part alias (e.g., "item.item_elements.toggle_button")
     /// through the cell hierarchy to find the actual cell name for element_events lookup.
     fn resolve_link_alias_through_cells(
@@ -3060,7 +3626,7 @@ impl Lowerer {
         for part in &parts[1..] {
             let field = part.as_str();
             // Check cell_field_cells for a direct field lookup.
-            if let Some(fields) = self.cell_field_cells.get(&current_cell) {
+            if let Some(fields) = self.resolve_cell_field_cells(current_cell) {
                 if let Some(&field_cell) = fields.get(field) {
                     current_cell = field_cell;
                     continue;
@@ -3297,10 +3863,15 @@ impl Lowerer {
 
             Expression::Block { variables, output } => {
                 // Lower block variables as local cells, then return the output expression.
+                // IMPORTANT: defer short-name registration until after the value is lowered
+                // so a block local can still read an outer binding with the same name.
+                let mut saved_bindings: Vec<(String, Option<CellId>)> = Vec::new();
                 for v in variables {
                     let name = v.node.name.as_str();
                     let cell = self.alloc_cell(name, v.span);
-                    self.name_to_cell.insert(name.to_string(), cell);
+                    let name_string = name.to_string();
+                    let saved = self.name_to_cell.get(name).copied();
+                    saved_bindings.push((name_string.clone(), saved));
                     let expr = self.lower_expr(&v.node.value.node, v.node.value.span);
                     // Propagate cell_field_cells so object-store fields remain
                     // accessible through this BLOCK variable.
@@ -3309,9 +3880,18 @@ impl Lowerer {
                             self.cell_field_cells.insert(cell, fields);
                         }
                     }
+                    self.name_to_cell.insert(name_string, cell);
                     self.nodes.push(IrNode::Derived { cell, expr });
                 }
-                self.lower_expr(&output.node, output.span)
+                let result = self.lower_expr(&output.node, output.span);
+                for (name, saved) in saved_bindings.into_iter().rev() {
+                    if let Some(cell) = saved {
+                        self.name_to_cell.insert(name, cell);
+                    } else {
+                        self.name_to_cell.remove(&name);
+                    }
+                }
+                result
             }
 
             Expression::Pipe { from, to } => self.lower_pipe_to_expr(from, to),
@@ -3422,8 +4002,7 @@ impl Lowerer {
                 if let Some(root_arg) = arguments.iter().find(|a| a.node.name.as_str() == "root") {
                     if let Some(ref val) = root_arg.node.value {
                         let root_cell = self.lower_expr_to_cell(val, "doc_root");
-                        self.nodes.push(IrNode::Document { root: root_cell });
-                        self.document = Some(root_cell);
+                        self.set_render_root(RenderSurface::Document, root_cell, None, None);
                         return IrExpr::CellRead(root_cell);
                     }
                 }
@@ -3432,14 +4011,23 @@ impl Lowerer {
             }
 
             // --- Scene/new(root: ..., lights: ..., geometry: ...) ---
-            // Extract the root element and treat it as the document root.
-            // Lights and geometry are ignored (no physical CSS in WASM engine yet).
+            // Preserve root, lights, and geometry so the renderer can decide
+            // how much scene-aware fallback behavior it can provide.
             ["Scene", "new"] => {
                 if let Some(root_arg) = arguments.iter().find(|a| a.node.name.as_str() == "root") {
                     if let Some(ref val) = root_arg.node.value {
                         let root_cell = self.lower_expr_to_cell(val, "scene_root");
-                        self.nodes.push(IrNode::Document { root: root_cell });
-                        self.document = Some(root_cell);
+                        let lights = arguments
+                            .iter()
+                            .find(|a| a.node.name.as_str() == "lights")
+                            .and_then(|arg| arg.node.value.as_ref())
+                            .map(|value| self.lower_expr_to_cell(value, "scene_lights"));
+                        let geometry = arguments
+                            .iter()
+                            .find(|a| a.node.name.as_str() == "geometry")
+                            .and_then(|arg| arg.node.value.as_ref())
+                            .map(|value| self.lower_expr_to_cell(value, "scene_geometry"));
+                        self.set_render_root(RenderSurface::Scene, root_cell, lights, geometry);
                         return IrExpr::CellRead(root_cell);
                     }
                 }
@@ -3447,12 +4035,52 @@ impl Lowerer {
                 IrExpr::Constant(IrValue::Void)
             }
 
-            // --- Lights/basic(), Light/directional(), Light/ambient() ---
-            // Stubs — values unused without physical CSS.
-            ["Lights", "basic"] | ["Lights", "directional"] | ["Lights", "ambient"]
-            | ["Light", "directional"] | ["Light", "ambient"] => {
-                IrExpr::Constant(IrValue::Void)
+            // --- Lights/basic(), Light/*() ---
+            ["Lights", "basic"] | ["Lights", "directional"] | ["Lights", "ambient"] => {
+                IrExpr::ListConstruct(Vec::new())
             }
+            ["Light", "directional"] => IrExpr::TaggedObject {
+                tag: "DirectionalLight".to_string(),
+                fields: vec![
+                    ("azimuth".to_string(), self.find_arg_expr(arguments, "azimuth", span)),
+                    (
+                        "altitude".to_string(),
+                        self.find_arg_expr(arguments, "altitude", span),
+                    ),
+                    ("spread".to_string(), self.find_arg_expr(arguments, "spread", span)),
+                    (
+                        "intensity".to_string(),
+                        self.find_arg_expr(arguments, "intensity", span),
+                    ),
+                    ("color".to_string(), self.find_arg_expr(arguments, "color", span)),
+                ],
+            },
+            ["Light", "ambient"] => IrExpr::TaggedObject {
+                tag: "AmbientLight".to_string(),
+                fields: vec![
+                    (
+                        "intensity".to_string(),
+                        self.find_arg_expr(arguments, "intensity", span),
+                    ),
+                    ("color".to_string(), self.find_arg_expr(arguments, "color", span)),
+                ],
+            },
+            ["Light", "spot"] => IrExpr::TaggedObject {
+                tag: "SpotLight".to_string(),
+                fields: vec![
+                    ("target".to_string(), self.find_arg_expr(arguments, "target", span)),
+                    ("color".to_string(), self.find_arg_expr(arguments, "color", span)),
+                    (
+                        "intensity".to_string(),
+                        self.find_arg_expr(arguments, "intensity", span),
+                    ),
+                    ("radius".to_string(), self.find_arg_expr(arguments, "radius", span)),
+                    (
+                        "softness".to_string(),
+                        self.find_arg_expr(arguments, "softness", span),
+                    ),
+                ],
+            },
 
             // --- Element/button(element: [...], label: TEXT { ... }, style: [...]) ---
             ["Element", "button"] => {
@@ -3485,12 +4113,6 @@ impl Lowerer {
                     .map(|v| self.lower_expr(&v.node, v.span));
                 let style = self.find_arg_expr_or_default(arguments, "style");
                 // Lower the text argument for text_input.
-                let text_expr = arguments
-                    .iter()
-                    .find(|a| a.node.name.as_str() == "text")
-                    .and_then(|a| a.node.value.as_ref())
-                    .map(|v| self.lower_expr(&v.node, v.span));
-
                 let cell = self.alloc_cell("text_input", span);
                 let links =
                     self.extract_links_for_element(&self.cells[cell.0 as usize].name.clone());
@@ -3498,10 +4120,17 @@ impl Lowerer {
 
                 let focus = self.has_element_bool_field(arguments, "focus")
                     || self.has_top_level_bool_arg(arguments, "focus");
-                let text_cell = text_expr.and_then(|expr| match expr {
-                    IrExpr::CellRead(c) => Some(c),
-                    _ => None,
-                });
+                let text_cell = arguments
+                    .iter()
+                    .find(|a| a.node.name.as_str() == "text")
+                    .and_then(|a| a.node.value.as_ref())
+                    .map(|v| self.lower_expr_to_cell(v, "text_input_text"));
+                if let (Some(prop_cell), Some(source_cell)) = (saved_elem.text_cell, text_cell) {
+                    self.nodes.push(IrNode::Derived {
+                        cell: prop_cell,
+                        expr: IrExpr::CellRead(source_cell),
+                    });
+                }
                 self.nodes.push(IrNode::Element {
                     cell,
                     kind: ElementKind::TextInput {
@@ -3978,6 +4607,49 @@ impl Lowerer {
                 IrExpr::CellRead(cell)
             }
 
+            // --- List/range(from: ..., to: ...) ---
+            ["List", "range"] => {
+                let from = self.find_arg_expr(arguments, "from", span);
+                let to = self.find_arg_expr(arguments, "to", span);
+                let from_n = match &from {
+                    IrExpr::Constant(IrValue::Number(n)) => Some(*n),
+                    IrExpr::CellRead(src) => match self.constant_cells.get(src) {
+                        Some(IrValue::Number(n)) => Some(*n),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let to_n = match &to {
+                    IrExpr::Constant(IrValue::Number(n)) => Some(*n),
+                    IrExpr::CellRead(src) => match self.constant_cells.get(src) {
+                        Some(IrValue::Number(n)) => Some(*n),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match (from_n, to_n) {
+                    (Some(from_n), Some(to_n)) => {
+                        let from_i = from_n as i64;
+                        let to_i = to_n as i64;
+                        let items = if from_i <= to_i {
+                            (from_i..=to_i)
+                                .map(|n| IrExpr::Constant(IrValue::Number(n as f64)))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        IrExpr::ListConstruct(items)
+                    }
+                    _ => {
+                        self.error(
+                            span,
+                            "List/range() currently requires constant `from` and `to` in the Wasm engine",
+                        );
+                        IrExpr::ListConstruct(Vec::new())
+                    }
+                }
+            }
+
             // --- Math/sum() (standalone, not in pipe) ---
             ["Math", "sum"] => {
                 self.error(
@@ -4047,8 +4719,9 @@ impl Lowerer {
                 };
                 if let Some(fn_name) = resolved_fn {
                     let func_def = self.find_func_def(&fn_name).unwrap();
+                    let func_id = self.name_to_func[&fn_name];
                     self.current_module = self.function_modules.get(&fn_name).cloned();
-                    return self.inline_function_call(&func_def, arguments, span);
+                    return self.inline_function_call(&fn_name, func_id, &func_def, arguments, span);
                 }
 
                 // Unknown — record as CustomCall for later handling.
@@ -4169,6 +4842,40 @@ impl Lowerer {
                 if parts.is_empty() {
                     self.error(span, "Empty alias");
                     return IrExpr::Constant(IrValue::Void);
+                }
+
+                if let Some(event_idx) = parts.iter().position(|p| p.as_str() == "event") {
+                    if event_idx > 0 && event_idx + 1 < parts.len() {
+                        if let Some(resolved_name) =
+                            self.resolve_link_alias_through_cells(&parts[..event_idx])
+                        {
+                            let event_name = parts[event_idx + 1].as_str();
+                            if let Some(events) = self.element_events.get(&resolved_name) {
+                                if let Some(&event_id) = events.get(event_name) {
+                                    if event_idx + 2 == parts.len() {
+                                        if let Some(&cell) = self.name_to_cell.get(&resolved_name) {
+                                            self.cell_events.insert(cell, event_id);
+                                            return IrExpr::CellRead(cell);
+                                        }
+                                    } else {
+                                        let data_name = format!(
+                                            "{}.event.{}",
+                                            resolved_name,
+                                            parts[event_idx + 1..]
+                                                .iter()
+                                                .map(|p| p.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(".")
+                                        );
+                                        if let Some(&data_cell) = self.name_to_cell.get(&data_name)
+                                        {
+                                            return IrExpr::CellRead(data_cell);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 let first = parts[0].as_str();
@@ -4341,8 +5048,9 @@ impl Lowerer {
                                 if rest.len() >= 2 && rest[0].as_str() == "event" {
                                     let event_name = rest[1].as_str();
                                     if let Some(events) = self.element_events.get(&partial_global) {
-                                        if let Some(&_event_id) = events.get(event_name) {
+                                        if let Some(&event_id) = events.get(event_name) {
                                             if rest.len() == 2 {
+                                                self.cell_events.insert(partial_cell, event_id);
                                                 return IrExpr::CellRead(partial_cell);
                                             }
                                             if rest.len() >= 3 {
@@ -4378,8 +5086,9 @@ impl Lowerer {
                             let element_name = first;
                             let event_name = parts[2].as_str();
                             if let Some(events) = self.element_events.get(element_name) {
-                                if let Some(&_event_id) = events.get(event_name) {
+                                if let Some(&event_id) = events.get(event_name) {
                                     if parts.len() == 3 {
+                                        self.cell_events.insert(cell, event_id);
                                         return IrExpr::CellRead(cell);
                                     }
                                     if parts.len() >= 4 {
@@ -4460,6 +5169,21 @@ impl Lowerer {
         parent_passed: &Option<Spanned<Expression>>,
     ) -> Option<Spanned<Expression>> {
         match &expr.node {
+            Expression::Object(obj) => {
+                let mut resolved = obj.clone();
+                for field in &mut resolved.variables {
+                    if let Some(next) =
+                        self.pre_resolve_pass_expr(&field.node.value, parent_passed)
+                    {
+                        field.node.value = next;
+                    }
+                }
+                Some(Spanned {
+                    node: Expression::Object(resolved),
+                    span: expr.span,
+                    persistence: None,
+                })
+            }
             Expression::Alias(Alias::WithPassed { extra_parts }) => {
                 let passed = parent_passed.as_ref()?;
                 let mut current = &passed.node;
@@ -4849,13 +5573,21 @@ impl Lowerer {
     /// and lowering the body in the extended scope.
     fn inline_function_call(
         &mut self,
+        fn_name: &str,
+        func_id: FuncId,
         func_def: &FuncDef,
         arguments: &[Spanned<Argument>],
         span: Span,
     ) -> IrExpr {
+        if self.active_function_calls.iter().any(|name| name == fn_name) {
+            return self.build_function_call_expr(func_id, func_def, None, arguments, span);
+        }
+
+        self.active_function_calls.push(fn_name.to_string());
         self.inline_depth += 1;
         if self.inline_depth > 64 {
             self.inline_depth -= 1;
+            self.active_function_calls.pop();
             self.error(span, "Function inlining exceeded maximum depth (possible recursion)");
             return IrExpr::Constant(IrValue::Void);
         }
@@ -4918,15 +5650,14 @@ impl Lowerer {
                 // and register in cell_field_cells. This enables WHEN pattern
                 // destructuring to bind field variables (e.g., `checked` in
                 // `ButtonIcon[checked] => ...`).
-                let tagged_field_cells =
-                    if let IrExpr::TaggedObject { ref fields, .. } = expr {
+                let object_field_cells = match &expr {
+                    IrExpr::TaggedObject { fields, .. } | IrExpr::ObjectConstruct(fields) => {
                         let mut field_map = HashMap::new();
                         for (field_name, field_expr) in fields {
                             let field_cell = match field_expr {
                                 IrExpr::CellRead(c) => *c,
                                 _ => {
-                                    let fc =
-                                        self.alloc_cell(field_name, span);
+                                    let fc = self.alloc_cell(field_name, span);
                                     self.nodes.push(IrNode::Derived {
                                         cell: fc,
                                         expr: field_expr.clone(),
@@ -4937,9 +5668,9 @@ impl Lowerer {
                             field_map.insert(field_name.clone(), field_cell);
                         }
                         Some(field_map)
-                    } else {
-                        None
-                    };
+                    }
+                    _ => None,
+                };
 
                 // If the argument is a namespace cell (object with field cells),
                 // propagate field cell names under the parameter name prefix so
@@ -4957,7 +5688,7 @@ impl Lowerer {
                     self.constant_cells.insert(cell, cv);
                 }
 
-                if let Some(field_map) = tagged_field_cells {
+                if let Some(field_map) = object_field_cells {
                     for (field_name, field_cell) in &field_map {
                         let dotted = format!("{}.{}", param_name, field_name);
                         self.name_to_cell.insert(dotted, *field_cell);
@@ -4988,6 +5719,7 @@ impl Lowerer {
         self.current_module = saved_module;
 
         self.inline_depth -= 1;
+        self.active_function_calls.pop();
         result
     }
 
@@ -4997,14 +5729,28 @@ impl Lowerer {
     /// to elements created inside the function body.
     fn inline_function_call_with_pipe(
         &mut self,
+        fn_name: &str,
+        func_id: FuncId,
         func_def: &FuncDef,
         pipe_source: CellId,
         arguments: &[Spanned<Argument>],
         span: Span,
     ) -> IrExpr {
+        if self.active_function_calls.iter().any(|name| name == fn_name) {
+            return self.build_function_call_expr(
+                func_id,
+                func_def,
+                Some(IrExpr::CellRead(pipe_source)),
+                arguments,
+                span,
+            );
+        }
+
+        self.active_function_calls.push(fn_name.to_string());
         self.inline_depth += 1;
         if self.inline_depth > 64 {
             self.inline_depth -= 1;
+            self.active_function_calls.pop();
             self.error(span, "Function inlining exceeded maximum depth (possible recursion)");
             return IrExpr::Constant(IrValue::Void);
         }
@@ -5071,15 +5817,14 @@ impl Lowerer {
                 };
 
                 // For TaggedObject, create sub-cells for field destructuring.
-                let tagged_field_cells =
-                    if let IrExpr::TaggedObject { ref fields, .. } = expr {
+                let object_field_cells = match &expr {
+                    IrExpr::TaggedObject { fields, .. } | IrExpr::ObjectConstruct(fields) => {
                         let mut field_map = HashMap::new();
                         for (field_name, field_expr) in fields {
                             let field_cell = match field_expr {
                                 IrExpr::CellRead(c) => *c,
                                 _ => {
-                                    let fc =
-                                        self.alloc_cell(field_name, span);
+                                    let fc = self.alloc_cell(field_name, span);
                                     self.nodes.push(IrNode::Derived {
                                         cell: fc,
                                         expr: field_expr.clone(),
@@ -5090,9 +5835,9 @@ impl Lowerer {
                             field_map.insert(field_name.clone(), field_cell);
                         }
                         Some(field_map)
-                    } else {
-                        None
-                    };
+                    }
+                    _ => None,
+                };
 
                 // Extract namespace source BEFORE moving expr into Derived node.
                 let namespace_source = if let IrExpr::CellRead(source_cell) = &expr {
@@ -5108,7 +5853,7 @@ impl Lowerer {
                 }
 
                 // Propagate namespace field cell names (same as inline_function_call).
-                if let Some(field_map) = tagged_field_cells {
+                if let Some(field_map) = object_field_cells {
                     for (field_name, field_cell) in &field_map {
                         let dotted = format!("{}.{}", param_name, field_name);
                         self.name_to_cell.insert(dotted, *field_cell);
@@ -5139,7 +5884,62 @@ impl Lowerer {
         self.current_module = saved_module;
 
         self.inline_depth -= 1;
+        self.active_function_calls.pop();
         result
+    }
+
+    fn build_function_call_expr(
+        &mut self,
+        func_id: FuncId,
+        func_def: &FuncDef,
+        pipe_source: Option<IrExpr>,
+        arguments: &[Spanned<Argument>],
+        span: Span,
+    ) -> IrExpr {
+        let mut args = Vec::with_capacity(func_def.params.len());
+
+        for (i, param_name) in func_def.params.iter().enumerate() {
+            let arg_expr = if i == 0 {
+                if let Some(pipe_expr) = pipe_source.clone() {
+                    Some(pipe_expr)
+                } else {
+                    arguments
+                        .iter()
+                        .find(|a| a.node.name.as_str() == param_name && a.node.name.as_str() != "PASS")
+                        .or_else(|| {
+                            let non_pass: Vec<_> = arguments
+                                .iter()
+                                .filter(|a| a.node.name.as_str() != "PASS")
+                                .collect();
+                            non_pass.get(i).copied()
+                        })
+                        .and_then(|a| a.node.value.as_ref())
+                        .map(|val| self.lower_expr(&val.node, val.span))
+                }
+            } else {
+                let positional_index = if pipe_source.is_some() { i - 1 } else { i };
+                arguments
+                    .iter()
+                    .find(|a| a.node.name.as_str() == param_name && a.node.name.as_str() != "PASS")
+                    .or_else(|| {
+                        let non_pass: Vec<_> = arguments
+                            .iter()
+                            .filter(|a| a.node.name.as_str() != "PASS")
+                            .collect();
+                        non_pass.get(positional_index).copied()
+                    })
+                    .and_then(|a| a.node.value.as_ref())
+                    .map(|val| self.lower_expr(&val.node, val.span))
+            };
+
+            args.push(arg_expr.unwrap_or(IrExpr::Constant(IrValue::Void)));
+        }
+
+        if args.is_empty() && pipe_source.is_some() && func_def.params.is_empty() {
+            self.error(span, "Piped function call has no parameters");
+        }
+
+        IrExpr::FunctionCall { func: func_id, args }
     }
 
     /// Lower a pattern. Tags in patterns are interned in the tag table.
@@ -5191,6 +5991,24 @@ impl Lowerer {
             match node {
                 IrNode::Derived {
                     cell: c,
+                    expr: IrExpr::TaggedObject { fields, .. },
+                }
+                | IrNode::Derived {
+                    cell: c,
+                    expr: IrExpr::ObjectConstruct(fields),
+                } if *c == cell => {
+                    let mut field_map = HashMap::new();
+                    for (field_name, field_expr) in fields {
+                        if let IrExpr::CellRead(field_cell) = field_expr {
+                            field_map.insert(field_name.clone(), *field_cell);
+                        }
+                    }
+                    if !field_map.is_empty() {
+                        return Some(field_map);
+                    }
+                }
+                IrNode::Derived {
+                    cell: c,
                     expr: IrExpr::CellRead(src),
                 } if *c == cell => {
                     return self.resolve_cell_field_cells(*src);
@@ -5217,6 +6035,62 @@ impl Lowerer {
             }
         }
         None
+    }
+
+    fn propagate_expr_field_cells(&mut self, target: CellId, expr: &IrExpr) {
+        let Some(source_fields) = ({
+            match expr {
+                IrExpr::CellRead(source) => self.resolve_cell_field_cells(*source),
+                IrExpr::FieldAccess { object, field } => {
+                    if let IrExpr::CellRead(object_cell) = object.as_ref() {
+                        self.resolve_cell_field_cells(*object_cell)
+                            .and_then(|object_fields| {
+                                object_fields
+                                    .get(field)
+                                    .copied()
+                                    .and_then(|field_cell| self.resolve_cell_field_cells(field_cell))
+                            })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+
+        let alias_fields = self.build_field_alias_map(target, &source_fields);
+        if !alias_fields.is_empty() {
+            self.cell_field_cells.insert(target, alias_fields);
+        }
+    }
+
+    fn build_field_alias_map(
+        &mut self,
+        target: CellId,
+        source_fields: &HashMap<String, CellId>,
+    ) -> HashMap<String, CellId> {
+        let target_name = self.cells[target.0 as usize].name.clone();
+        let span = self.cells[target.0 as usize].span;
+        let mut alias_fields = HashMap::new();
+        for (field_name, source_field) in source_fields {
+            let alias_name = format!("{}.{}", target_name, field_name);
+            let alias_cell = self.alloc_cell(&alias_name, span);
+            self.nodes.push(IrNode::Derived {
+                cell: alias_cell,
+                expr: IrExpr::Constant(IrValue::Void),
+            });
+            if let Some(nested_source_fields) = self.resolve_cell_field_cells(*source_field) {
+                let nested_alias_fields =
+                    self.build_field_alias_map(alias_cell, &nested_source_fields);
+                if !nested_alias_fields.is_empty() {
+                    self.cell_field_cells.insert(alias_cell, nested_alias_fields);
+                }
+            }
+            alias_fields.insert(field_name.clone(), alias_cell);
+        }
+        alias_fields
     }
 
     /// Follow CellRead/Derived/PipeThrough chains to find an inline object or
@@ -5617,7 +6491,45 @@ impl Lowerer {
         // where the expression must be re-evaluated at event time.
         if let Expression::FunctionCall { path, arguments } = &to.node {
             let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+            let resolved_fn = if path_strs.len() == 1 {
+                self.resolve_func_name(path_strs[0])
+            } else if path_strs.len() == 2 {
+                let qualified = format!("{}/{}", path_strs[0], path_strs[1]);
+                self.resolve_func_name(&qualified)
+            } else {
+                None
+            };
+            if let Some(fn_name) = resolved_fn {
+                let func_def = self.find_func_def(&fn_name).unwrap();
+                let func_id = self.name_to_func[&fn_name];
+                self.current_module = self.function_modules.get(&fn_name).cloned();
+                let source_expr = self.lower_expr(&from.node, from.span);
+                let source_cell = match source_expr {
+                    IrExpr::CellRead(cell) => cell,
+                    other => {
+                        let cell = self.alloc_cell("pipe_inline_arg", from.span);
+                        self.nodes.push(IrNode::Derived { cell, expr: other });
+                        cell
+                    }
+                };
+                return self.inline_function_call_with_pipe(
+                    &fn_name,
+                    func_id,
+                    &func_def,
+                    source_cell,
+                    arguments,
+                    to.span,
+                );
+            }
             match path_strs.as_slice() {
+                ["List", "get"] => {
+                    let source = self.lower_expr(&from.node, from.span);
+                    if let Some(index) = self.find_constant_index_argument(arguments, to.span) {
+                        if let Some(item) = self.try_resolve_list_get_expr(&source, index) {
+                            return item;
+                        }
+                    }
+                }
                 ["Bool", "not"] => {
                     let source = self.lower_expr(&from.node, from.span);
                     return IrExpr::Not(Box::new(source));
@@ -5650,6 +6562,259 @@ impl Lowerer {
             }
         }
         IrExpr::Constant(IrValue::Void)
+    }
+
+    fn find_constant_index_argument(
+        &mut self,
+        arguments: &[Spanned<Argument>],
+        span: Span,
+    ) -> Option<usize> {
+        let index_expr = self.find_arg_expr(arguments, "index", span);
+        match index_expr {
+            IrExpr::Constant(IrValue::Number(n)) if n >= 1.0 => Some(n as usize),
+            IrExpr::CellRead(src) => match self.constant_cells.get(&src) {
+                Some(IrValue::Number(n)) if *n >= 1.0 => Some(*n as usize),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn try_resolve_list_get_expr(&self, source: &IrExpr, index: usize) -> Option<IrExpr> {
+        match source {
+            IrExpr::ListConstruct(items) => items
+                .get(index.saturating_sub(1))
+                .cloned()
+                .map(|expr| self.inline_cell_reads_in_expr(expr, &mut HashSet::new())),
+            IrExpr::CellRead(cell) => {
+                self.try_resolve_list_get_from_cell(*cell, index, &mut HashSet::new())
+            }
+            _ => None,
+        }
+    }
+
+    fn try_resolve_list_get_from_cell(
+        &self,
+        cell: CellId,
+        index: usize,
+        visiting: &mut HashSet<CellId>,
+    ) -> Option<IrExpr> {
+        if !visiting.insert(cell) {
+            return None;
+        }
+
+        let result = self
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::Derived { cell: c, expr } if *c == cell => match expr {
+                    IrExpr::ListConstruct(items) => items
+                        .get(index.saturating_sub(1))
+                        .cloned()
+                        .map(|expr| self.inline_cell_reads_in_expr(expr, &mut HashSet::new())),
+                    IrExpr::CellRead(src) => {
+                        self.try_resolve_list_get_from_cell(*src, index, visiting)
+                    }
+                    _ => None,
+                },
+                IrNode::PipeThrough { cell: c, source } if *c == cell => {
+                    self.try_resolve_list_get_from_cell(*source, index, visiting)
+                }
+                IrNode::ListMap {
+                    cell: c,
+                    source,
+                    item_cell,
+                    template,
+                    ..
+                } if *c == cell => {
+                    let item_expr = self.try_resolve_list_get_from_cell(*source, index, visiting)?;
+                    match template.as_ref() {
+                        IrNode::Derived { expr, .. } => {
+                            let substituted =
+                                self.substitute_expr_cell(expr.clone(), *item_cell, &item_expr);
+                            Some(self.inline_cell_reads_in_expr(
+                                substituted,
+                                &mut HashSet::new(),
+                            ))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            });
+
+        visiting.remove(&cell);
+        result
+    }
+
+    fn substitute_expr_cell(&self, expr: IrExpr, target: CellId, replacement: &IrExpr) -> IrExpr {
+        match expr {
+            IrExpr::CellRead(cell) if cell == target => replacement.clone(),
+            IrExpr::CellRead(cell) => IrExpr::CellRead(cell),
+            IrExpr::FieldAccess { object, field } => IrExpr::FieldAccess {
+                object: Box::new(self.substitute_expr_cell(*object, target, replacement)),
+                field,
+            },
+            IrExpr::BinOp { op, lhs, rhs } => IrExpr::BinOp {
+                op,
+                lhs: Box::new(self.substitute_expr_cell(*lhs, target, replacement)),
+                rhs: Box::new(self.substitute_expr_cell(*rhs, target, replacement)),
+            },
+            IrExpr::UnaryNeg(inner) => {
+                IrExpr::UnaryNeg(Box::new(self.substitute_expr_cell(*inner, target, replacement)))
+            }
+            IrExpr::Compare { op, lhs, rhs } => IrExpr::Compare {
+                op,
+                lhs: Box::new(self.substitute_expr_cell(*lhs, target, replacement)),
+                rhs: Box::new(self.substitute_expr_cell(*rhs, target, replacement)),
+            },
+            IrExpr::TextConcat(parts) => IrExpr::TextConcat(
+                parts
+                    .into_iter()
+                    .map(|part| match part {
+                        TextSegment::Literal(text) => TextSegment::Literal(text),
+                        TextSegment::Expr(expr) => TextSegment::Expr(
+                            self.substitute_expr_cell(expr, target, replacement),
+                        ),
+                    })
+                    .collect(),
+            ),
+            IrExpr::FunctionCall { func, args } => IrExpr::FunctionCall {
+                func,
+                args: args
+                    .into_iter()
+                    .map(|arg| self.substitute_expr_cell(arg, target, replacement))
+                    .collect(),
+            },
+            IrExpr::Not(inner) => {
+                IrExpr::Not(Box::new(self.substitute_expr_cell(*inner, target, replacement)))
+            }
+            IrExpr::ObjectConstruct(fields) => IrExpr::ObjectConstruct(
+                fields
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (name, self.substitute_expr_cell(value, target, replacement))
+                    })
+                    .collect(),
+            ),
+            IrExpr::ListConstruct(items) => IrExpr::ListConstruct(
+                items
+                    .into_iter()
+                    .map(|item| self.substitute_expr_cell(item, target, replacement))
+                    .collect(),
+            ),
+            IrExpr::TaggedObject { tag, fields } => IrExpr::TaggedObject {
+                tag,
+                fields: fields
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (name, self.substitute_expr_cell(value, target, replacement))
+                    })
+                    .collect(),
+            },
+            IrExpr::PatternMatch { source, arms } => IrExpr::PatternMatch {
+                source,
+                arms: arms
+                    .into_iter()
+                    .map(|(pattern, body)| {
+                        (pattern, self.substitute_expr_cell(body, target, replacement))
+                    })
+                    .collect(),
+            },
+            IrExpr::Constant(value) => IrExpr::Constant(value),
+        }
+    }
+
+    fn inline_cell_reads_in_expr(&self, expr: IrExpr, visiting: &mut HashSet<CellId>) -> IrExpr {
+        match expr {
+            IrExpr::CellRead(cell) => {
+                if !visiting.insert(cell) {
+                    return IrExpr::CellRead(cell);
+                }
+                let resolved = self
+                    .nodes
+                    .iter()
+                    .find_map(|node| match node {
+                        IrNode::Derived { cell: c, expr } if *c == cell => {
+                            Some(self.inline_cell_reads_in_expr(expr.clone(), visiting))
+                        }
+                        IrNode::PipeThrough { cell: c, source } if *c == cell => Some(
+                            self.inline_cell_reads_in_expr(IrExpr::CellRead(*source), visiting),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or(IrExpr::CellRead(cell));
+                visiting.remove(&cell);
+                resolved
+            }
+            IrExpr::FieldAccess { object, field } => IrExpr::FieldAccess {
+                object: Box::new(self.inline_cell_reads_in_expr(*object, visiting)),
+                field,
+            },
+            IrExpr::BinOp { op, lhs, rhs } => IrExpr::BinOp {
+                op,
+                lhs: Box::new(self.inline_cell_reads_in_expr(*lhs, visiting)),
+                rhs: Box::new(self.inline_cell_reads_in_expr(*rhs, visiting)),
+            },
+            IrExpr::UnaryNeg(inner) => {
+                IrExpr::UnaryNeg(Box::new(self.inline_cell_reads_in_expr(*inner, visiting)))
+            }
+            IrExpr::Compare { op, lhs, rhs } => IrExpr::Compare {
+                op,
+                lhs: Box::new(self.inline_cell_reads_in_expr(*lhs, visiting)),
+                rhs: Box::new(self.inline_cell_reads_in_expr(*rhs, visiting)),
+            },
+            IrExpr::TextConcat(parts) => IrExpr::TextConcat(
+                parts
+                    .into_iter()
+                    .map(|part| match part {
+                        TextSegment::Literal(text) => TextSegment::Literal(text),
+                        TextSegment::Expr(expr) => {
+                            TextSegment::Expr(self.inline_cell_reads_in_expr(expr, visiting))
+                        }
+                    })
+                    .collect(),
+            ),
+            IrExpr::FunctionCall { func, args } => IrExpr::FunctionCall {
+                func,
+                args: args
+                    .into_iter()
+                    .map(|arg| self.inline_cell_reads_in_expr(arg, visiting))
+                    .collect(),
+            },
+            IrExpr::Not(inner) => {
+                IrExpr::Not(Box::new(self.inline_cell_reads_in_expr(*inner, visiting)))
+            }
+            IrExpr::ObjectConstruct(fields) => IrExpr::ObjectConstruct(
+                fields
+                    .into_iter()
+                    .map(|(name, value)| (name, self.inline_cell_reads_in_expr(value, visiting)))
+                    .collect(),
+            ),
+            IrExpr::ListConstruct(items) => IrExpr::ListConstruct(
+                items
+                    .into_iter()
+                    .map(|item| self.inline_cell_reads_in_expr(item, visiting))
+                    .collect(),
+            ),
+            IrExpr::TaggedObject { tag, fields } => IrExpr::TaggedObject {
+                tag,
+                fields: fields
+                    .into_iter()
+                    .map(|(name, value)| (name, self.inline_cell_reads_in_expr(value, visiting)))
+                    .collect(),
+            },
+            IrExpr::PatternMatch { source, arms } => IrExpr::PatternMatch {
+                source,
+                arms: arms
+                    .into_iter()
+                    .map(|(pattern, body)| {
+                        (pattern, self.inline_cell_reads_in_expr(body, visiting))
+                    })
+                    .collect(),
+            },
+            IrExpr::Constant(value) => IrExpr::Constant(value),
+        }
     }
 
     /// Extract a field from within a named argument's object value.
@@ -5787,11 +6952,21 @@ impl Lowerer {
                         self.alloc_event("then_trigger", EventSource::Synthetic, to.span)
                     });
                 let body_expr = self.lower_expr(&body.node, body.span);
+                if let IrExpr::CellRead(result_cell) = &body_expr {
+                    if let Some(fields) = self.cell_field_cells.get(result_cell).cloned() {
+                        self.cell_field_cells.insert(target, fields);
+                    }
+                    if let Some(constructor) = self.list_item_constructor.get(result_cell).cloned()
+                    {
+                        self.list_item_constructor.insert(target, constructor);
+                    }
+                }
                 self.nodes.push(IrNode::Then {
                     cell: target,
                     trigger,
                     body: body_expr,
                 });
+                self.cell_events.insert(target, trigger);
             }
 
             Expression::Hold { state_param, body } => {
@@ -5805,6 +6980,10 @@ impl Lowerer {
                     self.name_to_cell.insert(state_name, prev);
                 } else {
                     self.name_to_cell.remove(&state_name);
+                }
+                self.propagate_expr_field_cells(target, &init_expr);
+                for (_trigger, body) in &trigger_bodies {
+                    self.propagate_expr_field_cells(target, body);
                 }
                 self.nodes.push(IrNode::Hold {
                     cell: target,
@@ -5959,8 +7138,7 @@ impl Lowerer {
                             .and_then(|a| a.node.value.as_ref())
                             .map(|v| self.lower_expr_to_cell(v, "doc_root"))
                             .unwrap_or(source_cell);
-                        self.nodes.push(IrNode::Document { root });
-                        self.document = Some(root);
+                        self.set_render_root(RenderSurface::Document, root, None, None);
                         self.nodes.push(IrNode::PipeThrough {
                             cell: target,
                             source: root,
@@ -5980,12 +7158,39 @@ impl Lowerer {
                         });
                         self.cell_events.insert(target, event);
                     }
-                    ["Stream", "pulses"] | ["Stream", "skip"] => {
+                    ["Stream", "pulses"] => {
                         self.nodes.push(IrNode::PipeThrough {
                             cell: target,
                             source: source_cell,
                         });
                         // Propagate field cell info through pass-through.
+                        if let Some(fields) = self.cell_field_cells.get(&source_cell).cloned() {
+                            self.cell_field_cells.insert(target, fields);
+                        }
+                    }
+                    ["Stream", "skip"] => {
+                        let skip_count = arguments
+                            .iter()
+                            .find(|arg| arg.node.name.as_str() == "count")
+                            .and_then(|arg| arg.node.value.as_ref())
+                            .and_then(|value| match &value.node {
+                                Expression::Literal(
+                                    crate::parser::static_expression::Literal::Number(n),
+                                ) if *n >= 0.0 => Some(*n as usize),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        let seen_cell = self.alloc_cell("stream_skip_seen", to.span);
+                        self.nodes.push(IrNode::Derived {
+                            cell: seen_cell,
+                            expr: IrExpr::Constant(IrValue::Number(0.0)),
+                        });
+                        self.nodes.push(IrNode::StreamSkip {
+                            cell: target,
+                            source: source_cell,
+                            count: skip_count,
+                            seen_cell,
+                        });
                         if let Some(fields) = self.cell_field_cells.get(&source_cell).cloned() {
                             self.cell_field_cells.insert(target, fields);
                         }
@@ -6159,6 +7364,16 @@ impl Lowerer {
                             cell: target,
                             source: source_cell,
                         });
+                    }
+                    ["List", "latest"] => {
+                        if let Some(arms) = self.lower_list_latest_from_source(source_cell) {
+                            self.nodes.push(IrNode::Latest { target, arms });
+                        } else {
+                            self.nodes.push(IrNode::PipeThrough {
+                                cell: target,
+                                source: source_cell,
+                            });
+                        }
                     }
                     ["List", "is_empty"] => {
                         self.nodes.push(IrNode::ListIsEmpty {
@@ -6547,6 +7762,32 @@ impl Lowerer {
                             source: source_cell,
                         });
                     }
+                    ["Math", "min"] => {
+                        let b_cell = arguments
+                            .iter()
+                            .find(|a| a.node.name.as_str() == "b")
+                            .and_then(|a| a.node.value.as_ref())
+                            .map(|v| self.lower_expr_to_cell(v, "min_b"))
+                            .unwrap_or_else(|| self.alloc_cell("min_b_empty", var_span));
+                        self.nodes.push(IrNode::MathMin {
+                            cell: target,
+                            source: source_cell,
+                            b: b_cell,
+                        });
+                    }
+                    ["Math", "max"] => {
+                        let b_cell = arguments
+                            .iter()
+                            .find(|a| a.node.name.as_str() == "b")
+                            .and_then(|a| a.node.value.as_ref())
+                            .map(|v| self.lower_expr_to_cell(v, "max_b"))
+                            .unwrap_or_else(|| self.alloc_cell("max_b_empty", var_span));
+                        self.nodes.push(IrNode::MathMax {
+                            cell: target,
+                            source: source_cell,
+                            b: b_cell,
+                        });
+                    }
                     ["Bool", "not"] => {
                         self.nodes.push(IrNode::Derived {
                             cell: target,
@@ -6605,8 +7846,11 @@ impl Lowerer {
                         };
                         if let Some(fn_name) = resolved_fn {
                             let func_def = self.find_func_def(&fn_name).unwrap();
+                            let func_id = self.name_to_func[&fn_name];
                             self.current_module = self.function_modules.get(&fn_name).cloned();
                             let result = self.inline_function_call_with_pipe(
+                                &fn_name,
+                                func_id,
                                 &func_def,
                                 source_cell,
                                 arguments,
@@ -6752,23 +7996,1414 @@ impl Lowerer {
     /// Extract LINK event bindings for an element.
     /// Looks up the pre-allocated EventIds from Pass 1.5 scanning.
     fn extract_links_for_element(&self, element_var_name: &str) -> Vec<(String, EventId)> {
-        if let Some(events) = self.element_events.get(element_var_name) {
-            events
-                .iter()
-                .map(|(name, &eid)| (name.clone(), eid))
-                .collect()
-        } else if let Some(ref outer_name) = self.current_var_name {
-            // Fallback: try the outer variable name (for elements inside function calls).
+        if let Some(ref outer_name) = self.current_var_name {
+            // While lowering through `... |> LINK { target }`, always prefer the
+            // target's pre-allocated events so the element and its consumers
+            // share the same EventIds.
             if let Some(events) = self.element_events.get(outer_name) {
+                return events
+                    .iter()
+                    .map(|(name, &eid)| (name.clone(), eid))
+                    .collect();
+            }
+        }
+
+        self.element_events
+            .get(element_var_name)
+            .map(|events| {
                 events
                     .iter()
                     .map(|(name, &eid)| (name.clone(), eid))
                     .collect()
-            } else {
-                Vec::new()
+            })
+            .unwrap_or_default()
+    }
+
+    fn rebind_element_links_to_target(&mut self, cell: CellId, target_name: &str) {
+        let Some(target_events) = self.element_events.get(target_name).cloned() else {
+            return;
+        };
+
+        let mut text_source_cell = None;
+        for node in self.nodes.iter_mut().rev() {
+            match node {
+                IrNode::Element {
+                    cell: node_cell,
+                    links,
+                    kind,
+                    ..
+                } if *node_cell == cell => {
+                    *links = target_events
+                        .iter()
+                        .map(|(name, &event_id)| (name.clone(), event_id))
+                        .collect();
+                    if let ElementKind::TextInput {
+                        text_cell: Some(source_text_cell),
+                        ..
+                    } = kind
+                    {
+                        text_source_cell = Some(*source_text_cell);
+                    }
+                    break;
+                }
+                _ => {}
             }
-        } else {
-            Vec::new()
+        }
+
+        if let (Some(target_text_cell), Some(source_text_cell)) = (
+            self.name_to_cell.get(&format!("{target_name}.text")).copied(),
+            text_source_cell,
+        ) {
+            self.nodes.push(IrNode::Derived {
+                cell: target_text_cell,
+                expr: IrExpr::CellRead(source_text_cell),
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CellId, ElementKind, IrExpr, IrNode, IrValue, TextSegment, lower};
+    use crate::platform::browser::engine_wasm::parse_source;
+    use std::fs;
+
+    #[test]
+    fn lower_scene_preserves_light_constructors() {
+        let ast = parse_source(
+            r#"
+scene: Scene/new(
+    root: Scene/Element/text(
+        element: []
+        style: []
+        text: TEXT { hi }
+    )
+    lights: LIST {
+        Light/directional(
+            azimuth: 30
+            altitude: 45
+            spread: 1
+            intensity: 1.2
+            color: Oklch[lightness: 0.98, chroma: 0.015, hue: 65]
+        )
+        Light/ambient(
+            intensity: 0.4
+            color: Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
+        )
+        Light/spot(
+            target: FocusedElement
+            color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
+            intensity: 0.3
+            radius: 60
+            softness: 0.85
+        )
+    }
+
+    geometry: [
+        bevel_angle: 45
+    ]
+)
+"#,
+        )
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+        let render_root = program.render_root().expect("render root");
+        let scene = render_root.scene.expect("scene handles");
+        let lights_cell = scene.lights.expect("lights cell");
+        let geometry_cell = scene.geometry.expect("geometry cell");
+
+        let lights_items = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::Derived {
+                    cell,
+                    expr: IrExpr::ListConstruct(items),
+                } if *cell == lights_cell => Some(items),
+                _ => None,
+            })
+            .expect("lowered lights list");
+
+        assert!(
+            matches!(&lights_items[0], IrExpr::TaggedObject { tag, .. } if tag == "DirectionalLight")
+        );
+        assert!(matches!(&lights_items[1], IrExpr::TaggedObject { tag, .. } if tag == "AmbientLight"));
+        assert!(matches!(&lights_items[2], IrExpr::TaggedObject { tag, .. } if tag == "SpotLight"));
+
+        let geometry_fields = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::Derived {
+                    cell,
+                    expr: IrExpr::ObjectConstruct(fields),
+                } if *cell == geometry_cell => Some(fields),
+                _ => None,
+            })
+            .expect("lowered geometry object");
+
+        assert!(geometry_fields.iter().any(|(name, _)| name == "bevel_angle"));
+    }
+
+    #[test]
+    fn shopping_list_input_latest_reads_change_text_and_clear_trigger() {
+        let source = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../playground/frontend/src/examples/shopping_list/shopping_list.bn"
+        ))
+        .expect("read shopping_list example");
+        let ast = parse_source(&source).expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let change_text_cell = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, info)| {
+                (info.name == "store.elements.item_input.event.change.text")
+                    .then_some(CellId(idx as u32))
+            })
+            .expect("change text cell");
+        let text_to_add_cell = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, info)| (info.name == "store.text_to_add").then_some(CellId(idx as u32)))
+            .expect("text_to_add cell");
+        let item_input_text_cell = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, info)| {
+                (info.name == "store.elements.item_input.text").then_some(CellId(idx as u32))
+            })
+            .expect("item input text cell");
+        let latest_expr_cell = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::Derived {
+                    cell,
+                    expr: IrExpr::CellRead(source),
+                } if *cell == item_input_text_cell => Some(*source),
+                _ => None,
+            })
+            .expect("latest expr cell");
+        let local_change_text_cell = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, info)| {
+                (info.name == "element.event.change.text").then_some(CellId(idx as u32))
+            })
+            .expect("local change text cell");
+
+        let latest = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::Latest { target, arms } if *target == latest_expr_cell => Some(arms),
+                _ => None,
+            })
+            .expect("latest node");
+
+        assert!(
+            latest
+                .iter()
+                .any(|arm| matches!(arm.body, IrExpr::CellRead(cell) if cell == local_change_text_cell)),
+            "LATEST should read the local element.event.change.text arm",
+        );
+        assert!(
+            latest.iter().any(|arm| {
+                matches!(arm.body, IrExpr::Constant(IrValue::Text(ref text)) if text.is_empty())
+            }),
+            "LATEST should keep the empty-text arm",
+        );
+        assert!(
+            latest.iter().any(|arm| {
+                arm.trigger.is_some()
+                    && matches!(arm.body, IrExpr::Constant(IrValue::Text(ref text)) if text.is_empty())
+            }),
+            "LATEST should clear the input after the text_to_add trigger fires",
+        );
+
+        let text_to_add_is_event_driven = program.nodes.iter().any(|node| match node {
+            IrNode::When { cell, .. } => *cell == text_to_add_cell,
+            IrNode::Hold { cell, .. } => *cell == text_to_add_cell,
+            IrNode::Latest { target, .. } => *target == text_to_add_cell,
+            _ => false,
+        });
+        assert!(text_to_add_is_event_driven, "expected lowered store.text_to_add node");
+        assert_ne!(
+            local_change_text_cell, change_text_cell,
+            "linked text input lowers distinct local and linked change.text cells"
+        );
+    }
+
+    fn collect_function_calls(expr: &IrExpr, out: &mut Vec<u32>) {
+        match expr {
+            IrExpr::FunctionCall { func, args } => {
+                out.push(func.0);
+                for arg in args {
+                    collect_function_calls(arg, out);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } | IrExpr::Compare { lhs, rhs, .. } => {
+                collect_function_calls(lhs, out);
+                collect_function_calls(rhs, out);
+            }
+            IrExpr::UnaryNeg(inner) | IrExpr::Not(inner) => collect_function_calls(inner, out),
+            IrExpr::TextConcat(parts) => {
+                for part in parts {
+                    if let TextSegment::Expr(expr) = part {
+                        collect_function_calls(expr, out);
+                    }
+                }
+            }
+            IrExpr::FieldAccess { object, .. } => collect_function_calls(object, out),
+            IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => {
+                for (_, value) in fields {
+                    collect_function_calls(value, out);
+                }
+            }
+            IrExpr::ListConstruct(items) => {
+                for item in items {
+                    collect_function_calls(item, out);
+                }
+            }
+            IrExpr::PatternMatch { arms, .. } => {
+                for (_, body) in arms {
+                    collect_function_calls(body, out);
+                }
+            }
+            IrExpr::Constant(_) | IrExpr::CellRead(_) => {}
+        }
+    }
+
+    #[test]
+    fn cells_runtime_function_calls_are_limited_to_recursive_helpers() {
+        let source = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../playground/frontend/src/examples/cells/cells.bn"
+        ))
+        .expect("read cells example");
+        let ast = parse_source(&source).expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let mut calls = Vec::new();
+        for node in &program.nodes {
+            match node {
+                IrNode::Derived { expr, .. } => collect_function_calls(expr, &mut calls),
+                IrNode::When { arms, .. } | IrNode::While { arms, .. } => {
+                    for (_, body) in arms {
+                        collect_function_calls(body, &mut calls);
+                    }
+                }
+                IrNode::Latest { arms, .. } => {
+                    for arm in arms {
+                        collect_function_calls(&arm.body, &mut calls);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut names: Vec<String> = calls
+            .into_iter()
+            .filter_map(|func_id| program.functions.get(func_id as usize).map(|func| func.name.clone()))
+            .collect();
+        names.sort();
+        names.dedup();
+
+        assert!(
+            !names.iter().any(|name| matches!(
+                name.as_str(),
+                "make_row" | "make_cell_element" | "compute_value" | "cell_formula" | "expression_value"
+            )),
+            "non-recursive cells helpers should inline in Wasm, got runtime calls: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn reduced_timer_duration_row_does_not_self_reference_shadowed_passed_alias() {
+        let ast = parse_source(
+            r#"
+store: [
+    elements: [
+        duration_slider: LINK
+        reset_button: LINK
+    ]
+    max_duration: 15 |> HOLD state {
+        elements.duration_slider.event.change.value
+    }
+]
+
+document: Document/new(root: root_element(PASS: [store: store]))
+
+FUNCTION root_element() {
+    BLOCK {
+        max_duration: PASSED.store.max_duration
+        Element/stripe(
+            element: []
+            direction: Column
+            gap: 16
+            style: [padding: 20, width: 400]
+            items: LIST {
+                duration_row(PASS: [store: PASSED.store, max_duration: max_duration])
+                Element/button(
+                    element: [event: [press: LINK]]
+                    style: [width: Fill]
+                    label: TEXT { Reset }
+                ) |> LINK { PASSED.store.elements.reset_button }
+            }
+        )
+    }
+}
+
+FUNCTION duration_row() {
+    BLOCK {
+        max_duration: PASSED.max_duration
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: []
+            items: LIST {
+                Element/label(element: [], style: [], label: TEXT { Duration: })
+                Element/slider(
+                    element: [event: [change: LINK]]
+                    style: [width: 200]
+                    label: Hidden[text: TEXT { Duration }]
+                    value: max_duration
+                    min: 1
+                    max: 30
+                    step: 0.1
+                ) |> LINK { PASSED.store.elements.duration_slider }
+                Element/label(
+                    element: []
+                    style: []
+                    label: TEXT { {max_duration}s }
+                )
+            }
+        )
+    }
+}
+"#,
+        )
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let max_duration_cells: Vec<u32> = program
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, cell)| (cell.name == "max_duration").then_some(idx as u32))
+            .collect();
+
+        assert!(
+            max_duration_cells.len() >= 2,
+            "expected both outer and inner max_duration locals"
+        );
+
+        for cell_id in max_duration_cells {
+            if let Some(IrNode::Derived {
+                cell,
+                expr: IrExpr::CellRead(source),
+            }) = program.nodes.iter().find(|node| match node {
+                IrNode::Derived { cell, .. } => cell.0 == cell_id,
+                _ => false,
+            }) {
+                assert_ne!(
+                    cell.0, source.0,
+                    "shadowed PASSED alias lowered to a self-reference for cell {}",
+                    cell.0
+                );
+            }
+        }
+
+        let slider_change_event = program.nodes.iter().find_map(|node| match node {
+            IrNode::Element { kind, links, .. } if matches!(kind, super::ElementKind::Slider { .. }) => {
+                links.iter().find(|(name, _)| name == "change").map(|(_, event)| *event)
+            }
+            _ => None,
+        });
+        let max_duration_trigger = program.nodes.iter().find_map(|node| match node {
+            IrNode::Hold {
+                cell,
+                trigger_bodies,
+                ..
+            } if program.cells[cell.0 as usize]
+                .name
+                .ends_with("max_duration") =>
+            {
+                trigger_bodies.first().map(|(event, _)| *event)
+            }
+            _ => None,
+        });
+        let max_duration_trigger_body = program.nodes.iter().find_map(|node| match node {
+            IrNode::Hold {
+                cell,
+                trigger_bodies,
+                ..
+            } if program.cells[cell.0 as usize]
+                .name
+                .ends_with("max_duration") =>
+            {
+                trigger_bodies.first().map(|(_, body)| body.clone())
+            }
+            _ => None,
+        });
+
+        assert_eq!(
+            slider_change_event.map(|event| event.0),
+            max_duration_trigger.map(|event| event.0),
+            "slider change event should drive the max_duration HOLD (slider={:?}, hold={:?})",
+            slider_change_event
+                .map(|event| program.events[event.0 as usize].name.clone()),
+            max_duration_trigger
+                .map(|event| program.events[event.0 as usize].name.clone())
+        );
+
+        assert!(
+            matches!(
+                max_duration_trigger_body,
+                Some(IrExpr::CellRead(cell))
+                    if program.cells[cell.0 as usize]
+                        .name
+                        .ends_with(".event.change.value")
+            ),
+            "max_duration HOLD should read the slider change.value payload, got {:?}",
+            max_duration_trigger_body
+        );
+
+        assert!(
+            program
+                .cells
+                .iter()
+                .any(|cell| cell.name.ends_with(".event.change.value")),
+            "slider LINK should allocate a change.value payload cell"
+        );
+    }
+
+    #[test]
+    fn full_timer_slider_change_event_and_payload_are_wired_to_max_duration_hold() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/timer/timer.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+        let timer_count = program
+            .nodes
+            .iter()
+            .filter(|node| matches!(node, IrNode::Timer { .. }))
+            .count();
+
+        let (slider_change_event, slider_value_cell) = program.nodes.iter().find_map(|node| match node {
+            IrNode::Element { kind, links, .. } => match kind {
+                super::ElementKind::Slider { value_cell, .. } => Some((
+                    links.iter().find(|(name, _)| name == "change").map(|(_, event)| *event),
+                    *value_cell,
+                )),
+                _ => None,
+            },
+            _ => None,
+        }).expect("timer slider not found");
+        let max_duration_hold = program.nodes.iter().find_map(|node| match node {
+            IrNode::Hold {
+                cell,
+                trigger_bodies,
+                ..
+            } if program.cells[cell.0 as usize].name == "store.max_duration" => {
+                trigger_bodies.first().map(|(event, body)| (*event, body.clone()))
+            }
+            _ => None,
+        });
+
+        let Some((hold_event, hold_body)) = max_duration_hold else {
+            panic!("store.max_duration HOLD not found");
+        };
+
+        assert_eq!(timer_count, 1, "timer example should lower to exactly one timer node");
+        assert_eq!(
+            slider_change_event.map(|event| event.0),
+            Some(hold_event.0),
+            "timer slider and store.max_duration HOLD should share the same change event"
+        );
+        assert!(
+            matches!(
+                slider_value_cell,
+                Some(cell) if program.cells[cell.0 as usize].name.ends_with("max_duration")
+            ),
+            "timer slider value should read max_duration, got {:?}",
+            slider_value_cell.map(|cell| program.cells[cell.0 as usize].name.clone())
+        );
+        assert!(
+            matches!(
+                hold_body,
+                IrExpr::CellRead(cell)
+                    if program.cells[cell.0 as usize]
+                        .name
+                        .ends_with(".event.change.value")
+            ),
+            "store.max_duration HOLD should read change.value, got {:?}",
+            hold_body
+        );
+    }
+
+    #[test]
+    fn crud_filter_input_text_property_tracks_text_argument_cell() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/crud/crud.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let filter_text_cell = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, cell)| {
+                (cell.name == "store.elements.filter_input.text").then_some(CellId(idx as u32))
+            })
+            .expect("filter input .text cell");
+
+        let source_name = program.nodes.iter().find_map(|node| match node {
+            IrNode::Derived {
+                cell,
+                expr: IrExpr::CellRead(source),
+            } if *cell == filter_text_cell => Some(program.cells[source.0 as usize].name.clone()),
+            _ => None,
+        });
+
+        assert!(
+            source_name.is_some(),
+            "filter_input.text should be wired to the text argument cell, not left as Void"
+        );
+    }
+
+    #[test]
+    fn crud_create_button_press_is_shared_by_person_to_add_and_list_append() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/crud/crud.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let create_press_event = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::Element { kind, links, .. } => match kind {
+                    ElementKind::Button { label, .. } => {
+                        let is_create = matches!(
+                            label,
+                            IrExpr::Constant(IrValue::Text(text)) if text == "Create"
+                        ) || matches!(
+                            label,
+                            IrExpr::TextConcat(parts)
+                                if parts.len() == 1
+                                    && matches!(&parts[0], TextSegment::Literal(text) if text == "Create")
+                        );
+                        is_create.then(|| {
+                            links
+                                .iter()
+                                .find(|(name, _)| name == "press")
+                                .map(|(_, event)| *event)
+                        })?
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("Create button press event");
+
+        let person_to_add_trigger = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::Then { cell, trigger, .. }
+                    if program.cells[cell.0 as usize].name == "store.person_to_add" =>
+                {
+                    Some(*trigger)
+                }
+                _ => None,
+            })
+            .expect("store.person_to_add THEN");
+
+        let append_trigger = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::ListAppend { trigger, item, .. }
+                    if program.cells[item.0 as usize].name == "store.person_to_add" =>
+                {
+                    Some(*trigger)
+                }
+                _ => None,
+            })
+            .expect("CRUD ListAppend trigger");
+
+        assert_eq!(
+            person_to_add_trigger, create_press_event,
+            "store.person_to_add should fire on the Create button press event"
+        );
+        assert_eq!(
+            append_trigger, create_press_event,
+            "CRUD ListAppend should reuse the Create button press event"
+        );
+    }
+
+    #[test]
+    fn crud_person_to_add_fields_read_the_name_and_surname_inputs() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/crud/crud.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let name_input_text = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, cell)| {
+                (cell.name == "store.elements.name_input.text").then_some(CellId(idx as u32))
+            })
+            .expect("name input text cell");
+        let surname_input_text = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, cell)| {
+                (cell.name == "store.elements.surname_input.text").then_some(CellId(idx as u32))
+            })
+            .expect("surname input text cell");
+        let person_to_add = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, cell)| {
+                (cell.name == "store.person_to_add").then_some(CellId(idx as u32))
+            })
+            .expect("store.person_to_add cell");
+        let fields = program
+            .cell_field_cells
+            .get(&person_to_add)
+            .expect("store.person_to_add fields");
+        let name_field = fields.get("name").copied().expect("person_to_add.name field");
+        let surname_field = fields
+            .get("surname")
+            .copied()
+            .expect("person_to_add.surname field");
+
+        let name_init = program.nodes.iter().find_map(|node| match node {
+            IrNode::Hold { cell, init, .. } if *cell == name_field => Some(init),
+            _ => None,
+        });
+        let surname_init = program.nodes.iter().find_map(|node| match node {
+            IrNode::Hold { cell, init, .. } if *cell == surname_field => Some(init),
+            _ => None,
+        });
+        let name_param_source = match name_init {
+            Some(IrExpr::CellRead(param_cell)) => program.nodes.iter().find_map(|node| match node {
+                IrNode::Derived {
+                    cell,
+                    expr: IrExpr::CellRead(source),
+                } if *cell == *param_cell => Some(*source),
+                _ => None,
+            }),
+            _ => None,
+        };
+        let surname_param_source = match surname_init {
+            Some(IrExpr::CellRead(param_cell)) => program.nodes.iter().find_map(|node| match node {
+                IrNode::Derived {
+                    cell,
+                    expr: IrExpr::CellRead(source),
+                } if *cell == *param_cell => Some(*source),
+                _ => None,
+            }),
+            _ => None,
+        };
+
+        assert!(
+            matches!(name_param_source, Some(cell) if cell == name_input_text),
+            "person_to_add.name should read the name input text cell, got init={:?} source={:?}",
+            name_init.map(|expr| match expr {
+                IrExpr::CellRead(cell) => format!("CellRead({})", program.cells[cell.0 as usize].name),
+                other => format!("{other:?}"),
+            }),
+            name_param_source.map(|cell| program.cells[cell.0 as usize].name.clone())
+        );
+        assert!(
+            matches!(surname_param_source, Some(cell) if cell == surname_input_text),
+            "person_to_add.surname should read the surname input text cell, got init={:?} source={:?}",
+            surname_init.map(|expr| match expr {
+                IrExpr::CellRead(cell) => format!("CellRead({})", program.cells[cell.0 as usize].name),
+                other => format!("{other:?}"),
+            }),
+            surname_param_source.map(|cell| program.cells[cell.0 as usize].name.clone())
+        );
+    }
+
+    #[test]
+    fn crud_person_row_press_is_shared_by_selected_id_updates() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/crud/crud.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let row_press_event = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::Element { kind, links, .. } => match kind {
+                    ElementKind::Button { label, .. }
+                        if matches!(label, IrExpr::CellRead(_)) =>
+                    {
+                        links.iter().find(|(name, _)| name == "press").map(|(_, event)| *event)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("person row press event");
+
+        let selected_id_triggers = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::Hold { cell, trigger_bodies, .. }
+                    if program.cells[cell.0 as usize].name == "store.selected_id" =>
+                {
+                    Some(trigger_bodies.iter().map(|(event, _)| *event).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .expect("store.selected_id HOLD");
+
+        let describe_event = |event: super::EventId| {
+            let info = &program.events[event.0 as usize];
+            format!("EventId({}) {} {:?}", event.0, info.name, info.source)
+        };
+
+        assert!(
+            selected_id_triggers.contains(&row_press_event),
+            "store.selected_id should react to person row press events, got {:?} vs {}",
+            selected_id_triggers
+                .iter()
+                .map(|event| describe_event(*event))
+                .collect::<Vec<_>>(),
+            describe_event(row_press_event)
+        );
+    }
+
+    #[test]
+    fn crud_selected_id_preserves_object_field_cells() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/crud/crud.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let selected_id = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, cell)| (cell.name == "store.selected_id").then_some(CellId(idx as u32)))
+            .expect("store.selected_id cell");
+
+        let selected_fields = program
+            .cell_field_cells
+            .get(&selected_id)
+            .expect("store.selected_id field map");
+        let id_cell = *selected_fields.get("id").expect("selected_id.id field");
+        println!(
+            "selected_id.id leaf: {} {:?}",
+            program.cells[id_cell.0 as usize].name,
+            program.nodes.iter().find(|node| match node {
+                IrNode::Derived { cell, .. }
+                | IrNode::PipeThrough { cell, .. }
+                | IrNode::Then { cell, .. }
+                | IrNode::Hold { cell, .. }
+                | IrNode::Latest { target: cell, .. }
+                | IrNode::When { cell, .. }
+                | IrNode::While { cell, .. }
+                | IrNode::CustomCall { cell, .. } => *cell == id_cell,
+                _ => false,
+            })
+        );
+        assert!(
+            id_cell != selected_id,
+            "selected_id.id should point to a distinct scalar leaf cell"
+        );
+    }
+
+    #[test]
+    fn crud_render_list_map_template_contains_person_id_leaf() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/crud/crud.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let render_map = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::ListMap {
+                    item_cell,
+                    template_cell_range,
+                    ..
+                } => {
+                    let fields = program.cell_field_cells.get(item_cell)?;
+                    let surname = fields.get("surname")?;
+                    let name = fields.get("name")?;
+                    let id = fields.get("id")?;
+                    Some((*item_cell, *surname, *name, *id, *template_cell_range))
+                }
+                _ => None,
+            })
+            .expect("render list map");
+
+        let (_item_cell, _surname_cell, _name_cell, id_cell, (start, end)) = render_map;
+        let id_leaf = match program.nodes.iter().find(|node| match node {
+            IrNode::Derived {
+                cell,
+                expr: IrExpr::TaggedObject { .. },
+            } => *cell == id_cell,
+            _ => false,
+        }) {
+            Some(IrNode::Derived {
+                expr: IrExpr::TaggedObject { fields, .. },
+                ..
+            }) => fields
+                .iter()
+                .find_map(|(field, expr)| {
+                    (field == "id").then(|| match expr {
+                        IrExpr::CellRead(cell) => *cell,
+                        _ => CellId(u32::MAX),
+                    })
+                })
+                .expect("PersonId.id leaf"),
+            _ => id_cell,
+        };
+
+        assert!(
+            id_leaf.0 >= start && id_leaf.0 < end,
+            "item.id leaf {} should be inside template range {:?}",
+            program.cells[id_leaf.0 as usize].name,
+            (start, end)
+        );
+    }
+
+    #[test]
+    fn todo_mvc_render_list_map_item_preserves_title_and_completed_fields() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let render_map_fields = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::ListMap {
+                    item_cell,
+                    template_cell_range,
+                    ..
+                } => program
+                    .cell_field_cells
+                    .get(item_cell)
+                    .and_then(|fields| {
+                        (fields.contains_key("title") && fields.contains_key("completed"))
+                            .then_some((fields.clone(), *template_cell_range))
+                    }),
+                _ => None,
+            })
+            .expect("todo_mvc render list map field map");
+
+        let (fields, (start, end)) = render_map_fields;
+        let title_cell = fields.get("title").copied().expect("title field");
+        let completed_cell = fields.get("completed").copied().expect("completed field");
+
+        assert!(
+            title_cell.0 >= start && title_cell.0 < end,
+            "title field {} should be inside template range {:?}",
+            program.cells[title_cell.0 as usize].name,
+            (start, end)
+        );
+        assert!(
+            completed_cell.0 >= start && completed_cell.0 < end,
+            "completed field {} should be inside template range {:?}",
+            program.cells[completed_cell.0 as usize].name,
+            (start, end)
+        );
+    }
+
+    #[test]
+    #[ignore = "temporary lowering inspection"]
+    fn inspect_todo_mvc_remove_button_wiring() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        for (idx, event) in program.events.iter().enumerate() {
+            if event.name.contains("remove_todo_button") || event.name.contains("press") {
+                println!("event[{idx}] {} payload={:?}", event.name, event.payload_cells);
+            }
+        }
+
+        for node in &program.nodes {
+            if let IrNode::ListRemove {
+                cell,
+                source,
+                trigger,
+                predicate,
+                item_cell,
+                item_field_cells,
+            } = node
+            {
+                println!(
+                    "ListRemove cell={}({}) source={}({}) trigger={} pred={:?} item={:?} fields={:?}",
+                    cell.0,
+                    program.cells[cell.0 as usize].name,
+                    source.0,
+                    program.cells[source.0 as usize].name,
+                    trigger.0,
+                    predicate.map(|cell| cell.0),
+                    item_cell.map(|cell| (cell.0, program.cells[cell.0 as usize].name.clone())),
+                    item_field_cells
+                        .iter()
+                        .map(|(name, cell)| format!("{name}:{}({})", cell.0, program.cells[cell.0 as usize].name))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+
+        for target in [CellId(6), CellId(49), CellId(50)] {
+            println!(
+                "--- trace for cell {} ({}) ---",
+                target.0, program.cells[target.0 as usize].name
+            );
+            for node in &program.nodes {
+                match node {
+                    IrNode::PipeThrough { cell, source } if *cell == target || *source == target => {
+                        println!("  {}", crate::platform::browser::engine_wasm::ir::node_debug_short(node));
+                    }
+                    IrNode::ListAppend { cell, source, .. }
+                        if *cell == target || *source == target =>
+                    {
+                        println!("  {}", crate::platform::browser::engine_wasm::ir::node_debug_short(node));
+                    }
+                    IrNode::Derived { cell, expr } if *cell == target => {
+                        println!("  Derived cell={} expr={expr:?}", cell.0);
+                    }
+                    IrNode::ListMap { cell, source, .. }
+                        if *cell == target || *source == target =>
+                    {
+                        println!("  {}", crate::platform::browser::engine_wasm::ir::node_debug_short(node));
+                    }
+                    IrNode::ListRemove { cell, source, .. }
+                        if *cell == target || *source == target =>
+                    {
+                        println!("  {}", crate::platform::browser::engine_wasm::ir::node_debug_short(node));
+                    }
+                    IrNode::ListRetain {
+                        cell,
+                        source,
+                        predicate,
+                        ..
+                    } if *cell == target || *source == target || *predicate == Some(target) => {
+                        println!("  {}", crate::platform::browser::engine_wasm::ir::node_debug_short(node));
+                    }
+                    IrNode::Hold { cell, init, .. } if *cell == target => {
+                        println!("  Hold cell={} init={init:?}", cell.0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "temporary lowering inspection"]
+    fn crud_selected_id_map_item_id_matches_render_map_item_id_shape() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/crud/crud.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        for node in &program.nodes {
+            let IrNode::ListMap {
+                cell,
+                item_cell,
+                template_cell_range,
+                ..
+            } = node
+            else {
+                continue;
+            };
+
+            let Some(fields) = program.cell_field_cells.get(item_cell) else {
+                continue;
+            };
+            let Some(id_cell) = fields.get("id").copied() else {
+                continue;
+            };
+
+            let id_leaf = match program.nodes.iter().find(|node| match node {
+                IrNode::Derived {
+                    cell,
+                    expr: IrExpr::TaggedObject { .. },
+                } => *cell == id_cell,
+                _ => false,
+            }) {
+                Some(IrNode::Derived {
+                    expr: IrExpr::TaggedObject { fields, .. },
+                    ..
+                }) => fields
+                    .iter()
+                    .find_map(|(field, expr)| {
+                        (field == "id").then(|| match expr {
+                            IrExpr::CellRead(cell) => *cell,
+                            _ => CellId(u32::MAX),
+                        })
+                    })
+                    .expect("PersonId.id leaf"),
+                _ => id_cell,
+            };
+
+            println!(
+                "list_map cell={} range={:?} item.id={} leaf={} names=({}, {})",
+                program.cells[cell.0 as usize].name,
+                template_cell_range,
+                program.cells[id_cell.0 as usize].name,
+                program.cells[id_leaf.0 as usize].name,
+                id_cell.0,
+                id_leaf.0
+            );
+        }
+        panic!("inspect list_map item.id lowering");
+    }
+
+    #[test]
+    fn temperature_converter_text_inputs_keep_nested_while_dependencies() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/temperature_converter/temperature_converter.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let celsius_raw = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, cell)| (cell.name == "store.celsius_raw").then_some(CellId(idx as u32)))
+            .expect("store.celsius_raw");
+        let fahrenheit_raw = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, cell)| {
+                (cell.name == "store.fahrenheit_raw").then_some(CellId(idx as u32))
+            })
+            .expect("store.fahrenheit_raw");
+        let last_edited = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, cell)| (cell.name == "store.last_edited").then_some(CellId(idx as u32)))
+            .expect("store.last_edited");
+
+        let mut saw_celsius_dependency = false;
+        let mut saw_fahrenheit_dependency = false;
+
+        let resolve_text_cell = |mut cell: CellId| {
+            loop {
+                let next = program.nodes.iter().find_map(|node| match node {
+                    IrNode::Derived {
+                        cell: candidate,
+                        expr: IrExpr::CellRead(source),
+                    } if *candidate == cell => Some(*source),
+                    IrNode::PipeThrough {
+                        cell: candidate,
+                        source,
+                    } if *candidate == cell => Some(*source),
+                    _ => None,
+                });
+                let Some(next) = next else {
+                    return cell;
+                };
+                cell = next;
+            }
+        };
+
+        for node in &program.nodes {
+            let IrNode::Element {
+                kind:
+                    ElementKind::TextInput {
+                        text_cell: Some(text_cell),
+                        ..
+                    },
+                ..
+            } = node
+            else {
+                continue;
+            };
+
+            let text_cell = resolve_text_cell(*text_cell);
+            let Some(IrNode::While { source, deps, .. }) = program
+                .nodes
+                .iter()
+                .find(|candidate| matches!(candidate, IrNode::While { cell, .. } if *cell == text_cell))
+            else {
+                continue;
+            };
+
+            assert_eq!(
+                *source,
+                last_edited,
+                "text_input.text WHILE should match on store.last_edited"
+            );
+
+            if deps.contains(&celsius_raw) {
+                saw_celsius_dependency = true;
+            }
+            if deps.contains(&fahrenheit_raw) {
+                saw_fahrenheit_dependency = true;
+            }
+        }
+
+        assert!(
+            saw_celsius_dependency,
+            "expected one text input to depend on store.celsius_raw"
+        );
+        assert!(
+            saw_fahrenheit_dependency,
+            "expected one text input to depend on store.fahrenheit_raw"
+        );
+    }
+
+    #[test]
+    fn interval_hold_counter_lowers_to_stream_skip() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/interval_hold/interval_hold.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let counter = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, cell)| (cell.name == "counter").then_some(CellId(idx as u32)))
+            .expect("counter cell");
+
+        let Some(IrNode::StreamSkip {
+            source,
+            count,
+            seen_cell: _,
+            ..
+        }) = program.nodes.iter().find(|node| {
+            matches!(node, IrNode::StreamSkip { cell, .. } if *cell == counter)
+        }) else {
+            panic!("counter should lower to StreamSkip, got no StreamSkip node");
+        };
+
+        assert_eq!(*count, 1, "interval_hold should skip exactly one initial value");
+        assert_ne!(
+            *source, counter,
+            "StreamSkip should wrap the HOLD source rather than self-reference"
+        );
+        assert!(
+            program
+                .nodes
+                .iter()
+                .any(|node| matches!(node, IrNode::Hold { cell, init: IrExpr::Constant(IrValue::Number(0.0)), .. } if *cell == *source)),
+            "StreamSkip source should be the HOLD cell initialized from literal 0"
+        );
+        let hold_trigger_bodies = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::Hold {
+                    cell,
+                    trigger_bodies,
+                    ..
+                } if *cell == *source => Some(trigger_bodies),
+                _ => None,
+            })
+            .expect("interval_hold HOLD node");
+        assert_eq!(
+            hold_trigger_bodies.len(),
+            1,
+            "interval_hold HOLD should have exactly one timer-triggered body"
+        );
+        assert!(
+            matches!(
+                &hold_trigger_bodies[0].1,
+                IrExpr::BinOp {
+                    op: super::super::ir::BinOp::Add,
+                    lhs,
+                    rhs,
+                }
+                if matches!(&**lhs, IrExpr::CellRead(read) if *read == *source)
+                    && matches!(&**rhs, IrExpr::Constant(IrValue::Number(n)) if (*n - 1.0).abs() < f64::EPSILON)
+            ),
+            "interval_hold HOLD body should be `counter + 1` over its own source cell"
+        );
+    }
+
+    #[test]
+    fn fibonacci_result_keeps_current_field_through_stream_skip_and_log_info() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/fibonacci/fibonacci.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let current = program
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, cell)| (cell.name == "state.current").then_some(CellId(idx as u32)))
+            .expect("state.current cell");
+        let stream_skip_cell = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::StreamSkip { cell, .. } => Some(*cell),
+                _ => None,
+            })
+            .expect("fibonacci stream skip cell");
+        let log_info_cell = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::CustomCall { cell, path, .. }
+                    if path == &["Log".to_string(), "info".to_string()] =>
+                {
+                    Some(*cell)
+                }
+                _ => None,
+            })
+            .expect("fibonacci log/info cell");
+        let derived_current_cell = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::Derived { cell, expr }
+                    if matches!(expr, IrExpr::CellRead(read) if *read == current) =>
+                {
+                    Some(*cell)
+                }
+                _ => None,
+            })
+            .expect("derived state.current cell");
+
+        assert!(
+            matches!(
+                program.cell_field_cells.get(&stream_skip_cell).and_then(|fields| fields.get("current")),
+                Some(field_cell) if *field_cell == current
+            ),
+            "Stream/skip should preserve the `current` field mapping for fibonacci state"
+        );
+        assert!(
+            matches!(
+                program.cell_field_cells.get(&log_info_cell).and_then(|fields| fields.get("current")),
+                Some(field_cell) if *field_cell == current
+            ),
+            "Log/info should preserve the `current` field mapping for fibonacci state"
+        );
+        assert!(
+            derived_current_cell != current,
+            "fibonacci should still derive a downstream cell from state.current after Log/info"
+        );
+    }
+
+    #[test]
+    #[ignore = "temporary lowering inspection"]
+    fn inspect_fibonacci_result_path() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/fibonacci/fibonacci.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        for (idx, cell) in program.cells.iter().enumerate() {
+            if cell.name == "result"
+                || cell.name == "state.previous"
+                || cell.name == "state.current"
+                || cell.name.contains("pipe_result")
+                || cell.name.contains("stream_skip")
+            {
+                println!("cell[{idx}] {}", cell.name);
+            }
+        }
+
+        for node in &program.nodes {
+            let matches_cell = match node {
+                IrNode::Derived { cell, .. }
+                | IrNode::Hold { cell, .. }
+                | IrNode::Then { cell, .. }
+                | IrNode::When { cell, .. }
+                | IrNode::While { cell, .. }
+                | IrNode::MathSum { cell, .. }
+                | IrNode::PipeThrough { cell, .. }
+                | IrNode::StreamSkip { cell, .. }
+                | IrNode::TextInterpolation { cell, .. }
+                | IrNode::CustomCall { cell, .. }
+                | IrNode::Element { cell, .. }
+                | IrNode::ListAppend { cell, .. }
+                | IrNode::ListClear { cell, .. }
+                | IrNode::ListCount { cell, .. }
+                | IrNode::ListMap { cell, .. }
+                | IrNode::ListRemove { cell, .. }
+                | IrNode::ListRetain { cell, .. }
+                | IrNode::ListEvery { cell, .. }
+                | IrNode::ListAny { cell, .. }
+                | IrNode::ListIsEmpty { cell, .. }
+                | IrNode::RouterGoTo { cell, .. }
+                | IrNode::TextTrim { cell, .. }
+                | IrNode::TextIsNotEmpty { cell, .. }
+                | IrNode::TextToNumber { cell, .. }
+                | IrNode::TextStartsWith { cell, .. }
+                | IrNode::MathRound { cell, .. }
+                | IrNode::MathMin { cell, .. }
+                | IrNode::MathMax { cell, .. }
+                | IrNode::HoldLoop { cell, .. } => {
+                    matches!(cell.0, 1 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11)
+                }
+                IrNode::Latest { target, .. } => matches!(target.0, 1 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11),
+                IrNode::Document { root, .. } => matches!(root.0, 1 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11),
+                _ => false,
+            };
+            if matches_cell {
+                println!("{node:?}");
+            }
+        }
+
+        for (cell, fields) in &program.cell_field_cells {
+            let name = &program.cells[cell.0 as usize].name;
+            if name == "result"
+                || name == "state.previous"
+                || name == "state.current"
+                || name.contains("pipe_result")
+            {
+                println!(
+                    "fields {} -> {:?}",
+                    name,
+                    fields
+                        .iter()
+                        .map(|(field, cell)| format!("{field}:{}", program.cells[cell.0 as usize].name))
+                        .collect::<Vec<_>>()
+                );
+            }
         }
     }
 }

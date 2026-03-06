@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use boon_scene::RenderSurface;
 use indexmap::IndexMap;
 
 use super::value::Value;
@@ -145,6 +146,8 @@ pub struct DataflowGraph {
     pub collections: IndexMap<VarId, CollectionSpec>,
     /// The VarId of the root document output.
     pub document: VarId,
+    /// Whether the root was declared as `document` or `scene`.
+    pub render_surface: RenderSurface,
     /// Storage key for localStorage persistence (e.g., "counter_hold").
     /// When set, HOLD state changes are persisted and restored on re-run.
     pub storage_key: Option<String>,
@@ -185,6 +188,7 @@ pub enum InputKind {
 /// These are `Arc`-wrapped so they can be shared across DD operator closures.
 pub type TransformFn = Arc<dyn Fn(&Value) -> Value + 'static>;
 pub type CombineFn = Arc<dyn Fn(&Value, &Value) -> Value + 'static>;
+pub type KeyedCombineFn = Arc<dyn Fn(&ListKey, &Value, &Value) -> Value + 'static>;
 pub type FlatMapFn = Arc<dyn Fn(Value) -> Option<Value> + 'static>;
 pub type HoldTransformFn = Arc<dyn Fn(&Value, &Value) -> Value + 'static>;
 pub type ClassifyFn = Arc<dyn Fn(&Value) -> Option<(ListKey, Value)> + 'static>;
@@ -211,6 +215,11 @@ pub enum CollectionSpec {
     /// LATEST: concat multiple sources, keep only the most recently changed.
     HoldLatest(Vec<VarId>),
 
+    /// Combine the current value of multiple scalar sources into one object.
+    /// Emits an object like `{ __dep_0: v0, __dep_1: v1, ... }` after all
+    /// sources have produced an initial value, then updates on any source change.
+    CombineLatest(Vec<VarId>),
+
     /// HOLD state: stateful accumulator.
     /// initial + events → new state via transform(old_state, event).
     HoldState {
@@ -235,6 +244,13 @@ pub enum CollectionSpec {
         left: VarId,
         right: VarId,
         combine: CombineFn,
+    },
+
+    /// Sample the current scalar dependency when an event fires.
+    SampleOnEvent {
+        event: VarId,
+        dep: VarId,
+        f: CombineFn,
     },
 
     /// Concatenate multiple collections.
@@ -281,6 +297,9 @@ pub enum CollectionSpec {
         f: Arc<dyn Fn(&ListKey, &Value) -> Value + 'static>,
     },
 
+    /// Transform each list item with access to the item's key and one reactive scalar dependency.
+    ListMapWithKeyReactive { source: VarId, dep: VarId, f: KeyedCombineFn },
+
     /// Append items to a list (concat).
     ListAppend { list: VarId, new_items: VarId },
 
@@ -300,6 +319,18 @@ pub enum CollectionSpec {
 
     /// Scalar event → keyed pairs (for wildcard event demuxing).
     MapToKeyed { source: VarId, classify: ClassifyFn },
+
+    /// Keyed events sampled against the current keyed item state.
+    ///
+    /// Used for expressions like:
+    /// `people |> List/map(item, new: item.row.event.press |> THEN { item.id }) |> List/latest()`
+    /// where the event path carries the list key, but the emitted value must be
+    /// computed from the current keyed item.
+    KeyedEventMap {
+        items: VarId,
+        events: VarId,
+        f: CombineFn,
+    },
 
     /// Scalar trigger → new keyed item with auto-incrementing key.
     AppendNewKeyed {

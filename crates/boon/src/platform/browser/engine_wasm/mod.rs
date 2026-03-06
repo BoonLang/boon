@@ -16,6 +16,7 @@ pub mod runtime;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use wasm_bindgen::prelude::*;
 use zoon::*;
 
 use crate::parser::{
@@ -24,6 +25,16 @@ use crate::parser::{
 };
 
 pub use persistence::clear_wasm_persisted_states;
+
+thread_local! {
+    static ACTIVE_WASM_INSTANCE: RefCell<Option<Rc<runtime::WasmInstance>>> = const { RefCell::new(None) };
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = log)]
+    fn console_log(s: &str);
+}
 
 /// External function definition for multi-file support.
 pub use lower::ExternalFunction;
@@ -36,7 +47,11 @@ const ASYNC_COMPILE_THRESHOLD: usize = 4_000_000;
 /// Returns a Zoon element tree.
 ///
 /// `external_functions` provides pre-parsed functions from other module files.
-pub fn run_wasm(source: &str, external_functions: Option<&[ExternalFunction]>) -> RawElOrText {
+pub fn run_wasm(
+    source: &str,
+    external_functions: Option<&[ExternalFunction]>,
+    persistence_enabled: bool,
+) -> RawElOrText {
     // 1. Parse and lower to IR.
     let program = match compile(source, external_functions) {
         Ok(p) => Rc::new(p),
@@ -48,9 +63,9 @@ pub fn run_wasm(source: &str, external_functions: Option<&[ExternalFunction]>) -
 
     // 3. Choose sync or async compilation based on binary size.
     if wasm_output.wasm_bytes.len() > ASYNC_COMPILE_THRESHOLD {
-        run_wasm_async(program, wasm_output, source)
+        run_wasm_async(program, wasm_output, source, persistence_enabled)
     } else {
-        match run_wasm_sync(program, wasm_output, source) {
+        match run_wasm_sync(program, wasm_output, source, persistence_enabled) {
             Ok(el) => el,
             Err(msg) => error_element(&msg),
         }
@@ -63,6 +78,7 @@ fn run_wasm_sync(
     program: Rc<ir::IrProgram>,
     wasm_output: codegen::WasmOutput,
     source: &str,
+    persistence_enabled: bool,
 ) -> Result<RawElOrText, String> {
     // Compile synchronously.
     let wasm_buffer = js_sys::Uint8Array::from(&wasm_output.wasm_bytes[..]);
@@ -74,7 +90,7 @@ fn run_wasm_sync(
         runtime::WasmInstance::new(&module, program.clone(), wasm_output.text_patterns)
             .map_err(|e| format!("WASM instantiation failed: {}", e))?;
 
-    finish_setup(instance, program, source, true)
+    finish_setup(instance, program, source, persistence_enabled)
 }
 
 /// Async path: compile in background, show loading indicator, swap to real UI.
@@ -83,6 +99,7 @@ fn run_wasm_async(
     program: Rc<ir::IrProgram>,
     wasm_output: codegen::WasmOutput,
     source: &str,
+    persistence_enabled: bool,
 ) -> RawElOrText {
     let ui_storage: Rc<RefCell<Option<RawElOrText>>> = Rc::new(RefCell::new(None));
     let is_ready = Mutable::new(false);
@@ -90,6 +107,7 @@ fn run_wasm_async(
     let ui_ref = ui_storage.clone();
     let ready = is_ready.clone();
     let source_owned = source.to_string();
+    let persistence_enabled_owned = persistence_enabled;
     let bytes_len = wasm_output.wasm_bytes.len();
 
     Task::start(async move {
@@ -146,7 +164,7 @@ fn run_wasm_async(
             }
         };
 
-        match finish_setup(instance, program, &source_owned, true) {
+        match finish_setup(instance, program, &source_owned, persistence_enabled_owned) {
             Ok(ui) => *ui_ref.borrow_mut() = Some(ui),
             Err(msg) => *ui_ref.borrow_mut() = Some(error_element(&msg)),
         }
@@ -180,16 +198,27 @@ fn finish_setup(
     source: &str,
     restore_persistence: bool,
 ) -> Result<RawElOrText, String> {
+    console_log("[boon wasm] finish_setup:start");
     // Wrap in Rc early (needed for router setup).
     let instance = Rc::new(instance);
 
+    ACTIVE_WASM_INSTANCE.with(|slot| {
+        let previous = slot.borrow_mut().replace(instance.clone());
+        if let Some(old) = previous {
+            old.shutdown();
+        }
+    });
+
     // 3. Set up router BEFORE init so WHEN/WHILE arms see route text.
+    console_log("[boon wasm] finish_setup:router");
     bridge::setup_router(&program, &instance);
 
     // 4. Call init() to set initial cell values.
+    console_log("[boon wasm] finish_setup:init:start");
     instance
         .call_init()
         .map_err(|e| format!("init() failed: {}", e))?;
+    console_log("[boon wasm] finish_setup:init:done");
 
     // 5. Load persisted snapshot (only on page refresh, not on re-run).
     let storage_key = persistence::storage_key(source);
@@ -213,10 +242,13 @@ fn finish_setup(
     }));
 
     // 8. Start timers.
+    console_log("[boon wasm] finish_setup:timers");
     instance.start_timers(&program);
 
     // 9. Build Zoon element tree from IR + runtime.
+    console_log("[boon wasm] finish_setup:build_ui:start");
     let ui = bridge::build_ui(&program, instance.clone());
+    console_log("[boon wasm] finish_setup:build_ui:done");
 
     Ok(ui)
 }

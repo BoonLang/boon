@@ -18,8 +18,12 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use boon_scene::{PhysicalSceneParams, RenderSurface};
 use indexmap::IndexMap;
 
+use boon_renderer_zoon::{
+    select_placeholder, slider_placeholder, svg_canvas_placeholder, tagged_placeholder,
+};
 use futures_channel::mpsc;
 use pin_project::pin_project;
 use zoon::*;
@@ -1023,14 +1027,6 @@ where
 // Physical CSS helpers (Scene mode: material, depth, move, glow, gloss)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Default shadow parameters (used when SceneContext is not available).
-const SHADOW_DX_PER_DEPTH: f64 = 1.5;
-const SHADOW_DY_PER_DEPTH: f64 = 2.0;
-const SHADOW_BLUR_PER_DEPTH: f64 = 3.0;
-const SHADOW_INTENSITY: f64 = 0.8;
-const SHADOW_AMBIENT: f64 = 0.3;
-const BEVEL_ANGLE: f64 = 135.0;
-
 /// Extract material sub-object from the style fields.
 fn get_material_obj(style: &Fields) -> Option<&Fields> {
     match style.get("material") {
@@ -1040,8 +1036,65 @@ fn get_material_obj(style: &Fields) -> Option<&Fields> {
     }
 }
 
+fn derive_scene_params(value: &Value) -> PhysicalSceneParams {
+    let mut params = PhysicalSceneParams::default();
+    let Some(fields) = get_fields(value) else {
+        return params;
+    };
+
+    if let Some(geometry) = fields.get("geometry").and_then(get_fields) {
+        if let Some(bevel_angle) = geometry.get("bevel_angle").and_then(|v| v.as_number()) {
+            params.bevel_angle = bevel_angle;
+        }
+    }
+
+    if let Some(lights) = fields.get("lights") {
+        for light in lights.list_items() {
+            let Some(tag) = light.get_tag() else {
+                continue;
+            };
+            match tag {
+                "DirectionalLight" => {
+                    if let Some(intensity) = light.get_field("intensity").and_then(|v| v.as_number())
+                    {
+                        params.directional_intensity = intensity;
+                    }
+                    if let Some(spread) = light.get_field("spread").and_then(|v| v.as_number()) {
+                        params.shadow_blur_per_depth =
+                            PhysicalSceneParams::DEFAULT.shadow_blur_per_depth
+                                * spread.clamp(0.25, 4.0);
+                    }
+                    if let (Some(azimuth), Some(altitude)) = (
+                        light.get_field("azimuth").and_then(|v| v.as_number()),
+                        light.get_field("altitude").and_then(|v| v.as_number()),
+                    ) {
+                        let azimuth_radians = azimuth.to_radians();
+                        let altitude_radians = altitude.clamp(5.0, 85.0).to_radians();
+                        let altitude_factor = (1.0 / altitude_radians.tan()).clamp(0.35, 2.0);
+                        params.shadow_dx_per_depth = -azimuth_radians.sin()
+                            * PhysicalSceneParams::DEFAULT.shadow_dx_per_depth
+                            * altitude_factor;
+                        params.shadow_dy_per_depth = azimuth_radians.cos()
+                            * PhysicalSceneParams::DEFAULT.shadow_dy_per_depth
+                            * altitude_factor;
+                    }
+                }
+                "AmbientLight" => {
+                    if let Some(intensity) = light.get_field("intensity").and_then(|v| v.as_number())
+                    {
+                        params.ambient_factor = intensity.clamp(0.0, 1.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    params
+}
+
 /// Compute CSS box-shadow from depth, move, and glow properties.
-fn compute_box_shadow(style: &Fields) -> Option<String> {
+fn compute_box_shadow(style: &Fields, scene: PhysicalSceneParams) -> Option<String> {
     let depth = style.get("depth").and_then(|v| v.as_number()).unwrap_or(0.0);
 
     // move: [closer: N] or [further: N]
@@ -1062,10 +1115,10 @@ fn compute_box_shadow(style: &Fields) -> Option<String> {
     let mut shadows: Vec<String> = Vec::new();
 
     if effective_depth > 0.0 {
-        let dx = effective_depth * SHADOW_DX_PER_DEPTH;
-        let dy = effective_depth * SHADOW_DY_PER_DEPTH;
-        let blur = effective_depth * SHADOW_BLUR_PER_DEPTH;
-        let opacity = (SHADOW_INTENSITY * (1.0 - SHADOW_AMBIENT) * 0.3).min(0.5);
+        let dx = effective_depth * scene.shadow_dx_per_depth;
+        let dy = effective_depth * scene.shadow_dy_per_depth;
+        let blur = effective_depth * scene.shadow_blur_per_depth;
+        let opacity = scene.shadow_opacity();
 
         if is_inset {
             shadows.push(format!(
@@ -1111,14 +1164,15 @@ fn compute_box_shadow(style: &Fields) -> Option<String> {
 }
 
 /// Compute CSS background-image from material.gloss.
-fn compute_gloss(style: &Fields) -> Option<String> {
+fn compute_gloss(style: &Fields, scene: PhysicalSceneParams) -> Option<String> {
     let material = get_material_obj(style)?;
     let gloss = material.get("gloss").and_then(|v| v.as_number())?;
     let gloss = gloss.clamp(0.0, 1.0);
     if gloss > 0.0 {
         let alpha = gloss * 0.25;
         Some(format!(
-            "linear-gradient({BEVEL_ANGLE:.0}deg,rgba(255,255,255,{alpha:.2}) 0%,transparent 50%,rgba(0,0,0,{:.2}) 100%)",
+            "linear-gradient({:.0}deg,rgba(255,255,255,{alpha:.2}) 0%,transparent 50%,rgba(0,0,0,{:.2}) 100%)",
+            scene.bevel_angle,
             alpha * 0.3
         ))
     } else {
@@ -1186,10 +1240,46 @@ fn compute_move_scale(style: &Fields) -> Option<String> {
 ///
 /// Extracts material colors, depth shadows, gloss, transitions, transparency,
 /// and scale transforms from the style object and applies them as CSS signals.
-fn apply_physical_css_signals<T: RawEl>(raw_el: T, vm: &Mutable<Arc<Value>>) -> T
+fn apply_physical_css_signals<T: RawEl>(
+    raw_el: T,
+    vm: &Mutable<Arc<Value>>,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
+) -> T
 where
     T::DomElement: Clone,
 {
+    let box_shadow_signal: Pin<Box<dyn Signal<Item = Option<String>>>> =
+        if let Some(scene_params) = scene_params.clone() {
+            Box::pin(map_ref! {
+                let v = vm.signal_cloned(),
+                let scene = scene_params.signal() => {
+                    get_fields(v)
+                        .and_then(get_style_obj)
+                        .and_then(|style| compute_box_shadow(style, *scene))
+                }
+            })
+        } else {
+            Box::pin(vm.signal_cloned().map(|v| {
+                let style = get_style_obj(get_fields(&v)?)?;
+                compute_box_shadow(style, PhysicalSceneParams::default())
+            }))
+        };
+    let gloss_signal: Pin<Box<dyn Signal<Item = Option<String>>>> =
+        if let Some(scene_params) = scene_params {
+            Box::pin(map_ref! {
+                let v = vm.signal_cloned(),
+                let scene = scene_params.signal() => {
+                    get_fields(v)
+                        .and_then(get_style_obj)
+                        .and_then(|style| compute_gloss(style, *scene))
+                }
+            })
+        } else {
+            Box::pin(vm.signal_cloned().map(|v| {
+                let style = get_style_obj(get_fields(&v)?)?;
+                compute_gloss(style, PhysicalSceneParams::default())
+            }))
+        };
     raw_el
         // background-color from material.color (Oklch)
         .style_signal(
@@ -1203,18 +1293,12 @@ where
         // box-shadow from depth + move + glow
         .style_signal(
             "box-shadow",
-            vm.signal_cloned().map(|v| {
-                let style = get_style_obj(get_fields(&v)?)?;
-                compute_box_shadow(style)
-            }),
+            box_shadow_signal,
         )
         // background-image from material.gloss (specular gradient)
         .style_signal(
             "background-image",
-            vm.signal_cloned().map(|v| {
-                let style = get_style_obj(get_fields(&v)?)?;
-                compute_gloss(style)
-            }),
+            gloss_signal,
         )
         // transition from spring_range
         .style_signal(
@@ -1304,7 +1388,7 @@ impl KeyedItems {
                     if let Some(KeyedDiff::Upsert { value, .. }) = diffs.get(i + 1) {
                         if let Some(node) = self.items.get_mut(&key_str) {
                             let child_lp = Self::child_link_path(value, stripe_link_path, &key_str);
-                            node.update(value, handle, &child_lp);
+                            node.update(value, handle, &child_lp, None);
                         } else {
                             let insert_pos = self
                                 .items
@@ -1312,7 +1396,7 @@ impl KeyedItems {
                                 .position(|k| k.as_ref() > key_str.as_ref())
                                 .unwrap_or(self.items.len());
                             let child_lp = Self::child_link_path(value, stripe_link_path, &key_str);
-                            let (el, node) = build_retained_node(value, handle, &child_lp);
+                            let (el, node) = build_retained_node(value, handle, &child_lp, None);
                             self.items.shift_insert(insert_pos, key_str, node);
                             tx.unbounded_send(VecDiff::InsertAt {
                                 index: insert_pos,
@@ -1328,7 +1412,7 @@ impl KeyedItems {
                     if let Some(node) = self.items.get_mut(&key_str) {
                         // Update existing item in place (O(1) — IndexMap lookup + Mutable set)
                         let child_lp = Self::child_link_path(value, stripe_link_path, &key_str);
-                        node.update(value, handle, &child_lp);
+                        node.update(value, handle, &child_lp, None);
                     } else {
                         // New item — find sorted insertion position via binary search on keys
                         let insert_pos = self
@@ -1337,7 +1421,7 @@ impl KeyedItems {
                             .position(|k| k.as_ref() > key_str.as_ref())
                             .unwrap_or(self.items.len());
                         let child_lp = Self::child_link_path(value, stripe_link_path, &key_str);
-                        let (el, node) = build_retained_node(value, handle, &child_lp);
+                        let (el, node) = build_retained_node(value, handle, &child_lp, None);
                         self.items.shift_insert(insert_pos, key_str.clone(), node);
                         let _ = tx.unbounded_send(VecDiff::InsertAt {
                             index: insert_pos,
@@ -1373,6 +1457,8 @@ impl KeyedItems {
 /// Built once from the initial Value. On state changes, `update()` diffs
 /// old vs new Value tree and updates only changed Mutables.
 pub struct RetainedTree {
+    render_surface: RenderSurface,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
     root: RetainedNode,
 }
 
@@ -1483,7 +1569,7 @@ impl RetainedNode {
                 tag.as_ref() == "ElementBlock"
             }
             (RetainedNode::Document { .. }, Value::Tagged { tag, .. }) => {
-                tag.as_ref() == "DocumentNew"
+                matches!(tag.as_ref(), "DocumentNew" | "SceneNew")
             }
             (RetainedNode::Empty, _) => false,
             _ => false,
@@ -1496,22 +1582,59 @@ impl RetainedNode {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Build a retained tree from a document Value.
-pub fn build_retained_tree(value: &Value, handle: &DdWorkerHandle) -> (RawElOrText, RetainedTree) {
-    let (element, root) = build_retained_node(value, handle, "");
-    (element, RetainedTree { root })
+pub fn build_retained_tree(
+    value: &Value,
+    handle: &DdWorkerHandle,
+    render_surface: RenderSurface,
+) -> (RawElOrText, RetainedTree) {
+    let scene_params = render_surface
+        .is_scene()
+        .then(|| Mutable::new(derive_scene_params(value)));
+    let (element, root) =
+        build_retained_node_with_surface(value, handle, "", render_surface, scene_params.clone());
+    (
+        element,
+        RetainedTree {
+            render_surface,
+            scene_params,
+            root,
+        },
+    )
 }
 
 fn build_retained_node(
     value: &Value,
     handle: &DdWorkerHandle,
     link_path: &str,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
+) -> (RawElOrText, RetainedNode) {
+    build_retained_node_with_surface(
+        value,
+        handle,
+        link_path,
+        RenderSurface::Document,
+        scene_params,
+    )
+}
+
+fn build_retained_node_with_surface(
+    value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+    render_surface: RenderSurface,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
 ) -> (RawElOrText, RetainedNode) {
     match value {
         Value::Number(_) | Value::Text(_) | Value::Tag(_) | Value::Bool(_) | Value::Unit => {
             build_retained_primitive(value)
         }
+        Value::Tagged { tag, fields }
+            if matches!(tag.as_ref(), "DocumentNew" | "SceneNew") =>
+        {
+            build_retained_document(fields, handle, link_path, render_surface, scene_params)
+        }
         Value::Tagged { tag, fields } => {
-            build_retained_tagged(tag, fields, value, handle, link_path)
+            build_retained_tagged(tag, fields, value, handle, link_path, scene_params)
         }
         Value::Object(_) => build_retained_primitive(value),
     }
@@ -1539,45 +1662,33 @@ fn build_retained_tagged(
     full_value: &Value,
     handle: &DdWorkerHandle,
     link_path: &str,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
 ) -> (RawElOrText, RetainedNode) {
     match tag {
-        "ElementButton" => build_retained_button(fields, full_value, handle, link_path),
-        "ElementStripe" => build_retained_stripe(fields, full_value, handle, link_path),
-        "ElementStack" => build_retained_stack(fields, full_value, handle, link_path),
-        "ElementContainer" => build_retained_container(fields, full_value, handle, link_path),
-        "ElementLabel" => build_retained_label(fields, full_value, handle, link_path),
+        "ElementButton" => {
+            build_retained_button(fields, full_value, handle, link_path, scene_params)
+        }
+        "ElementStripe" => {
+            build_retained_stripe(fields, full_value, handle, link_path, scene_params)
+        }
+        "ElementStack" => {
+            build_retained_stack(fields, full_value, handle, link_path, scene_params)
+        }
+        "ElementContainer" => {
+            build_retained_container(fields, full_value, handle, link_path, scene_params)
+        }
+        "ElementLabel" => {
+            build_retained_label(fields, full_value, handle, link_path, scene_params)
+        }
         "ElementTextInput" => build_retained_text_input(fields, full_value, handle, link_path),
         "ElementCheckbox" => build_retained_checkbox(fields, full_value, handle, link_path),
-        "ElementParagraph" => build_retained_paragraph(fields, full_value, handle, link_path),
-        "ElementLink" => build_retained_link(fields, full_value, handle, link_path),
-        "ElementText" => build_retained_text(fields, full_value, handle, link_path),
-        "ElementBlock" => build_retained_block(fields, full_value, handle, link_path),
-        "DocumentNew" => {
-            let (child_tx, child_rx) = mpsc::unbounded();
-            let (child_opt, initial_elements) = if let Some(root) = fields.get("root") {
-                let (el, child) = build_retained_node(root, handle, link_path);
-                (Some(Box::new(child)), vec![el])
-            } else {
-                (None, vec![])
-            };
-            child_tx
-                .unbounded_send(VecDiff::Replace {
-                    values: initial_elements,
-                })
-                .ok();
-            let el = El::new()
-                .s(Width::fill())
-                .s(Height::fill())
-                .update_raw_el(|raw_el| {
-                    raw_el.children_signal_vec(VecDiffStreamSignalVec(child_rx))
-                });
-            (
-                el.unify(),
-                RetainedNode::Document {
-                    child: child_opt,
-                    child_tx,
-                },
-            )
+        "ElementParagraph" => {
+            build_retained_paragraph(fields, full_value, handle, link_path, scene_params)
+        }
+        "ElementLink" => build_retained_link(fields, full_value, handle, link_path, scene_params),
+        "ElementText" => build_retained_text(fields, full_value, handle, link_path, scene_params),
+        "ElementBlock" => {
+            build_retained_block(fields, full_value, handle, link_path, scene_params)
         }
         "ElementSelect" => build_retained_select_placeholder(fields, full_value, handle, link_path),
         "ElementSlider" => build_retained_slider_placeholder(fields, full_value, handle, link_path),
@@ -1585,6 +1696,44 @@ fn build_retained_tagged(
         "ElementSvgCircle" => build_retained_primitive(&Value::text("")),
         _ => build_retained_primitive(&Value::text(format!("{}[...]", tag))),
     }
+}
+
+fn build_retained_document(
+    fields: &Arc<Fields>,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+    render_surface: RenderSurface,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
+) -> (RawElOrText, RetainedNode) {
+    let (child_tx, child_rx) = mpsc::unbounded();
+    let (child_opt, initial_elements) = if let Some(root) = fields.get("root") {
+        let (el, child) = build_retained_node_with_surface(
+            root,
+            handle,
+            link_path,
+            render_surface,
+            scene_params,
+        );
+        (Some(Box::new(child)), vec![el])
+    } else {
+        (None, vec![])
+    };
+    child_tx
+        .unbounded_send(VecDiff::Replace {
+            values: initial_elements,
+        })
+        .ok();
+    let el = El::new()
+        .s(Width::fill())
+        .s(Height::fill())
+        .update_raw_el(|raw_el| raw_el.children_signal_vec(VecDiffStreamSignalVec(child_rx)));
+    (
+        el.unify(),
+        RetainedNode::Document {
+            child: child_opt,
+            child_tx,
+        },
+    )
 }
 
 /// Real Element/select — renders as a `<select>` dropdown with event wiring.
@@ -1910,6 +2059,7 @@ fn build_retained_button(
     full_value: &Value,
     handle: &DdWorkerHandle,
     link_path: &str,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(Arc::new(full_value.clone()));
     let effective_link = extract_effective_link(fields, link_path);
@@ -1986,9 +2136,10 @@ fn build_retained_button(
         .s(extract_font_line_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
+            let scene_params = scene_params.clone();
             move |raw_el| {
                 let raw_el = apply_raw_css_signals(raw_el, &vm);
-                apply_physical_css_signals(raw_el, &vm)
+                apply_physical_css_signals(raw_el, &vm, scene_params.clone())
             }
         })
         .on_press({
@@ -2030,6 +2181,7 @@ fn build_retained_stripe(
     full_value: &Value,
     handle: &DdWorkerHandle,
     link_path: &str,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(Arc::new(full_value.clone()));
     let (items_tx, items_rx) = mpsc::unbounded();
@@ -2065,7 +2217,7 @@ fn build_retained_stripe(
         let mut initial_elements = Vec::new();
         for (i, item) in item_values.iter().enumerate() {
             let child_lp = format!("{}.items.{}", link_path, i);
-            let (el, node) = build_retained_node(item, handle, &child_lp);
+            let (el, node) = build_retained_node(item, handle, &child_lp, scene_params.clone());
             retained_items.push(node);
             initial_elements.push(el);
         }
@@ -2130,9 +2282,10 @@ fn build_retained_stripe(
         .s(extract_font_line_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
+            let scene_params = scene_params.clone();
             move |raw_el| {
                 let raw_el = apply_raw_css_signals(raw_el, &vm);
-                apply_physical_css_signals(raw_el, &vm)
+                apply_physical_css_signals(raw_el, &vm, scene_params.clone())
             }
         })
         .items_signal_vec(VecDiffStreamSignalVec(items_rx));
@@ -2198,6 +2351,7 @@ fn build_retained_stack(
     full_value: &Value,
     handle: &DdWorkerHandle,
     link_path: &str,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(Arc::new(full_value.clone()));
     let (layers_tx, layers_rx) = mpsc::unbounded();
@@ -2208,7 +2362,7 @@ fn build_retained_stack(
 
     for (i, layer) in layer_values.iter().enumerate() {
         let child_lp = format!("{}.layers.{}", link_path, i);
-        let (el, node) = build_retained_node(layer, handle, &child_lp);
+        let (el, node) = build_retained_node(layer, handle, &child_lp, scene_params.clone());
         retained_layers.push(node);
         initial_elements.push(el);
     }
@@ -2244,6 +2398,7 @@ fn build_retained_container(
     full_value: &Value,
     handle: &DdWorkerHandle,
     link_path: &str,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(Arc::new(full_value.clone()));
     let (child_tx, child_rx) = mpsc::unbounded();
@@ -2252,7 +2407,7 @@ fn build_retained_container(
     let mut initial_elements = Vec::new();
 
     if let Some(child_val) = fields.get("child") {
-        let (el, node) = build_retained_node(child_val, handle, link_path);
+        let (el, node) = build_retained_node(child_val, handle, link_path, scene_params.clone());
         retained_child = Some(Box::new(node));
         initial_elements.push(el);
     }
@@ -2299,10 +2454,11 @@ fn build_retained_container(
         .s(extract_font_line_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
+            let scene_params = scene_params.clone();
             let child_rx = child_rx;
             move |raw_el| {
                 let raw_el = apply_raw_css_signals(raw_el, &vm);
-                let raw_el = apply_physical_css_signals(raw_el, &vm);
+                let raw_el = apply_physical_css_signals(raw_el, &vm, scene_params.clone());
                 raw_el.children_signal_vec(VecDiffStreamSignalVec(child_rx))
             }
         });
@@ -2322,6 +2478,7 @@ fn build_retained_label(
     full_value: &Value,
     handle: &DdWorkerHandle,
     link_path: &str,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(Arc::new(full_value.clone()));
     let effective_link = fields
@@ -2365,18 +2522,26 @@ fn build_retained_label(
         .s(extract_font_line_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
+            let scene_params = scene_params.clone();
             move |raw_el| {
                 let raw_el = apply_raw_css_signals(raw_el, &vm);
-                apply_physical_css_signals(raw_el, &vm)
+                apply_physical_css_signals(raw_el, &vm, scene_params.clone())
             }
         })
         .on_double_click({
             let handle_ref = handle.clone_ref();
             let lp = link_ref.clone();
             move || {
-                let path = lp.borrow().clone();
-                if !path.is_empty() {
-                    handle_ref.inject_dd_event(Event::DoubleClick { link_path: path });
+                let base = lp.borrow().clone();
+                if !base.is_empty() {
+                    zoon::println!(
+                        "[cells-dd-bridge] double_click base={} full={}",
+                        base,
+                        format!("{}.event.double_click", base)
+                    );
+                    handle_ref.inject_dd_event(Event::DoubleClick {
+                        link_path: format!("{}.event.double_click", base),
+                    });
                 }
             }
         })
@@ -2454,13 +2619,27 @@ fn build_retained_text_input(
             let persisted_text_key = persisted_text_key.clone();
             move |raw_el| {
                 let raw_el = apply_raw_css_signals(raw_el, &vm);
-                let raw_el = apply_physical_css_signals(raw_el, &vm);
+                let raw_el = apply_physical_css_signals(raw_el, &vm, None);
                 raw_el.after_insert(move |input_el: web_sys::HtmlInputElement| {
                     if initial_focus {
-                        input_el.focus().ok();
-                        input_el.set_value(&initial_text);
-                        let text_len: u32 = initial_text.len().try_into().unwrap_or(0);
-                        input_el.set_selection_range(text_len, text_len).ok();
+                        let focus_input = input_el.clone();
+                        let focus_text = initial_text.clone();
+                        let focus_callback =
+                            wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+                                focus_input.focus().ok();
+                                focus_input.set_value(&focus_text);
+                                let text_len: u32 = focus_text.len().try_into().unwrap_or(0);
+                                focus_input.set_selection_range(text_len, text_len).ok();
+                            });
+                        if let Some(window) = web_sys::window() {
+                            window
+                                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                    focus_callback.as_ref().unchecked_ref(),
+                                    0,
+                                )
+                                .ok();
+                        }
+                        focus_callback.forget();
                     }
 
                     if let Some(key) = persisted_text_key.as_ref() {
@@ -2530,7 +2709,6 @@ fn build_retained_text_input(
             let handle_ref = handle.clone_ref();
             let lp = link_ref.clone();
             let dom_el_ref = dom_el.clone();
-            let persisted_text_key = persisted_text_key.clone();
             move |event| {
                 let base = lp.borrow().clone();
                 if !base.is_empty() {
@@ -2539,38 +2717,17 @@ fn build_retained_text_input(
                         Key::Escape => "Escape".to_string(),
                         Key::Other(k) => k.clone(),
                     };
+                    let text = dom_el_ref
+                        .borrow()
+                        .as_ref()
+                        .map(|input| input.value())
+                        .unwrap_or_default();
                     let path = format!("{}.event.key_down", base);
                     handle_ref.inject_dd_event(Event::KeyDown {
                         link_path: path,
                         key,
+                        text,
                     });
-                    if matches!(event.key(), Key::Enter) {
-                        if let Some(input) = dom_el_ref.borrow().as_ref() {
-                            input.set_value("");
-                        }
-                        if let Some(key) = persisted_text_key.as_ref() {
-                            save_persisted_text_input(key, "");
-                        }
-                        let delayed_handle = handle_ref.clone_ref();
-                        let delayed_base = base.clone();
-                        let timeout_callback =
-                            wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
-                                let path = format!("{}.event.change", delayed_base);
-                                delayed_handle.inject_dd_event(Event::TextChange {
-                                    link_path: path,
-                                    text: String::new(),
-                                });
-                            });
-                        if let Some(window) = web_sys::window() {
-                            window
-                                .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                    timeout_callback.as_ref().unchecked_ref(),
-                                    20,
-                                )
-                                .ok();
-                        }
-                        timeout_callback.forget();
-                    }
                 }
             }
         })
@@ -2846,6 +3003,7 @@ fn build_retained_paragraph(
     full_value: &Value,
     handle: &DdWorkerHandle,
     link_path: &str,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(Arc::new(full_value.clone()));
     let (contents_tx, contents_rx) = mpsc::unbounded();
@@ -2856,7 +3014,7 @@ fn build_retained_paragraph(
 
     for (i, item) in content_values.iter().enumerate() {
         let child_lp = format!("{}.contents.{}", link_path, i);
-        let (el, node) = build_retained_node(item, handle, &child_lp);
+        let (el, node) = build_retained_node(item, handle, &child_lp, scene_params.clone());
         retained_contents.push(node);
         initial_elements.push(el);
     }
@@ -2880,9 +3038,10 @@ fn build_retained_paragraph(
         .s(extract_font_line_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
+            let scene_params = scene_params.clone();
             move |raw_el| {
                 let raw_el = apply_raw_css_signals(raw_el, &vm);
-                apply_physical_css_signals(raw_el, &vm)
+                apply_physical_css_signals(raw_el, &vm, scene_params.clone())
             }
         })
         .contents_signal_vec(VecDiffStreamSignalVec(contents_rx));
@@ -2902,6 +3061,7 @@ fn build_retained_link(
     full_value: &Value,
     handle: &DdWorkerHandle,
     link_path: &str,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(Arc::new(full_value.clone()));
     let effective_link = extract_effective_link(fields, link_path);
@@ -2936,9 +3096,10 @@ fn build_retained_link(
         .s(extract_font_line_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
+            let scene_params = scene_params.clone();
             move |raw_el| {
                 let raw_el = apply_raw_css_signals(raw_el, &vm);
-                apply_physical_css_signals(raw_el, &vm)
+                apply_physical_css_signals(raw_el, &vm, scene_params.clone())
             }
         });
 
@@ -3002,6 +3163,7 @@ fn build_retained_text(
     full_value: &Value,
     _handle: &DdWorkerHandle,
     _link_path: &str,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(Arc::new(full_value.clone()));
 
@@ -3030,9 +3192,10 @@ fn build_retained_text(
         .s(extract_padding_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
+            let scene_params = scene_params.clone();
             move |raw_el| {
                 let raw_el = apply_raw_css_signals(raw_el, &vm);
-                apply_physical_css_signals(raw_el, &vm)
+                apply_physical_css_signals(raw_el, &vm, scene_params.clone())
             }
         });
 
@@ -3046,6 +3209,7 @@ fn build_retained_block(
     full_value: &Value,
     handle: &DdWorkerHandle,
     link_path: &str,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(Arc::new(full_value.clone()));
     let (child_tx, child_rx) = mpsc::unbounded();
@@ -3059,7 +3223,7 @@ fn build_retained_block(
     let mut retained_child = None;
     let mut initial_elements = Vec::new();
     if let Some(child_val) = child_value {
-        let (el, node) = build_retained_node(child_val, handle, link_path);
+        let (el, node) = build_retained_node(child_val, handle, link_path, scene_params.clone());
         retained_child = Some(Box::new(node));
         initial_elements.push(el);
     }
@@ -3080,9 +3244,10 @@ fn build_retained_block(
         .s(extract_shadows_style(&vm))
         .update_raw_el({
             let vm = vm.clone();
+            let scene_params = scene_params.clone();
             move |raw_el| {
                 let raw_el = apply_raw_css_signals(raw_el, &vm);
-                let raw_el = apply_physical_css_signals(raw_el, &vm);
+                let raw_el = apply_physical_css_signals(raw_el, &vm, scene_params.clone());
                 raw_el.children_signal_vec(VecDiffStreamSignalVec(child_rx))
             }
         });
@@ -3102,6 +3267,11 @@ fn build_retained_block(
 // ═══════════════════════════════════════════════════════════════════════════
 
 impl RetainedTree {
+    #[must_use]
+    pub const fn render_surface(&self) -> RenderSurface {
+        self.render_surface
+    }
+
     /// Apply keyed diffs to the keyed Stripe in this tree.
     /// Walks the tree to find the Stripe with keyed_items and applies diffs to it.
     pub fn apply_keyed_diffs(&mut self, diffs: &[KeyedDiff], handle: &DdWorkerHandle) {
@@ -3111,12 +3281,22 @@ impl RetainedTree {
     /// Update the retained tree with a new document Value.
     /// Only changed elements' Mutables are updated; Zoon handles DOM diffs.
     pub fn update(&mut self, new_value: &Value, handle: &DdWorkerHandle) {
-        self.root.update(new_value, handle, "");
+        if let Some(scene_params) = &self.scene_params {
+            scene_params.set_neq(derive_scene_params(new_value));
+        }
+        self.root
+            .update(new_value, handle, "", self.scene_params.clone());
     }
 }
 
 impl RetainedNode {
-    fn update(&mut self, new_value: &Value, handle: &DdWorkerHandle, link_path: &str) {
+    fn update(
+        &mut self,
+        new_value: &Value,
+        handle: &DdWorkerHandle,
+        link_path: &str,
+        scene_params: Option<Mutable<PhysicalSceneParams>>,
+    ) {
         match self {
             RetainedNode::Primitive { text } => {
                 let new_text = match new_value {
@@ -3159,7 +3339,15 @@ impl RetainedNode {
                     // Non-keyed Stripes: use positional diff as before.
                     if keyed_items.is_none() {
                         let new_items = extract_sorted_list_items(fields, "items");
-                        diff_children(items, items_tx, &new_items, handle, link_path, "items");
+                        diff_children(
+                            items,
+                            items_tx,
+                            &new_items,
+                            handle,
+                            link_path,
+                            "items",
+                            scene_params.clone(),
+                        );
                     }
                 }
             }
@@ -3172,7 +3360,15 @@ impl RetainedNode {
                 value.set_neq(Arc::new(new_value.clone()));
                 if let Some(fields) = get_fields(new_value) {
                     let new_layers = extract_sorted_list_items(fields, "layers");
-                    diff_children(layers, layers_tx, &new_layers, handle, link_path, "layers");
+                    diff_children(
+                        layers,
+                        layers_tx,
+                        &new_layers,
+                        handle,
+                        link_path,
+                        "layers",
+                        scene_params.clone(),
+                    );
                 }
             }
 
@@ -3187,9 +3383,14 @@ impl RetainedNode {
                     match (child.as_mut(), new_child) {
                         (Some(existing), Some(new_val)) => {
                             if existing.matches_value_type(new_val) {
-                                existing.update(new_val, handle, link_path);
+                                existing.update(new_val, handle, link_path, scene_params.clone());
                             } else {
-                                let (el, node) = build_retained_node(new_val, handle, link_path);
+                                let (el, node) = build_retained_node(
+                                    new_val,
+                                    handle,
+                                    link_path,
+                                    scene_params.clone(),
+                                );
                                 *child = Some(Box::new(node));
                                 child_tx.unbounded_send(VecDiff::RemoveAt { index: 0 }).ok();
                                 child_tx
@@ -3201,7 +3402,12 @@ impl RetainedNode {
                             }
                         }
                         (None, Some(new_val)) => {
-                            let (el, node) = build_retained_node(new_val, handle, link_path);
+                            let (el, node) = build_retained_node(
+                                new_val,
+                                handle,
+                                link_path,
+                                scene_params.clone(),
+                            );
                             *child = Some(Box::new(node));
                             child_tx.unbounded_send(VecDiff::Push { value: el }).ok();
                         }
@@ -3258,9 +3464,23 @@ impl RetainedNode {
 
                     // Handle focus change: manually focus + set cursor position
                     if !last_focus.get() && new_focus {
-                        let text_len: u32 = new_text.len().try_into().unwrap_or(0);
-                        input_el.set_selection_range(text_len, text_len).ok();
-                        input_el.focus().ok();
+                        let focus_input = input_el.clone();
+                        let focus_text = new_text.clone();
+                        let focus_callback =
+                            wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+                                let text_len: u32 = focus_text.len().try_into().unwrap_or(0);
+                                focus_input.set_selection_range(text_len, text_len).ok();
+                                focus_input.focus().ok();
+                            });
+                        if let Some(window) = web_sys::window() {
+                            window
+                                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                    focus_callback.as_ref().unchecked_ref(),
+                                    0,
+                                )
+                                .ok();
+                        }
+                        focus_callback.forget();
                     }
                 }
                 last_focus.set(new_focus);
@@ -3309,6 +3529,7 @@ impl RetainedNode {
                         handle,
                         link_path,
                         "contents",
+                        scene_params.clone(),
                     );
                 }
             }
@@ -3338,9 +3559,14 @@ impl RetainedNode {
                     match (child.as_mut(), new_child) {
                         (Some(existing), Some(new_val)) => {
                             if existing.matches_value_type(new_val) {
-                                existing.update(new_val, handle, link_path);
+                                existing.update(new_val, handle, link_path, scene_params.clone());
                             } else {
-                                let (el, node) = build_retained_node(new_val, handle, link_path);
+                                let (el, node) = build_retained_node(
+                                    new_val,
+                                    handle,
+                                    link_path,
+                                    scene_params.clone(),
+                                );
                                 *child = Some(Box::new(node));
                                 child_tx.unbounded_send(VecDiff::RemoveAt { index: 0 }).ok();
                                 child_tx
@@ -3352,7 +3578,12 @@ impl RetainedNode {
                             }
                         }
                         (None, Some(new_val)) => {
-                            let (el, node) = build_retained_node(new_val, handle, link_path);
+                            let (el, node) = build_retained_node(
+                                new_val,
+                                handle,
+                                link_path,
+                                scene_params.clone(),
+                            );
                             *child = Some(Box::new(node));
                             child_tx.unbounded_send(VecDiff::Push { value: el }).ok();
                         }
@@ -3370,9 +3601,14 @@ impl RetainedNode {
                 match (child.as_mut(), new_root) {
                     (Some(existing), Some(new_val)) => {
                         if existing.matches_value_type(new_val) {
-                            existing.update(new_val, handle, link_path);
+                            existing.update(new_val, handle, link_path, scene_params.clone());
                         } else {
-                            let (el, node) = build_retained_node(new_val, handle, link_path);
+                            let (el, node) = build_retained_node(
+                                new_val,
+                                handle,
+                                link_path,
+                                scene_params.clone(),
+                            );
                             *child = Some(Box::new(node));
                             child_tx.unbounded_send(VecDiff::RemoveAt { index: 0 }).ok();
                             child_tx
@@ -3384,7 +3620,12 @@ impl RetainedNode {
                         }
                     }
                     (None, Some(new_val)) => {
-                        let (el, node) = build_retained_node(new_val, handle, link_path);
+                        let (el, node) = build_retained_node(
+                            new_val,
+                            handle,
+                            link_path,
+                            scene_params.clone(),
+                        );
                         *child = Some(Box::new(node));
                         child_tx.unbounded_send(VecDiff::Push { value: el }).ok();
                     }
@@ -3453,6 +3694,7 @@ fn diff_children(
     handle: &DdWorkerHandle,
     link_path: &str,
     field_name: &str,
+    scene_params: Option<Mutable<PhysicalSceneParams>>,
 ) {
     let old_len = retained.len();
     let new_len = new_items.len();
@@ -3461,9 +3703,10 @@ fn diff_children(
     for i in 0..common {
         let child_lp = format!("{}.{}.{}", link_path, field_name, i);
         if retained[i].matches_value_type(&new_items[i]) {
-            retained[i].update(&new_items[i], handle, &child_lp);
+            retained[i].update(&new_items[i], handle, &child_lp, scene_params.clone());
         } else {
-            let (el, node) = build_retained_node(&new_items[i], handle, &child_lp);
+            let (el, node) =
+                build_retained_node(&new_items[i], handle, &child_lp, scene_params.clone());
             retained[i] = node;
             tx.unbounded_send(VecDiff::RemoveAt { index: i }).ok();
             tx.unbounded_send(VecDiff::InsertAt {
@@ -3476,7 +3719,8 @@ fn diff_children(
 
     for i in old_len..new_len {
         let child_lp = format!("{}.{}.{}", link_path, field_name, i);
-        let (el, node) = build_retained_node(&new_items[i], handle, &child_lp);
+        let (el, node) =
+            build_retained_node(&new_items[i], handle, &child_lp, scene_params.clone());
         retained.push(node);
         tx.unbounded_send(VecDiff::Push { value: el }).ok();
     }
@@ -3652,7 +3896,7 @@ fn render_tagged_static(tag: &str, fields: &Arc<Fields>) -> RawElOrText {
             }
             el.unify()
         }
-        "DocumentNew" => {
+        "DocumentNew" | "SceneNew" => {
             if let Some(root) = fields.get("root") {
                 render_value_static(root)
             } else {
@@ -3661,19 +3905,19 @@ fn render_tagged_static(tag: &str, fields: &Arc<Fields>) -> RawElOrText {
         }
         "ElementSelect" => {
             let selected = fields.get("selected").and_then(|v| v.as_text()).unwrap_or("").to_string();
-            zoon::Text::new(format!("[select: {}]", selected)).unify()
+            select_placeholder(&selected)
         }
         "ElementSlider" => {
             let val = fields.get("value").and_then(|v| v.as_number()).unwrap_or(0.0);
-            zoon::Text::new(format!("[slider: {}]", val)).unify()
+            slider_placeholder(val)
         }
         "ElementSvg" => {
-            zoon::Text::new("[SVG canvas]").unify()
+            svg_canvas_placeholder()
         }
         "ElementSvgCircle" => {
             El::new().unify()
         }
-        _ => zoon::Text::new(format!("{}[...]", tag)).unify(),
+        _ => tagged_placeholder(tag),
     }
 }
 
@@ -3799,5 +4043,89 @@ fn render_container_static(fields: &Fields) -> RawElOrText {
         el.child(render_value_static(child)).unify()
     } else {
         el.unify()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_box_shadow, compute_gloss, derive_scene_params};
+    use crate::platform::browser::engine_dd::Value;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn derive_scene_params_reads_lights_and_geometry() {
+        let lights = Value::empty_list()
+            .list_append(
+                Value::tagged(
+                    "DirectionalLight",
+                    [
+                        ("azimuth", Value::number(30.0)),
+                        ("altitude", Value::number(45.0)),
+                        ("spread", Value::number(1.5)),
+                        ("intensity", Value::number(1.2)),
+                    ],
+                ),
+                0,
+            )
+            .list_append(
+                Value::tagged("AmbientLight", [("intensity", Value::number(0.4))]),
+                1,
+            );
+        let scene = Value::tagged(
+            "SceneNew",
+            [
+                ("lights", lights),
+                (
+                    "geometry",
+                    Value::object([("bevel_angle", Value::number(50.0))]),
+                ),
+            ],
+        );
+
+        let params = derive_scene_params(&scene);
+
+        assert_eq!(params.directional_intensity, 1.2);
+        assert_eq!(params.ambient_factor, 0.4);
+        assert_eq!(params.bevel_angle, 50.0);
+        assert_eq!(
+            params.shadow_blur_per_depth,
+            boon_scene::PhysicalSceneParams::DEFAULT.shadow_blur_per_depth * 1.5
+        );
+        assert_ne!(
+            params.shadow_dx_per_depth,
+            boon_scene::PhysicalSceneParams::DEFAULT.shadow_dx_per_depth
+        );
+        assert_ne!(
+            params.shadow_dy_per_depth,
+            boon_scene::PhysicalSceneParams::DEFAULT.shadow_dy_per_depth
+        );
+    }
+
+    #[test]
+    fn physical_css_helpers_reflect_scene_params() {
+        let style = Arc::new(BTreeMap::from([
+            (Arc::from("depth"), Value::number(2.0)),
+            (
+                Arc::from("material"),
+                Value::object([("gloss", Value::number(0.5))]),
+            ),
+        ]));
+        let scene = boon_scene::PhysicalSceneParams {
+            shadow_dx_per_depth: 2.0,
+            shadow_dy_per_depth: 3.0,
+            shadow_blur_per_depth: 4.0,
+            directional_intensity: 1.2,
+            ambient_factor: 0.4,
+            bevel_angle: 50.0,
+        };
+
+        let shadow = compute_box_shadow(&style, scene).expect("shadow");
+        assert!(shadow.contains("4.0px 6.0px 8.0px"));
+        assert!(shadow.contains("rgba(0,0,0,0.22)"));
+
+        let gloss = compute_gloss(&style, scene).expect("gloss");
+        assert!(gloss.contains("linear-gradient(50deg"));
+        assert!(gloss.contains("rgba(255,255,255,0.12)"));
     }
 }

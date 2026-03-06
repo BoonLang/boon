@@ -19,6 +19,7 @@
 //! - `.iterate()` — fixed-point loops
 
 use std::sync::Arc;
+use std::{collections::BTreeMap, collections::BTreeSet};
 
 use super::types::{LIST_TAG, ListKey};
 use super::value::Value;
@@ -65,6 +66,17 @@ where
                     for (event, ts, diff) in data.drain(..) {
                         if diff > 0 {
                             let new_state = transform(&state, &event);
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if event.to_display_string().contains("PersonId")
+                                || new_state.to_display_string().contains("PersonId")
+                            {
+                                std::eprintln!(
+                                    "[dd-hold-state] event={} old={} new={}",
+                                    event,
+                                    state,
+                                    new_state
+                                );
+                            }
                             if new_state != state {
                                 session.give((state.clone(), ts, -1isize));
                                 session.give((new_state.clone(), ts, 1isize));
@@ -79,6 +91,81 @@ where
 
     // Merge initial value with state changes
     initial_collection.concat(&changes)
+}
+
+/// Sample the current scalar dependency when an event fires.
+pub fn sample_on_event<G>(
+    events: &VecCollection<G, Value, isize>,
+    dep: &VecCollection<G, Value, isize>,
+    combine: impl Fn(&Value, &Value) -> Value + 'static,
+) -> VecCollection<G, Value, isize>
+where
+    G: Scope<Timestamp = u64>,
+{
+    let mut current_dep = Value::Unit;
+    let mut active_time: Option<u64> = None;
+    let mut dep_snapshot = Value::Unit;
+    let mut pending_dep: Option<Value> = None;
+    let tagged_dep = dep.map(|value| (0u8, value));
+    let tagged_events = events.map(|value| (1u8, value));
+    let combined = tagged_dep.concat(&tagged_events);
+
+    combined
+        .inner
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
+            Pipeline,
+            "SampleOnEvent",
+            |_cap, _info| {
+                move |input, output| {
+                    input.for_each(|time, data| {
+                        let now = *time.time();
+                        if active_time != Some(now) {
+                            if let Some(new_dep) = pending_dep.take() {
+                                current_dep = new_dep;
+                            }
+                            active_time = Some(now);
+                            dep_snapshot = current_dep.clone();
+                        }
+
+                        let mut session = output.session(&time);
+
+                        for ((kind, value), ts, diff) in data.drain(..) {
+                            if diff <= 0 {
+                                continue;
+                            }
+                            if kind == 0 {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if value.to_display_string().contains("PersonId")
+                                    || matches!(value, Value::Tag(ref tag) if tag.as_ref() == "None")
+                                {
+                                    std::eprintln!(
+                                        "[dd-sample-on-event] dep+ ts={} value={} current_before={}",
+                                        ts,
+                                        value,
+                                        current_dep
+                                    );
+                                }
+                                pending_dep = Some(value);
+                            } else {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if value.to_display_string().contains("Press")
+                                    || value.to_display_string().contains("__t")
+                                {
+                                    std::eprintln!(
+                                        "[dd-sample-on-event] event ts={} value={} dep_snapshot={}",
+                                        ts,
+                                        value,
+                                        dep_snapshot
+                                    );
+                                }
+                                session.give((combine(&value, &dep_snapshot), ts, 1isize));
+                            }
+                        }
+                    });
+                }
+            },
+        )
+        .as_collection()
 }
 
 /// LATEST operator.
@@ -114,6 +201,77 @@ where
                             // Insert new value
                             session.give((new_val.clone(), *ts, 1isize));
                             current = Some(new_val);
+                        }
+                    });
+                }
+            },
+        )
+        .as_collection()
+}
+
+/// Combine the latest value from multiple scalar sources into one object.
+///
+/// Emits only after all sources have produced an initial positive value.
+/// Later positive updates replace the matching field and retract/insert the
+/// combined object when it changes.
+pub fn combine_latest_scalars<G>(
+    sources: &[VecCollection<G, Value, isize>],
+) -> VecCollection<G, Value, isize>
+where
+    G: Scope<Timestamp = u64>,
+{
+    let mut tagged = sources
+        .first()
+        .expect("combine_latest_scalars requires at least one source")
+        .map(|value| (0usize, value));
+
+    for (idx, source) in sources.iter().enumerate().skip(1) {
+        tagged = tagged.concat(&source.map(move |value| (idx, value)));
+    }
+
+    let source_count = sources.len();
+    let mut current_fields: BTreeMap<usize, Value> = BTreeMap::new();
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    let mut last_output: Option<Value> = None;
+
+    tagged
+        .inner
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
+            Pipeline,
+            "CombineLatestScalars",
+            |_cap, _info| {
+                move |input, output| {
+                    input.for_each(|time, data| {
+                        for ((idx, value), _ts, diff) in data.drain(..) {
+                            if diff > 0 {
+                                current_fields.insert(idx, value);
+                                seen.insert(idx);
+                            }
+                        }
+
+                        if seen.len() != source_count {
+                            return;
+                        }
+
+                        let fields: BTreeMap<Arc<str>, Value> = current_fields
+                            .iter()
+                            .map(|(idx, value)| (Arc::from(format!("__dep_{idx}")), value.clone()))
+                            .collect();
+                        let new_output = Value::Object(Arc::new(fields));
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if source_count >= 5 {
+                            std::eprintln!(
+                                "[dd-combine-latest] output={}",
+                                new_output
+                            );
+                        }
+                        if last_output.as_ref() != Some(&new_output) {
+                            let mut session = output.session(&time);
+                            if let Some(old) = last_output.take() {
+                                session.give((old, *time.time(), -1isize));
+                            }
+                            session.give((new_output.clone(), *time.time(), 1isize));
+                            last_output = Some(new_output);
                         }
                     });
                 }
@@ -553,6 +711,133 @@ where
     })
 }
 
+/// List/map with key and one reactive scalar dependency.
+///
+/// Recomputes item outputs when either the keyed items change or the scalar
+/// dependency changes.
+pub fn list_map_with_key_reactive<G>(
+    list: &VecCollection<G, (ListKey, Value), isize>,
+    dep: &VecCollection<G, Value, isize>,
+    transform: impl Fn(&ListKey, &Value, &Value) -> Value + 'static,
+) -> VecCollection<G, (ListKey, Value), isize>
+where
+    G: Scope<Timestamp = u64>,
+{
+    let sentinel = ListKey::new("__dep");
+    let tagged_items = list.map(|(key, val)| (key, (0u8, val)));
+    let dep_key = sentinel.clone();
+    let tagged_dep = dep.map(move |val| (dep_key.clone(), (1u8, val)));
+    let combined = tagged_items.concat(&tagged_dep);
+
+    let mut items: std::collections::HashMap<ListKey, Value> = std::collections::HashMap::new();
+    let mut rendered: std::collections::HashMap<ListKey, Value> =
+        std::collections::HashMap::new();
+    let mut current_dep: Option<Value> = None;
+
+    combined
+        .inner
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
+            Pipeline,
+            "ListMapWithKeyReactive",
+            |_cap, _info| {
+                move |input, output| {
+                    input.for_each(|time, data| {
+                        let mut session = output.session(&time);
+                        let mut item_updates = Vec::new();
+                        let mut dep_updates = Vec::new();
+
+                        for item in data.drain(..) {
+                            match (item.0).1.0 {
+                                0 => item_updates.push(item),
+                                _ => dep_updates.push(item),
+                            }
+                        }
+
+                        for ((key, (_, value)), ts, diff) in item_updates {
+                            if diff > 0 {
+                                items.insert(key.clone(), value.clone());
+                                if let Some(dep_val) = current_dep.as_ref() {
+                                    let new_val = transform(&key, &value, dep_val);
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    std::eprintln!(
+                                        "[dd-list-map-reactive] item key={} dep={} mapped={}",
+                                        key.0.as_ref(),
+                                        dep_val,
+                                        new_val
+                                    );
+                                    match rendered.insert(key.clone(), new_val.clone()) {
+                                        Some(old) if old != new_val => {
+                                            session.give(((key.clone(), old), ts, -1isize));
+                                            session.give(((key, new_val), ts, 1isize));
+                                        }
+                                        Some(old) => {
+                                            rendered.insert(key, old);
+                                        }
+                                        None => {
+                                            session.give(((key, new_val), ts, 1isize));
+                                        }
+                                    }
+                                }
+                            } else {
+                                items.remove(&key);
+                                if let Some(old) = rendered.remove(&key) {
+                                    session.give(((key, old), ts, -1isize));
+                                }
+                            }
+                        }
+
+                        let new_dep = dep_updates
+                            .iter()
+                            .rev()
+                            .find_map(|((_, (_, value)), _, diff)| (*diff > 0).then(|| value.clone()));
+
+                        if let Some(new_dep) = new_dep {
+                            let dep_changed = current_dep.as_ref() != Some(&new_dep);
+                            #[cfg(not(target_arch = "wasm32"))]
+                            std::eprintln!(
+                                "[dd-list-map-reactive] dep update old={:?} new={} changed={} items={}",
+                                current_dep,
+                                new_dep,
+                                dep_changed,
+                                items.len()
+                            );
+                            current_dep = Some(new_dep.clone());
+                            if dep_changed {
+                                for (key, item) in &items {
+                                    let mapped = transform(key, item, &new_dep);
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    std::eprintln!(
+                                        "[dd-list-map-reactive] remap key={} mapped={}",
+                                        key.0.as_ref(),
+                                        mapped
+                                    );
+                                    match rendered.get(key) {
+                                        Some(old) if *old == mapped => {}
+                                        Some(old) => {
+                                            session.give(((key.clone(), old.clone()), *time.time(), -1isize));
+                                            session.give(((key.clone(), mapped.clone()), *time.time(), 1isize));
+                                            rendered.insert(key.clone(), mapped);
+                                        }
+                                        None => {
+                                            session.give(((key.clone(), mapped.clone()), *time.time(), 1isize));
+                                            rendered.insert(key.clone(), mapped);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if dep_updates.iter().any(|(_, _, diff)| *diff < 0) && current_dep.is_some() {
+                            current_dep = None;
+                            for (key, old) in rendered.drain() {
+                                session.give(((key, old), *time.time(), -1isize));
+                            }
+                        }
+                    });
+                }
+            },
+        )
+        .as_collection()
+}
+
 /// List/append: add an item to a list (concat with new keyed item).
 pub fn list_append<G>(
     list: &VecCollection<G, (ListKey, Value), isize>,
@@ -591,6 +876,96 @@ where
     G: Scope<Timestamp = u64>,
 {
     source.flat_map(move |value| classify(&value))
+}
+
+/// Sample keyed events against the current keyed item state and emit scalar values.
+///
+/// `items` maintains the latest value for each key. Each positive diff from `events`
+/// looks up the current item for that key and emits `transform(item, event)`.
+pub fn keyed_event_map<G>(
+    items: &VecCollection<G, (ListKey, Value), isize>,
+    events: &VecCollection<G, (ListKey, Value), isize>,
+    transform: impl Fn(&Value, &Value) -> Value + 'static,
+) -> VecCollection<G, Value, isize>
+where
+    G: Scope<Timestamp = u64>,
+{
+    let tagged_items = items.map(|(key, value)| (key, (0u8, value)));
+    let tagged_events = events.map(|(key, value)| (key, (1u8, value)));
+    let combined = tagged_items.concat(&tagged_events);
+    let mut states: std::collections::HashMap<ListKey, Value> = std::collections::HashMap::new();
+
+    combined
+        .inner
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
+            Pipeline,
+            "KeyedEventMap",
+            |_cap, _info| {
+                move |input, output| {
+                    input.for_each(|time, data| {
+                        let mut session = output.session(&time);
+                        let mut item_updates = Vec::new();
+                        let mut event_updates = Vec::new();
+
+                        for item in data.drain(..) {
+                            match (item.0).1.0 {
+                                0 => item_updates.push(item),
+                                _ => event_updates.push(item),
+                            }
+                        }
+
+                        for ((key, (_, value)), _ts, diff) in item_updates {
+                            if diff > 0 {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                std::eprintln!(
+                                    "[dd-keyed-event-map] item + key={} value={}",
+                                    key.0.as_ref(),
+                                    value
+                                );
+                                states.insert(key, value);
+                            } else {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                std::eprintln!(
+                                    "[dd-keyed-event-map] item - key={}",
+                                    key.0.as_ref()
+                                );
+                                states.remove(&key);
+                            }
+                        }
+
+                        for ((key, (_, value)), ts, diff) in event_updates {
+                            if diff > 0 {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                std::eprintln!(
+                                    "[dd-keyed-event-map] event key={} payload={} known_keys={:?}",
+                                    key.0.as_ref(),
+                                    value,
+                                    states.keys().map(|k| k.0.as_ref()).collect::<Vec<_>>()
+                                );
+                                if let Some(item) = states.get(&key) {
+                                    let transformed = transform(item, &value);
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    std::eprintln!(
+                                        "[dd-keyed-event-map] hit key={} item={} transformed={}",
+                                        key.0.as_ref(),
+                                        item,
+                                        transformed
+                                    );
+                                    session.give((transformed, ts, 1isize));
+                                } else {
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    std::eprintln!(
+                                        "[dd-keyed-event-map] miss key={}",
+                                        key.0.as_ref()
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
+            },
+        )
+        .as_collection()
 }
 
 /// Append new keyed items from a scalar trigger with auto-incrementing keys.

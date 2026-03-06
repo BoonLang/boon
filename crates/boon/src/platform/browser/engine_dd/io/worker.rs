@@ -23,6 +23,16 @@ use super::super::core::types::{
 };
 use super::super::core::value::Value;
 
+#[cfg(target_arch = "wasm32")]
+fn dd_debug_log(message: &str) {
+    zoon::eprintln!("{message}");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn dd_debug_log(message: &str) {
+    std::eprintln!("{message}");
+}
+
 // ---------------------------------------------------------------------------
 // Event types that can be injected into the DD engine
 // ---------------------------------------------------------------------------
@@ -36,7 +46,7 @@ use super::super::core::value::Value;
 pub enum Event {
     LinkPress { link_path: String },
     LinkClick { link_path: String },
-    KeyDown { link_path: String, key: String },
+    KeyDown { link_path: String, key: String, text: String },
     TextChange { link_path: String, text: String },
     NumberChange { link_path: String, value: f64 },
     Blur { link_path: String },
@@ -101,6 +111,14 @@ struct DdWorkerInner {
 }
 
 impl DdWorkerInner {
+    fn drive_until_settled(&mut self) {
+        // DD pipelines in this repo often require several worker steps for an
+        // event to reach keyed list diffs and the assembled document output.
+        for _ in 0..1000 {
+            self.worker.step();
+        }
+    }
+
     /// Check if output changed after a worker.step() and notify.
     /// When `force` is true, notify even if the document value hasn't changed
     /// (used when keyed diffs arrive without scalar changes).
@@ -283,9 +301,7 @@ impl DdWorkerHandle {
 
         // Step to propagate initial data through the dataflow chain.
         // Multiple steps may be needed for deeply chained operators.
-        for _ in 0..10 {
-            inner.worker.step();
-        }
+        inner.drive_until_settled();
 
         // Read initial output and notify
         let initial_output = inner.output_cell.borrow().clone();
@@ -336,9 +352,21 @@ impl DdWorkerHandle {
         let (link_path, event_value) = match event {
             Event::LinkPress { link_path } => (link_path, Value::tag("Press")),
             Event::LinkClick { link_path } => (link_path, Value::tag("Click")),
-            Event::KeyDown { link_path, key } => (link_path, Value::text(key)),
-            Event::TextChange { link_path, text } => (link_path, Value::text(text)),
-            Event::NumberChange { link_path, value } => (link_path, Value::number(value)),
+            Event::KeyDown { link_path, key, text } => {
+                (
+                    link_path,
+                    Value::object([
+                        ("key", Value::tag(key.as_str())),
+                        ("text", Value::text(text)),
+                    ]),
+                )
+            }
+            Event::TextChange { link_path, text } => {
+                (link_path, Value::object([("text", Value::text(text))]))
+            }
+            Event::NumberChange { link_path, value } => {
+                (link_path, Value::object([("value", Value::number(value))]))
+            }
             Event::SvgClick { link_path, x, y } => {
                 (link_path, Value::object([("x", Value::number(x)), ("y", Value::number(y))]))
             }
@@ -352,6 +380,20 @@ impl DdWorkerHandle {
                 (ROUTER_INPUT.to_string(), Value::text(path))
             }
         };
+
+        let trace_crud = link_path.contains("name_input")
+            || link_path.contains("surname_input")
+            || link_path.contains("create_button")
+            || link_path.contains("book_button");
+        let trace_crud = trace_crud || link_path.contains("person_elements.row");
+        let trace_cells = link_path.contains("row_1_cells.0000.cell_elements.display")
+            || link_path.contains("row_1_cells.0000.cell_elements.editing");
+        if trace_crud || trace_cells {
+            dd_debug_log(&format!(
+                "[dd-browser] inject_dd_event path={} value={}",
+                link_path, event_value
+            ));
+        }
 
         {
             let mut inner = self.inner.borrow_mut();
@@ -373,11 +415,28 @@ impl DdWorkerHandle {
                             ]);
                             if let Some(session) = inner.inputs.get_mut(&wildcard_id) {
                                 session.update(tagged, 1);
+                            }
+                            for session in inner.inputs.values_mut() {
                                 session.advance_to(epoch);
                                 session.flush();
                             }
-                            inner.worker.step();
+                            inner.drive_until_settled();
                             let has_keyed = !self.keyed_diff_buffer.borrow().is_empty();
+                            if trace_crud || trace_cells {
+                                let output_summary = if trace_cells {
+                                    let output_text = inner.output_cell.borrow().to_display_string();
+                                    let preview: String = output_text.chars().take(160).collect();
+                                    preview
+                                } else {
+                                    inner.output_cell.borrow().to_string()
+                                };
+                                dd_debug_log(&format!(
+                                    "[dd-browser] after wildcard event path={} keyed_diffs={} output={}",
+                                    link_path,
+                                    self.keyed_diff_buffer.borrow().len(),
+                                    output_summary
+                                ));
+                            }
                             inner.notify_if_changed(has_keyed);
                             drop(inner);
                             self.process_side_effects();
@@ -407,8 +466,22 @@ impl DdWorkerHandle {
                 session.flush();
             }
 
-            inner.worker.step();
+            inner.drive_until_settled();
             let has_keyed = !self.keyed_diff_buffer.borrow().is_empty();
+            if trace_crud || trace_cells {
+                let output_summary = if trace_cells {
+                    let output_text = inner.output_cell.borrow().to_display_string();
+                    output_text.chars().take(160).collect::<String>()
+                } else {
+                    inner.output_cell.borrow().to_string()
+                };
+                dd_debug_log(&format!(
+                    "[dd-browser] after event path={} keyed_diffs={} output={}",
+                    link_path,
+                    self.keyed_diff_buffer.borrow().len(),
+                    output_summary
+                ));
+            }
             inner.notify_if_changed(has_keyed);
         }
         // inner borrow released — now process side effects
@@ -491,7 +564,7 @@ impl DdWorkerHandle {
             let input_id = match inner.link_path_to_input.get(&link_path) {
                 Some(id) => *id,
                 None => {
-                    zoon::eprintln!("[DD] Unknown link: {}", link_path);
+                    dd_debug_log(&format!("[DD] Unknown link: {}", link_path));
                     return;
                 }
             };
@@ -505,7 +578,7 @@ impl DdWorkerHandle {
                 session.flush();
             }
 
-            inner.worker.step();
+            inner.drive_until_settled();
             let has_keyed = !self.keyed_diff_buffer.borrow().is_empty();
             inner.notify_if_changed(has_keyed);
         }
@@ -521,5 +594,561 @@ impl DdWorkerHandle {
     /// Get a clone of the handle for sharing with event handlers.
     pub fn clone_ref(&self) -> DdWorkerHandle {
         self.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DdWorkerHandle, Event};
+    use crate::platform::browser::engine_dd::core::compile::{compile, CompiledProgram};
+    use crate::platform::browser::engine_dd::core::types::KeyedDiff;
+    use crate::platform::browser::engine_dd::core::value::Value;
+    use crate::platform::browser::engine_dd::render::bridge::build_retained_tree;
+    use boon_scene::RenderSurface;
+    use std::path::PathBuf;
+
+    fn read_example(path: &str) -> String {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(base.join(path)).expect("read example source")
+    }
+
+    #[test]
+    fn crud_graph_materializes_into_worker() {
+        let source =
+            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD dataflow");
+        };
+
+        let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+        {
+            let mut inner = handle.inner.borrow_mut();
+            for _ in 0..200 {
+                inner.worker.step();
+            }
+            inner.notify_if_changed(false);
+        }
+        let output = handle.current_output();
+
+        assert_ne!(output, Value::Unit);
+    }
+
+    fn value_tree_contains_keyed_stripe(value: &Value) -> bool {
+        match value {
+            Value::Tagged { tag, fields } => {
+                if tag.as_ref() == "ElementStripe"
+                    && fields
+                        .get("__keyed__")
+                        .and_then(Value::as_tag)
+                        .is_some_and(|tag| tag == "True")
+                {
+                    return true;
+                }
+                fields.values().any(value_tree_contains_keyed_stripe)
+            }
+            Value::Object(fields) => fields.values().any(value_tree_contains_keyed_stripe),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn crud_output_marks_people_stripe_as_keyed() {
+        let source =
+            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD dataflow");
+        };
+
+        let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+        let output = handle.current_output();
+
+        assert!(
+            value_tree_contains_keyed_stripe(&output),
+            "expected CRUD document output to contain a keyed stripe marker, got: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn crud_worker_emits_initial_keyed_diffs() {
+        let source =
+            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD dataflow");
+        };
+
+        let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+        let diffs = handle.drain_keyed_diffs();
+
+        assert!(
+            !diffs.is_empty(),
+            "expected CRUD worker to emit initial keyed diffs for people list"
+        );
+    }
+
+    #[test]
+    fn crud_initial_keyed_diffs_include_people_rows() {
+        let source =
+            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD dataflow");
+        };
+
+        let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+        let diffs = handle.drain_keyed_diffs();
+        let diff_text = diffs
+            .iter()
+            .map(|diff| match diff {
+                KeyedDiff::Upsert { value, .. } => value.to_display_string(),
+                KeyedDiff::Remove { key } => format!("remove:{}", key.0),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        assert!(
+            diff_text.contains("Emil")
+                && diff_text.contains("Mustermann")
+                && diff_text.contains("Tansen"),
+            "expected initial keyed diffs to contain CRUD people rows, got: {diff_text}"
+        );
+    }
+
+    #[test]
+    fn crud_create_uses_current_name_and_surname_input_text() {
+        let source =
+            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD dataflow");
+        };
+
+        let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+        let _ = handle.drain_keyed_diffs();
+
+        handle.inject_dd_event(Event::TextChange {
+            link_path: "store.elements.name_input.event.change".to_string(),
+            text: "John".to_string(),
+        });
+        handle.inject_dd_event(Event::TextChange {
+            link_path: "store.elements.surname_input.event.change".to_string(),
+            text: "Doe".to_string(),
+        });
+        handle.inject_dd_event(Event::LinkPress {
+            link_path: "store.elements.create_button.event.press".to_string(),
+        });
+
+        let output_after_create = handle.current_output();
+        let diff_text = handle
+            .drain_keyed_diffs()
+            .into_iter()
+            .map(|diff| match diff {
+                KeyedDiff::Upsert { value, .. } => value.to_display_string(),
+                KeyedDiff::Remove { key } => format!("remove:{}", key.0),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        assert!(
+            diff_text.contains("Doe") && diff_text.contains("John"),
+            "expected create flow to emit a Doe/John row, got diffs: {diff_text}; output: {output_after_create}"
+        );
+    }
+
+    #[test]
+    fn crud_row_press_selects_the_keyed_person() {
+        let source =
+            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD dataflow");
+        };
+
+        let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+        let _ = handle.drain_keyed_diffs();
+
+        handle.inject_dd_event(Event::LinkPress {
+            link_path: "store.people.0002.person_elements.row.event.press".to_string(),
+        });
+
+        let output = handle.current_output();
+        let output_text = output.to_display_string();
+        let diff_text = handle
+            .drain_keyed_diffs()
+            .into_iter()
+            .map(|diff| match diff {
+                KeyedDiff::Upsert { value, .. } => value.to_display_string(),
+                KeyedDiff::Remove { key } => format!("remove:{}", key.0),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        assert!(
+            output_text.contains("► Tansen") || diff_text.contains("► Tansen"),
+            "expected keyed row press to select Tansen, got diffs: {diff_text}; output: {output_text}"
+        );
+    }
+
+    #[test]
+    fn crud_delete_removes_the_selected_person() {
+        let source =
+            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD dataflow");
+        };
+
+        let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+        let _ = handle.drain_keyed_diffs();
+
+        handle.inject_dd_event(Event::LinkPress {
+            link_path: "store.people.0002.person_elements.row.event.press".to_string(),
+        });
+        let _ = handle.drain_keyed_diffs();
+
+        handle.inject_dd_event(Event::LinkPress {
+            link_path: "store.elements.delete_button.event.press".to_string(),
+        });
+
+        let output_text = handle.current_output().to_display_string();
+        let diff_text = handle
+            .drain_keyed_diffs()
+            .into_iter()
+            .map(|diff| match diff {
+                KeyedDiff::Upsert { value, .. } => value.to_display_string(),
+                KeyedDiff::Remove { key } => format!("remove:{}", key.0),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        assert!(
+            !output_text.contains("Tansen") && !diff_text.contains("Tansen"),
+            "expected delete flow to remove Tansen, got diffs: {diff_text}; output: {output_text}"
+        );
+    }
+
+    #[test]
+    fn flight_booker_book_button_updates_confirmation_text() {
+        let source =
+            read_example("../../playground/frontend/src/examples/flight_booker/flight_booker.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("flight_booker should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected Flight Booker dataflow");
+        };
+
+        let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+        handle.inject_dd_event(Event::LinkPress {
+            link_path: "store.elements.book_button.event.press".to_string(),
+        });
+
+        let output_text = handle.current_output().to_display_string();
+        assert!(
+            output_text.contains("Booked one-way flight on 2026-03-03"),
+            "expected booking confirmation after clicking Book, got output: {output_text}"
+        );
+    }
+
+    #[test]
+    fn cells_initial_output_shows_seed_formula_values() {
+        let source =
+            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("cells should compile");
+        let output = match program {
+            CompiledProgram::Dataflow { graph } => {
+                let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+                handle.current_output().to_display_string()
+            }
+            CompiledProgram::Static { document_value, .. } => document_value.to_display_string(),
+        };
+
+        assert!(
+            output.contains(
+                "row_1_cells.0000.cell_elements.display, element: [event: [double_click: LINK]], label: 5"
+            ) && output.contains(
+                "row_1_cells.0001.cell_elements.display, element: [event: [double_click: LINK]], label: 15"
+            ) && output.contains(
+                "row_1_cells.0002.cell_elements.display, element: [event: [double_click: LINK]], label: 30"
+            ),
+            "expected first visible row to include A1=5, B1=15, C1=30; got output: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn cells_a1_double_click_enters_edit_mode() {
+        let source =
+            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("cells should compile");
+        let handle = match program {
+            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Static { .. } => panic!("cells should compile to dataflow"),
+        };
+
+        handle.inject_dd_event(Event::DoubleClick {
+            link_path: "row_1_cells.0000.cell_elements.display.event.double_click".to_string(),
+        });
+
+        let output_text = handle.current_output().to_display_string();
+        let input_count = output_text.matches("ElementTextInput").count()
+            + output_text.matches("text_input").count();
+        assert!(
+            output_text.contains("ElementTextInput") || output_text.contains("text_input"),
+            "expected cells A1 double click to show a text input; got output: {output_text}"
+        );
+        assert!(
+            input_count <= 2,
+            "expected only the active cell to enter edit mode; got {input_count} inputs in output: {output_text}"
+        );
+    }
+
+    #[test]
+    fn cells_enter_commits_a1_and_recomputes_dependents() {
+        let source =
+            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("cells should compile");
+        let handle = match program {
+            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Static { .. } => panic!("cells should compile to dataflow"),
+        };
+
+        handle.inject_dd_event(Event::DoubleClick {
+            link_path: "row_1_cells.0000.cell_elements.display.event.double_click".to_string(),
+        });
+        handle.inject_dd_event(Event::TextChange {
+            link_path: "row_1_cells.0000.cell_elements.editing.event.change".to_string(),
+            text: "7".to_string(),
+        });
+        handle.inject_dd_event(Event::KeyDown {
+            link_path: "row_1_cells.0000.cell_elements.editing.event.key_down".to_string(),
+            key: "Enter".to_string(),
+            text: "7".to_string(),
+        });
+
+        let output_text = handle.current_output().to_display_string();
+        assert!(
+            output_text.contains(
+                "row_1_cells.0000.cell_elements.display, element: [event: [double_click: LINK]], label: 7"
+            ) && output_text.contains(
+                "row_1_cells.0001.cell_elements.display, element: [event: [double_click: LINK]], label: 17"
+            ) && output_text.contains(
+                "row_1_cells.0002.cell_elements.display, element: [event: [double_click: LINK]], label: 32"
+            ),
+            "expected A1=7, B1=17, C1=32 after commit; got output: {output_text}"
+        );
+    }
+
+    #[test]
+    fn cells_reopen_after_commit_shows_the_committed_formula_text() {
+        let source =
+            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("cells should compile");
+        let handle = match program {
+            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Static { .. } => panic!("cells should compile to dataflow"),
+        };
+
+        handle.inject_dd_event(Event::DoubleClick {
+            link_path: "row_1_cells.0000.cell_elements.display.event.double_click".to_string(),
+        });
+        handle.inject_dd_event(Event::TextChange {
+            link_path: "row_1_cells.0000.cell_elements.editing.event.change".to_string(),
+            text: "7".to_string(),
+        });
+        handle.inject_dd_event(Event::KeyDown {
+            link_path: "row_1_cells.0000.cell_elements.editing.event.key_down".to_string(),
+            key: "Enter".to_string(),
+            text: "7".to_string(),
+        });
+        handle.inject_dd_event(Event::DoubleClick {
+            link_path: "row_1_cells.0000.cell_elements.display.event.double_click".to_string(),
+        });
+
+        let output_text = handle.current_output().to_display_string();
+        assert!(
+            output_text.contains("ElementTextInput")
+                && output_text.contains("row_1_cells.0000.cell_elements.editing")
+                && output_text.contains("text: 7"),
+            "expected reopening A1 to show input text 7; got output: {output_text}"
+        );
+    }
+
+    #[test]
+    fn cells_escape_after_reopen_preserves_committed_values() {
+        let source =
+            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("cells should compile");
+        let handle = match program {
+            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Static { .. } => panic!("cells should compile to dataflow"),
+        };
+
+        handle.inject_dd_event(Event::DoubleClick {
+            link_path: "row_1_cells.0000.cell_elements.display.event.double_click".to_string(),
+        });
+        handle.inject_dd_event(Event::TextChange {
+            link_path: "row_1_cells.0000.cell_elements.editing.event.change".to_string(),
+            text: "7".to_string(),
+        });
+        handle.inject_dd_event(Event::KeyDown {
+            link_path: "row_1_cells.0000.cell_elements.editing.event.key_down".to_string(),
+            key: "Enter".to_string(),
+            text: "7".to_string(),
+        });
+        handle.inject_dd_event(Event::DoubleClick {
+            link_path: "row_1_cells.0000.cell_elements.display.event.double_click".to_string(),
+        });
+        handle.inject_dd_event(Event::TextChange {
+            link_path: "row_1_cells.0000.cell_elements.editing.event.change".to_string(),
+            text: "9".to_string(),
+        });
+        handle.inject_dd_event(Event::KeyDown {
+            link_path: "row_1_cells.0000.cell_elements.editing.event.key_down".to_string(),
+            key: "Escape".to_string(),
+            text: "9".to_string(),
+        });
+
+        let output_text = handle.current_output().to_display_string();
+        assert!(
+            output_text.contains(
+                "row_1_cells.0000.cell_elements.display, element: [event: [double_click: LINK]], label: 7"
+            ) && output_text.contains(
+                "row_1_cells.0001.cell_elements.display, element: [event: [double_click: LINK]], label: 17"
+            ) && output_text.contains(
+                "row_1_cells.0002.cell_elements.display, element: [event: [double_click: LINK]], label: 32"
+            ),
+            "expected Escape after reopen to preserve committed A1=7, B1=17, C1=32; got output: {output_text}"
+        );
+    }
+
+    #[test]
+    fn cells_compile_registers_a_concrete_double_click_input_path() {
+        let source =
+            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("cells should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("cells should compile to dataflow");
+        };
+
+        let paths: Vec<String> = graph
+            .inputs
+            .iter()
+            .filter_map(|input| input.link_path.clone())
+            .collect();
+
+        assert!(
+            paths.iter().any(|path| path == "row_1_cells.0000.cell_elements.display.event.double_click"),
+            "expected concrete A1 double-click input path; got inputs: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn static_item_text_change_then_body_reads_nested_event_text() {
+        let source = r#"
+items: LIST {
+    [cell_elements: [editing: LINK]]
+}
+edit_changed: items
+    |> List/map(cell, new:
+        cell.cell_elements.editing.event.change |> THEN {
+            [text: cell.cell_elements.editing.event.change.text]
+        }
+    )
+    |> List/latest()
+editing_text: TEXT {  } |> HOLD state {
+    edit_changed |> THEN { edit_changed.text }
+}
+document: Document/new(root:
+    Element/label(element: [], style: [], label: editing_text)
+)
+"#;
+
+        let program = compile(source, None, &std::collections::HashMap::new(), None)
+            .expect("program should compile");
+        let handle = match program {
+            CompiledProgram::Dataflow { graph } => {
+                let paths: Vec<String> = graph
+                    .inputs
+                    .iter()
+                    .filter_map(|input| input.link_path.clone())
+                    .collect();
+                assert!(
+                    paths.iter().any(|path| path == "items.0000.cell_elements.editing.event.change"),
+                    "expected concrete text-change input path; got inputs: {paths:?}"
+                );
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
+            CompiledProgram::Static { .. } => panic!("program should compile to dataflow"),
+        };
+
+        handle.inject_dd_event(Event::TextChange {
+            link_path: "items.0000.cell_elements.editing.event.change".to_string(),
+            text: "7".to_string(),
+        });
+
+        let output_text = handle.current_output().to_display_string();
+        assert!(
+            output_text.contains("label: 7"),
+            "expected static item text change event to expose nested event text; got output: {output_text}"
+        );
+    }
+
+    #[test]
+    fn cells_worker_boot_reaches_output_clone() {
+        let source =
+            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("cells should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected cells dataflow");
+        };
+
+        eprintln!("[cells-dd] before new_from_graph");
+        let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+        eprintln!("[cells-dd] after new_from_graph");
+        let output = handle.current_output();
+        eprintln!("[cells-dd] after current_output clone");
+        assert_ne!(output, Value::Unit);
+    }
+
+    #[test]
+    #[ignore = "browser-only retained-tree path requires wasm/js runtime"]
+    fn crud_output_builds_retained_tree() {
+        let source =
+            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD dataflow");
+        };
+
+        let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+        {
+            let mut inner = handle.inner.borrow_mut();
+            for _ in 0..200 {
+                inner.worker.step();
+            }
+            inner.notify_if_changed(false);
+        }
+        let output = handle.current_output();
+        assert_ne!(output, Value::Unit);
+
+        let _ = build_retained_tree(&output, &handle, RenderSurface::Document);
     }
 }

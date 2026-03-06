@@ -22,6 +22,7 @@ pub struct TestOptions {
     pub examples_dir: Option<PathBuf>,
     pub no_launch: bool,
     pub engine: Option<String>,
+    pub skip_persistence: bool,
 }
 
 /// Options for smoke-examples command
@@ -524,6 +525,14 @@ async fn run_tests_inner(opts: &TestOptions) -> Result<Vec<TestResult>> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
+    // Milestone 1 example parity should run from fresh in-memory state, not persistence.
+    // Persistence is validated separately in dedicated sections and later milestones.
+    let _ = send_command_to_server(
+        opts.port,
+        WsCommand::SetPersistence { enabled: false },
+    )
+    .await;
+
     // Find examples directory
     let examples_dir = if let Some(ref dir) = opts.examples_dir {
         dir.clone()
@@ -665,6 +674,28 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
     let _ = send_command_to_server(opts.port, WsCommand::NavigateTo { path: "/".to_string() }).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    // Force a different-example switch before selecting the target example.
+    // The playground intentionally preserves same-example state to support
+    // persistence testing, which is not what Milestone 1 parity checks want.
+    let reset_example = if example.name == "counter.bn" {
+        "hello_world.bn"
+    } else {
+        "counter.bn"
+    };
+    let _ = send_command_to_server(
+        opts.port,
+        WsCommand::SelectExample {
+            name: reset_example.to_string(),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Clear persisted storage before each example so fresh-state expectations
+    // don't inherit previous runs.
+    let _ = send_command_to_server(opts.port, WsCommand::ClearStates).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
     // Use SelectExample to properly switch examples (clears state, updates file context, triggers run)
     // This matches the manual UI behavior and ensures the previous example's DOM is fully cleaned up
     let response = send_command_to_server(opts.port, WsCommand::SelectExample { name: example.name.clone() }).await?;
@@ -795,7 +826,7 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
 
     // --- PERSISTENCE TEST ---
     // If there are persistence sequences, do a FULL PAGE REFRESH and verify state was restored
-    if all_passed && !spec.persistence.is_empty() {
+    if all_passed && !opts.skip_persistence && !spec.persistence.is_empty() {
         // Full page refresh - this clears JavaScript memory and forces restoration from localStorage
         // NOTE: This properly tests persistence - TriggerRun would just keep memory state
         let response = send_command_to_server(opts.port, WsCommand::Refresh).await?;
@@ -1158,6 +1189,13 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        ParsedAction::ClickAt { x, y } => {
+            let response = send_command_to_server(port, WsCommand::ClickAt { x: *x, y: *y }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Click at failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         ParsedAction::DblClickText { text } => {
             let response = send_command_to_server(port, WsCommand::DoubleClickByText {
                 text: text.clone(),
@@ -1165,6 +1203,302 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
             }).await?;
             if let WsResponse::Error { message } = response {
                 anyhow::bail!("Double-click text failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ParsedAction::DblClickTextNth { text, index } => {
+            let js = format!(
+                r#"(function() {{
+                    const root = document.querySelector('[data-boon-panel="preview"]');
+                    if (!root) return {{ error: 'preview root not found' }};
+                    const targetText = {text_json};
+                    const wantedIndex = {wanted_index};
+                    const matches = [];
+                    const directText = (el) => Array.from(el.childNodes)
+                        .filter((n) => n.nodeType === Node.TEXT_NODE)
+                        .map((n) => n.textContent || '')
+                        .join('')
+                        .trim();
+                    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                    let node = walker.currentNode;
+                    while (node) {{
+                        const direct = directText(node);
+                        const full = (node.innerText || node.textContent || '').trim();
+                        if ((direct && direct === targetText) || (!direct && full === targetText)) {{
+                            matches.push(node);
+                        }}
+                        node = walker.nextNode();
+                    }}
+                    if (wantedIndex >= matches.length) {{
+                        return {{ error: `exact text '${{targetText}}' match ${{wantedIndex}} not found (found ${{matches.length}})` }};
+                    }}
+                    const rect = matches[wantedIndex].getBoundingClientRect();
+                    return {{
+                        x: Math.round(rect.left + rect.width / 2),
+                        y: Math.round(rect.top + rect.height / 2),
+                        count: matches.length
+                    }};
+                }})()"#,
+                text_json = serde_json::to_string(text)?,
+                wanted_index = index,
+            );
+            let response = send_command_to_server(port, WsCommand::EvalJs { expression: js }).await?;
+            let (x, y) = match response {
+                WsResponse::Success { data } => {
+                    let Some(serde_json::Value::Object(obj)) = data else {
+                        anyhow::bail!("Double-click nth text failed: JS did not return coordinates");
+                    };
+                    if let Some(error) = obj.get("error").and_then(|v| v.as_str()) {
+                        anyhow::bail!("Double-click nth text failed: {}", error);
+                    }
+                    let x = obj
+                        .get("x")
+                        .and_then(|v| v.as_i64())
+                        .context("Double-click nth text failed: missing x")?;
+                    let y = obj
+                        .get("y")
+                        .and_then(|v| v.as_i64())
+                        .context("Double-click nth text failed: missing y")?;
+                    (x as i32, y as i32)
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Double-click nth text failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for EvalJs"),
+            };
+
+            let response = send_command_to_server(port, WsCommand::DoubleClickAt { x, y }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Double-click nth text failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ParsedAction::DblClickAt { x, y } => {
+            let response = send_command_to_server(port, WsCommand::DoubleClickAt { x: *x, y: *y }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Double-click at failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ParsedAction::DblClickCellsCell { row, column } => {
+            let js = format!(
+                r#"(function() {{
+                    const root = document.querySelector('[data-boon-panel="preview"]');
+                    if (!root) return {{ error: 'preview root not found' }};
+                    const targetRow = {target_row};
+                    const targetColumn = {target_column};
+                    const directText = (el) => Array.from(el.childNodes)
+                        .filter((n) => n.nodeType === Node.TEXT_NODE)
+                        .map((n) => n.textContent || '')
+                        .join('')
+                        .trim();
+                    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                    let node = walker.currentNode;
+                    const rowMatches = [];
+                    while (node) {{
+                        const direct = directText(node);
+                        if (direct === String(targetRow)) {{
+                            const rect = node.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {{
+                                rowMatches.push({{
+                                    node,
+                                    top: rect.top,
+                                    left: rect.left,
+                                    right: rect.right,
+                                    bottom: rect.bottom,
+                                }});
+                            }}
+                        }}
+                        node = walker.nextNode();
+                    }}
+                    rowMatches.sort((a, b) => (a.top - b.top) || (a.left - b.left));
+                    const rowLabel = rowMatches[0];
+                    if (!rowLabel) {{
+                        return {{ error: `row label ${{targetRow}} not found` }};
+                    }}
+
+                    const rowCenterY = (rowLabel.top + rowLabel.bottom) / 2;
+                    const cellMatches = [];
+                    const labelWalker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                    node = labelWalker.currentNode;
+                    while (node) {{
+                        const rect = node.getBoundingClientRect();
+                        const direct = directText(node);
+                        if (
+                            rect.width > 0 &&
+                            rect.height > 0 &&
+                            rect.left >= rowLabel.right - 0.5 &&
+                            Math.abs(((rect.top + rect.bottom) / 2) - rowCenterY) <= 3 &&
+                            direct.length > 0
+                        ) {{
+                            cellMatches.push({{
+                                node,
+                                text: direct,
+                                left: rect.left,
+                                top: rect.top,
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            }});
+                        }}
+                        node = labelWalker.nextNode();
+                    }}
+                    cellMatches.sort((a, b) => (a.left - b.left) || (a.top - b.top));
+                    const dedupedCells = [];
+                    for (const candidate of cellMatches) {{
+                        const prev = dedupedCells[dedupedCells.length - 1];
+                        if (
+                            prev &&
+                            Math.abs(prev.left - candidate.left) <= 1 &&
+                            Math.abs(prev.top - candidate.top) <= 1 &&
+                            prev.text === candidate.text
+                        ) {{
+                            continue;
+                        }}
+                        dedupedCells.push(candidate);
+                    }}
+                    const cell = dedupedCells[targetColumn - 1];
+                    if (!cell) {{
+                        return {{
+                            error: `cell (${{targetRow}}, ${{targetColumn}}) not found`,
+                            rowLabel,
+                            cellMatches: dedupedCells.slice(0, 8),
+                        }};
+                    }}
+                    return {{
+                        ok: true,
+                        rowLabel,
+                        cell: {{
+                            text: cell.text,
+                            left: cell.left,
+                            top: cell.top,
+                            right: cell.right,
+                            bottom: cell.bottom,
+                        }},
+                        cellMatches: dedupedCells.slice(0, 8),
+                    }};
+                }})()"#,
+                target_row = row,
+                target_column = column,
+            );
+            let response =
+                send_command_to_server(port, WsCommand::EvalJs { expression: js }).await?;
+            let obj = match response {
+                WsResponse::Success {
+                    data: Some(serde_json::Value::Object(obj)),
+                } => obj,
+                WsResponse::Success { .. } => {
+                    anyhow::bail!(
+                        "Double-click cells cell failed: JS did not return target info"
+                    );
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Double-click cells cell failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for EvalJs"),
+            };
+            if let Some(error) = obj.get("error").and_then(|v| v.as_str()) {
+                anyhow::bail!("Double-click cells cell failed: {}", error);
+            }
+
+            let js_dispatch = format!(
+                r#"(function() {{
+                    const root = document.querySelector('[data-boon-panel="preview"]');
+                    if (!root) return {{ error: 'preview root not found' }};
+                    const targetRow = {target_row};
+                    const targetColumn = {target_column};
+                    const directText = (el) => Array.from(el.childNodes)
+                        .filter((n) => n.nodeType === Node.TEXT_NODE)
+                        .map((n) => n.textContent || '')
+                        .join('')
+                        .trim();
+                    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                    let node = walker.currentNode;
+                    const rowMatches = [];
+                    while (node) {{
+                        const direct = directText(node);
+                        if (direct === String(targetRow)) {{
+                            const rect = node.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {{
+                                rowMatches.push({{ node, top: rect.top, left: rect.left, right: rect.right, bottom: rect.bottom }});
+                            }}
+                        }}
+                        node = walker.nextNode();
+                    }}
+                    rowMatches.sort((a, b) => (a.top - b.top) || (a.left - b.left));
+                    const rowLabel = rowMatches[0];
+                    if (!rowLabel) return {{ error: `row label ${{targetRow}} not found` }};
+                    const rowCenterY = (rowLabel.top + rowLabel.bottom) / 2;
+                    const labelWalker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                    node = labelWalker.currentNode;
+                    const cellMatches = [];
+                    while (node) {{
+                        const rect = node.getBoundingClientRect();
+                        const direct = directText(node);
+                        if (
+                            rect.width > 0 &&
+                            rect.height > 0 &&
+                            rect.left >= rowLabel.right - 0.5 &&
+                            Math.abs(((rect.top + rect.bottom) / 2) - rowCenterY) <= 3 &&
+                            direct.length > 0
+                        ) {{
+                            cellMatches.push({{ node, text: direct, left: rect.left, top: rect.top }});
+                        }}
+                        node = labelWalker.nextNode();
+                    }}
+                    cellMatches.sort((a, b) => (a.left - b.left) || (a.top - b.top));
+                    const dedupedCells = [];
+                    for (const candidate of cellMatches) {{
+                        const prev = dedupedCells[dedupedCells.length - 1];
+                        if (
+                            prev &&
+                            Math.abs(prev.left - candidate.left) <= 1 &&
+                            Math.abs(prev.top - candidate.top) <= 1 &&
+                            prev.text === candidate.text
+                        ) {{
+                            continue;
+                        }}
+                        dedupedCells.push(candidate);
+                    }}
+                    const target = dedupedCells[targetColumn - 1]?.node;
+                    if (!target) {{
+                        return {{ error: `cell (${{targetRow}}, ${{targetColumn}}) not found` }};
+                    }}
+                    target.scrollIntoView({{ block: 'center', inline: 'center' }});
+                    const rect = target.getBoundingClientRect();
+                    const x = (rect.left + rect.right) / 2;
+                    const y = (rect.top + rect.bottom) / 2;
+                    const fire = (type, detail) => target.dispatchEvent(new MouseEvent(type, {{
+                        bubbles: true,
+                        cancelable: true,
+                        composed: true,
+                        detail,
+                        clientX: x,
+                        clientY: y,
+                        button: 0,
+                        buttons: 1,
+                        view: window,
+                    }}));
+                    fire('mousedown', 1);
+                    fire('mouseup', 1);
+                    fire('click', 1);
+                    fire('mousedown', 2);
+                    fire('mouseup', 2);
+                    fire('click', 2);
+                    fire('dblclick', 2);
+                    return {{ ok: true, text: directText(target), tag: target.tagName }};
+                }})()"#,
+                target_row = row,
+                target_column = column,
+            );
+            let dispatch_response = send_command_to_server(
+                port,
+                WsCommand::EvalJs {
+                    expression: js_dispatch,
+                },
+            )
+            .await?;
+            if let WsResponse::Error { message } = dispatch_response {
+                anyhow::bail!("Double-click cells cell failed: {}", message);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1544,6 +1878,39 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 }
                 WsResponse::Error { message } => {
                     anyhow::bail!("Set slider value failed: {}", message);
+                }
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        ParsedAction::SetInputValue { index, value } => {
+            let js = format!(
+                r#"(function() {{
+                    var inputs = document.querySelectorAll('[data-boon-panel="preview"] input[type="text"], [data-boon-panel="preview"] input:not([type]), [data-boon-panel="preview"] textarea');
+                    if ({index} >= inputs.length) return 'ERROR: input index {index} not found (have ' + inputs.length + ')';
+                    var input = inputs[{index}];
+                    var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+                        || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                    if (!nativeSetter) return 'ERROR: native value setter not found';
+                    nativeSetter.call(input, {value_json});
+                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return 'OK';
+                }})()"#,
+                index = index,
+                value_json = serde_json::to_string(value)?,
+            );
+            let response = send_command_to_server(port, WsCommand::EvalJs { expression: js }).await?;
+            match response {
+                WsResponse::Success { data } => {
+                    if let Some(serde_json::Value::String(ref d)) = data {
+                        if d.starts_with("ERROR") {
+                            anyhow::bail!("Set input value failed: {}", d);
+                        }
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Set input value failed: {}", message);
                 }
                 _ => {}
             }

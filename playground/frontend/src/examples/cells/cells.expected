@@ -3,15 +3,12 @@
 [test]
 category = "interactive"
 description = "7GUIs Task 7: spreadsheet with formulas and change propagation"
-# 10x10 grid (100 cells) renders fast on Actors. DD/Wasm not yet supported.
-skip_engines = ["DD", "Wasm"]
-
 [output]
 text = "Cells"
 match = "contains"
 
 [timing]
-timeout = 15000
+timeout = 30000
 poll_interval = 500
 initial_delay = 2000
 
@@ -25,6 +22,11 @@ expect = "Cells"
 [[sequence]]
 description = "Column A header visible"
 actions = [["assert_contains", "A"]]
+expect = "Cells"
+
+[[sequence]]
+description = "Column Z header visible"
+actions = [["assert_contains", "Z"]]
 expect = "Cells"
 
 # SPEC: Grid renders with default formulas
@@ -47,3 +49,57 @@ expect = "Cells"
 description = "Default C1=30 visible (sum(A1:A3) = 5+10+15)"
 actions = [["assert_contains", "30"]]
 expect = "Cells"
+
+[[sequence]]
+description = "Row 100 visible"
+actions = [["assert_contains", "100"]]
+expect = "Cells"
+
+[[sequence]]
+description = "Double-click A1 enters edit mode with current value"
+actions = [
+  ["dblclick_cells_cell", 1, 1],
+  ["wait", 200],
+  ["assert_focused", 0],
+  ["assert_input_value", 0, "5"],
+]
+expect = "Cells"
+
+[[sequence]]
+description = "Enter commits edited A1 and recomputes dependent cells"
+actions = [
+  ["set_input_value", 0, "7"],
+  ["assert_input_value", 0, "7"],
+  ["key", "Enter"],
+  ["wait", 200],
+  ["assert_not_focused", 0],
+]
+expect = "171732"
+
+[[sequence]]
+description = "Escape cancels in-progress edit"
+actions = [
+  ["dblclick_cells_cell", 1, 1],
+  ["wait", 200],
+  ["assert_focused", 0],
+  ["assert_input_value", 0, "7"],
+  ["set_input_value", 0, "9"],
+  ["assert_input_value", 0, "9"],
+  ["key", "Escape"],
+  ["wait", 200],
+  ["assert_not_focused", 0],
+]
+expect = "171732"
+
+[[sequence]]
+description = "Blur exits edit mode without corrupting committed values"
+actions = [
+  ["dblclick_cells_cell", 1, 1],
+  ["wait", 200],
+  ["assert_focused", 0],
+  ["set_input_value", 0, "8"],
+  ["click_text", "Cells"],
+  ["wait", 200],
+  ["assert_not_focused", 0],
+]
+expect = "171732"

@@ -208,6 +208,20 @@ impl Action {
                             .context("click_checkbox requires index (0-indexed)")?;
                         Ok(ParsedAction::ClickCheckbox { index: index as u32 })
                     }
+                    "click_at" => {
+                        let x = arr
+                            .get(1)
+                            .and_then(|v| v.as_i64())
+                            .context("click_at requires x coordinate")?;
+                        let y = arr
+                            .get(2)
+                            .and_then(|v| v.as_i64())
+                            .context("click_at requires y coordinate")?;
+                        Ok(ParsedAction::ClickAt {
+                            x: x as i32,
+                            y: y as i32,
+                        })
+                    }
                     "dblclick_text" => {
                         let text = arr
                             .get(1)
@@ -215,6 +229,49 @@ impl Action {
                             .context("dblclick_text requires text to double-click")?
                             .to_string();
                         Ok(ParsedAction::DblClickText { text })
+                    }
+                    "dblclick_text_nth" => {
+                        let text = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("dblclick_text_nth requires text to double-click")?
+                            .to_string();
+                        let index = arr
+                            .get(2)
+                            .and_then(|v| v.as_u64())
+                            .context("dblclick_text_nth requires match index (0-indexed)")?;
+                        Ok(ParsedAction::DblClickTextNth {
+                            text,
+                            index: index as usize,
+                        })
+                    }
+                    "dblclick_at" => {
+                        let x = arr
+                            .get(1)
+                            .and_then(|v| v.as_i64())
+                            .context("dblclick_at requires x coordinate")?;
+                        let y = arr
+                            .get(2)
+                            .and_then(|v| v.as_i64())
+                            .context("dblclick_at requires y coordinate")?;
+                        Ok(ParsedAction::DblClickAt {
+                            x: x as i32,
+                            y: y as i32,
+                        })
+                    }
+                    "dblclick_cells_cell" => {
+                        let row = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("dblclick_cells_cell requires 1-based row")?;
+                        let column = arr
+                            .get(2)
+                            .and_then(|v| v.as_u64())
+                            .context("dblclick_cells_cell requires 1-based column")?;
+                        Ok(ParsedAction::DblClickCellsCell {
+                            row: row as u32,
+                            column: column as u32,
+                        })
                     }
                     "hover_text" => {
                         let text = arr
@@ -393,6 +450,21 @@ impl Action {
                             .to_string();
                         Ok(ParsedAction::SelectOption { index: index as u32, value })
                     }
+                    "set_input_value" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("set_input_value requires input index (0-indexed)")?;
+                        let value = arr
+                            .get(2)
+                            .and_then(|v| v.as_str())
+                            .context("set_input_value requires value")?
+                            .to_string();
+                        Ok(ParsedAction::SetInputValue {
+                            index: index as u32,
+                            value,
+                        })
+                    }
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -414,7 +486,11 @@ pub enum ParsedAction {
     ClickButton { index: u32 },    // Click button by index
     ClickButtonNearText { text: String, button_text: Option<String> },  // Click button near text (e.g., × button for a todo)
     ClickCheckbox { index: u32 },  // Click checkbox by index
+    ClickAt { x: i32, y: i32 },    // Click preview coordinates
     DblClickText { text: String }, // Double-click by text content
+    DblClickTextNth { text: String, index: usize }, // Double-click nth exact match by text
+    DblClickAt { x: i32, y: i32 }, // Double-click preview coordinates
+    DblClickCellsCell { row: u32, column: u32 }, // Double-click a 7GUIs Cells grid cell by 1-based row/column
     HoverText { text: String },    // Hover over element by text content
     AssertFocused { input_index: Option<u32> },  // Assert input has focus
     AssertInputPlaceholder { index: u32, expected: String },  // Assert input placeholder
@@ -433,6 +509,7 @@ pub enum ParsedAction {
     AssertCheckboxClickable { index: u32 },  // Assert checkbox is clickable by real user (not obscured)
     AssertElementStyle { target: String, property: String, expected: String },  // Assert computed CSS style on element found by text
     AssertInputValue { index: u32, expected: String },  // Assert input's current value
+    SetInputValue { index: u32, value: String },  // Set text input value and dispatch input/change
     SetSliderValue { index: u32, value: String },  // Set range input value
     SelectOption { index: u32, value: String },  // Select dropdown option by value
 }

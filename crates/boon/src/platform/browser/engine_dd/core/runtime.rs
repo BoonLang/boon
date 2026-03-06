@@ -57,6 +57,143 @@ impl<G: Scope> AnyCollection<G> {
     }
 }
 
+fn collection_deps_ready<G: Scope>(
+    spec: &CollectionSpec,
+    collections: &HashMap<VarId, AnyCollection<G>>,
+) -> bool {
+    let has = |var: &VarId| collections.contains_key(var);
+    match spec {
+        CollectionSpec::Literal(_)
+        | CollectionSpec::LiteralList(_)
+        | CollectionSpec::Input(_) => true,
+        CollectionSpec::HoldState { initial, events, .. } => has(initial) && has(events),
+        CollectionSpec::Then { source, .. }
+        | CollectionSpec::Map { source, .. }
+        | CollectionSpec::FlatMap { source, .. }
+        | CollectionSpec::Skip { source, .. }
+        | CollectionSpec::SideEffect { source, .. }
+        | CollectionSpec::ListAssemble(source)
+        | CollectionSpec::ListCount(source)
+        | CollectionSpec::ListLatest(source)
+        | CollectionSpec::ListEvery { source, .. }
+        | CollectionSpec::ListAny { source, .. }
+        | CollectionSpec::ListRetain { source, .. }
+        | CollectionSpec::ListMap { source, .. }
+        | CollectionSpec::ListMapWithKey { source, .. }
+        | CollectionSpec::MapToKeyed { source, .. }
+        | CollectionSpec::AppendNewKeyed { source, .. } => has(source),
+        CollectionSpec::Join { left, right, .. } => has(left) && has(right),
+        CollectionSpec::SampleOnEvent { event, dep, .. } => has(event) && has(dep),
+        CollectionSpec::HoldLatest(sources)
+        | CollectionSpec::Concat(sources)
+        | CollectionSpec::CombineLatest(sources) => {
+            sources.iter().all(has)
+        }
+        CollectionSpec::ListRetainReactive {
+            list, filter_state, ..
+        } => has(list) && has(filter_state),
+        CollectionSpec::ListMapWithKeyReactive { source, dep, .. } => has(source) && has(dep),
+        CollectionSpec::ListAppend { list, new_items } => has(list) && has(new_items),
+        CollectionSpec::ListRemove { list, remove_keys } => has(list) && has(remove_keys),
+        CollectionSpec::KeyedHoldState {
+            initial,
+            events,
+            broadcasts,
+            ..
+        } => has(initial) && has(events) && broadcasts.as_ref().is_none_or(has),
+        CollectionSpec::KeyedEventMap { items, events, .. } => has(items) && has(events),
+    }
+}
+
+fn missing_collection_deps<G: Scope>(
+    spec: &CollectionSpec,
+    collections: &HashMap<VarId, AnyCollection<G>>,
+) -> Vec<String> {
+    let missing = |var: &VarId| {
+        if collections.contains_key(var) {
+            None
+        } else {
+            Some(var.as_str().to_string())
+        }
+    };
+    match spec {
+        CollectionSpec::Literal(_)
+        | CollectionSpec::LiteralList(_)
+        | CollectionSpec::Input(_) => Vec::new(),
+        CollectionSpec::HoldState { initial, events, .. } => {
+            [missing(initial), missing(events)].into_iter().flatten().collect()
+        }
+        CollectionSpec::Then { source, .. }
+        | CollectionSpec::Map { source, .. }
+        | CollectionSpec::FlatMap { source, .. }
+        | CollectionSpec::Skip { source, .. }
+        | CollectionSpec::SideEffect { source, .. }
+        | CollectionSpec::ListAssemble(source)
+        | CollectionSpec::ListCount(source)
+        | CollectionSpec::ListLatest(source)
+        | CollectionSpec::ListEvery { source, .. }
+        | CollectionSpec::ListAny { source, .. }
+        | CollectionSpec::ListRetain { source, .. }
+        | CollectionSpec::ListMap { source, .. }
+        | CollectionSpec::ListMapWithKey { source, .. }
+        | CollectionSpec::MapToKeyed { source, .. }
+        | CollectionSpec::AppendNewKeyed { source, .. } => missing(source).into_iter().collect(),
+        CollectionSpec::Join { left, right, .. } => {
+            [missing(left), missing(right)].into_iter().flatten().collect()
+        }
+        CollectionSpec::SampleOnEvent { event, dep, .. } => {
+            [missing(event), missing(dep)].into_iter().flatten().collect()
+        }
+        CollectionSpec::HoldLatest(sources)
+        | CollectionSpec::Concat(sources)
+        | CollectionSpec::CombineLatest(sources) => {
+            sources.iter().filter_map(missing).collect()
+        }
+        CollectionSpec::ListRetainReactive {
+            list, filter_state, ..
+        } => [missing(list), missing(filter_state)]
+            .into_iter()
+            .flatten()
+            .collect(),
+        CollectionSpec::ListMapWithKeyReactive { source, dep, .. } => {
+            [missing(source), missing(dep)].into_iter().flatten().collect()
+        }
+        CollectionSpec::ListAppend { list, new_items } => {
+            [missing(list), missing(new_items)]
+                .into_iter()
+                .flatten()
+                .collect()
+        }
+        CollectionSpec::ListRemove { list, remove_keys } => {
+            [missing(list), missing(remove_keys)]
+                .into_iter()
+                .flatten()
+                .collect()
+        }
+        CollectionSpec::KeyedHoldState {
+            initial,
+            events,
+            broadcasts,
+            ..
+        } => {
+            let mut out: Vec<String> =
+                [missing(initial), missing(events)].into_iter().flatten().collect();
+            if let Some(broadcasts) = broadcasts {
+                if let Some(dep) = missing(broadcasts) {
+                    out.push(dep);
+                }
+            }
+            out
+        }
+        CollectionSpec::KeyedEventMap { items, events, .. } => {
+            [missing(items), missing(events)]
+                .into_iter()
+                .flatten()
+                .collect()
+        }
+    }
+}
+
 /// Materialize a DataflowGraph into live DD collections within a timely scope.
 ///
 /// Creates input sessions for external inputs, builds DD collections for each
@@ -91,11 +228,21 @@ where
     let mut literal_sessions: Vec<InputSession<u64, Value, isize>> = Vec::new();
     let mut literal_sessions_keyed: Vec<InputSession<u64, (ListKey, Value), isize>> = Vec::new();
 
-    // Build collections in topological order
+    // Build collections once their dependencies are available.
     let mut collections: HashMap<VarId, AnyCollection<G>> = HashMap::new();
+    let mut pending: Vec<(&VarId, &CollectionSpec)> = graph.collections.iter().collect();
 
-    for (var_id, spec) in &graph.collections {
-        let any_collection: AnyCollection<G> = match spec {
+    while !pending.is_empty() {
+        let mut next_pending = Vec::new();
+        let mut progressed = false;
+
+        for (var_id, spec) in pending {
+            if !collection_deps_ready(spec, &collections) {
+                next_pending.push((var_id, spec));
+                continue;
+            }
+
+            let any_collection: AnyCollection<G> = match spec {
             CollectionSpec::Literal(value) => {
                 let (mut session, coll) = scope.new_collection::<Value, isize>();
                 session.update(value.clone(), 1);
@@ -192,6 +339,23 @@ where
                 ))
             }
 
+            CollectionSpec::SampleOnEvent { event, dep, f } => {
+                let event_coll = collections
+                    .get(event)
+                    .expect("SampleOnEvent event not found")
+                    .as_scalar();
+                let dep_coll = collections
+                    .get(dep)
+                    .expect("SampleOnEvent dep not found")
+                    .as_scalar();
+                let f = Arc::clone(f);
+                AnyCollection::Scalar(operators::sample_on_event(
+                    event_coll,
+                    dep_coll,
+                    move |event, dep| f(event, dep),
+                ))
+            }
+
             CollectionSpec::HoldLatest(sources) => {
                 let mut concatted = collections
                     .get(&sources[0])
@@ -216,6 +380,20 @@ where
                     result = result.concat(other);
                 }
                 AnyCollection::Scalar(result)
+            }
+
+            CollectionSpec::CombineLatest(sources) => {
+                let source_colls: Vec<_> = sources
+                    .iter()
+                    .map(|src| {
+                        collections
+                            .get(src)
+                            .expect("CombineLatest source not found")
+                            .as_scalar()
+                            .clone()
+                    })
+                    .collect();
+                AnyCollection::Scalar(operators::combine_latest_scalars(&source_colls))
             }
 
             CollectionSpec::Skip { source, count } => {
@@ -335,6 +513,23 @@ where
                 AnyCollection::Keyed(operators::list_map_with_key(list, move |k, v| f(k, &v)))
             }
 
+            CollectionSpec::ListMapWithKeyReactive { source, dep, f } => {
+                let list = collections
+                    .get(source)
+                    .expect("ListMapWithKeyReactive source not found")
+                    .as_keyed();
+                let dep = collections
+                    .get(dep)
+                    .expect("ListMapWithKeyReactive dep not found")
+                    .as_scalar();
+                let f = Arc::clone(f);
+                AnyCollection::Keyed(operators::list_map_with_key_reactive(
+                    list,
+                    dep,
+                    move |key, item, dep| f(key, item, dep),
+                ))
+            }
+
             CollectionSpec::ListAppend { list, new_items } => {
                 let list_coll = collections
                     .get(list)
@@ -400,6 +595,23 @@ where
                 AnyCollection::Keyed(operators::map_to_keyed(source_coll, move |v| classify(v)))
             }
 
+            CollectionSpec::KeyedEventMap { items, events, f } => {
+                let items_coll = collections
+                    .get(items)
+                    .expect("KeyedEventMap items not found")
+                    .as_keyed();
+                let events_coll = collections
+                    .get(events)
+                    .expect("KeyedEventMap events not found")
+                    .as_keyed();
+                let f = Arc::clone(f);
+                AnyCollection::Scalar(operators::keyed_event_map(
+                    items_coll,
+                    events_coll,
+                    move |item, event| f(item, event),
+                ))
+            }
+
             CollectionSpec::AppendNewKeyed {
                 source,
                 f,
@@ -418,7 +630,61 @@ where
             }
         };
 
-        collections.insert(var_id.clone(), any_collection);
+        #[cfg(test)]
+        if std::env::var_os("BOON_DD_TRACE_CRUD").is_some() {
+            let name = var_id.as_str().to_string();
+            let should_trace = name == "store.person_to_add"
+                || name == "store.people"
+                || name.contains("append_keyed")
+                || name.contains("membership")
+                || name.contains("keyed_hold")
+                || name.contains("assemble_raw");
+            if should_trace {
+                match &any_collection {
+                    AnyCollection::Scalar(coll) => {
+                        let traced_name = name.clone();
+                        coll.inspect(move |(value, time, diff)| {
+                            eprintln!(
+                                "[dd-trace] scalar {traced_name} @{} diff={} value={}",
+                                time,
+                                diff,
+                                value
+                            );
+                        });
+                    }
+                    AnyCollection::Keyed(coll) => {
+                        let traced_name = name.clone();
+                        coll.inspect(move |((key, value), time, diff)| {
+                            eprintln!(
+                                "[dd-trace] keyed {traced_name} @{} diff={} key={} value={}",
+                                time,
+                                diff,
+                                key.0,
+                                value
+                            );
+                        });
+                    }
+                }
+            }
+        }
+
+            collections.insert(var_id.clone(), any_collection);
+            progressed = true;
+        }
+
+        if !progressed {
+            let unresolved = next_pending
+                .iter()
+                .map(|(var_id, spec)| {
+                    let missing = missing_collection_deps(spec, &collections).join(", ");
+                    format!("{} <= {:?} missing [{}]", var_id.as_str(), std::mem::discriminant(*spec), missing)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            panic!("DD materialize stuck on unresolved collections: {unresolved}");
+        }
+
+        pending = next_pending;
     }
 
     // Wire inspect callback on the document output (always a scalar collection)

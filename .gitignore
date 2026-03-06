@@ -4,6 +4,8 @@
 
 # Chromium profile for browser automation testing (persists developer mode)
 tools/.chrome-profile/
+preview.png
+screenshot.png
 
 # DigitalJS development environment (cloned external repos)
 playground/frontend/src/examples/hw_examples/super_counter/digitaljs_boon/

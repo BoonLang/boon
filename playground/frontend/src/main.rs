@@ -127,6 +127,26 @@ fn set_example_in_url(example_name: &str) {
     }
 }
 
+fn engine_query_value(engine: EngineType) -> &'static str {
+    match engine {
+        EngineType::Actors => "actors",
+        EngineType::DifferentialDataflow => "dd",
+        EngineType::Wasm => "wasm",
+    }
+}
+
+fn hard_reload_example(example_name: &str, engine: EngineType) {
+    if let Some(window) = web_sys::window() {
+        let encoded_name = js_sys::encode_uri_component(example_name);
+        let url = format!(
+            "?engine={}&example={}",
+            engine_query_value(engine),
+            encoded_name
+        );
+        let _ = window.location().set_href(&url);
+    }
+}
+
 /// Get custom example name from URL query parameter (?custom-example=name)
 fn get_custom_example_from_url() -> Option<String> {
     let window = web_sys::window()?;
@@ -415,13 +435,38 @@ impl Playground {
         // Determine initial selected custom example ID (if loading from URL)
         let initial_selected_custom_example = custom_example_from_url.as_ref().map(|(id, _, _)| id.clone());
 
-        // Load files from storage, or initialize with default/URL example
+        // Load URL-selected examples before local storage so shareable example links
+        // are deterministic and do not silently reopen stale editor state.
         let (files, current_file, current_content) = if let Some((_, name, code)) = custom_example_from_url {
             // Load custom example from URL
             let filename = format!("{}.bn", name);
             let mut files = BTreeMap::new();
             files.insert(filename.clone(), code.clone());
             (files, filename, code)
+        } else if let Some(multi_example) = get_example_from_url()
+            .as_deref()
+            .and_then(find_multi_file_example_by_name)
+        {
+            // Multi-file example from URL parameter
+            let mut files = BTreeMap::new();
+            for (filename, content) in multi_example.files {
+                files.insert(filename.to_string(), content.to_string());
+            }
+            let entry_content = multi_example.files.iter()
+                .find(|(name, _)| *name == multi_example.entry_file)
+                .map(|(_, content)| content.to_string())
+                .unwrap_or_default();
+            (files, multi_example.entry_file.to_string(), entry_content)
+        } else if let Some(example_data) = get_example_from_url()
+            .and_then(|name| find_example_by_name(&name))
+        {
+            // Built-in single-file example from URL parameter
+            let mut files = BTreeMap::new();
+            files.insert(
+                example_data.filename.to_string(),
+                example_data.source_code.to_string(),
+            );
+            (files, example_data.filename.to_string(), example_data.source_code.to_string())
         } else if let Some(Ok(stored_files)) =
             local_storage().get::<BTreeMap<String, String>>(PROJECT_FILES_STORAGE_KEY)
         {
@@ -437,25 +482,9 @@ impl Playground {
                 });
             let content = stored_files.get(&current).cloned().unwrap_or_default();
             (stored_files, current, content)
-        } else if let Some(multi_example) = get_example_from_url()
-            .as_deref()
-            .and_then(find_multi_file_example_by_name)
-        {
-            // Multi-file example from URL parameter
-            let mut files = BTreeMap::new();
-            for (filename, content) in multi_example.files {
-                files.insert(filename.to_string(), content.to_string());
-            }
-            let entry_content = multi_example.files.iter()
-                .find(|(name, _)| *name == multi_example.entry_file)
-                .map(|(_, content)| content.to_string())
-                .unwrap_or_default();
-            (files, multi_example.entry_file.to_string(), entry_content)
         } else {
-            // Check URL for built-in single-file example parameter, or use default
-            let example_data = get_example_from_url()
-                .and_then(|name| find_example_by_name(&name))
-                .unwrap_or(EXAMPLE_DATAS[0]);
+            // Fall back to the default built-in example.
+            let example_data = EXAMPLE_DATAS[0];
 
             let mut files = BTreeMap::new();
             files.insert(
@@ -482,10 +511,16 @@ impl Playground {
         // Auto-save files to storage
         let _store_files_task = Rc::new(Task::start_droppable(
             files.signal_cloned().for_each_sync(|files| {
+                eprintln!(
+                    "[files-store] start count={} total_bytes={}",
+                    files.len(),
+                    files.values().map(|s| s.len()).sum::<usize>()
+                );
                 if let Err(error) = local_storage().insert(PROJECT_FILES_STORAGE_KEY, files.as_ref())
                 {
                     eprintln!("Failed to store project files: {error:#?}");
                 }
+                eprintln!("[files-store] done");
             }),
         ));
 
@@ -966,6 +1001,14 @@ impl Playground {
                             let is_same = *current_file_for_select.lock_ref() == example_data.filename;
                             pre_switch(is_same);
 
+                            if example_data.filename == "cells.bn" {
+                                hard_reload_example(
+                                    example_data.filename.trim_end_matches(".bn"),
+                                    engine_type_for_select.get(),
+                                );
+                                return true;
+                            }
+
                             set_example_in_url(example_data.filename.trim_end_matches(".bn"));
 
                             let mut new_files = BTreeMap::new();
@@ -973,12 +1016,26 @@ impl Playground {
                                 example_data.filename.to_string(),
                                 example_data.source_code.to_string(),
                             );
-                            files_for_select.set(Rc::new(new_files));
-                            current_file_for_select.set(example_data.filename.to_string());
-                            source_code_for_select.set_neq(Rc::new(Cow::from(example_data.source_code)));
-                            run_command_for_select.set(Some(RunCommand {
-                                filename: Some(example_data.filename),
-                            }));
+                            let files_for_select_inner = files_for_select.clone();
+                            let current_file_for_select_inner = current_file_for_select.clone();
+                            let source_code_for_select_inner = source_code_for_select.clone();
+                            let run_command_for_select_inner = run_command_for_select.clone();
+                            let filename = example_data.filename;
+                            let source = example_data.source_code;
+                            Task::start(async move {
+                                Timer::sleep(1).await;
+                                eprintln!("[selectExample] setting files for {}", filename);
+                                files_for_select_inner.set(Rc::new(new_files));
+                                eprintln!("[selectExample] setting current_file for {}", filename);
+                                current_file_for_select_inner.set(filename.to_string());
+                                eprintln!("[selectExample] setting source_code for {}", filename);
+                                source_code_for_select_inner
+                                    .set_neq(Rc::new(Cow::from(source)));
+                                eprintln!("[selectExample] setting run_command for {}", filename);
+                                run_command_for_select_inner.set(Some(RunCommand {
+                                    filename: Some(filename),
+                                }));
+                            });
                             return true;
                         }
 
@@ -996,16 +1053,26 @@ impl Playground {
                             for (filename, content) in example.files {
                                 new_files.insert(filename.to_string(), content.to_string());
                             }
-                            files_for_select.set(Rc::new(new_files));
-                            current_file_for_select.set(example.entry_file.to_string());
                             let entry_content = example.files.iter()
                                 .find(|(name, _)| *name == example.entry_file)
                                 .map(|(_, content)| *content)
                                 .unwrap_or("");
-                            source_code_for_select.set_neq(Rc::new(Cow::from(entry_content)));
-                            run_command_for_select.set(Some(RunCommand {
-                                filename: Some(example.entry_file),
-                            }));
+                            let files_for_select_inner = files_for_select.clone();
+                            let current_file_for_select_inner = current_file_for_select.clone();
+                            let source_code_for_select_inner = source_code_for_select.clone();
+                            let run_command_for_select_inner = run_command_for_select.clone();
+                            let entry_file = example.entry_file;
+                            let entry_content = entry_content;
+                            Task::start(async move {
+                                Timer::sleep(1).await;
+                                files_for_select_inner.set(Rc::new(new_files));
+                                current_file_for_select_inner.set(entry_file.to_string());
+                                source_code_for_select_inner
+                                    .set_neq(Rc::new(Cow::from(entry_content)));
+                                run_command_for_select_inner.set(Some(RunCommand {
+                                    filename: Some(entry_file),
+                                }));
+                            });
                             return true;
                         }
 
@@ -2446,7 +2513,11 @@ impl Playground {
         if engine_type == EngineType::Wasm {
             let external_fns = parse_module_files(&files, filename);
             let ext = if external_fns.is_empty() { None } else { Some(external_fns.as_slice()) };
-            let element = boon::platform::browser::engine_wasm::run_wasm(&source_code, ext);
+            let element = boon::platform::browser::engine_wasm::run_wasm(
+                &source_code,
+                ext,
+                persistence_enabled,
+            );
             drop(source_code);
             drop(files);
             return element;
@@ -2644,6 +2715,14 @@ impl Playground {
                     }
 
                     // Update URL to share this example
+                    if example_data.filename == "cells.bn" {
+                        hard_reload_example(
+                            example_data.filename.trim_end_matches(".bn"),
+                            engine_type.get(),
+                        );
+                        return;
+                    }
+
                     set_example_in_url(example_data.filename.trim_end_matches(".bn"));
 
                     // Replace project files with just this example

@@ -448,7 +448,7 @@ expect = "1 item left"
 
 [[sequence]]
 description = "Click delete button to remove 'Buy milk'"
-actions = [["click_text", "×"]]
+actions = [["click_button_near_text", "Buy milk"]]
 # When list is empty, the footer with item count is hidden (standard TodoMVC behavior)
 expect = "Double-click to edit"
 

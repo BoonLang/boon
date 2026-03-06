@@ -301,6 +301,81 @@ async function cdpTypeTextCharByChar(tabId, text) {
   await attachDebugger(tabId);
 
   for (const char of text) {
+    // Prefer direct DOM input for focused editable elements in the preview.
+    // CDP key events alone do not reliably trigger `input` handlers for the
+    // Zoon-managed text inputs used by the playground.
+    const insertedViaDom = await chrome.debugger.sendCommand(
+      { tabId },
+      'Runtime.evaluate',
+      {
+        expression: `(function() {
+          const preview = document.querySelector('[data-boon-panel="preview"]');
+          let focused = document.activeElement;
+          if ((!focused || focused === document.body) && preview) {
+            focused =
+              preview.querySelector(':focus') ||
+              preview.querySelector('[data-boon-focused="true"]') ||
+              preview.querySelector('[focused="true"]') ||
+              preview.querySelector('[autofocus]');
+          }
+          if (!focused) return false;
+
+          const text = ${JSON.stringify(char)};
+          const isTextControl =
+            focused instanceof HTMLInputElement ||
+            focused instanceof HTMLTextAreaElement;
+
+          if (isTextControl) {
+            if (document.activeElement !== focused && typeof focused.focus === 'function') {
+              focused.focus();
+            }
+            const start = focused.selectionStart ?? focused.value.length;
+            const end = focused.selectionEnd ?? start;
+            focused.value =
+              focused.value.slice(0, start) +
+              text +
+              focused.value.slice(end);
+            const caret = start + text.length;
+            if (focused.setSelectionRange) {
+              focused.setSelectionRange(caret, caret);
+            }
+            focused.dispatchEvent(
+              new InputEvent('input', {
+                bubbles: true,
+                composed: true,
+                data: text,
+                inputType: 'insertText'
+              })
+            );
+            return true;
+          }
+
+          if (focused.isContentEditable) {
+            if (document.activeElement !== focused && typeof focused.focus === 'function') {
+              focused.focus();
+            }
+            focused.textContent = (focused.textContent || '') + text;
+            focused.dispatchEvent(
+              new InputEvent('input', {
+                bubbles: true,
+                composed: true,
+                data: text,
+                inputType: 'insertText'
+              })
+            );
+            return true;
+          }
+
+          return false;
+        })()`,
+        returnByValue: true
+      }
+    ).then(({ result }) => Boolean(result?.value)).catch(() => false);
+
+    if (insertedViaDom) {
+      continue;
+    }
+
     // Get the correct key code for the character
     let keyCode;
     let codeStr;
@@ -1713,7 +1788,9 @@ async function handleCommand(id, command) {
                 console.log('[getFocusedElement] input attrs:', Array.from(inputs[0].attributes).map(a => a.name + '=' + a.value).join(', '));
               }
 
-              // If activeElement is body, try fallback detection methods
+              // If activeElement is body, try fallback detection methods.
+              // Do not treat [autofocus] as currently focused; it only marks
+              // mount-time intent and caused false positives after rerenders.
               if (!focused || focused === document.body) {
                 if (preview) {
                   // Try :focus pseudo-class
@@ -1725,10 +1802,6 @@ async function handleCommand(id, command) {
                   // Try elements with focused="true" attribute (dominator may set this)
                   if (!focused) {
                     focused = preview.querySelector('[focused="true"]');
-                  }
-                  // Try autofocus attribute as last resort
-                  if (!focused) {
-                    focused = preview.querySelector('[autofocus]');
                   }
                 }
               }

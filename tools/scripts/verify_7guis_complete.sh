@@ -32,13 +32,9 @@ fail() { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 skip() { SKIP=$((SKIP+1)); echo "  [SKIP] $1"; }
 
 EXAMPLES="temperature_converter flight_booker timer crud circle_drawer cells"
-# Engine support:
-#   Actors: all 6 examples pass
-#   DD: only temperature_converter passes (others need Timer/interval, List/remove_last reactive,
-#       Element event wiring, or are too complex for the static evaluator)
-#   Wasm: none pass (events don't flow, Element/select|slider|svg are placeholders)
-# The .expected files encode skip_engines per example — the test runner handles skipping automatically.
-ENGINES="Actors DD"
+# Milestone target is all three engines. Actual per-example support is still
+# encoded in each `.expected` file via `skip_engines`.
+ENGINES="Actors DD Wasm"
 
 # ── Section 1: Build boon-tools ──
 echo "=== 7GUIs Verification ==="
@@ -134,14 +130,122 @@ else
     fail "CRUD filter missing Text/starts_with"
 fi
 
-# Cells row count (30, not 100)
+# Milestone support examples
+COUNTER_EXPECTED="$EXAMPLES_DIR/counter/counter.expected"
+if [ -f "$COUNTER_EXPECTED" ]; then
+    ok "Counter expected file exists"
+else
+    fail "Counter expected file missing"
+fi
+
+TODO_EXPECTED="$EXAMPLES_DIR/todo_mvc/todo_mvc.expected"
+if [ -f "$TODO_EXPECTED" ]; then
+    ok "TodoMVC expected file exists"
+else
+    fail "TodoMVC expected file missing"
+fi
+
+TODO_PHYSICAL_RUN="$EXAMPLES_DIR/todo_mvc_physical/RUN.bn"
+if grep -q "Scene/new(" "$TODO_PHYSICAL_RUN"; then
+    ok "TodoMVC Physical uses Scene/new"
+else
+    fail "TodoMVC Physical missing Scene/new"
+fi
+
+if grep -q "Scene/Element/" "$TODO_PHYSICAL_RUN"; then
+    ok "TodoMVC Physical uses Scene elements"
+else
+    fail "TodoMVC Physical missing Scene elements"
+fi
+
+if grep -q "lights:" "$TODO_PHYSICAL_RUN"; then
+    ok "TodoMVC Physical passes lights to Scene/new"
+else
+    fail "TodoMVC Physical missing Scene lights"
+fi
+
+if grep -q "geometry:" "$TODO_PHYSICAL_RUN"; then
+    ok "TodoMVC Physical passes geometry to Scene/new"
+else
+    fail "TodoMVC Physical missing Scene geometry"
+fi
+
+TODO_PHYSICAL_THEME_DIR="$EXAMPLES_DIR/todo_mvc_physical/Theme"
+for theme_file in \
+    "$TODO_PHYSICAL_THEME_DIR/Professional.bn" \
+    "$TODO_PHYSICAL_THEME_DIR/Glassmorphism.bn" \
+    "$TODO_PHYSICAL_THEME_DIR/Neobrutalism.bn" \
+    "$TODO_PHYSICAL_THEME_DIR/Neumorphism.bn"
+do
+    theme_name="$(basename "$theme_file" .bn)"
+
+    if grep -q "Light/directional(" "$theme_file"; then
+        ok "TodoMVC Physical $theme_name defines directional light"
+    else
+        fail "TodoMVC Physical $theme_name missing directional light"
+    fi
+
+    if grep -q "Light/ambient(" "$theme_file"; then
+        ok "TodoMVC Physical $theme_name defines ambient light"
+    else
+        fail "TodoMVC Physical $theme_name missing ambient light"
+    fi
+
+    if grep -q "Light/spot(" "$theme_file"; then
+        ok "TodoMVC Physical $theme_name defines spot light"
+    else
+        fail "TodoMVC Physical $theme_name missing spot light"
+    fi
+
+    if grep -q "bevel_angle:" "$theme_file"; then
+        ok "TodoMVC Physical $theme_name defines bevel angle"
+    else
+        fail "TodoMVC Physical $theme_name missing bevel angle"
+    fi
+done
+
+if grep -q '^skip_engines' "$EXAMPLES_DIR/cells/cells.expected"; then
+    fail "Cells expected file still skips one or more engines"
+else
+    ok "Cells expected file no longer skips any engines"
+fi
+
+if grep -Fq 'skip_engines = ["DD", "Wasm"]' "$EXAMPLES_DIR/flight_booker/flight_booker.expected"; then
+    ok "Flight Booker expected skip list matches current DD/Wasm status"
+else
+    fail "Flight Booker expected skip list drifted"
+fi
+
+if grep -Fq 'skip_engines = ["DD", "Wasm"]' "$EXAMPLES_DIR/crud/crud.expected"; then
+    ok "CRUD expected skip list matches current DD/Wasm status"
+else
+    fail "CRUD expected skip list drifted"
+fi
+
+if grep -Fq 'skip_engines = ["Wasm"]' "$EXAMPLES_DIR/timer/timer.expected"; then
+    ok "Timer expected skip list matches current Wasm status"
+else
+    fail "Timer expected skip list drifted"
+fi
+
+# Cells grid size (official 7GUIs target: 26 columns x 100 rows)
 CELLS_BN="$EXAMPLES_DIR/cells/cells.bn"
-if grep -q "List/range(from: 1, to: 30)" "$CELLS_BN"; then
-    ok "Cells uses 30 rows"
 elif grep -q "List/range(from: 1, to: 100)" "$CELLS_BN"; then
-    fail "Cells still uses 100 rows (too slow)"
+    ok "Cells uses 100 rows"
+elif grep -q "List/range(from: 1, to: 30)" "$CELLS_BN"; then
+    fail "Cells still uses 30 rows (official target is 100)"
+elif grep -q "List/range(from: 1, to: 10)" "$CELLS_BN"; then
+    fail "Cells still uses 10 rows (official target is 100)"
 else
     skip "Cells row count unclear"
+fi
+
+if grep -q "List/range(from: 1, to: 26)" "$CELLS_BN"; then
+    ok "Cells uses 26 columns"
+elif grep -q "List/range(from: 1, to: 10)" "$CELLS_BN"; then
+    fail "Cells still uses 10 columns (milestone target is 26)"
+else
+    skip "Cells column count unclear"
 fi
 
 # ── Section 4: Live browser tests ──

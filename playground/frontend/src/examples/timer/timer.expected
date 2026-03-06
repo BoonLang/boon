@@ -3,7 +3,7 @@
 [test]
 category = "timer"
 description = "7GUIs Task 4: timer with adjustable duration and reset"
-skip_engines = ["Wasm"]
+skip_engines = []
 
 [output]
 text = "Timer"

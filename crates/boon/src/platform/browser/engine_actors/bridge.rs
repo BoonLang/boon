@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use boon_scene::{PhysicalSceneParams, RenderRootHandle, RenderSurface, SceneHandles};
+use boon_renderer_zoon::empty_text;
 use zoon::futures_util::stream::LocalBoxStream;
 use zoon::futures_util::{StreamExt, future, select, stream};
 use zoon::*;
@@ -37,48 +39,101 @@ thread_local! {
 }
 use crate::parser;
 
-// --- SceneContext: pre-computed rendering parameters for physical scenes ---
-
-/// CSS rendering parameters derived from a Scene's lights and geometry.
-/// Built once per scene render (theme changes rebuild the scene).
-/// Used by element functions to apply physical styles (depth→box-shadow,
-/// material→background, gloss→gradient, etc.).
-#[derive(Clone)]
-struct SceneContext {
-    /// Horizontal shadow offset per unit of depth (from directional light azimuth)
-    shadow_dx_per_depth: f64,
-    /// Vertical shadow offset per unit of depth (from directional light altitude)
-    shadow_dy_per_depth: f64,
-    /// Shadow blur per unit of depth (from light spread × intensity)
-    shadow_blur_per_depth: f64,
-    /// Directional light intensity (affects shadow opacity)
-    directional_intensity: f64,
-    /// Ambient light factor (affects shadow darkness: higher ambient = lighter shadows)
-    ambient_factor: f64,
-    /// Angle for specular/bevel gradient (from directional light azimuth)
-    bevel_angle: f64,
-}
-
-impl SceneContext {
-    /// Create a default SceneContext with reasonable values for a top-left light.
-    fn default_scene() -> Self {
-        Self {
-            shadow_dx_per_depth: 1.5,
-            shadow_dy_per_depth: 2.0,
-            shadow_blur_per_depth: 3.0,
-            directional_intensity: 0.8,
-            ambient_factor: 0.3,
-            bevel_angle: 135.0,
-        }
-    }
-}
-
 /// Extract SceneContext from a ConstructContext's type-erased scene_ctx field.
-fn get_scene_ctx(construct_context: &ConstructContext) -> Option<&SceneContext> {
+fn get_scene_ctx(construct_context: &ConstructContext) -> Option<&PhysicalSceneParams> {
     construct_context
         .scene_ctx
         .as_ref()?
-        .downcast_ref::<SceneContext>()
+        .downcast_ref::<PhysicalSceneParams>()
+}
+
+async fn read_number_variable(variable: Option<Arc<Variable>>) -> Option<f64> {
+    let variable = variable?;
+    match variable.value_actor().current_value().await.ok()? {
+        Value::Number(number, _) => Some(number.number()),
+        _ => None,
+    }
+}
+
+async fn derive_scene_params(scene: &SceneHandles<Arc<Variable>>) -> PhysicalSceneParams {
+    let mut params = PhysicalSceneParams::default();
+
+    if let Some(geometry_var) = &scene.geometry {
+        if let Ok(Value::Object(geometry_obj, _)) = geometry_var.value_actor().current_value().await {
+            if let Some(bevel_angle) =
+                read_number_variable(geometry_obj.variable("bevel_angle")).await
+            {
+                params.bevel_angle = bevel_angle;
+            }
+        }
+    }
+
+    if let Some(lights_var) = &scene.lights {
+        if let Ok(Value::List(lights, _)) = lights_var.value_actor().current_value().await {
+            for (_, item) in lights.snapshot().await {
+                let Ok(Value::TaggedObject(light, _)) = item.current_value().await else {
+                    continue;
+                };
+                match light.tag() {
+                    "DirectionalLight" => {
+                        if let Some(intensity) =
+                            read_number_variable(light.variable("intensity")).await
+                        {
+                            params.directional_intensity = intensity;
+                        }
+                        if let Some(spread) = read_number_variable(light.variable("spread")).await {
+                            params.shadow_blur_per_depth =
+                                PhysicalSceneParams::DEFAULT.shadow_blur_per_depth
+                                    * spread.clamp(0.25, 4.0);
+                        }
+                        if let (Some(azimuth), Some(altitude)) = (
+                            read_number_variable(light.variable("azimuth")).await,
+                            read_number_variable(light.variable("altitude")).await,
+                        ) {
+                            let azimuth_radians = azimuth.to_radians();
+                            let altitude_radians = altitude.clamp(5.0, 85.0).to_radians();
+                            // Interpret azimuth like a compass heading and project the shadow
+                            // opposite the light direction. Keep the default scale around 45deg.
+                            let altitude_factor = (1.0 / altitude_radians.tan()).clamp(0.35, 2.0);
+                            params.shadow_dx_per_depth =
+                                -azimuth_radians.sin()
+                                    * PhysicalSceneParams::DEFAULT.shadow_dx_per_depth
+                                    * altitude_factor;
+                            params.shadow_dy_per_depth =
+                                azimuth_radians.cos()
+                                    * PhysicalSceneParams::DEFAULT.shadow_dy_per_depth
+                                    * altitude_factor;
+                        }
+                    }
+                    "AmbientLight" => {
+                        if let Some(intensity) =
+                            read_number_variable(light.variable("intensity")).await
+                        {
+                            params.ambient_factor = intensity.clamp(0.0, 1.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    params
+}
+
+fn resolve_scene_root(scene_object: &Arc<Object>) -> RenderRootHandle<Arc<Variable>> {
+    RenderRootHandle::scene(
+        scene_object.expect_variable("root_element").clone(),
+        scene_object.variable("lights"),
+        scene_object.variable("geometry"),
+    )
+}
+
+fn resolve_document_root(document_object: &Arc<Object>) -> RenderRootHandle<Arc<Variable>> {
+    RenderRootHandle::new(
+        RenderSurface::Document,
+        document_object.expect_variable("root_element").clone(),
+    )
 }
 
 /// Generate physical CSS properties from a style Value in a scene context.
@@ -95,7 +150,10 @@ fn get_scene_ctx(construct_context: &ConstructContext) -> Option<&SceneContext> 
 /// - `rounded_corners` → border-radius
 /// - `spring_range` → CSS transition
 #[allow(dead_code)]
-async fn physical_css_from_style_value(style_value: &Value, scene_ctx: &SceneContext) -> String {
+async fn physical_css_from_style_value(
+    style_value: &Value,
+    scene_ctx: &PhysicalSceneParams,
+) -> String {
     let obj = match style_value {
         Value::Object(obj, _) => obj,
         _ => return String::new(),
@@ -145,8 +203,7 @@ async fn physical_css_from_style_value(style_value: &Value, scene_ctx: &SceneCon
         let dx = effective_depth * scene_ctx.shadow_dx_per_depth;
         let dy = effective_depth * scene_ctx.shadow_dy_per_depth;
         let blur = effective_depth * scene_ctx.shadow_blur_per_depth;
-        let opacity = (scene_ctx.directional_intensity * (1.0 - scene_ctx.ambient_factor) * 0.3)
-            .min(0.5);
+        let opacity = scene_ctx.shadow_opacity();
 
         if is_inset {
             shadows.push(format!(
@@ -551,10 +608,7 @@ fn apply_physical_css<E: RawEl>(
                     let dx = effective_depth * sc_shadow.shadow_dx_per_depth;
                     let dy = effective_depth * sc_shadow.shadow_dy_per_depth;
                     let blur = effective_depth * sc_shadow.shadow_blur_per_depth;
-                    let opacity = (sc_shadow.directional_intensity
-                        * (1.0 - sc_shadow.ambient_factor)
-                        * 0.3)
-                        .min(0.5);
+                    let opacity = sc_shadow.shadow_opacity();
 
                     if is_inset {
                         shadows.push(format!(
@@ -797,35 +851,37 @@ pub fn object_with_document_to_element_signal(
     root_object: Arc<Object>,
     construct_context: ConstructContext,
 ) -> impl Signal<Item = Option<RawElOrText>> {
-    // Try "scene" key first, fall back to "document"
-    let (root_variable, is_scene) = if let Some(scene_var) = root_object.variable("scene") {
-        (scene_var.clone(), true)
-    } else {
-        (root_object.expect_variable("document").clone(), false)
-    };
-    let root_actor = root_variable.value_actor();
+    let render_root = select_root_variable(&root_object);
+    let root_actor = render_root.root.clone().value_actor();
 
     // CRITICAL: Use switch_map (not flat_map) because the inner stream is infinite.
     // When example is switched, the document changes and we MUST switch to the new
     // root_element stream. flat_map would stay subscribed to the old one forever.
     let element_stream = switch_map(root_actor.clone().stream(), move |value| {
-        let inner_object = value.expect_object();
-
-        // Build SceneContext when rendering a physical scene.
-        // For now use defaults; when the example can fully run, we'll extract
-        // light parameters from the scene object's "lights" and "geometry" variables.
-        let scene_ctx: Option<Rc<dyn std::any::Any>> = if is_scene {
-            Some(Rc::new(SceneContext::default_scene()))
+        let resolved_root = if render_root.is_scene() {
+            resolve_scene_root(&value.expect_object())
         } else {
-            None
+            resolve_document_root(&value.expect_object())
         };
-
-        let root_element_var = inner_object.expect_variable("root_element").clone();
-        root_element_var
-            .value_actor()
-            .clone()
-            .stream()
-            .map(move |v| (v, scene_ctx.clone()))
+        let root_element_var = resolved_root.root.clone();
+        stream::once({
+            let scene = resolved_root.scene.clone();
+            async move {
+                let scene_ctx: Option<Rc<dyn std::any::Any>> = if let Some(scene) = scene {
+                    Some(Rc::new(derive_scene_params(&scene).await))
+                } else {
+                    None
+                };
+                (root_element_var, scene_ctx)
+            }
+        })
+        .flat_map(|(root_element_var, scene_ctx)| {
+            root_element_var
+                .value_actor()
+                .clone()
+                .stream()
+                .map(move |v| (v, scene_ctx.clone()))
+        })
     })
     .map(move |(value, scene_ctx)| {
         let mut ctx = construct_context.clone();
@@ -835,6 +891,17 @@ pub fn object_with_document_to_element_signal(
     .boxed_local();
 
     signal::from_stream(element_stream)
+}
+
+fn select_root_variable(root_object: &Arc<Object>) -> RenderRootHandle<Arc<Variable>> {
+    if let Some(scene_var) = root_object.variable("scene") {
+        RenderRootHandle::new(RenderSurface::Scene, scene_var.clone())
+    } else {
+        RenderRootHandle::new(
+            RenderSurface::Document,
+            root_object.expect_variable("document").clone(),
+        )
+    }
 }
 
 fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElOrText {
@@ -3689,7 +3756,7 @@ fn element_button(
             if let Some(label) = label {
                 label
             } else {
-                zoon::Text::new("").unify()
+                empty_text()
             }
         }))
         // @TODO Handle press event only when it's defined in Boon code? Add `.on_press_signal` to Zoon?
@@ -5848,7 +5915,7 @@ fn element_label(
         .s(Padding::all_signal(padding_all_signal))
         .label_signal(
             signal::from_stream(label_stream)
-                .map(|l| l.unwrap_or_else(|| zoon::Text::new("").unify())),
+                .map(|l| l.unwrap_or_else(empty_text)),
         )
         .on_double_click({
             let sender = double_click_sender.clone();
@@ -6029,7 +6096,7 @@ fn element_link(
     Link::new()
         .label_signal(
             signal::from_stream(label_stream)
-                .map(|l| l.unwrap_or_else(|| zoon::Text::new("").unify())),
+                .map(|l| l.unwrap_or_else(empty_text)),
         )
         .to_signal(signal::from_stream(to_stream).map(|t| t.unwrap_or_default()))
         .new_tab(NewTab::new())

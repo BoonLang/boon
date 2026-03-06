@@ -7,29 +7,36 @@
 //! Uses the existing Boon parser. The compiler walks the static AST
 //! and evaluates/compiles expressions.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use boon_scene::RenderSurface;
 use indexmap::IndexMap;
 
 use crate::parser::{
     SourceCode, lexer, parser, reset_expression_depth, resolve_references, span_at,
     static_expression::{
-        self, Alias, Argument, ArithmeticOperator, Expression, Literal, Spanned, TextPart,
+        self, Alias, Argument, ArithmeticOperator, Comparator, Expression, Literal, Spanned,
+        TextPart,
     },
 };
 
 use super::types::{
     BroadcastHandlerFn, CollectionSpec, DEP_FIELD_PREFIX, DataflowGraph, HOVER_PATH_FIELD,
-    HOVERED_FIELD, InputId, InputKind, InputSpec, KEYED_LIST_NAME_FIELD, KeyedListOutput,
-    LINK_PATH_FIELD, LIST_TAG, ListKey, PASSED_VAR, ROUTER_INPUT, SideEffectKind, VarId,
+    HOVERED_FIELD, HoldTransformFn, InputId, InputKind, InputSpec, KEYED_LIST_NAME_FIELD,
+    KeyedListOutput, LINK_PATH_FIELD, LIST_TAG, ListKey, PASSED_VAR, ROUTER_INPUT,
+    SideEffectKind, VarId,
 };
 use super::value::Value;
 
 /// Result of compiling a Boon program.
 pub enum CompiledProgram {
     /// Purely static program — no reactive computation.
-    Static { document_value: Value },
+    Static {
+        document_value: Value,
+        render_surface: RenderSurface,
+    },
 
     /// Reactive program compiled to a DD dataflow graph.
     /// All reactive computation flows through DD collections and operators.
@@ -66,30 +73,52 @@ pub fn compile(
     persisted_holds: &std::collections::HashMap<String, Value>,
     external_functions: Option<&[ExternalFunction]>,
 ) -> Result<CompiledProgram, String> {
+    let is_cells = source_code.contains("-- 7GUIs Task 7: Cells (Spreadsheet)");
+    if is_cells {
+        std::println!("[cells-dd] compile: start");
+    }
     let ast = parse_source(source_code)?;
+    if is_cells {
+        std::println!("[cells-dd] compile: parsed source");
+    }
 
     // Build top-level scope
     let mut compiler = Compiler::new();
     compiler.register_top_level(&ast);
+    if is_cells {
+        std::println!("[cells-dd] compile: registered top level");
+    }
 
     // Register external functions from other module files
     if let Some(ext_fns) = external_functions {
         compiler.register_external_functions(ext_fns);
+        if is_cells {
+            std::println!("[cells-dd] compile: registered external functions");
+        }
     }
 
     // Find the output variable: try "scene" first, then "document".
     // When "scene" is used, the value is a Scene/new(...) call — the DD renderer
     // will extract the root element from it (physical CSS properties are ignored for now).
-    let doc_expr = compiler
-        .get_var_expr("scene")
-        .or_else(|| compiler.get_var_expr("document"))
-        .ok_or_else(|| "No 'scene' or 'document' variable found".to_string())?
-        .clone();
+    let (render_surface, doc_expr) = if let Some(expr) = compiler.get_var_expr("scene") {
+        (RenderSurface::Scene, expr.clone())
+    } else if let Some(expr) = compiler.get_var_expr("document") {
+        (RenderSurface::Document, expr.clone())
+    } else {
+        return Err("No 'scene' or 'document' variable found".to_string());
+    };
 
     // Check if program is reactive
-    if compiler.has_reactive_constructs() {
+    let has_reactive = compiler.has_reactive_constructs();
+    if is_cells {
+        std::println!("[cells-dd] compile: has_reactive_constructs = {has_reactive}");
+    }
+    if has_reactive {
         // Compile to DataflowGraph
-        match compiler.compile_to_graph(&doc_expr, storage_key, persisted_holds) {
+        if is_cells {
+            std::println!("[cells-dd] compile: before compile_to_graph");
+        }
+        match compiler.compile_to_graph(&doc_expr, render_surface, storage_key, persisted_holds) {
             Ok(graph) => Ok(CompiledProgram::Dataflow { graph }),
             Err(e) => Err(format!("Reactive compilation failed: {}", e)),
         }
@@ -98,6 +127,7 @@ pub fn compile(
         match compiler.eval_static(&doc_expr) {
             Ok(value) => Ok(CompiledProgram::Static {
                 document_value: value,
+                render_surface,
             }),
             Err(e) => Err(format!("Static evaluation failed: {}", e)),
         }
@@ -111,11 +141,18 @@ pub fn compile(
 fn parse_source(source_code: &str) -> Result<Vec<Spanned<Expression>>, String> {
     use chumsky::prelude::*;
 
+    let is_cells = source_code.contains("-- 7GUIs Task 7: Cells (Spreadsheet)");
+    if is_cells {
+        std::println!("[cells-dd] parse_source: start");
+    }
     let source_code_arc = SourceCode::new(source_code.to_string());
     let source_for_parsing = source_code_arc.clone();
     let source_ref = source_for_parsing.as_str();
 
     let (tokens, lex_errors) = lexer().parse(source_ref).into_output_errors();
+    if is_cells {
+        std::println!("[cells-dd] parse_source: lexed");
+    }
     if !lex_errors.is_empty() {
         return Err(format!("Lex errors: {:?}", lex_errors));
     }
@@ -144,11 +181,20 @@ fn parse_source(source_code: &str) -> Result<Vec<Spanned<Expression>>, String> {
     let Some(ast) = ast else {
         return Err("Parser produced no output".to_string());
     };
+    if is_cells {
+        std::println!("[cells-dd] parse_source: parsed");
+    }
 
     let ast = resolve_references(ast).map_err(|e| format!("Reference errors: {:?}", e))?;
+    if is_cells {
+        std::println!("[cells-dd] parse_source: resolved references");
+    }
 
     // Convert to static expressions
     let static_ast = static_expression::convert_expressions(source_code_arc, ast);
+    if is_cells {
+        std::println!("[cells-dd] parse_source: converted to static");
+    }
     Ok(static_ast)
 }
 
@@ -159,31 +205,34 @@ fn parse_source(source_code: &str) -> Result<Vec<Spanned<Expression>>, String> {
 #[derive(Clone)]
 struct Compiler {
     /// Top-level variable definitions: name → expression
-    variables: Vec<(String, Spanned<Expression>)>,
+    variables: Arc<Vec<(String, Spanned<Expression>)>>,
     /// Function definitions: name → (params, body)
-    functions: Vec<(String, Vec<String>, Spanned<Expression>)>,
+    functions: Arc<Vec<(String, Vec<String>, Spanned<Expression>)>>,
     /// Module name for each qualified function (e.g., "Theme/get" → "Theme").
     /// Used for intra-module resolution: when inside Theme/get, an unqualified
     /// call to material() resolves to Theme/material.
     function_modules: HashMap<String, String>,
     /// Current module context during function body evaluation.
     current_module: Option<String>,
+    /// Cache for user-defined function external-input classification.
+    external_input_function_cache: RefCell<HashMap<String, bool>>,
 }
 
 impl Compiler {
     fn new() -> Self {
         Self {
-            variables: Vec::new(),
-            functions: Vec::new(),
+            variables: Arc::new(Vec::new()),
+            functions: Arc::new(Vec::new()),
             function_modules: HashMap::new(),
             current_module: None,
+            external_input_function_cache: RefCell::new(HashMap::new()),
         }
     }
 
     /// Register external functions from parsed module files.
     fn register_external_functions(&mut self, ext_fns: &[ExternalFunction]) {
         for (qualified_name, params, body, module_name) in ext_fns {
-            self.functions
+            Arc::make_mut(&mut self.functions)
                 .push((qualified_name.clone(), params.clone(), body.clone()));
             if let Some(module) = module_name {
                 self.function_modules
@@ -198,16 +247,16 @@ impl Compiler {
     fn find_function(
         &self,
         name: &str,
-    ) -> Option<(String, Vec<String>, Spanned<Expression>)> {
+    ) -> Option<&(String, Vec<String>, Spanned<Expression>)> {
         // Try exact match
         if let Some(f) = self.functions.iter().find(|(n, _, _)| n == name) {
-            return Some(f.clone());
+            return Some(f);
         }
         // Intra-module resolution: try current_module/name
         if let Some(module) = &self.current_module {
             let qualified = format!("{}/{}", module, name);
             if let Some(f) = self.functions.iter().find(|(n, _, _)| n == &qualified) {
-                return Some(f.clone());
+                return Some(f);
             }
         }
         None
@@ -533,7 +582,7 @@ impl Compiler {
             match &expr.node {
                 Expression::Variable(var) => {
                     let name = var.name.as_str().to_string();
-                    self.variables.push((name.clone(), var.value.clone()));
+                    Arc::make_mut(&mut self.variables).push((name.clone(), var.value.clone()));
                     // Flatten object fields into dotted-name variables.
                     // This allows sibling references (e.g., text_to_add inside store)
                     // to be resolved during state updates.
@@ -549,7 +598,7 @@ impl Compiler {
                         .iter()
                         .map(|p| p.node.as_str().to_string())
                         .collect();
-                    self.functions
+                    Arc::make_mut(&mut self.functions)
                         .push((fn_name, params, body.as_ref().clone()));
                 }
                 _ => {}
@@ -585,7 +634,7 @@ impl Compiler {
                     continue;
                 }
                 let field_name = format!("{}.{}", prefix, var.node.name.as_str());
-                self.variables
+                Arc::make_mut(&mut self.variables)
                     .push((field_name.clone(), var.node.value.clone()));
                 // Recurse for nested objects
                 self.flatten_object_fields(&field_name, &var.node.value);
@@ -607,17 +656,23 @@ impl Compiler {
         // Only needs DataflowGraph if there are external inputs (LINK, Timer)
         // Programs with HOLD/WHILE but no external inputs (like fibonacci)
         // can be evaluated statically.
+        let mut visiting_functions = HashSet::new();
         self.variables
             .iter()
-            .any(|(_, expr)| Self::has_external_input(expr))
+            .any(|(_, expr)| self.has_external_input(expr, &mut visiting_functions))
     }
 
-    fn has_external_input(expr: &Spanned<Expression>) -> bool {
+    fn has_external_input(
+        &self,
+        expr: &Spanned<Expression>,
+        visiting_functions: &mut HashSet<String>,
+    ) -> bool {
         match &expr.node {
             Expression::Link | Expression::LinkSetter { .. } => true,
-            Expression::Variable(var) => Self::has_external_input(&var.value),
+            Expression::Variable(var) => self.has_external_input(&var.value, visiting_functions),
             Expression::Pipe { from, to } => {
-                Self::has_external_input(from) || Self::has_external_input(to)
+                self.has_external_input(from, visiting_functions)
+                    || self.has_external_input(to, visiting_functions)
             }
             Expression::FunctionCall { path, arguments } => {
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
@@ -627,29 +682,64 @@ impl Compiler {
                 ) {
                     return true;
                 }
-                arguments.iter().any(|a| {
+                if arguments.iter().any(|a| {
                     a.node
                         .value
                         .as_ref()
-                        .map(|v| Self::has_external_input(v))
+                        .map(|v| self.has_external_input(v, visiting_functions))
                         .unwrap_or(false)
-                })
+                }) {
+                    return true;
+                }
+                let fn_name = match path_strs.as_slice() {
+                    [fn_name] => Some((*fn_name).to_string()),
+                    [module, fn_name] => Some(format!("{module}/{fn_name}")),
+                    _ => None,
+                };
+                if let Some(fn_name) = fn_name {
+                    if let Some((resolved_name, _, body)) = self.find_function(&fn_name) {
+                        if let Some(cached) = self
+                            .external_input_function_cache
+                            .borrow()
+                            .get(resolved_name.as_str())
+                            .copied()
+                        {
+                            return cached;
+                        }
+                        if visiting_functions.insert(resolved_name.clone()) {
+                            let has_external =
+                                self.has_external_input(body, visiting_functions);
+                            visiting_functions.remove(resolved_name.as_str());
+                            self.external_input_function_cache
+                                .borrow_mut()
+                                .insert(resolved_name.clone(), has_external);
+                            return has_external;
+                        }
+                    }
+                }
+                false
             }
-            Expression::List { items } => items.iter().any(Self::has_external_input),
+            Expression::List { items } => items
+                .iter()
+                .any(|item| self.has_external_input(item, visiting_functions)),
             Expression::Object(obj) => obj
                 .variables
                 .iter()
-                .any(|v| Self::has_external_input(&v.node.value)),
+                .any(|v| self.has_external_input(&v.node.value, visiting_functions)),
             Expression::Block { variables, output } => {
                 variables
                     .iter()
-                    .any(|v| Self::has_external_input(&v.node.value))
-                    || Self::has_external_input(output)
+                    .any(|v| self.has_external_input(&v.node.value, visiting_functions))
+                    || self.has_external_input(output, visiting_functions)
             }
-            Expression::Hold { body, .. } => Self::has_external_input(body),
-            Expression::Latest { inputs } => inputs.iter().any(Self::has_external_input),
-            Expression::Then { body } => Self::has_external_input(body),
-            Expression::While { arms } => arms.iter().any(|a| Self::has_external_input(&a.body)),
+            Expression::Hold { body, .. } => self.has_external_input(body, visiting_functions),
+            Expression::Latest { inputs } => inputs
+                .iter()
+                .any(|input| self.has_external_input(input, visiting_functions)),
+            Expression::Then { body } => self.has_external_input(body, visiting_functions),
+            Expression::While { arms } => arms
+                .iter()
+                .any(|a| self.has_external_input(&a.body, visiting_functions)),
             Expression::ArithmeticOperator(op) => match op {
                 ArithmeticOperator::Add {
                     operand_a,
@@ -666,23 +756,42 @@ impl Compiler {
                 | ArithmeticOperator::Divide {
                     operand_a,
                     operand_b,
-                } => Self::has_external_input(operand_a) || Self::has_external_input(operand_b),
-                ArithmeticOperator::Negate { operand } => Self::has_external_input(operand),
+                } => {
+                    self.has_external_input(operand_a, visiting_functions)
+                        || self.has_external_input(operand_b, visiting_functions)
+                }
+                ArithmeticOperator::Negate { operand } => {
+                    self.has_external_input(operand, visiting_functions)
+                }
             },
-            Expression::PostfixFieldAccess { expr, .. } => Self::has_external_input(expr),
+            Expression::PostfixFieldAccess { expr, .. } => {
+                self.has_external_input(expr, visiting_functions)
+            }
             _ => false,
         }
     }
 
-    fn is_reactive(expr: &Spanned<Expression>) -> bool {
+    fn is_reactive(&self, expr: &Spanned<Expression>) -> bool {
+        let mut visiting_functions = HashSet::new();
+        self.is_reactive_inner(expr, &mut visiting_functions)
+    }
+
+    fn is_reactive_inner(
+        &self,
+        expr: &Spanned<Expression>,
+        visiting_functions: &mut HashSet<String>,
+    ) -> bool {
         match &expr.node {
             Expression::Link | Expression::LinkSetter { .. } => true,
             Expression::Hold { .. } => true,
             Expression::Latest { .. } => true,
             Expression::Then { .. } => true,
             Expression::While { .. } => true,
-            Expression::Variable(var) => Self::is_reactive(&var.value),
-            Expression::Pipe { from, to } => Self::is_reactive_or_alias(from) || Self::is_reactive(to),
+            Expression::Variable(var) => self.is_reactive_inner(&var.value, visiting_functions),
+            Expression::Pipe { from, to } => {
+                self.is_reactive_or_alias_inner(from, visiting_functions)
+                    || self.is_reactive_inner(to, visiting_functions)
+            }
             Expression::When { .. } => true,
             Expression::FunctionCall { path, arguments } => {
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
@@ -706,22 +815,29 @@ impl Compiler {
                 ) {
                     return true;
                 }
-                arguments.iter().any(|a| {
+                if arguments.iter().any(|a| {
                     a.node
                         .value
                         .as_ref()
-                        .map(|v| Self::is_reactive(v))
+                        .map(|v| self.is_reactive_inner(v, visiting_functions))
                         .unwrap_or(false)
-                })
+                }) {
+                    return true;
+                }
+                false
             }
-            Expression::List { items } => items.iter().any(Self::is_reactive),
+            Expression::List { items } => items
+                .iter()
+                .any(|item| self.is_reactive_inner(item, visiting_functions)),
             Expression::Object(obj) => obj
                 .variables
                 .iter()
-                .any(|v| Self::is_reactive(&v.node.value)),
+                .any(|v| self.is_reactive_inner(&v.node.value, visiting_functions)),
             Expression::Block { variables, output } => {
-                variables.iter().any(|v| Self::is_reactive(&v.node.value))
-                    || Self::is_reactive(output)
+                variables
+                    .iter()
+                    .any(|v| self.is_reactive_inner(&v.node.value, visiting_functions))
+                    || self.is_reactive_inner(output, visiting_functions)
             }
             Expression::ArithmeticOperator(op) => match op {
                 ArithmeticOperator::Add {
@@ -739,8 +855,13 @@ impl Compiler {
                 | ArithmeticOperator::Divide {
                     operand_a,
                     operand_b,
-                } => Self::is_reactive_or_alias(operand_a) || Self::is_reactive_or_alias(operand_b),
-                ArithmeticOperator::Negate { operand } => Self::is_reactive_or_alias(operand),
+                } => {
+                    self.is_reactive_or_alias_inner(operand_a, visiting_functions)
+                        || self.is_reactive_or_alias_inner(operand_b, visiting_functions)
+                }
+                ArithmeticOperator::Negate { operand } => {
+                    self.is_reactive_or_alias_inner(operand, visiting_functions)
+                }
             },
             Expression::Comparator(cmp) => {
                 use static_expression::Comparator;
@@ -770,7 +891,8 @@ impl Compiler {
                         operand_b,
                     } => (operand_a, operand_b),
                 };
-                Self::is_reactive_or_alias(a) || Self::is_reactive_or_alias(b)
+                self.is_reactive_or_alias_inner(a, visiting_functions)
+                    || self.is_reactive_or_alias_inner(b, visiting_functions)
             }
             Expression::TextLiteral { parts, .. } => parts
                 .iter()
@@ -780,7 +902,9 @@ impl Compiler {
                 // But for top-level reactivity check, we look at definitions.
                 false
             }
-            Expression::PostfixFieldAccess { expr, .. } => Self::is_reactive(expr),
+            Expression::PostfixFieldAccess { expr, .. } => {
+                self.is_reactive_inner(expr, visiting_functions)
+            }
             _ => false,
         }
     }
@@ -788,8 +912,13 @@ impl Compiler {
     /// Like `is_reactive`, but also returns true for aliases.
     /// Used for arithmetic/comparison operands where aliases likely reference
     /// sibling reactive vars (e.g., `todos_count - completed_todos_count`).
-    fn is_reactive_or_alias(expr: &Spanned<Expression>) -> bool {
-        matches!(&expr.node, Expression::Alias(_)) || Self::is_reactive(expr)
+    fn is_reactive_or_alias_inner(
+        &self,
+        expr: &Spanned<Expression>,
+        visiting_functions: &mut HashSet<String>,
+    ) -> bool {
+        matches!(&expr.node, Expression::Alias(_))
+            || self.is_reactive_inner(expr, visiting_functions)
     }
 
     // -----------------------------------------------------------------------
@@ -1096,10 +1225,9 @@ impl Compiler {
             Expression::Pipe { from, to } => {
                 // Handle HOLD specially: return initial value for reactive bodies
                 if let Expression::Hold { state_param, body } = &to.node {
-                    let initial_val = self.eval_static_tolerant(from, local_scope);
-                    // Try the fold path; fall back to initial value
-                    self.eval_hold_static(state_param.as_str(), &initial_val, body, local_scope)
-                        .unwrap_or(initial_val)
+                    let _ = state_param;
+                    let _ = body;
+                    self.eval_static_tolerant(from, local_scope)
                 } else {
                     // Try strict eval first
                     if let Ok(val) = self.eval_pipe_static(from, to, local_scope) {
@@ -1283,24 +1411,104 @@ impl Compiler {
                 }
             }
             Expression::FunctionCall { path, arguments } => {
-                // Try strict eval first
+                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                match path_strs.as_slice() {
+                    // User-defined function: use tolerant evaluation directly to avoid
+                    // recursing through reactive aliases before the fallback gets a chance.
+                    [fn_name] => return self.eval_user_function_tolerant(fn_name, arguments, local_scope),
+                    [module, fn_name] => {
+                        let qualified = format!("{}/{}", module, fn_name);
+                        if self.find_function(&qualified).is_some() {
+                            return self.eval_user_function_tolerant(
+                                &qualified,
+                                arguments,
+                                local_scope,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                // Try strict eval first for builtins and known pure calls.
                 if let Ok(val) = self.eval_function_call_static(path, arguments, local_scope) {
                     return val;
                 }
                 // Tolerant fallback based on function type
-                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                 match path_strs.as_slice() {
-                    // Scene/new: extract the root element (ignore lights/geometry for now)
+                    // Scene/new: preserve root, lights, and geometry for later renderer use.
                     ["Scene", "new"] => {
-                        let mut root = Value::Unit;
+                        let mut fields = BTreeMap::new();
                         for arg in arguments {
-                            if arg.node.name.as_str() == "root" {
+                            let name = arg.node.name.as_str();
+                            if matches!(name, "root" | "lights" | "geometry") {
                                 if let Some(ref val_expr) = arg.node.value {
-                                    root = self.eval_static_tolerant(val_expr, local_scope);
+                                    fields.insert(
+                                        Arc::from(name),
+                                        self.eval_static_tolerant(val_expr, local_scope),
+                                    );
                                 }
                             }
                         }
-                        return root;
+                        return Value::Tagged {
+                            tag: Arc::from("SceneNew"),
+                            fields: Arc::new(fields),
+                        };
+                    }
+                    ["Lights", "basic"] | ["Lights", "directional"] | ["Lights", "ambient"] => {
+                        return Value::empty_list();
+                    }
+                    ["Light", "directional"] => {
+                        let mut fields = BTreeMap::new();
+                        for arg in arguments {
+                            let name = arg.node.name.as_str();
+                            if matches!(name, "azimuth" | "altitude" | "spread" | "intensity" | "color") {
+                                if let Some(ref val_expr) = arg.node.value {
+                                    fields.insert(
+                                        Arc::from(name),
+                                        self.eval_static_tolerant(val_expr, local_scope),
+                                    );
+                                }
+                            }
+                        }
+                        return Value::Tagged {
+                            tag: Arc::from("DirectionalLight"),
+                            fields: Arc::new(fields),
+                        };
+                    }
+                    ["Light", "ambient"] => {
+                        let mut fields = BTreeMap::new();
+                        for arg in arguments {
+                            let name = arg.node.name.as_str();
+                            if matches!(name, "intensity" | "color") {
+                                if let Some(ref val_expr) = arg.node.value {
+                                    fields.insert(
+                                        Arc::from(name),
+                                        self.eval_static_tolerant(val_expr, local_scope),
+                                    );
+                                }
+                            }
+                        }
+                        return Value::Tagged {
+                            tag: Arc::from("AmbientLight"),
+                            fields: Arc::new(fields),
+                        };
+                    }
+                    ["Light", "spot"] => {
+                        let mut fields = BTreeMap::new();
+                        for arg in arguments {
+                            let name = arg.node.name.as_str();
+                            if matches!(name, "target" | "color" | "intensity" | "radius" | "softness") {
+                                if let Some(ref val_expr) = arg.node.value {
+                                    fields.insert(
+                                        Arc::from(name),
+                                        self.eval_static_tolerant(val_expr, local_scope),
+                                    );
+                                }
+                            }
+                        }
+                        return Value::Tagged {
+                            tag: Arc::from("SpotLight"),
+                            fields: Arc::new(fields),
+                        };
                     }
                     // Scene/Element/* — aliases for Element/*
                     ["Scene", "Element", kind] | ["Element", kind] => {
@@ -1400,18 +1608,39 @@ impl Compiler {
                             fields: Arc::new(fields),
                         }
                     }
-                    // User-defined function: try tolerant body evaluation
-                    [fn_name] => self.eval_user_function_tolerant(fn_name, arguments, local_scope),
-                    // Module-qualified function: Theme/material(), Professional/get(), etc.
-                    [module, fn_name] => {
-                        let qualified = format!("{}/{}", module, fn_name);
-                        self.eval_user_function_tolerant(&qualified, arguments, local_scope)
-                    }
                     _ => Value::Unit,
                 }
             }
             // Alias: try strict eval with special handling for element self-references
             Expression::Alias(alias) => {
+                if let Alias::WithoutPassed { parts, .. } = alias {
+                    let path = parts
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    if path.contains(".event.") {
+                        if let Ok(val) = self.eval_static_with_scope(expr, local_scope) {
+                            return val;
+                        }
+                        return Value::Unit;
+                    }
+                    let has_local_binding = local_scope.contains_key(path.as_str())
+                        || parts
+                            .first()
+                            .map(|part| local_scope.contains_key(part.as_str()))
+                            .unwrap_or(false);
+                    if has_local_binding {
+                        if let Ok(val) = self.eval_static_with_scope(expr, local_scope) {
+                            return val;
+                        }
+                    }
+                    if let Some(var_expr) = self.get_var_expr(&path) {
+                        if self.is_reactive(var_expr) || self.expr_contains_link(var_expr) {
+                            return Value::Unit;
+                        }
+                    }
+                }
                 if let Ok(val) = self.eval_static_with_scope(expr, local_scope) {
                     return val;
                 }
@@ -1479,6 +1708,7 @@ impl Compiler {
             None => return Value::Unit,
         };
 
+
         // Set up module context for intra-module resolution in the function body
         let scoped = self.with_module_context(&qualified_name);
         let mut fn_scope = local_scope.clone();
@@ -1510,6 +1740,17 @@ impl Compiler {
         scoped.eval_static_tolerant(&body, &fn_scope)
     }
 
+    fn populate_scope_bindings_tolerant(
+        &self,
+        scope: &mut IndexMap<String, Value>,
+        bindings: &[(String, Spanned<Expression>)],
+    ) {
+        for (name, expr) in bindings {
+            let value = self.eval_static_tolerant(expr, scope);
+            scope.insert(name.clone(), value);
+        }
+    }
+
     fn eval_literal(lit: &Literal) -> Value {
         match lit {
             Literal::Number(n) => Value::number(*n),
@@ -1526,6 +1767,19 @@ impl Compiler {
         // Check local scope first
         if let Some(v) = local_scope.get(name) {
             return Ok(v.clone());
+        }
+        // Support dotted aliases that walk fields from a locally bound object,
+        // e.g. `person.surname` inside keyed List/map display functions.
+        if let Some((base, rest)) = name.split_once('.') {
+            if let Some(mut value) = local_scope.get(base).cloned() {
+                for field in rest.split('.') {
+                    value = value
+                        .get_field(field)
+                        .cloned()
+                        .ok_or_else(|| format!("Field '{}' not found in '{}'", field, name))?;
+                }
+                return Ok(value);
+            }
         }
         // Check top-level variables
         if let Some(expr) = self.get_var_expr(name) {
@@ -1562,21 +1816,79 @@ impl Compiler {
                 })
             }
 
-            // Scene/new: extract root element (ignore lights/geometry for now)
+            // Scene/new: preserve root, lights, and geometry for later renderer use.
             ["Scene", "new"] => {
+                let mut fields = BTreeMap::new();
                 for arg in arguments {
-                    if arg.node.name.as_str() == "root" {
+                    let name = arg.node.name.as_str();
+                    if matches!(name, "root" | "lights" | "geometry") {
                         if let Some(ref val_expr) = arg.node.value {
-                            return self.eval_static_with_scope(val_expr, local_scope);
+                            let val = self.eval_static_with_scope(val_expr, local_scope)?;
+                            fields.insert(Arc::from(name), val);
                         }
                     }
                 }
-                Err("Scene/new requires a 'root' argument".to_string())
+                if fields.contains_key("root") {
+                    Ok(Value::Tagged {
+                        tag: Arc::from("SceneNew"),
+                        fields: Arc::new(fields),
+                    })
+                } else {
+                    Err("Scene/new requires a 'root' argument".to_string())
+                }
             }
 
-            // Lights functions — stubs (values unused without physical CSS)
-            ["Lights", "basic"] | ["Lights", "directional"] | ["Lights", "ambient"]
-            | ["Light", "directional"] | ["Light", "ambient"] => Ok(Value::Unit),
+            ["Lights", "basic"] | ["Lights", "directional"] | ["Lights", "ambient"] => {
+                Ok(Value::empty_list())
+            }
+            ["Light", "directional"] => {
+                let mut fields = BTreeMap::new();
+                for arg in arguments {
+                    let name = arg.node.name.as_str();
+                    if matches!(name, "azimuth" | "altitude" | "spread" | "intensity" | "color") {
+                        if let Some(ref val_expr) = arg.node.value {
+                            let val = self.eval_static_with_scope(val_expr, local_scope)?;
+                            fields.insert(Arc::from(name), val);
+                        }
+                    }
+                }
+                Ok(Value::Tagged {
+                    tag: Arc::from("DirectionalLight"),
+                    fields: Arc::new(fields),
+                })
+            }
+            ["Light", "ambient"] => {
+                let mut fields = BTreeMap::new();
+                for arg in arguments {
+                    let name = arg.node.name.as_str();
+                    if matches!(name, "intensity" | "color") {
+                        if let Some(ref val_expr) = arg.node.value {
+                            let val = self.eval_static_with_scope(val_expr, local_scope)?;
+                            fields.insert(Arc::from(name), val);
+                        }
+                    }
+                }
+                Ok(Value::Tagged {
+                    tag: Arc::from("AmbientLight"),
+                    fields: Arc::new(fields),
+                })
+            }
+            ["Light", "spot"] => {
+                let mut fields = BTreeMap::new();
+                for arg in arguments {
+                    let name = arg.node.name.as_str();
+                    if matches!(name, "target" | "color" | "intensity" | "radius" | "softness") {
+                        if let Some(ref val_expr) = arg.node.value {
+                            let val = self.eval_static_with_scope(val_expr, local_scope)?;
+                            fields.insert(Arc::from(name), val);
+                        }
+                    }
+                }
+                Ok(Value::Tagged {
+                    tag: Arc::from("SpotLight"),
+                    fields: Arc::new(fields),
+                })
+            }
 
             // Scene/Element/* — aliases for Element/*
             ["Scene", "Element", kind] => {
@@ -1689,7 +2001,7 @@ impl Compiler {
                     .unwrap_or(1.0) as i64;
                 let mut fields = std::collections::BTreeMap::new();
                 for i in from..=to {
-                    let key: Arc<str> = Arc::from(format!("_{}", i - from));
+                    let key: Arc<str> = Arc::from(format!("{:04}", i - from));
                     fields.insert(key, Value::number(i as f64));
                 }
                 Ok(Value::Tagged {
@@ -1942,6 +2254,13 @@ impl Compiler {
                             self.eval_function_call_static(path, arguments, local_scope)
                         }
                     }
+                    ["Scene", "new"] => {
+                        if arguments.is_empty() {
+                            Ok(Value::tagged("SceneNew", [("root", from_val)]))
+                        } else {
+                            self.eval_function_call_static(path, arguments, local_scope)
+                        }
+                    }
                     ["Stream", "skip"] => {
                         let count = arguments
                             .iter()
@@ -2138,19 +2457,49 @@ impl Compiler {
                             let mapped = from_val.list_map(|item_val| {
                                 let mut map_scope = local_scope.clone();
                                 map_scope.insert(item_param.clone(), item_val.clone());
-                                // Use tolerant eval — mapping functions often contain
-                                // reactive elements (WHILE, WHEN, etc.) that need tolerance
-                                self.eval_static_tolerant(&expr, &map_scope)
+                                self.eval_static_with_scope(&expr, &map_scope)
+                                    .unwrap_or_else(|_| self.eval_static_tolerant(&expr, &map_scope))
                             });
                             Ok(mapped)
                         } else {
                             Ok(from_val)
                         }
                     }
-                    ["List", "append"] | ["List", "clear"] | ["List", "remove"] => {
-                        // List mutation operations in static context — pass through
-                        // (handled in general program transform)
-                        Ok(from_val)
+                    ["List", "append"] => {
+                        let item = arguments
+                            .iter()
+                            .find(|a| a.node.name.as_str() == "item" || a.node.name.as_str() == "on")
+                            .and_then(|a| a.node.value.as_ref())
+                            .map(|expr| self.eval_static_with_scope(expr, local_scope))
+                            .transpose()?
+                            .unwrap_or(Value::Unit);
+                        let count = from_val.list_count();
+                        Ok(from_val.list_append(item, count))
+                    }
+                    ["List", "clear"] => Ok(Value::empty_list()),
+                    ["List", "remove"] => {
+                        let item_param = arguments
+                            .first()
+                            .map(|a| a.node.name.as_str().to_string())
+                            .unwrap_or_else(|| "item".to_string());
+                        let if_expr = arguments
+                            .iter()
+                            .find(|a| a.node.name.as_str() == "if")
+                            .and_then(|a| a.node.value.as_ref());
+                        if let Some(pred) = if_expr {
+                            let pred = pred.clone();
+                            let retained = from_val.list_retain(|item_val| {
+                                let mut pred_scope = local_scope.clone();
+                                pred_scope.insert(item_param.clone(), item_val.clone());
+                                !self
+                                    .eval_static_tolerant(&pred, &pred_scope)
+                                    .as_bool()
+                                    .unwrap_or(false)
+                            });
+                            Ok(retained)
+                        } else {
+                            Ok(from_val)
+                        }
                     }
                     ["List", "retain"] => {
                         // `list |> List/retain(item, if: predicate_expr)`
@@ -2203,9 +2552,13 @@ impl Compiler {
                         // Built-in Text/ functions
                         if *module == "Text" {
                             match *fn_name {
+                                "trim" => {
+                                    let s = from_val.as_text().unwrap_or("");
+                                    return Ok(Value::text(s.trim()));
+                                }
                                 "to_number" => {
                                     let s = from_val.as_text().unwrap_or("");
-                                    return match s.parse::<f64>() {
+                                    return match s.trim().parse::<f64>() {
                                         Ok(n) if n.is_finite() => Ok(Value::number(n)),
                                         _ => Ok(Value::tag("NaN")),
                                     };
@@ -2890,13 +3243,14 @@ impl Compiler {
     fn compile_to_graph(
         &self,
         doc_expr: &Spanned<Expression>,
+        render_surface: RenderSurface,
         storage_key: Option<&str>,
         persisted_holds: &std::collections::HashMap<String, Value>,
     ) -> Result<DataflowGraph, String> {
         // Try the real DD compilation path first.
         // If it fails (e.g., unsupported pattern), fall back to the general path.
         let mut ctx = GraphBuilder::new(self, storage_key, persisted_holds);
-        ctx.compile_program(doc_expr)
+        ctx.compile_program(doc_expr, render_surface)
     }
 }
 
@@ -2913,6 +3267,9 @@ struct DisplayPipelineInfo {
     map_item_param: String,
     /// The `new:` expression from List/map (e.g., `todo_item(todo: item)`).
     map_new_expr: Spanned<Expression>,
+    /// Enclosing `BLOCK` bindings that must stay available when keyed retain/map
+    /// is extracted into DD operators.
+    scope_bindings: Vec<(String, Spanned<Expression>)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3014,14 +3371,55 @@ impl<'a> GraphBuilder<'a> {
         id
     }
 
-    fn compile_program(&mut self, doc_expr: &Spanned<Expression>) -> Result<DataflowGraph, String> {
+    fn compile_program(
+        &mut self,
+        doc_expr: &Spanned<Expression>,
+        render_surface: RenderSurface,
+    ) -> Result<DataflowGraph, String> {
+        let trace_cells = self
+            .compiler
+            .get_var_expr("document")
+            .map(|expr| expr.span.start == doc_expr.span.start && expr.span.end == doc_expr.span.end)
+            .unwrap_or(false);
         // Pass 1: Find all reactive variables and compile them
-        let vars: Vec<(String, Spanned<Expression>)> = self.compiler.variables.clone();
-        for (name, expr) in &vars {
-            if name == "document" || name == "scene" {
-                continue; // Handle document/scene separately
+        let mut pending: Vec<(String, Spanned<Expression>)> = self
+            .compiler
+            .variables
+            .iter()
+            .cloned()
+            .filter(|(name, expr)| {
+                name != "document" && name != "scene" && self.compiler.is_reactive(expr)
+            })
+            .collect();
+
+        if trace_cells {
+            std::println!(
+                "[cells-dd] compile_program pending reactive vars count={}",
+                pending.len()
+            );
+        }
+
+        while !pending.is_empty() {
+            let mut compiled_any = false;
+            let mut deferred = Vec::new();
+            let mut last_deferred_error: Option<String> = None;
+
+            if trace_cells {
+                std::println!(
+                    "[cells-dd] compile_program pass pending_count={}",
+                    pending.len()
+                );
             }
-            if Compiler::is_reactive(expr) {
+
+            for (name, expr) in pending {
+                if trace_cells {
+                    std::println!("[cells-dd] compile reactive var {name}");
+                }
+                if self.reactive_vars.contains_key(&name) {
+                    compiled_any = true;
+                    continue;
+                }
+
                 // Derive scope prefix from dotted variable names
                 // e.g., "store.nav_action" → scope_prefix = "store"
                 if let Some(dot_pos) = name.rfind('.') {
@@ -3029,23 +3427,58 @@ impl<'a> GraphBuilder<'a> {
                 } else {
                     self.scope_prefix = None;
                 }
-                self.compile_reactive_var(name, expr).map_err(|e| {
-                    format!("Failed compiling '{}': {}", name, e)
-                })?;
+
+                match self.compile_reactive_var(&name, &expr) {
+                    Ok(_) => {
+                        if trace_cells {
+                            std::println!("[cells-dd] compiled reactive var {name}");
+                        }
+                        compiled_any = true
+                    }
+                    Err(e) if Self::should_defer_reactive_compile_error(&e) => {
+                        if trace_cells {
+                            std::println!("[cells-dd] deferred reactive var {name}: {e}");
+                        }
+                        last_deferred_error = Some(format!("Failed compiling '{}': {}", name, e));
+                        deferred.push((name, expr));
+                    }
+                    Err(e) => {
+                        return Err(format!("Failed compiling '{}': {}", name, e));
+                    }
+                }
             }
+
+            if !compiled_any {
+                return Err(last_deferred_error.unwrap_or_else(|| {
+                    "Failed compiling reactive variables: no progress made".to_string()
+                }));
+            }
+
+            pending = deferred;
         }
         self.scope_prefix = None;
+
+        if trace_cells {
+            std::println!("[cells-dd] after reactive pass1");
+        }
 
         // Capture initial PASSED context from the document expression's PASS argument.
         // This is needed by the keyed display pipeline so Theme functions can resolve
         // colors/styles using the program's initial configuration.
         self.initial_passed = self.extract_initial_passed(doc_expr);
 
+        if trace_cells {
+            std::println!("[cells-dd] after extract_initial_passed");
+        }
+
         // Between Pass 1 and Pass 2: Build keyed display pipeline.
         // Scans function bodies for `PASSED.store.<keyed_name> |> List/retain(...) |> List/map(...)`
         // and compiles keyed DD operators: ListRetainReactive → ListMapWithKey.
         // The display_var points to the post-retain-post-map keyed collection for O(1) per-item diffs.
         let keyed_list_output = if let Some((list_name, keyed_var)) = self.keyed_hold_vars.first() {
+            if trace_cells {
+                std::println!("[cells-dd] before build_display_pipeline list_name={list_name}");
+            }
             let list_name = list_name.clone();
             let keyed_var = keyed_var.clone();
             let short_name = list_name
@@ -3055,6 +3488,9 @@ impl<'a> GraphBuilder<'a> {
             let display_var = self
                 .build_display_pipeline(&list_name, &keyed_var)
                 .unwrap_or_else(|_| keyed_var.clone());
+            if trace_cells {
+                std::println!("[cells-dd] after build_display_pipeline");
+            }
             // Find the element tag of the Stripe that displays keyed items
             let element_tag = self.compiler.find_keyed_stripe_element_tag(&short_name);
             // Record the list name so build_doc_template can emit empty items
@@ -3072,16 +3508,34 @@ impl<'a> GraphBuilder<'a> {
             None
         };
 
+        if trace_cells {
+            std::println!("[cells-dd] before compile_document_expr");
+        }
+
         // Pass 2: Compile the document expression
         let doc_var = self.compile_document_expr(doc_expr)?;
+
+        if trace_cells {
+            std::println!("[cells-dd] after compile_document_expr");
+        }
 
         Ok(DataflowGraph {
             inputs: std::mem::take(&mut self.inputs),
             collections: std::mem::take(&mut self.collections),
             document: doc_var,
+            render_surface,
             storage_key: self.storage_key.clone(),
             keyed_list_output,
         })
+    }
+
+    fn should_defer_reactive_compile_error(error: &str) -> bool {
+        let lowered = error.to_ascii_lowercase();
+        error.contains("Reactive source '")
+            || error.contains("Event source '")
+            || lowered.contains("not compiled yet")
+            || error.contains("List/latest() requires a keyed list source")
+            || lowered.contains("reactive dep '")
     }
 
     fn compile_reactive_var(
@@ -3800,15 +4254,54 @@ impl<'a> GraphBuilder<'a> {
             // Pattern: `event_source |> THEN { body }`
             Expression::Then { body } => {
                 let (source_var, _) = self.compile_event_source(from)?;
-                let transform = self.build_then_transform(body);
+                let event_source_name = Self::extract_hold_event_source_name(from);
+                let mut reactive_deps = self.find_reactive_deps_in_expr(body);
+                self.collect_ensured_text_reactive_deps(body, &mut reactive_deps);
+                Self::retain_non_event_reactive_deps(&mut reactive_deps, event_source_name.as_ref());
                 let then_var = VarId::new(name);
-                self.collections.insert(
-                    then_var.clone(),
-                    CollectionSpec::Then {
-                        source: source_var,
-                        body: transform,
-                    },
-                );
+                let uses_event_alias = event_source_name
+                    .as_ref()
+                    .map(|name| Self::expr_references_name(body, name))
+                    .unwrap_or(false);
+                if reactive_deps.is_empty() && !uses_event_alias {
+                    let transform = self.build_then_transform(body);
+                    self.collections.insert(
+                        then_var.clone(),
+                        CollectionSpec::Then {
+                            source: source_var,
+                            body: transform,
+                        },
+                    );
+                } else if reactive_deps.is_empty() {
+                    let transform = self.build_then_dep_transform(
+                        body,
+                        &[],
+                        self.scope_prefix.clone(),
+                        event_source_name,
+                    );
+                    self.collections.insert(
+                        then_var.clone(),
+                        CollectionSpec::Map {
+                            source: source_var,
+                            f: transform,
+                        },
+                    );
+                } else {
+                    let joined = self.join_event_with_reactive_deps(source_var, &reactive_deps)?;
+                    let transform = self.build_then_dep_transform(
+                        body,
+                        &reactive_deps,
+                        self.scope_prefix.clone(),
+                        event_source_name,
+                    );
+                    self.collections.insert(
+                        then_var.clone(),
+                        CollectionSpec::Map {
+                            source: joined,
+                            f: transform,
+                        },
+                    );
+                }
                 self.reactive_vars
                     .insert(name.to_string(), then_var.clone());
                 Ok(then_var)
@@ -3929,7 +4422,7 @@ impl<'a> GraphBuilder<'a> {
         );
 
         // Find LINK in the body and create input
-        let (events_var, link_path) = self.compile_hold_body_events(name, body)?;
+        let (events_var, link_path) = self.compile_hold_body_events(name, state_param, body)?;
 
         // Build the transform closure
         let transform = self.build_hold_transform(state_param, body);
@@ -3970,6 +4463,7 @@ impl<'a> GraphBuilder<'a> {
     fn compile_hold_body_events(
         &mut self,
         hold_name: &str,
+        state_param: &str,
         body: &Spanned<Expression>,
     ) -> Result<(VarId, Option<String>), String> {
         // Body is typically: `event_source |> THEN { transform }`
@@ -3979,23 +4473,75 @@ impl<'a> GraphBuilder<'a> {
                     Expression::Then { body: then_body } => {
                         // `from` is the event source (e.g., increment_button.event.press)
                         let (source_var, link_path) = self.compile_event_source(from)?;
+                        let event_source_name = Self::extract_hold_event_source_name(from);
+                        let depends_on_state =
+                            Self::expr_references_name(then_body, state_param);
 
                         // Create a THEN collection
                         let then_var = self.fresh_var(&format!("{}_then", hold_name));
-                        let transform = self.build_then_transform(then_body);
-                        self.collections.insert(
-                            then_var.clone(),
-                            CollectionSpec::Then {
-                                source: source_var,
-                                body: transform,
-                            },
+                        let mut reactive_deps = self.find_reactive_deps_in_expr(then_body);
+                        self.collect_ensured_text_reactive_deps(then_body, &mut reactive_deps);
+                        reactive_deps.retain(|dep| dep != state_param && dep != hold_name);
+                        Self::retain_non_event_reactive_deps(
+                            &mut reactive_deps,
+                            event_source_name.as_ref(),
                         );
+                        if depends_on_state {
+                            return Ok((source_var, link_path));
+                        }
+                        let uses_event_alias = event_source_name
+                            .as_ref()
+                            .map(|name| Self::expr_references_name(then_body, name))
+                            .unwrap_or(false);
+                        if reactive_deps.is_empty() && !uses_event_alias {
+                            let transform = self.build_then_transform(then_body);
+                            self.collections.insert(
+                                then_var.clone(),
+                                CollectionSpec::Then {
+                                    source: source_var,
+                                    body: transform,
+                                },
+                            );
+                        } else if reactive_deps.is_empty() {
+                            let transform = self.build_then_dep_transform(
+                                then_body,
+                                &[],
+                                self.scope_prefix.clone(),
+                                event_source_name,
+                            );
+                            self.collections.insert(
+                                then_var.clone(),
+                                CollectionSpec::Map {
+                                    source: source_var,
+                                    f: transform,
+                                },
+                            );
+                        } else {
+                            let joined =
+                                self.join_event_with_reactive_deps(source_var, &reactive_deps)?;
+                            let transform = self.build_then_dep_transform(
+                                then_body,
+                                &reactive_deps,
+                                self.scope_prefix.clone(),
+                                event_source_name,
+                            );
+                            self.collections.insert(
+                                then_var.clone(),
+                                CollectionSpec::Map {
+                                    source: joined,
+                                    f: transform,
+                                },
+                            );
+                        }
 
                         Ok((then_var, link_path))
                     }
                     _ => {
-                        // Direct event source without THEN
-                        self.compile_event_source(from)
+                        // Direct reactive stream without THEN, for example
+                        // `people |> List/map(...) |> List/latest()` inside a HOLD body.
+                        let inline_name = format!("{}__pipe_event", hold_name);
+                        let var_id = self.compile_reactive_var(&inline_name, body)?;
+                        Ok((var_id, None))
                     }
                 }
             }
@@ -4005,7 +4551,7 @@ impl<'a> GraphBuilder<'a> {
                 let mut event_vars = Vec::new();
                 for (i, input) in inputs.iter().enumerate() {
                     let sub_name = format!("{}__latest_{}", hold_name, i);
-                    let (var_id, _) = self.compile_hold_body_events(&sub_name, input)?;
+                    let (var_id, _) = self.compile_hold_body_events(&sub_name, state_param, input)?;
                     event_vars.push(var_id);
                 }
                 if event_vars.is_empty() {
@@ -4081,6 +4627,11 @@ impl<'a> GraphBuilder<'a> {
                 if parts.len() == 1 {
                     if let Some(var_id) = self.reactive_vars.get(var_name) {
                         return Ok((var_id.clone(), None));
+                    }
+                    if let Some(var_expr) = self.compiler.get_var_expr(var_name) {
+                        if self.compiler.is_reactive(var_expr) {
+                            return Ok((VarId::new(var_name), None));
+                        }
                     }
                 }
 
@@ -4197,12 +4748,17 @@ impl<'a> GraphBuilder<'a> {
             return Ok(var);
         }
 
-        // Try static evaluation for constant expressions (e.g., Text/empty(), tagged objects)
-        if let Ok(val) = self.compiler.eval_static(expr) {
-            let var = self.fresh_var(&format!("{}_const{}", parent_name, index));
-            self.collections
-                .insert(var.clone(), CollectionSpec::Literal(val));
-            return Ok(var);
+        // Try static evaluation only for expressions that are not reactive.
+        // Running eval_static on a reactive pipe can recurse through forward
+        // references (for example CRUD's `people |> List/map(...) |> List/latest()`
+        // inside `selected_id`) and hang the compiler.
+        if !self.compiler.is_reactive(expr) {
+            if let Ok(val) = self.compiler.eval_static(expr) {
+                let var = self.fresh_var(&format!("{}_const{}", parent_name, index));
+                self.collections
+                    .insert(var.clone(), CollectionSpec::Literal(val));
+                return Ok(var);
+            }
         }
 
         // Delegate to general reactive compilation for everything else
@@ -4300,23 +4856,25 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn compile_document_expr(&mut self, expr: &Spanned<Expression>) -> Result<VarId, String> {
-        // Handle `reactive_var |> Document/new()` pipe pattern
+        #[cfg(test)]
+        let trace_cells = self
+            .compiler
+            .get_var_expr("document")
+            .map(|doc| doc.span.start == expr.span.start && doc.span.end == expr.span.end)
+            .unwrap_or(false);
+        // Handle `reactive_var |> Document/new()` / `reactive_var |> Scene/new()` pipe patterns.
         if let Expression::Pipe { from, to } = &expr.node {
-            if let Expression::FunctionCall { path, arguments } = &to.node {
-                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                if path_strs.as_slice() == ["Document", "new"] && arguments.is_empty() {
-                    // Try simple alias first (e.g., `counter |> Document/new()`)
-                    if let Ok(var) = self.compile_piped_document(from) {
-                        return Ok(var);
+            if let Expression::FunctionCall { arguments, .. } = &to.node {
+                if let Some(render_tag) = Self::render_root_tag_from_expr(to) {
+                    if arguments.is_empty() {
+                        // Try simple alias first (e.g., `counter |> Document/new()`)
+                        if let Ok(var) = self.compile_piped_document(from, render_tag) {
+                            return Ok(var);
+                        }
+                        // Fall through to chain compilation for pipe expressions
+                        return self.compile_piped_document_chain(expr, render_tag);
                     }
-                    // Fall through to chain compilation for pipe expressions
-                    return self.compile_piped_document_chain(expr);
                 }
-            }
-            // Check for longer pipe chains ending in Document/new()
-            // e.g., `Timer |> THEN |> Math/sum |> Document/new()`
-            if self.is_reactive_pipe(expr) {
-                return self.compile_piped_document_chain(expr);
             }
         }
 
@@ -4342,6 +4900,14 @@ impl<'a> GraphBuilder<'a> {
             .map(|(name, _)| name.clone())
             .collect();
 
+        #[cfg(test)]
+        if trace_cells {
+            eprintln!(
+                "[cells-dd] compile_document_expr reactive_deps={}",
+                reactive_deps.join(", ")
+            );
+        }
+
         if reactive_deps.is_empty() {
             // Static document
             let val = self
@@ -4359,12 +4925,46 @@ impl<'a> GraphBuilder<'a> {
             let dep_name = &reactive_deps[0];
             let dep_var = self.reactive_vars.get(dep_name).unwrap().clone();
 
+            if self.expr_contains_user_function_call(expr) {
+                #[cfg(test)]
+                if trace_cells {
+                    eprintln!(
+                        "[cells-dd] using single-dep eval closure for {dep_name} due to user function calls"
+                    );
+                }
+                let compiler_clone = self.compiler.clone();
+                let doc_expr_clone = expr.clone();
+                let dep_name_clone = dep_name.clone();
+                let doc_var = self.fresh_var("document");
+                self.collections.insert(
+                    doc_var.clone(),
+                    CollectionSpec::Map {
+                        source: dep_var,
+                        f: Arc::new(move |reactive_value: &Value| {
+                            let mut scope = IndexMap::new();
+                            scope.insert(
+                                dep_name_clone.clone(),
+                                decorate_reactive_scope_value(reactive_value, &dep_name_clone),
+                            );
+                            compiler_clone
+                                .eval_static_with_scope(&doc_expr_clone, &scope)
+                                .unwrap_or(Value::Unit)
+                        }),
+                    },
+                );
+                return Ok(doc_var);
+            }
+
             // Build a document template closure.
             // Falls back to closure-based evaluation when the template can't
             // interpolate the reactive value (e.g., used via PASSED inside
             // a user function call like root_element).
             match self.build_document_closure(dep_name, expr) {
                 Ok(doc_closure) => {
+                    #[cfg(test)]
+                    if trace_cells {
+                        eprintln!("[cells-dd] build_document_closure succeeded for {dep_name}");
+                    }
                     let doc_var = self.fresh_var("document");
                     self.collections.insert(
                         doc_var.clone(),
@@ -4376,6 +4976,10 @@ impl<'a> GraphBuilder<'a> {
                     return Ok(doc_var);
                 }
                 Err(_) => {
+                    #[cfg(test)]
+                    if trace_cells {
+                        eprintln!("[cells-dd] build_document_closure fell back for {dep_name}");
+                    }
                     return self.compile_multi_dep_document(expr, &reactive_deps);
                 }
             }
@@ -4448,21 +5052,26 @@ impl<'a> GraphBuilder<'a> {
         }
     }
 
-    /// Compile `reactive_var |> Document/new()` where the from is a simple alias.
-    fn compile_piped_document(&mut self, from: &Spanned<Expression>) -> Result<VarId, String> {
+    /// Compile `reactive_var |> Document/new()` or `reactive_var |> Scene/new()`
+    /// where the source is a simple alias.
+    fn compile_piped_document(
+        &mut self,
+        from: &Spanned<Expression>,
+        render_tag: &'static str,
+    ) -> Result<VarId, String> {
         // Check if `from` references a reactive variable
         if let Expression::Alias(Alias::WithoutPassed { parts, .. }) = &from.node {
             if parts.len() == 1 {
                 let name = parts[0].as_str();
                 if let Some(source_var) = self.reactive_vars.get(name).cloned() {
-                    // Map the reactive value into a DocumentNew wrapper
+                    // Map the reactive value into the requested render-root wrapper.
                     let doc_var = self.fresh_var("document");
                     self.collections.insert(
                         doc_var.clone(),
                         CollectionSpec::Map {
                             source: source_var,
-                            f: Arc::new(|v: &Value| {
-                                Value::tagged("DocumentNew", [("root", v.clone())])
+                            f: Arc::new(move |v: &Value| {
+                                Value::tagged(render_tag, [("root", v.clone())])
                             }),
                         },
                     );
@@ -4473,37 +5082,47 @@ impl<'a> GraphBuilder<'a> {
         Err("Unsupported piped document source".to_string())
     }
 
-    /// Compile a full reactive pipe chain as the document.
-    /// e.g., `Duration[seconds: 1] |> Timer/interval() |> THEN { 1 } |> Math/sum() |> Document/new()`
+    /// Compile a full reactive pipe chain as the render root.
+    /// e.g., `Duration |> Timer/interval() |> THEN { 1 } |> Math/sum() |> Document/new()`
     fn compile_piped_document_chain(
         &mut self,
         expr: &Spanned<Expression>,
+        render_tag: &'static str,
     ) -> Result<VarId, String> {
-        // Peel off the outer `|> Document/new()` and compile the inner chain as a reactive var
+        // Peel off the outer render-root wrapper and compile the inner chain as a reactive var.
         if let Expression::Pipe { from, to } = &expr.node {
-            if let Expression::FunctionCall { path, .. } = &to.node {
-                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                if path_strs.as_slice() == ["Document", "new"] {
-                    // Compile the inner chain as a reactive variable named "__doc_source"
+            if let Some(tag) = Self::render_root_tag_from_expr(to) {
+                if tag == render_tag {
+                    // Compile the inner chain as a reactive variable named "__doc_source".
                     let source_var = self.compile_reactive_var("__doc_source", from)?;
-                    // Wrap in DocumentNew
+                    // Wrap in the requested render-root tag.
                     let doc_var = self.fresh_var("document");
                     self.collections.insert(
                         doc_var.clone(),
                         CollectionSpec::Map {
                             source: source_var,
-                            f: Arc::new(|v: &Value| {
-                                Value::tagged("DocumentNew", [("root", v.clone())])
+                            f: Arc::new(move |v: &Value| {
+                                Value::tagged(render_tag, [("root", v.clone())])
                             }),
                         },
                     );
                     return Ok(doc_var);
                 }
             }
-            // Recurse: the inner pipe might still have Document/new deeper
-            // This handles chains like `a |> b |> c |> Document/new()`
         }
         Err("Cannot compile piped document chain".to_string())
+    }
+
+    fn render_root_tag_from_expr(expr: &Spanned<Expression>) -> Option<&'static str> {
+        let Expression::FunctionCall { path, .. } = &expr.node else {
+            return None;
+        };
+        let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+        match path_strs.as_slice() {
+            ["Document", "new"] => Some("DocumentNew"),
+            ["Scene", "new"] => Some("SceneNew"),
+            _ => None,
+        }
     }
 
     fn is_reactive_pipe(&self, expr: &Spanned<Expression>) -> bool {
@@ -4523,6 +5142,114 @@ impl<'a> GraphBuilder<'a> {
             }
             Expression::Then { .. } | Expression::Hold { .. } | Expression::Latest { .. } => true,
             Expression::TaggedObject { tag, .. } => tag.as_str() == "Duration",
+            _ => false,
+        }
+    }
+
+    fn expr_contains_user_function_call(&self, expr: &Spanned<Expression>) -> bool {
+        match &expr.node {
+            Expression::FunctionCall { path, arguments } => {
+                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                let is_user_function = match path_strs.as_slice() {
+                    [name] => self.compiler.find_function(name).is_some(),
+                    [module, name] => self
+                        .compiler
+                        .find_function(&format!("{module}/{name}"))
+                        .is_some(),
+                    _ => false,
+                };
+                is_user_function
+                    || arguments.iter().any(|arg| {
+                        arg.node
+                            .value
+                            .as_ref()
+                            .map(|value| self.expr_contains_user_function_call(value))
+                            .unwrap_or(false)
+                    })
+            }
+            Expression::Pipe { from, to } => {
+                self.expr_contains_user_function_call(from)
+                    || self.expr_contains_user_function_call(to)
+            }
+            Expression::List { items } => items
+                .iter()
+                .any(|item| self.expr_contains_user_function_call(item)),
+            Expression::Object(object) => object
+                .variables
+                .iter()
+                .any(|var| self.expr_contains_user_function_call(&var.node.value)),
+            Expression::Block { variables, output } => {
+                variables
+                    .iter()
+                    .any(|var| self.expr_contains_user_function_call(&var.node.value))
+                    || self.expr_contains_user_function_call(output)
+            }
+            Expression::Latest { inputs } => inputs
+                .iter()
+                .any(|input| self.expr_contains_user_function_call(input)),
+            Expression::Then { body } => self.expr_contains_user_function_call(body),
+            Expression::While { arms } => arms
+                .iter()
+                .any(|arm| self.expr_contains_user_function_call(&arm.body)),
+            Expression::ArithmeticOperator(op) => match op {
+                ArithmeticOperator::Add {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Subtract {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Multiply {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Divide {
+                    operand_a,
+                    operand_b,
+                } => {
+                    self.expr_contains_user_function_call(operand_a)
+                        || self.expr_contains_user_function_call(operand_b)
+                }
+                ArithmeticOperator::Negate { operand } => {
+                    self.expr_contains_user_function_call(operand)
+                }
+            },
+            Expression::Comparator(cmp) => {
+                use static_expression::Comparator;
+                let (a, b) = match cmp {
+                    Comparator::Equal {
+                        operand_a,
+                        operand_b,
+                    }
+                    | Comparator::NotEqual {
+                        operand_a,
+                        operand_b,
+                    }
+                    | Comparator::Greater {
+                        operand_a,
+                        operand_b,
+                    }
+                    | Comparator::GreaterOrEqual {
+                        operand_a,
+                        operand_b,
+                    }
+                    | Comparator::Less {
+                        operand_a,
+                        operand_b,
+                    }
+                    | Comparator::LessOrEqual {
+                        operand_a,
+                        operand_b,
+                    } => (operand_a, operand_b),
+                };
+                self.expr_contains_user_function_call(a)
+                    || self.expr_contains_user_function_call(b)
+            }
+            Expression::PostfixFieldAccess { expr, .. } => {
+                self.expr_contains_user_function_call(expr)
+            }
+            Expression::Variable(var) => self.expr_contains_user_function_call(&var.value),
             _ => false,
         }
     }
@@ -4608,42 +5335,15 @@ impl<'a> GraphBuilder<'a> {
             return Ok(doc_var);
         }
 
-        // Build a chain of Joins to combine all deps
-        // Join is binary, so for N deps we build a chain: Join(Join(d0, d1), d2), ...
-        let first_var = self.reactive_vars.get(&real_dep_names[0]).unwrap().clone();
-        let second_var = self.reactive_vars.get(&real_dep_names[1]).unwrap().clone();
-        let mut current_var = self.fresh_var("joined_deps");
+        let current_var = self.fresh_var("joined_deps");
+        let source_vars: Vec<VarId> = real_dep_names
+            .iter()
+            .map(|dep_name| self.reactive_vars.get(dep_name).unwrap().clone())
+            .collect();
         self.collections.insert(
             current_var.clone(),
-            CollectionSpec::Join {
-                left: first_var,
-                right: second_var,
-                combine: Arc::new(move |a: &Value, b: &Value| {
-                    Value::object([
-                        (format!("{DEP_FIELD_PREFIX}0"), a.clone()),
-                        (format!("{DEP_FIELD_PREFIX}1"), b.clone()),
-                    ])
-                }),
-            },
+            CollectionSpec::CombineLatest(source_vars),
         );
-
-        for (i, dep_name) in real_dep_names.iter().enumerate().skip(2) {
-            let dep_var = self.reactive_vars.get(dep_name).unwrap().clone();
-            let prev = current_var.clone();
-            current_var = self.fresh_var("joined_deps");
-            let idx = i;
-            self.collections.insert(
-                current_var.clone(),
-                CollectionSpec::Join {
-                    left: prev,
-                    right: dep_var,
-                    combine: Arc::new(move |combined: &Value, new_dep: &Value| {
-                        let key = format!("{DEP_FIELD_PREFIX}{idx}");
-                        combined.update_field(&key, new_dep.clone())
-                    }),
-                },
-            );
-        }
 
         // Map from joined deps to document
         let doc_closure = self.build_multi_dep_doc_closure(doc_expr, &real_dep_names)?;
@@ -4682,7 +5382,8 @@ impl<'a> GraphBuilder<'a> {
         // Build static default values for ALL store fields (LINK stubs, static values).
         // The closure will override reactive dep fields with live values.
         let mut link_defaults: Vec<(String, Value)> = Vec::new();
-        for (var_name, var_expr) in &self.compiler.variables {
+        let mut static_scope_bindings: Vec<(String, Value)> = Vec::new();
+        for (var_name, var_expr) in self.compiler.variables.iter() {
             if let Some(field_name) = var_name.strip_prefix("store.") {
                 // Skip reactive deps — they'll be provided from the combined value
                 if dep_names.iter().any(|d| d == var_name) {
@@ -4700,13 +5401,31 @@ impl<'a> GraphBuilder<'a> {
                         // Can't evaluate statically — skip (LINK evaluates to Value::tag("LINK"))
                     }
                 }
+                continue;
+            }
+
+            if var_name == "document"
+                || self.reactive_vars.contains_key(var_name)
+                || var_name.contains('.')
+            {
+                continue;
+            }
+
+            if let Ok(val) = self
+                .compiler
+                .eval_static_with_scope(var_expr, &IndexMap::new())
+            {
+                if value_needs_reactive_decoration(&val) {
+                    static_scope_bindings
+                        .push((var_name.clone(), decorate_reactive_scope_value(&val, var_name)));
+                }
             }
         }
 
         // Collect LINK variable paths for injection into the store object.
         // These create __link_path__ fields so the bridge can route events back.
         let mut link_injections: Vec<(String, String)> = Vec::new(); // (nested_path, full_path)
-        for (var_name, var_expr) in &self.compiler.variables {
+        for (var_name, var_expr) in self.compiler.variables.iter() {
             if matches!(var_expr.node, Expression::Link) {
                 if let Some(rest) = var_name.strip_prefix("store.") {
                     link_injections.push((rest.to_string(), var_name.clone()));
@@ -4717,6 +5436,10 @@ impl<'a> GraphBuilder<'a> {
         Ok(Arc::new(move |combined: &Value| {
             let mut scope = IndexMap::new();
 
+            for (name, value) in &static_scope_bindings {
+                scope.insert(name.clone(), value.clone());
+            }
+
             // Reconstruct the scope from combined deps.
             // Deps like "store.todos", "theme_options.mode" are grouped into parent
             // objects ("store", "theme_options") for the static evaluator.
@@ -4726,6 +5449,7 @@ impl<'a> GraphBuilder<'a> {
             for (i, name) in dep_names.iter().enumerate() {
                 let dep_key = format!("{DEP_FIELD_PREFIX}{i}");
                 let val = combined.get_field(&dep_key).cloned().unwrap_or(Value::Unit);
+                let decorated = decorate_reactive_scope_value(&val, name);
 
                 // Parse dotted names: "store.items" → group into parent "store"
                 let parts: Vec<&str> = name.split('.').collect();
@@ -4733,9 +5457,9 @@ impl<'a> GraphBuilder<'a> {
                     object_fields
                         .entry(parts[0].to_string())
                         .or_default()
-                        .insert(Arc::from(parts[1]), val.clone());
+                        .insert(Arc::from(parts[1]), decorated.clone());
                 }
-                scope.insert(name.clone(), val);
+                scope.insert(name.clone(), decorated);
             }
 
             // Build composite objects for each parent prefix
@@ -4816,9 +5540,34 @@ impl<'a> GraphBuilder<'a> {
                 );
             }
 
+            #[cfg(test)]
+            if dep_names.iter().any(|name| name == "sheet") {
+                if let Some(sheet) = scope.get("sheet") {
+                    let row_1 = sheet
+                        .list_items()
+                        .first()
+                        .copied()
+                        .map(Value::list_items)
+                        .unwrap_or_default();
+                    let preview = row_1
+                        .iter()
+                        .take(3)
+                        .map(|value| value.as_text().unwrap_or("?").to_string())
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    eprintln!("[cells-doc-scope] row1={preview}");
+                }
+            }
+
             match compiler.eval_static_with_scope(&doc_expr, &scope) {
                 Ok(val) => val,
-                Err(_) => Value::Unit,
+                Err(err) => {
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::eprintln!("[DD DOC STRICT FALLBACK] {err}");
+                    #[cfg(not(target_arch = "wasm32"))]
+                    std::eprintln!("[DD DOC STRICT FALLBACK] {err}");
+                    compiler.eval_static_tolerant(&doc_expr, &scope)
+                }
             }
         }))
     }
@@ -4838,26 +5587,60 @@ impl<'a> GraphBuilder<'a> {
             HoldTransform::Custom => {
                 // General transform: evaluate the THEN body with state in scope.
                 // Extract the THEN body expression from the HOLD body.
-                let then_body = match &body.node {
-                    Expression::Pipe { to, .. } => match &to.node {
-                        Expression::Then { body: then_body } => Some(then_body.as_ref().clone()),
-                        _ => None,
+                let (then_body, event_source_name) = match &body.node {
+                    Expression::Pipe { from, to } => match &to.node {
+                        Expression::Then { body: then_body } => (
+                            Some(then_body.as_ref().clone()),
+                            Self::extract_hold_event_source_name(from),
+                        ),
+                        _ => (None, None),
                     },
-                    _ => None,
+                    _ => (None, None),
                 };
                 if let Some(then_expr) = then_body {
                     let compiler = self.compiler.clone();
                     let sname = state_name.to_string();
-                    Arc::new(move |state: &Value, _event: &Value| {
+                    let event_name = event_source_name.clone();
+                    Arc::new(move |state: &Value, event: &Value| {
+                        if matches!(event, Value::Unit) || event.get_tag() == Some("SKIP") {
+                            return state.clone();
+                        }
                         let mut scope = IndexMap::new();
                         scope.insert(sname.clone(), state.clone());
-                        compiler
+                        if let Some(event_name) = &event_name {
+                            inject_scope_path_merged(&mut scope, event_name, event.clone());
+                        }
+                        let result = compiler
                             .eval_static_with_scope(&then_expr, &scope)
-                            .unwrap_or_else(|_| {
-                                // Last resort fallback: increment by 1
-                                let current = state.as_number().unwrap_or(0.0);
-                                Value::number(current + 1.0)
-                            })
+                            .unwrap_or_else(|err| {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                std::eprintln!(
+                                    "[dd-hold-transform-error] state_name={} event_name={:?} err={} state={} event={}",
+                                    sname,
+                                    event_name,
+                                    err,
+                                    state,
+                                    event
+                                );
+                                if event.get_tag() != Some("Event") {
+                                    event.clone()
+                                } else {
+                                    // Last resort fallback: increment by 1
+                                    let current = state.as_number().unwrap_or(0.0);
+                                    Value::number(current + 1.0)
+                                }
+                            });
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if sname == "sheet" || sname == "overrides" {
+                            std::eprintln!(
+                                "[dd-hold-transform] state_name={} event_name={:?} event={} result={}",
+                                sname,
+                                event_name,
+                                event,
+                                result
+                            );
+                        }
+                        result
                     })
                 } else if let Expression::Latest { inputs } = &body.node {
                     // LATEST body: merge multiple event sources.
@@ -4878,6 +5661,9 @@ impl<'a> GraphBuilder<'a> {
                     let compiler = self.compiler.clone();
                     let sname = state_name.to_string();
                     Arc::new(move |state: &Value, event: &Value| {
+                        if matches!(event, Value::Unit) || event.get_tag() == Some("SKIP") {
+                            return state.clone();
+                        }
                         // If event is a concrete value (not marker), use it directly
                         if event.get_tag() != Some("Event") {
                             return event.clone();
@@ -4920,6 +5706,39 @@ impl<'a> GraphBuilder<'a> {
                 _ => HoldTransform::Custom,
             },
             _ => HoldTransform::Custom,
+        }
+    }
+
+    fn extract_hold_event_source_name(expr: &Spanned<Expression>) -> Option<String> {
+        match &expr.node {
+            Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
+                let full_path = parts
+                    .iter()
+                    .map(|part| part.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                Some(Self::normalize_event_binding_path(&full_path))
+            }
+            _ => None,
+        }
+    }
+
+    fn normalize_event_binding_path(full_path: &str) -> String {
+        if full_path.contains(".event.") {
+            let (_, link_path) = Self::detect_event_kind_and_path(full_path);
+            link_path
+        } else {
+            full_path.to_string()
+        }
+    }
+
+    fn retain_non_event_reactive_deps(
+        reactive_deps: &mut Vec<String>,
+        event_source_name: Option<&String>,
+    ) {
+        if let Some(event_source_name) = event_source_name {
+            let event_prefix = format!("{event_source_name}.");
+            reactive_deps.retain(|dep| dep != event_source_name && !dep.starts_with(&event_prefix));
         }
     }
 
@@ -4969,6 +5788,248 @@ impl<'a> GraphBuilder<'a> {
         }
     }
 
+    fn build_then_dep_transform(
+        &self,
+        body: &Spanned<Expression>,
+        dep_names: &[String],
+        relative_prefix: Option<String>,
+        event_source_name: Option<String>,
+    ) -> Arc<dyn Fn(&Value) -> Value + 'static> {
+        let compiler = self.compiler.clone();
+        let body = body.clone();
+        let dep_names = dep_names.to_vec();
+        let event_source_name = event_source_name.clone();
+        Arc::new(move |combined: &Value| {
+            let mut scope = IndexMap::new();
+            let mut relative_scope = Value::Object(Arc::new(BTreeMap::new()));
+            let event_value = combined
+                .get_field("__event")
+                .cloned()
+                .unwrap_or_else(|| combined.clone());
+
+            if matches!(event_value, Value::Unit) || event_value.get_tag() == Some("SKIP") {
+                return Value::Unit;
+            }
+
+            scope.insert("__event".to_string(), event_value.clone());
+            if let Some(event_source_name) = &event_source_name {
+                inject_scope_path_merged(&mut scope, event_source_name, event_value);
+            }
+
+            for (i, name) in dep_names.iter().enumerate() {
+                let dep_key = format!("{DEP_FIELD_PREFIX}{i}");
+                let value = combined.get_field(&dep_key).cloned().unwrap_or(Value::Unit);
+                scope.insert(name.clone(), value.clone());
+                inject_scope_path_merged(&mut scope, name, value.clone());
+                if let Some(prefix) = relative_prefix.as_deref() {
+                    if let Some(relative_path) = name.strip_prefix(&format!("{prefix}.")) {
+                        relative_scope =
+                            set_nested_field(&relative_scope, relative_path, value.clone());
+                    }
+                }
+            }
+
+            if let Value::Object(fields) = relative_scope {
+                for (field_name, value) in fields.iter() {
+                    scope.insert(field_name.to_string(), value.clone());
+                }
+            }
+
+            let result = compiler.eval_static_tolerant(&body, &scope);
+            #[cfg(not(target_arch = "wasm32"))]
+            if dep_names.iter().any(|name| name.contains("is_return"))
+                || dep_names.iter().any(|name| name.contains("departure_date"))
+            {
+                std::eprintln!(
+                    "[dd-then-deps] deps={:?} combined={} result={}",
+                    dep_names,
+                    combined,
+                    result
+                );
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if event_source_name.as_deref() == Some("enter_pressed")
+                || event_source_name.as_deref() == Some("edit_changed")
+            {
+                std::eprintln!(
+                    "[dd-then-event] event_name={:?} deps={:?} combined={} result={}",
+                    event_source_name,
+                    dep_names,
+                    combined,
+                    result
+                );
+            }
+            result
+        })
+    }
+
+    fn join_event_with_reactive_deps(
+        &mut self,
+        event_var: VarId,
+        reactive_deps: &[String],
+    ) -> Result<VarId, String> {
+        let first_dep = reactive_deps
+            .first()
+            .ok_or_else(|| "join_event_with_reactive_deps requires at least one dep".to_string())?;
+        let first_dep_var = if let Some(var_id) = self.reactive_vars.get(first_dep).cloned() {
+            var_id
+        } else if self
+            .compiler
+            .get_var_expr(first_dep)
+            .is_some_and(|expr| self.compiler.is_reactive(expr))
+        {
+            VarId::new(first_dep.as_str())
+        } else {
+            return Err(format!("Reactive dep '{}' not found", first_dep));
+        };
+
+        let mut current_var = self.fresh_var("then_deps_join");
+        self.collections.insert(
+            current_var.clone(),
+            CollectionSpec::SampleOnEvent {
+                event: event_var,
+                dep: first_dep_var,
+                f: Arc::new(move |event: &Value, dep: &Value| {
+                    let mut fields = BTreeMap::new();
+                    fields.insert(Arc::from("__event"), event.clone());
+                    fields.insert(Arc::from(format!("{DEP_FIELD_PREFIX}0")), dep.clone());
+                    Value::Object(Arc::new(fields))
+                }),
+            },
+        );
+
+        for (i, dep_name) in reactive_deps.iter().enumerate().skip(1) {
+            let dep_var = if let Some(var_id) = self.reactive_vars.get(dep_name).cloned() {
+                var_id
+            } else if self
+                .compiler
+                .get_var_expr(dep_name)
+                .is_some_and(|expr| self.compiler.is_reactive(expr))
+            {
+                VarId::new(dep_name.as_str())
+            } else {
+                return Err(format!("Reactive dep '{}' not found", dep_name));
+            };
+            let prev = current_var.clone();
+            current_var = self.fresh_var("then_deps_join");
+            let idx = i;
+            self.collections.insert(
+                current_var.clone(),
+                CollectionSpec::SampleOnEvent {
+                    event: prev,
+                    dep: dep_var,
+                    f: Arc::new(move |combined: &Value, dep: &Value| {
+                        combined.update_field(&format!("{DEP_FIELD_PREFIX}{idx}"), dep.clone())
+                    }),
+                },
+            );
+        }
+
+        Ok(current_var)
+    }
+
+    fn collect_ensured_text_reactive_deps(
+        &mut self,
+        expr: &Spanned<Expression>,
+        deps: &mut Vec<String>,
+    ) {
+        if let Some(dep) = self.ensure_text_alias_reactive_dep(expr) {
+            if !deps.contains(&dep) {
+                deps.push(dep);
+            }
+        }
+        match &expr.node {
+            Expression::Pipe { from, to } => {
+                self.collect_ensured_text_reactive_deps(from, deps);
+                self.collect_ensured_text_reactive_deps(to, deps);
+            }
+            Expression::FunctionCall { arguments, .. } => {
+                for arg in arguments {
+                    if let Some(value) = arg.node.value.as_ref() {
+                        self.collect_ensured_text_reactive_deps(value, deps);
+                    }
+                }
+            }
+            Expression::Block {
+                variables, output, ..
+            } => {
+                for var in variables {
+                    self.collect_ensured_text_reactive_deps(&var.node.value, deps);
+                }
+                self.collect_ensured_text_reactive_deps(output, deps);
+            }
+            Expression::When { arms } | Expression::While { arms } => {
+                for arm in arms {
+                    self.collect_ensured_text_reactive_deps(&arm.body, deps);
+                }
+            }
+            Expression::List { items } => {
+                for item in items {
+                    self.collect_ensured_text_reactive_deps(item, deps);
+                }
+            }
+            Expression::Object(object) => {
+                for var in &object.variables {
+                    self.collect_ensured_text_reactive_deps(&var.node.value, deps);
+                }
+            }
+            Expression::ArithmeticOperator(op) => match op {
+                ArithmeticOperator::Add {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Subtract {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Multiply {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Divide {
+                    operand_a,
+                    operand_b,
+                } => {
+                    self.collect_ensured_text_reactive_deps(operand_a, deps);
+                    self.collect_ensured_text_reactive_deps(operand_b, deps);
+                }
+                ArithmeticOperator::Negate { operand } => {
+                    self.collect_ensured_text_reactive_deps(operand, deps);
+                }
+            },
+            Expression::Comparator(cmp) => match cmp {
+                static_expression::Comparator::Equal {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::NotEqual {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::Greater {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::Less {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::GreaterOrEqual {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::LessOrEqual {
+                    operand_a,
+                    operand_b,
+                } => {
+                    self.collect_ensured_text_reactive_deps(operand_a, deps);
+                    self.collect_ensured_text_reactive_deps(operand_b, deps);
+                }
+            },
+            _ => {}
+        }
+    }
+
     /// Resolve an alias expression to its reactive VarId.
     /// Check if any argument in a built-in piped function references a reactive variable.
     /// Returns the first reactive argument's name and VarId, if any.
@@ -5000,6 +6061,16 @@ impl<'a> GraphBuilder<'a> {
 
     fn resolve_reactive_source(&mut self, expr: &Spanned<Expression>) -> Result<VarId, String> {
         if let Expression::Alias(Alias::WithoutPassed { parts, .. }) = &expr.node {
+            let full_name = parts
+                .iter()
+                .map(|part| part.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+
+            if let Some(var_id) = self.reactive_vars.get(&full_name) {
+                return Ok(var_id.clone());
+            }
+
             if parts.len() == 1 {
                 let name = parts[0].as_str();
                 if let Some(var_id) = self.reactive_vars.get(name) {
@@ -5011,6 +6082,21 @@ impl<'a> GraphBuilder<'a> {
                     if let Some(var_id) = self.reactive_vars.get(&prefixed) {
                         return Ok(var_id.clone());
                     }
+                    if let Some(prefixed_expr) = self.compiler.get_var_expr(&prefixed) {
+                        if self.compiler.is_reactive(prefixed_expr) {
+                            return Err(format!("Reactive source '{}' not compiled yet", prefixed));
+                        }
+                    }
+                }
+                if let Some(var_expr) = self.compiler.get_var_expr(name) {
+                    if self.compiler.is_reactive(var_expr) {
+                        return Err(format!("Reactive source '{}' not compiled yet", name));
+                    }
+                }
+            }
+            if let Some(var_expr) = self.compiler.get_var_expr(&full_name) {
+                if self.compiler.is_reactive(var_expr) {
+                    return Err(format!("Reactive source '{}' not compiled yet", full_name));
                 }
             }
             // Multi-part alias — try as event source (LINK event path)
@@ -5334,7 +6420,12 @@ impl<'a> GraphBuilder<'a> {
             CollectionSpec::Map {
                 source: text_input_var,
                 f: Arc::new(|v: &Value| {
+                    let text_value = v
+                        .get_field("text")
+                        .cloned()
+                        .unwrap_or_else(|| v.clone());
                     Value::object([("__t", Value::text("text")), ("v", v.clone())])
+                        .update_field("v", text_value)
                 }),
             },
         );
@@ -5346,7 +6437,11 @@ impl<'a> GraphBuilder<'a> {
             CollectionSpec::Map {
                 source: key_input_var,
                 f: Arc::new(|v: &Value| {
-                    Value::object([("__t", Value::text("key")), ("v", v.clone())])
+                    let key_value = v
+                        .get_field("key")
+                        .cloned()
+                        .unwrap_or_else(|| v.clone());
+                    Value::object([("__t", Value::text("key")), ("v", key_value)])
                 }),
             },
         );
@@ -5484,7 +6579,8 @@ impl<'a> GraphBuilder<'a> {
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                 if path_strs.as_slice() == ["List", "retain"] {
                     if let Some(keyed_var) = self.resolve_keyed_source(inner_from) {
-                        let retain_var = self.compile_inline_keyed_retain(keyed_var, arguments)?;
+                        let retain_var =
+                            self.compile_inline_keyed_retain(keyed_var, arguments, &[])?;
                         return self.build_empty_safe_keyed_count(name, retain_var);
                     }
                 }
@@ -5510,6 +6606,267 @@ impl<'a> GraphBuilder<'a> {
     ///
     /// Reduces a keyed `(ListKey, Value)` collection to a scalar `Value`
     /// that always holds the most recently changed item.
+    fn try_compile_inline_keyed_event_map(
+        &mut self,
+        name: &str,
+        source_expr: &Spanned<Expression>,
+        keyed_var: VarId,
+        arguments: &[Spanned<Argument>],
+    ) -> Result<Option<VarId>, String> {
+        let item_param = arguments
+            .iter()
+            .find(|a| a.node.value.is_none())
+            .map(|a| a.node.name.as_str().to_string())
+            .unwrap_or_else(|| "item".to_string());
+
+        let new_expr = arguments
+            .iter()
+            .find(|a| a.node.name.as_str() == "new")
+            .and_then(|a| a.node.value.as_ref());
+
+        let Some(new_expr) = new_expr else {
+            return Ok(None);
+        };
+
+        let Expression::Pipe { from, to } = &new_expr.node else {
+            return Ok(None);
+        };
+        let Expression::Then { body } = &to.node else {
+            return Ok(None);
+        };
+
+        let Some(event_suffix) = Self::extract_item_event_suffix(from, &item_param) else {
+            return Ok(None);
+        };
+        let event_scope_path =
+            Self::normalize_event_binding_path(&format!("{item_param}.{event_suffix}"));
+        let Some(list_path) = self.resolve_keyed_source_path(source_expr) else {
+            return Ok(None);
+        };
+
+        let wildcard_id = self.add_input(InputKind::LinkPress, Some("__wildcard".to_string()));
+        let wildcard_input_var = self.fresh_var("wildcard_input");
+        self.collections.insert(
+            wildcard_input_var.clone(),
+            CollectionSpec::Input(wildcard_id),
+        );
+
+        let list_prefix = format!("{list_path}.");
+        let wildcard_keyed_var = self.fresh_var("wildcard_keyed");
+        self.collections.insert(
+            wildcard_keyed_var.clone(),
+            CollectionSpec::MapToKeyed {
+                source: wildcard_input_var,
+                classify: Arc::new(move |value: &Value| {
+                    let path = value.get_field("path")?.as_text()?;
+                    let event_value = value.get_field("value").cloned().unwrap_or(Value::Unit);
+                    let rest = path.strip_prefix(&list_prefix)?;
+                    let mut parts = rest.splitn(2, '.');
+                    let key = parts.next()?;
+                    let subpath = parts.next()?;
+                    if subpath == event_suffix {
+                        Some((ListKey::new(key), event_value))
+                    } else {
+                        None
+                    }
+                }),
+            },
+        );
+
+        let compiler = self.compiler.clone();
+        let body = body.clone();
+        let item_param_clone = item_param.clone();
+        let event_scope_path_clone = event_scope_path.clone();
+        let event_map_var = VarId::new(name);
+        self.collections.insert(
+            event_map_var.clone(),
+            CollectionSpec::KeyedEventMap {
+                items: keyed_var,
+                events: wildcard_keyed_var,
+                f: Arc::new(move |item: &Value, event: &Value| {
+                    let mut scope = IndexMap::new();
+                    scope.insert(item_param_clone.clone(), item.clone());
+                    scope.insert("__event".to_string(), event.clone());
+                    scope.insert("event_value".to_string(), event.clone());
+                    inject_scope_path_merged(&mut scope, &event_scope_path_clone, event.clone());
+                    compiler.eval_static_tolerant(&body, &scope)
+                }),
+            },
+        );
+        self.reactive_vars
+            .insert(name.to_string(), event_map_var.clone());
+        Ok(Some(event_map_var))
+    }
+
+    fn try_compile_inline_static_event_map(
+        &mut self,
+        name: &str,
+        source_expr: &Spanned<Expression>,
+        arguments: &[Spanned<Argument>],
+    ) -> Result<Option<VarId>, String> {
+        let item_param = arguments
+            .iter()
+            .find(|a| a.node.value.is_none())
+            .map(|a| a.node.name.as_str().to_string())
+            .unwrap_or_else(|| "item".to_string());
+
+        let new_expr = arguments
+            .iter()
+            .find(|a| a.node.name.as_str() == "new")
+            .and_then(|a| a.node.value.as_ref());
+
+        let Some(new_expr) = new_expr else {
+            return Ok(None);
+        };
+
+        let Expression::Pipe { from, to } = &new_expr.node else {
+            return Ok(None);
+        };
+
+        let source_value = match self
+            .compiler
+            .eval_static_with_scope(source_expr, &IndexMap::new())
+        {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+
+        let source_name = Self::resolve_static_source_name(source_expr);
+        let event_scope_path = Self::extract_item_event_suffix(from, &item_param)
+            .map(|suffix| Self::normalize_event_binding_path(&format!("{item_param}.{suffix}")));
+        let compiler = self.compiler.clone();
+        let mut event_vars = Vec::new();
+
+        for (idx, item) in source_value.list_items().into_iter().enumerate() {
+            let key = format!("{idx:04}");
+            let decorated_item = if let Some(source_name) = source_name.as_deref() {
+                decorate_reactive_scope_value(&item, &format!("{source_name}.{key}"))
+            } else {
+                item.clone()
+            };
+
+            let Some((kind, link_path)) =
+                Self::resolve_static_item_event_path(from, &item_param, &decorated_item)
+            else {
+                continue;
+            };
+
+            let input_id = self.add_input(kind, Some(link_path));
+            let input_var = self.fresh_var("static_item_event_input");
+            self.collections
+                .insert(input_var.clone(), CollectionSpec::Input(input_id));
+
+            let event_var = self.fresh_var("static_item_event_map");
+            let item_scope_value = decorated_item.clone();
+            let item_param_clone = item_param.clone();
+            let from_expr_clone = from.clone();
+            let to_expr_clone = to.clone();
+            let compiler_clone = compiler.clone();
+            let event_scope_path_clone = event_scope_path.clone();
+            self.collections.insert(
+                event_var.clone(),
+                CollectionSpec::Map {
+                    source: input_var,
+                    f: Arc::new(move |event: &Value| {
+                        let mut scope = IndexMap::new();
+                        scope.insert(item_param_clone.clone(), item_scope_value.clone());
+                        scope.insert("__event".to_string(), event.clone());
+                        scope.insert("event_value".to_string(), event.clone());
+                        if let Some(event_scope_path) = &event_scope_path_clone {
+                            inject_scope_path_merged(&mut scope, event_scope_path, event.clone());
+                        }
+                        let result = Self::eval_static_event_projection(
+                            &compiler_clone,
+                            &scope,
+                            &from_expr_clone,
+                            &to_expr_clone,
+                        );
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if item_param_clone == "cell" || item_param_clone == "item" {
+                            std::eprintln!(
+                                "[dd-static-item-event] item_param={} event_scope={:?} event={} scope_item={} result={}",
+                                item_param_clone,
+                                event_scope_path_clone,
+                                event,
+                                scope.get(&item_param_clone).cloned().unwrap_or(Value::Unit),
+                                result
+                            );
+                        }
+                        result
+                    }),
+                },
+            );
+            event_vars.push(event_var);
+        }
+
+        if event_vars.is_empty() {
+            return Ok(None);
+        }
+
+        let result_var = if event_vars.len() == 1 {
+            event_vars.pop().expect("single event var")
+        } else {
+            let concat_var = VarId::new(name);
+            self.collections
+                .insert(concat_var.clone(), CollectionSpec::Concat(event_vars));
+            concat_var
+        };
+
+        self.reactive_vars
+            .insert(name.to_string(), result_var.clone());
+        Ok(Some(result_var))
+    }
+
+    fn literal_expr_from_value(value: &Value) -> Option<Spanned<Expression>> {
+        let node = match value {
+            Value::Number(n) => Expression::Literal(Literal::Number(**n)),
+            Value::Text(text) => {
+                let source = SourceCode::new(text.to_string());
+                let slice = source.slice(0, text.len());
+                Expression::Literal(Literal::Text(slice))
+            }
+            Value::Tag(tag) => {
+                let source = SourceCode::new(tag.to_string());
+                let slice = source.slice(0, tag.len());
+                Expression::Literal(Literal::Tag(slice))
+            }
+            _ => return None,
+        };
+
+        Some(Spanned {
+            span: span_at(0),
+            persistence: None,
+            node,
+        })
+    }
+
+    fn eval_static_event_projection(
+        compiler: &Compiler,
+        scope: &IndexMap<String, Value>,
+        from_expr: &Spanned<Expression>,
+        to_expr: &Spanned<Expression>,
+    ) -> Value {
+        if let Expression::Then { body } = &to_expr.node {
+            return compiler.eval_static_tolerant(body, scope);
+        }
+
+        let from_value = compiler.eval_static_tolerant(from_expr, scope);
+        let Some(event_expr) = Self::literal_expr_from_value(&from_value) else {
+            return Value::Unit;
+        };
+
+        let piped_expr = Spanned {
+            span: to_expr.span,
+            persistence: None,
+            node: Expression::Pipe {
+                from: Box::new(event_expr),
+                to: Box::new(to_expr.clone()),
+            },
+        };
+
+        compiler.eval_static_tolerant(&piped_expr, scope)
+    }
+
     fn compile_list_latest(
         &mut self,
         name: &str,
@@ -5539,7 +6896,7 @@ impl<'a> GraphBuilder<'a> {
                     ["List", "retain"] => {
                         if let Some(keyed_var) = self.resolve_keyed_source(inner_from) {
                             let retain_var =
-                                self.compile_inline_keyed_retain(keyed_var, arguments)?;
+                                self.compile_inline_keyed_retain(keyed_var, arguments, &[])?;
                             let latest_var = VarId::new(name);
                             self.collections.insert(
                                 latest_var.clone(),
@@ -5552,6 +6909,14 @@ impl<'a> GraphBuilder<'a> {
                     }
                     ["List", "map"] => {
                         if let Some(keyed_var) = self.resolve_keyed_source(inner_from) {
+                            if let Some(event_var) = self.try_compile_inline_keyed_event_map(
+                                name,
+                                inner_from,
+                                keyed_var.clone(),
+                                arguments,
+                            )? {
+                                return Ok(event_var);
+                            }
                             let map_var =
                                 self.compile_inline_keyed_map(keyed_var, arguments)?;
                             let latest_var = VarId::new(name);
@@ -5562,6 +6927,11 @@ impl<'a> GraphBuilder<'a> {
                             self.reactive_vars
                                 .insert(name.to_string(), latest_var.clone());
                             return Ok(latest_var);
+                        }
+                        if let Some(event_var) =
+                            self.try_compile_inline_static_event_map(name, inner_from, arguments)?
+                        {
+                            return Ok(event_var);
                         }
                     }
                     _ => {}
@@ -5824,6 +7194,7 @@ impl<'a> GraphBuilder<'a> {
         &mut self,
         keyed_var: VarId,
         arguments: &[Spanned<Argument>],
+        scope_bindings: &[(String, Spanned<Expression>)],
     ) -> Result<VarId, String> {
         let item_param: String = arguments
             .iter()
@@ -5837,7 +7208,27 @@ impl<'a> GraphBuilder<'a> {
             .and_then(|a| a.node.value.as_ref())
             .ok_or_else(|| "List/retain missing 'if' argument".to_string())?;
 
-        let reactive_deps = self.find_reactive_deps_in_expr(predicate_expr);
+        let mut reactive_deps = self.find_reactive_deps_in_expr(predicate_expr);
+        for (_, binding_expr) in scope_bindings {
+            for dep in self.find_reactive_deps_in_expr(binding_expr) {
+                if !reactive_deps.contains(&dep) {
+                    reactive_deps.push(dep);
+                }
+            }
+        }
+        if reactive_deps.is_empty() {
+            for (_, binding_expr) in scope_bindings {
+                if let Some(dep) = self.ensure_text_alias_reactive_dep(binding_expr) {
+                    reactive_deps.push(dep);
+                    break;
+                }
+            }
+        }
+        if reactive_deps.is_empty() {
+            if let Some(dep) = self.ensure_text_alias_reactive_dep(predicate_expr) {
+                reactive_deps.push(dep);
+            }
+        }
 
         let retain_var = self.fresh_var("keyed_retain");
 
@@ -5846,6 +7237,7 @@ impl<'a> GraphBuilder<'a> {
             let compiler = self.compiler.clone();
             let pred_expr = predicate_expr.clone();
             let param_name = item_param;
+            let scope_bindings = scope_bindings.to_vec();
 
             self.collections.insert(
                 retain_var.clone(),
@@ -5854,6 +7246,7 @@ impl<'a> GraphBuilder<'a> {
                     predicate: Arc::new(move |item: &Value| {
                         let mut scope = indexmap::IndexMap::new();
                         scope.insert(param_name.clone(), item.clone());
+                        compiler.populate_scope_bindings_tolerant(&mut scope, &scope_bindings);
                         compiler
                             .eval_static_with_scope(&pred_expr, &scope)
                             .and_then(|v| Ok(v.as_bool().unwrap_or(false)))
@@ -5873,6 +7266,7 @@ impl<'a> GraphBuilder<'a> {
             let compiler = self.compiler.clone();
             let pred_expr = predicate_expr.clone();
             let param_name = item_param;
+            let scope_bindings = scope_bindings.to_vec();
             // Build the path parts for constructing __passed object.
             // reactive_dep = "store.selected_filter" → parts = ["store", "selected_filter"]
             let dep_parts: Vec<String> = reactive_dep.split('.').map(|s| s.to_string()).collect();
@@ -5908,6 +7302,7 @@ impl<'a> GraphBuilder<'a> {
                             passed_val = Value::Object(Arc::new(fields));
                         }
                         scope.insert(PASSED_VAR.to_string(), passed_val);
+                        compiler.populate_scope_bindings_tolerant(&mut scope, &scope_bindings);
                         compiler
                             .eval_static_with_scope(&pred_expr, &scope)
                             .and_then(|v| Ok(v.as_bool().unwrap_or(false)))
@@ -5919,6 +7314,93 @@ impl<'a> GraphBuilder<'a> {
 
         self.keyed_collection_vars.insert(retain_var.clone());
         Ok(retain_var)
+    }
+
+    fn ensure_text_alias_reactive_dep(
+        &mut self,
+        expr: &Spanned<Expression>,
+    ) -> Option<String> {
+        match &expr.node {
+            Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
+                let path = parts
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                self.ensure_text_state_var(&path)
+            }
+            Expression::Alias(Alias::WithPassed { extra_parts }) => {
+                let mut parts = vec![PASSED_VAR.to_string()];
+                parts.extend(extra_parts.iter().map(|p| p.as_str().to_string()));
+                self.ensure_text_state_var(&parts.join("."))
+            }
+            Expression::Pipe { from, to } => self
+                .ensure_text_alias_reactive_dep(from)
+                .or_else(|| self.ensure_text_alias_reactive_dep(to)),
+            Expression::FunctionCall { arguments, .. } => arguments
+                .iter()
+                .filter_map(|arg| arg.node.value.as_ref())
+                .find_map(|value| self.ensure_text_alias_reactive_dep(value)),
+            Expression::Block {
+                variables, output, ..
+            } => variables
+                .iter()
+                .find_map(|var| self.ensure_text_alias_reactive_dep(&var.node.value))
+                .or_else(|| self.ensure_text_alias_reactive_dep(output)),
+            Expression::When { arms } | Expression::While { arms } => arms
+                .iter()
+                .find_map(|arm| self.ensure_text_alias_reactive_dep(&arm.body)),
+            _ => None,
+        }
+    }
+
+    fn ensure_text_state_var(&mut self, path: &str) -> Option<String> {
+        let dep_name = path.strip_prefix("PASSED.").unwrap_or(path);
+        let dep_name = dep_name.strip_prefix("__passed.").unwrap_or(dep_name);
+        if !dep_name.ends_with(".text") {
+            return None;
+        }
+        let effective_name = if let Some(prefix) = &self.scope_prefix {
+            let first = dep_name.split('.').next().unwrap_or(dep_name);
+            let first_is_known = self.compiler.variables.iter().any(|(name, _)| {
+                name == first || name.starts_with(&format!("{first}."))
+            });
+            if dep_name.starts_with(&format!("{prefix}."))
+                || dep_name.starts_with("store.")
+                || dep_name.starts_with("theme_options.")
+                || first_is_known
+            {
+                dep_name.to_string()
+            } else {
+                format!("{prefix}.{dep_name}")
+            }
+        } else {
+            dep_name.to_string()
+        };
+        if self.reactive_vars.contains_key(&effective_name) {
+            return Some(effective_name);
+        }
+        let link_base = effective_name.strip_suffix(".text")?;
+        let change_path = format!("{}.event.change", link_base);
+        let input_id = self.add_input(InputKind::TextChange, Some(change_path));
+        let input_var = self.fresh_var("text_state_input");
+        self.collections
+            .insert(input_var.clone(), CollectionSpec::Input(input_id));
+
+        let default_var = self.fresh_var("text_state_default");
+        self.collections.insert(
+            default_var.clone(),
+            CollectionSpec::Literal(Value::text("")),
+        );
+
+        let state_var = VarId::new(effective_name.as_str());
+        self.collections.insert(
+            state_var.clone(),
+            CollectionSpec::HoldLatest(vec![default_var, input_var]),
+        );
+        self.reactive_vars
+            .insert(effective_name.clone(), state_var.clone());
+        Some(effective_name)
     }
 
     /// Inline-compile a `List/map(item, new: expr)` on a keyed source.
@@ -5982,7 +7464,11 @@ impl<'a> GraphBuilder<'a> {
 
         // Build keyed retain (if present) or use raw keyed var
         let map_source = if let Some(ref retain_args) = pipeline.retain_arguments {
-            self.compile_inline_keyed_retain(keyed_var.clone(), retain_args)?
+            self.compile_inline_keyed_retain(
+                keyed_var.clone(),
+                retain_args,
+                &pipeline.scope_bindings,
+            )?
         } else {
             keyed_var.clone()
         };
@@ -5992,33 +7478,183 @@ impl<'a> GraphBuilder<'a> {
         let compiler = self.compiler.clone();
         let map_new_expr = pipeline.map_new_expr.clone();
         let map_item_param = pipeline.map_item_param.clone();
+        let scope_bindings = pipeline.scope_bindings.clone();
         let initial_passed = self.initial_passed.clone();
         let list_path = format!(
             "store.{}",
             list_name.strip_prefix("store.").unwrap_or(list_name)
         );
+        let mut reactive_deps = self.find_reactive_deps_in_expr(&pipeline.map_new_expr);
+        for (_, binding_expr) in &pipeline.scope_bindings {
+            for dep in self.find_reactive_deps_in_expr(binding_expr) {
+                if !reactive_deps.contains(&dep) {
+                    reactive_deps.push(dep);
+                }
+            }
+        }
 
-        self.collections.insert(
-            display_var.clone(),
-            CollectionSpec::ListMapWithKey {
-                source: map_source,
-                f: Arc::new(move |key: &ListKey, item: &Value| {
-                    // Inject link paths and hover state before evaluating the element template
-                    let item_with_links =
-                        inject_item_link_paths_with_key(item, &list_path, key.0.as_ref());
-                    let mut scope = IndexMap::new();
-                    scope.insert(map_item_param.clone(), item_with_links);
-                    // Inject initial PASSED context captured from the program's
-                    // PASS argument so Theme functions can resolve colors/styles.
-                    if !matches!(&initial_passed, Value::Unit) {
-                        scope.insert(PASSED_VAR.to_string(), initial_passed.clone());
+        if reactive_deps.is_empty() {
+            self.collections.insert(
+                display_var.clone(),
+                CollectionSpec::ListMapWithKey {
+                    source: map_source,
+                    f: Arc::new(move |key: &ListKey, item: &Value| {
+                        let item_with_links =
+                            inject_item_link_paths_with_key(item, &list_path, key.0.as_ref());
+                        let mut scope = IndexMap::new();
+                        scope.insert(map_item_param.clone(), item_with_links);
+                        if !matches!(&initial_passed, Value::Unit) {
+                            scope.insert(PASSED_VAR.to_string(), initial_passed.clone());
+                        }
+                        compiler.populate_scope_bindings_tolerant(&mut scope, &scope_bindings);
+                        compiler.eval_static_tolerant(&map_new_expr, &scope)
+                    }),
+                },
+            );
+        } else {
+            let real_dep_names: Vec<String> = reactive_deps
+                .iter()
+                .filter(|name| {
+                    if name.contains(".__state") {
+                        return false;
                     }
-                    // Use tolerant eval — the map function body may contain
-                    // WHILE, WHEN, LINK patterns that need tolerance
-                    compiler.eval_static_tolerant(&map_new_expr, &scope)
-                }),
-            },
-        );
+                    if let Some(var_id) = self.reactive_vars.get(*name) {
+                        if let Some(spec) = self.collections.get(var_id) {
+                            if matches!(spec, CollectionSpec::SideEffect { .. }) {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+            if real_dep_names.is_empty() {
+                return Err("List/map display: no real reactive deps found".to_string());
+            }
+
+            let dep_var = if real_dep_names.len() == 1 {
+                let reactive_dep = real_dep_names[0].clone();
+                let reactive_var = self
+                    .reactive_vars
+                    .get(&reactive_dep)
+                    .cloned()
+                    .ok_or_else(|| format!("List/map display: reactive dep '{}' not found", reactive_dep))?;
+                if self.has_initial_value(&reactive_var) {
+                    reactive_var
+                } else {
+                    let dep_default = self.fresh_var("display_dep_default");
+                    self.collections.insert(
+                        dep_default.clone(),
+                        CollectionSpec::Literal(Value::Object(Arc::new(BTreeMap::from([(
+                            Arc::from(format!("{DEP_FIELD_PREFIX}0")),
+                            Value::Unit,
+                        )])))),
+                    );
+                    let dep_wrapped = self.fresh_var("display_dep_wrapped");
+                    self.collections.insert(
+                        dep_wrapped.clone(),
+                        CollectionSpec::Map {
+                            source: reactive_var,
+                            f: Arc::new(move |value: &Value| {
+                                Value::Object(Arc::new(BTreeMap::from([(
+                                    Arc::from(format!("{DEP_FIELD_PREFIX}0")),
+                                    value.clone(),
+                                )])))
+                            }),
+                        },
+                    );
+                    let dep_with_default = self.fresh_var("display_dep_with_default");
+                    self.collections.insert(
+                        dep_with_default.clone(),
+                        CollectionSpec::HoldLatest(vec![dep_default, dep_wrapped]),
+                    );
+                    dep_with_default
+                }
+            } else {
+                let first_var = self
+                    .reactive_vars
+                    .get(&real_dep_names[0])
+                    .cloned()
+                    .ok_or_else(|| format!("List/map display: reactive dep '{}' not found", real_dep_names[0]))?;
+                let second_var = self
+                    .reactive_vars
+                    .get(&real_dep_names[1])
+                    .cloned()
+                    .ok_or_else(|| format!("List/map display: reactive dep '{}' not found", real_dep_names[1]))?;
+                let mut current_var = self.fresh_var("display_joined_deps");
+                self.collections.insert(
+                    current_var.clone(),
+                    CollectionSpec::Join {
+                        left: first_var,
+                        right: second_var,
+                        combine: Arc::new(move |a: &Value, b: &Value| {
+                            Value::object([
+                                (format!("{DEP_FIELD_PREFIX}0"), a.clone()),
+                                (format!("{DEP_FIELD_PREFIX}1"), b.clone()),
+                            ])
+                        }),
+                    },
+                );
+
+                for (i, dep_name) in real_dep_names.iter().enumerate().skip(2) {
+                    let dep_var = self
+                        .reactive_vars
+                        .get(dep_name)
+                        .cloned()
+                        .ok_or_else(|| format!("List/map display: reactive dep '{}' not found", dep_name))?;
+                    let prev = current_var.clone();
+                    current_var = self.fresh_var("display_joined_deps");
+                    let idx = i;
+                    self.collections.insert(
+                        current_var.clone(),
+                        CollectionSpec::Join {
+                            left: prev,
+                            right: dep_var,
+                            combine: Arc::new(move |combined: &Value, new_dep: &Value| {
+                                let key = format!("{DEP_FIELD_PREFIX}{idx}");
+                                combined.update_field(&key, new_dep.clone())
+                            }),
+                        },
+                    );
+                }
+
+                current_var
+            };
+            let dep_names = real_dep_names.clone();
+
+            self.collections.insert(
+                display_var.clone(),
+                CollectionSpec::ListMapWithKeyReactive {
+                    source: map_source,
+                    dep: dep_var,
+                    f: Arc::new(move |key: &ListKey, item: &Value, dep: &Value| {
+                        let item_with_links =
+                            inject_item_link_paths_with_key(item, &list_path, key.0.as_ref());
+                        let mut scope = IndexMap::new();
+                        scope.insert(map_item_param.clone(), item_with_links);
+
+                        let mut passed_val = if matches!(&initial_passed, Value::Unit) {
+                            Value::Object(Arc::new(BTreeMap::new()))
+                        } else {
+                            initial_passed.clone()
+                        };
+                        for (idx, dep_name) in dep_names.iter().enumerate() {
+                            let dep_value = dep
+                                .get_field(&format!("{DEP_FIELD_PREFIX}{idx}"))
+                                .cloned()
+                                .unwrap_or(Value::Unit);
+                            inject_scope_path(&mut scope, dep_name, dep_value.clone());
+                            passed_val = set_nested_field(&passed_val, dep_name, dep_value);
+                        }
+                        scope.insert(PASSED_VAR.to_string(), passed_val);
+
+                        compiler.populate_scope_bindings_tolerant(&mut scope, &scope_bindings);
+                        compiler.eval_static_tolerant(&map_new_expr, &scope)
+                    }),
+                },
+            );
+        }
         self.keyed_collection_vars.insert(display_var.clone());
         Ok(display_var)
     }
@@ -6067,8 +7703,8 @@ impl<'a> GraphBuilder<'a> {
         // The keyed name without "store." prefix for matching PASSED.store.<name>
         let short_name = list_name.strip_prefix("store.").unwrap_or(list_name);
 
-        for (_fn_name, _params, body) in &self.compiler.functions {
-            if let Some(info) = self.find_display_pipeline_in_expr(body, short_name) {
+        for (_fn_name, _params, body) in self.compiler.functions.iter() {
+            if let Some(info) = self.find_display_pipeline_in_expr(body, short_name, &[]) {
                 return Some(info);
             }
         }
@@ -6080,6 +7716,7 @@ impl<'a> GraphBuilder<'a> {
         &self,
         expr: &Spanned<Expression>,
         list_short_name: &str,
+        scope_bindings: &[(String, Spanned<Expression>)],
     ) -> Option<DisplayPipelineInfo> {
         match &expr.node {
             // Check Element/stripe calls for items: argument with the pattern
@@ -6092,7 +7729,11 @@ impl<'a> GraphBuilder<'a> {
                     {
                         if let Some(ref items_expr) = items_arg.node.value {
                             if let Some(info) =
-                                self.match_display_pipeline_pattern(items_expr, list_short_name)
+                                self.match_display_pipeline_pattern(
+                                    items_expr,
+                                    list_short_name,
+                                    scope_bindings,
+                                )
                             {
                                 return Some(info);
                             }
@@ -6103,7 +7744,11 @@ impl<'a> GraphBuilder<'a> {
                 for arg in arguments {
                     if let Some(ref val_expr) = arg.node.value {
                         if let Some(info) =
-                            self.find_display_pipeline_in_expr(val_expr, list_short_name)
+                            self.find_display_pipeline_in_expr(
+                                val_expr,
+                                list_short_name,
+                                scope_bindings,
+                            )
                         {
                             return Some(info);
                         }
@@ -6111,31 +7756,46 @@ impl<'a> GraphBuilder<'a> {
                 }
             }
             Expression::Pipe { from, to } => {
-                if let Some(info) = self.find_display_pipeline_in_expr(from, list_short_name) {
+                if let Some(info) =
+                    self.find_display_pipeline_in_expr(from, list_short_name, scope_bindings)
+                {
                     return Some(info);
                 }
-                if let Some(info) = self.find_display_pipeline_in_expr(to, list_short_name) {
+                if let Some(info) =
+                    self.find_display_pipeline_in_expr(to, list_short_name, scope_bindings)
+                {
                     return Some(info);
                 }
             }
             Expression::Block {
                 variables, output, ..
             } => {
+                let mut nested_bindings = scope_bindings.to_vec();
                 for var in variables {
-                    if let Some(info) =
-                        self.find_display_pipeline_in_expr(&var.node.value, list_short_name)
+                    if let Some(info) = self.find_display_pipeline_in_expr(
+                        &var.node.value,
+                        list_short_name,
+                        &nested_bindings,
+                    )
                     {
                         return Some(info);
                     }
+                    nested_bindings.push((var.node.name.as_str().to_string(), var.node.value.clone()));
                 }
-                if let Some(info) = self.find_display_pipeline_in_expr(output, list_short_name) {
+                if let Some(info) =
+                    self.find_display_pipeline_in_expr(output, list_short_name, &nested_bindings)
+                {
                     return Some(info);
                 }
             }
             Expression::While { arms } | Expression::When { arms } => {
                 for arm in arms {
                     if let Some(info) =
-                        self.find_display_pipeline_in_expr(&arm.body, list_short_name)
+                        self.find_display_pipeline_in_expr(
+                            &arm.body,
+                            list_short_name,
+                            scope_bindings,
+                        )
                     {
                         return Some(info);
                     }
@@ -6143,7 +7803,9 @@ impl<'a> GraphBuilder<'a> {
             }
             Expression::List { items } => {
                 for item in items {
-                    if let Some(info) = self.find_display_pipeline_in_expr(item, list_short_name) {
+                    if let Some(info) =
+                        self.find_display_pipeline_in_expr(item, list_short_name, scope_bindings)
+                    {
                         return Some(info);
                     }
                 }
@@ -6161,6 +7823,7 @@ impl<'a> GraphBuilder<'a> {
         &self,
         expr: &Spanned<Expression>,
         list_short_name: &str,
+        scope_bindings: &[(String, Spanned<Expression>)],
     ) -> Option<DisplayPipelineInfo> {
         if let Expression::Pipe {
             from: outer_from,
@@ -6210,6 +7873,7 @@ impl<'a> GraphBuilder<'a> {
                                     retain_arguments: Some(retain_args.clone()),
                                     map_item_param,
                                     map_new_expr,
+                                    scope_bindings: scope_bindings.to_vec(),
                                 });
                             }
                         }
@@ -6222,6 +7886,7 @@ impl<'a> GraphBuilder<'a> {
                         retain_arguments: None,
                         map_item_param,
                         map_new_expr,
+                        scope_bindings: scope_bindings.to_vec(),
                     });
                 }
             }
@@ -6513,7 +8178,6 @@ impl<'a> GraphBuilder<'a> {
                 _ => false,
             }
         });
-
         if has_wildcard_ops {
             return self.build_keyed_list_holdstate(name, initial_list_expr, ops);
         }
@@ -6522,10 +8186,20 @@ impl<'a> GraphBuilder<'a> {
         let mut remove_counter = 0u32;
 
         // Evaluate initial list statically
-        let initial_list = self
-            .compiler
-            .eval_static(initial_list_expr)
-            .unwrap_or_else(|_| Value::empty_list());
+        let initial_list = if let Expression::List { items } = &initial_list_expr.node {
+            let mut fields = BTreeMap::new();
+            for (i, item) in items.iter().enumerate() {
+                let val = self.compiler.eval_static_tolerant(item, &IndexMap::new());
+                fields.insert(Arc::from(format!("{:04}", i)), val);
+            }
+            Value::Tagged {
+                tag: Arc::from(LIST_TAG),
+                fields: Arc::new(fields),
+            }
+        } else {
+            self.compiler
+                .eval_static_tolerant(initial_list_expr, &IndexMap::new())
+        };
 
         // Process each operation (they were collected outermost-first, so reverse to get pipeline order)
         for op in ops.iter().rev() {
@@ -6716,11 +8390,24 @@ impl<'a> GraphBuilder<'a> {
     ) -> Result<VarId, String> {
         use super::types::ClassifyFn;
 
-        // Evaluate initial list statically
-        let initial_list = self
-            .compiler
-            .eval_static(initial_list_expr)
-            .unwrap_or_else(|_| Value::empty_list());
+        // Evaluate initial list statically.
+        // For keyed CRUD-style lists, evaluate items one by one so we can
+        // tolerate reactive fields inside constructor calls without hanging
+        // the whole list build on a single recursive path.
+        let initial_list = if let Expression::List { items } = &initial_list_expr.node {
+            let mut fields = BTreeMap::new();
+            for (i, item) in items.iter().enumerate() {
+                let val = self.compiler.eval_static_tolerant(item, &IndexMap::new());
+                fields.insert(Arc::from(format!("{:04}", i)), val);
+            }
+            Value::Tagged {
+                tag: Arc::from(LIST_TAG),
+                fields: Arc::new(fields),
+            }
+        } else {
+            self.compiler
+                .eval_static_tolerant(initial_list_expr, &IndexMap::new())
+        };
 
         // Get effective initial (with persistence)
         let effective_initial = self
@@ -6880,9 +8567,106 @@ impl<'a> GraphBuilder<'a> {
             },
         );
 
+        let keyed_transform: HoldTransformFn = Arc::new(|state: &Value, event: &Value| {
+            let event_type = event
+                .get_field("type")
+                .and_then(|v| v.as_text())
+                .unwrap_or("")
+                .to_string();
+
+            match event_type.as_str() {
+                "remove" => Value::Unit,
+                "checkbox_click" => {
+                    let completed = state
+                        .get_field("completed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    state.update_field(
+                        "completed",
+                        if !completed {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        },
+                    )
+                }
+                "double_click" => {
+                    let title = state
+                        .get_field("title")
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("")
+                        .to_string();
+                    state
+                        .update_field("editing", Value::tag("True"))
+                        .update_field("__edit_text", Value::text(title.as_str()))
+                }
+                "edit_key_enter" => {
+                    let edit_text = state
+                        .get_field("__edit_text")
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("")
+                        .to_string();
+                    let trimmed = edit_text.trim();
+                    if !trimmed.is_empty() {
+                        state
+                            .update_field("title", Value::text(trimmed))
+                            .update_field("editing", Value::tag("False"))
+                    } else {
+                        state.clone()
+                    }
+                }
+                "edit_key_escape" => state.update_field("editing", Value::tag("False")),
+                "edit_text_change" => {
+                    let text = event
+                        .get_field("text")
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("");
+                    state.update_field("__edit_text", Value::text(text))
+                }
+                "edit_blur" => {
+                    let edit_text = state
+                        .get_field("__edit_text")
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("")
+                        .to_string();
+                    let trimmed = edit_text.trim();
+                    if !trimmed.is_empty() {
+                        state
+                            .update_field("title", Value::text(trimmed))
+                            .update_field("editing", Value::tag("False"))
+                    } else {
+                        state.update_field("editing", Value::tag("False"))
+                    }
+                }
+                "hover_change" => {
+                    let hovered = event
+                        .get_field("hovered")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    state.update_field(
+                        HOVERED_FIELD,
+                        if hovered {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        },
+                    )
+                }
+                _ => state.clone(),
+            }
+        });
+
+        // Register the keyed membership stream early so forward dependents like
+        // `store.selected_id` can compile against stable per-item identity
+        // without introducing a cycle through the final keyed hold state.
+        self.keyed_hold_vars
+            .insert(name.to_string(), membership_var.clone());
+        self.keyed_collection_vars.insert(membership_var.clone());
+
         // 5. Detect broadcast sources (toggle_all, remove_completed)
         let mut broadcast_vars: Vec<VarId> = Vec::new();
         let mut has_broadcasts = false;
+        let mut custom_broadcast_handlers: Vec<BroadcastHandlerFn> = Vec::new();
 
         // Toggle-all: check if the store has a toggle_all_checkbox LINK
         if let Some(toggle_expr) = self
@@ -6919,18 +8703,126 @@ impl<'a> GraphBuilder<'a> {
                 if let Some(on_expr) = on_arg {
                     if Self::expr_references_name(on_expr, "item") {
                         if let Expression::Pipe { from, to } = &on_expr.node {
-                            if matches!(&to.node, Expression::Then { .. }) {
+                            if let Expression::Then { body } = &to.node {
                                 if !Self::expr_references_name(from, "item") {
                                     let (event_var, _) = self.compile_event_source(from)?;
-                                    let remove_then_var = self.fresh_var("remove_completed_then");
-                                    self.collections.insert(
-                                        remove_then_var.clone(),
-                                        CollectionSpec::Then {
-                                            source: event_var,
-                                            body: Arc::new(|_| Value::tag("remove_completed")),
-                                        },
-                                    );
-                                    broadcast_vars.push(remove_then_var);
+                                    let reactive_deps = self.find_reactive_deps_in_expr(body);
+                                    if reactive_deps.is_empty() {
+                                        let remove_then_var =
+                                            self.fresh_var("remove_completed_then");
+                                        self.collections.insert(
+                                            remove_then_var.clone(),
+                                            CollectionSpec::Then {
+                                                source: event_var,
+                                                body: Arc::new(|_| {
+                                                    Value::tag("remove_completed")
+                                                }),
+                                            },
+                                        );
+                                        broadcast_vars.push(remove_then_var);
+                                    } else {
+                                        let reactive_dep = reactive_deps[0].clone();
+                                        let dep_var = if let Some(dep_var) =
+                                            self.reactive_vars.get(&reactive_dep).cloned()
+                                        {
+                                            dep_var
+                                        } else if let Some(dep_expr) = self
+                                            .compiler
+                                            .get_var_expr(&reactive_dep)
+                                            .cloned()
+                                        {
+                                            self.compile_reactive_var(&reactive_dep, &dep_expr)?
+                                        } else {
+                                            return Err(format!(
+                                                "Keyed remove: reactive dep '{}' not found",
+                                                reactive_dep
+                                            ));
+                                        };
+                                        let remove_tag =
+                                            format!("broadcast_remove_{}", custom_broadcast_handlers.len());
+                                        let tag_clone = remove_tag.clone();
+                                        let sample_var =
+                                            self.fresh_var("remove_broadcast_sample");
+                                        self.collections.insert(
+                                            sample_var.clone(),
+                                            CollectionSpec::SampleOnEvent {
+                                                event: event_var,
+                                                dep: dep_var,
+                                                f: Arc::new(move |_event: &Value, dep: &Value| {
+                                                    let mut fields = BTreeMap::new();
+                                                    fields.insert(
+                                                        Arc::from("__t"),
+                                                        Value::text(tag_clone.as_str()),
+                                                    );
+                                                    fields.insert(
+                                                        Arc::from(format!("{DEP_FIELD_PREFIX}0")),
+                                                        dep.clone(),
+                                                    );
+                                                    Value::Object(Arc::new(fields))
+                                                }),
+                                            },
+                                        );
+                                        broadcast_vars.push(sample_var);
+
+                                        let compiler = self.compiler.clone();
+                                        let body_expr = body.as_ref().clone();
+                                        let dep_name = reactive_dep.clone();
+                                        let handler_tag = remove_tag.clone();
+                                        custom_broadcast_handlers.push(Arc::new(
+                                            move |states, event| {
+                                                if event
+                                                    .get_field("__t")
+                                                    .and_then(|v| v.as_text())
+                                                    != Some(handler_tag.as_str())
+                                                {
+                                                    return Vec::new();
+                                                }
+                                                        let dep_value = event
+                                                            .get_field(&format!("{DEP_FIELD_PREFIX}0"))
+                                                            .cloned()
+                                                            .unwrap_or(Value::Unit);
+                                                states
+                                                    .iter()
+                                                    .filter_map(|(key, item)| {
+                                                        let mut scope = IndexMap::new();
+                                                        scope.insert("item".to_string(), item.clone());
+                                                        inject_scope_path(
+                                                            &mut scope,
+                                                            &dep_name,
+                                                            dep_value.clone(),
+                                                        );
+                                                        let mut passed =
+                                                            Value::Object(Arc::new(BTreeMap::new()));
+                                                        passed = set_nested_field(
+                                                            &passed,
+                                                            &dep_name,
+                                                            dep_value.clone(),
+                                                        );
+                                                        scope.insert(
+                                                            PASSED_VAR.to_string(),
+                                                            passed,
+                                                        );
+                                                        let result = compiler
+                                                            .eval_static_tolerant(&body_expr, &scope);
+                                                        #[cfg(not(target_arch = "wasm32"))]
+                                                        std::eprintln!(
+                                                            "[dd-broadcast-remove] dep_name={} key={} dep={} item={} result={}",
+                                                            dep_name,
+                                                            key,
+                                                            dep_value,
+                                                            item,
+                                                            result
+                                                        );
+                                                        if matches!(result, Value::Unit) {
+                                                            None
+                                                        } else {
+                                                            Some((key.clone(), None))
+                                                        }
+                                                    })
+                                                    .collect()
+                                            },
+                                        ));
+                                    }
                                     has_broadcasts = true;
                                 }
                             }
@@ -7007,10 +8899,11 @@ impl<'a> GraphBuilder<'a> {
 
         // Build broadcast handler
         let broadcast_handler: Option<BroadcastHandlerFn> = if has_broadcasts {
+            let custom_handlers = custom_broadcast_handlers.clone();
             Some(Arc::new(
-                |states: &std::collections::HashMap<ListKey, Value>, event: &Value| {
+                move |states: &std::collections::HashMap<ListKey, Value>, event: &Value| {
                     let event_tag = event.as_tag().unwrap_or("");
-                    match event_tag {
+                    let mut results = match event_tag {
                         "toggle_all" => {
                             let all_completed = !states.is_empty()
                                 && states.values().all(|item| {
@@ -7048,7 +8941,11 @@ impl<'a> GraphBuilder<'a> {
                             })
                             .collect(),
                         _ => Vec::new(),
+                    };
+                    for handler in &custom_handlers {
+                        results.extend(handler(states, event));
                     }
+                    results
                 },
             ))
         } else {
@@ -7057,7 +8954,6 @@ impl<'a> GraphBuilder<'a> {
 
         // 6. KeyedHoldState: per-item state with self-removal sentinel + broadcast support
         let keyed_hold_var = self.fresh_var("keyed_hold");
-        // Store the keyed var for downstream keyed operators (ListCount, ListRetain)
         self.keyed_hold_vars
             .insert(name.to_string(), keyed_hold_var.clone());
         self.keyed_collection_vars.insert(keyed_hold_var.clone());
@@ -7066,94 +8962,7 @@ impl<'a> GraphBuilder<'a> {
             CollectionSpec::KeyedHoldState {
                 initial: membership_var,
                 events: wildcard_keyed_var,
-                transform: Arc::new(|state: &Value, event: &Value| {
-                    let event_type = event
-                        .get_field("type")
-                        .and_then(|v| v.as_text())
-                        .unwrap_or("")
-                        .to_string();
-
-                    match event_type.as_str() {
-                        "remove" => Value::Unit, // Self-removal sentinel
-                        "checkbox_click" => {
-                            let completed = state
-                                .get_field("completed")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            state.update_field(
-                                "completed",
-                                if !completed {
-                                    Value::tag("True")
-                                } else {
-                                    Value::tag("False")
-                                },
-                            )
-                        }
-                        "double_click" => {
-                            let title = state
-                                .get_field("title")
-                                .and_then(|v| v.as_text())
-                                .unwrap_or("")
-                                .to_string();
-                            state
-                                .update_field("editing", Value::tag("True"))
-                                .update_field("__edit_text", Value::text(title.as_str()))
-                        }
-                        "edit_key_enter" => {
-                            let edit_text = state
-                                .get_field("__edit_text")
-                                .and_then(|v| v.as_text())
-                                .unwrap_or("")
-                                .to_string();
-                            let trimmed = edit_text.trim();
-                            if !trimmed.is_empty() {
-                                state
-                                    .update_field("title", Value::text(trimmed))
-                                    .update_field("editing", Value::tag("False"))
-                            } else {
-                                state.clone()
-                            }
-                        }
-                        "edit_key_escape" => state.update_field("editing", Value::tag("False")),
-                        "edit_text_change" => {
-                            let text = event
-                                .get_field("text")
-                                .and_then(|v| v.as_text())
-                                .unwrap_or("");
-                            state.update_field("__edit_text", Value::text(text))
-                        }
-                        "edit_blur" => {
-                            let edit_text = state
-                                .get_field("__edit_text")
-                                .and_then(|v| v.as_text())
-                                .unwrap_or("")
-                                .to_string();
-                            let trimmed = edit_text.trim();
-                            if !trimmed.is_empty() {
-                                state
-                                    .update_field("title", Value::text(trimmed))
-                                    .update_field("editing", Value::tag("False"))
-                            } else {
-                                state.update_field("editing", Value::tag("False"))
-                            }
-                        }
-                        "hover_change" => {
-                            let hovered = event
-                                .get_field("hovered")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            state.update_field(
-                                HOVERED_FIELD,
-                                if hovered {
-                                    Value::tag("True")
-                                } else {
-                                    Value::tag("False")
-                                },
-                            )
-                        }
-                        _ => state.clone(),
-                    }
-                }),
+                transform: keyed_transform,
                 broadcasts: broadcasts_var,
                 broadcast_handler,
             },
@@ -7216,6 +9025,10 @@ impl<'a> GraphBuilder<'a> {
             Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
                 parts.first().map(|p| p.as_str() == name).unwrap_or(false)
             }
+            Expression::Alias(Alias::WithPassed { extra_parts }) => extra_parts
+                .first()
+                .map(|p| p.as_str() == name)
+                .unwrap_or(false),
             Expression::Pipe { from, to } => {
                 Self::expr_references_name(from, name) || Self::expr_references_name(to, name)
             }
@@ -7226,6 +9039,59 @@ impl<'a> GraphBuilder<'a> {
             Expression::While { arms } => arms
                 .iter()
                 .any(|a| Self::expr_references_name(&a.body, name)),
+            Expression::Comparator(cmp) => match cmp {
+                static_expression::Comparator::Equal {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::NotEqual {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::Greater {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::Less {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::GreaterOrEqual {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::LessOrEqual {
+                    operand_a,
+                    operand_b,
+                } => {
+                    Self::expr_references_name(operand_a, name)
+                        || Self::expr_references_name(operand_b, name)
+                }
+            },
+            Expression::ArithmeticOperator(op) => match op {
+                ArithmeticOperator::Add {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Subtract {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Multiply {
+                    operand_a,
+                    operand_b,
+                }
+                | ArithmeticOperator::Divide {
+                    operand_a,
+                    operand_b,
+                } => {
+                    Self::expr_references_name(operand_a, name)
+                        || Self::expr_references_name(operand_b, name)
+                }
+                ArithmeticOperator::Negate { operand } => {
+                    Self::expr_references_name(operand, name)
+                }
+            },
             Expression::FunctionCall { arguments, .. } => arguments.iter().any(|a| {
                 a.node
                     .value
@@ -7233,6 +9099,11 @@ impl<'a> GraphBuilder<'a> {
                     .map(|v| Self::expr_references_name(v, name))
                     .unwrap_or(false)
             }),
+            Expression::List { items } => items.iter().any(|v| Self::expr_references_name(v, name)),
+            Expression::Object(object) => object
+                .variables
+                .iter()
+                .any(|v| Self::expr_references_name(&v.node.value, name)),
             Expression::Block { variables, output } => {
                 variables
                     .iter()
@@ -7336,16 +9207,131 @@ impl<'a> GraphBuilder<'a> {
         None
     }
 
+    fn resolve_keyed_source_path(&self, expr: &Spanned<Expression>) -> Option<String> {
+        match &expr.node {
+            Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
+                let path = parts
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if parts.len() == 1 {
+                    if let Some(prefix) = &self.scope_prefix {
+                        let first_seg_is_known = self.compiler.variables.iter().any(|(n, _)| {
+                            n == &path || n.starts_with(&format!("{path}."))
+                        });
+                        if !first_seg_is_known {
+                            return Some(format!("{prefix}.{path}"));
+                        }
+                    }
+                }
+                Some(path)
+            }
+            Expression::Alias(Alias::WithPassed { extra_parts }) => Some(
+                extra_parts
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            ),
+            Expression::Pipe { from, .. } => self.resolve_keyed_source_path(from),
+            _ => None,
+        }
+    }
+
+    fn resolve_static_source_name(expr: &Spanned<Expression>) -> Option<String> {
+        match &expr.node {
+            Expression::Alias(Alias::WithoutPassed { parts, .. }) => Some(
+                parts.iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            ),
+            _ => None,
+        }
+    }
+
+    fn resolve_static_item_event_path(
+        expr: &Spanned<Expression>,
+        item_param: &str,
+        item: &Value,
+    ) -> Option<(InputKind, String)> {
+        let Expression::Alias(Alias::WithoutPassed { parts, .. }) = &expr.node else {
+            return None;
+        };
+        if parts.first()?.as_str() != item_param || parts.len() < 2 {
+            return None;
+        }
+
+        let suffix_parts: Vec<&str> = parts[1..].iter().map(|p| p.as_str()).collect();
+        let mut current = item.clone();
+
+        for (idx, part) in suffix_parts.iter().enumerate() {
+            if let Some(base) = current.get_field(LINK_PATH_FIELD).and_then(|v| v.as_text()) {
+                let rest = suffix_parts[idx..].join(".");
+                let full_path = if rest.is_empty() {
+                    base.to_string()
+                } else {
+                    format!("{base}.{rest}")
+                };
+                return Some(Self::detect_event_kind_and_path(&full_path));
+            }
+            current = current.get_field(part).cloned()?;
+        }
+
+        current
+            .get_field(LINK_PATH_FIELD)
+            .and_then(|v| v.as_text())
+            .map(|path| Self::detect_event_kind_and_path(path))
+    }
+
+    fn extract_item_event_suffix(
+        expr: &Spanned<Expression>,
+        item_param: &str,
+    ) -> Option<String> {
+        match &expr.node {
+            Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
+                if parts.first()?.as_str() != item_param || parts.len() < 2 {
+                    return None;
+                }
+                Some(
+                    parts[1..]
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                )
+            }
+            _ => None,
+        }
+    }
+
     /// Find reactive variable names referenced in an expression.
     fn find_reactive_deps_in_expr(&self, expr: &Spanned<Expression>) -> Vec<String> {
         let mut deps = Vec::new();
-        self.collect_reactive_deps(expr, &mut deps);
+        let mut visited_functions = std::collections::HashSet::new();
+        self.collect_reactive_deps(expr, &mut deps, &mut visited_functions);
         deps
     }
 
-    fn collect_reactive_deps(&self, expr: &Spanned<Expression>, deps: &mut Vec<String>) {
+    fn collect_reactive_deps(
+        &self,
+        expr: &Spanned<Expression>,
+        deps: &mut Vec<String>,
+        visited_functions: &mut std::collections::HashSet<String>,
+    ) {
         match &expr.node {
+            Expression::Variable(var) => {
+                self.collect_reactive_deps(&var.value, deps, visited_functions);
+            }
             Expression::Alias(alias) => {
+                let is_known_reactive = |name: &str| {
+                    self.reactive_vars.contains_key(name)
+                        || self
+                            .compiler
+                            .get_var_expr(name)
+                            .is_some_and(|expr| self.compiler.is_reactive(expr))
+                };
                 // Build the full alias path and check if it (or a prefix) is a reactive var
                 let path = match alias {
                     Alias::WithoutPassed { parts, .. } => parts
@@ -7365,30 +9351,44 @@ impl<'a> GraphBuilder<'a> {
                 } else {
                     path.clone()
                 };
-                if self.reactive_vars.contains_key(&full_path) {
+                if is_known_reactive(&full_path) {
                     deps.push(full_path);
-                } else if self.reactive_vars.contains_key(&path) {
+                } else if is_known_reactive(&path) {
                     deps.push(path);
                 } else if let Some(without_passed) = path.strip_prefix("PASSED.") {
                     // PASSED.store.X → store.X in reactive_vars
-                    if self.reactive_vars.contains_key(without_passed) {
+                    if is_known_reactive(without_passed) {
                         deps.push(without_passed.to_string());
                     }
                 }
             }
             Expression::Pipe { from, to } => {
-                self.collect_reactive_deps(from, deps);
-                self.collect_reactive_deps(to, deps);
+                self.collect_reactive_deps(from, deps, visited_functions);
+                self.collect_reactive_deps(to, deps, visited_functions);
             }
             Expression::When { arms } => {
                 for arm in arms {
-                    self.collect_reactive_deps(&arm.body, deps);
+                    self.collect_reactive_deps(&arm.body, deps, visited_functions);
                 }
             }
-            Expression::FunctionCall { arguments, .. } => {
+            Expression::FunctionCall { path, arguments } => {
                 for arg in arguments {
                     if let Some(ref value) = arg.node.value {
-                        self.collect_reactive_deps(value, deps);
+                        self.collect_reactive_deps(value, deps, visited_functions);
+                    }
+                }
+
+                let fn_name = path
+                    .iter()
+                    .map(|segment| segment.as_str())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if let Some((qualified_name, _params, body)) =
+                    self.compiler.find_function(&fn_name)
+                {
+                    if visited_functions.insert(qualified_name.clone()) {
+                        self.collect_reactive_deps(body, deps, visited_functions);
+                        visited_functions.remove(qualified_name.as_str());
                     }
                 }
             }
@@ -7409,13 +9409,108 @@ impl<'a> GraphBuilder<'a> {
                     operand_a,
                     operand_b,
                 } => {
-                    self.collect_reactive_deps(operand_a, deps);
-                    self.collect_reactive_deps(operand_b, deps);
+                    self.collect_reactive_deps(operand_a, deps, visited_functions);
+                    self.collect_reactive_deps(operand_b, deps, visited_functions);
                 }
                 ArithmeticOperator::Negate { operand } => {
-                    self.collect_reactive_deps(operand, deps);
+                    self.collect_reactive_deps(operand, deps, visited_functions);
                 }
             },
+            Expression::Comparator(op) => match op {
+                Comparator::Equal {
+                    operand_a,
+                    operand_b,
+                }
+                | Comparator::NotEqual {
+                    operand_a,
+                    operand_b,
+                } => {
+                    self.collect_reactive_deps(operand_a, deps, visited_functions);
+                    self.collect_reactive_deps(operand_b, deps, visited_functions);
+                }
+                Comparator::Greater {
+                    operand_a,
+                    operand_b,
+                }
+                | Comparator::GreaterOrEqual {
+                    operand_a,
+                    operand_b,
+                }
+                | Comparator::Less {
+                    operand_a,
+                    operand_b,
+                }
+                | Comparator::LessOrEqual {
+                    operand_a,
+                    operand_b,
+                } => {
+                    self.collect_reactive_deps(operand_a, deps, visited_functions);
+                    self.collect_reactive_deps(operand_b, deps, visited_functions);
+                }
+            },
+            Expression::While { arms } => {
+                for arm in arms {
+                    self.collect_reactive_deps(&arm.body, deps, visited_functions);
+                }
+            }
+            Expression::Then { body } => {
+                self.collect_reactive_deps(body, deps, visited_functions);
+            }
+            Expression::Latest { inputs } => {
+                for input in inputs {
+                    self.collect_reactive_deps(input, deps, visited_functions);
+                }
+            }
+            Expression::TextLiteral { parts, .. } => {
+                for part in parts {
+                    if let TextPart::Interpolation { var, .. } = part {
+                        let path = var.as_str().to_string();
+                        let full_path = if let Some(ref prefix) = self.scope_prefix {
+                            format!("{}.{}", prefix, path)
+                        } else {
+                            path.clone()
+                        };
+                        let is_known_reactive = |name: &str| {
+                            self.reactive_vars.contains_key(name)
+                                || self
+                                    .compiler
+                                    .get_var_expr(name)
+                                    .is_some_and(|expr| self.compiler.is_reactive(expr))
+                        };
+                        if is_known_reactive(&full_path) {
+                            deps.push(full_path);
+                        } else if is_known_reactive(&path) {
+                            deps.push(path);
+                        } else if let Some(without_passed) = path.strip_prefix("PASSED.") {
+                            if is_known_reactive(without_passed) {
+                                deps.push(without_passed.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Expression::Block { variables, output } => {
+                for variable in variables {
+                    self.collect_reactive_deps(&variable.node.value, deps, visited_functions);
+                }
+                self.collect_reactive_deps(output, deps, visited_functions);
+            }
+            Expression::Object(obj) => {
+                for variable in &obj.variables {
+                    self.collect_reactive_deps(&variable.node.value, deps, visited_functions);
+                }
+            }
+            Expression::List { items } => {
+                for item in items {
+                    self.collect_reactive_deps(item, deps, visited_functions);
+                }
+            }
+            Expression::Hold { body, .. } => {
+                self.collect_reactive_deps(body, deps, visited_functions);
+            }
+            Expression::PostfixFieldAccess { expr, .. } => {
+                self.collect_reactive_deps(expr, deps, visited_functions);
+            }
             _ => {}
         }
     }
@@ -7439,6 +9534,7 @@ impl<'a> GraphBuilder<'a> {
             }
             Some(CollectionSpec::Map { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::Then { source, .. }) => self.has_initial_value(source),
+            Some(CollectionSpec::SampleOnEvent { .. }) => false,
             Some(CollectionSpec::FlatMap { .. }) => {
                 // FlatMap (when_match) may filter items — can't guarantee initial value
                 false
@@ -7452,6 +9548,9 @@ impl<'a> GraphBuilder<'a> {
             Some(CollectionSpec::Concat(sources)) => {
                 sources.iter().any(|s| self.has_initial_value(s))
             }
+            Some(CollectionSpec::CombineLatest(sources)) => {
+                sources.iter().all(|s| self.has_initial_value(s))
+            }
             Some(CollectionSpec::Skip { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::SideEffect { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::ListAssemble(source)) => self.has_initial_value(source),
@@ -7462,6 +9561,9 @@ impl<'a> GraphBuilder<'a> {
             }) => self.has_initial_value(list) && self.has_initial_value(filter_state),
             Some(CollectionSpec::ListMap { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::ListMapWithKey { source, .. }) => self.has_initial_value(source),
+            Some(CollectionSpec::ListMapWithKeyReactive { source, dep, .. }) => {
+                self.has_initial_value(source) && self.has_initial_value(dep)
+            }
             Some(CollectionSpec::ListAppend { list, .. }) => self.has_initial_value(list),
             Some(CollectionSpec::ListRemove { list, .. }) => self.has_initial_value(list),
             Some(CollectionSpec::ListLatest(source)) => {
@@ -7477,6 +9579,7 @@ impl<'a> GraphBuilder<'a> {
             Some(CollectionSpec::ListEvery { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::ListAny { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::MapToKeyed { .. }) => false, // Event stream, no initial value
+            Some(CollectionSpec::KeyedEventMap { .. }) => false, // Event stream, no initial value
             Some(CollectionSpec::AppendNewKeyed { .. }) => false, // Event stream, no initial value
             None => false,
         }
@@ -7717,11 +9820,127 @@ fn set_nested_field(obj: &Value, path: &str, value: Value) -> Value {
     }
 }
 
-/// Inject __link_path__ fields into a list item's todo_elements.
+fn inject_scope_path(scope: &mut IndexMap<String, Value>, path: &str, value: Value) {
+    let root = set_nested_field(&Value::Object(Arc::new(BTreeMap::new())), path, value);
+    if let Value::Object(fields) = root {
+        for (key, val) in fields.iter() {
+            scope.insert(key.as_ref().to_string(), val.clone());
+        }
+    }
+}
+
+fn inject_scope_path_merged(scope: &mut IndexMap<String, Value>, path: &str, value: Value) {
+    let mut parts = path.splitn(2, '.');
+    let Some(root_name) = parts.next() else {
+        return;
+    };
+    let updated = if let Some(rest) = parts.next() {
+        let existing = scope
+            .get(root_name)
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Arc::new(BTreeMap::new())));
+        set_nested_field(&existing, rest, value)
+    } else {
+        value
+    };
+    scope.insert(root_name.to_string(), updated);
+}
+
+fn decorate_reactive_scope_value(value: &Value, base_path: &str) -> Value {
+    match value {
+        Value::Tagged { tag, fields } if tag.as_ref() == LIST_TAG => {
+            let decorated_fields: BTreeMap<Arc<str>, Value> = fields
+                .iter()
+                .map(|(key, item)| {
+                    let item_path = format!("{base_path}.{}", key.as_ref());
+                    let decorated = decorate_reactive_scope_value(item, &item_path);
+                    (key.clone(), decorated)
+                })
+                .collect();
+            Value::Tagged {
+                tag: tag.clone(),
+                fields: Arc::new(decorated_fields),
+            }
+        }
+        Value::Object(fields) => {
+            let mut result = value.clone();
+
+            if value.get_field(HOVERED_FIELD).is_none() {
+                result = result.update_field(HOVERED_FIELD, Value::tag("False"));
+            }
+            result = result.update_field(
+                HOVER_PATH_FIELD,
+                Value::text(format!("{base_path}.hovered").as_str()),
+            );
+
+            for (field_name, field_value) in fields.iter() {
+                if field_name.ends_with("_elements") {
+                    let mut new_elements = field_value.clone();
+                    if let Value::Object(element_fields) = field_value {
+                        for (el_name, existing) in element_fields.iter() {
+                            let link_path = format!("{base_path}.{}.{}", field_name, el_name);
+                            let updated = match existing {
+                                Value::Object(_) => existing.update_field(
+                                    LINK_PATH_FIELD,
+                                    Value::text(link_path.as_str()),
+                                ),
+                                _ => Value::object([(LINK_PATH_FIELD, Value::text(link_path.as_str()))]),
+                            };
+                            new_elements =
+                                new_elements.update_field(el_name.as_ref(), updated);
+                        }
+                    }
+                    result = result.update_field(field_name.as_ref(), new_elements);
+                    continue;
+                }
+
+                let child_path = format!("{base_path}.{}", field_name);
+                let decorated = decorate_reactive_scope_value(field_value, &child_path);
+                result = result.update_field(field_name.as_ref(), decorated);
+            }
+
+            result
+        }
+        Value::Tagged { tag, fields } => {
+            let decorated_fields: BTreeMap<Arc<str>, Value> = fields
+                .iter()
+                .map(|(field_name, field_value)| {
+                    let child_path = format!("{base_path}.{}", field_name);
+                    (
+                        field_name.clone(),
+                        decorate_reactive_scope_value(field_value, &child_path),
+                    )
+                })
+                .collect();
+            Value::Tagged {
+                tag: tag.clone(),
+                fields: Arc::new(decorated_fields),
+            }
+        }
+        _ => value.clone(),
+    }
+}
+
+fn value_needs_reactive_decoration(value: &Value) -> bool {
+    match value {
+        Value::Tag(tag) => tag.as_ref() == "LINK",
+        Value::Object(fields) => fields.iter().any(|(field_name, field_value)| {
+            field_name.ends_with("_elements") || value_needs_reactive_decoration(field_value)
+        }),
+        Value::Tagged { fields, .. } => fields
+            .values()
+            .any(value_needs_reactive_decoration),
+        _ => false,
+    }
+}
+
 /// Inject __link_path__ fields into a list item with a specific key.
+///
+/// Any object field ending with `_elements` is treated as a per-item element
+/// namespace and receives item-specific `__link_path__` values for each LINK.
 fn inject_item_link_paths_with_key(item: &Value, list_path: &str, key: &str) -> Value {
     let item_path = format!("{}.{}", list_path, key);
-    let mut result = item.clone();
+    let mut result = decorate_reactive_scope_value(item, &item_path);
 
     // While editing, render the in-progress edit buffer via `title`.
     // The TodoMVC edit input uses `LATEST { todo.title, element.event.change.text }`.
@@ -7737,31 +9956,6 @@ fn inject_item_link_paths_with_key(item: &Value, list_path: &str, key: &str) -> 
         if let Some(edit_text) = result.get_field("__edit_text").and_then(|v| v.as_text()) {
             result = result.update_field("title", Value::text(edit_text));
         }
-    }
-
-    // Inject hover path for per-item hover (element.hovered).
-    // Preserve existing __hovered state (set by wildcard HoverChange events).
-    if item.get_field(HOVERED_FIELD).is_none() {
-        result = result.update_field(HOVERED_FIELD, Value::tag("False"));
-    }
-    result = result.update_field(
-        HOVER_PATH_FIELD,
-        Value::text(format!("{}.hovered", item_path).as_str()),
-    );
-
-    // If the item has todo_elements, inject link paths
-    if let Some(todo_elements) = item.get_field("todo_elements") {
-        let mut new_elements = todo_elements.clone();
-        if let Value::Object(fields) = &todo_elements {
-            for (el_name, _) in fields.iter() {
-                let link_path = format!("{}.todo_elements.{}", item_path, el_name);
-                new_elements = new_elements.update_field(
-                    el_name.as_ref(),
-                    Value::object([(LINK_PATH_FIELD, Value::text(link_path.as_str()))]),
-                );
-            }
-        }
-        result = result.update_field("todo_elements", new_elements);
     }
 
     result
@@ -7896,6 +10090,78 @@ impl Compiler {
                         }
                         Ok(DocTemplate::Tagged {
                             tag: "DocumentNew".to_string(),
+                            fields: field_templates,
+                        })
+                    }
+                    ["Scene", "new"] => {
+                        let mut field_templates = Vec::new();
+                        for arg in arguments {
+                            let name = arg.node.name.as_str().to_string();
+                            if let Some(ref val_expr) = arg.node.value {
+                                let tmpl = self.build_doc_template_inner(
+                                    reactive_var_name,
+                                    val_expr,
+                                    keyed_list_name,
+                                )?;
+                                field_templates.push((name, tmpl));
+                            }
+                        }
+                        Ok(DocTemplate::Tagged {
+                            tag: "SceneNew".to_string(),
+                            fields: field_templates,
+                        })
+                    }
+                    ["Light", "directional"] => {
+                        let mut field_templates = Vec::new();
+                        for arg in arguments {
+                            let name = arg.node.name.as_str().to_string();
+                            if let Some(ref val_expr) = arg.node.value {
+                                let tmpl = self.build_doc_template_inner(
+                                    reactive_var_name,
+                                    val_expr,
+                                    keyed_list_name,
+                                )?;
+                                field_templates.push((name, tmpl));
+                            }
+                        }
+                        Ok(DocTemplate::Tagged {
+                            tag: "DirectionalLight".to_string(),
+                            fields: field_templates,
+                        })
+                    }
+                    ["Light", "ambient"] => {
+                        let mut field_templates = Vec::new();
+                        for arg in arguments {
+                            let name = arg.node.name.as_str().to_string();
+                            if let Some(ref val_expr) = arg.node.value {
+                                let tmpl = self.build_doc_template_inner(
+                                    reactive_var_name,
+                                    val_expr,
+                                    keyed_list_name,
+                                )?;
+                                field_templates.push((name, tmpl));
+                            }
+                        }
+                        Ok(DocTemplate::Tagged {
+                            tag: "AmbientLight".to_string(),
+                            fields: field_templates,
+                        })
+                    }
+                    ["Light", "spot"] => {
+                        let mut field_templates = Vec::new();
+                        for arg in arguments {
+                            let name = arg.node.name.as_str().to_string();
+                            if let Some(ref val_expr) = arg.node.value {
+                                let tmpl = self.build_doc_template_inner(
+                                    reactive_var_name,
+                                    val_expr,
+                                    keyed_list_name,
+                                )?;
+                                field_templates.push((name, tmpl));
+                            }
+                        }
+                        Ok(DocTemplate::Tagged {
+                            tag: "SpotLight".to_string(),
                             fields: field_templates,
                         })
                     }
@@ -8062,7 +10328,7 @@ impl Compiler {
         _element_expr: &Spanned<Expression>,
     ) -> Option<String> {
         // Walk through top-level variables to find which one contains this LINK
-        for (name, expr) in &self.variables {
+        for (name, expr) in self.variables.iter() {
             if self.expr_contains_link(expr) {
                 if let Expression::FunctionCall { .. } = &expr.node {
                     return Some(format!("{}.event.press", name));
@@ -8092,7 +10358,7 @@ impl Compiler {
     /// Scans function bodies for `Element/stripe(element: [tag: X], items: PASSED.store.<name> |> ...)`
     /// and returns the tag X (e.g., "Ul" for todo_mvc's todos_element).
     fn find_keyed_stripe_element_tag(&self, keyed_list_short_name: &str) -> Option<String> {
-        for (_, _, body) in &self.functions {
+        for (_, _, body) in self.functions.iter() {
             if let Some(tag) = self.find_keyed_stripe_tag_in_expr(body, keyed_list_short_name) {
                 return Some(tag);
             }
@@ -8209,3 +10475,1378 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        CollectionSpec, CompiledProgram, Compiler, LIST_TAG, compile,
+        decorate_reactive_scope_value, inject_item_link_paths_with_key,
+        parse_source,
+    };
+    use crate::parser::static_expression::Expression;
+    use crate::platform::browser::engine_dd::core::types::{
+        DEP_FIELD_PREFIX, InputKind, LINK_PATH_FIELD, ListKey, VarId,
+    };
+    use crate::platform::browser::engine_dd::core::value::Value;
+    use boon_scene::RenderSurface;
+    use indexmap::IndexMap;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn read_example(path: &str) -> String {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(base.join(path)).expect("read example source")
+    }
+
+    fn list_value(items: Vec<Value>) -> Value {
+        let fields: BTreeMap<Arc<str>, Value> = items
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| (Arc::from(format!("{:04}", i)), value))
+            .collect();
+        Value::Tagged {
+            tag: Arc::from(super::LIST_TAG),
+            fields: Arc::new(fields),
+        }
+    }
+
+    #[test]
+    fn cells_formula_helpers_resolve_mocked_cell_values() {
+        let mut source =
+            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        source.push_str(
+            r#"
+
+probe_formula_a1: cell_formula(column: 1, row: 1)
+probe_formula_a2: cell_formula(column: 1, row: 2)
+probe_formula_a3: cell_formula(column: 1, row: 3)
+probe_value_a1: compute_value(formula_text: cell_formula(column: 1, row: 1))
+probe_value_a2: compute_value(formula_text: cell_formula(column: 1, row: 2))
+probe_value_a3: compute_value(formula_text: cell_formula(column: 1, row: 3))
+probe_add_expression: expression_value(text: TEXT { add(A1, A2) })
+probe_add_left_ref: BLOCK {
+    text: TEXT { add(A1, A2) }
+    comma_index: text |> Text/find(search: TEXT { , })
+    left_length: comma_index - 4
+    text |> Text/substring(start: 4, length: left_length) |> Text/trim()
+}
+probe_add_right_ref: BLOCK {
+    text: TEXT { add(A1, A2) }
+    comma_index: text |> Text/find(search: TEXT { , })
+    right_length: text |> Text/length() - comma_index - 2
+    text |> Text/substring(start: comma_index + 1, length: right_length) |> Text/trim()
+}
+probe_add_left_value: BLOCK {
+    left_ref: TEXT { A1 }
+    left_column: left_ref |> Text/substring(start: 0, length: 1) |> parse_column_letter()
+    left_row: left_ref |> Text/substring(start: 1, length: 8) |> Text/to_number()
+    compute_value(formula_text: cell_formula(column: left_column, row: left_row))
+}
+probe_add_right_value: BLOCK {
+    right_ref: TEXT { A2 }
+    right_column: right_ref |> Text/substring(start: 0, length: 1) |> parse_column_letter()
+    right_row: right_ref |> Text/substring(start: 1, length: 8) |> Text/to_number()
+    compute_value(formula_text: cell_formula(column: right_column, row: right_row))
+}
+probe_sum_expression: expression_value(text: TEXT { sum(A1:A3) })
+probe_sum_start_ref: BLOCK {
+    text: TEXT { sum(A1:A3) }
+    text_length: text |> Text/length()
+    colon_index: text |> Text/find(search: TEXT { : })
+    start_ref_length: colon_index - 4
+    text |> Text/substring(start: 4, length: start_ref_length) |> Text/trim()
+}
+probe_sum_end_ref: BLOCK {
+    text: TEXT { sum(A1:A3) }
+    text_length: text |> Text/length()
+    colon_index: text |> Text/find(search: TEXT { : })
+    end_ref_length: text_length - colon_index - 2
+    text |> Text/substring(start: colon_index + 1, length: end_ref_length) |> Text/trim()
+}
+probe_sum_range_value: BLOCK {
+    sum_range(column: 1, start_row: 1, end_row: 3)
+}
+probe_add: compute_value(formula_text: TEXT { =add(A1, A2) })
+probe_sum: compute_value(formula_text: TEXT { =sum(A1:A3) })
+probe_display_cell: make_cell_element(cell: [column: 1 row: 1 cell_elements: [display: LINK editing: LINK]])
+probe_display_row_elements: make_row_elements(row_cells: row_1_cells)
+probe_display_row: make_row(row_index: 1, row_cells: row_1_cells)
+"#,
+        );
+
+        let ast = parse_source(&source).expect("cells source should parse");
+        let mut compiler = Compiler::new();
+        compiler.register_top_level(&ast);
+
+        let mocked_cells = list_value(vec![
+            list_value(vec![
+                Value::text("5"),
+                Value::text("=add(A1, A2)"),
+                Value::text("=sum(A1:A3)"),
+            ]),
+            list_value(vec![Value::text("10"), Value::text(""), Value::text("")]),
+            list_value(vec![Value::text("15"), Value::text(""), Value::text("")]),
+        ]);
+
+        let mut scope = IndexMap::new();
+        scope.insert("sheet".to_string(), mocked_cells);
+
+        let probe_formula_a1 = compiler
+            .get_var_expr("probe_formula_a1")
+            .expect("probe_formula_a1 expr");
+        let probe_formula_a2 = compiler
+            .get_var_expr("probe_formula_a2")
+            .expect("probe_formula_a2 expr");
+        let probe_formula_a3 = compiler
+            .get_var_expr("probe_formula_a3")
+            .expect("probe_formula_a3 expr");
+        let probe_value_a1 = compiler
+            .get_var_expr("probe_value_a1")
+            .expect("probe_value_a1 expr");
+        let probe_value_a2 = compiler
+            .get_var_expr("probe_value_a2")
+            .expect("probe_value_a2 expr");
+        let probe_value_a3 = compiler
+            .get_var_expr("probe_value_a3")
+            .expect("probe_value_a3 expr");
+        let probe_add = compiler.get_var_expr("probe_add").expect("probe_add expr");
+        let probe_add_expression = compiler
+            .get_var_expr("probe_add_expression")
+            .expect("probe_add_expression expr");
+        let probe_add_left_ref = compiler
+            .get_var_expr("probe_add_left_ref")
+            .expect("probe_add_left_ref expr");
+        let probe_add_right_ref = compiler
+            .get_var_expr("probe_add_right_ref")
+            .expect("probe_add_right_ref expr");
+        let probe_add_left_value = compiler
+            .get_var_expr("probe_add_left_value")
+            .expect("probe_add_left_value expr");
+        let probe_add_right_value = compiler
+            .get_var_expr("probe_add_right_value")
+            .expect("probe_add_right_value expr");
+        let probe_sum_expression = compiler
+            .get_var_expr("probe_sum_expression")
+            .expect("probe_sum_expression expr");
+        let probe_sum_start_ref = compiler
+            .get_var_expr("probe_sum_start_ref")
+            .expect("probe_sum_start_ref expr");
+        let probe_sum_end_ref = compiler
+            .get_var_expr("probe_sum_end_ref")
+            .expect("probe_sum_end_ref expr");
+        let probe_sum_range_value = compiler
+            .get_var_expr("probe_sum_range_value")
+            .expect("probe_sum_range_value expr");
+        let probe_sum = compiler.get_var_expr("probe_sum").expect("probe_sum expr");
+        let probe_display_cell = compiler
+            .get_var_expr("probe_display_cell")
+            .expect("probe_display_cell expr");
+        let probe_display_row_elements = compiler
+            .get_var_expr("probe_display_row_elements")
+            .expect("probe_display_row_elements expr");
+        let probe_display_row = compiler
+            .get_var_expr("probe_display_row")
+            .expect("probe_display_row expr");
+        let row_1_formulas = compiler
+            .get_var_expr("row_1_formulas")
+            .expect("row_1_formulas expr");
+
+        assert_eq!(
+            compiler
+                .eval_static_with_scope(probe_formula_a1, &scope)
+                .ok()
+                .and_then(|v| v.as_text().map(str::to_string)),
+            Some("5".to_string()),
+            "cell_formula(1,1) should resolve A1 formula text from mocked sheet"
+        );
+        let row_1_formula_items = compiler
+            .eval_static_with_scope(row_1_formulas, &scope)
+            .expect("row_1_formulas should evaluate")
+            .list_items()
+            .into_iter()
+            .take(3)
+            .map(|value| value.as_text().unwrap_or("?").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            row_1_formula_items,
+            vec!["5".to_string(), "=add(A1, A2)".to_string(), "=sum(A1:A3)".to_string()],
+            "row_1_formulas should seed A1/B1/C1 formulas"
+        );
+        assert_eq!(
+            compiler
+                .eval_static_with_scope(probe_formula_a2, &scope)
+                .ok()
+                .and_then(|v| v.as_text().map(str::to_string)),
+            Some("10".to_string()),
+            "cell_formula(1,2) should resolve A2 formula text from mocked sheet"
+        );
+        assert_eq!(
+            compiler
+                .eval_static_with_scope(probe_formula_a3, &scope)
+                .ok()
+                .and_then(|v| v.as_text().map(str::to_string)),
+            Some("15".to_string()),
+            "cell_formula(1,3) should resolve A3 formula text from mocked sheet"
+        );
+        assert_eq!(
+            compiler
+                .eval_static_with_scope(probe_value_a1, &scope)
+                .ok()
+                .and_then(|v| v.as_number()),
+            Some(5.0),
+            "compute_value(cell_formula(1,1)) should resolve A1 to 5"
+        );
+        assert_eq!(
+            compiler
+                .eval_static_with_scope(probe_value_a2, &scope)
+                .ok()
+                .and_then(|v| v.as_number()),
+            Some(10.0),
+            "compute_value(cell_formula(1,2)) should resolve A2 to 10"
+        );
+        assert_eq!(
+            compiler
+                .eval_static_with_scope(probe_value_a3, &scope)
+                .ok()
+                .and_then(|v| v.as_number()),
+            Some(15.0),
+            "compute_value(cell_formula(1,3)) should resolve A3 to 15"
+        );
+        eprintln!(
+            "[cells-dd] probe_add_expression={:?} left_ref={:?} right_ref={:?} left_value={:?} right_value={:?} add={:?} sum_expression={:?} sum_start_ref={:?} sum_end_ref={:?} sum_range={:?} sum={:?}",
+            compiler.eval_static_with_scope(probe_add_expression, &scope).ok(),
+            compiler.eval_static_with_scope(probe_add_left_ref, &scope).ok(),
+            compiler.eval_static_with_scope(probe_add_right_ref, &scope).ok(),
+            compiler.eval_static_with_scope(probe_add_left_value, &scope).ok(),
+            compiler.eval_static_with_scope(probe_add_right_value, &scope).ok(),
+            compiler.eval_static_with_scope(probe_add, &scope).ok(),
+            compiler.eval_static_with_scope(probe_sum_expression, &scope).ok(),
+            compiler.eval_static_with_scope(probe_sum_start_ref, &scope).ok(),
+            compiler.eval_static_with_scope(probe_sum_end_ref, &scope).ok(),
+            compiler.eval_static_with_scope(probe_sum_range_value, &scope).ok(),
+            compiler.eval_static_with_scope(probe_sum, &scope).ok(),
+        );
+        assert_eq!(
+            compiler
+                .eval_static_with_scope(probe_add, &scope)
+                .ok()
+                .and_then(|v| v.as_number()),
+            Some(15.0),
+            "compute_value(add(A1, A2)) should evaluate to 15"
+        );
+        assert_eq!(
+            compiler
+                .eval_static_with_scope(probe_sum, &scope)
+                .ok()
+                .and_then(|v| v.as_number()),
+            Some(30.0),
+            "compute_value(sum(A1:A3)) should evaluate to 30"
+        );
+
+        scope.insert(
+            "editing_cell".to_string(),
+            Value::object([("row", Value::number(0.0)), ("column", Value::number(0.0))]),
+        );
+        scope.insert("editing_text".to_string(), Value::text(""));
+        let probe_display_cell_value = compiler
+            .eval_static_with_scope(probe_display_cell, &scope)
+            .expect("display cell should evaluate");
+        assert_eq!(
+            probe_display_cell_value.get_tag(),
+            Some("ElementLabel"),
+            "make_cell_element should render a label when not editing; got {probe_display_cell_value}"
+        );
+        assert_eq!(
+            probe_display_cell_value
+                .get_field("label")
+                .and_then(Value::as_text),
+            Some("5"),
+            "A1 display cell should render the computed value 5; got {probe_display_cell_value}"
+        );
+
+        let probe_display_row_elements_value = compiler
+            .eval_static_with_scope(probe_display_row_elements, &scope)
+            .expect("display row elements should evaluate");
+        let probe_display_row_items = probe_display_row_elements_value.list_items();
+        assert_eq!(
+            probe_display_row_items
+                .get(0)
+                .and_then(|v| v.get_field("label"))
+                .and_then(Value::as_text),
+            Some("5"),
+            "row_1 first cell should render 5; got {probe_display_row_elements_value}"
+        );
+        assert_eq!(
+            probe_display_row_items
+                .get(1)
+                .and_then(|v| v.get_field("label"))
+                .and_then(Value::as_text),
+            Some("15"),
+            "row_1 second cell should render 15; got {probe_display_row_elements_value}"
+        );
+        assert_eq!(
+            probe_display_row_items
+                .get(2)
+                .and_then(|v| v.get_field("label"))
+                .and_then(Value::as_text),
+            Some("30"),
+            "row_1 third cell should render 30; got {probe_display_row_elements_value}"
+        );
+
+        let probe_display_row_value = compiler
+            .eval_static_with_scope(probe_display_row, &scope)
+            .expect("display row should evaluate");
+        let nested_row_items = probe_display_row_value
+            .get_field("items")
+            .expect("row stripe should have items")
+            .list_items();
+        let nested_cells = nested_row_items
+            .get(1)
+            .and_then(|v| v.get_field("items"))
+            .expect("row stripe should have nested cell stripe items")
+            .list_items();
+        assert_eq!(
+            nested_cells
+                .get(0)
+                .and_then(|v| v.get_field("label"))
+                .and_then(Value::as_text),
+            Some("5"),
+            "nested row first cell should render 5; got {probe_display_row_value}"
+        );
+
+        scope.insert(
+            "editing_cell".to_string(),
+            Value::object([("row", Value::number(1.0)), ("column", Value::number(1.0))]),
+        );
+        scope.insert("editing_text".to_string(), Value::text("5"));
+        assert_eq!(
+            compiler
+                .eval_static_with_scope(probe_display_cell, &scope)
+                .ok()
+                .and_then(|v| v.get_tag().map(str::to_string)),
+            Some("ElementTextInput".to_string()),
+            "make_cell_element should render a text input while editing A1"
+        );
+    }
+
+    #[test]
+    fn cells_sheet_hold_transform_updates_a1_formula_text() {
+        let source =
+            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let ast = parse_source(&source).expect("cells source should parse");
+        let mut compiler = Compiler::new();
+        compiler.register_top_level(&ast);
+
+        let sheet_expr = compiler.get_var_expr("sheet").expect("sheet expr");
+        let then_expr = match &sheet_expr.node {
+            Expression::Pipe { to, .. } => match &to.node {
+                Expression::Hold { body, .. } => match &body.node {
+                    Expression::Pipe { to, .. } => match &to.node {
+                        Expression::Then { body } => body.as_ref().clone(),
+                        other => panic!("expected THEN in sheet HOLD body, got {other:?}"),
+                    },
+                    other => panic!("expected pipe in sheet HOLD body, got {other:?}"),
+                },
+                other => panic!("expected HOLD in sheet expr, got {other:?}"),
+            },
+            other => panic!("expected pipe in sheet expr, got {other:?}"),
+        };
+
+        let mut rows = Vec::new();
+        for row in 1..=100 {
+            let mut cols = Vec::new();
+            for col in 1..=26 {
+                let text = match (row, col) {
+                    (1, 1) => "5",
+                    (1, 2) => "=add(A1, A2)",
+                    (1, 3) => "=sum(A1:A3)",
+                    (2, 1) => "10",
+                    (3, 1) => "15",
+                    _ => "",
+                };
+                cols.push(Value::text(text));
+            }
+            rows.push(list_value(cols));
+        }
+
+        let mut scope = IndexMap::new();
+        scope.insert("state".to_string(), list_value(rows));
+        scope.insert(
+            "edit_committed".to_string(),
+            Value::object([
+                ("row", Value::number(1.0)),
+                ("column", Value::number(1.0)),
+                ("text", Value::text("7")),
+            ]),
+        );
+
+        let result = compiler.eval_static_with_scope(&then_expr, &scope);
+        assert!(
+            result.is_ok(),
+            "sheet HOLD transform THEN body should evaluate with scoped state + edit_committed, got: {result:?}"
+        );
+
+        let result = result.expect("sheet HOLD transform result");
+        let rows = result.list_items();
+        assert!(
+            rows.len() >= 3,
+            "updated sheet should still be a list of rows, got: {result}"
+        );
+        let row_1 = rows[0].list_items();
+        let row_2 = rows[1].list_items();
+        let row_3 = rows[2].list_items();
+        assert_eq!(row_1[0].as_text(), Some("7"));
+        assert_eq!(row_1[1].as_text(), Some("=add(A1, A2)"));
+        assert_eq!(row_1[2].as_text(), Some("=sum(A1:A3)"));
+        assert_eq!(row_2[0].as_text(), Some("10"));
+        assert_eq!(row_3[0].as_text(), Some("15"));
+    }
+
+    #[test]
+    fn cells_compile_to_dataflow_graph() {
+        let source =
+            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        eprintln!("[cells-dd] before compile()");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("cells should compile");
+        eprintln!("[cells-dd] after compile()");
+        match program {
+            CompiledProgram::Dataflow { graph } => {
+                assert!(
+                    !graph.collections.is_empty(),
+                    "cells should produce non-empty DD collections"
+                );
+            }
+            CompiledProgram::Static { .. } => {
+                panic!("cells should compile to dataflow")
+            }
+        }
+    }
+
+    #[test]
+    fn cells_document_eval_with_overrides_keeps_committed_values_after_cancel_state() {
+        let source =
+            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let ast = parse_source(&source).expect("cells source should parse");
+        let mut compiler = Compiler::new();
+        compiler.register_top_level(&ast);
+
+        let document_expr = compiler
+            .get_var_expr("document")
+            .expect("document expr should exist");
+
+        let mut scope = IndexMap::new();
+        scope.insert(
+            "editing_cell".to_string(),
+            Value::object([("row", Value::number(0.0)), ("column", Value::number(0.0))]),
+        );
+        scope.insert("editing_text".to_string(), Value::text(""));
+        scope.insert("edit_changed".to_string(), Value::object([("text", Value::text(""))]));
+        scope.insert("edit_cancelled".to_string(), Value::Bool(true));
+        scope.insert(
+            "overrides".to_string(),
+            list_value(vec![Value::object([
+                ("row", Value::number(1.0)),
+                ("column", Value::number(1.0)),
+                ("text", Value::text("7")),
+            ])]),
+        );
+
+        let document_value = compiler
+            .eval_static_with_scope(document_expr, &scope)
+            .expect("document should evaluate with override scope");
+
+        let root = document_value
+            .get_field("root")
+            .expect("document should have root");
+        let top_items = root
+            .get_field("items")
+            .expect("root should have items")
+            .list_items();
+        let body = top_items
+            .get(2)
+            .expect("document body should be third item");
+        let rows = body
+            .get_field("items")
+            .expect("body should have row items")
+            .list_items();
+        let row_1 = rows.first().expect("row 1 should exist");
+        let row_1_items = row_1
+            .get_field("items")
+            .expect("row 1 should have items")
+            .list_items();
+        let cells = row_1_items
+            .get(1)
+            .and_then(|v| v.get_field("items"))
+            .expect("row 1 should have cell stripe items")
+            .list_items();
+
+        assert_eq!(
+            cells.first()
+                .and_then(|v| v.get_field("label"))
+                .and_then(Value::as_text),
+            Some("7"),
+            "A1 should render committed override after cancel-state scope; got {document_value}"
+        );
+        assert_eq!(
+            cells.get(1)
+                .and_then(|v| v.get_field("label"))
+                .and_then(Value::as_text),
+            Some("17"),
+            "B1 should recompute from committed override after cancel-state scope; got {document_value}"
+        );
+        assert_eq!(
+            cells.get(2)
+                .and_then(|v| v.get_field("label"))
+                .and_then(Value::as_text),
+            Some("32"),
+            "C1 should recompute from committed override after cancel-state scope; got {document_value}"
+        );
+    }
+
+    #[test]
+    fn cells_compiled_document_map_keeps_committed_values_after_cancel_state() {
+        let source =
+            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("cells should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("cells should compile to dataflow");
+        };
+
+        let document_spec = graph
+            .collections
+            .get(&graph.document)
+            .expect("document collection should exist");
+        let CollectionSpec::Map { f, .. } = document_spec else {
+            panic!("document collection should be a Map, got different spec");
+        };
+
+        let combined = Value::object([
+            ("__dep_0", Value::object([("text", Value::text(""))])),
+            ("__dep_1", Value::text("")),
+            ("__dep_2", Value::Bool(true)),
+            (
+                "__dep_3",
+                Value::object([("row", Value::number(0.0)), ("column", Value::number(0.0))]),
+            ),
+            (
+                "__dep_4",
+                list_value(vec![Value::object([
+                    ("row", Value::number(1.0)),
+                    ("column", Value::number(1.0)),
+                    ("text", Value::text("7")),
+                ])]),
+            ),
+        ]);
+
+        let document_value = f(&combined);
+        let root = document_value
+            .get_field("root")
+            .expect("document should have root");
+        let top_items = root
+            .get_field("items")
+            .expect("root should have items")
+            .list_items();
+        let body = top_items
+            .get(2)
+            .expect("document body should be third item");
+        let rows = body
+            .get_field("items")
+            .expect("body should have row items")
+            .list_items();
+        let row_1 = rows.first().expect("row 1 should exist");
+        let row_1_items = row_1
+            .get_field("items")
+            .expect("row 1 should have items")
+            .list_items();
+        let cells = row_1_items
+            .get(1)
+            .and_then(|v| v.get_field("items"))
+            .expect("row 1 should have cell stripe items")
+            .list_items();
+
+        assert_eq!(
+            cells.first()
+                .and_then(|v| v.get_field("label"))
+                .and_then(Value::as_text),
+            Some("7"),
+            "compiled document closure should render committed A1 override; got {document_value}"
+        );
+        assert_eq!(
+            cells.get(1)
+                .and_then(|v| v.get_field("label"))
+                .and_then(Value::as_text),
+            Some("17"),
+            "compiled document closure should recompute B1 from committed override; got {document_value}"
+        );
+        assert_eq!(
+            cells.get(2)
+                .and_then(|v| v.get_field("label"))
+                .and_then(Value::as_text),
+            Some("32"),
+            "compiled document closure should recompute C1 from committed override; got {document_value}"
+        );
+    }
+
+    #[test]
+    fn static_scene_compile_preserves_lights_and_geometry() {
+        let source = r#"
+scene: Scene/new(
+    root: Scene/Element/text(
+        element: []
+        style: []
+        text: TEXT { hi }
+    )
+    lights: LIST {
+        Light/directional(
+            azimuth: 30
+            altitude: 45
+            spread: 1
+            intensity: 1.2
+            color: Oklch[lightness: 0.98, chroma: 0.015, hue: 65]
+        )
+        Light/ambient(
+            intensity: 0.4
+            color: Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
+        )
+        Light/spot(
+            target: FocusedElement
+            color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
+            intensity: 0.3
+            radius: 60
+            softness: 0.85
+        )
+    }
+    geometry: [
+        bevel_angle: 45
+    ]
+)
+"#;
+
+        let program = compile(source, None, &std::collections::HashMap::new(), None)
+            .expect("compile should succeed");
+
+        let CompiledProgram::Static {
+            document_value,
+            render_surface,
+        } = program
+        else {
+            panic!("expected static program");
+        };
+
+        assert_eq!(render_surface, RenderSurface::Scene);
+        assert_eq!(document_value.get_tag(), Some("SceneNew"));
+        assert_eq!(
+            document_value
+                .get_field("geometry")
+                .and_then(|v| v.get_field("bevel_angle"))
+                .and_then(|v| v.as_number()),
+            Some(45.0)
+        );
+
+        let lights = document_value
+            .get_field("lights")
+            .expect("scene should preserve lights");
+        let light_tags: Vec<_> = lights
+            .list_items()
+            .into_iter()
+            .filter_map(|item| item.get_tag().map(str::to_string))
+            .collect();
+        assert_eq!(
+            light_tags,
+            vec![
+                "DirectionalLight".to_string(),
+                "AmbientLight".to_string(),
+                "SpotLight".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reactive_scene_root_map_keeps_static_lights_and_geometry() {
+        let source = r#"
+scene: Scene/new(
+    root: counter
+    lights: LIST {
+        Light/directional(
+            azimuth: 30
+            altitude: 45
+            spread: 1
+            intensity: 1.2
+            color: Oklch[lightness: 0.98, chroma: 0.015, hue: 65]
+        )
+        Light/ambient(
+            intensity: 0.4
+            color: Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
+        )
+    }
+    geometry: [
+        bevel_angle: 45
+    ]
+)
+
+counter:
+    LATEST {
+        0
+        increment_button.event.press |> THEN { 1 }
+    }
+    |> Math/sum()
+
+increment_button: Element/button(
+    element: [event: [press: LINK]]
+    style: []
+    label: TEXT { + }
+)
+"#;
+
+        let program = compile(source, None, &std::collections::HashMap::new(), None)
+            .expect("compile should succeed");
+
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected reactive program");
+        };
+
+        assert_eq!(graph.render_surface, RenderSurface::Scene);
+
+        let CollectionSpec::Map { f, .. } = graph
+            .collections
+            .get(&graph.document)
+            .expect("document collection should exist")
+        else {
+            panic!("expected document map");
+        };
+
+        let scene = f(&Value::number(7.0));
+        assert_eq!(scene.get_tag(), Some("SceneNew"));
+        assert_eq!(
+            scene.get_field("root").and_then(|value| value.as_number()),
+            Some(7.0)
+        );
+        assert_eq!(
+            scene
+                .get_field("geometry")
+                .and_then(|v| v.get_field("bevel_angle"))
+                .and_then(|v| v.as_number()),
+            Some(45.0)
+        );
+        let lights = scene.get_field("lights").expect("lights field");
+        assert_eq!(lights.list_count(), 2);
+        assert_eq!(
+            lights
+                .list_items()
+                .first()
+                .and_then(|item| item.get_tag()),
+            Some("DirectionalLight")
+        );
+    }
+
+    #[test]
+    fn crud_example_compiles_as_dataflow() {
+        let source = read_example(
+            "../../playground/frontend/src/examples/crud/crud.bn",
+        );
+
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD to compile as dataflow");
+        };
+
+        assert_eq!(graph.render_surface, RenderSurface::Document);
+        assert!(
+            graph.collections.keys().any(|var| var.as_str() == "store.people"),
+            "store.people should be compiled into the graph"
+        );
+        assert!(
+            graph
+                .collections
+                .keys()
+                .any(|var| var.as_str() == "store.selected_id"),
+            "store.selected_id should be compiled into the graph"
+        );
+    }
+
+    #[test]
+    fn crud_filter_pipeline_is_reactive_and_filters_rows() {
+        let source = read_example(
+            "../../playground/frontend/src/examples/crud/crud.bn",
+        );
+
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD to compile as dataflow");
+        };
+
+        let retain = graph
+            .collections
+            .values()
+            .find_map(|spec| match spec {
+                CollectionSpec::ListRetainReactive {
+                    predicate,
+                    filter_state,
+                    ..
+                } => Some((predicate, filter_state)),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                let filter_vars: Vec<_> = graph
+                    .collections
+                    .keys()
+                    .filter(|var| var.as_str().contains("filter_input"))
+                    .map(|var| var.as_str().to_string())
+                    .collect();
+                panic!(
+                    "CRUD should compile keyed retain as reactive; filter-related vars: {:?}",
+                    filter_vars
+                );
+            });
+
+        let hans = Value::object([
+            ("name", Value::text("Hans")),
+            ("surname", Value::text("Emil")),
+        ]);
+        let mustermann = Value::object([
+            ("name", Value::text("Max")),
+            ("surname", Value::text("Mustermann")),
+        ]);
+
+        assert!(
+            !(retain.0)(&hans, &Value::text("M")),
+            "filter M should exclude Hans/Emil"
+        );
+        assert!(
+            (retain.0)(&mustermann, &Value::text("M")),
+            "filter M should keep Mustermann"
+        );
+        assert!(
+            matches!(
+                graph.collections.get(retain.1),
+                Some(CollectionSpec::HoldLatest(_))
+            ),
+            "reactive filter state should be wrapped in HoldLatest"
+        );
+    }
+
+    #[test]
+    fn crud_person_to_add_joins_create_press_with_text_inputs() {
+        let source = read_example(
+            "../../playground/frontend/src/examples/crud/crud.bn",
+        );
+
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD to compile as dataflow");
+        };
+
+        let person_to_add = graph
+            .collections
+            .get(&VarId::new("store.person_to_add"))
+            .expect("store.person_to_add should exist");
+
+        let CollectionSpec::Map { source, f } = person_to_add else {
+            panic!("store.person_to_add should compile to a Map over joined deps");
+        };
+
+        let CollectionSpec::Join { .. } = graph
+            .collections
+            .get(source)
+            .expect("store.person_to_add source should exist")
+        else {
+            panic!("store.person_to_add source should be a Join");
+        };
+
+        assert!(
+            graph
+                .collections
+                .contains_key(&VarId::new("store.elements.name_input.text")),
+            "name input text state should be synthesized as a reactive var"
+        );
+        assert!(
+            graph
+                .collections
+                .contains_key(&VarId::new("store.elements.surname_input.text")),
+            "surname input text state should be synthesized as a reactive var"
+        );
+
+        let mut combined_fields = BTreeMap::new();
+        combined_fields.insert(Arc::from("__event"), Value::tag("Press"));
+        combined_fields.insert(Arc::from(format!("{DEP_FIELD_PREFIX}0")), Value::text("John"));
+        combined_fields.insert(Arc::from(format!("{DEP_FIELD_PREFIX}1")), Value::text("Doe"));
+        let combined = Value::Object(Arc::new(combined_fields));
+        let result = f(&combined);
+
+        assert_eq!(
+            result.get_field("name").and_then(|v| v.as_text()),
+            Some("John"),
+            "store.person_to_add should read current name input text"
+        );
+        assert_eq!(
+            result.get_field("surname").and_then(|v| v.as_text()),
+            Some("Doe"),
+            "store.person_to_add should read current surname input text"
+        );
+        assert!(
+            result.get_field("id").is_some(),
+            "store.person_to_add should include generated id state"
+        );
+        assert!(
+            result
+                .get_field("person_elements")
+                .and_then(|v| v.get_field("row"))
+                .is_some(),
+            "store.person_to_add should include row link state"
+        );
+    }
+
+    #[test]
+    fn crud_people_keyed_append_is_wired_to_person_to_add() {
+        let source = read_example(
+            "../../playground/frontend/src/examples/crud/crud.bn",
+        );
+
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD to compile as dataflow");
+        };
+
+        let append_var = graph
+            .collections
+            .iter()
+            .find_map(|(var, spec)| match spec {
+                CollectionSpec::AppendNewKeyed { source, .. }
+                    if source == &VarId::new("store.person_to_add") =>
+                {
+                    Some(var.clone())
+                }
+                _ => None,
+            })
+            .expect("CRUD keyed append should consume store.person_to_add");
+
+        let membership_uses_append = graph.collections.values().any(|spec| {
+            matches!(
+                spec,
+                CollectionSpec::ListAppend { new_items, .. } if new_items == &append_var
+            )
+        });
+        assert!(
+            membership_uses_append,
+            "CRUD keyed membership should consume the keyed append stream"
+        );
+    }
+
+    #[test]
+    fn crud_selected_id_uses_keyed_row_press_events() {
+        let source = read_example(
+            "../../playground/frontend/src/examples/crud/crud.bn",
+        );
+
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD to compile as dataflow");
+        };
+
+        let keyed_event_maps: Vec<String> = graph
+            .collections
+            .iter()
+            .filter_map(|(var, spec)| match spec {
+                CollectionSpec::KeyedEventMap { items, events, .. } => Some(format!(
+                    "{} => items={}, events={}",
+                    var, items, events
+                )),
+                _ => None,
+            })
+            .collect();
+        let selected_related: Vec<String> = graph
+            .collections
+            .iter()
+            .filter(|(var, _)| var.as_str().contains("selected") || var.as_str().contains("latest"))
+            .map(|(var, spec)| format!("{} => {:?}", var, std::mem::discriminant(spec)))
+            .collect();
+
+        assert!(
+            graph.collections.values().any(|spec| {
+                matches!(
+                    spec,
+                    CollectionSpec::KeyedEventMap { .. }
+                )
+            }),
+            "selected_id row-press pipeline should compile as a KeyedEventMap; keyed_event_maps={keyed_event_maps:?}; selected_related={selected_related:?}"
+        );
+    }
+
+    #[test]
+    fn crud_selected_id_wildcard_classifier_matches_row_press_path() {
+        let source = read_example(
+            "../../playground/frontend/src/examples/crud/crud.bn",
+        );
+
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD to compile as dataflow");
+        };
+
+        let events_var = graph
+            .collections
+            .values()
+            .find_map(|spec| match spec {
+                CollectionSpec::KeyedEventMap { events, .. } => Some(events.clone()),
+                _ => None,
+            })
+            .expect("expected keyed event map for selected_id");
+
+        let classify = match graph.collections.get(&events_var) {
+            Some(CollectionSpec::MapToKeyed { classify, .. }) => classify,
+            _ => panic!("expected MapToKeyed for selected_id events"),
+        };
+
+        let classified = classify(&Value::object([
+            ("path", Value::text("store.people.0002.person_elements.row.event.press")),
+            ("value", Value::tag("Press")),
+        ]));
+
+        let Some((key, payload)) = classified else {
+            panic!("wildcard classifier did not match CRUD row press path");
+        };
+        assert_eq!(key.0.as_ref(), "0002");
+        assert_eq!(payload.as_tag(), Some("Press"));
+    }
+
+    #[test]
+    fn crud_selected_id_keyed_event_map_reads_item_id() {
+        let source = read_example(
+            "../../playground/frontend/src/examples/crud/crud.bn",
+        );
+
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD to compile as dataflow");
+        };
+
+        let transform = graph
+            .collections
+            .values()
+            .find_map(|spec| match spec {
+                CollectionSpec::KeyedEventMap { f, .. } => Some(f),
+                _ => None,
+            })
+            .expect("expected keyed event map for selected_id");
+
+        let item = Value::object([
+            ("id", Value::text("person-42")),
+            ("name", Value::text("Roman")),
+            ("surname", Value::text("Tansen")),
+        ]);
+
+        let selected = transform(&item, &Value::tag("Press"));
+        assert_eq!(selected.as_text(), Some("person-42"));
+    }
+
+    #[test]
+    fn crud_display_pipeline_reacts_to_selected_id() {
+        let source = read_example(
+            "../../playground/frontend/src/examples/crud/crud.bn",
+        );
+
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD to compile as dataflow");
+        };
+
+        assert!(
+            graph.collections.values().any(|spec| {
+                matches!(spec, CollectionSpec::ListMapWithKeyReactive { .. })
+            }),
+            "CRUD display pipeline should compile as ListMapWithKeyReactive"
+        );
+    }
+
+    #[test]
+    fn crud_display_pipeline_uses_joined_dep_state() {
+        let source = read_example(
+            "../../playground/frontend/src/examples/crud/crud.bn",
+        );
+
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD to compile as dataflow");
+        };
+
+        let dep_var = graph
+            .collections
+            .values()
+            .find_map(|spec| match spec {
+                CollectionSpec::ListMapWithKeyReactive { dep, .. } => Some(dep.clone()),
+                _ => None,
+            })
+            .expect("expected reactive display pipeline");
+
+        assert!(
+            matches!(graph.collections.get(&dep_var), Some(CollectionSpec::Join { .. })),
+            "reactive display dep should be a joined scalar object; dep_var={dep_var}"
+        );
+    }
+
+    #[test]
+    fn crud_delete_broadcast_handler_removes_selected_person() {
+        let source = read_example(
+            "../../playground/frontend/src/examples/crud/crud.bn",
+        );
+
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("crud should compile");
+
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected CRUD to compile as dataflow");
+        };
+
+        let handler = graph
+            .collections
+            .values()
+            .find_map(|spec| match spec {
+                CollectionSpec::KeyedHoldState {
+                    broadcast_handler: Some(handler),
+                    ..
+                } => Some(handler),
+                _ => None,
+            })
+            .expect("expected CRUD keyed hold state with broadcast handler");
+        let sample_event = graph
+            .collections
+            .values()
+            .find_map(|spec| match spec {
+                CollectionSpec::SampleOnEvent { f, .. } => Some(f),
+                _ => None,
+            })
+            .expect("expected CRUD delete broadcast sample");
+
+        let selected_id = Value::tagged("PersonId", [("id", Value::text("person-42"))]);
+        let mut states = std::collections::HashMap::new();
+        states.insert(
+            ListKey::new("0001"),
+            Value::object([
+                ("id", Value::tagged("PersonId", [("id", Value::text("person-1"))])),
+                ("surname", Value::text("Mustermann")),
+            ]),
+        );
+        states.insert(
+            ListKey::new("0002"),
+            Value::object([
+                ("id", selected_id.clone()),
+                ("surname", Value::text("Tansen")),
+            ]),
+        );
+
+        let delete_event = sample_event(&Value::tag("Press"), &selected_id);
+        let removals = handler(&states, &delete_event);
+
+        assert!(
+            removals.contains(&(ListKey::new("0002"), None)),
+            "expected CRUD delete broadcast to remove the selected row, got {removals:?}; event={delete_event}"
+        );
+        assert!(
+            !removals.iter().any(|(key, _)| key.0.as_ref() == "0001"),
+            "delete broadcast should not remove non-selected rows, got {removals:?}"
+        );
+    }
+
+    #[test]
+    fn counter_hold_compiles_state_self_reference_without_external_dep_join() {
+        let source = read_example(
+            "../../playground/frontend/src/examples/counter_hold/counter_hold.bn",
+        );
+
+        let program = compile(&source, None, &std::collections::HashMap::new(), None)
+            .expect("counter_hold should compile");
+
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected counter_hold to compile as dataflow");
+        };
+
+        assert!(
+            graph.collections.contains_key(&VarId::new("counter")),
+            "counter HOLD collection should exist"
+        );
+        assert!(
+            graph.collections.contains_key(&graph.document),
+            "document collection should exist for counter_hold"
+        );
+    }
+
+    #[test]
+    fn list_range_keys_preserve_numeric_iteration_order() {
+        let source = r#"
+numbers: List/range(from: 1, to: 12)
+
+document: Document/new(root:
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: []
+        items: numbers |> List/map(old, new:
+            Element/label(
+                element: []
+                style: []
+                label: TEXT { {old} }
+            )
+        )
+    )
+)
+"#;
+
+        let program = compile(source, None, &std::collections::HashMap::new(), None)
+            .expect("range document should compile");
+
+        let CompiledProgram::Static { document_value, .. } = program else {
+            panic!("expected static document");
+        };
+
+        let stripe_items = document_value
+            .get_field("root")
+            .and_then(|root| root.get_field("items"))
+            .expect("stripe items");
+
+        let labels: Vec<String> = stripe_items
+            .list_items()
+            .into_iter()
+            .filter_map(|item| item.get_field("label"))
+            .filter_map(|label| label.as_text().map(ToString::to_string))
+            .collect();
+
+        assert_eq!(
+            labels,
+            vec![
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"
+            ],
+            "List/range labels should stay in numeric order"
+        );
+    }
+
+    #[test]
+    fn inject_item_link_paths_covers_generic_element_groups() {
+        let item = Value::object([
+            (
+                "person_elements",
+                Value::object([("row", Value::tag("LINK"))]),
+            ),
+            (
+                "cell_elements",
+                Value::object([("display", Value::tag("LINK"))]),
+            ),
+        ]);
+
+        let injected = inject_item_link_paths_with_key(&item, "store.people", "0002");
+
+        assert_eq!(
+            injected
+                .get_field("person_elements")
+                .and_then(|v| v.get_field("row"))
+                .and_then(|v| v.get_field(LINK_PATH_FIELD))
+                .and_then(|v| v.as_text()),
+            Some("store.people.0002.person_elements.row")
+        );
+        assert_eq!(
+            injected
+                .get_field("cell_elements")
+                .and_then(|v| v.get_field("display"))
+                .and_then(|v| v.get_field(LINK_PATH_FIELD))
+                .and_then(|v| v.as_text()),
+            Some("store.people.0002.cell_elements.display")
+        );
+    }
+
+    #[test]
+    fn static_list_map_latest_registers_item_event_inputs() {
+        let source = r#"
+items: LIST {
+    [row: 1, cell_elements: [display: LINK]]
+    [row: 2, cell_elements: [display: LINK]]
+}
+selected_row: items
+    |> List/map(cell, new:
+        cell.cell_elements.display.event.double_click |> THEN { cell.row }
+    )
+    |> List/latest()
+document: Document/new(root:
+    Element/label(element: [], style: [], label: selected_row)
+)
+"#;
+
+        let program = compile(source, None, &std::collections::HashMap::new(), None)
+            .expect("program should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected dataflow");
+        };
+
+        let double_click_paths: Vec<String> = graph
+            .inputs
+            .iter()
+            .filter(|input| input.kind == InputKind::DoubleClick)
+            .filter_map(|input| input.link_path.clone())
+            .collect();
+
+        assert!(
+            double_click_paths
+                .iter()
+                .any(|path| path == "items.0000.cell_elements.display.event.double_click"),
+            "expected first static item double-click input path, got {double_click_paths:?}"
+        );
+        assert!(
+            double_click_paths
+                .iter()
+                .any(|path| path == "items.0001.cell_elements.display.event.double_click"),
+            "expected second static item double-click input path, got {double_click_paths:?}"
+        );
+    }
+
+    #[test]
+    fn decorate_reactive_scope_value_recurses_into_nested_lists() {
+        let value = Value::tagged(
+            LIST_TAG,
+            [(
+                "0001",
+                Value::tagged(
+                    LIST_TAG,
+                    [(
+                        "0001",
+                        Value::object([(
+                            "cell_elements",
+                            Value::object([("display", Value::tag("LINK"))]),
+                        )]),
+                    )],
+                ),
+            )],
+        );
+
+        let decorated = decorate_reactive_scope_value(&value, "cells");
+
+        assert_eq!(
+            decorated
+                .get_field("0001")
+                .and_then(|v| v.get_field("0001"))
+                .and_then(|v| v.get_field("cell_elements"))
+                .and_then(|v| v.get_field("display"))
+                .and_then(|v| v.get_field(LINK_PATH_FIELD))
+                .and_then(|v| v.as_text()),
+            Some("cells.0001.0001.cell_elements.display")
+        );
+    }
+}

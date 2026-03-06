@@ -20,6 +20,7 @@ pub use core::value::Value;
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use boon_scene::{RenderRootHandle, RenderSurface, SceneHandles};
 use wasm_bindgen::JsCast;
 use zoon::*;
 
@@ -100,6 +101,65 @@ pub struct DdResult {
 pub struct DdDocument {
     /// The Mutable holding the current document value.
     pub value: Mutable<Value>,
+    /// Monotonic revision used to wake render paths even when keyed diffs
+    /// arrive without changing the scalar document value.
+    pub revision: Mutable<u64>,
+    /// Whether the root came from `document` or `scene`.
+    pub render_surface: RenderSurface,
+    /// Scene-only sub-handles exposed through the shared render-root contract.
+    pub scene_lights: Option<Mutable<Value>>,
+    pub scene_geometry: Option<Mutable<Value>>,
+}
+
+impl DdDocument {
+    #[must_use]
+    pub const fn is_scene(&self) -> bool {
+        self.render_surface.is_scene()
+    }
+
+    #[must_use]
+    pub fn render_root(&self) -> RenderRootHandle<Mutable<Value>> {
+        if self.render_surface.is_scene() {
+            RenderRootHandle {
+                surface: self.render_surface,
+                root: self.value.clone(),
+                scene: Some(SceneHandles {
+                    lights: self.scene_lights.clone(),
+                    geometry: self.scene_geometry.clone(),
+                }),
+            }
+        } else {
+            RenderRootHandle::new(self.render_surface, self.value.clone())
+        }
+    }
+}
+
+fn scene_field_value(value: &Value, field: &str) -> Value {
+    value.get_field(field).cloned().unwrap_or(Value::Unit)
+}
+
+fn build_dd_document(
+    value: Mutable<Value>,
+    revision: Mutable<u64>,
+    render_surface: RenderSurface,
+) -> DdDocument {
+    let initial = value.get_cloned();
+    let (scene_lights, scene_geometry) = if render_surface.is_scene() {
+        (
+            Some(Mutable::new(scene_field_value(&initial, "lights"))),
+            Some(Mutable::new(scene_field_value(&initial, "geometry"))),
+        )
+    } else {
+        (None, None)
+    };
+
+    DdDocument {
+        value,
+        revision,
+        render_surface,
+        scene_lights,
+        scene_geometry,
+    }
 }
 
 /// DD execution context (timers, accumulators, etc.)
@@ -159,16 +219,21 @@ pub fn run_dd_reactive_with_persistence(
     };
 
     match compiled {
-        CompiledProgram::Static { document_value } => {
+        CompiledProgram::Static {
+            document_value,
+            render_surface,
+        } => {
             let output = Mutable::new(document_value);
+            let revision = Mutable::new(0);
             Some(DdResult {
-                document: Some(DdDocument { value: output }),
+                document: Some(build_dd_document(output, revision, render_surface)),
                 context: DdContext { has_timers: false },
                 worker_handle: None,
             })
         }
 
         CompiledProgram::Dataflow { graph } => {
+            let render_surface = graph.render_surface;
             let has_timers = graph
                 .inputs
                 .iter()
@@ -192,10 +257,13 @@ pub fn run_dd_reactive_with_persistence(
                 .collect();
 
             let output = Mutable::new(Value::Unit);
+            let revision = Mutable::new(0);
             let output_for_callback = output.clone();
+            let revision_for_callback = revision.clone();
 
             let worker_handle = io::worker::DdWorkerHandle::new_from_graph(graph, move |value| {
                 output_for_callback.set(value.clone());
+                revision_for_callback.set(revision_for_callback.get() + 1);
             });
 
             // Set up JavaScript intervals for timer inputs
@@ -241,7 +309,7 @@ pub fn run_dd_reactive_with_persistence(
             }
 
             Some(DdResult {
-                document: Some(DdDocument { value: output }),
+                document: Some(build_dd_document(output, revision, render_surface)),
                 context: DdContext { has_timers },
                 worker_handle: Some(worker_handle),
             })
@@ -275,6 +343,7 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
 
     match document {
         Some(doc) => {
+            let render_root = doc.render_root();
             if let Some(ref w) = worker {
                 // Dataflow programs: retained tree for efficient updates.
                 let ready = Mutable::new(false);
@@ -284,17 +353,39 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                     std::cell::RefCell<Option<render::bridge::RetainedTree>>,
                 > = Default::default();
                 let handle = w.clone();
+                let revision = doc.revision.clone();
 
                 let _task_handle = Task::start_droppable({
                     let ready = ready.clone();
                     let root_cell = root_cell.clone();
                     let retained = retained.clone();
+                    let scene_lights =
+                        render_root.scene.as_ref().and_then(|scene| scene.lights.clone());
+                    let scene_geometry =
+                        render_root.scene.as_ref().and_then(|scene| scene.geometry.clone());
+                    let render_surface = render_root.surface;
                     async move {
-                        let stream = doc.value.signal_cloned().to_stream();
+                        let stream = map_ref! {
+                            let value = render_root.root.signal_cloned(),
+                            let _revision = revision.signal() => value.clone()
+                        }
+                        .to_stream();
                         futures_util::pin_mut!(stream);
                         while let Some(value) = stream.next().await {
                             if matches!(&value, Value::Unit) {
                                 continue;
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let preview = value.to_display_string();
+                                let preview: String = preview.chars().take(240).collect();
+                                zoon::eprintln!("[dd-render-preview] {}", preview);
+                            }
+                            if let Some(scene_lights) = &scene_lights {
+                                scene_lights.set_neq(scene_field_value(&value, "lights"));
+                            }
+                            if let Some(scene_geometry) = &scene_geometry {
+                                scene_geometry.set_neq(scene_field_value(&value, "geometry"));
                             }
                             let mut ret = retained.borrow_mut();
                             if let Some(tree) = ret.as_mut() {
@@ -307,8 +398,11 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                                     tree.apply_keyed_diffs(&diffs, &handle);
                                 }
                             } else {
-                                let (element, mut tree) =
-                                    render::bridge::build_retained_tree(&value, &handle);
+                                let (element, mut tree) = render::bridge::build_retained_tree(
+                                    &value,
+                                    &handle,
+                                    render_surface,
+                                );
                                 let diffs = handle.drain_keyed_diffs();
                                 if !diffs.is_empty() {
                                     tree.apply_keyed_diffs(&diffs, &handle);
@@ -338,11 +432,9 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                     }))
             } else {
                 // Static: single render
-                El::new().child_signal(
-                    doc.value
-                        .signal_cloned()
-                        .map(|value| render::bridge::render_value_static(&value)),
-                )
+                El::new().child_signal(render_root.root.signal_cloned().map(|value| {
+                    render::bridge::render_value_static(&value)
+                }))
             }
         }
         None => El::new().child("DD Engine: No document"),
@@ -367,5 +459,51 @@ pub fn clear_dd_persisted_states() {
         for key in keys_to_remove {
             let _ = storage.remove_item(&key);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Value, build_dd_document};
+    use boon_scene::RenderSurface;
+    use zoon::Mutable;
+
+    #[test]
+    fn scene_document_exposes_scene_handles_in_render_root() {
+        let document = build_dd_document(
+            Mutable::new(Value::tagged(
+                "SceneNew",
+                [
+                    ("root", Value::text("root")),
+                    ("lights", Value::text("lights")),
+                    ("geometry", Value::text("geometry")),
+                ],
+            )),
+            Mutable::new(0),
+            RenderSurface::Scene,
+        );
+
+        let render_root = document.render_root();
+        assert!(render_root.is_scene());
+        let scene = render_root
+            .scene
+            .as_ref()
+            .expect("scene handles should exist");
+        assert_eq!(
+            scene
+                .lights
+                .as_ref()
+                .expect("lights")
+                .get_cloned(),
+            Value::text("lights")
+        );
+        assert_eq!(
+            scene
+                .geometry
+                .as_ref()
+                .expect("geometry")
+                .get_cloned(),
+            Value::text("geometry")
+        );
     }
 }

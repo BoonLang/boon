@@ -3,7 +3,6 @@
 [test]
 category = "interactive"
 description = "7GUIs Task 3: flight booking with date validation"
-skip_engines = ["DD", "Wasm"]
 
 [output]
 text = "Flight Booker"
@@ -46,7 +45,7 @@ expect = "Flight Booker"
 # SPEC: Book valid one-way flight -> confirmation message
 [[sequence]]
 description = "Book one-way flight"
-actions = [["click_text", "Book"]]
+actions = [["click_button", 0]]
 expect = "Booked one-way flight"
 expect_match = "contains"
 
@@ -59,7 +58,7 @@ expect = "Flight Booker"
 # SPEC: Book return flight -> shows both dates
 [[sequence]]
 description = "Book return flight"
-actions = [["click_text", "Book"]]
+actions = [["click_button", 0]]
 expect = "Booked return flight"
 expect_match = "contains"
 
@@ -72,6 +71,6 @@ expect = "Flight Booker"
 # SPEC: Can still book one-way after switching back
 [[sequence]]
 description = "Book one-way again"
-actions = [["click_text", "Book"]]
+actions = [["click_button", 0]]
 expect = "Booked one-way flight"
 expect_match = "contains"

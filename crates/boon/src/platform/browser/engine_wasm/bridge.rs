@@ -5,6 +5,10 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use boon_scene::PhysicalSceneParams;
+use boon_renderer_zoon::{
+    custom_call_placeholder, unknown_placeholder, with_render_root,
+};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use zoon::*;
@@ -17,7 +21,7 @@ extern "C" {
 }
 
 use super::ir::*;
-use super::runtime::{CellStore, WasmInstance};
+use super::runtime::{CellStore, ItemCellStore, ListStore, WasmInstance};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -26,16 +30,10 @@ use super::runtime::{CellStore, WasmInstance};
 /// Build the Zoon element tree for the given IR program and WASM instance.
 /// The tag_table is cloned for reactive text display.
 pub fn build_ui(program: &IrProgram, instance: Rc<WasmInstance>) -> RawElOrText {
-    let doc_root = match program.document {
-        Some(cell) => cell,
-        None => return zoon::Text::new("No document root").unify(),
-    };
-
-    // Find the Document node to get the root cell.
-    let root_cell = find_document_root(program).unwrap_or(doc_root);
-
-    // Build element from the root cell.
-    build_cell_element(program, &instance, root_cell)
+    with_render_root(program.render_root(), |render_root| {
+        initialize_scene_params(&instance);
+        build_cell_element(program, &instance, render_root.root)
+    })
 }
 
 /// Set up the connection between Router/go_to() and Router/route().
@@ -205,6 +203,7 @@ fn build_element(
             | IrNode::MathSum { .. }
             | IrNode::Hold { .. }
             | IrNode::Then { .. }
+            | IrNode::StreamSkip { .. }
             | IrNode::ListCount { .. }
             | IrNode::HoldLoop { .. }
             | IrNode::ListIsEmpty { .. }
@@ -214,6 +213,8 @@ fn build_element(
             | IrNode::TextIsNotEmpty { .. }
             | IrNode::TextToNumber { .. }
             | IrNode::MathRound { .. }
+            | IrNode::MathMin { .. }
+            | IrNode::MathMax { .. }
             | IrNode::TextStartsWith { .. } => build_reactive_text_ctx(instance, ctx, cell),
             IrNode::ListAppend { source, .. }
             | IrNode::ListClear { source, .. }
@@ -231,6 +232,7 @@ fn build_element(
             } => build_list_map(
                 program,
                 instance,
+                ctx.item_ctx().cloned(),
                 cell,
                 *source,
                 *item_cell,
@@ -239,14 +241,9 @@ fn build_element(
                 *template_cell_range,
                 *template_event_range,
             ),
-            IrNode::Document { root } => build_element(program, instance, ctx, *root),
-            IrNode::CustomCall { path, .. } => {
-                let path_str = path.join("/");
-                zoon::Text::new(format!("[{}]", path_str)).unify()
-            }
-            _ => {
-                zoon::Text::new("?").unify()
-            }
+            IrNode::Document { root, .. } => build_element(program, instance, ctx, *root),
+            IrNode::CustomCall { path, .. } => custom_call_placeholder(path),
+            _ => unknown_placeholder(),
         }
     } else {
         // No node found for cell — falls back to reactive text
@@ -273,9 +270,13 @@ fn build_reactive_text_ctx(
 /// Build a reactive text element that shows the cell's display value.
 fn build_reactive_text(instance: &Rc<WasmInstance>, cell: CellId) -> RawElOrText {
     let store = instance.cell_store.clone();
+    let program = instance.program.clone();
     let cell_id = cell.0;
-    let signal = store.get_cell_signal(cell_id);
-    zoon::Text::with_signal(signal.map(move |_| format_cell_value(&store, cell_id))).unify()
+    let signal = store.get_revision_signal();
+    zoon::Text::with_signal(signal.map(move |_| {
+        format_runtime_cell_value(&program, &store, CellId(cell_id))
+    }))
+    .unify()
 }
 
 /// Format a number for display (remove trailing ".0" for integers).
@@ -300,6 +301,20 @@ fn format_cell_value(store: &super::runtime::CellStore, cell_id: u32) -> String 
         store.get_cell_text(cell_id)
     } else {
         format_number(store.get_cell_value(cell_id))
+    }
+}
+
+fn format_runtime_cell_value(
+    program: &IrProgram,
+    store: &super::runtime::CellStore,
+    cell: CellId,
+) -> String {
+    match resolve_runtime_cell_expr(program, store, cell, 0).unwrap_or(IrExpr::CellRead(cell)) {
+        IrExpr::Constant(IrValue::Text(t)) => t,
+        IrExpr::Constant(IrValue::Number(n)) => format_number(n),
+        IrExpr::Constant(IrValue::Tag(t)) => t,
+        IrExpr::CellRead(cell) => format_cell_value(store, cell.0),
+        _ => format_cell_value(store, cell.0),
     }
 }
 
@@ -746,35 +761,133 @@ fn build_button(
     links: &[(String, EventId)],
     hovered_cell: Option<CellId>,
 ) -> RawElOrText {
+    fn resolve_field_map(program: &IrProgram, cell: CellId, depth: usize) -> Option<HashMap<String, CellId>> {
+        if depth > 16 {
+            return None;
+        }
+        if let Some(fields) = program.cell_field_cells.get(&cell) {
+            return Some(fields.clone());
+        }
+        for node in &program.nodes {
+            match node {
+                IrNode::Derived {
+                    cell: c,
+                    expr: IrExpr::TaggedObject { fields, .. },
+                }
+                | IrNode::Derived {
+                    cell: c,
+                    expr: IrExpr::ObjectConstruct(fields),
+                } if *c == cell => {
+                    let mut field_map = HashMap::new();
+                    for (field_name, field_expr) in fields {
+                        if let IrExpr::CellRead(field_cell) = field_expr {
+                            field_map.insert(field_name.clone(), *field_cell);
+                        }
+                    }
+                    if !field_map.is_empty() {
+                        return Some(field_map);
+                    }
+                }
+                IrNode::Derived {
+                    cell: c,
+                    expr: IrExpr::CellRead(source),
+                } if *c == cell => return resolve_field_map(program, *source, depth + 1),
+                IrNode::PipeThrough { cell: c, source } if *c == cell => {
+                    return resolve_field_map(program, *source, depth + 1);
+                }
+                IrNode::Derived {
+                    cell: c,
+                    expr: IrExpr::FieldAccess { object, field },
+                } if *c == cell => {
+                    let IrExpr::CellRead(object_cell) = object.as_ref() else {
+                        return None;
+                    };
+                    let object_fields = resolve_field_map(program, *object_cell, depth + 1)?;
+                    let field_cell = *object_fields.get(field)?;
+                    return resolve_field_map(program, field_cell, depth + 1);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn resolve_scalar_leaf_cell(program: &IrProgram, start: CellId) -> CellId {
+        let mut current = start;
+        for _ in 0..16 {
+            let Some(fields) = resolve_field_map(program, current, 0) else {
+                break;
+            };
+            if fields.len() != 1 {
+                break;
+            }
+            if let Some(next) = fields.values().next() {
+                current = *next;
+            } else {
+                break;
+            }
+        }
+        current
+    }
+
     let press_event = links
         .iter()
         .find(|(name, _)| name == "press")
         .map(|(_, eid)| *eid);
-
     let label_child = build_label_child(program, instance, ctx, label);
     let inst_press = instance.clone();
-    let is_template_event = press_event
-        .map(|e| ctx.is_template_event(e))
-        .unwrap_or(false);
     let item_idx = ctx.item_ctx().map(|c| c.item_idx);
-    let mut btn = Button::new().label(label_child).on_press(move || {
+    let item_label_cell = match (ctx.item_ctx(), label) {
+        (Some(item_ctx), IrExpr::CellRead(cell)) if item_ctx.is_template_cell(*cell) => Some(cell.0),
+        _ => None,
+    };
+    let item_id_scalar_cell = ctx.item_ctx().and_then(|item_ctx| {
+        program
+            .cell_field_cells
+            .get(&CellId(item_ctx.item_cell_id))
+            .and_then(|fields| fields.get("id"))
+            .map(|cell| resolve_scalar_leaf_cell(program, *cell).0)
+    });
+    let fire_press: Rc<dyn Fn()> = Rc::new(move || {
         if let Some(event_id) = press_event {
-            if is_template_event {
-                let _ = inst_press.call_on_item_event(item_idx.unwrap(), event_id.0);
+            if let Some(item_idx) = item_idx {
+                let _ = inst_press.call_on_item_event(item_idx, event_id.0);
             } else {
                 let _ = inst_press.fire_event(event_id.0);
             }
         }
     });
-    btn = apply_typed_styles(btn, style, program, false);
-    if let Some(cell) = hovered_cell {
-        btn = apply_hover(btn, instance, ctx.item_ctx(), cell);
+    if ctx.item_ctx().is_some() {
+        let mut el = El::new();
+        el = apply_typed_styles(el, style, program, false);
+        if let Some(cell) = hovered_cell {
+            el = apply_hover(el, instance, ctx.item_ctx(), cell);
+        }
+        el.child(label_child)
+            .update_raw_el(|raw_el| {
+                let fire_press = fire_press.clone();
+                let raw_el = raw_el
+                    .attr("role", "button")
+                    .attr("tabindex", "0")
+                    .style("cursor", "pointer")
+                    .style("user-select", "none")
+                    .event_handler(move |_: events::MouseDown| fire_press());
+                let raw_el = apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false);
+                apply_physical_css(raw_el, style, program, instance, ctx.item_ctx())
+            })
+            .into_raw_unchecked()
+    } else {
+        let mut btn = Button::new().label(label_child).on_press(move || fire_press());
+        btn = apply_typed_styles(btn, style, program, false);
+        if let Some(cell) = hovered_cell {
+            btn = apply_hover(btn, instance, ctx.item_ctx(), cell);
+        }
+        btn.update_raw_el(|raw_el| {
+            let raw_el = apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false);
+            apply_physical_css(raw_el, style, program, instance, ctx.item_ctx())
+        })
+        .into_raw_unchecked()
     }
-    btn.update_raw_el(|raw_el| {
-        let raw_el = apply_raw_css(raw_el, style, program, instance, ctx.item_ctx(), false);
-        apply_physical_css(raw_el, style, program, instance, ctx.item_ctx())
-    })
-    .into_raw_unchecked()
 }
 
 /// A child slot for Stripe elements — either a static element or a reactive signal.
@@ -977,19 +1090,48 @@ fn build_text_input(
 
     // Find data cells for event payloads.
     let key_data_cell = find_data_cell_for_event(program, links, "key_down", "key");
-    let change_text_cell = find_data_cell_for_event(program, links, "change", "text");
-    let text_cell = find_text_property_cell(program, links);
+    let mut change_text_cells = find_data_cells_for_event(program, links, "change", "text");
+    let mut text_cells = find_text_property_cells(program, links);
+    if let Some(local_text_cell) = boon_text_cell {
+        text_cells.push(local_text_cell.0);
+        if let Some(base_name) = program.cells[local_text_cell.0 as usize]
+            .name
+            .strip_suffix(".text")
+        {
+            let local_change_text_name = format!("{}.event.change.text", base_name);
+            if let Some(cell_id) = program
+                .cells
+                .iter()
+                .enumerate()
+                .find_map(|(idx, info)| {
+                    (info.name == local_change_text_name).then_some(idx as u32)
+                })
+            {
+                change_text_cells.push(cell_id);
+            }
+        }
+    }
+    change_text_cells.sort_unstable();
+    change_text_cells.dedup();
+    text_cells.sort_unstable();
+    text_cells.dedup();
+    let text_cell = text_cells.iter().copied().find(|cell_id| {
+        boon_text_cell.is_none() || Some(CellId(*cell_id)) == boon_text_cell
+    });
     let inherit_text_color = !style_defines_font_color(style, program);
 
-    let mut ti = TextInput::new();
-    ti = apply_typed_styles(ti, style, program, false);
-    if let Some(cell) = hovered_cell {
-        ti = apply_hover(ti, instance, None, cell);
-    }
-    // Apply placeholder via Zoon's typed Placeholder API.
-    let ph_el = build_placeholder(placeholder, program);
-    ti.placeholder(ph_el)
-        .update_raw_el(|raw_el| {
+    let ti = TextInput::new();
+    let ti = apply_typed_styles(ti, style, program, false);
+    let ti = if let Some(cell) = hovered_cell {
+        apply_hover(ti, instance, None, cell)
+    } else {
+        ti
+    };
+    macro_rules! finish_text_input {
+        ($ti:expr) => {{
+            let ph_el = build_placeholder(placeholder, program);
+            $ti.placeholder(ph_el)
+                .update_raw_el(|raw_el| {
             let mut raw_el = raw_el
                 .style("box-sizing", "border-box")
                 .style("outline", "none");
@@ -1004,6 +1146,16 @@ fn build_text_input(
                     let _ = el.focus();
                 });
             }
+
+            let mount_key_down_event = key_down_event.map(|event_id| event_id.0);
+            let mount_change_event = change_event.map(|event_id| event_id.0);
+            let mount_text_cell = text_cell;
+            let mount_boon_text_cell = boon_text_cell.map(|cell_id| cell_id.0);
+            raw_el = raw_el.after_insert(move |_input_el: web_sys::HtmlInputElement| {
+                console_log(&format!(
+                    "[boon wasm] mount_text_input key_down={mount_key_down_event:?} change={mount_change_event:?} text_cell={mount_text_cell:?} boon_text_cell={mount_boon_text_cell:?}"
+                ));
+            });
 
             // Keep DOM value synchronized with `element.text` cell state so
             // reruns and persistence restores show the stored draft text.
@@ -1063,11 +1215,39 @@ fn build_text_input(
             raw_el = apply_raw_css(raw_el, style, program, instance, None, false);
             raw_el = apply_physical_css(raw_el, style, program, instance, None);
 
+            if let Some(event_id) = change_event {
+                let inst = instance.clone();
+                let change_text_cells_for_input = change_text_cells.clone();
+                let text_cells_for_input = text_cells.clone();
+                raw_el = raw_el.event_handler(move |event: events::Input| {
+                    if let Some(target) = event.target() {
+                        if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
+                            let text = input.value();
+                            for &cell_id in &change_text_cells_for_input {
+                                inst.cell_store.set_cell_text(cell_id, text.clone());
+                            }
+                            for &cell_id in &text_cells_for_input {
+                                inst.cell_store.set_cell_text(cell_id, text.clone());
+                            }
+                        }
+                    }
+                    let _ = inst.fire_event(event_id.0);
+                });
+            }
+
             // Set up keydown event listener.
             let raw_el = if let Some(event_id) = key_down_event {
                 let inst = instance.clone();
+                let change_event_for_key = change_event;
+                let change_text_cells_for_key = change_text_cells.clone();
+                let text_cells_for_key = text_cells.clone();
                 raw_el.event_handler(move |event: events::KeyDown| {
                     let key = event.key();
+                    console_log(&format!(
+                        "[boon wasm] text_input_keydown key={key} event={} change={:?}",
+                        event_id.0,
+                        change_event_for_key.map(|event_id| event_id.0)
+                    ));
                     let tag_value = match key.as_str() {
                         "Enter" => inst.program_tag_index("Enter"),
                         "Escape" => inst.program_tag_index("Escape"),
@@ -1076,13 +1256,16 @@ fn build_text_input(
                     if let Some(target) = event.target() {
                         if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
                             let input_text = input.value();
-                            if let Some(cell_id) = change_text_cell {
+                            for &cell_id in &change_text_cells_for_key {
                                 inst.cell_store.set_cell_text(cell_id, input_text.clone());
                             }
-                            if let Some(cell_id) = text_cell {
+                            for &cell_id in &text_cells_for_key {
                                 inst.cell_store.set_cell_text(cell_id, input_text.clone());
                             }
                             if key == "Enter" {
+                                if let Some(change_eid) = change_event_for_key {
+                                    let _ = inst.fire_event(change_eid.0);
+                                }
                                 input.set_value("");
                             }
                         }
@@ -1096,28 +1279,13 @@ fn build_text_input(
                 raw_el
             };
 
-            // Set up input change event listener.
-            if let Some(event_id) = change_event {
-                let inst = instance.clone();
-                raw_el.event_handler(move |event: events::Input| {
-                    if let Some(target) = event.target() {
-                        if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
-                            let input_text = input.value();
-                            if let Some(cell_id) = change_text_cell {
-                                inst.cell_store.set_cell_text(cell_id, input_text.clone());
-                            }
-                            if let Some(cell_id) = text_cell {
-                                inst.cell_store.set_cell_text(cell_id, input_text);
-                            }
-                        }
-                    }
-                    let _ = inst.fire_event(event_id.0);
+                    raw_el
                 })
-            } else {
-                raw_el
-            }
-        })
-        .into_raw_unchecked()
+                .into_raw_unchecked()
+        }};
+    }
+
+    finish_text_input!(ti)
 }
 
 /// Build a slider (`<input type="range">`) element with change event.
@@ -1136,7 +1304,7 @@ fn build_slider(
         .iter()
         .find(|(name, _)| name == "change")
         .map(|(_, eid)| *eid);
-    let change_value_cell = find_data_cell_for_event(program, links, "change", "value");
+    let change_value_cells = find_data_cells_for_event(program, links, "change", "value");
 
     let mut raw_el = RawHtmlEl::new("input")
         .attr("type", "range")
@@ -1193,8 +1361,11 @@ fn build_slider(
             if let Some(target) = event.target() {
                 if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
                     let val: f64 = input.value().parse().unwrap_or(0.0);
-                    if let Some(cell_id) = change_value_cell {
-                        inst.set_cell_value(cell_id, val);
+                    if let Some(cell) = value_cell {
+                        inst.set_cell_value(cell.0, val);
+                    }
+                    for cell_id in &change_value_cells {
+                        inst.set_cell_value(*cell_id, val);
                     }
                 }
             }
@@ -1219,7 +1390,7 @@ fn build_select(
         .iter()
         .find(|(name, _)| name == "change")
         .map(|(_, eid)| *eid);
-    let change_value_cell = find_data_cell_for_event(program, links, "change", "value");
+    let change_value_cells = find_data_cells_for_event(program, links, "change", "value");
 
     let initial_selected = selected
         .and_then(|s| match s {
@@ -1257,21 +1428,30 @@ fn build_select(
         });
     }
 
-    // Handle change event — dispatches `input` event to match Element/select convention.
+    // Handle change event from the browser select element.
     if let Some(event_id) = change_event {
         let inst = instance.clone();
-        raw_el = raw_el.event_handler(move |event: events::Input| {
-            if let Some(target) = event.target() {
-                // HtmlSelectElement feature not enabled in web_sys, so get value via js_sys.
-                let value_key = wasm_bindgen::JsValue::from_str("value");
-                if let Ok(val) = js_sys::Reflect::get(&target, &value_key) {
-                    let selected_value = val.as_string().unwrap_or_default();
-                    if let Some(cell_id) = change_value_cell {
-                        inst.cell_store.set_cell_text(cell_id, selected_value);
-                    }
+        let apply_select_change = move |target: web_sys::EventTarget| {
+            // HtmlSelectElement feature not enabled in web_sys, so get value via js_sys.
+            let value_key = wasm_bindgen::JsValue::from_str("value");
+            if let Ok(val) = js_sys::Reflect::get(&target, &value_key) {
+                let selected_value = val.as_string().unwrap_or_default();
+                for cell_id in &change_value_cells {
+                    inst.cell_store.set_cell_text(*cell_id, selected_value.clone());
                 }
             }
             let _ = inst.fire_event(event_id.0);
+        };
+        let apply_select_input = apply_select_change.clone();
+        raw_el = raw_el.event_handler(move |event: events::Input| {
+            if let Some(target) = event.target() {
+                apply_select_input(target);
+            }
+        });
+        raw_el = raw_el.event_handler(move |event: events::Change| {
+            if let Some(target) = event.target() {
+                apply_select_change(target);
+            }
         });
     }
 
@@ -1579,6 +1759,46 @@ fn find_data_cell_for_event(
     find_data_cell_for_event_in_range(program, links, event_name, field_name, None)
 }
 
+fn find_data_cells_for_event(
+    program: &IrProgram,
+    links: &[(String, EventId)],
+    event_name: &str,
+    field_name: &str,
+) -> Vec<u32> {
+    let Some(event_id) = links
+        .iter()
+        .find(|(name, _)| name == event_name)
+        .map(|(_, eid)| *eid)
+    else {
+        return Vec::new();
+    };
+
+    let event_info = &program.events[event_id.0 as usize];
+    let field_suffix = format!(".event.{}.{}", event_name, field_name);
+    let mut cells: Vec<u32> = event_info
+        .payload_cells
+        .iter()
+        .filter_map(|cid| {
+            program
+                .cells
+                .get(cid.0 as usize)
+                .is_some_and(|info| info.name.ends_with(&field_suffix))
+                .then_some(cid.0)
+        })
+        .collect();
+
+    if cells.is_empty() {
+        if let Some(cell) = find_data_cell_for_event(program, links, event_name, field_name) {
+            cells.push(cell);
+        }
+    } else {
+        cells.sort_unstable();
+        cells.dedup();
+    }
+
+    cells
+}
+
 /// Find event data cell, optionally restricted to a template cell range.
 /// When a range is given, prefer cells within that range (for per-item templates).
 /// Falls back to any matching cell if none found in the range.
@@ -1594,12 +1814,55 @@ fn find_data_cell_for_event_in_range(
         .iter()
         .find(|(name, _)| name == event_name)
         .map(|(_, eid)| *eid)?;
-    // The event's name is "{element_path}.{event_name}".
     let event_info = &program.events[event_id.0 as usize];
-    // Strip the event name suffix to get the element path.
     let element_path = event_info.name.strip_suffix(&format!(".{}", event_name))?;
-    // Look for the data cell.
     let data_cell_name = format!("{}.event.{}.{}", element_path, event_name, field_name);
+
+    let exact_match = |cid: &CellId| {
+        program
+            .cells
+            .get(cid.0 as usize)
+            .is_some_and(|info| info.name == data_cell_name)
+    };
+    if let Some((start, end)) = template_range {
+        if let Some(cell_id) = event_info
+            .payload_cells
+            .iter()
+            .copied()
+            .find(|cid| cid.0 >= start && cid.0 < end && exact_match(cid))
+        {
+            return Some(cell_id.0);
+        }
+    }
+    if let Some(cell_id) = event_info.payload_cells.iter().copied().find(exact_match) {
+        return Some(cell_id.0);
+    }
+
+    let field_suffix = format!(".event.{}.{}", event_name, field_name);
+
+    // Prefer payload cells explicitly declared on the event. This is more robust
+    // than reconstructing the element path from the event name because LINK
+    // lowering can reuse event ids across local and linked element aliases.
+    let payload_match = |cid: &CellId| {
+        program
+            .cells
+            .get(cid.0 as usize)
+            .is_some_and(|info| info.name.ends_with(&field_suffix))
+    };
+    if let Some((start, end)) = template_range {
+        if let Some(cell_id) = event_info
+            .payload_cells
+            .iter()
+            .copied()
+            .find(|cid| cid.0 >= start && cid.0 < end && payload_match(cid))
+        {
+            return Some(cell_id.0);
+        }
+    }
+    if let Some(cell_id) = event_info.payload_cells.iter().copied().find(payload_match) {
+        return Some(cell_id.0);
+    }
+
     // If a template range is given, prefer cells within that range.
     if let Some((start, end)) = template_range {
         let template_match = program
@@ -1626,6 +1889,36 @@ fn find_data_cell_for_event_in_range(
 /// Find the .text property cell for a text input element.
 fn find_text_property_cell(program: &IrProgram, links: &[(String, EventId)]) -> Option<u32> {
     find_text_property_cell_in_range(program, links, None)
+}
+
+fn find_text_property_cells(program: &IrProgram, links: &[(String, EventId)]) -> Vec<u32> {
+    let Some(event_id) = links.first().map(|(_, eid)| *eid) else {
+        return Vec::new();
+    };
+    let event_info = &program.events[event_id.0 as usize];
+    let Some(dot_pos) = event_info.name.rfind('.') else {
+        return Vec::new();
+    };
+    let element_path = &event_info.name[..dot_pos];
+    let text_cell_name = format!("{}.text", element_path);
+
+    let mut cells: Vec<u32> = program
+        .cells
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, info)| (info.name == text_cell_name).then_some(idx as u32))
+        .collect();
+
+    if cells.is_empty() {
+        if let Some(cell) = find_text_property_cell(program, links) {
+            cells.push(cell);
+        }
+    } else {
+        cells.sort_unstable();
+        cells.dedup();
+    }
+
+    cells
 }
 
 /// Find text property cell, optionally restricted to a template cell range.
@@ -2389,6 +2682,16 @@ impl ItemContext {
     }
 }
 
+fn is_item_local_event(program: &IrProgram, ctx: &ItemContext, event: EventId) -> bool {
+    if ctx.is_template_event(event) {
+        return true;
+    }
+    let Some(event_info) = program.events.get(event.0 as usize) else {
+        return false;
+    };
+    event_info.name.starts_with("object.") || event_info.name.starts_with("element.")
+}
+
 /// Context for building elements — Global (top-level) or Item (per-list-item).
 #[derive(Clone)]
 enum BuildContext<'a> {
@@ -2420,7 +2723,9 @@ impl<'a> BuildContext<'a> {
 
     fn fire_event(&self, instance: &Rc<WasmInstance>, event: EventId) {
         match self {
-            BuildContext::Item(ctx) if ctx.is_template_event(event) => {
+            BuildContext::Item(ctx)
+                if is_item_local_event(instance.program.as_ref(), ctx, event) =>
+            {
                 let _ = instance.call_on_item_event(ctx.item_idx, event.0);
             }
             _ => {
@@ -2434,10 +2739,11 @@ impl<'a> BuildContext<'a> {
 fn build_list_map(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
+    parent_item_ctx: Option<ItemContext>,
     map_cell: CellId,
     source: CellId,
     item_cell: CellId,
-    _item_name: &str,
+    item_name: &str,
     template: &IrNode,
     template_cell_range: (u32, u32),
     template_event_range: (u32, u32),
@@ -2465,7 +2771,8 @@ fn build_list_map(
     // cross-scope item updates (e.g. toggle-all) working even when the map's
     // visible source is filtered to zero items.
     let fanout_source = resolve_cross_scope_fanout_source(program, source);
-
+    let template_global_deps =
+        collect_template_global_dependencies(program, template_cell_range);
     let inst = instance.clone();
 
     // Track which items have been initialized by their stable memory index.
@@ -2480,9 +2787,11 @@ fn build_list_map(
         let inst_hook = inst.clone();
         let initialized_for_hook = initialized_indices.clone();
         let hook_map_cell = map_cell.0;
+        let hook_parent_item_ctx = parent_item_ctx.clone();
         inst.add_post_event_hook(Box::new(move |event_id| {
             if cross_events.contains(&event_id) {
-                let list_id = inst_hook.cell_store.get_cell_value(fanout_source.0);
+                let list_id =
+                    current_list_id_for_source(&inst_hook, hook_parent_item_ctx.as_ref(), fanout_source);
                 let text_items = inst_hook.list_store.items_text(list_id);
                 let f64_items = inst_hook.list_store.items(list_id);
                 let item_count = if !text_items.is_empty() {
@@ -2520,10 +2829,37 @@ fn build_list_map(
     // We track previous item indices (memory indices for each list position)
     // and only fire when they actually change. This converts the raw version
     // signal into a stable "list content changed" signal.
+    let template_global_revision = Mutable::new(0_u64);
+    let dependency_watchers: Rc<Vec<TaskHandle>> = Rc::new(
+        template_global_deps
+            .iter()
+            .map(|dep| {
+                let dep_id = dep.0;
+                let store = instance.cell_store.clone();
+                let revision = template_global_revision.clone();
+                Task::start_droppable(store.get_cell_signal(dep_id).for_each_sync(move |_| {
+                    revision.set(revision.get().wrapping_add(1));
+                }))
+            })
+            .collect(),
+    );
+    let trigger_signal: Box<dyn Signal<Item = (f64, u64)> + Unpin> =
+        if template_global_deps.is_empty() {
+            Box::new(version_signal.map(|version| (version, 0)))
+        } else {
+            Box::new(map_ref! {
+                let version = version_signal,
+                let revision = template_global_revision.signal() => (*version, *revision)
+            })
+        };
     let inst_dedup = instance.clone();
     let prev_indices: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
-    let deduped_signal = version_signal.filter_map(move |_version| {
-        let current_list_id = inst_dedup.cell_store.get_cell_value(source.0);
+    let prev_global_revision = Rc::new(RefCell::new(None::<u64>));
+    let resolved_item_store = resolve_to_object_store(program, item_cell);
+    let dedup_parent_item_ctx = parent_item_ctx.clone();
+    let deduped_signal = trigger_signal.filter_map(move |(_version, global_revision)| {
+        let current_list_id =
+            current_list_id_for_source(&inst_dedup, dedup_parent_item_ctx.as_ref(), source);
         let text_items = inst_dedup.list_store.items_text(current_list_id);
         let f64_items = inst_dedup.list_store.items(current_list_id);
         let item_count = if !text_items.is_empty() {
@@ -2535,13 +2871,18 @@ fn build_list_map(
             .map(|i| inst_dedup.list_store.item_memory_index(current_list_id, i) as u32)
             .collect();
         let mut prev = prev_indices.borrow_mut();
-        if *prev == current {
+        let mut prev_revision = prev_global_revision.borrow_mut();
+        if *prev == current && *prev_revision == Some(global_revision) {
             None // Same items — suppress signal, don't re-render
         } else {
             *prev = current;
-            Some(()) // Items changed — allow signal through
+            *prev_revision = Some(global_revision);
+            Some(global_revision) // Items changed — allow signal through
         }
     });
+    let last_applied_global_revision = Rc::new(RefCell::new(None::<u64>));
+    let render_count = Rc::new(RefCell::new(0_u32));
+    let item_name_owned = item_name.to_string();
 
     // Build a map: field_name → HOLD init source cell for each field in item_cell.
     // This allows us to seed the correct text on the HOLD's source cell BEFORE
@@ -2573,10 +2914,22 @@ fn build_list_map(
     // Build a container that reactively re-renders children when the list changes.
     RawHtmlEl::new("div")
         .style("display", "contents")
-        .child_signal(deduped_signal.map(move |_opt| {
+        .child_signal(deduped_signal.map({
+            let child_parent_item_ctx = parent_item_ctx.clone();
+            let render_count = render_count.clone();
+            let item_name_owned = item_name_owned.clone();
+            move |global_revision| {
+            let _keep_dependency_watchers_alive = dependency_watchers.len();
+            let global_deps_changed = {
+                let mut last = last_applied_global_revision.borrow_mut();
+                let changed = *last != global_revision;
+                *last = global_revision;
+                changed
+            };
             // Re-read list_id from source cell each time — the filter loop may
             // have replaced the list with a new filtered copy.
-            let current_list_id = inst.cell_store.get_cell_value(source.0);
+            let current_list_id =
+                current_list_id_for_source(&inst, child_parent_item_ctx.as_ref(), source);
             let text_items = inst.list_store.items_text(current_list_id);
             let f64_items = inst.list_store.items(current_list_id);
             let item_count = if !text_items.is_empty() {
@@ -2584,6 +2937,22 @@ fn build_list_map(
             } else {
                 f64_items.len()
             };
+            {
+                let mut count = render_count.borrow_mut();
+                *count += 1;
+                if *count <= 5 {
+                    console_log(&format!(
+                        "[boon wasm] list_map_render map={} source={} item={} render_count={} item_count={} global_revision={:?} deps_changed={}",
+                        map_cell.0,
+                        source.0,
+                        item_cell.0,
+                        *count,
+                        item_count,
+                        global_revision,
+                        global_deps_changed
+                    ));
+                }
+            }
             if item_count == 0 {
                 // Only reset initialized indices when the backing list is truly
                 // empty. A filtered view can be empty while backing items still
@@ -2604,9 +2973,19 @@ fn build_list_map(
 
             let program = &inst.program;
             let has_pending_snapshot = inst.has_pending_snapshot();
+            let initialized_any = Rc::new(RefCell::new(false));
 
             let children: Vec<RawElOrText> = (0..item_count)
                 .map(|i| {
+                    if i < 3 || i % 10 == 0 {
+                        console_log(&format!(
+                            "[boon wasm] list_map_child_begin map={} item_name={} i={} item_count={}",
+                            map_cell.0,
+                            item_name_owned,
+                            i,
+                            item_count
+                        ));
+                    }
                     // Use item_memory_index to correctly map position → memory index.
                     // For index-based lists (after ListRetain/ListRemove), f64 values
                     // are original memory indices. For regular lists, use sequential index.
@@ -2623,11 +3002,16 @@ fn build_list_map(
                         if !has_pending_snapshot || ics.get_text(item_idx, item_cell.0).is_empty() {
                             if i < text_items.len() {
                                 ics.set_text(item_idx, item_cell.0, text_items[i].clone());
-                            } else if i < f64_items.len() {
+                            } else if i < f64_items.len()
+                                && !program
+                                    .cell_field_cells
+                                    .contains_key(&resolved_item_store)
+                            {
                                 // Numeric list items: format value as text for label display.
                                 ics.set_text(item_idx, item_cell.0, format_number(f64_items[i]));
                             }
                         }
+
                     }
 
                     // Seed HOLD source cells BEFORE init_item. For multi-field
@@ -2638,8 +3022,27 @@ fn build_list_map(
                     // the correct per-field texts on those source cells so init_item
                     // propagates them through the entire template, including derived
                     // text interpolations (e.g., label = TEXT { {surname}, {name} }).
+                    let item_expr_for_template = resolve_runtime_list_item_expr_for_context(
+                        program,
+                        &inst,
+                        parent_item_ctx.as_ref(),
+                        source,
+                        i,
+                    );
+
                     if !initialized_indices.borrow().contains(&item_idx) {
                         if let Some(ref ics) = inst.item_cell_store {
+                            if let Some(ref item_expr) = item_expr_for_template {
+                                seed_item_template_cells_from_expr(
+                                    program,
+                                    &inst,
+                                    ics,
+                                    item_idx,
+                                    template_cell_range,
+                                    item_cell,
+                                    item_expr,
+                                );
+                            }
                             let field_texts = inst.list_store.field_texts_for_mem_idx(item_idx);
                             if !field_texts.is_empty() {
                                 for (name, source_cell) in &field_hold_sources {
@@ -2660,8 +3063,46 @@ fn build_list_map(
                     // (e.g. completed toggle) across re-renders.
                     // Runs AFTER text seeding so host_copy_text reads correct texts.
                     if !initialized_indices.borrow().contains(&item_idx) {
+                        if item_name_owned == "row_data" && (i < 3 || i % 10 == 0) {
+                            console_log(&format!(
+                                "[boon wasm] list_map_init_item_begin map={} item_name={} i={} item_idx={}",
+                                map_cell.0,
+                                item_name_owned,
+                                i,
+                                item_idx
+                            ));
+                        }
                         let _ = inst.call_init_item(item_idx, map_cell.0);
+                        if item_name_owned == "row_data" && (i < 3 || i % 10 == 0) {
+                            console_log(&format!(
+                                "[boon wasm] list_map_init_item_done map={} item_name={} i={} item_idx={}",
+                                map_cell.0,
+                                item_name_owned,
+                                i,
+                                item_idx
+                            ));
+                        }
+                        *initialized_any.borrow_mut() = true;
+                        if let Some(ref ics) = inst.item_cell_store {
+                            if let Some(ref item_expr) = item_expr_for_template {
+                                // Some template field/list cells are intentionally seeded
+                                // from the bound item object on the host side. Re-apply
+                                // those bindings after init_item so default template
+                                // initializers do not clobber nested list/object fields.
+                                seed_item_template_cells_from_expr(
+                                    program,
+                                    &inst,
+                                    ics,
+                                    item_idx,
+                                    template_cell_range,
+                                    item_cell,
+                                    item_expr,
+                                );
+                            }
+                        }
                         initialized_indices.borrow_mut().insert(item_idx);
+                    } else if !template_global_deps.is_empty() && global_deps_changed {
+                        let _ = inst.call_refresh_item(item_idx, map_cell.0);
                     }
 
                     // Build per-item element tree.
@@ -2673,7 +3114,18 @@ fn build_list_map(
                     };
 
                     if let Some(root_cell) = template_root_cell {
-                        build_element(program, &inst, &BuildContext::Item(&ctx), root_cell)
+                        let built = build_element(program, &inst, &BuildContext::Item(&ctx), root_cell);
+                        if i < 3 || i % 10 == 0 {
+                            console_log(&format!(
+                                "[boon wasm] list_map_child_built map={} item_name={} i={} item_idx={} root_cell={}",
+                                map_cell.0,
+                                item_name_owned,
+                                i,
+                                item_idx,
+                                root_cell.0
+                            ));
+                        }
+                        built
                     } else {
                         // Fallback: render item text directly.
                         if i < text_items.len() {
@@ -2681,11 +3133,22 @@ fn build_list_map(
                         } else if i < f64_items.len() {
                             zoon::Text::new(format_number(f64_items[i])).unify()
                         } else {
-                            zoon::Text::new("?").unify()
+                            unknown_placeholder()
                         }
                     }
                 })
                 .collect();
+
+            console_log(&format!(
+                "[boon wasm] list_map_children_complete map={} item_name={} item_count={}",
+                map_cell.0,
+                item_name_owned,
+                item_count
+            ));
+
+            if *initialized_any.borrow() {
+                let _ = inst.call_rerun_retain_filters();
+            }
 
             // Finalize snapshot restore: re-derive global values from
             // restored per-item WASM memory and re-apply global cells.
@@ -2702,8 +3165,26 @@ fn build_list_map(
                     .children(children)
                     .into_raw_unchecked(),
             )
-        }))
+        }}))
         .into_raw_unchecked()
+}
+
+fn current_list_id_for_source(
+    instance: &Rc<WasmInstance>,
+    parent_item_ctx: Option<&ItemContext>,
+    source: CellId,
+) -> f64 {
+    if let Some(parent_ctx) = parent_item_ctx {
+        if parent_ctx.is_template_cell(source) {
+            if let Some(ref ics) = instance.item_cell_store {
+                let item_value = ics.get_value(parent_ctx.item_idx, source.0);
+                if !item_value.is_nan() {
+                    return item_value;
+                }
+            }
+        }
+    }
+    instance.cell_store.get_cell_value(source.0)
 }
 
 /// Resolve the list cell to use for cross-scope per-item event fanout.
@@ -2780,6 +3261,169 @@ fn collect_cross_scope_events(
     result
 }
 
+fn collect_template_global_dependencies(
+    program: &IrProgram,
+    template_cell_range: (u32, u32),
+) -> Vec<CellId> {
+    let mut deps = HashSet::new();
+    let mut seen = HashSet::new();
+
+    for cell_id in template_cell_range.0..template_cell_range.1 {
+        collect_template_cell_dependencies(
+            program,
+            CellId(cell_id),
+            template_cell_range,
+            &mut deps,
+            &mut seen,
+        );
+    }
+
+    let mut deps: Vec<_> = deps.into_iter().collect();
+    deps.sort_by_key(|cell| cell.0);
+    deps
+}
+
+fn collect_template_cell_dependencies(
+    program: &IrProgram,
+    cell: CellId,
+    template_cell_range: (u32, u32),
+    deps: &mut HashSet<CellId>,
+    seen: &mut HashSet<CellId>,
+) {
+    if !seen.insert(cell) {
+        return;
+    }
+
+    if cell.0 < template_cell_range.0 || cell.0 >= template_cell_range.1 {
+        deps.insert(cell);
+        return;
+    }
+
+    let Some(node) = find_node_for_cell(program, cell) else {
+        return;
+    };
+
+    match node {
+        IrNode::Derived { expr, .. } => {
+            collect_template_expr_dependencies(program, expr, template_cell_range, deps, seen);
+        }
+        IrNode::PipeThrough { source, .. }
+        | IrNode::TextTrim { source, .. }
+        | IrNode::TextIsNotEmpty { source, .. }
+        | IrNode::TextToNumber { source, .. }
+        | IrNode::MathRound { source, .. } => {
+            collect_template_cell_dependencies(program, *source, template_cell_range, deps, seen);
+        }
+        IrNode::TextStartsWith { source, prefix, .. }
+        | IrNode::MathMin { source, b: prefix, .. }
+        | IrNode::MathMax { source, b: prefix, .. } => {
+            collect_template_cell_dependencies(program, *source, template_cell_range, deps, seen);
+            collect_template_cell_dependencies(program, *prefix, template_cell_range, deps, seen);
+        }
+        IrNode::When { source, arms, .. } => {
+            collect_template_cell_dependencies(program, *source, template_cell_range, deps, seen);
+            for (_, body) in arms {
+                collect_template_expr_dependencies(program, body, template_cell_range, deps, seen);
+            }
+        }
+        IrNode::While {
+            source,
+            deps: node_deps,
+            arms,
+            ..
+        } => {
+            collect_template_cell_dependencies(program, *source, template_cell_range, deps, seen);
+            for dep in node_deps {
+                collect_template_cell_dependencies(program, *dep, template_cell_range, deps, seen);
+            }
+            for (_, body) in arms {
+                collect_template_expr_dependencies(program, body, template_cell_range, deps, seen);
+            }
+        }
+        IrNode::Hold {
+            init,
+            trigger_bodies,
+            ..
+        } => {
+            collect_template_expr_dependencies(program, init, template_cell_range, deps, seen);
+            for (_, body) in trigger_bodies {
+                collect_template_expr_dependencies(program, body, template_cell_range, deps, seen);
+            }
+        }
+        IrNode::Latest { arms, .. } => {
+            for arm in arms {
+                collect_template_expr_dependencies(
+                    program,
+                    &arm.body,
+                    template_cell_range,
+                    deps,
+                    seen,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_template_expr_dependencies(
+    program: &IrProgram,
+    expr: &IrExpr,
+    template_cell_range: (u32, u32),
+    deps: &mut HashSet<CellId>,
+    seen: &mut HashSet<CellId>,
+) {
+    match expr {
+        IrExpr::CellRead(cell) => {
+            collect_template_cell_dependencies(program, *cell, template_cell_range, deps, seen);
+        }
+        IrExpr::FieldAccess { object, .. } => {
+            collect_template_expr_dependencies(program, object, template_cell_range, deps, seen);
+        }
+        IrExpr::TextConcat(parts) => {
+            for part in parts {
+                if let TextSegment::Expr(expr) = part {
+                    collect_template_expr_dependencies(
+                        program,
+                        expr,
+                        template_cell_range,
+                        deps,
+                        seen,
+                    );
+                }
+            }
+        }
+        IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => {
+            for (_, value) in fields {
+                collect_template_expr_dependencies(program, value, template_cell_range, deps, seen);
+            }
+        }
+        IrExpr::Compare { lhs, rhs, .. } | IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_template_expr_dependencies(program, lhs, template_cell_range, deps, seen);
+            collect_template_expr_dependencies(program, rhs, template_cell_range, deps, seen);
+        }
+        IrExpr::UnaryNeg(inner) | IrExpr::Not(inner) => {
+            collect_template_expr_dependencies(program, inner, template_cell_range, deps, seen);
+        }
+        IrExpr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_template_expr_dependencies(program, arg, template_cell_range, deps, seen);
+            }
+        }
+        IrExpr::ListConstruct(items) => {
+            for item in items {
+                collect_template_expr_dependencies(program, item, template_cell_range, deps, seen);
+            }
+        }
+        IrExpr::PatternMatch { source, arms } => {
+            collect_template_cell_dependencies(program, *source, template_cell_range, deps, seen);
+            for (_, body) in arms {
+                collect_template_expr_dependencies(program, body, template_cell_range, deps, seen);
+            }
+        }
+        IrExpr::Constant(_) => {}
+    }
+}
+
 /// Build reactive text that reads from per-item cell store.
 fn build_item_reactive_text(
     instance: &Rc<WasmInstance>,
@@ -2792,10 +3436,22 @@ fn build_item_reactive_text(
     };
     let item_idx = ctx.item_idx;
     let cell_id = cell.0;
+    let program = instance.program.clone();
     let signal = ics.get_signal(item_idx, cell_id);
     zoon::Text::with_signal(signal.map(move |_sig_val| {
         let text = ics.get_text(item_idx, cell_id);
         let val = ics.get_value(item_idx, cell_id);
+        if item_idx < 3 && (text == "False" || (text.is_empty() && val == 0.0)) {
+            let name = program
+                .cells
+                .get(cell_id as usize)
+                .map(|cell| cell.name.as_str())
+                .unwrap_or("<unknown>");
+            console_log(&format!(
+                "[boon wasm] item_text item_idx={} cell={} name={} text={:?} value={}",
+                item_idx, cell_id, name, text, val
+            ));
+        }
         if !text.is_empty() {
             text
         } else {
@@ -2832,6 +3488,7 @@ fn build_item_text_from_segments(
 
     let store = instance.cell_store.clone();
     let item_idx = ctx.item_idx;
+    let program = instance.program.clone();
 
     // Build segment descriptions for the closure.
     let seg_desc: Vec<ItemSegDesc> = segments
@@ -2866,7 +3523,7 @@ fn build_item_text_from_segments(
     if ctx.is_template_cell(trigger_cell) {
         let signal = ics.get_signal(item_idx, trigger_cell.0);
         zoon::Text::with_signal(signal.map(move |_| {
-            seg_desc
+            let rendered = seg_desc
                 .iter()
                 .map(|s| match s {
                     ItemSegDesc::Lit(t) => t.clone(),
@@ -2880,7 +3537,30 @@ fn build_item_text_from_segments(
                     }
                     ItemSegDesc::GlobalCell(id) => format_cell_value(&store, *id),
                 })
-                .collect::<String>()
+                .collect::<String>();
+            if item_idx < 2 && rendered == "False" {
+                let item_cells: Vec<String> = seg_desc
+                    .iter()
+                    .filter_map(|seg| match seg {
+                        ItemSegDesc::ItemCell(id) => Some(format!(
+                            "{}={:?}/{}",
+                            program
+                                .cells
+                                .get(*id as usize)
+                                .map(|cell| cell.name.as_str())
+                                .unwrap_or("<unknown>"),
+                            ics.get_text(item_idx, *id),
+                            ics.get_value(item_idx, *id)
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                console_log(&format!(
+                    "[boon wasm] item_segments item_idx={} trigger={} rendered=False item_cells={:?}",
+                    item_idx, trigger_cell.0, item_cells
+                ));
+            }
+            rendered
         }))
         .unify()
     } else {
@@ -3091,14 +3771,21 @@ fn build_item_element_node(
     };
     // Attach remaining event handlers (blur, focus, click, double_click, and hover for Checkbox/Link/Paragraph).
     if handled_events.is_empty() {
-        attach_item_events(raw, instance, ctx, links, remaining_hovered_cell)
+        attach_item_events(program, raw, instance, ctx, links, remaining_hovered_cell)
     } else {
         let filtered: Vec<_> = links
             .iter()
             .filter(|(name, _)| !handled_events.contains(&name.as_str()))
             .cloned()
             .collect();
-        attach_item_events(raw, instance, ctx, &filtered, remaining_hovered_cell)
+        attach_item_events(
+            program,
+            raw,
+            instance,
+            ctx,
+            &filtered,
+            remaining_hovered_cell,
+        )
     }
 }
 
@@ -3107,6 +3794,7 @@ fn build_item_element_node(
 /// Events are attached directly to the element (no wrapper div) to avoid
 /// Chrome's buggy mouse events on `display: contents` elements.
 fn attach_item_events(
+    program: &IrProgram,
     el: RawElOrText,
     instance: &Rc<WasmInstance>,
     ctx: &ItemContext,
@@ -3172,7 +3860,7 @@ fn attach_item_events(
 
     if let Some(event_id) = blur_event {
         let inst = instance.clone();
-        let is_template = ctx.is_template_event(event_id);
+        let is_template = is_item_local_event(program, ctx, event_id);
         html_el = html_el.event_handler(move |_: events::Blur| {
             if is_template {
                 let _ = inst.call_on_item_event(item_idx, event_id.0);
@@ -3184,7 +3872,7 @@ fn attach_item_events(
 
     if let Some(event_id) = focus_event {
         let inst = instance.clone();
-        let is_template = ctx.is_template_event(event_id);
+        let is_template = is_item_local_event(program, ctx, event_id);
         html_el = html_el.event_handler(move |_: events::Focus| {
             if is_template {
                 let _ = inst.call_on_item_event(item_idx, event_id.0);
@@ -3196,7 +3884,7 @@ fn attach_item_events(
 
     if let Some(event_id) = click_event {
         let inst = instance.clone();
-        let is_template = ctx.is_template_event(event_id);
+        let is_template = is_item_local_event(program, ctx, event_id);
         html_el = html_el.event_handler(move |_: events::Click| {
             if is_template {
                 let _ = inst.call_on_item_event(item_idx, event_id.0);
@@ -3208,7 +3896,7 @@ fn attach_item_events(
 
     if let Some(event_id) = double_click_event {
         let inst = instance.clone();
-        let is_template = ctx.is_template_event(event_id);
+        let is_template = is_item_local_event(program, ctx, event_id);
         html_el = html_el.event_handler(move |_: events::DoubleClick| {
             if is_template {
                 let _ = inst.call_on_item_event(item_idx, event_id.0);
@@ -3324,15 +4012,18 @@ fn build_item_text_input(
     };
     let inherit_text_color = !style_defines_font_color(style, program);
 
-    let mut ti = TextInput::new();
-    ti = apply_typed_styles(ti, style, program, false);
-    if let Some(cell) = hovered_cell {
-        ti = apply_hover(ti, instance, Some(ctx), cell);
-    }
-    // Apply placeholder via Zoon's typed Placeholder API.
-    let ph_el = build_placeholder(placeholder, program);
-    ti.placeholder(ph_el)
-        .update_raw_el(|raw_el| {
+    let ti = TextInput::new();
+    let ti = apply_typed_styles(ti, style, program, false);
+    let ti = if let Some(cell) = hovered_cell {
+        apply_hover(ti, instance, Some(ctx), cell)
+    } else {
+        ti
+    };
+    macro_rules! finish_item_text_input {
+        ($ti:expr) => {{
+            let ph_el = build_placeholder(placeholder, program);
+            $ti.placeholder(ph_el)
+                .update_raw_el(|raw_el| {
             let mut raw_el = raw_el
                 .style("box-sizing", "border-box")
                 .style("outline", "none");
@@ -3359,13 +4050,45 @@ fn build_item_text_input(
                 });
             }
 
+            if let Some(event_id) = change_event {
+                let inst = instance.clone();
+                let is_template = is_item_local_event(program, ctx, event_id);
+                let ics = ics_clone.clone();
+                let template_cell_range = ctx.template_cell_range;
+                raw_el = raw_el.event_handler(move |event: events::Input| {
+                    if let Some(target) = event.target() {
+                        if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
+                            let text = input.value();
+                            for cell_id_opt in [change_text_cell, text_cell] {
+                                if let Some(cell_id) = cell_id_opt {
+                                    if cell_id >= template_cell_range.0
+                                        && cell_id < template_cell_range.1
+                                    {
+                                        if let Some(ref ics) = ics {
+                                            ics.set_text(item_idx, cell_id, text.clone());
+                                        }
+                                    } else {
+                                        inst.cell_store.set_cell_text(cell_id, text.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if is_template {
+                        let _ = inst.call_on_item_event(item_idx, event_id.0);
+                    } else {
+                        let _ = inst.fire_event(event_id.0);
+                    }
+                });
+            }
+
             // Set up keydown event listener.
             let raw_el = if let Some(event_id) = key_down_event {
                 let inst = instance.clone();
-                let is_template = ctx.is_template_event(event_id);
+                let is_template = is_item_local_event(program, ctx, event_id);
                 let change_event_for_key = change_event;
                 let change_is_template = change_event
-                    .map(|eid| ctx.is_template_event(eid))
+                    .map(|eid| is_item_local_event(program, ctx, eid))
                     .unwrap_or(false);
                 let ics = ics_clone.clone();
                 let template_cell_range = ctx.template_cell_range;
@@ -3423,42 +4146,13 @@ fn build_item_text_input(
                 raw_el
             };
 
-            // Set up input change event listener.
-            if let Some(event_id) = change_event {
-                let inst = instance.clone();
-                let is_template = ctx.is_template_event(event_id);
-                let ics = ics_clone.clone();
-                let template_cell_range = ctx.template_cell_range;
-                raw_el.event_handler(move |event: events::Input| {
-                    if let Some(target) = event.target() {
-                        if let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() {
-                            let input_text = input.value();
-                            for cell_id_opt in [change_text_cell, text_cell] {
-                                if let Some(cell_id) = cell_id_opt {
-                                    if cell_id >= template_cell_range.0
-                                        && cell_id < template_cell_range.1
-                                    {
-                                        if let Some(ref ics) = ics {
-                                            ics.set_text(item_idx, cell_id, input_text.clone());
-                                        }
-                                    } else {
-                                        inst.cell_store.set_cell_text(cell_id, input_text.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if is_template {
-                        let _ = inst.call_on_item_event(item_idx, event_id.0);
-                    } else {
-                        let _ = inst.fire_event(event_id.0);
-                    }
+                    raw_el
                 })
-            } else {
-                raw_el
-            }
-        })
-        .into_raw_unchecked()
+                .into_raw_unchecked()
+        }};
+    }
+
+    finish_item_text_input!(ti)
 }
 
 /// Build a per-item Checkbox element using Zoon's typed Checkbox.
@@ -3507,7 +4201,7 @@ fn build_item_checkbox(
     // Use raw DOM click handler to avoid checked_signal → on_change feedback loop.
     let inst_change = instance.clone();
     let is_template = click_event
-        .map(|e| ctx.is_template_event(e))
+        .map(|e| is_item_local_event(program, ctx, e))
         .unwrap_or(false);
     let mut cb = Checkbox::new()
         .label_hidden("toggle")
@@ -3548,16 +4242,6 @@ fn resolve_color(expr: &IrExpr) -> Option<String> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Find the root CellId from the Document node.
-fn find_document_root(program: &IrProgram) -> Option<CellId> {
-    for node in &program.nodes {
-        if let IrNode::Document { root } = node {
-            return Some(*root);
-        }
-    }
-    None
-}
-
 /// Find the IrNode that defines a given cell.
 fn find_node_for_cell(program: &IrProgram, cell: CellId) -> Option<&IrNode> {
     for node in &program.nodes {
@@ -3570,6 +4254,7 @@ fn find_node_for_cell(program: &IrProgram, cell: CellId) -> Option<&IrNode> {
             | IrNode::While { cell: c, .. }
             | IrNode::MathSum { cell: c, .. }
             | IrNode::PipeThrough { cell: c, .. }
+            | IrNode::StreamSkip { cell: c, .. }
             | IrNode::TextInterpolation { cell: c, .. }
             | IrNode::CustomCall { cell: c, .. }
             | IrNode::Element { cell: c, .. }
@@ -3587,13 +4272,15 @@ fn find_node_for_cell(program: &IrProgram, cell: CellId) -> Option<&IrNode> {
             | IrNode::TextIsNotEmpty { cell: c, .. }
             | IrNode::TextToNumber { cell: c, .. }
             | IrNode::MathRound { cell: c, .. }
+            | IrNode::MathMin { cell: c, .. }
+            | IrNode::MathMax { cell: c, .. }
             | IrNode::TextStartsWith { cell: c, .. }
             | IrNode::HoldLoop { cell: c, .. } => {
                 if *c == cell {
                     return Some(node);
                 }
             }
-            IrNode::Document { root } => {
+            IrNode::Document { root, .. } => {
                 if *root == cell {
                     return Some(node);
                 }
@@ -4671,6 +5358,37 @@ fn apply_physical_css<T: RawEl>(
 
 /// Apply material properties (color → background-color, glow → box-shadow,
 /// transparency → opacity/backdrop-filter, gloss → background-image).
+fn compute_physical_gloss_background(gloss: f64, scene: PhysicalSceneParams) -> Option<String> {
+    let gloss = gloss.clamp(0.0, 1.0);
+    if gloss > 0.0 {
+        let alpha = gloss * 0.25;
+        Some(format!(
+            "linear-gradient({:.0}deg,rgba(255,255,255,{alpha:.2}) 0%,transparent 50%,rgba(0,0,0,{:.2}) 100%)",
+            scene.bevel_angle,
+            alpha * 0.3
+        ))
+    } else {
+        None
+    }
+}
+
+fn compute_physical_depth_box_shadow(depth: f64, scene: PhysicalSceneParams) -> Option<String> {
+    if depth <= 0.0 {
+        return None;
+    }
+
+    let dx = depth * scene.shadow_dx_per_depth;
+    let dy = depth * scene.shadow_dy_per_depth;
+    let blur = depth * scene.shadow_blur_per_depth;
+    let opacity = scene.shadow_opacity();
+    let amb_blur = blur * 2.0;
+    let amb_opacity = opacity * 0.4;
+    Some(format!(
+        "{dx:.1}px {dy:.1}px {blur:.1}px rgba(0,0,0,{opacity:.2}), 0px {:.1}px {amb_blur:.1}px rgba(0,0,0,{amb_opacity:.2})",
+        dy * 0.5
+    ))
+}
+
 fn apply_physical_material<T: RawEl>(
     mut el: T,
     value: &IrExpr,
@@ -4678,6 +5396,7 @@ fn apply_physical_material<T: RawEl>(
     instance: &Rc<WasmInstance>,
     item_ctx: Option<&ItemContext>,
 ) -> T {
+    let scene_params = instance.scene_params.clone();
     let reconstructed;
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(f) => f,
@@ -4715,17 +5434,13 @@ fn apply_physical_material<T: RawEl>(
             }
             "gloss" => {
                 if let IrExpr::Constant(IrValue::Number(n)) = val {
-                    let gloss = n.clamp(0.0, 1.0);
-                    if gloss > 0.0 {
-                        let alpha = gloss * 0.25;
-                        el = el.style(
-                            "background-image",
-                            &format!(
-                                "linear-gradient(145deg,rgba(255,255,255,{alpha:.2}) 0%,transparent 50%,rgba(0,0,0,{:.2}) 100%)",
-                                alpha * 0.3
-                            ),
-                        );
-                    }
+                    let gloss = *n;
+                    el = el.style_signal(
+                        "background-image",
+                        scene_params
+                            .signal()
+                            .map(move |scene| compute_physical_gloss_background(gloss, scene)),
+                    );
                 }
             }
             _ => {}
@@ -4742,29 +5457,21 @@ fn apply_physical_depth<T: RawEl>(
     instance: &Rc<WasmInstance>,
     item_ctx: Option<&ItemContext>,
 ) -> T {
+    let scene_params = instance.scene_params.clone();
     match value {
         IrExpr::Constant(IrValue::Number(depth)) => {
-            if *depth > 0.0 {
-                let dx = depth * 0.5;
-                let dy = depth * 1.5;
-                let blur = depth * 3.0;
-                let opacity = (depth * 0.06).min(0.4);
-                let amb_blur = blur * 2.0;
-                let amb_opacity = opacity * 0.4;
-                el.style(
-                    "box-shadow",
-                    &format!(
-                        "{dx:.1}px {dy:.1}px {blur:.1}px rgba(0,0,0,{opacity:.2}), 0px {:.1}px {amb_blur:.1}px rgba(0,0,0,{amb_opacity:.2})",
-                        dy * 0.5
-                    ),
-                )
-            } else {
-                el
-            }
+            let depth = *depth;
+            el.style_signal(
+                "box-shadow",
+                scene_params
+                    .signal()
+                    .map(move |scene| compute_physical_depth_box_shadow(depth, scene)),
+            )
         }
         IrExpr::CellRead(cell) => {
             let store = instance.cell_store.clone();
             let cell_id = cell.0;
+            let scene_params = scene_params;
             let is_template = item_ctx.map_or(false, |ctx| {
                 cell_id >= ctx.template_cell_range.0 && cell_id < ctx.template_cell_range.1
             });
@@ -4774,44 +5481,26 @@ fn apply_physical_depth<T: RawEl>(
                         let signal = ics.get_signal(ctx.item_idx, cell_id);
                         return el.style_signal(
                             "box-shadow",
-                            signal.map(move |depth| {
-                                if depth > 0.0 {
-                                    let dx = depth * 0.5;
-                                    let dy = depth * 1.5;
-                                    let blur = depth * 3.0;
-                                    let opacity = (depth * 0.06).min(0.4);
-                                    let amb_blur = blur * 2.0;
-                                    let amb_opacity = opacity * 0.4;
-                                    Some(format!(
-                                        "{dx:.1}px {dy:.1}px {blur:.1}px rgba(0,0,0,{opacity:.2}), 0px {:.1}px {amb_blur:.1}px rgba(0,0,0,{amb_opacity:.2})",
-                                        dy * 0.5
-                                    ))
-                                } else {
-                                    Some("none".to_string())
+                            map_ref! {
+                                let depth = signal,
+                                let scene = scene_params.signal() => {
+                                    compute_physical_depth_box_shadow(*depth, *scene)
+                                        .or_else(|| Some("none".to_string()))
                                 }
-                            }),
+                            },
                         );
                     }
                 }
             }
             el.style_signal(
                 "box-shadow",
-                store.get_cell_signal(cell_id).map(move |depth| {
-                    if depth > 0.0 {
-                        let dx = depth * 0.5;
-                        let dy = depth * 1.5;
-                        let blur = depth * 3.0;
-                        let opacity = (depth * 0.06).min(0.4);
-                        let amb_blur = blur * 2.0;
-                        let amb_opacity = opacity * 0.4;
-                        Some(format!(
-                            "{dx:.1}px {dy:.1}px {blur:.1}px rgba(0,0,0,{opacity:.2}), 0px {:.1}px {amb_blur:.1}px rgba(0,0,0,{amb_opacity:.2})",
-                            dy * 0.5
-                        ))
-                    } else {
-                        Some("none".to_string())
+                map_ref! {
+                    let depth = store.get_cell_signal(cell_id),
+                    let scene = scene_params.signal() => {
+                        compute_physical_depth_box_shadow(*depth, *scene)
+                            .or_else(|| Some("none".to_string()))
                     }
-                }),
+                },
             )
         }
         _ => el,
@@ -5153,6 +5842,835 @@ fn reconstruct_object_fields(program: &IrProgram, cell: CellId) -> Vec<(String, 
         }
     }
     fields
+}
+
+fn resolve_runtime_expr(
+    program: &IrProgram,
+    cell_store: &CellStore,
+    expr: &IrExpr,
+    depth: u32,
+) -> Option<IrExpr> {
+    resolve_runtime_expr_with_bindings(program, cell_store, expr, depth, &HashMap::new())
+}
+
+fn resolve_runtime_object_fields_with_bindings(
+    program: &IrProgram,
+    cell_store: &CellStore,
+    expr: &IrExpr,
+    depth: u32,
+    bindings: &HashMap<CellId, IrExpr>,
+) -> Option<Vec<(String, IrExpr)>> {
+    match resolve_runtime_expr_with_bindings(program, cell_store, expr, depth + 1, bindings)
+        .unwrap_or_else(|| expr.clone())
+    {
+        IrExpr::ObjectConstruct(fields) => Some(fields),
+        IrExpr::TaggedObject { fields, .. } => Some(fields),
+        IrExpr::CellRead(cell) => {
+            if let Some(bound) = bindings.get(&cell) {
+                resolve_runtime_object_fields_with_bindings(
+                    program,
+                    cell_store,
+                    bound,
+                    depth + 1,
+                    bindings,
+                )
+            } else {
+                Some(reconstruct_object_fields(program, cell))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn resolve_runtime_expr_with_bindings(
+    program: &IrProgram,
+    cell_store: &CellStore,
+    expr: &IrExpr,
+    depth: u32,
+    bindings: &HashMap<CellId, IrExpr>,
+) -> Option<IrExpr> {
+    if depth > 20 {
+        return None;
+    }
+
+    match expr {
+        IrExpr::Constant(_) => Some(expr.clone()),
+        IrExpr::ObjectConstruct(fields) => Some(IrExpr::ObjectConstruct(
+            fields
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        resolve_runtime_expr_with_bindings(
+                            program,
+                            cell_store,
+                            value,
+                            depth + 1,
+                            bindings,
+                        )
+                        .unwrap_or_else(|| value.clone()),
+                    )
+                })
+                .collect(),
+        )),
+        IrExpr::ListConstruct(items) => Some(IrExpr::ListConstruct(
+            items
+                .iter()
+                .map(|item| {
+                    resolve_runtime_expr_with_bindings(
+                        program,
+                        cell_store,
+                        item,
+                        depth + 1,
+                        bindings,
+                    )
+                    .unwrap_or_else(|| item.clone())
+                })
+                .collect(),
+        )),
+        IrExpr::TaggedObject { tag, fields } => Some(IrExpr::TaggedObject {
+            tag: tag.clone(),
+            fields: fields
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        resolve_runtime_expr_with_bindings(
+                            program,
+                            cell_store,
+                            value,
+                            depth + 1,
+                            bindings,
+                        )
+                        .unwrap_or_else(|| value.clone()),
+                    )
+                })
+                .collect(),
+        }),
+        IrExpr::CellRead(cell) => {
+            if let Some(bound) = bindings.get(cell) {
+                resolve_runtime_expr_with_bindings(program, cell_store, bound, depth + 1, bindings)
+                    .or_else(|| Some(bound.clone()))
+            } else {
+                resolve_runtime_cell_expr_with_bindings(
+                    program,
+                    cell_store,
+                    *cell,
+                    depth + 1,
+                    bindings,
+                )
+            }
+        }
+        IrExpr::FieldAccess { object, field } => {
+            resolve_runtime_object_fields_with_bindings(
+                program,
+                cell_store,
+                object,
+                depth + 1,
+                bindings,
+            )
+            .and_then(|fields| {
+                fields
+                    .into_iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, value)| value)
+            })
+        }
+        IrExpr::BinOp { op, lhs, rhs } => {
+            let lhs = resolve_runtime_expr_with_bindings(program, cell_store, lhs, depth + 1, bindings)
+                .unwrap_or_else(|| *lhs.clone());
+            let rhs = resolve_runtime_expr_with_bindings(program, cell_store, rhs, depth + 1, bindings)
+                .unwrap_or_else(|| *rhs.clone());
+            match (lhs, rhs) {
+                (IrExpr::Constant(IrValue::Number(a)), IrExpr::Constant(IrValue::Number(b))) => {
+                    let value = match op {
+                        BinOp::Add => a + b,
+                        BinOp::Sub => a - b,
+                        BinOp::Mul => a * b,
+                        BinOp::Div => a / b,
+                    };
+                    Some(IrExpr::Constant(IrValue::Number(value)))
+                }
+                _ => None,
+            }
+        }
+        IrExpr::Compare { op, lhs, rhs } => {
+            let lhs = resolve_runtime_expr_with_bindings(program, cell_store, lhs, depth + 1, bindings)
+                .unwrap_or_else(|| *lhs.clone());
+            let rhs = resolve_runtime_expr_with_bindings(program, cell_store, rhs, depth + 1, bindings)
+                .unwrap_or_else(|| *rhs.clone());
+            match (lhs, rhs) {
+                (IrExpr::Constant(IrValue::Number(a)), IrExpr::Constant(IrValue::Number(b))) => {
+                    let value = match op {
+                        CmpOp::Eq => a == b,
+                        CmpOp::Ne => a != b,
+                        CmpOp::Gt => a > b,
+                        CmpOp::Ge => a >= b,
+                        CmpOp::Lt => a < b,
+                        CmpOp::Le => a <= b,
+                    };
+                    Some(IrExpr::Constant(IrValue::Number(if value { 1.0 } else { 0.0 })))
+                }
+                _ => None,
+            }
+        }
+        IrExpr::UnaryNeg(inner) => {
+            match resolve_runtime_expr_with_bindings(program, cell_store, inner, depth + 1, bindings)
+                .unwrap_or_else(|| *inner.clone())
+            {
+                IrExpr::Constant(IrValue::Number(n)) => Some(IrExpr::Constant(IrValue::Number(-n))),
+                _ => None,
+            }
+        }
+        IrExpr::Not(inner) => {
+            match resolve_runtime_expr_with_bindings(program, cell_store, inner, depth + 1, bindings)
+                .unwrap_or_else(|| *inner.clone())
+            {
+                IrExpr::Constant(IrValue::Number(n)) => {
+                    Some(IrExpr::Constant(IrValue::Number(if n == 0.0 { 1.0 } else { 0.0 })))
+                }
+                _ => None,
+            }
+        }
+        IrExpr::TextConcat(parts) => {
+            let mut text = String::new();
+            for part in parts {
+                match part {
+                    TextSegment::Literal(t) => text.push_str(t),
+                    TextSegment::Expr(expr) => match resolve_runtime_expr_with_bindings(
+                        program,
+                        cell_store,
+                        expr,
+                        depth + 1,
+                        bindings,
+                    )
+                    .unwrap_or_else(|| expr.clone()) {
+                        IrExpr::Constant(IrValue::Text(t)) => text.push_str(&t),
+                        IrExpr::Constant(IrValue::Number(n)) => text.push_str(&format_number(n)),
+                        IrExpr::Constant(IrValue::Tag(t)) => text.push_str(&t),
+                        IrExpr::CellRead(cell) => text.push_str(&format_runtime_cell_value(
+                            program,
+                            cell_store,
+                            cell,
+                        )),
+                        _ => {}
+                    },
+                }
+            }
+            Some(IrExpr::Constant(IrValue::Text(text)))
+        }
+        IrExpr::FunctionCall { func, args } => {
+            let ir_func = program.functions.get(func.0 as usize)?;
+            let mut nested_bindings = bindings.clone();
+            for (param_cell, arg) in ir_func.param_cells.iter().zip(args.iter()) {
+                nested_bindings.insert(*param_cell, arg.clone());
+            }
+            resolve_runtime_expr_with_bindings(
+                program,
+                cell_store,
+                &ir_func.body,
+                depth + 1,
+                &nested_bindings,
+            )
+            .or_else(|| Some(ir_func.body.clone()))
+        }
+        IrExpr::PatternMatch { source, arms } => {
+            let matchers: Vec<ArmMatcher> = arms
+                .iter()
+                .map(|(pattern, _)| pattern_to_matcher(pattern, &program.tag_table))
+                .collect();
+            let source_expr = resolve_runtime_cell_expr_with_bindings(
+                program,
+                cell_store,
+                *source,
+                depth + 1,
+                bindings,
+            )
+            .unwrap_or(IrExpr::CellRead(*source));
+            let (value, text) = match source_expr {
+                IrExpr::Constant(IrValue::Number(n)) => (n, String::new()),
+                IrExpr::Constant(IrValue::Text(t)) => (f64::NAN, t),
+                IrExpr::Constant(IrValue::Tag(t)) => (f64::NAN, t),
+                IrExpr::CellRead(cell) => (cell_store.get_cell_value(cell.0), cell_store.get_cell_text(cell.0)),
+                _ => (cell_store.get_cell_value(source.0), cell_store.get_cell_text(source.0)),
+            };
+            let arm = find_matching_arm_idx(&matchers, value, &text)?;
+            resolve_runtime_expr_with_bindings(program, cell_store, &arms[arm].1, depth + 1, bindings)
+                .or_else(|| Some(arms[arm].1.clone()))
+        }
+    }
+}
+
+fn resolve_runtime_cell_expr(
+    program: &IrProgram,
+    cell_store: &CellStore,
+    cell: CellId,
+    depth: u32,
+) -> Option<IrExpr> {
+    resolve_runtime_cell_expr_with_bindings(program, cell_store, cell, depth, &HashMap::new())
+}
+
+fn resolve_runtime_cell_expr_with_bindings(
+    program: &IrProgram,
+    cell_store: &CellStore,
+    cell: CellId,
+    depth: u32,
+    bindings: &HashMap<CellId, IrExpr>,
+) -> Option<IrExpr> {
+    if depth > 20 {
+        return None;
+    }
+
+    if let Some(bound) = bindings.get(&cell) {
+        return resolve_runtime_expr_with_bindings(program, cell_store, bound, depth + 1, bindings)
+            .or_else(|| Some(bound.clone()));
+    }
+
+    if program.cell_field_cells.contains_key(&resolve_to_object_store(program, cell)) {
+        return Some(IrExpr::ObjectConstruct(reconstruct_object_fields(program, cell)));
+    }
+
+    match find_node_for_cell(program, cell)? {
+        IrNode::Derived { expr, .. } => resolve_runtime_expr_with_bindings(
+            program,
+            cell_store,
+            expr,
+            depth + 1,
+            bindings,
+        )
+            .or_else(|| Some(expr.clone())),
+        IrNode::PipeThrough { source, .. } => {
+            resolve_runtime_cell_expr_with_bindings(program, cell_store, *source, depth + 1, bindings)
+        }
+        IrNode::When { source, arms, .. } | IrNode::While { source, arms, .. } => {
+            let matchers: Vec<ArmMatcher> = arms
+                .iter()
+                .map(|(pattern, _)| pattern_to_matcher(pattern, &program.tag_table))
+                .collect();
+            let source_expr = resolve_runtime_cell_expr_with_bindings(
+                program,
+                cell_store,
+                *source,
+                depth + 1,
+                bindings,
+            )
+            .unwrap_or(IrExpr::CellRead(*source));
+            let (value, text) = match source_expr {
+                IrExpr::Constant(IrValue::Number(n)) => (n, String::new()),
+                IrExpr::Constant(IrValue::Text(t)) => (f64::NAN, t),
+                IrExpr::Constant(IrValue::Tag(t)) => (f64::NAN, t),
+                IrExpr::CellRead(cell) => (cell_store.get_cell_value(cell.0), cell_store.get_cell_text(cell.0)),
+                _ => (cell_store.get_cell_value(source.0), cell_store.get_cell_text(source.0)),
+            };
+            let arm = find_matching_arm_idx(&matchers, value, &text)?;
+            resolve_runtime_expr_with_bindings(program, cell_store, &arms[arm].1, depth + 1, bindings)
+                .or_else(|| Some(arms[arm].1.clone()))
+        }
+        _ => Some(IrExpr::CellRead(cell)),
+    }
+}
+
+fn resolve_runtime_list_item_expr(
+    program: &IrProgram,
+    cell_store: &CellStore,
+    list_cell: CellId,
+    index: usize,
+) -> Option<IrExpr> {
+    fn inner(
+        program: &IrProgram,
+        cell_store: &CellStore,
+        list_cell: CellId,
+        index: usize,
+        seen: &mut HashSet<CellId>,
+    ) -> Option<IrExpr> {
+        if !seen.insert(list_cell) {
+            return None;
+        }
+        let resolved = match resolve_runtime_cell_expr(program, cell_store, list_cell, 0)
+            .unwrap_or(IrExpr::CellRead(list_cell))
+        {
+            IrExpr::ListConstruct(items) => items.get(index).cloned(),
+            IrExpr::CellRead(next) if next != list_cell => inner(program, cell_store, next, index, seen),
+            IrExpr::CellRead(cell) => match find_node_for_cell(program, cell) {
+                Some(IrNode::Derived {
+                    expr: IrExpr::ListConstruct(items),
+                    ..
+                }) => items.get(index).cloned(),
+                Some(IrNode::PipeThrough { source, .. }) => inner(program, cell_store, *source, index, seen),
+                _ => None,
+            },
+            _ => None,
+        };
+        seen.remove(&list_cell);
+        resolved
+    }
+
+    inner(program, cell_store, list_cell, index, &mut HashSet::new())
+}
+
+fn resolve_runtime_list_item_expr_for_context(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    parent_item_ctx: Option<&ItemContext>,
+    list_cell: CellId,
+    index: usize,
+) -> Option<IrExpr> {
+    if let Some(parent_ctx) = parent_item_ctx {
+        if parent_ctx.is_template_cell(list_cell) {
+            if let Some(ref ics) = instance.item_cell_store {
+                let list_id = ics.get_value(parent_ctx.item_idx, list_cell.0);
+                if !list_id.is_nan() && list_id > 0.0 {
+                    if let Some(items) = instance.template_list_items.borrow().get(&list_id.to_bits())
+                    {
+                        return items.get(index).cloned();
+                    }
+                }
+            }
+        }
+    }
+    resolve_runtime_list_item_expr(program, &instance.cell_store, list_cell, index)
+}
+
+fn seed_item_template_cells_from_expr(
+    program: &IrProgram,
+    instance: &Rc<WasmInstance>,
+    ics: &ItemCellStore,
+    item_idx: u32,
+    template_cell_range: (u32, u32),
+    item_cell: CellId,
+    item_expr: &IrExpr,
+) {
+    let cell_store = &instance.cell_store;
+    let mut bindings = HashMap::new();
+    bindings.insert(item_cell, item_expr.clone());
+
+    for raw_cell in template_cell_range.0..template_cell_range.1 {
+        let cell = CellId(raw_cell);
+        let Some(resolved) =
+            resolve_runtime_cell_expr_with_bindings(program, cell_store, cell, 0, &bindings)
+        else {
+            continue;
+        };
+        if let Some(list_id) = materialize_template_list_expr(
+            program,
+            &instance.list_store,
+            &instance.template_list_items,
+            cell_store,
+            &resolved,
+            0,
+            &bindings,
+        ) {
+            ics.set_text(item_idx, raw_cell, String::new());
+            ics.set_cell(item_idx, raw_cell, list_id);
+            continue;
+        }
+        match resolved {
+            IrExpr::Constant(IrValue::Number(n)) => {
+                ics.set_text(item_idx, raw_cell, String::new());
+                ics.set_cell(item_idx, raw_cell, n);
+            }
+            IrExpr::Constant(IrValue::Text(text)) => {
+                ics.set_text(item_idx, raw_cell, text);
+            }
+            IrExpr::Constant(IrValue::Tag(tag)) => {
+                ics.set_text(item_idx, raw_cell, tag);
+            }
+            IrExpr::CellRead(global_cell) => {
+                let text = cell_store.get_cell_text(global_cell.0);
+                if !text.is_empty() {
+                    ics.set_text(item_idx, raw_cell, text);
+                } else {
+                    ics.set_text(item_idx, raw_cell, String::new());
+                }
+                let value = cell_store.get_cell_value(global_cell.0);
+                if !value.is_nan() {
+                    ics.set_cell(item_idx, raw_cell, value);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn materialize_template_list_expr(
+    program: &IrProgram,
+    list_store: &ListStore,
+    template_list_items: &Rc<RefCell<HashMap<u64, Vec<IrExpr>>>>,
+    cell_store: &CellStore,
+    expr: &IrExpr,
+    depth: u32,
+    bindings: &HashMap<CellId, IrExpr>,
+) -> Option<f64> {
+    if depth > 20 {
+        return None;
+    }
+
+    match expr {
+        IrExpr::ListConstruct(items) => {
+            let list_id = list_store.create();
+            list_store.set_index_based(list_id);
+            for _ in items {
+                list_store.append_with_next_memory_index(list_id);
+            }
+            template_list_items
+                .borrow_mut()
+                .insert(list_id.to_bits(), items.clone());
+            Some(list_id)
+        }
+        IrExpr::CellRead(cell) => {
+            let value = cell_store.get_cell_value(cell.0);
+            if !value.is_nan() && value > 0.0 {
+                return Some(value);
+            }
+            let resolved = resolve_runtime_cell_expr_with_bindings(
+                program,
+                cell_store,
+                *cell,
+                depth + 1,
+                bindings,
+            )?;
+            if matches!(resolved, IrExpr::CellRead(next) if next == *cell) {
+                None
+            } else {
+                materialize_template_list_expr(
+                    program,
+                    list_store,
+                    template_list_items,
+                    cell_store,
+                    &resolved,
+                    depth + 1,
+                    bindings,
+                )
+            }
+        }
+        IrExpr::FieldAccess { object, field } => {
+            let fields = resolve_runtime_object_fields_with_bindings(
+                program,
+                cell_store,
+                object,
+                depth + 1,
+                bindings,
+            )?;
+            let value = fields
+                .into_iter()
+                .find(|(name, _)| name == field)
+                .map(|(_, value)| value)?;
+            materialize_template_list_expr(
+                program,
+                list_store,
+                template_list_items,
+                cell_store,
+                &value,
+                depth + 1,
+                bindings,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn resolve_scene_number(
+    program: &IrProgram,
+    cell_store: &CellStore,
+    expr: &IrExpr,
+) -> Option<f64> {
+    match resolve_runtime_expr(program, cell_store, expr, 0).unwrap_or_else(|| expr.clone()) {
+        IrExpr::Constant(IrValue::Number(n)) => Some(n),
+        IrExpr::CellRead(cell) => {
+            let value = cell_store.get_cell_value(cell.0);
+            (!value.is_nan()).then_some(value)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_scene_object_fields(
+    program: &IrProgram,
+    cell_store: &CellStore,
+    expr: &IrExpr,
+) -> Option<Vec<(String, IrExpr)>> {
+    match resolve_runtime_expr(program, cell_store, expr, 0).unwrap_or_else(|| expr.clone()) {
+        IrExpr::ObjectConstruct(fields) => Some(fields),
+        IrExpr::TaggedObject { fields, .. } => Some(fields),
+        IrExpr::CellRead(cell) => Some(reconstruct_object_fields(program, cell)),
+        _ => None,
+    }
+}
+
+fn resolve_scene_list_items(
+    program: &IrProgram,
+    cell_store: &CellStore,
+    expr: &IrExpr,
+) -> Option<Vec<IrExpr>> {
+    match resolve_runtime_expr(program, cell_store, expr, 0).unwrap_or_else(|| expr.clone()) {
+        IrExpr::ListConstruct(items) => Some(items),
+        IrExpr::CellRead(cell) => match find_node_for_cell(program, cell) {
+            Some(IrNode::Derived {
+                expr: IrExpr::ListConstruct(items),
+                ..
+            }) => Some(items.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn resolve_scene_tagged_fields(
+    program: &IrProgram,
+    cell_store: &CellStore,
+    expr: &IrExpr,
+) -> Option<(String, Vec<(String, IrExpr)>)> {
+    match resolve_runtime_expr(program, cell_store, expr, 0).unwrap_or_else(|| expr.clone()) {
+        IrExpr::TaggedObject { tag, fields } => Some((tag, fields)),
+        IrExpr::CellRead(cell) => match find_node_for_cell(program, cell) {
+            Some(IrNode::Derived {
+                expr: IrExpr::TaggedObject { tag, fields },
+                ..
+            }) => Some((tag.clone(), fields.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn resolve_scene_params(program: &IrProgram, cell_store: &CellStore) -> PhysicalSceneParams {
+    let mut params = PhysicalSceneParams::default();
+    let Some(render_root) = program.render_root() else {
+        return params;
+    };
+    let Some(scene) = render_root.scene else {
+        return params;
+    };
+
+    if let Some(geometry) = scene.geometry {
+        if let Some(fields) = resolve_scene_object_fields(program, cell_store, &IrExpr::CellRead(geometry)) {
+            if let Some((_, bevel_angle)) = fields.iter().find(|(name, _)| name == "bevel_angle") {
+                if let Some(bevel_angle) = resolve_scene_number(program, cell_store, bevel_angle) {
+                    params.bevel_angle = bevel_angle;
+                }
+            }
+        }
+    }
+
+    if let Some(lights) = scene.lights {
+        if let Some(items) = resolve_scene_list_items(program, cell_store, &IrExpr::CellRead(lights)) {
+            for item in &items {
+                let Some((tag, fields)) = resolve_scene_tagged_fields(program, cell_store, item) else {
+                    continue;
+                };
+                match tag.as_str() {
+                    "DirectionalLight" => {
+                        if let Some((_, intensity)) =
+                            fields.iter().find(|(name, _)| name == "intensity")
+                        {
+                            if let Some(intensity) = resolve_scene_number(program, cell_store, intensity) {
+                                params.directional_intensity = intensity;
+                            }
+                        }
+                        if let Some((_, spread)) = fields.iter().find(|(name, _)| name == "spread")
+                        {
+                            if let Some(spread) = resolve_scene_number(program, cell_store, spread) {
+                                params.shadow_blur_per_depth =
+                                    PhysicalSceneParams::DEFAULT.shadow_blur_per_depth
+                                        * spread.clamp(0.25, 4.0);
+                            }
+                        }
+                        let azimuth = fields
+                            .iter()
+                            .find(|(name, _)| name == "azimuth")
+                            .and_then(|(_, value)| resolve_scene_number(program, cell_store, value));
+                        let altitude = fields
+                            .iter()
+                            .find(|(name, _)| name == "altitude")
+                            .and_then(|(_, value)| resolve_scene_number(program, cell_store, value));
+                        if let (Some(azimuth), Some(altitude)) = (azimuth, altitude) {
+                            let azimuth_radians = azimuth.to_radians();
+                            let altitude_radians = altitude.clamp(5.0, 85.0).to_radians();
+                            let altitude_factor = (1.0 / altitude_radians.tan()).clamp(0.35, 2.0);
+                            params.shadow_dx_per_depth = -azimuth_radians.sin()
+                                * PhysicalSceneParams::DEFAULT.shadow_dx_per_depth
+                                * altitude_factor;
+                            params.shadow_dy_per_depth = azimuth_radians.cos()
+                                * PhysicalSceneParams::DEFAULT.shadow_dy_per_depth
+                                * altitude_factor;
+                        }
+                    }
+                    "AmbientLight" => {
+                        if let Some((_, intensity)) =
+                            fields.iter().find(|(name, _)| name == "intensity")
+                        {
+                            if let Some(intensity) = resolve_scene_number(program, cell_store, intensity) {
+                                params.ambient_factor = intensity.clamp(0.0, 1.0);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    params
+}
+
+fn collect_scene_param_dependency_cells(program: &IrProgram) -> Vec<CellId> {
+    let Some(render_root) = program.render_root() else {
+        return Vec::new();
+    };
+    let Some(scene) = render_root.scene else {
+        return Vec::new();
+    };
+
+    let mut deps = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(lights) = scene.lights {
+        collect_scene_expr_dependencies(program, &IrExpr::CellRead(lights), &mut deps, &mut seen);
+    }
+    if let Some(geometry) = scene.geometry {
+        collect_scene_expr_dependencies(
+            program,
+            &IrExpr::CellRead(geometry),
+            &mut deps,
+            &mut seen,
+        );
+    }
+
+    deps
+}
+
+fn collect_scene_expr_dependencies(
+    program: &IrProgram,
+    expr: &IrExpr,
+    deps: &mut Vec<CellId>,
+    seen_cells: &mut HashSet<u32>,
+) {
+    match expr {
+        IrExpr::Constant(_) => {}
+        IrExpr::CellRead(cell) => {
+            if seen_cells.insert(cell.0) {
+                deps.push(*cell);
+                if let Some(node) = find_node_for_cell(program, *cell) {
+                    collect_scene_node_dependencies(program, node, deps, seen_cells);
+                }
+            }
+        }
+        IrExpr::FieldAccess { object, .. } => {
+            collect_scene_expr_dependencies(program, object, deps, seen_cells);
+        }
+        IrExpr::BinOp { lhs, rhs, .. } | IrExpr::Compare { lhs, rhs, .. } => {
+            collect_scene_expr_dependencies(program, lhs, deps, seen_cells);
+            collect_scene_expr_dependencies(program, rhs, deps, seen_cells);
+        }
+        IrExpr::UnaryNeg(inner) | IrExpr::Not(inner) => {
+            collect_scene_expr_dependencies(program, inner, deps, seen_cells);
+        }
+        IrExpr::TextConcat(parts) => {
+            for part in parts {
+                if let TextSegment::Expr(expr) = part {
+                    collect_scene_expr_dependencies(program, expr, deps, seen_cells);
+                }
+            }
+        }
+        IrExpr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_scene_expr_dependencies(program, arg, deps, seen_cells);
+            }
+        }
+        IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => {
+            for (_, value) in fields {
+                collect_scene_expr_dependencies(program, value, deps, seen_cells);
+            }
+        }
+        IrExpr::ListConstruct(items) => {
+            for item in items {
+                collect_scene_expr_dependencies(program, item, deps, seen_cells);
+            }
+        }
+        IrExpr::PatternMatch { source, arms } => {
+            collect_scene_expr_dependencies(program, &IrExpr::CellRead(*source), deps, seen_cells);
+            for (_, body) in arms {
+                collect_scene_expr_dependencies(program, body, deps, seen_cells);
+            }
+        }
+    }
+}
+
+fn collect_scene_node_dependencies(
+    program: &IrProgram,
+    node: &IrNode,
+    deps: &mut Vec<CellId>,
+    seen_cells: &mut HashSet<u32>,
+) {
+    match node {
+        IrNode::Derived { expr, .. } => {
+            collect_scene_expr_dependencies(program, expr, deps, seen_cells);
+        }
+        IrNode::PipeThrough { source, .. } => {
+            collect_scene_expr_dependencies(program, &IrExpr::CellRead(*source), deps, seen_cells);
+        }
+        IrNode::When { source, arms, .. } | IrNode::While { source, arms, .. } => {
+            collect_scene_expr_dependencies(program, &IrExpr::CellRead(*source), deps, seen_cells);
+            for (_, body) in arms {
+                collect_scene_expr_dependencies(program, body, deps, seen_cells);
+            }
+        }
+        IrNode::TextInterpolation { parts, .. } => {
+            for part in parts {
+                if let TextSegment::Expr(expr) = part {
+                    collect_scene_expr_dependencies(program, expr, deps, seen_cells);
+                }
+            }
+        }
+        IrNode::Document {
+            lights, geometry, ..
+        } => {
+            if let Some(lights) = lights {
+                collect_scene_expr_dependencies(
+                    program,
+                    &IrExpr::CellRead(*lights),
+                    deps,
+                    seen_cells,
+                );
+            }
+            if let Some(geometry) = geometry {
+                collect_scene_expr_dependencies(
+                    program,
+                    &IrExpr::CellRead(*geometry),
+                    deps,
+                    seen_cells,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn initialize_scene_params(instance: &Rc<WasmInstance>) {
+    refresh_scene_params(&instance.program, &instance.cell_store, &instance.scene_params);
+
+    let deps = collect_scene_param_dependency_cells(&instance.program);
+    for cell in deps {
+        let inst = instance.clone();
+        let handle = Task::start_droppable(
+            inst.cell_store
+                .get_cell_signal(cell.0)
+                .for_each_sync(move |_| {
+                    refresh_scene_params(&inst.program, &inst.cell_store, &inst.scene_params);
+                }),
+        );
+        std::mem::forget(handle);
+    }
+}
+
+fn refresh_scene_params(
+    program: &IrProgram,
+    cell_store: &CellStore,
+    scene_params: &Mutable<PhysicalSceneParams>,
+) -> PhysicalSceneParams {
+    let scene = resolve_scene_params(program, cell_store);
+    scene_params.set_neq(scene);
+    scene
 }
 
 /// Apply font line properties (strikethrough, underline).
@@ -6147,4 +7665,508 @@ fn follow_cell_read(program: &IrProgram, cell: CellId) -> CellId {
         }
     }
     cell
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use super::{
+        CellStore, collect_scene_param_dependency_cells, compute_physical_depth_box_shadow,
+        compute_physical_gloss_background, find_data_cells_for_event,
+        materialize_template_list_expr, refresh_scene_params, reconstruct_object_fields,
+        resolve_runtime_object_fields_with_bindings,
+        resolve_runtime_cell_expr_with_bindings, resolve_runtime_list_item_expr,
+        resolve_scene_params,
+    };
+    use crate::platform::browser::engine_wasm::{
+        ir::{CellId, ElementKind, IrExpr, IrNode, IrProgram, IrValue},
+        lower::lower,
+        parse_source,
+        runtime::ListStore,
+    };
+    use boon_scene::{PhysicalSceneParams, RenderSurface};
+    use zoon::Mutable;
+
+    #[test]
+    fn resolve_scene_params_uses_compiled_light_and_geometry_cells() {
+        let program = IrProgram {
+            cells: Vec::new(),
+            events: Vec::new(),
+            nodes: vec![
+                IrNode::Document {
+                    kind: RenderSurface::Scene,
+                    root: CellId(1),
+                    lights: Some(CellId(2)),
+                    geometry: Some(CellId(3)),
+                },
+                IrNode::Derived {
+                    cell: CellId(2),
+                    expr: IrExpr::ListConstruct(vec![
+                        IrExpr::TaggedObject {
+                            tag: "DirectionalLight".to_string(),
+                            fields: vec![
+                                ("azimuth".to_string(), IrExpr::CellRead(CellId(10))),
+                                ("altitude".to_string(), IrExpr::CellRead(CellId(11))),
+                                ("spread".to_string(), IrExpr::CellRead(CellId(12))),
+                                ("intensity".to_string(), IrExpr::CellRead(CellId(13))),
+                            ],
+                        },
+                        IrExpr::TaggedObject {
+                            tag: "AmbientLight".to_string(),
+                            fields: vec![(
+                                "intensity".to_string(),
+                                IrExpr::CellRead(CellId(14)),
+                            )],
+                        },
+                    ]),
+                },
+                IrNode::Derived {
+                    cell: CellId(3),
+                    expr: IrExpr::ObjectConstruct(vec![(
+                        "bevel_angle".to_string(),
+                        IrExpr::CellRead(CellId(15)),
+                    )]),
+                },
+            ],
+            document: Some(CellId(1)),
+            render_surface: Some(RenderSurface::Scene),
+            functions: Vec::new(),
+            tag_table: Vec::new(),
+            cell_field_cells: HashMap::new(),
+        };
+
+        let store = CellStore::new(16);
+        store.set_cell_f64(10, 30.0);
+        store.set_cell_f64(11, 45.0);
+        store.set_cell_f64(12, 1.5);
+        store.set_cell_f64(13, 1.2);
+        store.set_cell_f64(14, 0.4);
+        store.set_cell_f64(15, 50.0);
+
+        let scene = resolve_scene_params(&program, &store);
+
+        assert_eq!(scene.directional_intensity, 1.2);
+        assert_eq!(scene.ambient_factor, 0.4);
+        assert_eq!(scene.bevel_angle, 50.0);
+        assert_eq!(
+            scene.shadow_blur_per_depth,
+            boon_scene::PhysicalSceneParams::DEFAULT.shadow_blur_per_depth * 1.5
+        );
+        assert_ne!(
+            scene.shadow_dx_per_depth,
+            boon_scene::PhysicalSceneParams::DEFAULT.shadow_dx_per_depth
+        );
+        assert_ne!(
+            scene.shadow_dy_per_depth,
+            boon_scene::PhysicalSceneParams::DEFAULT.shadow_dy_per_depth
+        );
+    }
+
+    #[test]
+    fn physical_css_helpers_reflect_scene_params() {
+        let scene = PhysicalSceneParams {
+            shadow_dx_per_depth: 2.0,
+            shadow_dy_per_depth: 3.0,
+            shadow_blur_per_depth: 4.0,
+            directional_intensity: 1.2,
+            ambient_factor: 0.4,
+            bevel_angle: 50.0,
+        };
+
+        let shadow = compute_physical_depth_box_shadow(2.0, scene).expect("shadow");
+        assert!(shadow.contains("4.0px 6.0px 8.0px"));
+        assert!(shadow.contains("rgba(0,0,0,0.22)"));
+
+        let gloss = compute_physical_gloss_background(0.5, scene).expect("gloss");
+        assert!(gloss.contains("linear-gradient(50deg"));
+        assert!(gloss.contains("rgba(255,255,255,0.12)"));
+    }
+
+    #[test]
+    fn collect_scene_param_dependency_cells_finds_nested_light_and_geometry_cells() {
+        let program = IrProgram {
+            cells: Vec::new(),
+            events: Vec::new(),
+            nodes: vec![
+                IrNode::Document {
+                    kind: RenderSurface::Scene,
+                    root: CellId(1),
+                    lights: Some(CellId(2)),
+                    geometry: Some(CellId(3)),
+                },
+                IrNode::Derived {
+                    cell: CellId(2),
+                    expr: IrExpr::ListConstruct(vec![IrExpr::TaggedObject {
+                        tag: "DirectionalLight".to_string(),
+                        fields: vec![
+                            ("azimuth".to_string(), IrExpr::CellRead(CellId(10))),
+                            ("altitude".to_string(), IrExpr::CellRead(CellId(11))),
+                            ("spread".to_string(), IrExpr::CellRead(CellId(12))),
+                            ("intensity".to_string(), IrExpr::CellRead(CellId(13))),
+                        ],
+                    }]),
+                },
+                IrNode::Derived {
+                    cell: CellId(3),
+                    expr: IrExpr::ObjectConstruct(vec![(
+                        "bevel_angle".to_string(),
+                        IrExpr::CellRead(CellId(15)),
+                    )]),
+                },
+            ],
+            document: Some(CellId(1)),
+            render_surface: Some(RenderSurface::Scene),
+            functions: Vec::new(),
+            tag_table: Vec::new(),
+            cell_field_cells: HashMap::new(),
+        };
+
+        let deps = collect_scene_param_dependency_cells(&program);
+        let dep_ids: Vec<u32> = deps.into_iter().map(|cell| cell.0).collect();
+
+        assert!(dep_ids.contains(&2));
+        assert!(dep_ids.contains(&3));
+        assert!(dep_ids.contains(&10));
+        assert!(dep_ids.contains(&11));
+        assert!(dep_ids.contains(&12));
+        assert!(dep_ids.contains(&13));
+        assert!(dep_ids.contains(&15));
+    }
+
+    #[test]
+    fn refresh_scene_params_updates_shared_state_after_cell_changes() {
+        let program = IrProgram {
+            cells: Vec::new(),
+            events: Vec::new(),
+            nodes: vec![
+                IrNode::Document {
+                    kind: RenderSurface::Scene,
+                    root: CellId(1),
+                    lights: Some(CellId(2)),
+                    geometry: Some(CellId(3)),
+                },
+                IrNode::Derived {
+                    cell: CellId(2),
+                    expr: IrExpr::ListConstruct(vec![IrExpr::TaggedObject {
+                        tag: "DirectionalLight".to_string(),
+                        fields: vec![
+                            ("azimuth".to_string(), IrExpr::CellRead(CellId(10))),
+                            ("altitude".to_string(), IrExpr::CellRead(CellId(11))),
+                            ("spread".to_string(), IrExpr::CellRead(CellId(12))),
+                            ("intensity".to_string(), IrExpr::CellRead(CellId(13))),
+                        ],
+                    }]),
+                },
+                IrNode::Derived {
+                    cell: CellId(3),
+                    expr: IrExpr::ObjectConstruct(vec![(
+                        "bevel_angle".to_string(),
+                        IrExpr::CellRead(CellId(15)),
+                    )]),
+                },
+            ],
+            document: Some(CellId(1)),
+            render_surface: Some(RenderSurface::Scene),
+            functions: Vec::new(),
+            tag_table: Vec::new(),
+            cell_field_cells: HashMap::new(),
+        };
+
+        let store = CellStore::new(16);
+        store.set_cell_f64(10, 25.0);
+        store.set_cell_f64(11, 40.0);
+        store.set_cell_f64(12, 1.0);
+        store.set_cell_f64(13, 0.8);
+        store.set_cell_f64(15, 35.0);
+
+        let scene_params = Mutable::new(PhysicalSceneParams::default());
+        let initial = refresh_scene_params(&program, &store, &scene_params);
+
+        assert_eq!(initial.directional_intensity, 0.8);
+        assert_eq!(initial.bevel_angle, 35.0);
+        assert_eq!(scene_params.get().directional_intensity, 0.8);
+
+        store.set_cell_f64(12, 1.8);
+        store.set_cell_f64(13, 1.4);
+        store.set_cell_f64(15, 70.0);
+
+        let updated = refresh_scene_params(&program, &store, &scene_params);
+
+        assert_eq!(updated.directional_intensity, 1.4);
+        assert_eq!(updated.bevel_angle, 70.0);
+        assert_eq!(scene_params.get().directional_intensity, 1.4);
+        assert_eq!(scene_params.get().bevel_angle, 70.0);
+        assert!(
+            updated.shadow_blur_per_depth
+                > initial.shadow_blur_per_depth,
+            "light spread should increase blur"
+        );
+    }
+
+    #[test]
+    fn slider_change_value_cells_use_timer_link_payloads() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/timer/timer.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+
+        let slider_links = program.nodes.iter().find_map(|node| match node {
+            IrNode::Element { kind, links, .. } if matches!(kind, ElementKind::Slider { .. }) => {
+                Some(links.clone())
+            }
+            _ => None,
+        });
+        let Some(links) = slider_links else {
+            panic!("timer slider not found");
+        };
+
+        let value_cells = find_data_cells_for_event(&program, &links, "change", "value");
+        let value_cell_names: Vec<String> = value_cells
+            .iter()
+            .map(|cell_id| program.cells[*cell_id as usize].name.clone())
+            .collect();
+
+        assert!(
+            value_cell_names
+                .iter()
+                .any(|name| name == "store.elements.duration_slider.event.change.value"),
+            "expected linked slider payload cell, got {:?}",
+            value_cell_names
+        );
+    }
+
+    #[test]
+    fn cells_row_template_resolves_first_row_number_from_item_binding() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/cells/cells.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+        let cell_store = CellStore::new(program.cells.len());
+
+        let (source_cell, item_cell, template_cell_range) = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::ListMap {
+                    source,
+                    item_name,
+                    item_cell,
+                    template_cell_range,
+                    ..
+                } if item_name == "row_data" => Some((*source, *item_cell, *template_cell_range)),
+                _ => None,
+            })
+            .expect("outer row list map");
+
+        let item_expr =
+            resolve_runtime_list_item_expr(&program, &cell_store, source_cell, 0).expect("item expr");
+        println!(
+            "outer row source node: {:?}",
+            super::find_node_for_cell(&program, source_cell)
+        );
+        let bindings = HashMap::from([(item_cell, item_expr)]);
+        let row_like_cells: Vec<(u32, String)> = program
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, cell)| {
+                ((idx as u32) >= template_cell_range.0
+                    && (idx as u32) < template_cell_range.1
+                    && cell.name.contains("row"))
+                .then_some((idx as u32, cell.name.clone()))
+            })
+            .collect();
+        let row_cell = row_like_cells
+            .iter()
+            .find_map(|(idx, name)| {
+                (name.ends_with(".row") || name == "row" || name.contains("object.row"))
+                    .then_some(CellId(*idx))
+            })
+            .unwrap_or_else(|| panic!("row-like cells: {:?}", row_like_cells));
+
+        let resolved = resolve_runtime_cell_expr_with_bindings(
+            &program,
+            &cell_store,
+            row_cell,
+            0,
+            &bindings,
+        )
+        .expect("resolved row expr");
+
+        assert!(
+            matches!(resolved, IrExpr::Constant(IrValue::Number(n)) if (n - 1.0).abs() < f64::EPSILON),
+            "expected row 1, got {resolved:?}; item_expr={:?}; reconstructed={:?}",
+            bindings.get(&item_cell),
+            bindings
+                .get(&item_cell)
+                .and_then(|expr| match expr {
+                    IrExpr::CellRead(cell) => Some(reconstruct_object_fields(&program, *cell)),
+                    IrExpr::ObjectConstruct(fields) => Some(fields.clone()),
+                    _ => None,
+                })
+        );
+    }
+
+    #[test]
+    fn cells_row_template_resolves_first_row_cells_from_item_binding() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/cells/cells.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+        let cell_store = CellStore::new(program.cells.len());
+
+        let (source_cell, item_cell, template_cell_range) = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::ListMap {
+                    source,
+                    item_name,
+                    item_cell,
+                    template_cell_range,
+                    ..
+                } if item_name == "row_data" => Some((*source, *item_cell, *template_cell_range)),
+                _ => None,
+            })
+            .expect("outer row list map");
+
+        let item_expr =
+            resolve_runtime_list_item_expr(&program, &cell_store, source_cell, 0).expect("item expr");
+        let bindings = HashMap::from([(item_cell, item_expr)]);
+        let row_cells_cell = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::ListMap {
+                    cell,
+                    source,
+                    item_name,
+                    ..
+                } if cell.0 >= template_cell_range.0
+                    && cell.0 < template_cell_range.1
+                    && item_name == "cell" =>
+                {
+                    Some(*source)
+                }
+                _ => None,
+            })
+            .expect("inner row cell list source");
+
+        let resolved = resolve_runtime_cell_expr_with_bindings(
+            &program,
+            &cell_store,
+            row_cells_cell,
+            0,
+            &bindings,
+        )
+        .expect("resolved row_cells expr");
+
+        println!(
+            "row_cells source node: {:?}",
+            super::find_node_for_cell(&program, row_cells_cell)
+        );
+        println!("resolved row_cells expr: {resolved:?}");
+        assert!(
+            matches!(
+                resolved,
+                IrExpr::FieldAccess { .. } | IrExpr::ListConstruct(_) | IrExpr::CellRead(_)
+            ),
+            "expected row cells path to stay resolvable, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn cells_row_template_materializes_first_row_cells_list_from_item_binding() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/cells/cells.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+        let cell_store = CellStore::new(program.cells.len());
+        let list_store = ListStore::new();
+        let template_list_items = Rc::new(RefCell::new(HashMap::new()));
+
+        let (source_cell, item_cell, template_cell_range) = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::ListMap {
+                    source,
+                    item_name,
+                    item_cell,
+                    template_cell_range,
+                    ..
+                } if item_name == "row_data" => Some((*source, *item_cell, *template_cell_range)),
+                _ => None,
+            })
+            .expect("outer row list map");
+
+        let item_expr =
+            resolve_runtime_list_item_expr(&program, &cell_store, source_cell, 0).expect("item expr");
+        let bindings = HashMap::from([(item_cell, item_expr)]);
+        let row_cells_cell = program
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                IrNode::ListMap {
+                    cell,
+                    source,
+                    item_name,
+                    ..
+                } if cell.0 >= template_cell_range.0
+                    && cell.0 < template_cell_range.1
+                    && item_name == "cell" =>
+                {
+                    Some(*source)
+                }
+                _ => None,
+            })
+            .expect("inner row cell list source");
+
+        let resolved = resolve_runtime_cell_expr_with_bindings(
+            &program,
+            &cell_store,
+            row_cells_cell,
+            0,
+            &bindings,
+        )
+        .expect("resolved row_cells expr");
+        let object_fields = resolve_runtime_object_fields_with_bindings(
+            &program,
+            &cell_store,
+            &IrExpr::CellRead(item_cell),
+            0,
+            &bindings,
+        );
+        println!("item_expr: {:?}", bindings.get(&item_cell));
+        println!(
+            "resolved outer list expr: {:?}",
+            resolve_runtime_cell_expr_with_bindings(&program, &cell_store, source_cell, 0, &HashMap::new())
+        );
+        println!("object_fields: {:?}", object_fields);
+        let list_id = materialize_template_list_expr(
+            &program,
+            &list_store,
+            &template_list_items,
+            &cell_store,
+            &resolved,
+            0,
+            &bindings,
+        )
+        .expect("materialized row cell list");
+
+        assert!(list_id > 0.0, "expected concrete list id, got {list_id}");
+        let items = template_list_items
+            .borrow()
+            .get(&list_id.to_bits())
+            .cloned()
+            .expect("template list items");
+        assert_eq!(items.len(), 26, "expected 26 cells in first row");
+    }
 }

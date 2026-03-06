@@ -278,10 +278,10 @@ impl EvaluationContext {
 
     /// Create a derived context with additional parameters.
     pub fn with_parameters(&self, params: HashMap<String, ActorHandle>) -> Self {
-        let mut new_params = self.actor_context.parameters.clone();
+        let mut new_params = (*self.actor_context.parameters).clone();
         new_params.extend(params);
         self.with_actor_context(ActorContext {
-            parameters: new_params,
+            parameters: Arc::new(new_params),
             ..self.actor_context.clone()
         })
     }
@@ -978,7 +978,7 @@ fn schedule_expression(
             // This allows sibling field expressions to resolve references locally
             // instead of relying on the global ReferenceConnector (which can be overwritten
             // when multiple Objects are created from the same function definition)
-            let mut object_locals = ctx.actor_context.object_locals.clone();
+            let mut object_locals = (*ctx.actor_context.object_locals).clone();
 
             for var in variables {
                 let var_slot = state.alloc_slot();
@@ -1041,7 +1041,7 @@ fn schedule_expression(
             // not to intermediate data structures like BLOCKs.
             let ctx_with_locals = EvaluationContext {
                 actor_context: ActorContext {
-                    object_locals: object_locals.clone(),
+                    object_locals: Arc::new(object_locals.clone()),
                     is_snapshot_context: false,
                     ..ctx.actor_context.clone()
                 },
@@ -1089,7 +1089,7 @@ fn schedule_expression(
             let mut vars_to_schedule = Vec::new();
 
             // Build object_locals map from forwarding actors
-            let mut object_locals = ctx.actor_context.object_locals.clone();
+            let mut object_locals = (*ctx.actor_context.object_locals).clone();
 
             for var in object.variables {
                 let var_slot = state.alloc_slot();
@@ -1165,7 +1165,7 @@ fn schedule_expression(
             // Create context with object_locals for variable expression evaluation
             let ctx_with_locals = EvaluationContext {
                 actor_context: ActorContext {
-                    object_locals: object_locals.clone(),
+                    object_locals: Arc::new(object_locals.clone()),
                     ..ctx.actor_context.clone()
                 },
                 current_module: ctx.current_module.clone(),
@@ -1214,7 +1214,7 @@ fn schedule_expression(
             // This allows sibling field expressions to resolve references locally
             // instead of relying on the global ReferenceConnector (which can be overwritten
             // when multiple Objects are created from the same function definition)
-            let mut object_locals = ctx.actor_context.object_locals.clone();
+            let mut object_locals = (*ctx.actor_context.object_locals).clone();
 
             for var in object.variables {
                 let var_slot = state.alloc_slot();
@@ -1290,7 +1290,7 @@ fn schedule_expression(
             // Create context with object_locals for variable expression evaluation
             let ctx_with_locals = EvaluationContext {
                 actor_context: ActorContext {
-                    object_locals: object_locals.clone(),
+                    object_locals: Arc::new(object_locals.clone()),
                     ..ctx.actor_context.clone()
                 },
                 current_module: ctx.current_module.clone(),
@@ -1405,7 +1405,7 @@ fn schedule_expression(
                     // This allows subsequent arguments to resolve references locally
                     // instead of relying on the global ReferenceConnector (which can be overwritten
                     // when the same function is called multiple times)
-                    let mut arg_locals = ctx.actor_context.object_locals.clone();
+                    let mut arg_locals = (*ctx.actor_context.object_locals).clone();
 
                     // Note: piped value is handled in call_function for BUILTIN functions only
                     // User-defined functions don't receive piped as positional arg
@@ -1473,7 +1473,7 @@ fn schedule_expression(
                     // at trigger time when called inside THEN/WHEN bodies.
                     let ctx_with_arg_locals = EvaluationContext {
                         actor_context: ActorContext {
-                            object_locals: arg_locals,
+                            object_locals: Arc::new(arg_locals),
                             ..ctx.actor_context.clone()
                         },
                         current_module: ctx.current_module.clone(),
@@ -3424,7 +3424,7 @@ fn build_then_actor(
                     output_valve_signal: actor_context_clone.output_valve_signal.clone(),
                     piped: Some(value_actor.clone()),
                     passed: actor_context_clone.passed.clone(),
-                    parameters: frozen_parameters,
+                    parameters: Arc::new(frozen_parameters),
                     sequential_processing: actor_context_clone.sequential_processing,
                     backpressure_permit: actor_context_clone.backpressure_permit.clone(),
                     // Don't propagate callback to body - body evaluation is internal
@@ -3704,7 +3704,7 @@ fn build_when_actor(
                             output_valve_signal: actor_context_clone.output_valve_signal.clone(),
                             piped: Some(value_actor.clone()),
                             passed: actor_context_clone.passed.clone(),
-                            parameters,
+                            parameters: Arc::new(parameters),
                             sequential_processing: actor_context_clone.sequential_processing,
                             backpressure_permit: actor_context_clone.backpressure_permit.clone(),
                             // Don't propagate HOLD callback into WHEN arms - each arm is a separate evaluation
@@ -3926,7 +3926,7 @@ fn build_while_actor(
                     actor_context_clone.scope_id(),
                 );
 
-                let mut parameters = actor_context_clone.parameters.clone();
+                let mut parameters = (*actor_context_clone.parameters).clone();
                 for (name, bound_value) in bindings {
                     let bound_actor = create_actor(
                         ConstructInfo::new(
@@ -3946,7 +3946,7 @@ fn build_while_actor(
                     output_valve_signal: actor_context_clone.output_valve_signal.clone(),
                     piped: Some(value_actor),
                     passed: actor_context_clone.passed.clone(),
-                    parameters,
+                    parameters: Arc::new(parameters),
                     sequential_processing: actor_context_clone.sequential_processing,
                     backpressure_permit: actor_context_clone.backpressure_permit.clone(),
                     // Propagate HOLD callback through WHILE arms - body might need it
@@ -4308,7 +4308,7 @@ fn build_hold_actor(
     );
 
     // Bind the state parameter in the context so body can reference it
-    let mut body_parameters = ctx.actor_context.parameters.clone();
+    let mut body_parameters = (*ctx.actor_context.parameters).clone();
     body_parameters.insert(state_param.clone(), state_actor.clone());
 
     // Clone state_actor for use in state_update_stream to directly update its stored value
@@ -4338,7 +4338,7 @@ fn build_hold_actor(
         output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
         piped: None, // Clear piped - the body shouldn't re-use it
         passed: ctx.actor_context.passed.clone(),
-        parameters: body_parameters,
+        parameters: Arc::new(body_parameters),
         // Force sequential processing in HOLD body to ensure state consistency.
         // Without this, THEN/WHEN would spawn parallel body evaluations that all
         // read stale state (e.g., Stream/pulses(3) |> THEN { counter + 1 } would read counter=0 three times).
@@ -5305,7 +5305,7 @@ fn build_list_append_with_recording(
 
             // 3. Bind the input to the function's first parameter (like call_function does with piped)
             // For `title_to_add |> new_todo()`, the piped value becomes the first argument (title)
-            let mut parameters = ctx.actor_context.parameters.clone();
+            let mut parameters = (*ctx.actor_context.parameters).clone();
             if let Some(first_param) = func_def.parameters.first() {
                 if LOG_DEBUG {
                     zoon::println!(
@@ -5327,7 +5327,7 @@ fn build_list_append_with_recording(
             // This ensures HOLDs inside the function can find their persisted state
             let body_ctx = EvaluationContext {
                 actor_context: ActorContext {
-                    parameters,
+                    parameters: Arc::new(parameters),
                     is_restoring: true,
                     ..child_ctx.with_restoring_child_scope(&recorded_call.id)
                 },
@@ -5586,11 +5586,9 @@ fn call_function(
         });
 
     if let Some(func_def) = func_def_opt {
-        // Create parameters from arguments
-        let mut parameters = ctx.actor_context.parameters.clone();
-        for (param_name, arg_actor) in arg_map {
-            parameters.insert(param_name, arg_actor);
-        }
+        // User-defined functions don't capture caller parameter maps.
+        // Carry only the explicit call arguments into the callee.
+        let mut parameters = arg_map;
 
         // Check if piped value should be bound to an unbound function parameter.
         // For `position |> fibonacci()`, bind `position` to the first parameter of `fibonacci`.
@@ -5699,7 +5697,7 @@ fn call_function(
                     output_valve_signal: ctx_for_closure.actor_context.output_valve_signal.clone(),
                     piped: None, // Clear piped - we've consumed it
                     passed: ctx_for_closure.actor_context.passed.clone(),
-                    parameters: params,
+                    parameters: Arc::new(params),
                     sequential_processing: ctx_for_closure.actor_context.sequential_processing,
                     backpressure_permit: ctx_for_closure.actor_context.backpressure_permit.clone(),
                     hold_state_update_callback: None,
@@ -5707,7 +5705,7 @@ fn call_function(
                     // Don't inherit snapshot mode - function body evaluates in normal streaming context
                     is_snapshot_context: false,
                     // Clear object_locals - function body is a new scope
-                    object_locals: HashMap::new(),
+                    object_locals: Arc::new(HashMap::new()),
                     scope: call_scope,
                     subscription_scope: ctx_for_closure.actor_context.subscription_scope.clone(),
                     call_recorder: ctx_for_closure.actor_context.call_recorder.clone(),
@@ -5789,7 +5787,7 @@ fn call_function(
             output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
             piped: ctx.actor_context.piped.clone(),
             passed: ctx.actor_context.passed.clone(),
-            parameters,
+            parameters: Arc::new(parameters),
             sequential_processing: ctx.actor_context.sequential_processing,
             backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
             // Don't propagate HOLD callback into user-defined functions - they have their own scope
@@ -5798,7 +5796,7 @@ fn call_function(
             // Don't inherit snapshot mode - function body evaluates in normal streaming context
             is_snapshot_context: false,
             // Clear object_locals - function body is a new scope
-            object_locals: HashMap::new(),
+            object_locals: Arc::new(HashMap::new()),
             scope: call_scope,
             subscription_scope: ctx.actor_context.subscription_scope.clone(),
             call_recorder: ctx.actor_context.call_recorder.clone(),
@@ -5879,7 +5877,7 @@ fn call_function(
                 // Don't inherit snapshot mode - builtin functions evaluate in normal streaming context
                 is_snapshot_context: false,
                 // Clear object_locals - function call is a new scope
-                object_locals: HashMap::new(),
+                object_locals: Arc::new(HashMap::new()),
                 scope: ctx.actor_context.scope.clone(),
                 subscription_scope: ctx.actor_context.subscription_scope.clone(),
                 call_recorder: ctx.actor_context.call_recorder.clone(),

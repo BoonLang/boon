@@ -3,7 +3,6 @@
 [test]
 category = "interactive"
 description = "7GUIs Task 5: CRUD with filter, create, update, delete"
-skip_engines = ["DD", "Wasm"]
 
 [output]
 text = "Emil"
@@ -68,7 +67,7 @@ expect = "Mustermann"
 # SPEC: Clear filter -> all people shown
 [[sequence]]
 description = "Clear filter -> all people"
-actions = [["focus_input", 0], ["key", "Backspace"]]
+actions = [["set_input_value", 0, ""]]
 expect = "Emil"
 expect_match = "contains"
 

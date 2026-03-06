@@ -1,349 +1,946 @@
 -- 7GUIs Task 7: Cells (Spreadsheet)
--- 10 columns (A-J) x 10 rows (1-10), row-major storage
---
--- Supported formulas:
---   42            plain number
---   =42           literal number
---   =A1           cell reference (column letter + row number)
---   =add(A1, 5)   binary ops: add, sub, mul, div, mod
---   =mul(2, A1)   nested: =add(mul(2, A1), B1)
---   =sum(A1:A3)   range ops: sum, prod (single column)
---
--- Double-click a cell to edit. Enter confirms, Escape cancels.
--- Click elsewhere to blur-deselect. Formulas auto-update reactively.
+-- 26 columns (A-Z) x 100 rows (1-100), official-size grid.
+-- Double-click edit, Enter commit, Escape cancel, blur exit, reactive formulas.
 
--- ─── Formula Helpers ──────────────────────────────────────────────
-
-FUNCTION is_uppercase(char_code) {
-    char_code >= 65 |> WHILE {
-        True => char_code <= 90
-        False => False
-    }
-}
-
-FUNCTION is_digit(char_code) {
-    char_code >= 48 |> WHILE {
-        True => char_code <= 57
-        False => False
-    }
-}
-
-FUNCTION is_cell_ref(text) {
-    BLOCK {
-        first_code: text |> Text/char_at(index: 0) |> Text/char_code()
-        second_code: text |> Text/char_at(index: 1) |> Text/char_code()
-        first_upper: is_uppercase(char_code: first_code)
-        second_digit: is_digit(char_code: second_code)
-        first_upper |> WHILE {
-            True => second_digit
-            False => False
-        }
-    }
-}
-
-FUNCTION find_comma_depth(text, position, depth) {
-    BLOCK {
-        char: text |> Text/char_at(index: position)
-        char_code: char |> Text/char_code()
-        is_comma: char_code == 44
-        is_open: char_code == 40
-        is_close: char_code == 41
-
-        is_comma |> WHILE {
-            True => depth == 0 |> WHILE {
-                True => position
-                False => find_comma_depth(text: text, position: position + 1, depth: depth)
-            }
-            False => BLOCK {
-                new_depth: is_open |> WHILE {
-                    True => depth + 1
-                    False => is_close |> WHILE {
-                        True => depth - 1
-                        False => depth
-                    }
+FUNCTION cell_formula(column, row) {
+    LATEST {
+        default_formula(column: column, row: row)
+        overrides |> List/map(override, new:
+            override.row == row |> WHEN {
+                True => override.column == column |> WHEN {
+                    True => override.text
+                    __ => SKIP
                 }
-                find_comma_depth(text: text, position: position + 1, depth: new_depth)
+                __ => SKIP
             }
-        }
+        ) |> List/latest()
     }
 }
 
--- ─── Formula Evaluation ───────────────────────────────────────────
-
-FUNCTION cell_lookup(column, row, all_cells) {
-    BLOCK {
-        cell: all_cells |> List/get(index: row) |> List/get(index: column)
-        cell |> WHILE { c => c.value }
+FUNCTION parse_column_letter(text) {
+    text |> WHEN {
+        TEXT { A } => 1
+        TEXT { B } => 2
+        TEXT { C } => 3
+        TEXT { D } => 4
+        TEXT { E } => 5
+        TEXT { F } => 6
+        TEXT { G } => 7
+        TEXT { H } => 8
+        TEXT { I } => 9
+        TEXT { J } => 10
+        TEXT { K } => 11
+        TEXT { L } => 12
+        TEXT { M } => 13
+        TEXT { N } => 14
+        TEXT { O } => 15
+        TEXT { P } => 16
+        TEXT { Q } => 17
+        TEXT { R } => 18
+        TEXT { S } => 19
+        TEXT { T } => 20
+        TEXT { U } => 21
+        TEXT { V } => 22
+        TEXT { W } => 23
+        TEXT { X } => 24
+        TEXT { Y } => 25
+        TEXT { Z } => 26
+        __ => 0
     }
 }
 
-FUNCTION apply_binary(name, left, right) {
-    name == TEXT { add } |> WHILE {
-        True => left + right
-        False => name == TEXT { sub } |> WHILE {
-            True => left - right
-            False => name == TEXT { mul } |> WHILE {
-                True => left * right
-                False => name == TEXT { div } |> WHILE {
-                    True => left / right
-                    False => name == TEXT { mod } |> WHILE {
-                        True => left |> Math/modulo(divisor: right)
-                        False => 0
-                    }
-                }
-            }
-        }
+FUNCTION extract_reference_column(ref_text) { ref_text |> Text/substring(start: 0, length: 1) |> parse_column_letter() }
+FUNCTION extract_reference_row(ref_text) { ref_text |> Text/substring(start: 1, length: 8) |> Text/to_number() }
+
+FUNCTION sum_range(column, start_row, end_row) {
+    start_row > end_row |> WHEN {
+        True => 0
+        __ => compute_value(formula_text: cell_formula(column: column, row: start_row)) + sum_range(column: column, start_row: start_row + 1, end_row: end_row)
     }
 }
 
-FUNCTION apply_range(name, values) {
-    name == TEXT { sum } |> WHILE {
-        True => values |> List/sum()
-        False => name == TEXT { prod } |> WHILE {
-            True => values |> List/product()
-            False => 0
-        }
-    }
-}
-
-FUNCTION parse_cell_ref(text, all_cells) {
-    BLOCK {
-        first_code: text |> Text/char_at(index: 0) |> Text/char_code()
-        column_number: first_code - 64
-        rest_length: text |> Text/length() |> WHILE { length => length - 1 }
-        rest: text |> Text/substring(start: 1, length: rest_length)
-        row_number: rest |> Text/to_number()
-        cell_lookup(column: column_number, row: row_number, all_cells: all_cells)
-    }
-}
-
-FUNCTION parse_function_call(text, all_cells) {
+FUNCTION expression_value(text) {
     BLOCK {
         text_length: text |> Text/length()
-        paren_pos: text |> Text/find(search: TEXT { ( })
-        func_name: text |> Text/substring(start: 0, length: paren_pos)
-        args_start: paren_pos + 1
-        args_length: text_length - args_start - 1
-        args_text: text |> Text/substring(start: args_start, length: args_length)
-        colon_pos: args_text |> Text/find(search: TEXT { : })
-        has_colon: colon_pos >= 0
-
-        has_colon |> WHILE {
+        comma_index: text |> Text/find(search: TEXT { , })
+        colon_index: text |> Text/find(search: TEXT { : })
+        has_comma: comma_index >= 0
+        has_colon: colon_index >= 0
+        has_comma |> WHEN {
             True => BLOCK {
-                start_ref: args_text |> Text/substring(start: 0, length: colon_pos) |> Text/trim()
-                end_start: colon_pos + 1
-                end_length: args_text |> Text/length() |> WHILE { length => length - end_start }
-                end_ref: args_text |> Text/substring(start: end_start, length: end_length) |> Text/trim()
-
-                start_col: start_ref |> Text/char_at(index: 0) |> Text/char_code() |> WHILE { code => code - 64 }
-                start_rest_len: start_ref |> Text/length() |> WHILE { length => length - 1 }
-                start_row: start_ref |> Text/substring(start: 1, length: start_rest_len) |> Text/to_number()
-
-                end_rest_len: end_ref |> Text/length() |> WHILE { length => length - 1 }
-                end_row: end_ref |> Text/substring(start: 1, length: end_rest_len) |> Text/to_number()
-
-                range_values: List/range(from: start_row, to: end_row) |> List/map(old, new:
-                    cell_lookup(column: start_col, row: old, all_cells: all_cells)
-                )
-                apply_range(name: func_name, values: range_values)
+                left_length: comma_index - 4
+                left_ref: text |> Text/substring(start: 4, length: left_length) |> Text/trim()
+                right_length: text_length - comma_index - 2
+                right_ref: text |> Text/substring(start: comma_index + 1, length: right_length) |> Text/trim()
+                left_column: left_ref |> Text/substring(start: 0, length: 1) |> parse_column_letter()
+                left_row: left_ref |> Text/substring(start: 1, length: 8) |> Text/to_number()
+                right_column: right_ref |> Text/substring(start: 0, length: 1) |> parse_column_letter()
+                right_row: right_ref |> Text/substring(start: 1, length: 8) |> Text/to_number()
+                compute_value(formula_text: cell_formula(column: left_column, row: left_row))
+                + compute_value(formula_text: cell_formula(column: right_column, row: right_row))
             }
-            False => BLOCK {
-                comma_pos: find_comma_depth(text: args_text, position: 0, depth: 0)
-                left_text: args_text |> Text/substring(start: 0, length: comma_pos)
-                right_start: comma_pos + 1
-                right_length: args_text |> Text/length() |> WHILE { length => length - right_start }
-                right_text: args_text |> Text/substring(start: right_start, length: right_length)
-                left_val: evaluate_expression(text: left_text, all_cells: all_cells)
-                right_val: evaluate_expression(text: right_text, all_cells: all_cells)
-                apply_binary(name: func_name, left: left_val, right: right_val)
+            __ => has_colon |> WHEN {
+                True => BLOCK {
+                    start_ref_length: colon_index - 4
+                    start_ref: text |> Text/substring(start: 4, length: start_ref_length) |> Text/trim()
+                    end_ref_length: text_length - colon_index - 2
+                    end_ref: text |> Text/substring(start: colon_index + 1, length: end_ref_length) |> Text/trim()
+                    start_column: start_ref |> Text/substring(start: 0, length: 1) |> parse_column_letter()
+                    start_row: start_ref |> Text/substring(start: 1, length: 8) |> Text/to_number()
+                    end_row: end_ref |> Text/substring(start: 1, length: 8) |> Text/to_number()
+                    sum_range(column: start_column, start_row: start_row, end_row: end_row)
+                }
+                __ => 0
             }
         }
     }
 }
 
-FUNCTION evaluate_expression(text, all_cells) {
-    BLOCK {
-        trimmed: text |> Text/trim()
-        as_number: trimmed |> Text/to_number()
-        is_number: as_number |> WHEN { NaN => False, __ => True }
-
-        is_number |> WHILE {
-            True => as_number
-            False => is_cell_ref(text: trimmed) |> WHILE {
-                True => parse_cell_ref(text: trimmed, all_cells: all_cells)
-                False => parse_function_call(text: trimmed, all_cells: all_cells)
-            }
-        }
-    }
-}
-
-FUNCTION compute_value(formula_text, all_cells) {
+FUNCTION compute_value(formula_text) {
     formula_text |> Text/starts_with(prefix: TEXT { = }) |> WHILE {
-        False => formula_text |> Text/to_number() |> WHILE {
-            NaN => 0
-            number => number
-        }
-        True => BLOCK {
-            full_length: formula_text |> Text/length()
-            expr_length: full_length |> WHILE { length => length - 1 }
-            expression: formula_text |> Text/substring(start: 1, length: expr_length)
-            evaluate_expression(text: expression, all_cells: all_cells)
+        False => formula_text |> Text/to_number() |> WHILE { NaN => 0 number => number }
+        __ => BLOCK {
+            formula_length: formula_text |> Text/length()
+            expression: formula_text |> Text/substring(start: 1, length: formula_length - 1)
+            expression_value(text: expression)
         }
     }
 }
 
--- ─── Cell ─────────────────────────────────────────────────────────
-
-FUNCTION new_cell(initial_formula, all_cells) {
-    [
-        cell_elements: [display: LINK, editing: LINK]
-        is_editing: False |> HOLD state {
-            LATEST {
-                cell_elements.display.event.double_click |> THEN { True }
-                cell_elements.editing.event.blur |> THEN { False }
-                cell_elements.editing.event.key_down.key
-                    |> WHEN { Escape => False, Enter => False, __ => SKIP }
-            }
-        }
-        editing_text: formula |> HOLD state {
-            LATEST {
-                cell_elements.editing.event.change.text
-                cell_elements.editing.event.key_down.key
-                    |> WHEN { Escape => formula, __ => SKIP }
-            }
-        }
-        confirmed_text: cell_elements.editing.event.key_down.key
-            |> WHEN { Enter => editing_text, __ => SKIP }
-        formula: LATEST { initial_formula, confirmed_text }
-        value: compute_value(formula_text: formula, all_cells: all_cells)
-    ]
-}
-
--- ─── Default Formulas ─────────────────────────────────────────────
-
+FUNCTION make_cell(column, row) { [column: column row: row cell_elements: [display: LINK, editing: LINK]] }
+FUNCTION make_row_cells(row) { LIST {
+    make_cell(column: 1, row: row)
+    make_cell(column: 2, row: row)
+    make_cell(column: 3, row: row)
+    make_cell(column: 4, row: row)
+    make_cell(column: 5, row: row)
+    make_cell(column: 6, row: row)
+    make_cell(column: 7, row: row)
+    make_cell(column: 8, row: row)
+    make_cell(column: 9, row: row)
+    make_cell(column: 10, row: row)
+    make_cell(column: 11, row: row)
+    make_cell(column: 12, row: row)
+    make_cell(column: 13, row: row)
+    make_cell(column: 14, row: row)
+    make_cell(column: 15, row: row)
+    make_cell(column: 16, row: row)
+    make_cell(column: 17, row: row)
+    make_cell(column: 18, row: row)
+    make_cell(column: 19, row: row)
+    make_cell(column: 20, row: row)
+    make_cell(column: 21, row: row)
+    make_cell(column: 22, row: row)
+    make_cell(column: 23, row: row)
+    make_cell(column: 24, row: row)
+    make_cell(column: 25, row: row)
+    make_cell(column: 26, row: row)
+} }
 FUNCTION default_formula(column, row) {
     column == 1 |> WHEN {
-        True => row |> WHEN {
-            1 => TEXT { 5 }
-            2 => TEXT { 10 }
-            3 => TEXT { 15 }
-            __ => Text/empty()
-        }
-        __ => column == 2 |> WHEN {
-            True => row == 1 |> WHEN {
-                True => TEXT { =add(A1, A2) }
-                __ => Text/empty()
-            }
-            __ => column == 3 |> WHEN {
-                True => row == 1 |> WHEN {
-                    True => TEXT { =sum(A1:A3) }
-                    __ => Text/empty()
-                }
-                __ => Text/empty()
-            }
-        }
+        True => row |> WHEN { 1 => TEXT { 5 } 2 => TEXT { 10 } 3 => TEXT { 15 } __ => Text/empty() }
+        __ => column == 2 |> WHEN { True => row == 1 |> WHEN { True => TEXT { =add(A1, A2) } __ => Text/empty() } __ => column == 3 |> WHEN { True => row == 1 |> WHEN { True => TEXT { =sum(A1:A3) } __ => Text/empty() } __ => Text/empty() } }
+    }
+}
+FUNCTION edit_started_in_row(row_cells) { row_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest() }
+FUNCTION edit_changed_in_row(row_cells) { row_cells |> List/map(cell, new: cell.cell_elements.editing.event.change |> THEN { [text: cell.cell_elements.editing.event.change.text] }) |> List/latest() }
+FUNCTION enter_pressed_in_row(row_cells) { row_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest() }
+FUNCTION edit_cancelled_in_row(row_cells) {
+    row_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Escape => True __ => SKIP }) |> List/latest()
+}
+FUNCTION is_editing_cell(cell) {
+    editing_cell.row == cell.row |> WHEN {
+        True => editing_cell.column == cell.column
+        __ => False
+    }
+}
+FUNCTION column_header(column_index) { column_index |> WHEN {
+    1 => TEXT { A }
+    2 => TEXT { B }
+    3 => TEXT { C }
+    4 => TEXT { D }
+    5 => TEXT { E }
+    6 => TEXT { F }
+    7 => TEXT { G }
+    8 => TEXT { H }
+    9 => TEXT { I }
+    10 => TEXT { J }
+    11 => TEXT { K }
+    12 => TEXT { L }
+    13 => TEXT { M }
+    14 => TEXT { N }
+    15 => TEXT { O }
+    16 => TEXT { P }
+    17 => TEXT { Q }
+    18 => TEXT { R }
+    19 => TEXT { S }
+    20 => TEXT { T }
+    21 => TEXT { U }
+    22 => TEXT { V }
+    23 => TEXT { W }
+    24 => TEXT { X }
+    25 => TEXT { Y }
+    26 => TEXT { Z }
+    __ => TEXT { ? } } }
+
+row_1_cells: make_row_cells(row: 1)
+row_2_cells: make_row_cells(row: 2)
+row_3_cells: make_row_cells(row: 3)
+row_4_cells: make_row_cells(row: 4)
+row_5_cells: make_row_cells(row: 5)
+row_6_cells: make_row_cells(row: 6)
+row_7_cells: make_row_cells(row: 7)
+row_8_cells: make_row_cells(row: 8)
+row_9_cells: make_row_cells(row: 9)
+row_10_cells: make_row_cells(row: 10)
+row_11_cells: make_row_cells(row: 11)
+row_12_cells: make_row_cells(row: 12)
+row_13_cells: make_row_cells(row: 13)
+row_14_cells: make_row_cells(row: 14)
+row_15_cells: make_row_cells(row: 15)
+row_16_cells: make_row_cells(row: 16)
+row_17_cells: make_row_cells(row: 17)
+row_18_cells: make_row_cells(row: 18)
+row_19_cells: make_row_cells(row: 19)
+row_20_cells: make_row_cells(row: 20)
+row_21_cells: make_row_cells(row: 21)
+row_22_cells: make_row_cells(row: 22)
+row_23_cells: make_row_cells(row: 23)
+row_24_cells: make_row_cells(row: 24)
+row_25_cells: make_row_cells(row: 25)
+row_26_cells: make_row_cells(row: 26)
+row_27_cells: make_row_cells(row: 27)
+row_28_cells: make_row_cells(row: 28)
+row_29_cells: make_row_cells(row: 29)
+row_30_cells: make_row_cells(row: 30)
+row_31_cells: make_row_cells(row: 31)
+row_32_cells: make_row_cells(row: 32)
+row_33_cells: make_row_cells(row: 33)
+row_34_cells: make_row_cells(row: 34)
+row_35_cells: make_row_cells(row: 35)
+row_36_cells: make_row_cells(row: 36)
+row_37_cells: make_row_cells(row: 37)
+row_38_cells: make_row_cells(row: 38)
+row_39_cells: make_row_cells(row: 39)
+row_40_cells: make_row_cells(row: 40)
+row_41_cells: make_row_cells(row: 41)
+row_42_cells: make_row_cells(row: 42)
+row_43_cells: make_row_cells(row: 43)
+row_44_cells: make_row_cells(row: 44)
+row_45_cells: make_row_cells(row: 45)
+row_46_cells: make_row_cells(row: 46)
+row_47_cells: make_row_cells(row: 47)
+row_48_cells: make_row_cells(row: 48)
+row_49_cells: make_row_cells(row: 49)
+row_50_cells: make_row_cells(row: 50)
+row_51_cells: make_row_cells(row: 51)
+row_52_cells: make_row_cells(row: 52)
+row_53_cells: make_row_cells(row: 53)
+row_54_cells: make_row_cells(row: 54)
+row_55_cells: make_row_cells(row: 55)
+row_56_cells: make_row_cells(row: 56)
+row_57_cells: make_row_cells(row: 57)
+row_58_cells: make_row_cells(row: 58)
+row_59_cells: make_row_cells(row: 59)
+row_60_cells: make_row_cells(row: 60)
+row_61_cells: make_row_cells(row: 61)
+row_62_cells: make_row_cells(row: 62)
+row_63_cells: make_row_cells(row: 63)
+row_64_cells: make_row_cells(row: 64)
+row_65_cells: make_row_cells(row: 65)
+row_66_cells: make_row_cells(row: 66)
+row_67_cells: make_row_cells(row: 67)
+row_68_cells: make_row_cells(row: 68)
+row_69_cells: make_row_cells(row: 69)
+row_70_cells: make_row_cells(row: 70)
+row_71_cells: make_row_cells(row: 71)
+row_72_cells: make_row_cells(row: 72)
+row_73_cells: make_row_cells(row: 73)
+row_74_cells: make_row_cells(row: 74)
+row_75_cells: make_row_cells(row: 75)
+row_76_cells: make_row_cells(row: 76)
+row_77_cells: make_row_cells(row: 77)
+row_78_cells: make_row_cells(row: 78)
+row_79_cells: make_row_cells(row: 79)
+row_80_cells: make_row_cells(row: 80)
+row_81_cells: make_row_cells(row: 81)
+row_82_cells: make_row_cells(row: 82)
+row_83_cells: make_row_cells(row: 83)
+row_84_cells: make_row_cells(row: 84)
+row_85_cells: make_row_cells(row: 85)
+row_86_cells: make_row_cells(row: 86)
+row_87_cells: make_row_cells(row: 87)
+row_88_cells: make_row_cells(row: 88)
+row_89_cells: make_row_cells(row: 89)
+row_90_cells: make_row_cells(row: 90)
+row_91_cells: make_row_cells(row: 91)
+row_92_cells: make_row_cells(row: 92)
+row_93_cells: make_row_cells(row: 93)
+row_94_cells: make_row_cells(row: 94)
+row_95_cells: make_row_cells(row: 95)
+row_96_cells: make_row_cells(row: 96)
+row_97_cells: make_row_cells(row: 97)
+row_98_cells: make_row_cells(row: 98)
+row_99_cells: make_row_cells(row: 99)
+row_100_cells: make_row_cells(row: 100)
+edit_started: LATEST {
+    row_1_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_2_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_3_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_4_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_5_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_6_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_7_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_8_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_9_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_10_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_11_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_12_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_13_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_14_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_15_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_16_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_17_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_18_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_19_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_20_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_21_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_22_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_23_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_24_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_25_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_26_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_27_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_28_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_29_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_30_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_31_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_32_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_33_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_34_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_35_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_36_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_37_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_38_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_39_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_40_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_41_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_42_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_43_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_44_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_45_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_46_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_47_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_48_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_49_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_50_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_51_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_52_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_53_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_54_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_55_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_56_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_57_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_58_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_59_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_60_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_61_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_62_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_63_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_64_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_65_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_66_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_67_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_68_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_69_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_70_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_71_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_72_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_73_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_74_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_75_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_76_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_77_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_78_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_79_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_80_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_81_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_82_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_83_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_84_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_85_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_86_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_87_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_88_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_89_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_90_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_91_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_92_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_93_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_94_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_95_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_96_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_97_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_98_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_99_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+    row_100_cells |> List/map(cell, new: cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] }) |> List/latest()
+}
+
+edit_changed: LATEST {
+    edit_changed_in_row(row_cells: row_1_cells)
+    edit_changed_in_row(row_cells: row_2_cells)
+    edit_changed_in_row(row_cells: row_3_cells)
+    edit_changed_in_row(row_cells: row_4_cells)
+    edit_changed_in_row(row_cells: row_5_cells)
+    edit_changed_in_row(row_cells: row_6_cells)
+    edit_changed_in_row(row_cells: row_7_cells)
+    edit_changed_in_row(row_cells: row_8_cells)
+    edit_changed_in_row(row_cells: row_9_cells)
+    edit_changed_in_row(row_cells: row_10_cells)
+    edit_changed_in_row(row_cells: row_11_cells)
+    edit_changed_in_row(row_cells: row_12_cells)
+    edit_changed_in_row(row_cells: row_13_cells)
+    edit_changed_in_row(row_cells: row_14_cells)
+    edit_changed_in_row(row_cells: row_15_cells)
+    edit_changed_in_row(row_cells: row_16_cells)
+    edit_changed_in_row(row_cells: row_17_cells)
+    edit_changed_in_row(row_cells: row_18_cells)
+    edit_changed_in_row(row_cells: row_19_cells)
+    edit_changed_in_row(row_cells: row_20_cells)
+    edit_changed_in_row(row_cells: row_21_cells)
+    edit_changed_in_row(row_cells: row_22_cells)
+    edit_changed_in_row(row_cells: row_23_cells)
+    edit_changed_in_row(row_cells: row_24_cells)
+    edit_changed_in_row(row_cells: row_25_cells)
+    edit_changed_in_row(row_cells: row_26_cells)
+    edit_changed_in_row(row_cells: row_27_cells)
+    edit_changed_in_row(row_cells: row_28_cells)
+    edit_changed_in_row(row_cells: row_29_cells)
+    edit_changed_in_row(row_cells: row_30_cells)
+    edit_changed_in_row(row_cells: row_31_cells)
+    edit_changed_in_row(row_cells: row_32_cells)
+    edit_changed_in_row(row_cells: row_33_cells)
+    edit_changed_in_row(row_cells: row_34_cells)
+    edit_changed_in_row(row_cells: row_35_cells)
+    edit_changed_in_row(row_cells: row_36_cells)
+    edit_changed_in_row(row_cells: row_37_cells)
+    edit_changed_in_row(row_cells: row_38_cells)
+    edit_changed_in_row(row_cells: row_39_cells)
+    edit_changed_in_row(row_cells: row_40_cells)
+    edit_changed_in_row(row_cells: row_41_cells)
+    edit_changed_in_row(row_cells: row_42_cells)
+    edit_changed_in_row(row_cells: row_43_cells)
+    edit_changed_in_row(row_cells: row_44_cells)
+    edit_changed_in_row(row_cells: row_45_cells)
+    edit_changed_in_row(row_cells: row_46_cells)
+    edit_changed_in_row(row_cells: row_47_cells)
+    edit_changed_in_row(row_cells: row_48_cells)
+    edit_changed_in_row(row_cells: row_49_cells)
+    edit_changed_in_row(row_cells: row_50_cells)
+    edit_changed_in_row(row_cells: row_51_cells)
+    edit_changed_in_row(row_cells: row_52_cells)
+    edit_changed_in_row(row_cells: row_53_cells)
+    edit_changed_in_row(row_cells: row_54_cells)
+    edit_changed_in_row(row_cells: row_55_cells)
+    edit_changed_in_row(row_cells: row_56_cells)
+    edit_changed_in_row(row_cells: row_57_cells)
+    edit_changed_in_row(row_cells: row_58_cells)
+    edit_changed_in_row(row_cells: row_59_cells)
+    edit_changed_in_row(row_cells: row_60_cells)
+    edit_changed_in_row(row_cells: row_61_cells)
+    edit_changed_in_row(row_cells: row_62_cells)
+    edit_changed_in_row(row_cells: row_63_cells)
+    edit_changed_in_row(row_cells: row_64_cells)
+    edit_changed_in_row(row_cells: row_65_cells)
+    edit_changed_in_row(row_cells: row_66_cells)
+    edit_changed_in_row(row_cells: row_67_cells)
+    edit_changed_in_row(row_cells: row_68_cells)
+    edit_changed_in_row(row_cells: row_69_cells)
+    edit_changed_in_row(row_cells: row_70_cells)
+    edit_changed_in_row(row_cells: row_71_cells)
+    edit_changed_in_row(row_cells: row_72_cells)
+    edit_changed_in_row(row_cells: row_73_cells)
+    edit_changed_in_row(row_cells: row_74_cells)
+    edit_changed_in_row(row_cells: row_75_cells)
+    edit_changed_in_row(row_cells: row_76_cells)
+    edit_changed_in_row(row_cells: row_77_cells)
+    edit_changed_in_row(row_cells: row_78_cells)
+    edit_changed_in_row(row_cells: row_79_cells)
+    edit_changed_in_row(row_cells: row_80_cells)
+    edit_changed_in_row(row_cells: row_81_cells)
+    edit_changed_in_row(row_cells: row_82_cells)
+    edit_changed_in_row(row_cells: row_83_cells)
+    edit_changed_in_row(row_cells: row_84_cells)
+    edit_changed_in_row(row_cells: row_85_cells)
+    edit_changed_in_row(row_cells: row_86_cells)
+    edit_changed_in_row(row_cells: row_87_cells)
+    edit_changed_in_row(row_cells: row_88_cells)
+    edit_changed_in_row(row_cells: row_89_cells)
+    edit_changed_in_row(row_cells: row_90_cells)
+    edit_changed_in_row(row_cells: row_91_cells)
+    edit_changed_in_row(row_cells: row_92_cells)
+    edit_changed_in_row(row_cells: row_93_cells)
+    edit_changed_in_row(row_cells: row_94_cells)
+    edit_changed_in_row(row_cells: row_95_cells)
+    edit_changed_in_row(row_cells: row_96_cells)
+    edit_changed_in_row(row_cells: row_97_cells)
+    edit_changed_in_row(row_cells: row_98_cells)
+    edit_changed_in_row(row_cells: row_99_cells)
+    edit_changed_in_row(row_cells: row_100_cells)
+}
+
+editing_text: TEXT {  } |> HOLD state {
+    LATEST {
+        edit_started |> THEN { TEXT {  } }
+        edit_changed |> THEN { edit_changed.text }
+        edit_committed |> THEN { TEXT {  } }
+        edit_cancelled |> THEN { TEXT {  } }
     }
 }
 
-FUNCTION make_row_cells(row, all_cells) {
-    List/range(from: 1, to: 10) |> List/map(old, new:
-        new_cell(
-            initial_formula: default_formula(column: old, row: row)
-            all_cells: all_cells
-        )
-    )
+enter_pressed: LATEST {
+    row_1_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_2_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_3_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_4_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_5_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_6_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_7_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_8_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_9_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_10_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_11_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_12_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_13_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_14_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_15_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_16_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_17_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_18_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_19_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_20_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_21_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_22_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_23_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_24_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_25_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_26_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_27_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_28_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_29_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_30_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_31_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_32_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_33_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_34_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_35_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_36_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_37_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_38_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_39_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_40_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_41_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_42_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_43_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_44_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_45_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_46_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_47_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_48_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_49_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_50_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_51_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_52_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_53_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_54_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_55_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_56_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_57_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_58_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_59_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_60_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_61_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_62_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_63_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_64_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_65_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_66_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_67_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_68_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_69_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_70_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_71_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_72_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_73_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_74_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_75_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_76_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_77_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_78_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_79_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_80_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_81_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_82_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_83_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_84_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_85_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_86_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_87_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_88_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_89_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_90_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_91_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_92_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_93_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_94_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_95_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_96_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_97_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_98_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_99_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
+    row_100_cells |> List/map(cell, new: cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP }) |> List/latest()
 }
 
--- ─── Store ────────────────────────────────────────────────────────
+edit_committed: enter_pressed |> THEN { [row: enter_pressed.row, column: enter_pressed.column, text: enter_pressed.text] }
 
-cells: List/range(from: 1, to: 10) |> List/map(old, new:
-    make_row_cells(row: old, all_cells: cells)
-)
 
--- ─── Grid Rendering ───────────────────────────────────────────────
-
+edit_cancelled: LATEST {
+    edit_cancelled_in_row(row_cells: row_1_cells)
+    edit_cancelled_in_row(row_cells: row_2_cells)
+    edit_cancelled_in_row(row_cells: row_3_cells)
+    edit_cancelled_in_row(row_cells: row_4_cells)
+    edit_cancelled_in_row(row_cells: row_5_cells)
+    edit_cancelled_in_row(row_cells: row_6_cells)
+    edit_cancelled_in_row(row_cells: row_7_cells)
+    edit_cancelled_in_row(row_cells: row_8_cells)
+    edit_cancelled_in_row(row_cells: row_9_cells)
+    edit_cancelled_in_row(row_cells: row_10_cells)
+    edit_cancelled_in_row(row_cells: row_11_cells)
+    edit_cancelled_in_row(row_cells: row_12_cells)
+    edit_cancelled_in_row(row_cells: row_13_cells)
+    edit_cancelled_in_row(row_cells: row_14_cells)
+    edit_cancelled_in_row(row_cells: row_15_cells)
+    edit_cancelled_in_row(row_cells: row_16_cells)
+    edit_cancelled_in_row(row_cells: row_17_cells)
+    edit_cancelled_in_row(row_cells: row_18_cells)
+    edit_cancelled_in_row(row_cells: row_19_cells)
+    edit_cancelled_in_row(row_cells: row_20_cells)
+    edit_cancelled_in_row(row_cells: row_21_cells)
+    edit_cancelled_in_row(row_cells: row_22_cells)
+    edit_cancelled_in_row(row_cells: row_23_cells)
+    edit_cancelled_in_row(row_cells: row_24_cells)
+    edit_cancelled_in_row(row_cells: row_25_cells)
+    edit_cancelled_in_row(row_cells: row_26_cells)
+    edit_cancelled_in_row(row_cells: row_27_cells)
+    edit_cancelled_in_row(row_cells: row_28_cells)
+    edit_cancelled_in_row(row_cells: row_29_cells)
+    edit_cancelled_in_row(row_cells: row_30_cells)
+    edit_cancelled_in_row(row_cells: row_31_cells)
+    edit_cancelled_in_row(row_cells: row_32_cells)
+    edit_cancelled_in_row(row_cells: row_33_cells)
+    edit_cancelled_in_row(row_cells: row_34_cells)
+    edit_cancelled_in_row(row_cells: row_35_cells)
+    edit_cancelled_in_row(row_cells: row_36_cells)
+    edit_cancelled_in_row(row_cells: row_37_cells)
+    edit_cancelled_in_row(row_cells: row_38_cells)
+    edit_cancelled_in_row(row_cells: row_39_cells)
+    edit_cancelled_in_row(row_cells: row_40_cells)
+    edit_cancelled_in_row(row_cells: row_41_cells)
+    edit_cancelled_in_row(row_cells: row_42_cells)
+    edit_cancelled_in_row(row_cells: row_43_cells)
+    edit_cancelled_in_row(row_cells: row_44_cells)
+    edit_cancelled_in_row(row_cells: row_45_cells)
+    edit_cancelled_in_row(row_cells: row_46_cells)
+    edit_cancelled_in_row(row_cells: row_47_cells)
+    edit_cancelled_in_row(row_cells: row_48_cells)
+    edit_cancelled_in_row(row_cells: row_49_cells)
+    edit_cancelled_in_row(row_cells: row_50_cells)
+    edit_cancelled_in_row(row_cells: row_51_cells)
+    edit_cancelled_in_row(row_cells: row_52_cells)
+    edit_cancelled_in_row(row_cells: row_53_cells)
+    edit_cancelled_in_row(row_cells: row_54_cells)
+    edit_cancelled_in_row(row_cells: row_55_cells)
+    edit_cancelled_in_row(row_cells: row_56_cells)
+    edit_cancelled_in_row(row_cells: row_57_cells)
+    edit_cancelled_in_row(row_cells: row_58_cells)
+    edit_cancelled_in_row(row_cells: row_59_cells)
+    edit_cancelled_in_row(row_cells: row_60_cells)
+    edit_cancelled_in_row(row_cells: row_61_cells)
+    edit_cancelled_in_row(row_cells: row_62_cells)
+    edit_cancelled_in_row(row_cells: row_63_cells)
+    edit_cancelled_in_row(row_cells: row_64_cells)
+    edit_cancelled_in_row(row_cells: row_65_cells)
+    edit_cancelled_in_row(row_cells: row_66_cells)
+    edit_cancelled_in_row(row_cells: row_67_cells)
+    edit_cancelled_in_row(row_cells: row_68_cells)
+    edit_cancelled_in_row(row_cells: row_69_cells)
+    edit_cancelled_in_row(row_cells: row_70_cells)
+    edit_cancelled_in_row(row_cells: row_71_cells)
+    edit_cancelled_in_row(row_cells: row_72_cells)
+    edit_cancelled_in_row(row_cells: row_73_cells)
+    edit_cancelled_in_row(row_cells: row_74_cells)
+    edit_cancelled_in_row(row_cells: row_75_cells)
+    edit_cancelled_in_row(row_cells: row_76_cells)
+    edit_cancelled_in_row(row_cells: row_77_cells)
+    edit_cancelled_in_row(row_cells: row_78_cells)
+    edit_cancelled_in_row(row_cells: row_79_cells)
+    edit_cancelled_in_row(row_cells: row_80_cells)
+    edit_cancelled_in_row(row_cells: row_81_cells)
+    edit_cancelled_in_row(row_cells: row_82_cells)
+    edit_cancelled_in_row(row_cells: row_83_cells)
+    edit_cancelled_in_row(row_cells: row_84_cells)
+    edit_cancelled_in_row(row_cells: row_85_cells)
+    edit_cancelled_in_row(row_cells: row_86_cells)
+    edit_cancelled_in_row(row_cells: row_87_cells)
+    edit_cancelled_in_row(row_cells: row_88_cells)
+    edit_cancelled_in_row(row_cells: row_89_cells)
+    edit_cancelled_in_row(row_cells: row_90_cells)
+    edit_cancelled_in_row(row_cells: row_91_cells)
+    edit_cancelled_in_row(row_cells: row_92_cells)
+    edit_cancelled_in_row(row_cells: row_93_cells)
+    edit_cancelled_in_row(row_cells: row_94_cells)
+    edit_cancelled_in_row(row_cells: row_95_cells)
+    edit_cancelled_in_row(row_cells: row_96_cells)
+    edit_cancelled_in_row(row_cells: row_97_cells)
+    edit_cancelled_in_row(row_cells: row_98_cells)
+    edit_cancelled_in_row(row_cells: row_99_cells)
+    edit_cancelled_in_row(row_cells: row_100_cells)
+    row_1_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_2_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_3_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_4_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_5_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_6_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_7_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_8_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_9_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_10_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_11_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_12_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_13_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_14_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_15_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_16_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_17_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_18_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_19_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_20_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_21_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_22_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_23_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_24_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_25_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_26_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_27_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_28_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_29_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_30_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_31_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_32_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_33_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_34_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_35_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_36_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_37_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_38_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_39_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_40_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_41_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_42_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_43_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_44_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_45_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_46_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_47_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_48_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_49_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_50_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_51_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_52_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_53_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_54_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_55_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_56_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_57_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_58_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_59_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_60_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_61_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_62_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_63_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_64_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_65_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_66_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_67_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_68_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_69_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_70_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_71_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_72_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_73_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_74_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_75_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_76_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_77_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_78_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_79_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_80_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_81_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_82_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_83_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_84_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_85_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_86_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_87_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_88_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_89_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_90_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_91_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_92_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_93_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_94_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_95_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_96_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_97_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_98_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_99_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+    row_100_cells |> List/map(cell, new: cell.cell_elements.editing.event.blur |> THEN { True }) |> List/latest()
+}
+editing_cell: [row: 0, column: 0] |> HOLD state {
+    LATEST {
+        edit_started
+        edit_committed |> THEN { [row: 0, column: 0] }
+        edit_cancelled |> THEN { [row: 0, column: 0] }
+    }
+}
+overrides: LIST { } |> HOLD state {
+    edit_committed |> THEN { state |> List/append(item: [row: edit_committed.row, column: edit_committed.column, text: edit_committed.text]) }
+}
 FUNCTION make_cell_element(cell) {
-    cell.is_editing |> WHILE {
-        True => Element/text_input(
-            element: [event: [change: LINK, key_down: LINK, blur: LINK]]
-            style: [width: 80]
-            label: Hidden[text: TEXT { cell }]
-            text: cell.editing_text
-            placeholder: [text: Text/empty()]
-            focus: True
-        ) |> LINK { cell.cell_elements.editing }
-
-        False => Element/label(
-            element: [event: [double_click: LINK]]
-            style: [width: 80, height: 22]
-            label: cell.formula |> Text/is_empty() |> WHILE {
-                True => TEXT { . }
-                __ => TEXT { {cell.value} }
-            }
-        ) |> LINK { cell.cell_elements.display }
-    }
-}
-
-FUNCTION num_to_column(column_index) {
-    column_index + 64 |> Text/from_char_code()
-}
-
-FUNCTION make_row(row_index) {
     BLOCK {
-        row: cells |> List/get(index: row_index)
-        Element/stripe(
-            element: [], direction: Row, gap: 0, style: []
-            items: LIST {
-                Element/label(
-                    element: [], style: [width: 40, height: 22]
-                    label: TEXT { {row_index} }
-                )
-                Element/stripe(
-                    element: [], direction: Row, gap: 0, style: []
-                    items: row |> List/map(old, new:
-                        make_cell_element(cell: old)
-                    )
-                )
-            }
-        )
+        formula_text: cell_formula(column: cell.column, row: cell.row)
+        display_value: compute_value(formula_text: formula_text)
+        is_editing: is_editing_cell(cell: cell)
+        input_text: editing_text |> Text/is_empty() |> WHEN { True => formula_text __ => editing_text }
+        is_editing |> WHILE {
+            True => Element/text_input(element: [event: [change: LINK, key_down: LINK, blur: LINK]] style: [width: 80] label: Hidden[text: TEXT { cell }] text: input_text placeholder: [text: Text/empty()] focus: True) |> LINK { cell.cell_elements.editing }
+            False => Element/label(element: [event: [double_click: LINK]] style: [width: 80, height: 22] label: formula_text |> Text/is_empty() |> WHILE { True => TEXT { . } __ => TEXT { {display_value} } }) |> LINK { cell.cell_elements.display }
+        }
     }
 }
+FUNCTION make_row_elements(row_cells) {
+    row_cells |> List/map(cell, new: make_cell_element(cell: cell))
+}
+FUNCTION make_row(row_number, row_cells) {
+    Element/stripe(element: [], direction: Row, gap: 0, style: [], items: LIST {
+        Element/label(element: [], style: [width: 40, height: 22], label: TEXT { {row_number} })
+        Element/stripe(element: [], direction: Row, gap: 0, style: [], items: make_row_elements(row_cells: row_cells))
+    })
+}
 
--- ─── Document ─────────────────────────────────────────────────────
+FUNCTION make_row_data(row_number, row_cells) { [row: row_number cells: row_cells] }
 
-document: Document/new(root:
-    Element/stripe(
-        element: [], direction: Column, gap: 0
-        style: [padding: 20]
-        items: LIST {
-            Element/label(
-                element: []
-                style: [font: [size: 22, weight: Bold]]
-                label: TEXT { Cells }
-            )
-            Element/stripe(
-                element: [], direction: Row, gap: 0, style: []
-                items: LIST {
-                    Element/label(element: [], style: [width: 40], label: TEXT {  })
-                    Element/stripe(
-                        element: [], direction: Row, gap: 0, style: []
-                        items: List/range(from: 1, to: 10) |> List/map(old, new:
-                            Element/label(
-                                element: []
-                                style: [width: 80]
-                                label: num_to_column(column_index: old)
-                            )
-                        )
-                    )
-                }
-            )
-            Element/stripe(
-                element: [], direction: Column, gap: 0
-                style: [scrollbars: True, height: 500]
-                items: List/range(from: 1, to: 10) |> List/map(old, new:
-                    make_row(row_index: old)
-                )
-            )
-        }
-    )
-)
+all_row_cells: LIST {
+    make_row_data(row_number: 1, row_cells: row_1_cells)
+    make_row_data(row_number: 2, row_cells: row_2_cells)
+    make_row_data(row_number: 3, row_cells: row_3_cells)
+    make_row_data(row_number: 4, row_cells: row_4_cells)
+    make_row_data(row_number: 5, row_cells: row_5_cells)
+    make_row_data(row_number: 6, row_cells: row_6_cells)
+    make_row_data(row_number: 7, row_cells: row_7_cells)
+    make_row_data(row_number: 8, row_cells: row_8_cells)
+    make_row_data(row_number: 9, row_cells: row_9_cells)
+    make_row_data(row_number: 10, row_cells: row_10_cells)
+    make_row_data(row_number: 11, row_cells: row_11_cells)
+    make_row_data(row_number: 12, row_cells: row_12_cells)
+    make_row_data(row_number: 13, row_cells: row_13_cells)
+    make_row_data(row_number: 14, row_cells: row_14_cells)
+    make_row_data(row_number: 15, row_cells: row_15_cells)
+    make_row_data(row_number: 16, row_cells: row_16_cells)
+    make_row_data(row_number: 17, row_cells: row_17_cells)
+    make_row_data(row_number: 18, row_cells: row_18_cells)
+    make_row_data(row_number: 19, row_cells: row_19_cells)
+    make_row_data(row_number: 20, row_cells: row_20_cells)
+    make_row_data(row_number: 21, row_cells: row_21_cells)
+    make_row_data(row_number: 22, row_cells: row_22_cells)
+    make_row_data(row_number: 23, row_cells: row_23_cells)
+    make_row_data(row_number: 24, row_cells: row_24_cells)
+    make_row_data(row_number: 25, row_cells: row_25_cells)
+    make_row_data(row_number: 26, row_cells: row_26_cells)
+    make_row_data(row_number: 27, row_cells: row_27_cells)
+    make_row_data(row_number: 28, row_cells: row_28_cells)
+    make_row_data(row_number: 29, row_cells: row_29_cells)
+    make_row_data(row_number: 30, row_cells: row_30_cells)
+    make_row_data(row_number: 31, row_cells: row_31_cells)
+    make_row_data(row_number: 32, row_cells: row_32_cells)
+    make_row_data(row_number: 33, row_cells: row_33_cells)
+    make_row_data(row_number: 34, row_cells: row_34_cells)
+    make_row_data(row_number: 35, row_cells: row_35_cells)
+    make_row_data(row_number: 36, row_cells: row_36_cells)
+    make_row_data(row_number: 37, row_cells: row_37_cells)
+    make_row_data(row_number: 38, row_cells: row_38_cells)
+    make_row_data(row_number: 39, row_cells: row_39_cells)
+    make_row_data(row_number: 40, row_cells: row_40_cells)
+    make_row_data(row_number: 41, row_cells: row_41_cells)
+    make_row_data(row_number: 42, row_cells: row_42_cells)
+    make_row_data(row_number: 43, row_cells: row_43_cells)
+    make_row_data(row_number: 44, row_cells: row_44_cells)
+    make_row_data(row_number: 45, row_cells: row_45_cells)
+    make_row_data(row_number: 46, row_cells: row_46_cells)
+    make_row_data(row_number: 47, row_cells: row_47_cells)
+    make_row_data(row_number: 48, row_cells: row_48_cells)
+    make_row_data(row_number: 49, row_cells: row_49_cells)
+    make_row_data(row_number: 50, row_cells: row_50_cells)
+    make_row_data(row_number: 51, row_cells: row_51_cells)
+    make_row_data(row_number: 52, row_cells: row_52_cells)
+    make_row_data(row_number: 53, row_cells: row_53_cells)
+    make_row_data(row_number: 54, row_cells: row_54_cells)
+    make_row_data(row_number: 55, row_cells: row_55_cells)
+    make_row_data(row_number: 56, row_cells: row_56_cells)
+    make_row_data(row_number: 57, row_cells: row_57_cells)
+    make_row_data(row_number: 58, row_cells: row_58_cells)
+    make_row_data(row_number: 59, row_cells: row_59_cells)
+    make_row_data(row_number: 60, row_cells: row_60_cells)
+    make_row_data(row_number: 61, row_cells: row_61_cells)
+    make_row_data(row_number: 62, row_cells: row_62_cells)
+    make_row_data(row_number: 63, row_cells: row_63_cells)
+    make_row_data(row_number: 64, row_cells: row_64_cells)
+    make_row_data(row_number: 65, row_cells: row_65_cells)
+    make_row_data(row_number: 66, row_cells: row_66_cells)
+    make_row_data(row_number: 67, row_cells: row_67_cells)
+    make_row_data(row_number: 68, row_cells: row_68_cells)
+    make_row_data(row_number: 69, row_cells: row_69_cells)
+    make_row_data(row_number: 70, row_cells: row_70_cells)
+    make_row_data(row_number: 71, row_cells: row_71_cells)
+    make_row_data(row_number: 72, row_cells: row_72_cells)
+    make_row_data(row_number: 73, row_cells: row_73_cells)
+    make_row_data(row_number: 74, row_cells: row_74_cells)
+    make_row_data(row_number: 75, row_cells: row_75_cells)
+    make_row_data(row_number: 76, row_cells: row_76_cells)
+    make_row_data(row_number: 77, row_cells: row_77_cells)
+    make_row_data(row_number: 78, row_cells: row_78_cells)
+    make_row_data(row_number: 79, row_cells: row_79_cells)
+    make_row_data(row_number: 80, row_cells: row_80_cells)
+    make_row_data(row_number: 81, row_cells: row_81_cells)
+    make_row_data(row_number: 82, row_cells: row_82_cells)
+    make_row_data(row_number: 83, row_cells: row_83_cells)
+    make_row_data(row_number: 84, row_cells: row_84_cells)
+    make_row_data(row_number: 85, row_cells: row_85_cells)
+    make_row_data(row_number: 86, row_cells: row_86_cells)
+    make_row_data(row_number: 87, row_cells: row_87_cells)
+    make_row_data(row_number: 88, row_cells: row_88_cells)
+    make_row_data(row_number: 89, row_cells: row_89_cells)
+    make_row_data(row_number: 90, row_cells: row_90_cells)
+    make_row_data(row_number: 91, row_cells: row_91_cells)
+    make_row_data(row_number: 92, row_cells: row_92_cells)
+    make_row_data(row_number: 93, row_cells: row_93_cells)
+    make_row_data(row_number: 94, row_cells: row_94_cells)
+    make_row_data(row_number: 95, row_cells: row_95_cells)
+    make_row_data(row_number: 96, row_cells: row_96_cells)
+    make_row_data(row_number: 97, row_cells: row_97_cells)
+    make_row_data(row_number: 98, row_cells: row_98_cells)
+    make_row_data(row_number: 99, row_cells: row_99_cells)
+    make_row_data(row_number: 100, row_cells: row_100_cells)
+}
+
+document: Document/new(root: Element/stripe(element: [], direction: Column, gap: 0 style: [padding: 20] items: LIST { Element/label(element: [], style: [font: [size: 22, weight: Bold]], label: TEXT { Cells }) Element/stripe(element: [], direction: Row, gap: 0, style: [], items: LIST { Element/label(element: [], style: [width: 40], label: TEXT {  }) Element/stripe(element: [], direction: Row, gap: 0, style: [], items: List/range(from: 1, to: 26) |> List/map(column, new: Element/label(element: [], style: [width: 80], label: column_header(column_index: column))) ) }) Element/stripe(element: [], direction: Column, gap: 0 style: [scrollbars: True, height: 500] items: all_row_cells |> List/map(row_data, new: make_row(row_number: row_data.row, row_cells: row_data.cells)) ) }) )

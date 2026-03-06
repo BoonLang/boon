@@ -71,6 +71,8 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
   buildDecorations(view: EditorView) {
     const builder = new RangeSetBuilder<Decoration>()
     const {from, to} = view.viewport
+    const doc = view.state.doc
+    const docText = doc.toString()
     let expectFunctionName = false
     let pendingDefinition: {from: number, to: number} | null = null
     let pendingFunctionCall: {from: number, to: number} | null = null
@@ -87,7 +89,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
           return
         }
 
-        const text = view.state.doc.sliceString(node.from, node.to)
+        const text = doc.sliceString(node.from, node.to)
 
         if (node.name === "Keyword") {
           expectFunctionName = text === "FUNCTION"
@@ -96,8 +98,9 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 
           // Handle TEXT { content } or TEXT #{ content } literals with hash escaping
           if (text === "TEXT") {
-            // Look ahead for optional hashes and opening brace
-            const docText = view.state.doc.toString()
+            // Look ahead for optional hashes and opening brace. Reuse the
+            // document string for the whole decoration pass so large files do
+            // not repeatedly materialize the full editor buffer.
             let pos = node.to
             // Skip whitespace
             while (pos < docText.length && /\s/.test(docText[pos])) {
@@ -189,7 +192,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
         }
 
         if (node.name === "SnakeCase") {
-          const before = node.from > 0 ? view.state.doc.sliceString(node.from - 1, node.from) : ""
+          const before = node.from > 0 ? doc.sliceString(node.from - 1, node.from) : ""
           if (before === ".") {
             chainIndex += 1
           } else {
@@ -295,7 +298,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
           node.name === "TaggedObject"
         ) {
           if (node.name === "Punctuation") {
-            const punctuationText = view.state.doc.sliceString(node.from, node.to)
+            const punctuationText = doc.sliceString(node.from, node.to)
             if (punctuationText === ".") {
               return
             }

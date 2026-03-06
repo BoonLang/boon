@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use boon_scene::{RenderRootHandle, RenderSurface};
+
 use crate::parser::Span;
 
 // ---------------------------------------------------------------------------
@@ -168,8 +170,13 @@ pub enum IrNode {
         hovered_cell: Option<CellId>,
     },
 
-    /// Document root.
-    Document { root: CellId },
+    /// Render root lowered from Document/new or Scene/new.
+    Document {
+        kind: RenderSurface,
+        root: CellId,
+        lights: Option<CellId>,
+        geometry: Option<CellId>,
+    },
 
     /// TEXT interpolation output cell.
     TextInterpolation {
@@ -182,6 +189,14 @@ pub enum IrNode {
 
     /// Pipe from one cell to another (identity / pass-through).
     PipeThrough { cell: CellId, source: CellId },
+
+    /// Skip the first N emissions from a source stream.
+    StreamSkip {
+        cell: CellId,
+        source: CellId,
+        count: usize,
+        seen_cell: CellId,
+    },
 
     /// FunctionCall that doesn't map to a known built-in — placeholder for
     /// user-defined functions or not-yet-implemented built-ins.
@@ -294,6 +309,20 @@ pub enum IrNode {
     /// Math/round: round number to nearest integer.
     MathRound { cell: CellId, source: CellId },
 
+    /// Math/min: clamp source to at most `b`.
+    MathMin {
+        cell: CellId,
+        source: CellId,
+        b: CellId,
+    },
+
+    /// Math/max: clamp source to at least `b`.
+    MathMax {
+        cell: CellId,
+        source: CellId,
+        b: CellId,
+    },
+
     /// HOLD with object state and Stream/pulses loop.
     /// Computes N iterations at init time, updating per-field cells.
     /// Used for patterns like:
@@ -313,7 +342,7 @@ pub enum IrNode {
     },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LatestArm {
     pub trigger: Option<EventId>,
     pub body: IrExpr,
@@ -425,6 +454,7 @@ pub struct IrProgram {
     pub events: Vec<EventInfo>,
     pub nodes: Vec<IrNode>,
     pub document: Option<CellId>,
+    pub render_surface: Option<RenderSurface>,
     pub functions: Vec<IrFunction>,
     /// Tag string → encoded f64 value mapping.
     /// Tags are encoded as positive f64 values starting at 1.0.
@@ -433,6 +463,34 @@ pub struct IrProgram {
     /// Used by codegen to resolve text from namespace cells (e.g., finding the
     /// "title" field of a todo item for list display).
     pub cell_field_cells: HashMap<CellId, HashMap<String, CellId>>,
+}
+
+impl IrProgram {
+    #[must_use]
+    pub fn render_surface(&self) -> RenderSurface {
+        self.render_surface.unwrap_or(RenderSurface::Document)
+    }
+
+    #[must_use]
+    pub fn render_root(&self) -> Option<RenderRootHandle<CellId>> {
+        self.nodes.iter().find_map(|node| {
+            if let IrNode::Document {
+                kind,
+                root,
+                lights,
+                geometry,
+            } = node
+            {
+                Some(if kind.is_scene() {
+                    RenderRootHandle::scene(*root, *lights, *geometry)
+                } else {
+                    RenderRootHandle::new(*kind, *root)
+                })
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -463,6 +521,7 @@ pub enum EventSource {
 pub struct IrFunction {
     pub name: String,
     pub params: Vec<String>,
+    pub param_cells: Vec<CellId>,
     pub body: IrExpr,
 }
 
@@ -516,13 +575,32 @@ pub fn node_debug_short(node: &IrNode) -> String {
         IrNode::Element { cell, kind, .. } => {
             format!("Element(cell={}, kind={})", cell.0, element_kind_name(kind))
         }
-        IrNode::Document { root } => format!("Document(root={})", root.0),
+        IrNode::Document {
+            kind,
+            root,
+            lights,
+            geometry,
+        } => format!(
+            "{:?}(root={}, lights={:?}, geometry={:?})",
+            kind, root.0, lights, geometry
+        ),
         IrNode::TextInterpolation { cell, parts } => {
             format!("TextInterp(cell={}, parts={})", cell.0, parts.len())
         }
         IrNode::MathSum { cell, input } => format!("MathSum(cell={}, input={})", cell.0, input.0),
         IrNode::PipeThrough { cell, source } => {
             format!("PipeThrough(cell={}, source={})", cell.0, source.0)
+        }
+        IrNode::StreamSkip {
+            cell,
+            source,
+            count,
+            seen_cell,
+        } => {
+            format!(
+                "StreamSkip(cell={}, source={}, count={}, seen={})",
+                cell.0, source.0, count, seen_cell.0
+            )
         }
         IrNode::CustomCall { cell, path, .. } => {
             format!("CustomCall(cell={}, path={:?})", cell.0, path)
@@ -654,6 +732,12 @@ pub fn node_debug_short(node: &IrNode) -> String {
         IrNode::MathRound { cell, source } => {
             format!("MathRound(cell={}, source={})", cell.0, source.0)
         }
+        IrNode::MathMin { cell, source, b } => {
+            format!("MathMin(cell={}, source={}, b={})", cell.0, source.0, b.0)
+        }
+        IrNode::MathMax { cell, source, b } => {
+            format!("MathMax(cell={}, source={}, b={})", cell.0, source.0, b.0)
+        }
         IrNode::HoldLoop {
             cell, field_cells, ..
         } => format!(
@@ -694,5 +778,39 @@ fn element_kind_name(kind: &ElementKind) -> &'static str {
         ElementKind::Select { .. } => "Select",
         ElementKind::Svg { .. } => "Svg",
         ElementKind::SvgCircle { .. } => "SvgCircle",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::{CellId, IrNode, IrProgram};
+    use boon_scene::RenderSurface;
+
+    #[test]
+    fn render_root_preserves_scene_handles() {
+        let program = IrProgram {
+            cells: Vec::new(),
+            events: Vec::new(),
+            nodes: vec![IrNode::Document {
+                kind: RenderSurface::Scene,
+                root: CellId(1),
+                lights: Some(CellId(2)),
+                geometry: Some(CellId(3)),
+            }],
+            document: Some(CellId(1)),
+            render_surface: Some(RenderSurface::Scene),
+            functions: Vec::new(),
+            tag_table: Vec::new(),
+            cell_field_cells: HashMap::new(),
+        };
+
+        let render_root = program.render_root().expect("render root should exist");
+        assert!(render_root.is_scene());
+        assert_eq!(render_root.root.0, 1);
+        let scene = render_root.scene.expect("scene metadata should exist");
+        assert_eq!(scene.lights.expect("lights cell").0, 2);
+        assert_eq!(scene.geometry.expect("geometry cell").0, 3);
     }
 }

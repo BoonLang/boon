@@ -386,6 +386,10 @@ enum ExecAction {
         /// Engine to test against: Actors, DD, or Wasm (default: use current engine)
         #[arg(long)]
         engine: Option<String>,
+
+        /// Skip persistence refresh/re-run checks and only verify live behavior
+        #[arg(long)]
+        skip_persistence: bool,
     },
 
     /// Smoke-run all built-in playground examples from EXAMPLE_DATAS
@@ -1018,6 +1022,7 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             examples_dir,
             no_launch,
             engine,
+            skip_persistence,
         } => {
             use commands::test_examples::{run_tests, TestOptions};
 
@@ -1041,6 +1046,7 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                 examples_dir,
                 no_launch,
                 engine,
+                skip_persistence,
             };
 
             let results = run_tests(opts).await?;

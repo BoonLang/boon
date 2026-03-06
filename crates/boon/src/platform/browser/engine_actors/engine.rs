@@ -2031,7 +2031,7 @@ pub struct ActorContext {
     /// Function parameter bindings - maps parameter names to their values.
     /// Set when calling a user-defined function.
     /// e.g., `fn(param: x)` binds "param" -> x's ValueActor
-    pub parameters: HashMap<String, ActorHandle>,
+    pub parameters: Arc<HashMap<String, ActorHandle>>,
     /// When true, THEN/WHEN process events sequentially (one body completes before next starts).
     /// Set by HOLD to ensure state consistency in accumulator patterns.
     /// This prevents race conditions where multiple parallel body evaluations read stale state.
@@ -2074,7 +2074,7 @@ pub struct ActorContext {
     /// This prevents span collisions when multiple Objects are created from
     /// the same function definition (they would otherwise share the same spans
     /// and overwrite each other in the global ReferenceConnector).
-    pub object_locals: HashMap<parser::Span, ActorHandle>,
+    pub object_locals: Arc<HashMap<parser::Span, ActorHandle>>,
     /// Scope context for Variables - either Root (top-level) or Nested (inside List/map).
     ///
     /// **IMPORTANT: When to create a new scope:**
@@ -4146,13 +4146,13 @@ impl ActorRegistry {
     /// Destroy a scope and all its actors and child scopes (recursive).
     pub fn destroy_scope(&mut self, scope_id: ScopeId) {
         let scope_idx = usize::try_from(scope_id.index).unwrap();
-        let Some(scope) = self.get_scope(scope_id) else {
+        let Some(scope) = self.get_scope_mut(scope_id) else {
             return;
         };
 
-        // Collect children and actors before removing
-        let children: Vec<ScopeId> = scope.children.clone();
-        let actors: Vec<ActorId> = scope.actors.clone();
+        // Take ownership of children and actors before freeing the scope slot.
+        let children = std::mem::take(&mut scope.children);
+        let actors = std::mem::take(&mut scope.actors);
         if LOG_ACTOR_FLOW {
             zoon::println!(
                 "[FLOW] destroy_scope({:?}): {} children, {} actors: {:?}",
@@ -9601,7 +9601,7 @@ impl ListBindingFunction {
     ) -> ActorHandle {
         // Create a new ActorContext with the binding variable set
         let binding_name = config.binding_name.to_string();
-        let mut new_params = actor_context.parameters.clone();
+        let mut new_params = (*actor_context.parameters).clone();
 
         new_params.insert(binding_name.clone(), item_actor.clone());
 
@@ -9629,7 +9629,7 @@ impl ListBindingFunction {
             })
         });
         let new_actor_context = ActorContext {
-            parameters: new_params,
+            parameters: Arc::new(new_params),
             registry_scope_id: item_registry_scope.or(child_scope.registry_scope_id),
             ..child_scope
         };
