@@ -1055,14 +1055,15 @@ fn derive_scene_params(value: &Value) -> PhysicalSceneParams {
             };
             match tag {
                 "DirectionalLight" => {
-                    if let Some(intensity) = light.get_field("intensity").and_then(|v| v.as_number())
+                    if let Some(intensity) =
+                        light.get_field("intensity").and_then(|v| v.as_number())
                     {
                         params.directional_intensity = intensity;
                     }
                     if let Some(spread) = light.get_field("spread").and_then(|v| v.as_number()) {
-                        params.shadow_blur_per_depth =
-                            PhysicalSceneParams::DEFAULT.shadow_blur_per_depth
-                                * spread.clamp(0.25, 4.0);
+                        params.shadow_blur_per_depth = PhysicalSceneParams::DEFAULT
+                            .shadow_blur_per_depth
+                            * spread.clamp(0.25, 4.0);
                     }
                     if let (Some(azimuth), Some(altitude)) = (
                         light.get_field("azimuth").and_then(|v| v.as_number()),
@@ -1080,7 +1081,8 @@ fn derive_scene_params(value: &Value) -> PhysicalSceneParams {
                     }
                 }
                 "AmbientLight" => {
-                    if let Some(intensity) = light.get_field("intensity").and_then(|v| v.as_number())
+                    if let Some(intensity) =
+                        light.get_field("intensity").and_then(|v| v.as_number())
                     {
                         params.ambient_factor = intensity.clamp(0.0, 1.0);
                     }
@@ -1095,7 +1097,10 @@ fn derive_scene_params(value: &Value) -> PhysicalSceneParams {
 
 /// Compute CSS box-shadow from depth, move, and glow properties.
 fn compute_box_shadow(style: &Fields, scene: PhysicalSceneParams) -> Option<String> {
-    let depth = style.get("depth").and_then(|v| v.as_number()).unwrap_or(0.0);
+    let depth = style
+        .get("depth")
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
 
     // move: [closer: N] or [further: N]
     let (elevation, is_inset) = match style.get("move") {
@@ -1195,18 +1200,14 @@ fn compute_transition(style: &Fields) -> Option<String> {
             let range = extend.max(compress);
             if range > 0.0 {
                 let duration = (range * 0.04).clamp(0.08, 0.5);
-                Some(format!(
-                    "all {duration:.2}s cubic-bezier(0.34,1.56,0.64,1)"
-                ))
+                Some(format!("all {duration:.2}s cubic-bezier(0.34,1.56,0.64,1)"))
             } else {
                 None
             }
         }
         Some(Value::Number(n)) => {
             let duration = (n.0 * 0.15).clamp(0.05, 0.8);
-            Some(format!(
-                "all {duration:.2}s cubic-bezier(0.34,1.56,0.64,1)"
-            ))
+            Some(format!("all {duration:.2}s cubic-bezier(0.34,1.56,0.64,1)"))
         }
         _ => None,
     }
@@ -1291,15 +1292,9 @@ where
             }),
         )
         // box-shadow from depth + move + glow
-        .style_signal(
-            "box-shadow",
-            box_shadow_signal,
-        )
+        .style_signal("box-shadow", box_shadow_signal)
         // background-image from material.gloss (specular gradient)
-        .style_signal(
-            "background-image",
-            gloss_signal,
-        )
+        .style_signal("background-image", gloss_signal)
         // transition from spring_range
         .style_signal(
             "transition",
@@ -1314,9 +1309,7 @@ where
             vm.signal_cloned().map(|v| {
                 let style = get_style_obj(get_fields(&v)?)?;
                 let material = get_material_obj(style)?;
-                let transparency = material
-                    .get("transparency")
-                    .and_then(|v| v.as_number())?;
+                let transparency = material.get("transparency").and_then(|v| v.as_number())?;
                 let opacity = 1.0 - transparency.clamp(0.0, 1.0);
                 Some(format!("{opacity:.2}"))
             }),
@@ -1327,9 +1320,7 @@ where
             vm.signal_cloned().map(|v| {
                 let style = get_style_obj(get_fields(&v)?)?;
                 let material = get_material_obj(style)?;
-                material
-                    .get("transparency")
-                    .and_then(|v| v.as_number())?;
+                material.get("transparency").and_then(|v| v.as_number())?;
                 Some("blur(12px)".to_string())
             }),
         )
@@ -1562,9 +1553,7 @@ impl RetainedNode {
                 tag.as_ref() == "ElementParagraph"
             }
             (RetainedNode::Link { .. }, Value::Tagged { tag, .. }) => tag.as_ref() == "ElementLink",
-            (RetainedNode::Text { .. }, Value::Tagged { tag, .. }) => {
-                tag.as_ref() == "ElementText"
-            }
+            (RetainedNode::Text { .. }, Value::Tagged { tag, .. }) => tag.as_ref() == "ElementText",
             (RetainedNode::Block { .. }, Value::Tagged { tag, .. }) => {
                 tag.as_ref() == "ElementBlock"
             }
@@ -1628,9 +1617,7 @@ fn build_retained_node_with_surface(
         Value::Number(_) | Value::Text(_) | Value::Tag(_) | Value::Bool(_) | Value::Unit => {
             build_retained_primitive(value)
         }
-        Value::Tagged { tag, fields }
-            if matches!(tag.as_ref(), "DocumentNew" | "SceneNew") =>
-        {
+        Value::Tagged { tag, fields } if matches!(tag.as_ref(), "DocumentNew" | "SceneNew") => {
             build_retained_document(fields, handle, link_path, render_surface, scene_params)
         }
         Value::Tagged { tag, fields } => {
@@ -1671,15 +1658,11 @@ fn build_retained_tagged(
         "ElementStripe" => {
             build_retained_stripe(fields, full_value, handle, link_path, scene_params)
         }
-        "ElementStack" => {
-            build_retained_stack(fields, full_value, handle, link_path, scene_params)
-        }
+        "ElementStack" => build_retained_stack(fields, full_value, handle, link_path, scene_params),
         "ElementContainer" => {
             build_retained_container(fields, full_value, handle, link_path, scene_params)
         }
-        "ElementLabel" => {
-            build_retained_label(fields, full_value, handle, link_path, scene_params)
-        }
+        "ElementLabel" => build_retained_label(fields, full_value, handle, link_path, scene_params),
         "ElementTextInput" => build_retained_text_input(fields, full_value, handle, link_path),
         "ElementCheckbox" => build_retained_checkbox(fields, full_value, handle, link_path),
         "ElementParagraph" => {
@@ -1687,9 +1670,7 @@ fn build_retained_tagged(
         }
         "ElementLink" => build_retained_link(fields, full_value, handle, link_path, scene_params),
         "ElementText" => build_retained_text(fields, full_value, handle, link_path, scene_params),
-        "ElementBlock" => {
-            build_retained_block(fields, full_value, handle, link_path, scene_params)
-        }
+        "ElementBlock" => build_retained_block(fields, full_value, handle, link_path, scene_params),
         "ElementSelect" => build_retained_select_placeholder(fields, full_value, handle, link_path),
         "ElementSlider" => build_retained_slider_placeholder(fields, full_value, handle, link_path),
         "ElementSvg" => build_retained_svg_placeholder(fields, full_value, handle, link_path),
@@ -1707,13 +1688,8 @@ fn build_retained_document(
 ) -> (RawElOrText, RetainedNode) {
     let (child_tx, child_rx) = mpsc::unbounded();
     let (child_opt, initial_elements) = if let Some(root) = fields.get("root") {
-        let (el, child) = build_retained_node_with_surface(
-            root,
-            handle,
-            link_path,
-            render_surface,
-            scene_params,
-        );
+        let (el, child) =
+            build_retained_node_with_surface(root, handle, link_path, render_surface, scene_params);
         (Some(Box::new(child)), vec![el])
     } else {
         (None, vec![])
@@ -1761,76 +1737,80 @@ fn build_retained_select_placeholder(
         .unwrap_or("")
         .to_string();
 
-    let el = El::new()
-        .update_raw_el({
-            let handle_ref = handle.clone_ref();
-            let lp = link_ref.clone();
-            let options = options.clone();
-            let selected = selected.clone();
-            move |raw_el| {
-                raw_el.after_insert(move |el: web_sys::HtmlElement| {
-                    // Create a real <select> element
-                    let doc = web_sys::window().unwrap().document().unwrap();
-                    let select = doc.create_element("select").unwrap();
-                    let select_html: web_sys::HtmlElement = select.clone().dyn_into().unwrap();
-                    select_html.style().set_property("font-size", "16px").ok();
-                    select_html.style().set_property("padding", "4px 8px").ok();
-                    select_html.style().set_property("width", "100%").ok();
+    let el = El::new().update_raw_el({
+        let handle_ref = handle.clone_ref();
+        let lp = link_ref.clone();
+        let options = options.clone();
+        let selected = selected.clone();
+        move |raw_el| {
+            raw_el.after_insert(move |el: web_sys::HtmlElement| {
+                // Create a real <select> element
+                let doc = web_sys::window().unwrap().document().unwrap();
+                let select = doc.create_element("select").unwrap();
+                let select_html: web_sys::HtmlElement = select.clone().dyn_into().unwrap();
+                select_html.style().set_property("font-size", "16px").ok();
+                select_html.style().set_property("padding", "4px 8px").ok();
+                select_html.style().set_property("width", "100%").ok();
 
-                    // Add options
-                    for opt_val in &options {
-                        let value = opt_val
-                            .get_field("value")
-                            .and_then(|v| v.as_text())
-                            .unwrap_or("")
-                            .to_string();
-                        let label = opt_val
-                            .get_field("label")
-                            .and_then(|v| v.as_text())
-                            .unwrap_or(&value)
-                            .to_string();
-                        let option = doc.create_element("option").unwrap();
-                        option.set_attribute("value", &value).ok();
-                        option.set_text_content(Some(&label));
-                        if value == selected {
-                            option.set_attribute("selected", "").ok();
-                        }
-                        select.append_child(&option).ok();
+                // Add options
+                for opt_val in &options {
+                    let value = opt_val
+                        .get_field("value")
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("")
+                        .to_string();
+                    let label = opt_val
+                        .get_field("label")
+                        .and_then(|v| v.as_text())
+                        .unwrap_or(&value)
+                        .to_string();
+                    let option = doc.create_element("option").unwrap();
+                    option.set_attribute("value", &value).ok();
+                    option.set_text_content(Some(&label));
+                    if value == selected {
+                        option.set_attribute("selected", "").ok();
                     }
+                    select.append_child(&option).ok();
+                }
 
-                    // Wire input event — read value via JS interop
-                    let select_el = select.clone();
-                    let input_closure =
-                        wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                            let base = lp.borrow().clone();
-                            if base.is_empty() {
-                                return;
-                            }
-                            // Get value via js_sys::Reflect
-                            let value = js_sys::Reflect::get(&select_el, &"value".into())
-                                .ok()
-                                .and_then(|v| v.as_string())
-                                .unwrap_or_default();
-                            let path = format!("{}.event.change", base);
-                            handle_ref.inject_dd_event(Event::TextChange {
-                                link_path: path,
-                                text: value,
-                            });
-                        });
-                    select
-                        .add_event_listener_with_callback(
-                            "input",
-                            input_closure.as_ref().unchecked_ref(),
-                        )
-                        .ok();
-                    input_closure.forget();
+                // Wire input event — read value via JS interop
+                let select_el = select.clone();
+                let input_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    let base = lp.borrow().clone();
+                    if base.is_empty() {
+                        return;
+                    }
+                    // Get value via js_sys::Reflect
+                    let value = js_sys::Reflect::get(&select_el, &"value".into())
+                        .ok()
+                        .and_then(|v| v.as_string())
+                        .unwrap_or_default();
+                    let path = format!("{}.event.change", base);
+                    handle_ref.inject_dd_event(Event::TextChange {
+                        link_path: path,
+                        text: value,
+                    });
+                });
+                select
+                    .add_event_listener_with_callback(
+                        "input",
+                        input_closure.as_ref().unchecked_ref(),
+                    )
+                    .ok();
+                input_closure.forget();
 
-                    el.append_child(&select).ok();
-                })
-            }
-        });
+                el.append_child(&select).ok();
+            })
+        }
+    });
 
-    (el.unify(), RetainedNode::Label { value: vm, link_path: link_ref })
+    (
+        el.unify(),
+        RetainedNode::Label {
+            value: vm,
+            link_path: link_ref,
+        },
+    )
 }
 
 /// Real Element/slider — renders as `<input type="range">` with event wiring.
@@ -1854,10 +1834,7 @@ fn build_retained_slider_placeholder(
         .get("value")
         .and_then(|v| v.as_number())
         .unwrap_or(0.0);
-    let min = fields
-        .get("min")
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0);
+    let min = fields.get("min").and_then(|v| v.as_number()).unwrap_or(0.0);
     let max = fields
         .get("max")
         .and_then(|v| v.as_number())
@@ -1867,56 +1844,57 @@ fn build_retained_slider_placeholder(
         .and_then(|v| v.as_number())
         .unwrap_or(1.0);
 
-    let el = El::new()
-        .update_raw_el({
-            let handle_ref = handle.clone_ref();
-            let lp = link_ref.clone();
-            move |raw_el| {
-                raw_el.after_insert(move |el: web_sys::HtmlElement| {
-                    let doc = web_sys::window().unwrap().document().unwrap();
-                    let input: web_sys::HtmlInputElement = doc
-                        .create_element("input")
-                        .unwrap()
-                        .dyn_into()
-                        .unwrap();
-                    input.set_type("range");
-                    input.set_value(&format!("{}", value));
-                    input.set_min(&format!("{}", min));
-                    input.set_max(&format!("{}", max));
-                    input.set_step(&format!("{}", step));
-                    input.style().set_property("width", "100%").ok();
+    let el = El::new().update_raw_el({
+        let handle_ref = handle.clone_ref();
+        let lp = link_ref.clone();
+        move |raw_el| {
+            raw_el.after_insert(move |el: web_sys::HtmlElement| {
+                let doc = web_sys::window().unwrap().document().unwrap();
+                let input: web_sys::HtmlInputElement =
+                    doc.create_element("input").unwrap().dyn_into().unwrap();
+                input.set_type("range");
+                input.set_value(&format!("{}", value));
+                input.set_min(&format!("{}", min));
+                input.set_max(&format!("{}", max));
+                input.set_step(&format!("{}", step));
+                input.style().set_property("width", "100%").ok();
 
-                    // Wire input event
-                    let input_clone = input.clone();
-                    let input_closure =
-                        wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                            let base = lp.borrow().clone();
-                            if base.is_empty() {
-                                return;
-                            }
-                            let value_str = input_clone.value();
-                            let path = format!("{}.event.change", base);
-                            // Slider values are always numeric
-                            let numeric = value_str.parse::<f64>().unwrap_or(0.0);
-                            handle_ref.inject_dd_event(Event::NumberChange {
-                                link_path: path,
-                                value: numeric,
-                            });
-                        });
-                    input
-                        .add_event_listener_with_callback(
-                            "input",
-                            input_closure.as_ref().unchecked_ref(),
-                        )
-                        .ok();
-                    input_closure.forget();
+                // Wire input event
+                let input_clone = input.clone();
+                let input_closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    let base = lp.borrow().clone();
+                    if base.is_empty() {
+                        return;
+                    }
+                    let value_str = input_clone.value();
+                    let path = format!("{}.event.change", base);
+                    // Slider values are always numeric
+                    let numeric = value_str.parse::<f64>().unwrap_or(0.0);
+                    handle_ref.inject_dd_event(Event::NumberChange {
+                        link_path: path,
+                        value: numeric,
+                    });
+                });
+                input
+                    .add_event_listener_with_callback(
+                        "input",
+                        input_closure.as_ref().unchecked_ref(),
+                    )
+                    .ok();
+                input_closure.forget();
 
-                    el.append_child(&input).ok();
-                })
-            }
-        });
+                el.append_child(&input).ok();
+            })
+        }
+    });
 
-    (el.unify(), RetainedNode::Label { value: vm, link_path: link_ref })
+    (
+        el.unify(),
+        RetainedNode::Label {
+            value: vm,
+            link_path: link_ref,
+        },
+    )
 }
 
 /// Element/svg — renders as `<svg>` with click events carrying (x, y) coordinates.
@@ -1957,60 +1935,66 @@ fn build_retained_svg_placeholder(
         .map(|c| extract_sorted_list_items_from_value(c))
         .unwrap_or_default();
 
-    let el = El::new()
-        .update_raw_el({
-            let handle_ref = handle.clone_ref();
-            let lp = link_ref.clone();
-            let child_items = child_items.clone();
-            move |raw_el| {
-                raw_el.after_insert(move |el: web_sys::HtmlElement| {
-                    let doc = web_sys::window().unwrap().document().unwrap();
-                    let svg = doc
-                        .create_element_ns(Some("http://www.w3.org/2000/svg"), "svg")
-                        .unwrap();
-                    svg.set_attribute("width", &format!("{}", width)).ok();
-                    svg.set_attribute("height", &format!("{}", height)).ok();
-                    svg.set_attribute("style", &format!("overflow: visible; background: {};", background)).ok();
+    let el = El::new().update_raw_el({
+        let handle_ref = handle.clone_ref();
+        let lp = link_ref.clone();
+        let child_items = child_items.clone();
+        move |raw_el| {
+            raw_el.after_insert(move |el: web_sys::HtmlElement| {
+                let doc = web_sys::window().unwrap().document().unwrap();
+                let svg = doc
+                    .create_element_ns(Some("http://www.w3.org/2000/svg"), "svg")
+                    .unwrap();
+                svg.set_attribute("width", &format!("{}", width)).ok();
+                svg.set_attribute("height", &format!("{}", height)).ok();
+                svg.set_attribute(
+                    "style",
+                    &format!("overflow: visible; background: {};", background),
+                )
+                .ok();
 
-                    // Render circle children
-                    for item in &child_items {
-                        if let Value::Tagged { tag, fields } = item {
-                            if tag.as_ref() == "ElementSvgCircle" {
-                                let cx = fields.get("cx").and_then(|v| v.as_number()).unwrap_or(0.0);
-                                let cy = fields.get("cy").and_then(|v| v.as_number()).unwrap_or(0.0);
-                                let r = fields.get("r").and_then(|v| v.as_number()).unwrap_or(20.0);
-                                let style_fields = fields.get("style");
-                                let fill = style_fields
-                                    .and_then(|s| s.get_field("fill"))
-                                    .and_then(|v| v.as_text())
-                                    .unwrap_or("gray");
-                                let stroke = style_fields
-                                    .and_then(|s| s.get_field("stroke"))
-                                    .and_then(|v| v.as_text())
-                                    .unwrap_or("black");
-                                let stroke_width = style_fields
-                                    .and_then(|s| s.get_field("stroke_width"))
-                                    .and_then(|v| v.as_number())
-                                    .unwrap_or(1.0);
+                // Render circle children
+                for item in &child_items {
+                    if let Value::Tagged { tag, fields } = item {
+                        if tag.as_ref() == "ElementSvgCircle" {
+                            let cx = fields.get("cx").and_then(|v| v.as_number()).unwrap_or(0.0);
+                            let cy = fields.get("cy").and_then(|v| v.as_number()).unwrap_or(0.0);
+                            let r = fields.get("r").and_then(|v| v.as_number()).unwrap_or(20.0);
+                            let style_fields = fields.get("style");
+                            let fill = style_fields
+                                .and_then(|s| s.get_field("fill"))
+                                .and_then(|v| v.as_text())
+                                .unwrap_or("gray");
+                            let stroke = style_fields
+                                .and_then(|s| s.get_field("stroke"))
+                                .and_then(|v| v.as_text())
+                                .unwrap_or("black");
+                            let stroke_width = style_fields
+                                .and_then(|s| s.get_field("stroke_width"))
+                                .and_then(|v| v.as_number())
+                                .unwrap_or(1.0);
 
-                                let circle = doc
-                                    .create_element_ns(Some("http://www.w3.org/2000/svg"), "circle")
-                                    .unwrap();
-                                circle.set_attribute("cx", &format!("{}", cx)).ok();
-                                circle.set_attribute("cy", &format!("{}", cy)).ok();
-                                circle.set_attribute("r", &format!("{}", r)).ok();
-                                circle.set_attribute("fill", fill).ok();
-                                circle.set_attribute("stroke", stroke).ok();
-                                circle.set_attribute("stroke-width", &format!("{}", stroke_width)).ok();
-                                svg.append_child(&circle).ok();
-                            }
+                            let circle = doc
+                                .create_element_ns(Some("http://www.w3.org/2000/svg"), "circle")
+                                .unwrap();
+                            circle.set_attribute("cx", &format!("{}", cx)).ok();
+                            circle.set_attribute("cy", &format!("{}", cy)).ok();
+                            circle.set_attribute("r", &format!("{}", r)).ok();
+                            circle.set_attribute("fill", fill).ok();
+                            circle.set_attribute("stroke", stroke).ok();
+                            circle
+                                .set_attribute("stroke-width", &format!("{}", stroke_width))
+                                .ok();
+                            svg.append_child(&circle).ok();
                         }
                     }
+                }
 
-                    // Wire click event with coordinates
-                    let svg_clone = svg.clone();
-                    let click_closure =
-                        wasm_bindgen::closure::Closure::<dyn Fn(web_sys::MouseEvent)>::new(move |event: web_sys::MouseEvent| {
+                // Wire click event with coordinates
+                let svg_clone = svg.clone();
+                let click_closure =
+                    wasm_bindgen::closure::Closure::<dyn Fn(web_sys::MouseEvent)>::new(
+                        move |event: web_sys::MouseEvent| {
                             let base = lp.borrow().clone();
                             if base.is_empty() {
                                 return;
@@ -2024,20 +2008,27 @@ fn build_retained_svg_placeholder(
                                 x,
                                 y,
                             });
-                        });
-                    svg.add_event_listener_with_callback(
-                        "click",
-                        click_closure.as_ref().unchecked_ref(),
-                    )
-                    .ok();
-                    click_closure.forget();
+                        },
+                    );
+                svg.add_event_listener_with_callback(
+                    "click",
+                    click_closure.as_ref().unchecked_ref(),
+                )
+                .ok();
+                click_closure.forget();
 
-                    el.append_child(&svg).ok();
-                })
-            }
-        });
+                el.append_child(&svg).ok();
+            })
+        }
+    });
 
-    (el.unify(), RetainedNode::Label { value: vm, link_path: link_ref })
+    (
+        el.unify(),
+        RetainedNode::Label {
+            value: vm,
+            link_path: link_ref,
+        },
+    )
 }
 
 /// Create a hover change handler for Zoon's `.on_hovered_change()`.
@@ -3620,12 +3611,8 @@ impl RetainedNode {
                         }
                     }
                     (None, Some(new_val)) => {
-                        let (el, node) = build_retained_node(
-                            new_val,
-                            handle,
-                            link_path,
-                            scene_params.clone(),
-                        );
+                        let (el, node) =
+                            build_retained_node(new_val, handle, link_path, scene_params.clone());
                         *child = Some(Box::new(node));
                         child_tx.unbounded_send(VecDiff::Push { value: el }).ok();
                     }
@@ -3847,8 +3834,7 @@ fn render_tagged_static(tag: &str, fields: &Arc<Fields>) -> RawElOrText {
             } else {
                 Some(zoon::Text::new(text).unify())
             };
-            let el = El::new()
-                .child_signal(always(child));
+            let el = El::new().child_signal(always(child));
             let el = if let Some(font) = extract_font_from_fields(fields) {
                 el.s(font)
             } else {
@@ -3867,9 +3853,7 @@ fn render_tagged_static(tag: &str, fields: &Arc<Fields>) -> RawElOrText {
                 .and_then(|s| s.get_field("child"))
                 .or_else(|| fields.get("child"))
                 .map(|child_val| render_value_static(child_val));
-            let mut el = El::new()
-                .s(Width::fill())
-                .child_signal(always(child));
+            let mut el = El::new().s(Width::fill()).child_signal(always(child));
             if let Some(font) = extract_font_from_fields(fields) {
                 el = el.s(font);
             }
@@ -3904,19 +3888,22 @@ fn render_tagged_static(tag: &str, fields: &Arc<Fields>) -> RawElOrText {
             }
         }
         "ElementSelect" => {
-            let selected = fields.get("selected").and_then(|v| v.as_text()).unwrap_or("").to_string();
+            let selected = fields
+                .get("selected")
+                .and_then(|v| v.as_text())
+                .unwrap_or("")
+                .to_string();
             select_placeholder(&selected)
         }
         "ElementSlider" => {
-            let val = fields.get("value").and_then(|v| v.as_number()).unwrap_or(0.0);
+            let val = fields
+                .get("value")
+                .and_then(|v| v.as_number())
+                .unwrap_or(0.0);
             slider_placeholder(val)
         }
-        "ElementSvg" => {
-            svg_canvas_placeholder()
-        }
-        "ElementSvgCircle" => {
-            El::new().unify()
-        }
+        "ElementSvg" => svg_canvas_placeholder(),
+        "ElementSvgCircle" => El::new().unify(),
         _ => tagged_placeholder(tag),
     }
 }

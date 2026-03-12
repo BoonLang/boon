@@ -16,6 +16,7 @@ pub mod runtime;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use js_sys::{Object, Reflect};
 use wasm_bindgen::prelude::*;
 use zoon::*;
 
@@ -28,12 +29,6 @@ pub use persistence::clear_wasm_persisted_states;
 
 thread_local! {
     static ACTIVE_WASM_INSTANCE: RefCell<Option<Rc<runtime::WasmInstance>>> = const { RefCell::new(None) };
-}
-
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = console, js_name = log)]
-    fn console_log(s: &str);
 }
 
 /// External function definition for multi-file support.
@@ -86,9 +81,8 @@ fn run_wasm_sync(
         .map_err(|e| format!("WASM compile error: {:?}", e))?;
 
     // Instantiate synchronously (fine for small modules).
-    let instance =
-        runtime::WasmInstance::new(&module, program.clone(), wasm_output.text_patterns)
-            .map_err(|e| format!("WASM instantiation failed: {}", e))?;
+    let instance = runtime::WasmInstance::new(&module, program.clone(), wasm_output.text_patterns)
+        .map_err(|e| format!("WASM instantiation failed: {}", e))?;
 
     finish_setup(instance, program, source, persistence_enabled)
 }
@@ -126,10 +120,8 @@ fn run_wasm_async(
         };
 
         // Prepare imports and stores (sync, no WASM involved).
-        let parts = match runtime::WasmInstance::prepare(
-            program.clone(),
-            wasm_output.text_patterns,
-        ) {
+        let parts = match runtime::WasmInstance::prepare(program.clone(), wasm_output.text_patterns)
+        {
             Ok(p) => p,
             Err(msg) => {
                 *ui_ref.borrow_mut() = Some(error_element(&msg));
@@ -139,8 +131,7 @@ fn run_wasm_async(
         };
 
         // Instantiate asynchronously — no size limit on main thread.
-        let instantiate_promise =
-            js_sys::WebAssembly::instantiate_module(&module, &parts.imports);
+        let instantiate_promise = js_sys::WebAssembly::instantiate_module(&module, &parts.imports);
         let instance_result = JsFuture::from(instantiate_promise).await;
         let wasm_instance_js: js_sys::WebAssembly::Instance = match instance_result {
             Ok(js) => js.unchecked_into(),
@@ -198,7 +189,6 @@ fn finish_setup(
     source: &str,
     restore_persistence: bool,
 ) -> Result<RawElOrText, String> {
-    console_log("[boon wasm] finish_setup:start");
     // Wrap in Rc early (needed for router setup).
     let instance = Rc::new(instance);
 
@@ -208,17 +198,15 @@ fn finish_setup(
             old.shutdown();
         }
     });
+    install_debug_api(instance.clone(), program.clone());
 
     // 3. Set up router BEFORE init so WHEN/WHILE arms see route text.
-    console_log("[boon wasm] finish_setup:router");
     bridge::setup_router(&program, &instance);
 
     // 4. Call init() to set initial cell values.
-    console_log("[boon wasm] finish_setup:init:start");
     instance
         .call_init()
         .map_err(|e| format!("init() failed: {}", e))?;
-    console_log("[boon wasm] finish_setup:init:done");
 
     // 5. Load persisted snapshot (only on page refresh, not on re-run).
     let storage_key = persistence::storage_key(source);
@@ -234,23 +222,200 @@ fn finish_setup(
         instance.set_pending_snapshot(snap);
     }
 
-    // 7. Register persistence save hook (fires after every event).
-    let save_inst = instance.clone();
-    let save_key = storage_key.clone();
-    instance.set_save_hook(Box::new(move || {
-        persistence::save_and_store(&save_inst, &save_key);
-    }));
+    // 7. Register persistence save hook only when persistence is enabled.
+    if restore_persistence {
+        let save_inst = instance.clone();
+        let save_key = storage_key.clone();
+        instance.set_save_hook(Box::new(move || {
+            persistence::save_and_store(&save_inst, &save_key);
+        }));
+    }
 
     // 8. Start timers.
-    console_log("[boon wasm] finish_setup:timers");
     instance.start_timers(&program);
 
     // 9. Build Zoon element tree from IR + runtime.
-    console_log("[boon wasm] finish_setup:build_ui:start");
     let ui = bridge::build_ui(&program, instance.clone());
-    console_log("[boon wasm] finish_setup:build_ui:done");
 
     Ok(ui)
+}
+
+fn install_debug_api(instance: Rc<runtime::WasmInstance>, program: Rc<ir::IrProgram>) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+
+    let api = Object::new();
+    let instance_for_cell = instance.clone();
+    let program_for_cell = program.clone();
+    let program_for_find = program.clone();
+    let get_cell = Closure::wrap(Box::new(move |name: String| -> JsValue {
+        let result = Object::new();
+        let found = program_for_cell
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, cell)| (cell.name == name).then_some(idx as u32));
+        match found {
+            Some(cell_id) => {
+                let _ = Reflect::set(&result, &"found".into(), &JsValue::TRUE);
+                let _ = Reflect::set(&result, &"id".into(), &JsValue::from(cell_id));
+                let _ = Reflect::set(
+                    &result,
+                    &"value".into(),
+                    &JsValue::from(instance_for_cell.cell_store.get_cell_value(cell_id)),
+                );
+                let _ = Reflect::set(
+                    &result,
+                    &"text".into(),
+                    &JsValue::from(instance_for_cell.cell_store.get_cell_text(cell_id)),
+                );
+            }
+            None => {
+                let _ = Reflect::set(&result, &"found".into(), &JsValue::FALSE);
+            }
+        }
+        result.into()
+    }) as Box<dyn Fn(String) -> JsValue>);
+    let _ = Reflect::set(&api, &"getCell".into(), get_cell.as_ref());
+    get_cell.forget();
+
+    let find_cells = Closure::wrap(Box::new(move |pattern: String| -> JsValue {
+        let result = js_sys::Array::new();
+        for (idx, cell) in program_for_find.cells.iter().enumerate() {
+            if cell.name.contains(&pattern) {
+                let entry = Object::new();
+                let _ = Reflect::set(&entry, &"id".into(), &JsValue::from(idx as u32));
+                let _ = Reflect::set(&entry, &"name".into(), &JsValue::from(cell.name.clone()));
+                result.push(&entry);
+            }
+        }
+        result.into()
+    }) as Box<dyn Fn(String) -> JsValue>);
+    let _ = Reflect::set(&api, &"findCells".into(), find_cells.as_ref());
+    find_cells.forget();
+
+    let program_for_find_events = program.clone();
+    let find_events = Closure::wrap(Box::new(move |pattern: String| -> JsValue {
+        let result = js_sys::Array::new();
+        for (idx, event) in program_for_find_events.events.iter().enumerate() {
+            if event.name.contains(&pattern) {
+                let entry = Object::new();
+                let _ = Reflect::set(&entry, &"id".into(), &JsValue::from(idx as u32));
+                let _ = Reflect::set(&entry, &"name".into(), &JsValue::from(event.name.clone()));
+                result.push(&entry);
+            }
+        }
+        result.into()
+    }) as Box<dyn Fn(String) -> JsValue>);
+    let _ = Reflect::set(&api, &"findEvents".into(), find_events.as_ref());
+    find_events.forget();
+
+    let instance_for_item = instance.clone();
+    let get_item_cell = Closure::wrap(Box::new(move |item_idx: u32, cell_id: u32| -> JsValue {
+        let result = Object::new();
+        if let Some(item_store) = instance_for_item.item_cell_store.as_ref() {
+            let _ = Reflect::set(&result, &"found".into(), &JsValue::TRUE);
+            let _ = Reflect::set(
+                &result,
+                &"value".into(),
+                &JsValue::from(item_store.get_value(item_idx, cell_id)),
+            );
+            let _ = Reflect::set(
+                &result,
+                &"text".into(),
+                &JsValue::from(item_store.get_text(item_idx, cell_id)),
+            );
+        } else {
+            let _ = Reflect::set(&result, &"found".into(), &JsValue::FALSE);
+        }
+        result.into()
+    }) as Box<dyn Fn(u32, u32) -> JsValue>);
+    let _ = Reflect::set(&api, &"getItemCell".into(), get_item_cell.as_ref());
+    get_item_cell.forget();
+
+    let instance_for_dump = instance.clone();
+    let program_for_dump = program.clone();
+    let dump_item_cells = Closure::wrap(Box::new(move |item_idx: u32| -> JsValue {
+        let result = js_sys::Array::new();
+        let Some(item_store) = instance_for_dump.item_cell_store.as_ref() else {
+            return result.into();
+        };
+
+        for (cell_id, value) in item_store.all_cell_values(item_idx) {
+            let entry = Object::new();
+            let _ = Reflect::set(&entry, &"id".into(), &JsValue::from(cell_id));
+            if let Some(cell) = program_for_dump.cells.get(cell_id as usize) {
+                let _ = Reflect::set(&entry, &"name".into(), &JsValue::from(cell.name.clone()));
+            }
+            let _ = Reflect::set(&entry, &"value".into(), &JsValue::from(value));
+            let text = item_store.get_text(item_idx, cell_id);
+            if !text.is_empty() {
+                let _ = Reflect::set(&entry, &"text".into(), &JsValue::from(text));
+            }
+            result.push(&entry);
+        }
+
+        for (cell_id, text) in item_store.all_text_values(item_idx) {
+            if text.is_empty() {
+                continue;
+            }
+            if item_store.get_value(item_idx, cell_id).is_nan() {
+                let entry = Object::new();
+                let _ = Reflect::set(&entry, &"id".into(), &JsValue::from(cell_id));
+                if let Some(cell) = program_for_dump.cells.get(cell_id as usize) {
+                    let _ = Reflect::set(&entry, &"name".into(), &JsValue::from(cell.name.clone()));
+                }
+                let _ = Reflect::set(&entry, &"text".into(), &JsValue::from(text));
+                result.push(&entry);
+            }
+        }
+
+        result.into()
+    }) as Box<dyn Fn(u32) -> JsValue>);
+    let _ = Reflect::set(&api, &"dumpItemCells".into(), dump_item_cells.as_ref());
+    dump_item_cells.forget();
+
+    let program_for_name = program.clone();
+    let cell_name = Closure::wrap(Box::new(move |cell_id: u32| -> JsValue {
+        program_for_name
+            .cells
+            .get(cell_id as usize)
+            .map(|cell| JsValue::from(cell.name.clone()))
+            .unwrap_or(JsValue::NULL)
+    }) as Box<dyn Fn(u32) -> JsValue>);
+    let _ = Reflect::set(&api, &"cellName".into(), cell_name.as_ref());
+    cell_name.forget();
+
+    let program_for_event_name = program.clone();
+    let event_name = Closure::wrap(Box::new(move |event_id: u32| -> JsValue {
+        program_for_event_name
+            .events
+            .get(event_id as usize)
+            .map(|event| JsValue::from(event.name.clone()))
+            .unwrap_or(JsValue::NULL)
+    }) as Box<dyn Fn(u32) -> JsValue>);
+    let _ = Reflect::set(&api, &"eventName".into(), event_name.as_ref());
+    event_name.forget();
+
+    let instance_for_item_event = instance.clone();
+    let fire_item_event = Closure::wrap(Box::new(move |item_idx: u32, event_id: u32| -> JsValue {
+        let result = Object::new();
+        match instance_for_item_event.call_on_item_event(item_idx, event_id, item_idx) {
+            Ok(()) => {
+                let _ = Reflect::set(&result, &"ok".into(), &JsValue::TRUE);
+            }
+            Err(error) => {
+                let _ = Reflect::set(&result, &"ok".into(), &JsValue::FALSE);
+                let _ = Reflect::set(&result, &"error".into(), &JsValue::from(error));
+            }
+        }
+        result.into()
+    }) as Box<dyn Fn(u32, u32) -> JsValue>);
+    let _ = Reflect::set(&api, &"fireItemEvent".into(), fire_item_event.as_ref());
+    fire_item_event.forget();
+
+    let _ = Reflect::set(window.as_ref(), &"__boonWasmDebug".into(), &api);
 }
 
 fn error_element(msg: &str) -> RawElOrText {

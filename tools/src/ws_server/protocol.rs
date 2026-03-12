@@ -198,7 +198,7 @@ pub enum Command {
 
     /// Set the engine type and trigger re-run
     SetEngine {
-        /// Engine name: "Actors", "DD", or "Wasm"
+        /// Engine name: "Actors", "DD", "Wasm", or "WasmPro"
         engine: String,
     },
 
@@ -355,7 +355,7 @@ pub enum Response {
 
     /// Engine info response
     EngineInfo {
-        /// Current engine: "Actors", "DD", or "Wasm"
+        /// Current engine: "Actors", "DD", "Wasm", or "WasmPro"
         engine: String,
         /// Whether engine switching is available
         switchable: bool,

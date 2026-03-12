@@ -5,11 +5,12 @@
 #[cfg(not(any(
     feature = "engine-actors",
     feature = "engine-dd",
-    feature = "engine-wasm"
+    feature = "engine-wasm",
+    feature = "engine-wasm-pro"
 )))]
 compile_error!(
     "At least one Boon engine must be enabled. \
-     Use --features engine-actors, --features engine-dd, or --features engine-wasm"
+     Use --features engine-actors, --features engine-dd, --features engine-wasm, or --features engine-wasm-pro"
 );
 
 pub mod parser;

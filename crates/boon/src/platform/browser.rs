@@ -1,4 +1,5 @@
 pub mod common;
+pub(crate) mod kernel;
 
 // Engine-specific modules (feature-gated)
 // NOTE: engine-actors is legacy; engine-dd is default.
@@ -10,6 +11,9 @@ pub mod engine_dd;
 
 #[cfg(feature = "engine-wasm")]
 pub mod engine_wasm;
+
+#[cfg(feature = "engine-wasm-pro")]
+pub mod engine_wasm_pro;
 
 // Actor engine modules (legacy) - api and interpreter depend on actor engine types
 #[cfg(feature = "engine-actors")]

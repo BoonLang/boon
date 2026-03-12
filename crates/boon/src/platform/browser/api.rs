@@ -1297,11 +1297,7 @@ pub fn function_element_svg(
                 actor_context.scope.clone(),
             ),
             Variable::new_arc(
-                ConstructInfo::new(
-                    function_call_id.with_child_id(7),
-                    None,
-                    "ElementSvg[event]",
-                ),
+                ConstructInfo::new(function_call_id.with_child_id(7), None, "ElementSvg[event]"),
                 construct_context.clone(),
                 "event",
                 event_actor,
@@ -1375,8 +1371,13 @@ pub fn function_element_svg_circle(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [argument_element, argument_cx, argument_cy, argument_r, argument_style] =
-        arguments.as_slice()
+    let [
+        argument_element,
+        argument_cx,
+        argument_cy,
+        argument_r,
+        argument_style,
+    ] = arguments.as_slice()
     else {
         panic!("Element/svg_circle expects 5 arguments")
     };
@@ -1995,7 +1996,10 @@ pub fn function_math_min(
     let [argument_a, argument_b] = arguments.as_slice() else {
         panic!("Math/min expects 2 arguments")
     };
-    enum Input { A(f64), B(f64) }
+    enum Input {
+        A(f64),
+        B(f64),
+    }
     let a_stream = argument_a.clone().stream().map(|v| match &v {
         Value::Number(n, _) => Input::A(n.number()),
         _ => panic!("Math/min expects Number arguments"),
@@ -2005,22 +2009,29 @@ pub fn function_math_min(
         _ => panic!("Math/min expects Number arguments"),
     });
     stream::select(a_stream, b_stream)
-        .scan((None::<f64>, None::<f64>), move |(last_a, last_b), input| {
-            match input {
-                Input::A(val) => *last_a = Some(val),
-                Input::B(val) => *last_b = Some(val),
-            }
-            if let (Some(a), Some(b)) = (*last_a, *last_b) {
-                future::ready(Some(Some(Number::new_value(
-                    ConstructInfo::new(function_call_id.with_child_id(0), None, "Math/min result"),
-                    construct_context.clone(),
-                    ValueIdempotencyKey::new(),
-                    a.min(b),
-                ))))
-            } else {
-                future::ready(Some(None))
-            }
-        })
+        .scan(
+            (None::<f64>, None::<f64>),
+            move |(last_a, last_b), input| {
+                match input {
+                    Input::A(val) => *last_a = Some(val),
+                    Input::B(val) => *last_b = Some(val),
+                }
+                if let (Some(a), Some(b)) = (*last_a, *last_b) {
+                    future::ready(Some(Some(Number::new_value(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(0),
+                            None,
+                            "Math/min result",
+                        ),
+                        construct_context.clone(),
+                        ValueIdempotencyKey::new(),
+                        a.min(b),
+                    ))))
+                } else {
+                    future::ready(Some(None))
+                }
+            },
+        )
         .filter_map(future::ready)
 }
 
@@ -2035,7 +2046,10 @@ pub fn function_math_max(
     let [argument_a, argument_b] = arguments.as_slice() else {
         panic!("Math/max expects 2 arguments")
     };
-    enum Input { A(f64), B(f64) }
+    enum Input {
+        A(f64),
+        B(f64),
+    }
     let a_stream = argument_a.clone().stream().map(|v| match &v {
         Value::Number(n, _) => Input::A(n.number()),
         _ => panic!("Math/max expects Number arguments"),
@@ -2045,22 +2059,29 @@ pub fn function_math_max(
         _ => panic!("Math/max expects Number arguments"),
     });
     stream::select(a_stream, b_stream)
-        .scan((None::<f64>, None::<f64>), move |(last_a, last_b), input| {
-            match input {
-                Input::A(val) => *last_a = Some(val),
-                Input::B(val) => *last_b = Some(val),
-            }
-            if let (Some(a), Some(b)) = (*last_a, *last_b) {
-                future::ready(Some(Some(Number::new_value(
-                    ConstructInfo::new(function_call_id.with_child_id(0), None, "Math/max result"),
-                    construct_context.clone(),
-                    ValueIdempotencyKey::new(),
-                    a.max(b),
-                ))))
-            } else {
-                future::ready(Some(None))
-            }
-        })
+        .scan(
+            (None::<f64>, None::<f64>),
+            move |(last_a, last_b), input| {
+                match input {
+                    Input::A(val) => *last_a = Some(val),
+                    Input::B(val) => *last_b = Some(val),
+                }
+                if let (Some(a), Some(b)) = (*last_a, *last_b) {
+                    future::ready(Some(Some(Number::new_value(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(0),
+                            None,
+                            "Math/max result",
+                        ),
+                        construct_context.clone(),
+                        ValueIdempotencyKey::new(),
+                        a.max(b),
+                    ))))
+                } else {
+                    future::ready(Some(None))
+                }
+            },
+        )
         .filter_map(future::ready)
 }
 
@@ -2279,13 +2300,21 @@ pub fn function_text_to_number(
         };
         match text.trim().parse::<f64>() {
             Ok(number) => Number::new_value(
-                ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/to_number result"),
+                ConstructInfo::new(
+                    function_call_id.with_child_id(0),
+                    None,
+                    "Text/to_number result",
+                ),
                 construct_context.clone(),
                 ValueIdempotencyKey::new(),
                 number,
             ),
             Err(_) => Tag::new_value(
-                ConstructInfo::new(function_call_id.with_child_id(1), None, "Text/to_number NaN"),
+                ConstructInfo::new(
+                    function_call_id.with_child_id(1),
+                    None,
+                    "Text/to_number NaN",
+                ),
                 construct_context.clone(),
                 ValueIdempotencyKey::new(),
                 "NaN".to_string(),
@@ -2306,7 +2335,10 @@ pub fn function_text_starts_with(
     let [argument_text, argument_prefix] = arguments.as_slice() else {
         panic!("Text/starts_with expects 2 arguments")
     };
-    enum Input { Text(String), Prefix(String) }
+    enum Input {
+        Text(String),
+        Prefix(String),
+    }
     let text_stream = argument_text.clone().stream().map(|v| match &v {
         Value::Text(t, _) => Input::Text(t.text().to_string()),
         _ => panic!("Text/starts_with expects Text for first argument"),
@@ -2330,7 +2362,11 @@ pub fn function_text_starts_with(
                         *last_result = Some(current_result);
                         let tag = if current_result { "True" } else { "False" };
                         future::ready(Some(Some(Tag::new_value(
-                            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/starts_with result"),
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(0),
+                                None,
+                                "Text/starts_with result",
+                            ),
                             construct_context.clone(),
                             ValueIdempotencyKey::new(),
                             tag.to_string(),
@@ -2404,30 +2440,27 @@ pub fn function_bool_toggle(
 
     let when_stream = argument_when.stream().map(|_| Msg::Toggle);
 
-    stream::select(value_stream, when_stream).scan(
-        None::<bool>,
-        move |state, msg| {
-            match msg {
-                Msg::SetValue(v) => *state = Some(v),
-                Msg::Toggle => {
-                    let current = state.unwrap_or(false);
-                    *state = Some(!current);
-                }
+    stream::select(value_stream, when_stream).scan(None::<bool>, move |state, msg| {
+        match msg {
+            Msg::SetValue(v) => *state = Some(v),
+            Msg::Toggle => {
+                let current = state.unwrap_or(false);
+                *state = Some(!current);
             }
-            let is_true = state.unwrap_or(false);
-            let result_tag = if is_true { "True" } else { "False" };
-            future::ready(Some(Tag::new_value(
-                ConstructInfo::new(
-                    function_call_id.with_child_id(0),
-                    None,
-                    "Bool/toggle result",
-                ),
-                construct_context.clone(),
-                ValueIdempotencyKey::new(),
-                result_tag.to_string(),
-            )))
-        },
-    )
+        }
+        let is_true = state.unwrap_or(false);
+        let result_tag = if is_true { "True" } else { "False" };
+        future::ready(Some(Tag::new_value(
+            ConstructInfo::new(
+                function_call_id.with_child_id(0),
+                None,
+                "Bool/toggle result",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            result_tag.to_string(),
+        )))
+    })
 }
 
 /// Bool/or(this, that) -> Tag (True/False)
@@ -3644,7 +3677,11 @@ pub fn function_element_text(
 
     if let Some(argument_element) = argument_element {
         vars.push(Variable::new_arc(
-            ConstructInfo::new(function_call_id.with_child_id(1), None, "ElementText[element]"),
+            ConstructInfo::new(
+                function_call_id.with_child_id(1),
+                None,
+                "ElementText[element]",
+            ),
             construct_context.clone(),
             "element",
             argument_element.clone(),
@@ -3654,17 +3691,29 @@ pub fn function_element_text(
     }
 
     vars.push(Variable::new_arc(
-        ConstructInfo::new(function_call_id.with_child_id(2), None, "ElementText[settings]"),
+        ConstructInfo::new(
+            function_call_id.with_child_id(2),
+            None,
+            "ElementText[settings]",
+        ),
         construct_context.clone(),
         "settings",
         Object::new_arc_value_actor(
-            ConstructInfo::new(function_call_id.with_child_id(3), None, "ElementText[settings: [..]]"),
+            ConstructInfo::new(
+                function_call_id.with_child_id(3),
+                None,
+                "ElementText[settings: [..]]",
+            ),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
             actor_context.clone(),
             [
                 Variable::new_arc(
-                    ConstructInfo::new(function_call_id.with_child_id(4), None, "ElementText[settings: [style]]"),
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(4),
+                        None,
+                        "ElementText[settings: [style]]",
+                    ),
                     construct_context.clone(),
                     "style",
                     argument_style.clone(),
@@ -3672,7 +3721,11 @@ pub fn function_element_text(
                     actor_context.scope.clone(),
                 ),
                 Variable::new_arc(
-                    ConstructInfo::new(function_call_id.with_child_id(5), None, "ElementText[settings: [text]]"),
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(5),
+                        None,
+                        "ElementText[settings: [text]]",
+                    ),
                     construct_context.clone(),
                     "text",
                     argument_text.clone(),
@@ -3686,7 +3739,11 @@ pub fn function_element_text(
     ));
 
     TaggedObject::new_constant(
-        ConstructInfo::new(function_call_id.with_child_id(0), None, "Element/text(..) -> ElementText[..]"),
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/text(..) -> ElementText[..]",
+        ),
         construct_context,
         ValueIdempotencyKey::new(),
         "ElementText",
@@ -3714,7 +3771,11 @@ pub fn function_element_block(
 
     if let Some(argument_element) = argument_element {
         vars.push(Variable::new_arc(
-            ConstructInfo::new(function_call_id.with_child_id(1), None, "ElementBlock[element]"),
+            ConstructInfo::new(
+                function_call_id.with_child_id(1),
+                None,
+                "ElementBlock[element]",
+            ),
             construct_context.clone(),
             "element",
             argument_element.clone(),
@@ -3724,17 +3785,29 @@ pub fn function_element_block(
     }
 
     vars.push(Variable::new_arc(
-        ConstructInfo::new(function_call_id.with_child_id(2), None, "ElementBlock[settings]"),
+        ConstructInfo::new(
+            function_call_id.with_child_id(2),
+            None,
+            "ElementBlock[settings]",
+        ),
         construct_context.clone(),
         "settings",
         Object::new_arc_value_actor(
-            ConstructInfo::new(function_call_id.with_child_id(3), None, "ElementBlock[settings: [..]]"),
+            ConstructInfo::new(
+                function_call_id.with_child_id(3),
+                None,
+                "ElementBlock[settings: [..]]",
+            ),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
             actor_context.clone(),
             [
                 Variable::new_arc(
-                    ConstructInfo::new(function_call_id.with_child_id(4), None, "ElementBlock[settings: [style]]"),
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(4),
+                        None,
+                        "ElementBlock[settings: [style]]",
+                    ),
                     construct_context.clone(),
                     "style",
                     argument_style.clone(),
@@ -3742,7 +3815,11 @@ pub fn function_element_block(
                     actor_context.scope.clone(),
                 ),
                 Variable::new_arc(
-                    ConstructInfo::new(function_call_id.with_child_id(5), None, "ElementBlock[settings: [child]]"),
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(5),
+                        None,
+                        "ElementBlock[settings: [child]]",
+                    ),
                     construct_context.clone(),
                     "child",
                     argument_child.clone(),
@@ -3756,7 +3833,11 @@ pub fn function_element_block(
     ));
 
     TaggedObject::new_constant(
-        ConstructInfo::new(function_call_id.with_child_id(0), None, "Element/block(..) -> ElementBlock[..]"),
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/block(..) -> ElementBlock[..]",
+        ),
         construct_context,
         ValueIdempotencyKey::new(),
         "ElementBlock",
@@ -3788,7 +3869,11 @@ pub fn function_scene_new(
     let mut vars: Vec<Arc<Variable>> = Vec::new();
 
     vars.push(Variable::new_arc(
-        ConstructInfo::new(function_call_id.with_child_id(1), None, "Scene/new(..) -> [root_element]"),
+        ConstructInfo::new(
+            function_call_id.with_child_id(1),
+            None,
+            "Scene/new(..) -> [root_element]",
+        ),
         construct_context.clone(),
         "root_element",
         argument_root.clone(),
@@ -3798,7 +3883,11 @@ pub fn function_scene_new(
 
     if let Some(argument_lights) = argument_lights {
         vars.push(Variable::new_arc(
-            ConstructInfo::new(function_call_id.with_child_id(2), None, "Scene/new(..) -> [lights]"),
+            ConstructInfo::new(
+                function_call_id.with_child_id(2),
+                None,
+                "Scene/new(..) -> [lights]",
+            ),
             construct_context.clone(),
             "lights",
             argument_lights.clone(),
@@ -3809,7 +3898,11 @@ pub fn function_scene_new(
 
     if let Some(argument_geometry) = argument_geometry {
         vars.push(Variable::new_arc(
-            ConstructInfo::new(function_call_id.with_child_id(3), None, "Scene/new(..) -> [geometry]"),
+            ConstructInfo::new(
+                function_call_id.with_child_id(3),
+                None,
+                "Scene/new(..) -> [geometry]",
+            ),
             construct_context.clone(),
             "geometry",
             argument_geometry.clone(),
@@ -3819,7 +3912,11 @@ pub fn function_scene_new(
     }
 
     Object::new_constant(
-        ConstructInfo::new(function_call_id.with_child_id(0), None, "Scene/new(..) -> []"),
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Scene/new(..) -> []",
+        ),
         construct_context,
         ValueIdempotencyKey::new(),
         vars,
@@ -3837,41 +3934,87 @@ pub fn function_light_directional(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [arg_azimuth, arg_altitude, arg_spread, arg_intensity, arg_color] = arguments.as_slice() else {
+    let [
+        arg_azimuth,
+        arg_altitude,
+        arg_spread,
+        arg_intensity,
+        arg_color,
+    ] = arguments.as_slice()
+    else {
         panic!("Light/directional expects 5 arguments")
     };
     let scoped_id = function_call_persistence_id;
 
     TaggedObject::new_constant(
-        ConstructInfo::new(function_call_id.with_child_id(0), None, "Light/directional(..) -> DirectionalLight[..]"),
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Light/directional(..) -> DirectionalLight[..]",
+        ),
         construct_context.clone(),
         ValueIdempotencyKey::new(),
         "DirectionalLight",
         [
             Variable::new_arc(
-                ConstructInfo::new(function_call_id.with_child_id(1), None, "DirectionalLight[azimuth]"),
-                construct_context.clone(), "azimuth", arg_azimuth.clone(),
-                scoped_id.with_child_index(1), actor_context.scope.clone(),
+                ConstructInfo::new(
+                    function_call_id.with_child_id(1),
+                    None,
+                    "DirectionalLight[azimuth]",
+                ),
+                construct_context.clone(),
+                "azimuth",
+                arg_azimuth.clone(),
+                scoped_id.with_child_index(1),
+                actor_context.scope.clone(),
             ),
             Variable::new_arc(
-                ConstructInfo::new(function_call_id.with_child_id(2), None, "DirectionalLight[altitude]"),
-                construct_context.clone(), "altitude", arg_altitude.clone(),
-                scoped_id.with_child_index(2), actor_context.scope.clone(),
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "DirectionalLight[altitude]",
+                ),
+                construct_context.clone(),
+                "altitude",
+                arg_altitude.clone(),
+                scoped_id.with_child_index(2),
+                actor_context.scope.clone(),
             ),
             Variable::new_arc(
-                ConstructInfo::new(function_call_id.with_child_id(3), None, "DirectionalLight[spread]"),
-                construct_context.clone(), "spread", arg_spread.clone(),
-                scoped_id.with_child_index(3), actor_context.scope.clone(),
+                ConstructInfo::new(
+                    function_call_id.with_child_id(3),
+                    None,
+                    "DirectionalLight[spread]",
+                ),
+                construct_context.clone(),
+                "spread",
+                arg_spread.clone(),
+                scoped_id.with_child_index(3),
+                actor_context.scope.clone(),
             ),
             Variable::new_arc(
-                ConstructInfo::new(function_call_id.with_child_id(4), None, "DirectionalLight[intensity]"),
-                construct_context.clone(), "intensity", arg_intensity.clone(),
-                scoped_id.with_child_index(4), actor_context.scope.clone(),
+                ConstructInfo::new(
+                    function_call_id.with_child_id(4),
+                    None,
+                    "DirectionalLight[intensity]",
+                ),
+                construct_context.clone(),
+                "intensity",
+                arg_intensity.clone(),
+                scoped_id.with_child_index(4),
+                actor_context.scope.clone(),
             ),
             Variable::new_arc(
-                ConstructInfo::new(function_call_id.with_child_id(5), None, "DirectionalLight[color]"),
-                construct_context, "color", arg_color.clone(),
-                scoped_id.with_child_index(5), actor_context.scope,
+                ConstructInfo::new(
+                    function_call_id.with_child_id(5),
+                    None,
+                    "DirectionalLight[color]",
+                ),
+                construct_context,
+                "color",
+                arg_color.clone(),
+                scoped_id.with_child_index(5),
+                actor_context.scope,
             ),
         ],
     )
@@ -3892,20 +4035,38 @@ pub fn function_light_ambient(
     let scoped_id = function_call_persistence_id;
 
     TaggedObject::new_constant(
-        ConstructInfo::new(function_call_id.with_child_id(0), None, "Light/ambient(..) -> AmbientLight[..]"),
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Light/ambient(..) -> AmbientLight[..]",
+        ),
         construct_context.clone(),
         ValueIdempotencyKey::new(),
         "AmbientLight",
         [
             Variable::new_arc(
-                ConstructInfo::new(function_call_id.with_child_id(1), None, "AmbientLight[intensity]"),
-                construct_context.clone(), "intensity", arg_intensity.clone(),
-                scoped_id.with_child_index(1), actor_context.scope.clone(),
+                ConstructInfo::new(
+                    function_call_id.with_child_id(1),
+                    None,
+                    "AmbientLight[intensity]",
+                ),
+                construct_context.clone(),
+                "intensity",
+                arg_intensity.clone(),
+                scoped_id.with_child_index(1),
+                actor_context.scope.clone(),
             ),
             Variable::new_arc(
-                ConstructInfo::new(function_call_id.with_child_id(2), None, "AmbientLight[color]"),
-                construct_context, "color", arg_color.clone(),
-                scoped_id.with_child_index(2), actor_context.scope,
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "AmbientLight[color]",
+                ),
+                construct_context,
+                "color",
+                arg_color.clone(),
+                scoped_id.with_child_index(2),
+                actor_context.scope,
             ),
         ],
     )
@@ -4610,7 +4771,11 @@ pub fn function_text_length(
             _ => panic!("Text/length expects a Text value"),
         };
         Number::new_value(
-            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/length result"),
+            ConstructInfo::new(
+                function_call_id.with_child_id(0),
+                None,
+                "Text/length result",
+            ),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
             text.chars().count() as f64,
@@ -4630,7 +4795,10 @@ pub fn function_text_char_at(
     let [argument_text, argument_index] = arguments.as_slice() else {
         panic!("Text/char_at expects 2 arguments")
     };
-    enum Input { Text(String), Index(f64) }
+    enum Input {
+        Text(String),
+        Index(f64),
+    }
     let text_stream = argument_text.clone().stream().map(|v| match &v {
         Value::Text(t, _) => Input::Text(t.text().to_string()),
         _ => panic!("Text/char_at expects Text for first argument"),
@@ -4640,24 +4808,35 @@ pub fn function_text_char_at(
         _ => panic!("Text/char_at expects Number for index argument"),
     });
     stream::select(text_stream, index_stream)
-        .scan((None::<String>, None::<f64>), move |(last_text, last_index), input| {
-            match input {
-                Input::Text(t) => *last_text = Some(t),
-                Input::Index(i) => *last_index = Some(i),
-            }
-            if let (Some(text), Some(index)) = (last_text.as_ref(), *last_index) {
-                let idx = index as usize;
-                let ch = text.chars().nth(idx).map(|c| c.to_string()).unwrap_or_default();
-                future::ready(Some(Some(Text::new_value(
-                    ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/char_at result"),
-                    construct_context.clone(),
-                    ValueIdempotencyKey::new(),
-                    ch,
-                ))))
-            } else {
-                future::ready(Some(None))
-            }
-        })
+        .scan(
+            (None::<String>, None::<f64>),
+            move |(last_text, last_index), input| {
+                match input {
+                    Input::Text(t) => *last_text = Some(t),
+                    Input::Index(i) => *last_index = Some(i),
+                }
+                if let (Some(text), Some(index)) = (last_text.as_ref(), *last_index) {
+                    let idx = index as usize;
+                    let ch = text
+                        .chars()
+                        .nth(idx)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default();
+                    future::ready(Some(Some(Text::new_value(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(0),
+                            None,
+                            "Text/char_at result",
+                        ),
+                        construct_context.clone(),
+                        ValueIdempotencyKey::new(),
+                        ch,
+                    ))))
+                } else {
+                    future::ready(Some(None))
+                }
+            },
+        )
         .filter_map(future::ready)
 }
 
@@ -4673,7 +4852,10 @@ pub fn function_text_find(
     let [argument_text, argument_search] = arguments.as_slice() else {
         panic!("Text/find expects 2 arguments")
     };
-    enum Input { Text(String), Search(String) }
+    enum Input {
+        Text(String),
+        Search(String),
+    }
     let text_stream = argument_text.clone().stream().map(|v| match &v {
         Value::Text(t, _) => Input::Text(t.text().to_string()),
         _ => panic!("Text/find expects Text for first argument"),
@@ -4683,27 +4865,34 @@ pub fn function_text_find(
         _ => panic!("Text/find expects Text for search argument"),
     });
     stream::select(text_stream, search_stream)
-        .scan((None::<String>, None::<String>), move |(last_text, last_search), input| {
-            match input {
-                Input::Text(t) => *last_text = Some(t),
-                Input::Search(s) => *last_search = Some(s),
-            }
-            if let (Some(text), Some(search)) = (last_text.as_ref(), last_search.as_ref()) {
-                // Find byte offset, then convert to char index
-                let result = match text.find(search.as_str()) {
-                    Some(byte_offset) => text[..byte_offset].chars().count() as f64,
-                    None => -1.0,
-                };
-                future::ready(Some(Some(Number::new_value(
-                    ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/find result"),
-                    construct_context.clone(),
-                    ValueIdempotencyKey::new(),
-                    result,
-                ))))
-            } else {
-                future::ready(Some(None))
-            }
-        })
+        .scan(
+            (None::<String>, None::<String>),
+            move |(last_text, last_search), input| {
+                match input {
+                    Input::Text(t) => *last_text = Some(t),
+                    Input::Search(s) => *last_search = Some(s),
+                }
+                if let (Some(text), Some(search)) = (last_text.as_ref(), last_search.as_ref()) {
+                    // Find byte offset, then convert to char index
+                    let result = match text.find(search.as_str()) {
+                        Some(byte_offset) => text[..byte_offset].chars().count() as f64,
+                        None => -1.0,
+                    };
+                    future::ready(Some(Some(Number::new_value(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(0),
+                            None,
+                            "Text/find result",
+                        ),
+                        construct_context.clone(),
+                        ValueIdempotencyKey::new(),
+                        result,
+                    ))))
+                } else {
+                    future::ready(Some(None))
+                }
+            },
+        )
         .filter_map(future::ready)
 }
 
@@ -4718,10 +4907,16 @@ pub fn function_text_find_closing(
     construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [argument_text, argument_open, argument_close, argument_start] = arguments.as_slice() else {
+    let [argument_text, argument_open, argument_close, argument_start] = arguments.as_slice()
+    else {
         panic!("Text/find_closing expects 4 arguments")
     };
-    enum Input { Text(String), Open(String), Close(String), Start(f64) }
+    enum Input {
+        Text(String),
+        Open(String),
+        Close(String),
+        Start(f64),
+    }
     let text_stream = argument_text.clone().stream().map(|v| match &v {
         Value::Text(t, _) => Input::Text(t.text().to_string()),
         _ => panic!("Text/find_closing expects Text for first argument"),
@@ -4751,9 +4946,12 @@ pub fn function_text_find_closing(
                 Input::Close(c) => *last_close = Some(c),
                 Input::Start(s) => *last_start = Some(s),
             }
-            if let (Some(text), Some(open), Some(close), Some(start)) =
-                (last_text.as_ref(), last_open.as_ref(), last_close.as_ref(), *last_start)
-            {
+            if let (Some(text), Some(open), Some(close), Some(start)) = (
+                last_text.as_ref(),
+                last_open.as_ref(),
+                last_close.as_ref(),
+                *last_start,
+            ) {
                 let start_idx = start as usize;
                 let open_char = open.chars().next().unwrap_or('(');
                 let close_char = close.chars().next().unwrap_or(')');
@@ -4774,7 +4972,11 @@ pub fn function_text_find_closing(
                     }
                 }
                 future::ready(Some(Some(Number::new_value(
-                    ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/find_closing result"),
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "Text/find_closing result",
+                    ),
                     construct_context.clone(),
                     ValueIdempotencyKey::new(),
                     result,
@@ -4799,7 +5001,11 @@ pub fn function_text_substring(
     let [argument_text, argument_start, argument_length] = arguments.as_slice() else {
         panic!("Text/substring expects 3 arguments")
     };
-    enum Input { Text(String), Start(f64), Length(f64) }
+    enum Input {
+        Text(String),
+        Start(f64),
+        Length(f64),
+    }
     let text_stream = argument_text.clone().stream().map(|v| match &v {
         Value::Text(t, _) => Input::Text(t.text().to_string()),
         _ => panic!("Text/substring expects Text for first argument"),
@@ -4828,7 +5034,11 @@ pub fn function_text_substring(
                     let len = (length as isize).max(0) as usize;
                     let result: String = text.chars().skip(start_idx).take(len).collect();
                     future::ready(Some(Some(Text::new_value(
-                        ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/substring result"),
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(0),
+                            None,
+                            "Text/substring result",
+                        ),
                         construct_context.clone(),
                         ValueIdempotencyKey::new(),
                         result,
@@ -4858,7 +5068,11 @@ pub fn function_text_to_uppercase(
             _ => panic!("Text/to_uppercase expects a Text value"),
         };
         Text::new_value(
-            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/to_uppercase result"),
+            ConstructInfo::new(
+                function_call_id.with_child_id(0),
+                None,
+                "Text/to_uppercase result",
+            ),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
             text.to_uppercase(),
@@ -4885,7 +5099,11 @@ pub fn function_text_char_code(
         };
         let code = text.chars().next().map(|c| c as u32 as f64).unwrap_or(0.0);
         Number::new_value(
-            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/char_code result"),
+            ConstructInfo::new(
+                function_call_id.with_child_id(0),
+                None,
+                "Text/char_code result",
+            ),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
             code,
@@ -4912,7 +5130,11 @@ pub fn function_text_from_char_code(
         };
         let ch = char::from_u32(code as u32).unwrap_or('\0');
         Text::new_value(
-            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/from_char_code result"),
+            ConstructInfo::new(
+                function_call_id.with_child_id(0),
+                None,
+                "Text/from_char_code result",
+            ),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
             ch.to_string(),
@@ -4978,7 +5200,11 @@ pub fn function_list_get(
     let construct_context_for_oob = _construct_context.clone();
     switch_map(item_stream, move |(list, index)| {
         // Convert 1-based Boon index to 0-based Rust index
-        let idx = if index >= 1.0 { (index as usize) - 1 } else { usize::MAX };
+        let idx = if index >= 1.0 {
+            (index as usize) - 1
+        } else {
+            usize::MAX
+        };
         let function_call_id = function_call_id.clone();
         let construct_context = construct_context_for_oob.clone();
         list.stream()
@@ -4989,14 +5215,16 @@ pub fn function_list_get(
             .flat_map(move |item_opt| -> LocalBoxStream<'static, Value> {
                 match item_opt {
                     Some(actor) => Box::pin(actor.stream()),
-                    None => Box::pin(stream::once(future::ready(
-                        Tag::new_value(
-                            ConstructInfo::new(function_call_id.with_child_id(0), None, "List/get OutOfBounds"),
-                            construct_context.clone(),
-                            ValueIdempotencyKey::new(),
-                            "OutOfBounds".to_string(),
+                    None => Box::pin(stream::once(future::ready(Tag::new_value(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(0),
+                            None,
+                            "List/get OutOfBounds",
                         ),
-                    ))),
+                        construct_context.clone(),
+                        ValueIdempotencyKey::new(),
+                        "OutOfBounds".to_string(),
+                    )))),
                 }
             })
     })
@@ -5116,16 +5344,22 @@ pub fn function_list_sum(
                     let function_call_id = function_call_id.clone();
                     if items.is_empty() {
                         return stream::once(future::ready(Number::new_value(
-                            ConstructInfo::new(function_call_id.with_child_id(0), None, "List/sum empty"),
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(0),
+                                None,
+                                "List/sum empty",
+                            ),
                             construct_context,
                             ValueIdempotencyKey::new(),
                             0.0,
                         )))
                         .left_stream();
                     }
-                    let streams: Vec<_> = items.iter().enumerate().map(|(i, item)| {
-                        item.clone().stream().map(move |v| (i, v))
-                    }).collect();
+                    let streams: Vec<_> = items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| item.clone().stream().map(move |v| (i, v)))
+                        .collect();
                     let item_count = items.len();
                     stream::select_all(streams)
                         .scan(vec![0.0f64; item_count], move |values, (i, value)| {
@@ -5134,7 +5368,11 @@ pub fn function_list_sum(
                             }
                             let sum: f64 = values.iter().sum();
                             future::ready(Some(Number::new_value(
-                                ConstructInfo::new(function_call_id.with_child_id(0), None, "List/sum result"),
+                                ConstructInfo::new(
+                                    function_call_id.with_child_id(0),
+                                    None,
+                                    "List/sum result",
+                                ),
                                 construct_context.clone(),
                                 ValueIdempotencyKey::new(),
                                 sum,
@@ -5177,16 +5415,22 @@ pub fn function_list_product(
                     let function_call_id = function_call_id.clone();
                     if items.is_empty() {
                         return stream::once(future::ready(Number::new_value(
-                            ConstructInfo::new(function_call_id.with_child_id(0), None, "List/product empty"),
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(0),
+                                None,
+                                "List/product empty",
+                            ),
                             construct_context,
                             ValueIdempotencyKey::new(),
                             1.0,
                         )))
                         .left_stream();
                     }
-                    let streams: Vec<_> = items.iter().enumerate().map(|(i, item)| {
-                        item.clone().stream().map(move |v| (i, v))
-                    }).collect();
+                    let streams: Vec<_> = items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| item.clone().stream().map(move |v| (i, v)))
+                        .collect();
                     let item_count = items.len();
                     stream::select_all(streams)
                         .scan(vec![1.0f64; item_count], move |values, (i, value)| {
@@ -5195,7 +5439,11 @@ pub fn function_list_product(
                             }
                             let product: f64 = values.iter().product();
                             future::ready(Some(Number::new_value(
-                                ConstructInfo::new(function_call_id.with_child_id(0), None, "List/product result"),
+                                ConstructInfo::new(
+                                    function_call_id.with_child_id(0),
+                                    None,
+                                    "List/product result",
+                                ),
                                 construct_context.clone(),
                                 ValueIdempotencyKey::new(),
                                 product,
@@ -5220,7 +5468,10 @@ pub fn function_math_modulo(
     let [argument_a, argument_divisor] = arguments.as_slice() else {
         panic!("Math/modulo expects 2 arguments")
     };
-    enum Input { A(f64), Divisor(f64) }
+    enum Input {
+        A(f64),
+        Divisor(f64),
+    }
     let a_stream = argument_a.clone().stream().map(|v| match &v {
         Value::Number(n, _) => Input::A(n.number()),
         _ => panic!("Math/modulo expects Number arguments"),
@@ -5230,21 +5481,28 @@ pub fn function_math_modulo(
         _ => panic!("Math/modulo expects Number arguments"),
     });
     stream::select(a_stream, divisor_stream)
-        .scan((None::<f64>, None::<f64>), move |(last_a, last_divisor), input| {
-            match input {
-                Input::A(val) => *last_a = Some(val),
-                Input::Divisor(val) => *last_divisor = Some(val),
-            }
-            if let (Some(a), Some(divisor)) = (*last_a, *last_divisor) {
-                future::ready(Some(Some(Number::new_value(
-                    ConstructInfo::new(function_call_id.with_child_id(0), None, "Math/modulo result"),
-                    construct_context.clone(),
-                    ValueIdempotencyKey::new(),
-                    a % divisor,
-                ))))
-            } else {
-                future::ready(Some(None))
-            }
-        })
+        .scan(
+            (None::<f64>, None::<f64>),
+            move |(last_a, last_divisor), input| {
+                match input {
+                    Input::A(val) => *last_a = Some(val),
+                    Input::Divisor(val) => *last_divisor = Some(val),
+                }
+                if let (Some(a), Some(divisor)) = (*last_a, *last_divisor) {
+                    future::ready(Some(Some(Number::new_value(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(0),
+                            None,
+                            "Math/modulo result",
+                        ),
+                        construct_context.clone(),
+                        ValueIdempotencyKey::new(),
+                        a % divisor,
+                    ))))
+                } else {
+                    future::ready(Some(None))
+                }
+            },
+        )
         .filter_map(future::ready)
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ariadne::{Config, Label, Report, ReportKind, Source};
 use chumsky::input::Stream;
 use serde_json_any_key::MapIterToJson;
-use zoon::{UnwrapThrowExt, WebStorage, eprintln, local_storage, println};
+use zoon::{UnwrapThrowExt, WebStorage, eprintln, local_storage, println, serde_json};
 
 /// Set to false to disable verbose source code and AST logging in console
 const LOG_SOURCE_AND_AST: bool = false;
@@ -136,9 +136,7 @@ pub fn run(
     // Skip when persistence is disabled (empty key).
     if !changed_variable_ids.is_empty() && !states_local_storage_key.is_empty() {
         if let Some(Ok(mut states)) = local_storage()
-            .get::<std::collections::BTreeMap<String, serde_json::Value>>(
-                &states_local_storage_key,
-            )
+            .get::<std::collections::BTreeMap<String, serde_json::Value>>(&states_local_storage_key)
         {
             let before = states.len();
             for id in &changed_variable_ids {
@@ -320,9 +318,7 @@ pub fn run_with_registry(
     // Skip when persistence is disabled (empty key).
     if !changed_variable_ids.is_empty() && !states_local_storage_key.is_empty() {
         if let Some(Ok(mut states)) = local_storage()
-            .get::<std::collections::BTreeMap<String, serde_json::Value>>(
-                &states_local_storage_key,
-            )
+            .get::<std::collections::BTreeMap<String, serde_json::Value>>(&states_local_storage_key)
         {
             let before = states.len();
             for id in &changed_variable_ids {

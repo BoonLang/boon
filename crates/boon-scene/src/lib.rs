@@ -219,6 +219,73 @@ pub enum SceneDiff {
     },
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderDiffBatch {
+    pub ops: Vec<RenderOp>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenderOp {
+    ReplaceRoot(RenderRoot),
+    InsertChild {
+        parent: NodeId,
+        index: usize,
+        node: RenderNode,
+    },
+    RemoveNode {
+        id: NodeId,
+    },
+    MoveChild {
+        parent: NodeId,
+        id: NodeId,
+        index: usize,
+    },
+    SetText {
+        id: NodeId,
+        text: String,
+    },
+    SetProperty {
+        id: NodeId,
+        name: String,
+        value: Option<String>,
+    },
+    SetStyle {
+        id: NodeId,
+        name: String,
+        value: Option<String>,
+    },
+    SetClassFlag {
+        id: NodeId,
+        class_name: String,
+        enabled: bool,
+    },
+    AttachEventPort {
+        id: NodeId,
+        port: EventPortId,
+        kind: UiEventKind,
+    },
+    DetachEventPort {
+        id: NodeId,
+        port: EventPortId,
+    },
+    SetInputValue {
+        id: NodeId,
+        value: String,
+    },
+    SetChecked {
+        id: NodeId,
+        checked: bool,
+    },
+    SetSelectedIndex {
+        id: NodeId,
+        index: Option<usize>,
+    },
+    UpdateSceneParam {
+        name: String,
+        value: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RenderNode {
     Ui(UiNode),
@@ -271,7 +338,32 @@ pub enum UiFactKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{PhysicalSceneParams, RenderRootHandle, RenderSurface};
+    use super::{
+        EventPortId, NodeId, PhysicalSceneParams, RenderDiffBatch, RenderNode, RenderOp,
+        RenderRoot, RenderRootHandle, RenderSurface, SceneNode, SceneNodeKind, UiEventKind, UiNode,
+        UiNodeKind,
+    };
+
+    fn sample_ui_root() -> RenderRoot {
+        RenderRoot::UiTree(
+            UiNode::new(UiNodeKind::Element {
+                tag: "button".to_string(),
+                text: Some("Press".to_string()),
+                event_ports: Vec::new(),
+            })
+            .with_children(vec![UiNode::new(UiNodeKind::Text {
+                text: "Child".to_string(),
+            })]),
+        )
+    }
+
+    fn sample_scene_root() -> RenderRoot {
+        RenderRoot::SceneGraph(SceneNode::new(SceneNodeKind::Group).with_children(vec![
+            SceneNode::new(SceneNodeKind::Label {
+                text: "Scene".to_string(),
+            }),
+        ]))
+    }
 
     #[test]
     fn render_surface_reports_scene_mode() {
@@ -312,5 +404,130 @@ mod tests {
         assert_eq!(params.ambient_factor, 0.3);
         assert_eq!(params.bevel_angle, 135.0);
         assert!((params.shadow_opacity() - 0.168).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn render_diff_batch_round_trips_via_serde() {
+        let parent = NodeId::new();
+        let node = UiNode::new(UiNodeKind::Element {
+            tag: "div".to_string(),
+            text: None,
+            event_ports: Vec::new(),
+        });
+        let port = EventPortId::new();
+        let batch = RenderDiffBatch {
+            ops: vec![
+                RenderOp::ReplaceRoot(sample_ui_root()),
+                RenderOp::InsertChild {
+                    parent,
+                    index: 1,
+                    node: RenderNode::Ui(node.clone()),
+                },
+                RenderOp::AttachEventPort {
+                    id: node.id,
+                    port,
+                    kind: UiEventKind::Click,
+                },
+                RenderOp::SetSelectedIndex {
+                    id: node.id,
+                    index: None,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&batch).expect("batch should serialize");
+        let restored: RenderDiffBatch =
+            serde_json::from_str(&json).expect("batch should deserialize");
+
+        assert_eq!(restored, batch);
+    }
+
+    #[test]
+    fn move_child_preserves_target_parent_and_index() {
+        let parent = NodeId::new();
+        let child = NodeId::new();
+        let op = RenderOp::MoveChild {
+            parent,
+            id: child,
+            index: 3,
+        };
+
+        match op {
+            RenderOp::MoveChild {
+                parent: p,
+                id,
+                index,
+            } => {
+                assert_eq!(p, parent);
+                assert_eq!(id, child);
+                assert_eq!(index, 3);
+            }
+            other => panic!("expected MoveChild, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_and_detach_event_port_keep_port_identity() {
+        let id = NodeId::new();
+        let port = EventPortId::new();
+        let attach = RenderOp::AttachEventPort {
+            id,
+            port,
+            kind: UiEventKind::DoubleClick,
+        };
+        let detach = RenderOp::DetachEventPort { id, port };
+
+        match attach {
+            RenderOp::AttachEventPort {
+                id: a_id,
+                port: a_port,
+                kind,
+            } => {
+                assert_eq!(a_id, id);
+                assert_eq!(a_port, port);
+                assert_eq!(kind, UiEventKind::DoubleClick);
+            }
+            other => panic!("expected AttachEventPort, got {other:?}"),
+        }
+
+        match detach {
+            RenderOp::DetachEventPort {
+                id: d_id,
+                port: d_port,
+            } => {
+                assert_eq!(d_id, id);
+                assert_eq!(d_port, port);
+            }
+            other => panic!("expected DetachEventPort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_selected_index_allows_none() {
+        let op = RenderOp::SetSelectedIndex {
+            id: NodeId::new(),
+            index: None,
+        };
+
+        match op {
+            RenderOp::SetSelectedIndex { index, .. } => assert_eq!(index, None),
+            other => panic!("expected SetSelectedIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replace_root_accepts_ui_and_scene_roots() {
+        let ui = RenderOp::ReplaceRoot(sample_ui_root());
+        let scene = RenderOp::ReplaceRoot(sample_scene_root());
+
+        match ui {
+            RenderOp::ReplaceRoot(RenderRoot::UiTree(_)) => {}
+            other => panic!("expected UI root replacement, got {other:?}"),
+        }
+
+        match scene {
+            RenderOp::ReplaceRoot(RenderRoot::SceneGraph(_)) => {}
+            other => panic!("expected scene root replacement, got {other:?}"),
+        }
     }
 }

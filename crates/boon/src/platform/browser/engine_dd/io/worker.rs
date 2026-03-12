@@ -44,18 +44,49 @@ fn dd_debug_log(message: &str) {
 /// DataflowGraph's InputSpec entries.
 #[derive(Clone, Debug)]
 pub enum Event {
-    LinkPress { link_path: String },
-    LinkClick { link_path: String },
-    KeyDown { link_path: String, key: String, text: String },
-    TextChange { link_path: String, text: String },
-    NumberChange { link_path: String, value: f64 },
-    Blur { link_path: String },
-    Focus { link_path: String },
-    DoubleClick { link_path: String },
-    SvgClick { link_path: String, x: f64, y: f64 },
-    HoverChange { link_path: String, hovered: bool },
-    TimerTick { var_name: String },
-    RouterChange { path: String },
+    LinkPress {
+        link_path: String,
+    },
+    LinkClick {
+        link_path: String,
+    },
+    KeyDown {
+        link_path: String,
+        key: String,
+        text: String,
+    },
+    TextChange {
+        link_path: String,
+        text: String,
+    },
+    NumberChange {
+        link_path: String,
+        value: f64,
+    },
+    Blur {
+        link_path: String,
+    },
+    Focus {
+        link_path: String,
+    },
+    DoubleClick {
+        link_path: String,
+    },
+    SvgClick {
+        link_path: String,
+        x: f64,
+        y: f64,
+    },
+    HoverChange {
+        link_path: String,
+        hovered: bool,
+    },
+    TimerTick {
+        var_name: String,
+    },
+    RouterChange {
+        path: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -352,24 +383,27 @@ impl DdWorkerHandle {
         let (link_path, event_value) = match event {
             Event::LinkPress { link_path } => (link_path, Value::tag("Press")),
             Event::LinkClick { link_path } => (link_path, Value::tag("Click")),
-            Event::KeyDown { link_path, key, text } => {
-                (
-                    link_path,
-                    Value::object([
-                        ("key", Value::tag(key.as_str())),
-                        ("text", Value::text(text)),
-                    ]),
-                )
-            }
+            Event::KeyDown {
+                link_path,
+                key,
+                text,
+            } => (
+                link_path,
+                Value::object([
+                    ("key", Value::tag(key.as_str())),
+                    ("text", Value::text(text)),
+                ]),
+            ),
             Event::TextChange { link_path, text } => {
                 (link_path, Value::object([("text", Value::text(text))]))
             }
             Event::NumberChange { link_path, value } => {
                 (link_path, Value::object([("value", Value::number(value))]))
             }
-            Event::SvgClick { link_path, x, y } => {
-                (link_path, Value::object([("x", Value::number(x)), ("y", Value::number(y))]))
-            }
+            Event::SvgClick { link_path, x, y } => (
+                link_path,
+                Value::object([("x", Value::number(x)), ("y", Value::number(y))]),
+            ),
             Event::Blur { link_path } => (link_path, Value::tag("Blur")),
             Event::Focus { link_path } => (link_path, Value::tag("Focus")),
             Event::DoubleClick { link_path } => (link_path, Value::tag("DoubleClick")),
@@ -424,7 +458,8 @@ impl DdWorkerHandle {
                             let has_keyed = !self.keyed_diff_buffer.borrow().is_empty();
                             if trace_crud || trace_cells {
                                 let output_summary = if trace_cells {
-                                    let output_text = inner.output_cell.borrow().to_display_string();
+                                    let output_text =
+                                        inner.output_cell.borrow().to_display_string();
                                     let preview: String = output_text.chars().take(160).collect();
                                     preview
                                 } else {
@@ -600,10 +635,14 @@ impl DdWorkerHandle {
 #[cfg(test)]
 mod tests {
     use super::{DdWorkerHandle, Event};
-    use crate::platform::browser::engine_dd::core::compile::{compile, CompiledProgram};
+    use crate::platform::browser::engine_dd::core::compile::{CompiledProgram, compile};
     use crate::platform::browser::engine_dd::core::types::KeyedDiff;
     use crate::platform::browser::engine_dd::core::value::Value;
     use crate::platform::browser::engine_dd::render::bridge::build_retained_tree;
+    use crate::platform::browser::kernel::{
+        ExprId, KernelValue, LatestCandidate, Runtime as KernelRuntime, RuntimeUpdate, ScopeId,
+        SlotKey, TickId, TickSeq, Trigger, select_latest,
+    };
     use boon_scene::RenderSurface;
     use std::path::PathBuf;
 
@@ -612,10 +651,100 @@ mod tests {
         std::fs::read_to_string(base.join(path)).expect("read example source")
     }
 
+    fn latest_conformance_source() -> &'static str {
+        r#"
+left_button: LINK
+right_button: LINK
+
+selected: LATEST {
+    left_button.event.press |> THEN { TEXT { left } }
+    right_button.event.press |> THEN { TEXT { right } }
+}
+
+document: Document/new(root:
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: []
+        items: LIST {
+            Element/button(
+                element: [event: [press: LINK]]
+                label: TEXT { Left }
+                style: []
+            ) |> LINK { left_button }
+            Element/button(
+                element: [event: [press: LINK]]
+                label: TEXT { Right }
+                style: []
+            ) |> LINK { right_button }
+            Element/label(
+                element: []
+                style: []
+                label: selected
+            )
+        }
+    )
+)
+"#
+    }
+
+    fn hold_conformance_source() -> &'static str {
+        r#"
+increment_button: LINK
+
+counter: 0 |> HOLD state {
+    increment_button.event.press |> THEN { state + 1 }
+}
+
+document: Document/new(root:
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: []
+        items: LIST {
+            Element/button(
+                element: [event: [press: LINK]]
+                label: TEXT { Increment }
+                style: []
+            ) |> LINK { increment_button }
+            Element/label(
+                element: []
+                style: []
+                label: counter
+            )
+        }
+    )
+)
+"#
+    }
+
+    fn kernel_counter_after_presses(presses: usize) -> KernelValue {
+        let mut runtime = KernelRuntime::new();
+        let slot = SlotKey::new(ScopeId::ROOT, ExprId(1));
+        runtime.create_hold(slot, 0.0.into());
+
+        for seq in 1..=presses {
+            let current = match runtime.hold(slot).expect("counter hold").value() {
+                KernelValue::Number(value) => *value,
+                other => panic!("expected numeric HOLD state, got {other:?}"),
+            };
+            runtime.commit_updates(vec![RuntimeUpdate::HoldValue {
+                slot,
+                value: KernelValue::from(current + 1.0),
+                trigger: Trigger::System {
+                    seq: TickSeq::new(runtime.tick(), seq as u32),
+                },
+            }]);
+        }
+
+        runtime.hold(slot).expect("counter hold").value().clone()
+    }
+
     #[test]
     fn crud_graph_materializes_into_worker() {
-        let source =
-            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let source = read_example("../../playground/frontend/src/examples/crud/crud.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("crud should compile");
         let CompiledProgram::Dataflow { graph } = program else {
@@ -633,6 +762,98 @@ mod tests {
         let output = handle.current_output();
 
         assert_ne!(output, Value::Unit);
+    }
+
+    #[test]
+    fn latest_press_sequence_matches_reference_kernel_selection() {
+        let program = compile(
+            latest_conformance_source(),
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .expect("LATEST conformance program should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected LATEST conformance program to compile as dataflow");
+        };
+
+        let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+
+        handle.inject_dd_event(Event::LinkPress {
+            link_path: "left_button.event.press".to_string(),
+        });
+        handle.inject_dd_event(Event::LinkPress {
+            link_path: "right_button.event.press".to_string(),
+        });
+
+        let expected = select_latest(&[
+            LatestCandidate::new(KernelValue::from("left"), TickSeq::new(TickId(1), 1)),
+            LatestCandidate::new(KernelValue::from("right"), TickSeq::new(TickId(1), 2)),
+        ]);
+        let output_text = handle.current_output().to_display_string();
+
+        let KernelValue::Text(expected_text) = expected else {
+            panic!("expected reference kernel to produce text");
+        };
+
+        assert!(
+            output_text.contains(&format!("label: {expected_text}")),
+            "expected DD output to match reference-kernel LATEST result {expected_text:?}, got {output_text}"
+        );
+
+        handle.inject_dd_event(Event::LinkPress {
+            link_path: "left_button.event.press".to_string(),
+        });
+
+        let expected = select_latest(&[
+            LatestCandidate::new(KernelValue::from("left"), TickSeq::new(TickId(1), 3)),
+            LatestCandidate::new(KernelValue::from("right"), TickSeq::new(TickId(1), 2)),
+        ]);
+        let output_text = handle.current_output().to_display_string();
+
+        let KernelValue::Text(expected_text) = expected else {
+            panic!("expected reference kernel to produce text");
+        };
+
+        assert!(
+            output_text.contains(&format!("label: {expected_text}")),
+            "expected DD output to match reference-kernel LATEST result {expected_text:?} after later left press, got {output_text}"
+        );
+    }
+
+    #[test]
+    fn hold_press_sequence_matches_reference_kernel_counter_progression() {
+        let program = compile(
+            hold_conformance_source(),
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .expect("HOLD conformance program should compile");
+        let CompiledProgram::Dataflow { graph } = program else {
+            panic!("expected HOLD conformance program to compile as dataflow");
+        };
+
+        let handle = DdWorkerHandle::new_from_graph(graph, |_value| {});
+
+        for presses in 0..=2 {
+            if presses > 0 {
+                handle.inject_dd_event(Event::LinkPress {
+                    link_path: "increment_button.event.press".to_string(),
+                });
+            }
+
+            let expected = kernel_counter_after_presses(presses);
+            let KernelValue::Number(expected_number) = expected else {
+                panic!("expected numeric counter");
+            };
+            let output_text = handle.current_output().to_display_string();
+
+            assert!(
+                output_text.contains(&format!("label: {}", expected_number)),
+                "expected DD HOLD output to match reference-kernel counter value {expected_number}, got {output_text}"
+            );
+        }
     }
 
     fn value_tree_contains_keyed_stripe(value: &Value) -> bool {
@@ -655,8 +876,7 @@ mod tests {
 
     #[test]
     fn crud_output_marks_people_stripe_as_keyed() {
-        let source =
-            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let source = read_example("../../playground/frontend/src/examples/crud/crud.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("crud should compile");
         let CompiledProgram::Dataflow { graph } = program else {
@@ -675,8 +895,7 @@ mod tests {
 
     #[test]
     fn crud_worker_emits_initial_keyed_diffs() {
-        let source =
-            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let source = read_example("../../playground/frontend/src/examples/crud/crud.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("crud should compile");
         let CompiledProgram::Dataflow { graph } = program else {
@@ -694,8 +913,7 @@ mod tests {
 
     #[test]
     fn crud_initial_keyed_diffs_include_people_rows() {
-        let source =
-            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let source = read_example("../../playground/frontend/src/examples/crud/crud.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("crud should compile");
         let CompiledProgram::Dataflow { graph } = program else {
@@ -723,8 +941,7 @@ mod tests {
 
     #[test]
     fn crud_create_uses_current_name_and_surname_input_text() {
-        let source =
-            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let source = read_example("../../playground/frontend/src/examples/crud/crud.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("crud should compile");
         let CompiledProgram::Dataflow { graph } = program else {
@@ -765,8 +982,7 @@ mod tests {
 
     #[test]
     fn crud_row_press_selects_the_keyed_person() {
-        let source =
-            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let source = read_example("../../playground/frontend/src/examples/crud/crud.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("crud should compile");
         let CompiledProgram::Dataflow { graph } = program else {
@@ -800,8 +1016,7 @@ mod tests {
 
     #[test]
     fn crud_delete_removes_the_selected_person() {
-        let source =
-            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let source = read_example("../../playground/frontend/src/examples/crud/crud.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("crud should compile");
         let CompiledProgram::Dataflow { graph } = program else {
@@ -861,8 +1076,7 @@ mod tests {
 
     #[test]
     fn cells_initial_output_shows_seed_formula_values() {
-        let source =
-            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let source = read_example("../../playground/frontend/src/examples/cells/cells.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("cells should compile");
         let output = match program {
@@ -888,12 +1102,13 @@ mod tests {
 
     #[test]
     fn cells_a1_double_click_enters_edit_mode() {
-        let source =
-            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let source = read_example("../../playground/frontend/src/examples/cells/cells.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("cells should compile");
         let handle = match program {
-            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Dataflow { graph } => {
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
             CompiledProgram::Static { .. } => panic!("cells should compile to dataflow"),
         };
 
@@ -916,12 +1131,13 @@ mod tests {
 
     #[test]
     fn cells_enter_commits_a1_and_recomputes_dependents() {
-        let source =
-            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let source = read_example("../../playground/frontend/src/examples/cells/cells.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("cells should compile");
         let handle = match program {
-            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Dataflow { graph } => {
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
             CompiledProgram::Static { .. } => panic!("cells should compile to dataflow"),
         };
 
@@ -953,12 +1169,13 @@ mod tests {
 
     #[test]
     fn cells_reopen_after_commit_shows_the_committed_formula_text() {
-        let source =
-            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let source = read_example("../../playground/frontend/src/examples/cells/cells.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("cells should compile");
         let handle = match program {
-            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Dataflow { graph } => {
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
             CompiledProgram::Static { .. } => panic!("cells should compile to dataflow"),
         };
 
@@ -989,12 +1206,13 @@ mod tests {
 
     #[test]
     fn cells_escape_after_reopen_preserves_committed_values() {
-        let source =
-            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let source = read_example("../../playground/frontend/src/examples/cells/cells.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("cells should compile");
         let handle = match program {
-            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Dataflow { graph } => {
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
             CompiledProgram::Static { .. } => panic!("cells should compile to dataflow"),
         };
 
@@ -1038,8 +1256,7 @@ mod tests {
 
     #[test]
     fn cells_compile_registers_a_concrete_double_click_input_path() {
-        let source =
-            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let source = read_example("../../playground/frontend/src/examples/cells/cells.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("cells should compile");
         let CompiledProgram::Dataflow { graph } = program else {
@@ -1053,7 +1270,9 @@ mod tests {
             .collect();
 
         assert!(
-            paths.iter().any(|path| path == "row_1_cells.0000.cell_elements.display.event.double_click"),
+            paths
+                .iter()
+                .any(|path| path == "row_1_cells.0000.cell_elements.display.event.double_click"),
             "expected concrete A1 double-click input path; got inputs: {paths:?}"
         );
     }
@@ -1089,7 +1308,9 @@ document: Document/new(root:
                     .filter_map(|input| input.link_path.clone())
                     .collect();
                 assert!(
-                    paths.iter().any(|path| path == "items.0000.cell_elements.editing.event.change"),
+                    paths
+                        .iter()
+                        .any(|path| path == "items.0000.cell_elements.editing.event.change"),
                     "expected concrete text-change input path; got inputs: {paths:?}"
                 );
                 DdWorkerHandle::new_from_graph(graph, |_value| {})
@@ -1111,8 +1332,7 @@ document: Document/new(root:
 
     #[test]
     fn cells_worker_boot_reaches_output_clone() {
-        let source =
-            read_example("../../playground/frontend/src/examples/cells/cells.bn");
+        let source = read_example("../../playground/frontend/src/examples/cells/cells.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("cells should compile");
         let CompiledProgram::Dataflow { graph } = program else {
@@ -1130,8 +1350,7 @@ document: Document/new(root:
     #[test]
     #[ignore = "browser-only retained-tree path requires wasm/js runtime"]
     fn crud_output_builds_retained_tree() {
-        let source =
-            read_example("../../playground/frontend/src/examples/crud/crud.bn");
+        let source = read_example("../../playground/frontend/src/examples/crud/crud.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("crud should compile");
         let CompiledProgram::Dataflow { graph } = program else {

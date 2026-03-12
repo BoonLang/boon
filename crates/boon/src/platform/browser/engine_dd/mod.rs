@@ -18,9 +18,9 @@ pub mod render;
 pub use core::types::{InputId, LinkId, ListKey, VarId};
 pub use core::value::Value;
 
+use boon_scene::{RenderRootHandle, RenderSurface, SceneHandles};
 use std::cell::Cell;
 use std::cell::RefCell;
-use boon_scene::{RenderRootHandle, RenderSurface, SceneHandles};
 use wasm_bindgen::JsCast;
 use zoon::*;
 
@@ -210,7 +210,12 @@ pub fn run_dd_reactive_with_persistence(
         std::collections::HashMap::new()
     };
 
-    let compiled = match compile::compile(source_code, states_storage_key, &persisted_holds, external_functions) {
+    let compiled = match compile::compile(
+        source_code,
+        states_storage_key,
+        &persisted_holds,
+        external_functions,
+    ) {
         Ok(program) => program,
         Err(e) => {
             zoon::eprintln!("DD compilation error: {}", e);
@@ -359,10 +364,14 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                     let ready = ready.clone();
                     let root_cell = root_cell.clone();
                     let retained = retained.clone();
-                    let scene_lights =
-                        render_root.scene.as_ref().and_then(|scene| scene.lights.clone());
-                    let scene_geometry =
-                        render_root.scene.as_ref().and_then(|scene| scene.geometry.clone());
+                    let scene_lights = render_root
+                        .scene
+                        .as_ref()
+                        .and_then(|scene| scene.lights.clone());
+                    let scene_geometry = render_root
+                        .scene
+                        .as_ref()
+                        .and_then(|scene| scene.geometry.clone());
                     let render_surface = render_root.surface;
                     async move {
                         let stream = map_ref! {
@@ -432,9 +441,12 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                     }))
             } else {
                 // Static: single render
-                El::new().child_signal(render_root.root.signal_cloned().map(|value| {
-                    render::bridge::render_value_static(&value)
-                }))
+                El::new().child_signal(
+                    render_root
+                        .root
+                        .signal_cloned()
+                        .map(|value| render::bridge::render_value_static(&value)),
+                )
             }
         }
         None => El::new().child("DD Engine: No document"),
@@ -490,19 +502,11 @@ mod tests {
             .as_ref()
             .expect("scene handles should exist");
         assert_eq!(
-            scene
-                .lights
-                .as_ref()
-                .expect("lights")
-                .get_cloned(),
+            scene.lights.as_ref().expect("lights").get_cloned(),
             Value::text("lights")
         );
         assert_eq!(
-            scene
-                .geometry
-                .as_ref()
-                .expect("geometry")
-                .get_cloned(),
+            scene.geometry.as_ref().expect("geometry").get_cloned(),
             Value::text("geometry")
         );
     }

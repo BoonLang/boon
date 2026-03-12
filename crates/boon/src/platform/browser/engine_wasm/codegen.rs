@@ -98,7 +98,9 @@ pub fn emit_wasm(program: &IrProgram) -> WasmOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{node_debug_short, CellId, IrExpr, IrNode, WasmEmitter};
+    use std::collections::HashMap;
+
+    use super::{CellId, IrExpr, IrNode, WasmEmitter, node_debug_short};
     use crate::platform::browser::engine_wasm::{lower::lower, parse_source};
     use wasm_encoder::Function;
 
@@ -263,7 +265,9 @@ mod tests {
             .expect("store.max_duration HOLD");
 
         assert!(
-            emitter.extract_runtime_text_source_cell(hold_body).is_none(),
+            emitter
+                .extract_runtime_text_source_cell(hold_body)
+                .is_none(),
             "numeric slider payload must not use the text-copy path"
         );
     }
@@ -399,11 +403,15 @@ store: [
             nodes: vec![
                 IrNode::Derived {
                     cell: CellId(0),
-                    expr: IrExpr::Constant(crate::platform::browser::engine_wasm::ir::IrValue::Number(0.0)),
+                    expr: IrExpr::Constant(
+                        crate::platform::browser::engine_wasm::ir::IrValue::Number(0.0),
+                    ),
                 },
                 IrNode::Derived {
                     cell: CellId(1),
-                    expr: IrExpr::Constant(crate::platform::browser::engine_wasm::ir::IrValue::Number(42.0)),
+                    expr: IrExpr::Constant(
+                        crate::platform::browser::engine_wasm::ir::IrValue::Number(42.0),
+                    ),
                 },
             ],
             document: None,
@@ -415,15 +423,12 @@ store: [
                 std::iter::once(("id".to_string(), CellId(1))).collect(),
             ))
             .collect(),
+            list_map_plans: HashMap::new(),
         };
         let emitter = WasmEmitter::new(&program);
 
         let field_cell = emitter
-            .resolve_field_access_expr_cell(
-                &IrExpr::CellRead(CellId(0)),
-                "id",
-                0,
-            )
+            .resolve_field_access_expr_cell(&IrExpr::CellRead(CellId(0)), "id", 0)
             .expect("person.id field cell");
 
         assert_eq!(field_cell, CellId(1));
@@ -450,11 +455,15 @@ store: [
             nodes: vec![
                 IrNode::Derived {
                     cell: CellId(0),
-                    expr: IrExpr::Constant(crate::platform::browser::engine_wasm::ir::IrValue::Number(0.0)),
+                    expr: IrExpr::Constant(
+                        crate::platform::browser::engine_wasm::ir::IrValue::Number(0.0),
+                    ),
                 },
                 IrNode::Derived {
                     cell: CellId(1),
-                    expr: IrExpr::Constant(crate::platform::browser::engine_wasm::ir::IrValue::Number(0.0)),
+                    expr: IrExpr::Constant(
+                        crate::platform::browser::engine_wasm::ir::IrValue::Number(0.0),
+                    ),
                 },
                 IrNode::CustomCall {
                     cell: CellId(2),
@@ -478,6 +487,7 @@ store: [
             ]
             .into_iter()
             .collect(),
+            list_map_plans: HashMap::new(),
         };
         let emitter = WasmEmitter::new(&program);
 
@@ -521,10 +531,7 @@ store: [
             .expect("delete event");
         let all_maps = emitter.find_all_list_map_infos();
         let contexts = emitter.collect_item_event_contexts(&all_maps);
-        let delete_contexts = contexts
-            .get(&delete_event)
-            .cloned()
-            .unwrap_or_default();
+        let delete_contexts = contexts.get(&delete_event).cloned().unwrap_or_default();
 
         let delete_remove_source = program
             .nodes
@@ -597,6 +604,93 @@ store: [
     }
 
     #[test]
+    fn cells_double_click_event_contexts_debug() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/cells/cells.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+        let emitter = WasmEmitter::new(&program);
+
+        let event_id = program
+            .events
+            .iter()
+            .enumerate()
+            .find_map(|(idx, event)| {
+                (event.name == "object.cell_elements.display.double_click").then_some(idx as u32)
+            })
+            .expect("cells double_click event");
+
+        let all_maps = emitter.find_all_list_map_infos();
+        let contexts = emitter.collect_item_event_contexts(&all_maps);
+        let event_contexts = contexts.get(&event_id).cloned().unwrap_or_default();
+
+        eprintln!(
+            "[cells-double-click-contexts] {:?}",
+            event_contexts
+                .iter()
+                .map(|ctx| (ctx.cell_start, ctx.cell_end))
+                .collect::<Vec<_>>()
+        );
+        for info in &all_maps {
+            eprintln!(
+                "[cells-map] cell={} source={} item={} range={:?} event_range={:?}",
+                info.cell.0, info.source.0, info.item_cell.0, info.cell_range, info.event_range
+            );
+        }
+
+        assert!(!event_contexts.is_empty(), "expected item event contexts");
+    }
+
+    #[test]
+    fn cells_outer_row_init_excludes_nested_cell_template_nodes() {
+        let ast = parse_source(include_str!(
+            "../../../../../../playground/frontend/src/examples/cells/cells.bn"
+        ))
+        .expect("parse");
+        let program = lower(&ast, None).expect("lower");
+        let emitter = WasmEmitter::new(&program);
+        let all_maps = emitter.find_render_list_map_infos();
+
+        let outer_row_map = all_maps
+            .iter()
+            .find(|info| info.item_cell == CellId(309))
+            .expect("outer row render map");
+        let inner_cell_map = all_maps
+            .iter()
+            .find(|info| {
+                info.cell != outer_row_map.cell
+                    && info.cell_range.0 >= outer_row_map.cell_range.0
+                    && info.cell_range.1 <= outer_row_map.cell_range.1
+                    && info.cell_range != outer_row_map.cell_range
+            })
+            .expect("inner cell render map");
+
+        let mem_ctx = WasmEmitter::build_template_context(outer_row_map, 0)
+            .expect("outer row memory context");
+        let nested_ranges = emitter.nested_render_template_ranges(outer_row_map);
+        let template_nodes = emitter.template_nodes(&mem_ctx, &nested_ranges);
+
+        assert!(
+            nested_ranges.contains(&inner_cell_map.cell_range),
+            "expected outer row map to report nested inner cell range {:?}, got {:?}",
+            inner_cell_map.cell_range,
+            nested_ranges
+        );
+        assert!(
+            !template_nodes.iter().any(|node| matches!(
+                node,
+                IrNode::When {
+                    cell,
+                    source: CellId(699),
+                    ..
+                } if *cell == CellId(706)
+            )),
+            "outer row init must not include nested inner-cell is_editing/root selector nodes"
+        );
+    }
+
+    #[test]
     fn cells_example_builds_wasm_emitter() {
         eprintln!("[cells-wasm] parse start");
         let ast = parse_source(include_str!(
@@ -646,8 +740,7 @@ store: [
             0
         };
         let split_events = num_chunks > 0;
-        let first_event_fn =
-            super::NUM_IMPORTS + super::NUM_BASE_FUNCTIONS + 2 * num_chunks as u32;
+        let first_event_fn = super::NUM_IMPORTS + super::NUM_BASE_FUNCTIONS + 2 * num_chunks as u32;
         let _func = emitter.emit_on_event(split_events.then_some(first_event_fn));
     }
 
@@ -780,12 +873,7 @@ impl<'a> WasmEmitter<'a> {
         token as f64
     }
 
-    fn emit_ulid_generate(
-        &self,
-        func: &mut Function,
-        cell: CellId,
-        item_idx_local: Option<u32>,
-    ) {
+    fn emit_ulid_generate(&self, func: &mut Function, cell: CellId, item_idx_local: Option<u32>) {
         if let Some(local) = item_idx_local {
             func.instruction(&Instruction::LocalGet(local));
             func.instruction(&Instruction::I64ExtendI32U);
@@ -845,7 +933,10 @@ impl<'a> WasmEmitter<'a> {
             IrNode::MathSum { input, .. } => sources.push(*input),
             IrNode::PipeThrough { source, .. } => sources.push(*source),
             IrNode::StreamSkip { source, .. } => sources.push(*source),
-            IrNode::Derived { expr: IrExpr::CellRead(source), .. } => sources.push(*source),
+            IrNode::Derived {
+                expr: IrExpr::CellRead(source),
+                ..
+            } => sources.push(*source),
             IrNode::Derived { expr, .. } if !matches!(expr, IrExpr::CellRead(_)) => {
                 Self::collect_expr_cell_refs(expr, &mut sources);
             }
@@ -870,13 +961,18 @@ impl<'a> WasmEmitter<'a> {
             IrNode::TextTrim { source, .. } => sources.push(*source),
             IrNode::TextIsNotEmpty { source, .. } => sources.push(*source),
             IrNode::TextToNumber { source, .. } => sources.push(*source),
-            IrNode::TextStartsWith { source, prefix, .. } => { sources.push(*source); sources.push(*prefix); },
+            IrNode::TextStartsWith { source, prefix, .. } => {
+                sources.push(*source);
+                sources.push(*prefix);
+            }
             IrNode::MathRound { source, .. } => sources.push(*source),
             IrNode::MathMin { source, b, .. } | IrNode::MathMax { source, b, .. } => {
                 sources.push(*source);
                 sources.push(*b);
             }
-            IrNode::ListAppend { item, watch_cell, .. } => {
+            IrNode::ListAppend {
+                item, watch_cell, ..
+            } => {
                 sources.push(*item);
                 if let Some(watch) = watch_cell {
                     // Only add watch_cell if it differs from item to avoid
@@ -886,9 +982,18 @@ impl<'a> WasmEmitter<'a> {
                     }
                 }
             }
-            IrNode::ListRetain { predicate: Some(pred), .. } => sources.push(*pred),
-            IrNode::ListEvery { predicate: Some(pred), .. } => sources.push(*pred),
-            IrNode::ListAny { predicate: Some(pred), .. } => sources.push(*pred),
+            IrNode::ListRetain {
+                predicate: Some(pred),
+                ..
+            } => sources.push(*pred),
+            IrNode::ListEvery {
+                predicate: Some(pred),
+                ..
+            } => sources.push(*pred),
+            IrNode::ListAny {
+                predicate: Some(pred),
+                ..
+            } => sources.push(*pred),
             _ => {}
         }
         sources
@@ -969,7 +1074,8 @@ impl<'a> WasmEmitter<'a> {
     fn expr_uses_mem_ctx(&self, expr: &IrExpr, mem_ctx: &MemoryContext) -> bool {
         let mut refs = Vec::new();
         Self::collect_expr_cell_refs(expr, &mut refs);
-        refs.into_iter().any(|cell| self.cell_uses_mem_ctx(cell, mem_ctx))
+        refs.into_iter()
+            .any(|cell| self.cell_uses_mem_ctx(cell, mem_ctx))
     }
 
     fn cell_depends_on_external_cell(&self, cell: CellId, mem_ctx: &MemoryContext) -> bool {
@@ -984,6 +1090,27 @@ impl<'a> WasmEmitter<'a> {
         all_maps: &[ListMapInfo],
     ) -> HashMap<u32, Vec<MemoryContext>> {
         let mut event_to_mem_ctx: HashMap<u32, Vec<MemoryContext>> = HashMap::new();
+        let mut event_owner_ctx: HashMap<u32, MemoryContext> = HashMap::new();
+
+        for info in all_maps {
+            let Some(mem_ctx) = Self::build_template_context(info, 0) else {
+                continue;
+            };
+            let range_len = mem_ctx.cell_end.saturating_sub(mem_ctx.cell_start);
+            for event_id in info.event_range.0..info.event_range.1 {
+                let replace = event_owner_ctx
+                    .get(&event_id)
+                    .map(|current| {
+                        let current_len = current.cell_end.saturating_sub(current.cell_start);
+                        range_len < current_len
+                            || (range_len == current_len && mem_ctx.cell_start > current.cell_start)
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    event_owner_ctx.insert(event_id, mem_ctx);
+                }
+            }
+        }
 
         for info in all_maps {
             let mem_ctx = match Self::build_template_context(info, 0) {
@@ -998,12 +1125,13 @@ impl<'a> WasmEmitter<'a> {
                         cell,
                         body,
                     } => {
-                        let event_is_template_scoped =
-                            trigger.0 >= info.event_range.0 && trigger.0 < info.event_range.1;
-                        if Self::mem_ctx_contains_cell(&mem_ctx, *cell)
-                            || event_is_template_scoped
-                            || self.expr_uses_mem_ctx(body, &mem_ctx)
-                        {
+                        let event_is_owned_by_ctx = event_owner_ctx
+                            .get(&trigger.0)
+                            .copied()
+                            .is_some_and(|owner| owner == mem_ctx);
+                        let _target_is_owned_by_ctx = Self::mem_ctx_contains_cell(&mem_ctx, *cell);
+                        let _body_uses_ctx = self.expr_uses_mem_ctx(body, &mem_ctx);
+                        if event_is_owned_by_ctx {
                             event_to_mem_ctx.entry(trigger.0).or_default().push(mem_ctx);
                         }
                     }
@@ -1013,12 +1141,14 @@ impl<'a> WasmEmitter<'a> {
                         ..
                     } => {
                         for (trigger, body) in trigger_bodies {
-                            let event_is_template_scoped =
-                                trigger.0 >= info.event_range.0 && trigger.0 < info.event_range.1;
-                            if Self::mem_ctx_contains_cell(&mem_ctx, *cell)
-                                || event_is_template_scoped
-                                || self.expr_uses_mem_ctx(body, &mem_ctx)
-                            {
+                            let event_is_owned_by_ctx = event_owner_ctx
+                                .get(&trigger.0)
+                                .copied()
+                                .is_some_and(|owner| owner == mem_ctx);
+                            let _target_is_owned_by_ctx =
+                                Self::mem_ctx_contains_cell(&mem_ctx, *cell);
+                            let _body_uses_ctx = self.expr_uses_mem_ctx(body, &mem_ctx);
+                            if event_is_owned_by_ctx {
                                 event_to_mem_ctx.entry(trigger.0).or_default().push(mem_ctx);
                             }
                         }
@@ -1028,12 +1158,14 @@ impl<'a> WasmEmitter<'a> {
                             let Some(trigger) = arm.trigger else {
                                 continue;
                             };
-                            let event_is_template_scoped =
-                                trigger.0 >= info.event_range.0 && trigger.0 < info.event_range.1;
-                            if Self::mem_ctx_contains_cell(&mem_ctx, *target)
-                                || event_is_template_scoped
-                                || self.expr_uses_mem_ctx(&arm.body, &mem_ctx)
-                            {
+                            let event_is_owned_by_ctx = event_owner_ctx
+                                .get(&trigger.0)
+                                .copied()
+                                .is_some_and(|owner| owner == mem_ctx);
+                            let _target_is_owned_by_ctx =
+                                Self::mem_ctx_contains_cell(&mem_ctx, *target);
+                            let _body_uses_ctx = self.expr_uses_mem_ctx(&arm.body, &mem_ctx);
+                            if event_is_owned_by_ctx {
                                 event_to_mem_ctx.entry(trigger.0).or_default().push(mem_ctx);
                             }
                         }
@@ -1044,12 +1176,14 @@ impl<'a> WasmEmitter<'a> {
                         predicate: None,
                         ..
                     } => {
-                        let event_is_template_scoped =
-                            trigger.0 >= info.event_range.0 && trigger.0 < info.event_range.1;
-                        let source_uses_map_item = self
+                        let event_is_owned_by_ctx = event_owner_ctx
+                            .get(&trigger.0)
+                            .copied()
+                            .is_some_and(|owner| owner == mem_ctx);
+                        let _source_uses_map_item = self
                             .find_list_map_item_cell_for(Some(*source))
                             .is_some_and(|item_cell| item_cell == info.item_cell);
-                        if event_is_template_scoped || source_uses_map_item {
+                        if event_is_owned_by_ctx {
                             event_to_mem_ctx.entry(trigger.0).or_default().push(mem_ctx);
                         }
                     }
@@ -1058,12 +1192,19 @@ impl<'a> WasmEmitter<'a> {
             }
 
             for (event_idx, event_info) in self.program.events.iter().enumerate() {
+                let event_is_owned_by_ctx = event_owner_ctx
+                    .get(&(event_idx as u32))
+                    .copied()
+                    .is_some_and(|owner| owner == mem_ctx);
                 let has_template_payload = event_info
                     .payload_cells
                     .iter()
                     .any(|cell| Self::mem_ctx_contains_cell(&mem_ctx, *cell));
-                if has_template_payload {
-                    event_to_mem_ctx.entry(event_idx as u32).or_default().push(mem_ctx);
+                if event_is_owned_by_ctx && has_template_payload {
+                    event_to_mem_ctx
+                        .entry(event_idx as u32)
+                        .or_default()
+                        .push(mem_ctx);
                 }
             }
         }
@@ -1090,12 +1231,15 @@ impl<'a> WasmEmitter<'a> {
                 expr: IrExpr::CellRead(source),
                 ..
             }) => self.resolve_field_access_cell(*source, field, depth + 1),
-            Some(IrNode::PipeThrough { source, .. })
-            | Some(IrNode::StreamSkip { source, .. }) => {
+            Some(IrNode::PipeThrough { source, .. }) | Some(IrNode::StreamSkip { source, .. }) => {
                 self.resolve_field_access_cell(*source, field, depth + 1)
             }
             Some(IrNode::Derived {
-                expr: IrExpr::FieldAccess { object, field: inner },
+                expr:
+                    IrExpr::FieldAccess {
+                        object,
+                        field: inner,
+                    },
                 ..
             }) => {
                 let object_cell = self.resolve_field_access_expr_cell(object, inner, depth + 1)?;
@@ -1157,8 +1301,7 @@ impl<'a> WasmEmitter<'a> {
                 expr: IrExpr::CellRead(source),
                 ..
             }) => self.resolve_scalar_compare_cell_from_cell(*source, depth + 1),
-            Some(IrNode::PipeThrough { source, .. })
-            | Some(IrNode::StreamSkip { source, .. }) => {
+            Some(IrNode::PipeThrough { source, .. }) | Some(IrNode::StreamSkip { source, .. }) => {
                 self.resolve_scalar_compare_cell_from_cell(*source, depth + 1)
             }
             Some(IrNode::Derived {
@@ -1213,8 +1356,7 @@ impl<'a> WasmEmitter<'a> {
                 expr: IrExpr::CellRead(source),
                 ..
             }) => self.resolve_cell_field_map(*source, depth + 1),
-            Some(IrNode::PipeThrough { source, .. })
-            | Some(IrNode::StreamSkip { source, .. }) => {
+            Some(IrNode::PipeThrough { source, .. }) | Some(IrNode::StreamSkip { source, .. }) => {
                 self.resolve_cell_field_map(*source, depth + 1)
             }
             Some(IrNode::Derived {
@@ -1231,6 +1373,52 @@ impl<'a> WasmEmitter<'a> {
             }
             _ => None,
         }
+    }
+
+    fn is_template_cell(&self, cell: CellId) -> bool {
+        self.program.nodes.iter().any(|node| {
+            matches!(
+                node,
+                IrNode::ListMap {
+                    template_cell_range,
+                    ..
+                } if cell.0 >= template_cell_range.0 && cell.0 < template_cell_range.1
+            )
+        })
+    }
+
+    fn canonical_named_cell(&self, cell: CellId) -> CellId {
+        let Some(info) = self.program.cells.get(cell.0 as usize) else {
+            return cell;
+        };
+        let mut first_match = None;
+        for (idx, other) in self.program.cells.iter().enumerate() {
+            if other.name != info.name {
+                continue;
+            }
+            let candidate = CellId(idx as u32);
+            if first_match.is_none() {
+                first_match = Some(candidate);
+            }
+            if !self.is_template_cell(candidate) {
+                return candidate;
+            }
+        }
+        first_match.unwrap_or(cell)
+    }
+
+    fn canonicalize_target_field_map(
+        &self,
+        target: CellId,
+        field_map: HashMap<String, CellId>,
+    ) -> HashMap<String, CellId> {
+        if self.is_template_cell(target) {
+            return field_map;
+        }
+        field_map
+            .into_iter()
+            .map(|(name, cell)| (name, self.canonical_named_cell(cell)))
+            .collect()
     }
 
     /// Register a text pattern and return its index.
@@ -1586,10 +1774,8 @@ impl<'a> WasmEmitter<'a> {
         if emit_trace {
             eprintln!("[wasm-emit] emit set_global");
         }
-        let first_sg_chunk_fn = NUM_IMPORTS
-            + NUM_BASE_FUNCTIONS
-            + 2 * num_init_chunks as u32
-            + num_event_fns as u32;
+        let first_sg_chunk_fn =
+            NUM_IMPORTS + NUM_BASE_FUNCTIONS + 2 * num_init_chunks as u32 + num_event_fns as u32;
         let set_global_func = self.emit_set_global(if num_set_global_chunks > 0 {
             Some((first_sg_chunk_fn, num_set_global_chunks))
         } else {
@@ -1641,11 +1827,12 @@ impl<'a> WasmEmitter<'a> {
             + 2 * num_init_chunks as u32
             + num_event_fns as u32
             + num_set_global_chunks as u32;
-        let reevaluate_cell_func = self.emit_reevaluate_cell_dispatch(if num_reevaluate_chunks > 0 {
-            Some((first_reeval_chunk_fn, num_reevaluate_chunks))
-        } else {
-            None
-        });
+        let reevaluate_cell_func =
+            self.emit_reevaluate_cell_dispatch(if num_reevaluate_chunks > 0 {
+                Some((first_reeval_chunk_fn, num_reevaluate_chunks))
+            } else {
+                None
+            });
         code.function(&reevaluate_cell_func);
 
         // Init chunk functions: Phase 1 chunks first, then Phase 2 chunks.
@@ -1735,8 +1922,7 @@ impl<'a> WasmEmitter<'a> {
             let mut num_hold_loop_locals: u32 = 0;
             for node in &self.program.nodes {
                 if let IrNode::HoldLoop { field_cells, .. } = node {
-                    num_hold_loop_locals =
-                        num_hold_loop_locals.max(1 + field_cells.len() as u32);
+                    num_hold_loop_locals = num_hold_loop_locals.max(1 + field_cells.len() as u32);
                 }
             }
             let has_filter = self.has_per_item_filter();
@@ -1765,11 +1951,7 @@ impl<'a> WasmEmitter<'a> {
     }
 
     /// Set up filter_locals for Phase 2 (used by emit_downstream_updates).
-    fn emit_init_phase2_setup_filter_locals(
-        &self,
-        num_hold_loop_locals: u32,
-        num_f64_locals: u32,
-    ) {
+    fn emit_init_phase2_setup_filter_locals(&self, num_hold_loop_locals: u32, num_f64_locals: u32) {
         if self.has_per_item_filter() {
             let local_new_list = num_hold_loop_locals;
             let local_count = num_f64_locals;
@@ -1804,9 +1986,7 @@ impl<'a> WasmEmitter<'a> {
                         let pattern_idx = self.register_text_pattern(&text);
                         func.instruction(&Instruction::I32Const(cell.0 as i32));
                         func.instruction(&Instruction::I32Const(pattern_idx as i32));
-                        func.instruction(&Instruction::Call(
-                            IMPORT_HOST_SET_CELL_TEXT_PATTERN,
-                        ));
+                        func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
                     }
                 }
                 _ => {}
@@ -1921,7 +2101,8 @@ impl<'a> WasmEmitter<'a> {
                 IrNode::Derived { cell, expr } => {
                     // Check if this is a ListConstruct with items that feeds
                     // into list operations — if so, create a real host list.
-                    let is_reactive_list = matches!(expr, IrExpr::ListConstruct(items) if !items.is_empty());
+                    let is_reactive_list =
+                        matches!(expr, IrExpr::ListConstruct(items) if !items.is_empty());
                     if is_reactive_list {
                         // Create a host-side list (overrides emit_expr's 0.0).
                         func.instruction(&Instruction::Call(IMPORT_HOST_LIST_CREATE));
@@ -2292,7 +2473,11 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::GlobalGet(cell.0));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
-                IrNode::TextToNumber { cell, source, nan_tag_value } => {
+                IrNode::TextToNumber {
+                    cell,
+                    source,
+                    nan_tag_value,
+                } => {
                     // Call host to parse text → number. Returns number or NaN tag value.
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::F64Const(*nan_tag_value));
@@ -2302,7 +2487,11 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::GlobalGet(cell.0));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
-                IrNode::TextStartsWith { cell, source, prefix } => {
+                IrNode::TextStartsWith {
+                    cell,
+                    source,
+                    prefix,
+                } => {
                     // Call host to check if source text starts with prefix text.
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::I32Const(prefix.0 as i32));
@@ -2342,8 +2531,7 @@ impl<'a> WasmEmitter<'a> {
                 IrNode::CustomCall { cell, path, .. }
                     if path.len() == 2 && path[0] == "Ulid" && path[1] == "generate" =>
                 {
-                    let pattern_idx =
-                        self.register_text_pattern(&format!("ulid-{:08x}", cell.0));
+                    let pattern_idx = self.register_text_pattern(&format!("ulid-{:08x}", cell.0));
                     self.emit_ulid_generate(func, *cell, None);
                     func.instruction(&Instruction::I32Const(cell.0 as i32));
                     func.instruction(&Instruction::I32Const(pattern_idx as i32));
@@ -2621,6 +2809,7 @@ impl<'a> WasmEmitter<'a> {
                         self.emit_pattern_match(func, *source, arms, *cell, true);
                         continue;
                     }
+                    self.emit_reevaluate_expr_deps(func, body);
                     let text_source = self.extract_runtime_text_source_cell(body);
                     if let Some(src) = text_source {
                         self.emit_reevaluate_cell(func, src);
@@ -2659,6 +2848,7 @@ impl<'a> WasmEmitter<'a> {
                                 continue;
                             }
                             let may_skip = matches!(body, IrExpr::PatternMatch { .. });
+                            self.emit_reevaluate_expr_deps(func, body);
                             let text_source = self.extract_runtime_text_source_cell(body);
                             // Re-evaluate the text dependency chain before reading.
                             if let Some(src) = text_source {
@@ -2741,6 +2931,7 @@ impl<'a> WasmEmitter<'a> {
                     for arm in arms {
                         if arm.trigger == Some(event_id) {
                             let may_skip = matches!(&arm.body, IrExpr::PatternMatch { .. });
+                            self.emit_reevaluate_expr_deps(func, &arm.body);
                             let text_source = self.extract_runtime_text_source_cell(&arm.body);
                             if self.is_text_body(&arm.body) {
                                 // Text body: set text first, then bump counter.
@@ -2770,12 +2961,7 @@ impl<'a> WasmEmitter<'a> {
                                 func.instruction(&Instruction::I32Const(target.0 as i32));
                                 func.instruction(&Instruction::GlobalGet(target.0));
                                 func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
-                                self.emit_sync_namespace_assignment(
-                                    func,
-                                    *target,
-                                    &arm.body,
-                                    None,
-                                );
+                                self.emit_sync_namespace_assignment(func, *target, &arm.body, None);
                                 self.emit_downstream_updates(func, *target);
                                 func.instruction(&Instruction::End);
                             } else if let Some(src) = text_source {
@@ -2788,12 +2974,7 @@ impl<'a> WasmEmitter<'a> {
                                 func.instruction(&Instruction::I32Const(target.0 as i32));
                                 func.instruction(&Instruction::GlobalGet(target.0));
                                 func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
-                                self.emit_sync_namespace_assignment(
-                                    func,
-                                    *target,
-                                    &arm.body,
-                                    None,
-                                );
+                                self.emit_sync_namespace_assignment(func, *target, &arm.body, None);
                                 self.emit_downstream_updates(func, *target);
                             } else {
                                 self.emit_expr(func, &arm.body);
@@ -2802,12 +2983,7 @@ impl<'a> WasmEmitter<'a> {
                                 func.instruction(&Instruction::I32Const(target.0 as i32));
                                 func.instruction(&Instruction::GlobalGet(target.0));
                                 func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
-                                self.emit_sync_namespace_assignment(
-                                    func,
-                                    *target,
-                                    &arm.body,
-                                    None,
-                                );
+                                self.emit_sync_namespace_assignment(func, *target, &arm.body, None);
                                 self.emit_downstream_updates(func, *target);
                             }
                         }
@@ -3012,14 +3188,6 @@ impl<'a> WasmEmitter<'a> {
         target: CellId,
         propagate_downstream: bool,
     ) {
-        #[cfg(test)]
-        eprintln!(
-            "[cells-wasm-pattern] source={} target={} arms={} propagate={}",
-            source.0,
-            target.0,
-            arms.len(),
-            propagate_downstream
-        );
         // Emit nested if-else chain so only the FIRST matching arm executes.
         // Without this, wildcards would always overwrite earlier matches.
         self.emit_pattern_arms(func, source, arms, target, 0, propagate_downstream);
@@ -3040,14 +3208,6 @@ impl<'a> WasmEmitter<'a> {
         }
 
         let (pattern, body) = &arms[idx];
-        #[cfg(test)]
-        eprintln!(
-            "[cells-wasm-pattern-arm] source={} target={} idx={} pattern={:?}",
-            source.0,
-            target.0,
-            idx,
-            pattern
-        );
         let is_skip = matches!(body, IrExpr::Constant(IrValue::Skip));
         let has_more = idx + 1 < arms.len();
 
@@ -3069,7 +3229,14 @@ impl<'a> WasmEmitter<'a> {
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms(func, source, arms, target, idx + 1, propagate_downstream);
+                    self.emit_pattern_arms(
+                        func,
+                        source,
+                        arms,
+                        target,
+                        idx + 1,
+                        propagate_downstream,
+                    );
                 }
                 func.instruction(&Instruction::End);
             }
@@ -3083,7 +3250,14 @@ impl<'a> WasmEmitter<'a> {
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms(func, source, arms, target, idx + 1, propagate_downstream);
+                    self.emit_pattern_arms(
+                        func,
+                        source,
+                        arms,
+                        target,
+                        idx + 1,
+                        propagate_downstream,
+                    );
                 }
                 func.instruction(&Instruction::End);
             }
@@ -3099,7 +3273,14 @@ impl<'a> WasmEmitter<'a> {
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms(func, source, arms, target, idx + 1, propagate_downstream);
+                    self.emit_pattern_arms(
+                        func,
+                        source,
+                        arms,
+                        target,
+                        idx + 1,
+                        propagate_downstream,
+                    );
                 }
                 func.instruction(&Instruction::End);
             }
@@ -3118,14 +3299,13 @@ impl<'a> WasmEmitter<'a> {
     /// If the body's dependency chain includes a WHEN that SKIPped, the entire arm body
     /// is skipped (no cell update, no downstream propagation). This implements nested
     /// SKIP propagation: inner WHEN SKIP → outer arm body also skips.
-    fn emit_arm_body(&self, func: &mut Function, body: &IrExpr, target: CellId, propagate_downstream: bool) {
-        #[cfg(test)]
-        eprintln!(
-            "[cells-wasm-arm-body] target={} body={} propagate={}",
-            target.0,
-            expr_short(body),
-            propagate_downstream
-        );
+    fn emit_arm_body(
+        &self,
+        func: &mut Function,
+        body: &IrExpr,
+        target: CellId,
+        propagate_downstream: bool,
+    ) {
         let skip_global = self.program.cells.len() as u32;
 
         // Set skip flag = 1.0 (no skip) before re-evaluating the dependency chain.
@@ -3302,12 +3482,6 @@ impl<'a> WasmEmitter<'a> {
         cell: CellId,
         visiting: &mut HashSet<CellId>,
     ) {
-        #[cfg(test)]
-        eprintln!(
-            "[cells-wasm-reeval] cell={} visiting={}",
-            cell.0,
-            visiting.len()
-        );
         if !visiting.insert(cell) {
             // Dependency graph can include cycles (e.g., HOLD state references).
             // Stop at the cycle edge to avoid unbounded recursive codegen.
@@ -3352,7 +3526,11 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::GlobalGet(cell.0));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
-                IrNode::TextToNumber { source, nan_tag_value, .. } => {
+                IrNode::TextToNumber {
+                    source,
+                    nan_tag_value,
+                    ..
+                } => {
                     self.emit_reevaluate_cell(func, *source);
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::F64Const(*nan_tag_value));
@@ -3400,7 +3578,9 @@ impl<'a> WasmEmitter<'a> {
                     // not a change propagation. Propagating would cycle through While deps.
                     self.emit_pattern_match(func, *source, arms, cell, false);
                 }
-                IrNode::While { source, deps, arms, .. } => {
+                IrNode::While {
+                    source, deps, arms, ..
+                } => {
                     // Re-evaluate source and all dependency cells first.
                     self.emit_reevaluate_cell(func, *source);
                     for dep in deps {
@@ -3504,7 +3684,11 @@ impl<'a> WasmEmitter<'a> {
                     self.emit_cell_get(func, cell, Some(mem_ctx));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
-                IrNode::TextToNumber { source, nan_tag_value, .. } => {
+                IrNode::TextToNumber {
+                    source,
+                    nan_tag_value,
+                    ..
+                } => {
                     self.emit_reevaluate_cell_ctx_guarded(func, *source, mem_ctx, visiting);
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::F64Const(*nan_tag_value));
@@ -3579,8 +3763,13 @@ impl<'a> WasmEmitter<'a> {
             .map(|&idx| &self.program.nodes[idx])
     }
 
-    fn template_nodes<'b>(&'b self, mem_ctx: &MemoryContext) -> Vec<&'b IrNode> {
+    fn template_nodes<'b>(
+        &'b self,
+        mem_ctx: &MemoryContext,
+        nested_ranges: &[(u32, u32)],
+    ) -> Vec<&'b IrNode> {
         (mem_ctx.cell_start..mem_ctx.cell_end)
+            .filter(|cell_id| !Self::range_contains_nested_cell(nested_ranges, *cell_id))
             .filter_map(|cell_id| self.find_node_for_cell(CellId(cell_id)))
             .collect()
     }
@@ -3597,7 +3786,9 @@ impl<'a> WasmEmitter<'a> {
             return false;
         };
         match node {
-            IrNode::PipeThrough { source, .. } => self.cell_has_initial_value_depth(*source, depth + 1),
+            IrNode::PipeThrough { source, .. } => {
+                self.cell_has_initial_value_depth(*source, depth + 1)
+            }
             IrNode::Derived { expr, .. } => match expr {
                 IrExpr::CellRead(source) => self.cell_has_initial_value_depth(*source, depth + 1),
                 IrExpr::Constant(IrValue::Void) => false,
@@ -4000,8 +4191,17 @@ impl<'a> WasmEmitter<'a> {
                     {
                         if item_cell.is_some() {
                             self.emit_boolean_check_loop(
-                                func, *cell, *source, *pred, *item_cell,
-                                item_field_cells, l0, l1, l2, l3, true,
+                                func,
+                                *cell,
+                                *source,
+                                *pred,
+                                *item_cell,
+                                item_field_cells,
+                                l0,
+                                l1,
+                                l2,
+                                l3,
+                                true,
                             );
                         }
                     }
@@ -4019,8 +4219,17 @@ impl<'a> WasmEmitter<'a> {
                     {
                         if item_cell.is_some() {
                             self.emit_boolean_check_loop(
-                                func, *cell, *source, *pred, *item_cell,
-                                item_field_cells, l0, l1, l2, l3, false,
+                                func,
+                                *cell,
+                                *source,
+                                *pred,
+                                *item_cell,
+                                item_field_cells,
+                                l0,
+                                l1,
+                                l2,
+                                l3,
+                                false,
                             );
                         }
                     }
@@ -4249,7 +4458,11 @@ impl<'a> WasmEmitter<'a> {
                     self.emit_downstream_updates_guarded(func, *cell, visiting);
                 }
                 // TextToNumber re-evaluates when source text changes.
-                IrNode::TextToNumber { cell, source, nan_tag_value } if *source == updated_cell => {
+                IrNode::TextToNumber {
+                    cell,
+                    source,
+                    nan_tag_value,
+                } if *source == updated_cell => {
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::F64Const(*nan_tag_value));
                     func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_TO_NUMBER));
@@ -4260,7 +4473,11 @@ impl<'a> WasmEmitter<'a> {
                     self.emit_downstream_updates_guarded(func, *cell, visiting);
                 }
                 // TextStartsWith re-evaluates when source or prefix changes.
-                IrNode::TextStartsWith { cell, source, prefix } if *source == updated_cell || *prefix == updated_cell => {
+                IrNode::TextStartsWith {
+                    cell,
+                    source,
+                    prefix,
+                } if *source == updated_cell || *prefix == updated_cell => {
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::I32Const(prefix.0 as i32));
                     func.instruction(&Instruction::Call(IMPORT_HOST_TEXT_STARTS_WITH));
@@ -4319,7 +4536,8 @@ impl<'a> WasmEmitter<'a> {
                     && matches!(
                         self.program.events[trigger.0 as usize].source,
                         EventSource::Synthetic
-                    ) => {
+                    ) =>
+                {
                     // Append text from item cell to the list.
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::I32Const(item.0 as i32));
@@ -4338,7 +4556,8 @@ impl<'a> WasmEmitter<'a> {
                     && matches!(
                         self.program.events[trigger.0 as usize].source,
                         EventSource::Synthetic
-                    ) => {
+                    ) =>
+                {
                     // The watch cell changed — check for SKIP sentinel before appending.
                     // Compare bit pattern against specific SKIP sentinel (not any NaN,
                     // since text-only cells have NaN f64 values).
@@ -4413,8 +4632,17 @@ impl<'a> WasmEmitter<'a> {
                         (item_cell.is_some(), *self.filter_locals.borrow())
                     {
                         self.emit_boolean_check_loop(
-                            func, *cell, *source, *pred, *item_cell,
-                            item_field_cells, l0, l1, l2, l3, true,
+                            func,
+                            *cell,
+                            *source,
+                            *pred,
+                            *item_cell,
+                            item_field_cells,
+                            l0,
+                            l1,
+                            l2,
+                            l3,
+                            true,
                         );
                         self.emit_downstream_updates_guarded(func, *cell, visiting);
                     }
@@ -4430,8 +4658,17 @@ impl<'a> WasmEmitter<'a> {
                         (item_cell.is_some(), *self.filter_locals.borrow())
                     {
                         self.emit_boolean_check_loop(
-                            func, *cell, *source, *pred, *item_cell,
-                            item_field_cells, l0, l1, l2, l3, false,
+                            func,
+                            *cell,
+                            *source,
+                            *pred,
+                            *item_cell,
+                            item_field_cells,
+                            l0,
+                            l1,
+                            l2,
+                            l3,
+                            false,
                         );
                         self.emit_downstream_updates_guarded(func, *cell, visiting);
                     }
@@ -4498,7 +4735,44 @@ impl<'a> WasmEmitter<'a> {
             IrExpr::FunctionCall { args, .. } => {
                 args.iter().any(|a| Self::expr_references_cell(a, cell))
             }
+            IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => fields
+                .iter()
+                .any(|(_, value)| Self::expr_references_cell(value, cell)),
+            IrExpr::ListConstruct(items) => items
+                .iter()
+                .any(|item| Self::expr_references_cell(item, cell)),
+            IrExpr::PatternMatch { source, arms } => {
+                *source == cell
+                    || arms
+                        .iter()
+                        .any(|(_, body)| Self::expr_references_cell(body, cell))
+            }
             _ => false,
+        }
+    }
+
+    fn emit_reevaluate_expr_deps(&self, func: &mut Function, expr: &IrExpr) {
+        let mut refs = Vec::new();
+        Self::collect_expr_cell_refs(expr, &mut refs);
+        refs.sort_by_key(|cell| cell.0);
+        refs.dedup();
+        for cell in refs {
+            self.emit_reevaluate_cell(func, cell);
+        }
+    }
+
+    fn emit_reevaluate_expr_deps_ctx(
+        &self,
+        func: &mut Function,
+        expr: &IrExpr,
+        mem_ctx: &MemoryContext,
+    ) {
+        let mut refs = Vec::new();
+        Self::collect_expr_cell_refs(expr, &mut refs);
+        refs.sort_by_key(|cell| cell.0);
+        refs.dedup();
+        for cell in refs {
+            self.emit_reevaluate_cell_ctx(func, cell, mem_ctx);
         }
     }
 
@@ -4518,8 +4792,7 @@ impl<'a> WasmEmitter<'a> {
 
         let depends = match self.find_node_for_cell(cell) {
             Some(IrNode::Derived { expr, .. }) => Self::expr_references_cell(expr, dep),
-            Some(IrNode::PipeThrough { source, .. })
-            | Some(IrNode::StreamSkip { source, .. }) => {
+            Some(IrNode::PipeThrough { source, .. }) | Some(IrNode::StreamSkip { source, .. }) => {
                 *source == dep || self.cell_depends_on_guarded(*source, dep, visiting)
             }
             Some(IrNode::TextTrim { source, .. })
@@ -4529,8 +4802,12 @@ impl<'a> WasmEmitter<'a> {
                 *source == dep || self.cell_depends_on_guarded(*source, dep, visiting)
             }
             Some(IrNode::TextStartsWith { source, prefix, .. })
-            | Some(IrNode::MathMin { source, b: prefix, .. })
-            | Some(IrNode::MathMax { source, b: prefix, .. }) => {
+            | Some(IrNode::MathMin {
+                source, b: prefix, ..
+            })
+            | Some(IrNode::MathMax {
+                source, b: prefix, ..
+            }) => {
                 *source == dep
                     || *prefix == dep
                     || self.cell_depends_on_guarded(*source, dep, visiting)
@@ -4631,7 +4908,12 @@ impl<'a> WasmEmitter<'a> {
             IrExpr::PatternMatch { arms, .. } => arms.iter().any(|(_, body)| {
                 Self::extract_text_source_cell(body)
                     .map(|cell| self.expr_carries_runtime_text(body, cell, visiting))
-                    .unwrap_or_else(|| matches!(body, IrExpr::Constant(IrValue::Text(_)) | IrExpr::TextConcat(_)))
+                    .unwrap_or_else(|| {
+                        matches!(
+                            body,
+                            IrExpr::Constant(IrValue::Text(_)) | IrExpr::TextConcat(_)
+                        )
+                    })
             }),
             _ => false,
         }
@@ -4660,7 +4942,9 @@ impl<'a> WasmEmitter<'a> {
                     self.expr_carries_runtime_text(init, cell, visiting)
                         || trigger_bodies.iter().any(|(_, body)| {
                             Self::extract_text_source_cell(body)
-                                .map(|source| self.expr_carries_runtime_text(body, source, visiting))
+                                .map(|source| {
+                                    self.expr_carries_runtime_text(body, source, visiting)
+                                })
                                 .unwrap_or_else(|| {
                                     matches!(
                                         body,
@@ -4682,24 +4966,28 @@ impl<'a> WasmEmitter<'a> {
                 Some(IrNode::Then { body, .. }) => Self::extract_text_source_cell(body)
                     .map(|source| self.expr_carries_runtime_text(body, source, visiting))
                     .unwrap_or_else(|| {
-                        matches!(body, IrExpr::Constant(IrValue::Text(_)) | IrExpr::TextConcat(_))
+                        matches!(
+                            body,
+                            IrExpr::Constant(IrValue::Text(_)) | IrExpr::TextConcat(_)
+                        )
                     }),
-                Some(IrNode::When { arms, .. }) | Some(IrNode::While { arms, .. }) => arms.iter().any(|(_, body)| {
-                    Self::extract_text_source_cell(body)
-                        .map(|source| self.expr_carries_runtime_text(body, source, visiting))
-                        .unwrap_or_else(|| {
-                            matches!(
-                                body,
-                                IrExpr::Constant(IrValue::Text(_)) | IrExpr::TextConcat(_)
-                            )
-                        })
-                }),
+                Some(IrNode::When { arms, .. }) | Some(IrNode::While { arms, .. }) => {
+                    arms.iter().any(|(_, body)| {
+                        Self::extract_text_source_cell(body)
+                            .map(|source| self.expr_carries_runtime_text(body, source, visiting))
+                            .unwrap_or_else(|| {
+                                matches!(
+                                    body,
+                                    IrExpr::Constant(IrValue::Text(_)) | IrExpr::TextConcat(_)
+                                )
+                            })
+                    })
+                }
                 Some(IrNode::PipeThrough { source, .. })
                 | Some(IrNode::StreamSkip { source, .. }) => {
                     self.cell_carries_runtime_text(*source, visiting)
                 }
-                Some(IrNode::TextInterpolation { .. })
-                | Some(IrNode::TextTrim { .. }) => true,
+                Some(IrNode::TextInterpolation { .. }) | Some(IrNode::TextTrim { .. }) => true,
                 _ => false,
             }
         };
@@ -5033,11 +5321,193 @@ impl<'a> WasmEmitter<'a> {
         func.instruction(&Instruction::GlobalSet(cell.0));
     }
 
+    fn substitute_expr_cell(&self, expr: IrExpr, target: CellId, replacement: &IrExpr) -> IrExpr {
+        match expr {
+            IrExpr::CellRead(cell) if cell == target => replacement.clone(),
+            IrExpr::CellRead(cell) => IrExpr::CellRead(cell),
+            IrExpr::FieldAccess { object, field } => IrExpr::FieldAccess {
+                object: Box::new(self.substitute_expr_cell(*object, target, replacement)),
+                field,
+            },
+            IrExpr::BinOp { op, lhs, rhs } => IrExpr::BinOp {
+                op,
+                lhs: Box::new(self.substitute_expr_cell(*lhs, target, replacement)),
+                rhs: Box::new(self.substitute_expr_cell(*rhs, target, replacement)),
+            },
+            IrExpr::UnaryNeg(inner) => IrExpr::UnaryNeg(Box::new(self.substitute_expr_cell(
+                *inner,
+                target,
+                replacement,
+            ))),
+            IrExpr::Compare { op, lhs, rhs } => IrExpr::Compare {
+                op,
+                lhs: Box::new(self.substitute_expr_cell(*lhs, target, replacement)),
+                rhs: Box::new(self.substitute_expr_cell(*rhs, target, replacement)),
+            },
+            IrExpr::TextConcat(parts) => IrExpr::TextConcat(
+                parts
+                    .into_iter()
+                    .map(|part| match part {
+                        TextSegment::Literal(text) => TextSegment::Literal(text),
+                        TextSegment::Expr(expr) => {
+                            TextSegment::Expr(self.substitute_expr_cell(expr, target, replacement))
+                        }
+                    })
+                    .collect(),
+            ),
+            IrExpr::FunctionCall { func, args } => IrExpr::FunctionCall {
+                func,
+                args: args
+                    .into_iter()
+                    .map(|arg| self.substitute_expr_cell(arg, target, replacement))
+                    .collect(),
+            },
+            IrExpr::Not(inner) => IrExpr::Not(Box::new(self.substitute_expr_cell(
+                *inner,
+                target,
+                replacement,
+            ))),
+            IrExpr::ObjectConstruct(fields) => IrExpr::ObjectConstruct(
+                fields
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (name, self.substitute_expr_cell(value, target, replacement))
+                    })
+                    .collect(),
+            ),
+            IrExpr::ListConstruct(items) => IrExpr::ListConstruct(
+                items
+                    .into_iter()
+                    .map(|item| self.substitute_expr_cell(item, target, replacement))
+                    .collect(),
+            ),
+            IrExpr::TaggedObject { tag, fields } => IrExpr::TaggedObject {
+                tag,
+                fields: fields
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (name, self.substitute_expr_cell(value, target, replacement))
+                    })
+                    .collect(),
+            },
+            IrExpr::PatternMatch { source, arms } => IrExpr::PatternMatch {
+                source,
+                arms: arms
+                    .into_iter()
+                    .map(|(pattern, body)| {
+                        (
+                            pattern,
+                            self.substitute_expr_cell(body, target, replacement),
+                        )
+                    })
+                    .collect(),
+            },
+            IrExpr::Constant(value) => IrExpr::Constant(value),
+        }
+    }
+
+    fn expand_function_calls_in_expr(&self, expr: IrExpr, depth: usize) -> IrExpr {
+        if depth > 16 {
+            return expr;
+        }
+
+        match expr {
+            IrExpr::FunctionCall { func, args } => {
+                let Some(ir_func) = self.program.functions.get(func.0 as usize) else {
+                    return IrExpr::FunctionCall { func, args };
+                };
+                let mut body = ir_func.body.clone();
+                for (param_cell, arg) in ir_func.param_cells.iter().zip(args.iter()) {
+                    body = self.substitute_expr_cell(body, *param_cell, arg);
+                }
+                self.expand_function_calls_in_expr(body, depth + 1)
+            }
+            IrExpr::FieldAccess { object, field } => IrExpr::FieldAccess {
+                object: Box::new(self.expand_function_calls_in_expr(*object, depth + 1)),
+                field,
+            },
+            IrExpr::BinOp { op, lhs, rhs } => IrExpr::BinOp {
+                op,
+                lhs: Box::new(self.expand_function_calls_in_expr(*lhs, depth + 1)),
+                rhs: Box::new(self.expand_function_calls_in_expr(*rhs, depth + 1)),
+            },
+            IrExpr::UnaryNeg(inner) => IrExpr::UnaryNeg(Box::new(
+                self.expand_function_calls_in_expr(*inner, depth + 1),
+            )),
+            IrExpr::Compare { op, lhs, rhs } => IrExpr::Compare {
+                op,
+                lhs: Box::new(self.expand_function_calls_in_expr(*lhs, depth + 1)),
+                rhs: Box::new(self.expand_function_calls_in_expr(*rhs, depth + 1)),
+            },
+            IrExpr::TextConcat(parts) => IrExpr::TextConcat(
+                parts
+                    .into_iter()
+                    .map(|part| match part {
+                        TextSegment::Literal(text) => TextSegment::Literal(text),
+                        TextSegment::Expr(expr) => {
+                            TextSegment::Expr(self.expand_function_calls_in_expr(expr, depth + 1))
+                        }
+                    })
+                    .collect(),
+            ),
+            IrExpr::Not(inner) => IrExpr::Not(Box::new(
+                self.expand_function_calls_in_expr(*inner, depth + 1),
+            )),
+            IrExpr::ObjectConstruct(fields) => IrExpr::ObjectConstruct(
+                fields
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (name, self.expand_function_calls_in_expr(value, depth + 1))
+                    })
+                    .collect(),
+            ),
+            IrExpr::ListConstruct(items) => IrExpr::ListConstruct(
+                items
+                    .into_iter()
+                    .map(|item| self.expand_function_calls_in_expr(item, depth + 1))
+                    .collect(),
+            ),
+            IrExpr::TaggedObject { tag, fields } => IrExpr::TaggedObject {
+                tag,
+                fields: fields
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (name, self.expand_function_calls_in_expr(value, depth + 1))
+                    })
+                    .collect(),
+            },
+            IrExpr::PatternMatch { source, arms } => IrExpr::PatternMatch {
+                source,
+                arms: arms
+                    .into_iter()
+                    .map(|(pattern, body)| {
+                        (pattern, self.expand_function_calls_in_expr(body, depth + 1))
+                    })
+                    .collect(),
+            },
+            other => other,
+        }
+    }
+
     fn resolve_namespace_source_cell(&self, expr: &IrExpr) -> Option<CellId> {
+        self.resolve_namespace_source_cell_inner(expr, 0)
+    }
+
+    fn resolve_namespace_source_cell_inner(&self, expr: &IrExpr, depth: usize) -> Option<CellId> {
+        if depth > 32 {
+            return None;
+        }
         match expr {
             IrExpr::CellRead(cell) => Some(*cell),
             IrExpr::FieldAccess { object, field } => {
                 self.resolve_field_access_expr_cell(object, field, 0)
+            }
+            IrExpr::FunctionCall { .. } => {
+                let expanded = self.expand_function_calls_in_expr(expr.clone(), 0);
+                match expanded {
+                    IrExpr::FunctionCall { .. } => None,
+                    other => self.resolve_namespace_source_cell_inner(&other, depth + 1),
+                }
             }
             _ => None,
         }
@@ -5115,10 +5585,95 @@ impl<'a> WasmEmitter<'a> {
         if !self.program.cell_field_cells.contains_key(&target) {
             return;
         }
-        if let Some(source) = self.resolve_namespace_source_cell(expr) {
+        let expanded = self.expand_function_calls_in_expr(expr.clone(), 0);
+        if let IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } = &expanded {
+            if let Some(target_fields) = self
+                .resolve_cell_field_map(target, 0)
+                .map(|fields| self.canonicalize_target_field_map(target, fields))
+            {
+                for (name, target_field) in &target_fields {
+                    if let Some((_, value)) =
+                        fields.iter().find(|(field_name, _)| field_name == name)
+                    {
+                        self.emit_assign_namespace_expr(func, *target_field, value, mem_ctx, 0);
+                    } else {
+                        self.emit_clear_namespace_fields(func, *target_field, mem_ctx);
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(source) = self.resolve_namespace_source_cell(&expanded) {
             self.emit_copy_namespace_cell(func, target, source, mem_ctx);
         } else {
             self.emit_clear_namespace_fields(func, target, mem_ctx);
+        }
+    }
+
+    fn emit_assign_namespace_expr(
+        &self,
+        func: &mut Function,
+        target: CellId,
+        expr: &IrExpr,
+        mem_ctx: Option<&MemoryContext>,
+        depth: usize,
+    ) {
+        if depth > 16 {
+            self.emit_clear_namespace_fields(func, target, mem_ctx);
+            return;
+        }
+
+        let expanded = self.expand_function_calls_in_expr(expr.clone(), depth);
+        if let Some(target_fields) = self
+            .resolve_cell_field_map(target, 0)
+            .map(|fields| self.canonicalize_target_field_map(target, fields))
+        {
+            match &expanded {
+                IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => {
+                    for (name, target_field) in &target_fields {
+                        if let Some((_, value)) =
+                            fields.iter().find(|(field_name, _)| field_name == name)
+                        {
+                            self.emit_assign_namespace_expr(
+                                func,
+                                *target_field,
+                                value,
+                                mem_ctx,
+                                depth + 1,
+                            );
+                        } else {
+                            self.emit_clear_namespace_fields(func, *target_field, mem_ctx);
+                        }
+                    }
+                    return;
+                }
+                _ => {
+                    if let Some(source) = self.resolve_namespace_source_cell(&expanded) {
+                        self.emit_copy_namespace_cell(func, target, source, mem_ctx);
+                    } else {
+                        self.emit_clear_namespace_fields(func, target, mem_ctx);
+                    }
+                    return;
+                }
+            }
+        }
+
+        if self.is_text_body(&expanded) {
+            self.emit_text_setting_ctx(func, target, &expanded, mem_ctx);
+        } else {
+            self.emit_expr_ctx(func, &expanded, mem_ctx);
+            self.emit_cell_set(func, target, mem_ctx);
+            if let Some(src) = self.extract_runtime_text_source_cell(&expanded) {
+                func.instruction(&Instruction::I32Const(target.0 as i32));
+                func.instruction(&Instruction::I32Const(src.0 as i32));
+                func.instruction(&Instruction::Call(IMPORT_HOST_COPY_TEXT));
+            }
+        }
+        func.instruction(&Instruction::I32Const(target.0 as i32));
+        self.emit_cell_get(func, target, mem_ctx);
+        func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
+        if Self::expr_produces_bool(&expanded) {
+            self.emit_bool_text_update(func, target);
         }
     }
 
@@ -5173,6 +5728,25 @@ impl<'a> WasmEmitter<'a> {
             cell_start: info.cell_range.0,
             cell_end: info.cell_range.1,
         })
+    }
+
+    fn nested_render_template_ranges(&self, info: &ListMapInfo) -> Vec<(u32, u32)> {
+        self.find_render_list_map_infos()
+            .into_iter()
+            .filter_map(|other| {
+                (other.cell != info.cell
+                    && other.cell_range.0 >= info.cell_range.0
+                    && other.cell_range.1 <= info.cell_range.1
+                    && other.cell_range != info.cell_range)
+                    .then_some(other.cell_range)
+            })
+            .collect()
+    }
+
+    fn range_contains_nested_cell(ranges: &[(u32, u32)], cell_id: u32) -> bool {
+        ranges
+            .iter()
+            .any(|(start, end)| cell_id >= *start && cell_id < *end)
     }
 
     /// Find which ListMap is downstream of a given list source cell.
@@ -5607,12 +6181,7 @@ impl<'a> WasmEmitter<'a> {
             }
             (None, Some(source_fields)) if source_fields.len() == 1 => {
                 if let Some(source_field) = source_fields.values().next() {
-                    self.emit_load_item_field_from_template(
-                        func,
-                        target,
-                        *source_field,
-                        depth + 1,
-                    );
+                    self.emit_load_item_field_from_template(func, target, *source_field, depth + 1);
                 }
             }
             (None, _) => {
@@ -6008,6 +6577,7 @@ impl<'a> WasmEmitter<'a> {
                 Some(ctx) => ctx,
                 None => continue,
             };
+            let nested_ranges = self.nested_render_template_ranges(info);
 
             // if (local.1 == map_cell_id) { ... init cells ... }
             func.instruction(&Instruction::LocalGet(1)); // map_cell
@@ -6015,8 +6585,22 @@ impl<'a> WasmEmitter<'a> {
             func.instruction(&Instruction::I32Eq);
             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
+            // Reload the current per-item workspace from the host before
+            // evaluating init expressions. The bridge may have pre-seeded
+            // template cells (for example nested list ids or display/editing
+            // selector sources), and init must read those values rather than
+            // stale globals from another item or the default 0.0 workspace.
+            for cell_id in info.cell_range.0..info.cell_range.1 {
+                if Self::range_contains_nested_cell(&nested_ranges, cell_id) {
+                    continue;
+                }
+                func.instruction(&Instruction::I32Const(cell_id as i32));
+                func.instruction(&Instruction::Call(IMPORT_HOST_GET_CELL_F64));
+                func.instruction(&Instruction::GlobalSet(cell_id));
+            }
+
             // Initialize each template-scoped node for this ListMap.
-            self.emit_init_item_body(&mut func, info, &mem_ctx);
+            self.emit_init_item_body(&mut func, info, &mem_ctx, &nested_ranges);
 
             func.instruction(&Instruction::End); // end if
         }
@@ -6028,7 +6612,13 @@ impl<'a> WasmEmitter<'a> {
     }
 
     /// Emit the body of init_item for a single ListMap's template range.
-    fn emit_init_item_body(&self, func: &mut Function, info: &ListMapInfo, mem_ctx: &MemoryContext) {
+    fn emit_init_item_body(
+        &self,
+        func: &mut Function,
+        info: &ListMapInfo,
+        mem_ctx: &MemoryContext,
+        nested_ranges: &[(u32, u32)],
+    ) {
         let item_has_fields = self
             .program
             .cell_field_cells
@@ -6045,7 +6635,7 @@ impl<'a> WasmEmitter<'a> {
             func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
         }
 
-        for node in self.template_nodes(mem_ctx) {
+        for node in self.template_nodes(mem_ctx, nested_ranges) {
             match node {
                 IrNode::Hold { cell, init, .. }
                     if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
@@ -6094,9 +6684,7 @@ impl<'a> WasmEmitter<'a> {
                             let pattern_idx = self.register_text_pattern(&text);
                             func.instruction(&Instruction::I32Const(cell.0 as i32));
                             func.instruction(&Instruction::I32Const(pattern_idx as i32));
-                            func.instruction(&Instruction::Call(
-                                IMPORT_HOST_SET_CELL_TEXT_PATTERN,
-                            ));
+                            func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_TEXT_PATTERN));
                         }
                     } else if let Some(text) = self.resolve_expr_text_statically(expr) {
                         let pattern_idx = self.register_text_pattern(&text);
@@ -6118,18 +6706,21 @@ impl<'a> WasmEmitter<'a> {
                 IrNode::Latest { target, arms }
                     if target.0 >= mem_ctx.cell_start && target.0 < mem_ctx.cell_end =>
                 {
-                    // Initialize with the first arm's body (static or triggered).
-                    if let Some(arm) = arms.first() {
+                    // Only initialize from a non-triggered arm. Event-triggered
+                    // Latest arms must not seed representative values into the
+                    // template state before any real event fires.
+                    if let Some(arm) = arms.iter().find(|arm| arm.trigger.is_none()) {
                         if self.is_text_body(&arm.body) {
-                            self.emit_text_setting_ctx(
+                            self.emit_text_setting_ctx(func, *target, &arm.body, Some(mem_ctx));
+                        } else {
+                            self.emit_expr_ctx(func, &arm.body, Some(mem_ctx));
+                            self.emit_cell_set(func, *target, Some(mem_ctx));
+                            self.emit_sync_namespace_assignment(
                                 func,
                                 *target,
                                 &arm.body,
                                 Some(mem_ctx),
                             );
-                        } else {
-                            self.emit_expr_ctx(func, &arm.body, Some(mem_ctx));
-                            self.emit_cell_set(func, *target, Some(mem_ctx));
                         }
                         func.instruction(&Instruction::I32Const(target.0 as i32));
                         self.emit_cell_get(func, *target, Some(mem_ctx));
@@ -6176,6 +6767,7 @@ impl<'a> WasmEmitter<'a> {
                 Some(ctx) => ctx,
                 None => continue,
             };
+            let nested_ranges = self.nested_render_template_ranges(info);
 
             func.instruction(&Instruction::LocalGet(1)); // map_cell
             func.instruction(&Instruction::I32Const(info.cell.0 as i32));
@@ -6183,12 +6775,15 @@ impl<'a> WasmEmitter<'a> {
             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
             for cell_id in info.cell_range.0..info.cell_range.1 {
+                if Self::range_contains_nested_cell(&nested_ranges, cell_id) {
+                    continue;
+                }
                 func.instruction(&Instruction::I32Const(cell_id as i32));
                 func.instruction(&Instruction::Call(IMPORT_HOST_GET_CELL_F64));
                 func.instruction(&Instruction::GlobalSet(cell_id));
             }
 
-            self.emit_refresh_item_body(&mut func, info, &mem_ctx);
+            self.emit_refresh_item_body(&mut func, info, &mem_ctx, &nested_ranges);
 
             func.instruction(&Instruction::End);
         }
@@ -6203,6 +6798,7 @@ impl<'a> WasmEmitter<'a> {
         func: &mut Function,
         info: &ListMapInfo,
         mem_ctx: &MemoryContext,
+        nested_ranges: &[(u32, u32)],
     ) {
         let item_has_fields = self
             .program
@@ -6225,6 +6821,9 @@ impl<'a> WasmEmitter<'a> {
                 IrNode::Derived { cell, expr }
                     if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
                 {
+                    if Self::range_contains_nested_cell(nested_ranges, cell.0) {
+                        continue;
+                    }
                     self.emit_expr_ctx(func, expr, Some(mem_ctx));
                     self.emit_cell_set(func, *cell, Some(mem_ctx));
                     func.instruction(&Instruction::I32Const(cell.0 as i32));
@@ -6244,6 +6843,9 @@ impl<'a> WasmEmitter<'a> {
                 IrNode::When { cell, source, arms }
                     if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
                 {
+                    if Self::range_contains_nested_cell(nested_ranges, cell.0) {
+                        continue;
+                    }
                     if !self.cell_depends_on_external_cell(*cell, mem_ctx) {
                         continue;
                     }
@@ -6252,15 +6854,20 @@ impl<'a> WasmEmitter<'a> {
                 IrNode::While {
                     cell, source, arms, ..
                 } if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end => {
+                    if Self::range_contains_nested_cell(nested_ranges, cell.0) {
+                        continue;
+                    }
                     if !self.cell_depends_on_external_cell(*cell, mem_ctx) {
                         continue;
                     }
                     self.emit_pattern_match_ctx(func, *source, arms, *cell, Some(mem_ctx), true);
                 }
                 IrNode::TextIsNotEmpty { cell, source }
-                    if cell.0 >= mem_ctx.cell_start
-                        && cell.0 < mem_ctx.cell_end =>
+                    if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
                 {
+                    if Self::range_contains_nested_cell(nested_ranges, cell.0) {
+                        continue;
+                    }
                     if !self.cell_depends_on_external_cell(*cell, mem_ctx) {
                         continue;
                     }
@@ -6272,9 +6879,11 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
                 IrNode::TextTrim { cell, source }
-                    if cell.0 >= mem_ctx.cell_start
-                        && cell.0 < mem_ctx.cell_end =>
+                    if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
                 {
+                    if Self::range_contains_nested_cell(nested_ranges, cell.0) {
+                        continue;
+                    }
                     if !self.cell_depends_on_external_cell(*cell, mem_ctx) {
                         continue;
                     }
@@ -6287,10 +6896,14 @@ impl<'a> WasmEmitter<'a> {
                     self.emit_cell_get(func, *cell, Some(mem_ctx));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
-                IrNode::TextToNumber { cell, source, nan_tag_value }
-                    if cell.0 >= mem_ctx.cell_start
-                        && cell.0 < mem_ctx.cell_end =>
-                {
+                IrNode::TextToNumber {
+                    cell,
+                    source,
+                    nan_tag_value,
+                } if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end => {
+                    if Self::range_contains_nested_cell(nested_ranges, cell.0) {
+                        continue;
+                    }
                     if !self.cell_depends_on_external_cell(*cell, mem_ctx) {
                         continue;
                     }
@@ -6302,10 +6915,14 @@ impl<'a> WasmEmitter<'a> {
                     self.emit_cell_get(func, *cell, Some(mem_ctx));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
-                IrNode::TextStartsWith { cell, source, prefix }
-                    if cell.0 >= mem_ctx.cell_start
-                        && cell.0 < mem_ctx.cell_end =>
-                {
+                IrNode::TextStartsWith {
+                    cell,
+                    source,
+                    prefix,
+                } if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end => {
+                    if Self::range_contains_nested_cell(nested_ranges, cell.0) {
+                        continue;
+                    }
                     if !self.cell_depends_on_external_cell(*cell, mem_ctx) {
                         continue;
                     }
@@ -6318,9 +6935,11 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
                 IrNode::MathRound { cell, source }
-                    if cell.0 >= mem_ctx.cell_start
-                        && cell.0 < mem_ctx.cell_end =>
+                    if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
                 {
+                    if Self::range_contains_nested_cell(nested_ranges, cell.0) {
+                        continue;
+                    }
                     if !self.cell_depends_on_external_cell(*cell, mem_ctx) {
                         continue;
                     }
@@ -6332,9 +6951,11 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
                 IrNode::MathMin { cell, source, b }
-                    if cell.0 >= mem_ctx.cell_start
-                        && cell.0 < mem_ctx.cell_end =>
+                    if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
                 {
+                    if Self::range_contains_nested_cell(nested_ranges, cell.0) {
+                        continue;
+                    }
                     if !self.cell_depends_on_external_cell(*cell, mem_ctx) {
                         continue;
                     }
@@ -6347,9 +6968,11 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                 }
                 IrNode::MathMax { cell, source, b }
-                    if cell.0 >= mem_ctx.cell_start
-                        && cell.0 < mem_ctx.cell_end =>
+                    if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end =>
                 {
+                    if Self::range_contains_nested_cell(nested_ranges, cell.0) {
+                        continue;
+                    }
                     if !self.cell_depends_on_external_cell(*cell, mem_ctx) {
                         continue;
                     }
@@ -6476,13 +7099,20 @@ impl<'a> WasmEmitter<'a> {
                     cell,
                     trigger,
                     body,
-                } if *trigger == event_id =>
-                {
+                } if *trigger == event_id => {
                     if let IrExpr::PatternMatch { source, arms } = body {
                         self.emit_reevaluate_cell_ctx(func, *source, mem_ctx);
-                        self.emit_pattern_match_ctx(func, *source, arms, *cell, Some(mem_ctx), true);
+                        self.emit_pattern_match_ctx(
+                            func,
+                            *source,
+                            arms,
+                            *cell,
+                            Some(mem_ctx),
+                            true,
+                        );
                         continue;
                     }
+                    self.emit_reevaluate_expr_deps_ctx(func, body, mem_ctx);
                     if self.is_text_body(body) {
                         self.emit_text_setting_ctx(func, *cell, body, Some(mem_ctx));
                     } else {
@@ -6493,12 +7123,8 @@ impl<'a> WasmEmitter<'a> {
                     self.emit_cell_get(func, *cell, Some(mem_ctx));
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                     self.emit_sync_namespace_assignment(func, *cell, body, Some(mem_ctx));
-                    if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end {
-                        self.emit_item_downstream_updates(func, *cell, mem_ctx);
-                    } else {
-                        self.emit_item_downstream_updates(func, *cell, mem_ctx);
-                        self.emit_downstream_updates(func, *cell);
-                    }
+                    self.emit_item_downstream_updates(func, *cell, mem_ctx);
+                    self.emit_downstream_updates(func, *cell);
                 }
                 IrNode::Hold {
                     cell,
@@ -6509,10 +7135,18 @@ impl<'a> WasmEmitter<'a> {
                         if *trigger == event_id {
                             if let IrExpr::PatternMatch { source, arms } = body {
                                 self.emit_reevaluate_cell_ctx(func, *source, mem_ctx);
-                                self.emit_pattern_match_ctx(func, *source, arms, *cell, Some(mem_ctx), true);
+                                self.emit_pattern_match_ctx(
+                                    func,
+                                    *source,
+                                    arms,
+                                    *cell,
+                                    Some(mem_ctx),
+                                    true,
+                                );
                                 continue;
                             }
                             let may_skip = matches!(body, IrExpr::PatternMatch { .. });
+                            self.emit_reevaluate_expr_deps_ctx(func, body, mem_ctx);
                             // Extract text source cell from body for text copy.
                             let text_source = self.extract_runtime_text_source_cell(body);
                             // Re-evaluate the text dependency chain before reading.
@@ -6560,12 +7194,8 @@ impl<'a> WasmEmitter<'a> {
                                 if Self::expr_produces_bool(body) {
                                     self.emit_bool_text_update(func, *cell);
                                 }
-                                if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end {
-                                    self.emit_item_downstream_updates(func, *cell, mem_ctx);
-                                } else {
-                                    self.emit_item_downstream_updates(func, *cell, mem_ctx);
-                                    self.emit_downstream_updates(func, *cell);
-                                }
+                                self.emit_item_downstream_updates(func, *cell, mem_ctx);
+                                self.emit_downstream_updates(func, *cell);
                                 func.instruction(&Instruction::End);
                             } else {
                                 self.emit_expr_ctx(func, body, Some(mem_ctx));
@@ -6588,21 +7218,17 @@ impl<'a> WasmEmitter<'a> {
                                 if Self::expr_produces_bool(body) {
                                     self.emit_bool_text_update(func, *cell);
                                 }
-                                if cell.0 >= mem_ctx.cell_start && cell.0 < mem_ctx.cell_end {
-                                    self.emit_item_downstream_updates(func, *cell, mem_ctx);
-                                } else {
-                                    self.emit_item_downstream_updates(func, *cell, mem_ctx);
-                                    self.emit_downstream_updates(func, *cell);
-                                }
+                                self.emit_item_downstream_updates(func, *cell, mem_ctx);
+                                self.emit_downstream_updates(func, *cell);
                             }
                         }
                     }
                 }
-                IrNode::Latest { target, arms } =>
-                {
+                IrNode::Latest { target, arms } => {
                     for arm in arms {
                         if arm.trigger == Some(event_id) {
                             let may_skip = matches!(&arm.body, IrExpr::PatternMatch { .. });
+                            self.emit_reevaluate_expr_deps_ctx(func, &arm.body, mem_ctx);
                             let text_source = self.extract_runtime_text_source_cell(&arm.body);
                             if self.is_text_body(&arm.body) {
                                 self.emit_text_setting_ctx(func, *target, &arm.body, Some(mem_ctx));
@@ -6615,14 +7241,8 @@ impl<'a> WasmEmitter<'a> {
                                     &arm.body,
                                     Some(mem_ctx),
                                 );
-                                if target.0 >= mem_ctx.cell_start
-                                    && target.0 < mem_ctx.cell_end
-                                {
-                                    self.emit_item_downstream_updates(func, *target, mem_ctx);
-                                } else {
-                                    self.emit_item_downstream_updates(func, *target, mem_ctx);
-                                    self.emit_downstream_updates(func, *target);
-                                }
+                                self.emit_item_downstream_updates(func, *target, mem_ctx);
+                                self.emit_downstream_updates(func, *target);
                             } else if may_skip {
                                 let skip_global = self.program.cells.len() as u32;
                                 self.emit_expr_ctx(func, &arm.body, Some(mem_ctx));
@@ -6648,14 +7268,8 @@ impl<'a> WasmEmitter<'a> {
                                     &arm.body,
                                     Some(mem_ctx),
                                 );
-                                if target.0 >= mem_ctx.cell_start
-                                    && target.0 < mem_ctx.cell_end
-                                {
-                                    self.emit_item_downstream_updates(func, *target, mem_ctx);
-                                } else {
-                                    self.emit_item_downstream_updates(func, *target, mem_ctx);
-                                    self.emit_downstream_updates(func, *target);
-                                }
+                                self.emit_item_downstream_updates(func, *target, mem_ctx);
+                                self.emit_downstream_updates(func, *target);
                                 func.instruction(&Instruction::End);
                             } else {
                                 self.emit_expr_ctx(func, &arm.body, Some(mem_ctx));
@@ -6668,14 +7282,14 @@ impl<'a> WasmEmitter<'a> {
                                 func.instruction(&Instruction::I32Const(target.0 as i32));
                                 self.emit_cell_get(func, *target, Some(mem_ctx));
                                 func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
-                                if target.0 >= mem_ctx.cell_start
-                                    && target.0 < mem_ctx.cell_end
-                                {
-                                    self.emit_item_downstream_updates(func, *target, mem_ctx);
-                                } else {
-                                    self.emit_item_downstream_updates(func, *target, mem_ctx);
-                                    self.emit_downstream_updates(func, *target);
-                                }
+                                self.emit_sync_namespace_assignment(
+                                    func,
+                                    *target,
+                                    &arm.body,
+                                    Some(mem_ctx),
+                                );
+                                self.emit_item_downstream_updates(func, *target, mem_ctx);
+                                self.emit_downstream_updates(func, *target);
                             }
                         }
                     }
@@ -6935,7 +7549,15 @@ impl<'a> WasmEmitter<'a> {
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms_ctx(func, source, arms, target, idx + 1, mem_ctx, propagate_downstream);
+                    self.emit_pattern_arms_ctx(
+                        func,
+                        source,
+                        arms,
+                        target,
+                        idx + 1,
+                        mem_ctx,
+                        propagate_downstream,
+                    );
                 }
                 func.instruction(&Instruction::End);
             }
@@ -6949,7 +7571,15 @@ impl<'a> WasmEmitter<'a> {
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms_ctx(func, source, arms, target, idx + 1, mem_ctx, propagate_downstream);
+                    self.emit_pattern_arms_ctx(
+                        func,
+                        source,
+                        arms,
+                        target,
+                        idx + 1,
+                        mem_ctx,
+                        propagate_downstream,
+                    );
                 }
                 func.instruction(&Instruction::End);
             }
@@ -6965,7 +7595,15 @@ impl<'a> WasmEmitter<'a> {
                 }
                 if has_more {
                     func.instruction(&Instruction::Else);
-                    self.emit_pattern_arms_ctx(func, source, arms, target, idx + 1, mem_ctx, propagate_downstream);
+                    self.emit_pattern_arms_ctx(
+                        func,
+                        source,
+                        arms,
+                        target,
+                        idx + 1,
+                        mem_ctx,
+                        propagate_downstream,
+                    );
                 }
                 func.instruction(&Instruction::End);
             }
@@ -7129,10 +7767,7 @@ impl<'a> WasmEmitter<'a> {
                             self.emit_cell_get(func, *target, Some(mem_ctx));
                             func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                             self.emit_item_downstream_updates_guarded(
-                                func,
-                                *target,
-                                mem_ctx,
-                                visiting,
+                                func, *target, mem_ctx, visiting,
                             );
                         } else if may_skip {
                             let skip_global = self.program.cells.len() as u32;
@@ -7153,11 +7788,14 @@ impl<'a> WasmEmitter<'a> {
                             func.instruction(&Instruction::I32Const(target.0 as i32));
                             self.emit_cell_get(func, *target, Some(mem_ctx));
                             func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
-                            self.emit_item_downstream_updates_guarded(
+                            self.emit_sync_namespace_assignment(
                                 func,
                                 *target,
-                                mem_ctx,
-                                visiting,
+                                &arm.body,
+                                Some(mem_ctx),
+                            );
+                            self.emit_item_downstream_updates_guarded(
+                                func, *target, mem_ctx, visiting,
                             );
                             func.instruction(&Instruction::End);
                         } else {
@@ -7171,11 +7809,14 @@ impl<'a> WasmEmitter<'a> {
                             func.instruction(&Instruction::I32Const(target.0 as i32));
                             self.emit_cell_get(func, *target, Some(mem_ctx));
                             func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
-                            self.emit_item_downstream_updates_guarded(
+                            self.emit_sync_namespace_assignment(
                                 func,
                                 *target,
-                                mem_ctx,
-                                visiting,
+                                &arm.body,
+                                Some(mem_ctx),
+                            );
+                            self.emit_item_downstream_updates_guarded(
+                                func, *target, mem_ctx, visiting,
                             );
                         }
                     }
@@ -7208,10 +7849,13 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                     self.emit_item_downstream_updates_guarded(func, *cell, mem_ctx, visiting);
                 }
-                IrNode::TextToNumber { cell, source, nan_tag_value }
-                    if *source == updated_cell
-                        && cell.0 >= mem_ctx.cell_start
-                        && cell.0 < mem_ctx.cell_end =>
+                IrNode::TextToNumber {
+                    cell,
+                    source,
+                    nan_tag_value,
+                } if *source == updated_cell
+                    && cell.0 >= mem_ctx.cell_start
+                    && cell.0 < mem_ctx.cell_end =>
                 {
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::F64Const(*nan_tag_value));
@@ -7222,10 +7866,13 @@ impl<'a> WasmEmitter<'a> {
                     func.instruction(&Instruction::Call(IMPORT_HOST_SET_CELL_F64));
                     self.emit_item_downstream_updates_guarded(func, *cell, mem_ctx, visiting);
                 }
-                IrNode::TextStartsWith { cell, source, prefix }
-                    if (*source == updated_cell || *prefix == updated_cell)
-                        && cell.0 >= mem_ctx.cell_start
-                        && cell.0 < mem_ctx.cell_end =>
+                IrNode::TextStartsWith {
+                    cell,
+                    source,
+                    prefix,
+                } if (*source == updated_cell || *prefix == updated_cell)
+                    && cell.0 >= mem_ctx.cell_start
+                    && cell.0 < mem_ctx.cell_end =>
                 {
                     func.instruction(&Instruction::I32Const(source.0 as i32));
                     func.instruction(&Instruction::I32Const(prefix.0 as i32));
@@ -7323,8 +7970,17 @@ impl<'a> WasmEmitter<'a> {
                     item_field_cells,
                 } if item_cell.is_some() => {
                     self.emit_boolean_check_loop(
-                        &mut func, *cell, *source, *pred, *item_cell,
-                        item_field_cells, 0, 1, 2, 3, true,
+                        &mut func,
+                        *cell,
+                        *source,
+                        *pred,
+                        *item_cell,
+                        item_field_cells,
+                        0,
+                        1,
+                        2,
+                        3,
+                        true,
                     );
                     self.emit_downstream_updates(&mut func, *cell);
                 }
@@ -7336,8 +7992,17 @@ impl<'a> WasmEmitter<'a> {
                     item_field_cells,
                 } if item_cell.is_some() => {
                     self.emit_boolean_check_loop(
-                        &mut func, *cell, *source, *pred, *item_cell,
-                        item_field_cells, 0, 1, 2, 3, false,
+                        &mut func,
+                        *cell,
+                        *source,
+                        *pred,
+                        *item_cell,
+                        item_field_cells,
+                        0,
+                        1,
+                        2,
+                        3,
+                        false,
                     );
                     self.emit_downstream_updates(&mut func, *cell);
                 }

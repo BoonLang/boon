@@ -4,9 +4,20 @@ Boon's third engine: compile Boon source directly to WASM. Standalone `engine_wa
 module — does NOT depend on DD or Actors engine internals. Consumes the shared parser
 AST, has its own analysis + codegen pipeline.
 
+## Current Direction
+
+1. **`../wasm_pro.md`** — redesign memo for the next Wasm architecture.
+   Use this for the long-term boundary/runtime plan: Wasm-owned semantics, renderer-
+   agnostic diff output, small ABI, and migration from the current partial-compilation
+   design.
+
+2. **`../wasm_pro_execution_backlog.md`** — execution backlog for Wasm Pro.
+   Use this for milestone order, file targets, acceptance checks, and the first coding
+   sequence.
+
 ## Reading Order
 
-1. **`wasm_engine_direct_compilation_plan.md`** — THE implementation plan.
+1. **`wasm_engine_direct_compilation_plan.md`** — original direct-compilation plan.
    Milestones M0-M6, operator lowering with IR/WASM examples, host callback ABI,
    feature gating, build matrix. **Start here.**
 

@@ -298,7 +298,11 @@ pub enum CollectionSpec {
     },
 
     /// Transform each list item with access to the item's key and one reactive scalar dependency.
-    ListMapWithKeyReactive { source: VarId, dep: VarId, f: KeyedCombineFn },
+    ListMapWithKeyReactive {
+        source: VarId,
+        dep: VarId,
+        f: KeyedCombineFn,
+    },
 
     /// Append items to a list (concat).
     ListAppend { list: VarId, new_items: VarId },

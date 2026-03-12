@@ -1,7 +1,45 @@
 # Zoon Parity Tasks
 
+## Status
+
+- Active milestone tracker, but the engine direction changed on 2026-03-13.
+- New semantic-oracle work follows [reference_kernel_plan.md](/home/martinkavik/repos/boon/docs/plans/reference_kernel_plan.md).
+- The three engines remain independent and later belong in separate crates.
+- The reference kernel is for conformance, diagnostics, and tests only. It is not a shared production runtime.
+
 ## Current Completed Base
 
+- internal reference-kernel foundations now exist for semantic-oracle work:
+  - stable ids
+  - deterministic runtime update ordering
+  - renderer-owned UI event state
+  - reference `LATEST` selection semantics
+  - reference `HOLD` change-tracking semantics
+  - reference `LINK` binding/read semantics
+  - reference list item key/scope stability semantics
+- first engine-facing semantic-oracle footholds now exist:
+  - Actors evaluator-level `LATEST` conformance test landed and passes under `--features engine-actors`
+  - Actors evaluator-level `HOLD` conformance test landed and passes under `--features engine-actors`
+  - Actors evaluator-level `LINK` conformance test landed and passes under `--features engine-actors`
+  - Actors list-item scope-id stability tests landed and pass under `--features engine-actors`
+  - DD worker-level `LATEST` conformance test landed in code
+  - DD worker-level `HOLD` conformance test landed in code
+  - Wasm lowering-level `LATEST` conformance test landed and passes under `--features engine-wasm`
+  - Wasm lowering-level `HOLD` conformance test landed and passes under `--features engine-wasm`
+- Wasm lowering-level `LINK` conformance test landed and passes under `--features engine-wasm`
+- Wasm list-map item-store tracking regression passes under `--features engine-wasm`
+- Wasm bridge/runtime `cells` regressions now pass for:
+  - first-row nested `row_data -> cells` list materialization
+  - first-cell seed formula/value resolution
+  - `is_editing` activation only for the first cell when editing `A1`
+  - active-root switching only for the first cell under the same edit state
+- Wasm `cells` now also has two broader structural fixes landed:
+  - sparse `ItemCellStore` storage keyed by item memory index, replacing the old dense vector growth that caused edit-path `ensure_item` OOMs
+  - extension-side `DoubleClickAt` now dispatches an explicit DOM double-click sequence on the hit element instead of relying only on CDP click-count synthesis
+- Wasm `cells` now also has a codegen-side nested-template isolation fix:
+  - outer row `init_item` / `refresh_item` no longer initialize nested inner cell-template nodes in the wrong item context
+  - fresh live Wasm `cells` render is clean again with no initial stray inputs
+  - focused codegen regression `cells_outer_row_init_excludes_nested_cell_template_nodes` now passes under `--features engine-wasm`
 - shared crates exist for scene, monitor protocol, and Zoon renderer
 - shared renderer placeholders are used by Actors, DD, and Wasm bridges
 - `RenderSurface` is preserved in Actors bridge selection, DD compiled output, and Wasm IR
@@ -75,13 +113,18 @@
 
 ## Next Engine Tasks
 
-- add stronger `Scene/new` semantic checks for `todo_mvc_physical` and related examples
-- rerun the full non-persistence Zoon suites for Actors, DD, and Wasm with `cells` no longer skipped
-- add exact interactive `cells` edit-flow checks:
+- add the reference-kernel conformance layer:
+  - lock `HOLD`, `LINK`, `LATEST`, list identity, and event-order semantics
+  - use it as the oracle for Actors, DD, and Wasm behavior
+- keep stronger `Scene/new` semantic checks for `todo_mvc_physical` and related examples
+- keep exact interactive `cells` edit-flow checks:
   - double-click edit
   - Enter commit
   - Escape cancel
   - dependent recomputation
+- stage `cells` acceptance as:
+  - `26 x 30` parity first
+  - `26 x 100` scale target second
 - remove stale debug instrumentation from DD/Wasm `cells` work
 
 ## Current TODOs
@@ -114,9 +157,17 @@
 
 ### Wasm Cells
 
-- remove the remaining Wasm `cells` debug output from lowering/codegen
-- add a smaller regression for the header/`List/range -> List/map` path so future changes do not reintroduce the old stack/render failure
-- add edit-behavior coverage on the official grid
+- use [reference_kernel_plan.md](/home/martinkavik/repos/boon/docs/plans/reference_kernel_plan.md) as the current source of truth for semantic direction
+- treat [wasm_cells_performance_plan.md](/home/martinkavik/repos/boon/docs/plans/wasm_cells_performance_plan.md) as legacy Wasm-specific notes, not the primary work queue
+- preserve official 7GUIs semantics with no Cells-specific fallback or degraded slow path
+- only return to deeper Wasm redesign after the reference semantics are pinned down
+- when Wasm work resumes, make debug-mode responsiveness the hard gate:
+  - `select cells`
+  - initial grid render
+  - double-click edit
+  - Enter commit
+  - reopen current formula text
+  - Escape cancel
 
 ### Actors Cells
 
@@ -152,21 +203,88 @@
       - `Escape` cancel preserving committed values
       - blur exit without corruption
   - current concrete Wasm blocker:
-    - the old recursion/lowering failure is fixed:
-      - `cargo check -p boon --features engine-wasm` passes
-      - `cargo test -p boon --features engine-wasm cells_example_lowers_and_emits_wasm -- --nocapture` passes
-    - nested row-list binding is also fixed:
-      - outer `row_data` items now resolve real `cells` lists instead of `Void`
-      - bridge-side reseeding after `init_item` prevents `row_cells` from being clobbered back to `0`
-    - current first live blocker is actually shared frontend example selection:
-      - `target/debug/boon-tools exec set-engine Wasm`
-      - `target/debug/boon-tools exec select cells.bn`
-      - console then shows:
-        - `[selectExample] setting files for cells.bn`
-        - followed immediately by `RuntimeError: unreachable`
-      - the abort occurs on the first `files.set(...)` inside the playground `selectExample` task before `current_file`, `source_code`, or Wasm `finish_setup` begin
-    - implication:
-      - Wasm runtime/render investigation is currently blocked behind the shared frontend `files` signal write poisoning during `cells` selection
+    - `cells` still does not pass the strengthened live Wasm spec
+    - the active issue is no longer release size, the old lowerer stack overflow, or the old outer-row nested-template pollution
+    - the remaining work is now beyond the old nested-item binding collapse:
+      - the focused Wasm bridge/runtime regressions for nested `row_data -> cells` binding, first-cell seed resolution, and A1-only edit activation all pass locally
+      - the outer row template seeding regression is now also green:
+        - `row_data.cells.row` / `row_data.cells.column` are preseeded with real per-row coordinates before Wasm item-event handling
+      - temporary Wasm `cells` debug output from that reduction pass has been removed again
+      - fresh live Wasm `cells` now renders the initial seed values again with no initial stray inputs
+      - current strengthened live-spec failure is later:
+        - `Double-click A1 enters edit mode with current value`
+        - actual failure: `Assert focused input value failed: focused element is DIV, not input/textarea`
+      - live state sampling after the nested-template isolation fix shows:
+        - outer row items no longer carry bogus nested `cell.row` / `cell.column` / `is_editing` state
+        - but after the latest rebuild the browser page is not consistently reaching `API Ready`, so the fresh live rerun is pending in browser automation
+        - so the next meaningful Wasm step is to resume the rendered cell-label double-click / item-event dispatch investigation once the page is booting again, not more nested-template seeding cleanup or buffered nested rendering
+    - the broader Wasm redesign track is still kept in [wasm_cells_performance_plan.md](/home/martinkavik/repos/boon/docs/plans/wasm_cells_performance_plan.md):
+      - keep compile-time template and list-map plans as the source of truth
+      - keep reducing bridge-side reconstruction work
+      - restore prompt debug-mode full-grid responsiveness without timeout inflation
+    - current rewrite checkpoint:
+      - Wasm IR and bridge now use compile-time `TemplatePlan` / `ListMapPlan`
+      - lowerer now eagerly materializes more nested list-item field cells instead of deferring through `list_item_field_exprs`
+      - function-call parameter binding no longer uses a body-shape heuristic before materializing nested object fields
+      - user-defined helper calls in pipe position now propagate list constructor and concrete field metadata onto the target instead of leaving that shape hidden behind `PipeThrough`
+      - successful eager materialization now removes stale deferred `list_item_field_exprs` for the same cell instead of carrying both representations
+      - alias propagation, helper parameter binding, piped parameter binding, and helper-result postprocessing now also use inline-object fallback during lowering instead of leaving nested shape for the bridge to rediscover
+      - alias resolution and `List/get` representative-item resolution now also use compile-time inline-object fallback, reducing reliance on deferred `list_item_field_exprs`
+      - `resolve_cell_field_cells(...)` now preserves representative object fields even when they are still `FieldAccess` expressions rather than direct `CellRead`s
+      - inline helper calls now use the cached `function_requires_full_name_snapshot(...)` decision instead of rewalking the same helper body thousands of times during `cells` lowering
+      - the leftover nested-event `resolve_field_access_expr_to_cell(...)` debug print has been removed from the hot path
+      - `resolve_event_from_cell(...)` now also reuses an `IrExpr`-level event resolver, so nested `...event.double_click` chains do not depend entirely on intermediate event fields becoming concrete cells first
+      - unresolved `List/get` lowering now canonicalizes through metadata-source cells both in direct resolution and in the `pipe_result` fallback path, reducing shape loss for aliases like `row_data.cells`
+      - `materialize_list_item_field_cells(...)` now applies the same metadata-source canonicalization internally, so helper and alias callers automatically reuse the underlying list metadata source instead of each needing one-off fixes
+      - helper-returned `CellRead(result_cell)` values now go through a shared shape-repair step for both normal and piped user-defined calls, instead of only the non-piped path attempting to materialize nested object/list fields on the returned cell
+      - `Latest` extraction now follows resolvable `FieldAccess` through concrete field cells with a cycle guard, so the outer `row_data.cells |> List/latest()` path no longer has to remain as raw `FieldAccess`
+      - helper parameter binding and field-alias propagation now canonicalize direct alias sources through metadata-source cells before exposing them to user-defined calls
+      - reduced pre-finish inspection now shows the outer source list itself is no longer the first blocker:
+        - `all_row_cells` lowers as `ListConstruct([CellRead(item)])`
+        - that first item is an object-namespace cell with real field cells like `cells: object.cells`
+        - so the surviving leak is later, not at the first source-list shape checkpoint
+      - latest resolved Wasm structural slice:
+        - focused nested `row_data -> cells` reconstruction no longer collapses later cell items onto A1-style bindings
+        - runtime object-field reconstruction now keeps concrete inner field cells distinct instead of canonicalizing them onto one shared external field cell
+        - list-item normalization now preserves nested list payloads until the correct item scope exists
+        - that combination restores distinct `column` values for B1/C1 and fixes the `is_editing` / active-root regressions that were previously failing in unit tests
+          - projected constructor-param binding now prefers the better canonical field source over a stale representative alias, so `row_cells` should stop overriding a more concrete `row_1_cells` source when both are available
+          - projected field synthesis for simple object-returning constructors now uses the same preference rule, so `projected_item_fields` can no longer freeze `cells: row_cells` before later constructor binding has a chance to repair it
+          - representative canonicalization for list-shaped aliases now also falls back to the immediate `CellRead` source when metadata-source walking stops at an alias like `object.cells`
+          - reduced constructor-inlining proof is now green:
+            - `minimal_row_data_list_map_item_cells_field_tracks_row_1_cells`
+            - result: the inlined `cells` field now tracks the concrete representative row list instead of the hollow `row_data.cells -> object.cells` alias chain
+          - cheap validation still passes:
+            - `cargo check -p boon --no-default-features --features engine-wasm`
+        - latest reduced checkpoint:
+          - object-store field normalization now always propagates canonical list/object metadata from the resolved source onto the field cell, even when the field expression itself remains a same-source alias
+          - simple helper calls now distinguish between exact param-name restore and prefix-scoped restore:
+            - helpers without dotted param paths save only exact parameter bindings
+            - helpers that really use dotted param paths still use the heavier prefix-aware restore
+          - `minimal_multi_column_row_data_latest_preserves_all_double_click_triggers` now passes
+          - so the remaining blocker has moved up from the reduced nested-event path into the larger `cells` graph:
+            - the full `cells_edit_started_latest_preserves_double_click_triggers` regression now completes quickly instead of timing out
+            - current failure is narrow:
+              - `expected edit_started to preserve real double_click triggers, got ["object.cell_elements.display.double_click"]`
+            - the next target is therefore the full-sheet `cells` trigger structure and then the live Wasm flow, not lowerer throughput
+        - latest focused outer-row checkpoint:
+          - runtime bridge binding is no longer the first blocker:
+            - both `item_cell` and `resolved_item_store` are bound
+            - runtime object-field resolution now prefers those live bindings over static reconstruction
+            - first-row row-number resolution and first-row row-cells materialization regressions are fixed
+            - editing-state alias cells now read live `CellStore` values again
+          - the surviving stale lowerer binding is now explicit:
+            - outer `row_data` map is `ListMap { cell: 308, source: 0, item_name: "row_data", item_cell: 309, ... }`
+            - but `row_data.row` still lowers as `CellRead(11)`
+            - `11` is the upstream `row_number` item cell, not the current outer item
+          - current bridge/runtime blocker after those fixes:
+            - the outer `row_data -> cells` resolution path still collapses later nested cell items so B1/C1 can inherit A1-style bindings before nested item context is restored
+          - trying to force that outer row field dynamic immediately re-exposes the older inner blocker:
+            - `cell.cell_elements.display` / `cell.cell_elements.editing` still lack complete concrete shape during constructor inlining
+          - so the current seam is:
+            - outer `row_data` representative rebasing still incomplete
+            - inner `cell_elements.*` shape preservation still incomplete
+      - so the next structural target is now specifically the `row_data.cells -> row_cell(...) -> cell` handoff before the next expensive live Wasm rerun
   - Actors still needs the strengthened live `cells.expected` rerun after the Wasm blocker is cleared
 
 ## Zoon Milestone Tasks

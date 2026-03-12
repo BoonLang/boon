@@ -90,8 +90,7 @@ impl<'code> CommentMap<'code> {
                             _ => {
                                 // Check if there's a newline between the previous code
                                 // token's end and this comment's start.
-                                let between =
-                                    &source[tokens[j].span.end..tok.span.start];
+                                let between = &source[tokens[j].span.end..tok.span.start];
                                 standalone = between.contains('\n');
                                 break;
                             }
@@ -282,7 +281,9 @@ impl<'code> Formatter<'code> {
             self.emit_comments_before(expr.span.start);
             self.format_top_level_expression(expr);
             // Trailing comment after this expression, before the next one
-            let next_start = expressions.get(i + 1).map_or(self.source.len(), |e| e.span.start);
+            let next_start = expressions
+                .get(i + 1)
+                .map_or(self.source.len(), |e| e.span.start);
             self.emit_trailing_comment(expr.span.end, next_start);
             self.newline();
         }
@@ -511,10 +512,7 @@ impl<'code> Formatter<'code> {
         self.indent += 1;
         for (i, item) in items.iter().enumerate() {
             // Blank line when either adjacent item is multiline
-            if i > 0
-                && (self.is_item_multiline(&items[i - 1])
-                    || self.is_item_multiline(item))
-            {
+            if i > 0 && (self.is_item_multiline(&items[i - 1]) || self.is_item_multiline(item)) {
                 self.newline();
             }
             self.emit_comments_before(item.span.start);
@@ -554,11 +552,7 @@ impl<'code> Formatter<'code> {
 
     // -- TaggedObject -------------------------------------------------------
 
-    fn format_tagged_object(
-        &mut self,
-        tag: &str,
-        variables: &[Spanned<Variable<'code>>],
-    ) {
+    fn format_tagged_object(&mut self, tag: &str, variables: &[Spanned<Variable<'code>>]) {
         if variables.is_empty() {
             self.write(tag);
             self.write("[]");
@@ -819,10 +813,7 @@ impl<'code> Formatter<'code> {
         self.indent += 1;
         for (i, input) in inputs.iter().enumerate() {
             // Blank line when either adjacent input is multiline
-            if i > 0
-                && (self.is_item_multiline(&inputs[i - 1])
-                    || self.is_item_multiline(input))
-            {
+            if i > 0 && (self.is_item_multiline(&inputs[i - 1]) || self.is_item_multiline(input)) {
                 self.newline();
             }
             self.emit_comments_before(input.span.start);
@@ -835,11 +826,7 @@ impl<'code> Formatter<'code> {
 
     // -- Hold ---------------------------------------------------------------
 
-    fn format_hold(
-        &mut self,
-        state_param: &str,
-        body: &Spanned<Expression<'code>>,
-    ) {
+    fn format_hold(&mut self, state_param: &str, body: &Spanned<Expression<'code>>) {
         self.write("HOLD ");
         self.write(state_param);
         self.write(" {");
@@ -899,11 +886,7 @@ impl<'code> Formatter<'code> {
 
     // -- When / While -------------------------------------------------------
 
-    fn format_when_while(
-        &mut self,
-        keyword: &str,
-        arms: &[Arm<'code>],
-    ) {
+    fn format_when_while(&mut self, keyword: &str, arms: &[Arm<'code>]) {
         // Try inline for single short arm
         if arms.len() == 1 {
             if let Some(inline) = self.try_inline_arm(&arms[0]) {
@@ -923,10 +906,7 @@ impl<'code> Formatter<'code> {
         self.indent += 1;
         for (i, arm) in arms.iter().enumerate() {
             // Blank line when either adjacent arm is multiline
-            if i > 0
-                && (self.is_arm_multiline(&arms[i - 1])
-                    || self.is_arm_multiline(arm))
-            {
+            if i > 0 && (self.is_arm_multiline(&arms[i - 1]) || self.is_arm_multiline(arm)) {
                 self.newline();
             }
             self.emit_comments_before(arm.body.span.start);
@@ -1041,11 +1021,7 @@ impl<'code> Formatter<'code> {
 
     // -- Pipe ---------------------------------------------------------------
 
-    fn format_pipe(
-        &mut self,
-        from: &Spanned<Expression<'code>>,
-        to: &Spanned<Expression<'code>>,
-    ) {
+    fn format_pipe(&mut self, from: &Spanned<Expression<'code>>, to: &Spanned<Expression<'code>>) {
         // Collect the full pipe chain
         let mut chain = Vec::new();
         self.collect_pipe_chain(from, &mut chain);
@@ -1158,12 +1134,30 @@ impl<'code> Formatter<'code> {
 
     fn format_comparator(&mut self, cmp: &Comparator<'code>) {
         let (a, op, b) = match cmp {
-            Comparator::Equal { operand_a, operand_b } => (operand_a, "==", operand_b),
-            Comparator::NotEqual { operand_a, operand_b } => (operand_a, "=/=", operand_b),
-            Comparator::Greater { operand_a, operand_b } => (operand_a, ">", operand_b),
-            Comparator::GreaterOrEqual { operand_a, operand_b } => (operand_a, ">=", operand_b),
-            Comparator::Less { operand_a, operand_b } => (operand_a, "<", operand_b),
-            Comparator::LessOrEqual { operand_a, operand_b } => (operand_a, "<=", operand_b),
+            Comparator::Equal {
+                operand_a,
+                operand_b,
+            } => (operand_a, "==", operand_b),
+            Comparator::NotEqual {
+                operand_a,
+                operand_b,
+            } => (operand_a, "=/=", operand_b),
+            Comparator::Greater {
+                operand_a,
+                operand_b,
+            } => (operand_a, ">", operand_b),
+            Comparator::GreaterOrEqual {
+                operand_a,
+                operand_b,
+            } => (operand_a, ">=", operand_b),
+            Comparator::Less {
+                operand_a,
+                operand_b,
+            } => (operand_a, "<", operand_b),
+            Comparator::LessOrEqual {
+                operand_a,
+                operand_b,
+            } => (operand_a, "<=", operand_b),
         };
         self.format_expression(a);
         self.write(" ");
@@ -1180,22 +1174,34 @@ impl<'code> Formatter<'code> {
                 self.write("-");
                 self.format_expression(operand);
             }
-            ArithmeticOperator::Add { operand_a, operand_b } => {
+            ArithmeticOperator::Add {
+                operand_a,
+                operand_b,
+            } => {
                 self.format_expression(operand_a);
                 self.write(" + ");
                 self.format_expression(operand_b);
             }
-            ArithmeticOperator::Subtract { operand_a, operand_b } => {
+            ArithmeticOperator::Subtract {
+                operand_a,
+                operand_b,
+            } => {
                 self.format_expression(operand_a);
                 self.write(" - ");
                 self.format_expression(operand_b);
             }
-            ArithmeticOperator::Multiply { operand_a, operand_b } => {
+            ArithmeticOperator::Multiply {
+                operand_a,
+                operand_b,
+            } => {
                 self.format_expression(operand_a);
                 self.write(" * ");
                 self.format_expression(operand_b);
             }
-            ArithmeticOperator::Divide { operand_a, operand_b } => {
+            ArithmeticOperator::Divide {
+                operand_a,
+                operand_b,
+            } => {
                 self.format_expression(operand_a);
                 self.write(" / ");
                 self.format_expression(operand_b);
@@ -1294,9 +1300,7 @@ impl<'code> Formatter<'code> {
             Expression::TaggedObject { object, .. } => {
                 self.try_inline_object(&object.variables).is_some()
             }
-            Expression::Object(obj) => {
-                self.try_inline_object(&obj.variables).is_some()
-            }
+            Expression::Object(obj) => self.try_inline_object(&obj.variables).is_some(),
             Expression::Pipe { .. } => {
                 // Try to estimate if the entire pipe chain fits inline
                 let mut chain = Vec::new();
@@ -1439,9 +1443,7 @@ impl<'code> Formatter<'code> {
             Expression::Variable(var) => self.is_variable_multiline(var),
             _ => match self.estimate_inline(expr) {
                 None => true,
-                Some(inline) => {
-                    self.indent * INDENT.len() + inline.len() > MAX_LINE_WIDTH
-                }
+                Some(inline) => self.indent * INDENT.len() + inline.len() > MAX_LINE_WIDTH,
             },
         }
     }
@@ -1490,10 +1492,7 @@ impl<'code> Formatter<'code> {
         Some(format!("{} => {}", pattern_str, body_inline))
     }
 
-    fn try_inline_pipe_chain(
-        &self,
-        chain: &[&Spanned<Expression<'code>>],
-    ) -> Option<String> {
+    fn try_inline_pipe_chain(&self, chain: &[&Spanned<Expression<'code>>]) -> Option<String> {
         if chain.len() > MAX_INLINE_PIPE_PARTS {
             return None;
         }
@@ -1580,7 +1579,8 @@ mod tests {
     fn format_pipe_multiline_first_at_indent() {
         // Reproduce the real todo_mvc case: at deep indent, the function call's inline estimate
         // fits at indent 0 but wraps at the actual indent, so |> should go on a new line.
-        let input = include_str!("../../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
+        let input =
+            include_str!("../../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
         let result = format(input).unwrap();
         for line in result.lines() {
             // toggle_all_checkbox(...) |> LINK should not be on the same line
@@ -1591,7 +1591,10 @@ mod tests {
                 );
             }
             if line.trim_start().starts_with(") |>") {
-                panic!("Closing paren should not hug |> on the same line:\n{}", line);
+                panic!(
+                    "Closing paren should not hug |> on the same line:\n{}",
+                    line
+                );
             }
             // Function arg with NextLine pipe: "items: PASSED..." should not be on same line
             if line.contains("items: PASSED") {
@@ -1650,7 +1653,6 @@ mod tests {
         let result = format(input).unwrap();
         assert_eq!(result, "-- header\n\nx: 42\n");
     }
-
 
     #[test]
     fn format_error_returns_none() {
@@ -1714,7 +1716,12 @@ mod tests {
                 let input = include_str!($file);
                 let first = format(input).expect("First format failed");
                 let second = format(&first).expect("Second format failed");
-                assert_eq!(first, second, "Formatting is not idempotent for {}", stringify!($name));
+                assert_eq!(
+                    first,
+                    second,
+                    "Formatting is not idempotent for {}",
+                    stringify!($name)
+                );
             }
         };
     }

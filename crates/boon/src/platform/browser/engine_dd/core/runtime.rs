@@ -63,10 +63,12 @@ fn collection_deps_ready<G: Scope>(
 ) -> bool {
     let has = |var: &VarId| collections.contains_key(var);
     match spec {
-        CollectionSpec::Literal(_)
-        | CollectionSpec::LiteralList(_)
-        | CollectionSpec::Input(_) => true,
-        CollectionSpec::HoldState { initial, events, .. } => has(initial) && has(events),
+        CollectionSpec::Literal(_) | CollectionSpec::LiteralList(_) | CollectionSpec::Input(_) => {
+            true
+        }
+        CollectionSpec::HoldState {
+            initial, events, ..
+        } => has(initial) && has(events),
         CollectionSpec::Then { source, .. }
         | CollectionSpec::Map { source, .. }
         | CollectionSpec::FlatMap { source, .. }
@@ -86,9 +88,7 @@ fn collection_deps_ready<G: Scope>(
         CollectionSpec::SampleOnEvent { event, dep, .. } => has(event) && has(dep),
         CollectionSpec::HoldLatest(sources)
         | CollectionSpec::Concat(sources)
-        | CollectionSpec::CombineLatest(sources) => {
-            sources.iter().all(has)
-        }
+        | CollectionSpec::CombineLatest(sources) => sources.iter().all(has),
         CollectionSpec::ListRetainReactive {
             list, filter_state, ..
         } => has(list) && has(filter_state),
@@ -117,12 +117,15 @@ fn missing_collection_deps<G: Scope>(
         }
     };
     match spec {
-        CollectionSpec::Literal(_)
-        | CollectionSpec::LiteralList(_)
-        | CollectionSpec::Input(_) => Vec::new(),
-        CollectionSpec::HoldState { initial, events, .. } => {
-            [missing(initial), missing(events)].into_iter().flatten().collect()
+        CollectionSpec::Literal(_) | CollectionSpec::LiteralList(_) | CollectionSpec::Input(_) => {
+            Vec::new()
         }
+        CollectionSpec::HoldState {
+            initial, events, ..
+        } => [missing(initial), missing(events)]
+            .into_iter()
+            .flatten()
+            .collect(),
         CollectionSpec::Then { source, .. }
         | CollectionSpec::Map { source, .. }
         | CollectionSpec::FlatMap { source, .. }
@@ -138,17 +141,17 @@ fn missing_collection_deps<G: Scope>(
         | CollectionSpec::ListMapWithKey { source, .. }
         | CollectionSpec::MapToKeyed { source, .. }
         | CollectionSpec::AppendNewKeyed { source, .. } => missing(source).into_iter().collect(),
-        CollectionSpec::Join { left, right, .. } => {
-            [missing(left), missing(right)].into_iter().flatten().collect()
-        }
-        CollectionSpec::SampleOnEvent { event, dep, .. } => {
-            [missing(event), missing(dep)].into_iter().flatten().collect()
-        }
+        CollectionSpec::Join { left, right, .. } => [missing(left), missing(right)]
+            .into_iter()
+            .flatten()
+            .collect(),
+        CollectionSpec::SampleOnEvent { event, dep, .. } => [missing(event), missing(dep)]
+            .into_iter()
+            .flatten()
+            .collect(),
         CollectionSpec::HoldLatest(sources)
         | CollectionSpec::Concat(sources)
-        | CollectionSpec::CombineLatest(sources) => {
-            sources.iter().filter_map(missing).collect()
-        }
+        | CollectionSpec::CombineLatest(sources) => sources.iter().filter_map(missing).collect(),
         CollectionSpec::ListRetainReactive {
             list, filter_state, ..
         } => [missing(list), missing(filter_state)]
@@ -156,28 +159,29 @@ fn missing_collection_deps<G: Scope>(
             .flatten()
             .collect(),
         CollectionSpec::ListMapWithKeyReactive { source, dep, .. } => {
-            [missing(source), missing(dep)].into_iter().flatten().collect()
-        }
-        CollectionSpec::ListAppend { list, new_items } => {
-            [missing(list), missing(new_items)]
+            [missing(source), missing(dep)]
                 .into_iter()
                 .flatten()
                 .collect()
         }
-        CollectionSpec::ListRemove { list, remove_keys } => {
-            [missing(list), missing(remove_keys)]
-                .into_iter()
-                .flatten()
-                .collect()
-        }
+        CollectionSpec::ListAppend { list, new_items } => [missing(list), missing(new_items)]
+            .into_iter()
+            .flatten()
+            .collect(),
+        CollectionSpec::ListRemove { list, remove_keys } => [missing(list), missing(remove_keys)]
+            .into_iter()
+            .flatten()
+            .collect(),
         CollectionSpec::KeyedHoldState {
             initial,
             events,
             broadcasts,
             ..
         } => {
-            let mut out: Vec<String> =
-                [missing(initial), missing(events)].into_iter().flatten().collect();
+            let mut out: Vec<String> = [missing(initial), missing(events)]
+                .into_iter()
+                .flatten()
+                .collect();
             if let Some(broadcasts) = broadcasts {
                 if let Some(dep) = missing(broadcasts) {
                     out.push(dep);
@@ -185,12 +189,10 @@ fn missing_collection_deps<G: Scope>(
             }
             out
         }
-        CollectionSpec::KeyedEventMap { items, events, .. } => {
-            [missing(items), missing(events)]
-                .into_iter()
-                .flatten()
-                .collect()
-        }
+        CollectionSpec::KeyedEventMap { items, events, .. } => [missing(items), missing(events)]
+            .into_iter()
+            .flatten()
+            .collect(),
     }
 }
 
@@ -243,430 +245,425 @@ where
             }
 
             let any_collection: AnyCollection<G> = match spec {
-            CollectionSpec::Literal(value) => {
-                let (mut session, coll) = scope.new_collection::<Value, isize>();
-                session.update(value.clone(), 1);
-                session.flush();
-                literal_sessions.push(session);
-                AnyCollection::Scalar(coll)
-            }
-
-            CollectionSpec::LiteralList(items) => {
-                let (mut session, coll) = scope.new_collection::<(ListKey, Value), isize>();
-                for (key, value) in items {
-                    session.update((key.clone(), value.clone()), 1);
+                CollectionSpec::Literal(value) => {
+                    let (mut session, coll) = scope.new_collection::<Value, isize>();
+                    session.update(value.clone(), 1);
+                    session.flush();
+                    literal_sessions.push(session);
+                    AnyCollection::Scalar(coll)
                 }
-                session.flush();
-                literal_sessions_keyed.push(session);
-                AnyCollection::Keyed(coll)
-            }
 
-            CollectionSpec::Input(input_id) => AnyCollection::Scalar(
-                input_collections
-                    .get(input_id)
-                    .expect("Input collection not found")
-                    .clone(),
-            ),
-
-            CollectionSpec::HoldState {
-                initial,
-                events,
-                initial_value,
-                transform,
-            } => {
-                let initial_coll = collections
-                    .get(initial)
-                    .expect("Initial collection not found")
-                    .as_scalar();
-                let events_coll = collections
-                    .get(events)
-                    .expect("Events collection not found")
-                    .as_scalar();
-                let transform = Arc::clone(transform);
-                AnyCollection::Scalar(operators::hold_state(
-                    initial_coll,
-                    events_coll,
-                    initial_value.clone(),
-                    move |state, event| transform(state, event),
-                ))
-            }
-
-            CollectionSpec::Then { source, body } => {
-                let source_coll = collections
-                    .get(source)
-                    .expect("Source collection not found")
-                    .as_scalar();
-                let body = Arc::clone(body);
-                AnyCollection::Scalar(operators::then(source_coll, move |v| body(&v)))
-            }
-
-            CollectionSpec::Map { source, f } => {
-                let source_coll = collections
-                    .get(source)
-                    .expect("Source collection not found")
-                    .as_scalar();
-                let f = Arc::clone(f);
-                AnyCollection::Scalar(source_coll.map(move |v| f(&v)))
-            }
-
-            CollectionSpec::FlatMap { source, f } => {
-                let source_coll = collections
-                    .get(source)
-                    .expect("Source collection not found")
-                    .as_scalar();
-                let f = Arc::clone(f);
-                AnyCollection::Scalar(operators::when_match(source_coll, move |v| f(v)))
-            }
-
-            CollectionSpec::Join {
-                left,
-                right,
-                combine,
-            } => {
-                let left_coll = collections
-                    .get(left)
-                    .expect("Left collection not found")
-                    .as_scalar();
-                let right_coll = collections
-                    .get(right)
-                    .expect("Right collection not found")
-                    .as_scalar();
-                let combine = Arc::clone(combine);
-                AnyCollection::Scalar(operators::while_reactive(
-                    left_coll,
-                    right_coll,
-                    move |a, b| combine(a, b),
-                ))
-            }
-
-            CollectionSpec::SampleOnEvent { event, dep, f } => {
-                let event_coll = collections
-                    .get(event)
-                    .expect("SampleOnEvent event not found")
-                    .as_scalar();
-                let dep_coll = collections
-                    .get(dep)
-                    .expect("SampleOnEvent dep not found")
-                    .as_scalar();
-                let f = Arc::clone(f);
-                AnyCollection::Scalar(operators::sample_on_event(
-                    event_coll,
-                    dep_coll,
-                    move |event, dep| f(event, dep),
-                ))
-            }
-
-            CollectionSpec::HoldLatest(sources) => {
-                let mut concatted = collections
-                    .get(&sources[0])
-                    .expect("First source not found")
-                    .as_scalar()
-                    .clone();
-                for src in &sources[1..] {
-                    let other = collections.get(src).expect("Source not found").as_scalar();
-                    concatted = concatted.concat(other);
-                }
-                AnyCollection::Scalar(operators::hold_latest(&concatted))
-            }
-
-            CollectionSpec::Concat(sources) => {
-                let mut result = collections
-                    .get(&sources[0])
-                    .expect("First source not found")
-                    .as_scalar()
-                    .clone();
-                for src in &sources[1..] {
-                    let other = collections.get(src).expect("Source not found").as_scalar();
-                    result = result.concat(other);
-                }
-                AnyCollection::Scalar(result)
-            }
-
-            CollectionSpec::CombineLatest(sources) => {
-                let source_colls: Vec<_> = sources
-                    .iter()
-                    .map(|src| {
-                        collections
-                            .get(src)
-                            .expect("CombineLatest source not found")
-                            .as_scalar()
-                            .clone()
-                    })
-                    .collect();
-                AnyCollection::Scalar(operators::combine_latest_scalars(&source_colls))
-            }
-
-            CollectionSpec::Skip { source, count } => {
-                let source_coll = collections
-                    .get(source)
-                    .expect("Source collection not found")
-                    .as_scalar();
-                AnyCollection::Scalar(operators::skip(source_coll, *count))
-            }
-
-            CollectionSpec::SideEffect { source, effect } => {
-                let source_coll = collections
-                    .get(source)
-                    .expect("SideEffect source collection not found")
-                    .as_scalar();
-                let effect_clone = effect.clone();
-                let callback = on_side_effect.clone();
-                source_coll.inspect(move |(value, _time, diff)| {
-                    if *diff > 0 {
-                        callback(&effect_clone, value);
+                CollectionSpec::LiteralList(items) => {
+                    let (mut session, coll) = scope.new_collection::<(ListKey, Value), isize>();
+                    for (key, value) in items {
+                        session.update((key.clone(), value.clone()), 1);
                     }
-                });
-                // SideEffect is transparent — passes through the source collection
-                AnyCollection::Scalar(source_coll.clone())
-            }
+                    session.flush();
+                    literal_sessions_keyed.push(session);
+                    AnyCollection::Keyed(coll)
+                }
 
-            // ---------------------------------------------------------------
-            // List operations — real DD operators
-            // ---------------------------------------------------------------
-            CollectionSpec::ListAssemble(source) => {
-                let list = collections
-                    .get(source)
-                    .expect("ListAssemble source not found")
-                    .as_keyed();
-                AnyCollection::Scalar(operators::list_assemble(list))
-            }
+                CollectionSpec::Input(input_id) => AnyCollection::Scalar(
+                    input_collections
+                        .get(input_id)
+                        .expect("Input collection not found")
+                        .clone(),
+                ),
 
-            CollectionSpec::ListCount(source) => {
-                let list = collections
-                    .get(source)
-                    .expect("ListCount source not found")
-                    .as_keyed();
-                AnyCollection::Scalar(operators::list_count(list))
-            }
+                CollectionSpec::HoldState {
+                    initial,
+                    events,
+                    initial_value,
+                    transform,
+                } => {
+                    let initial_coll = collections
+                        .get(initial)
+                        .expect("Initial collection not found")
+                        .as_scalar();
+                    let events_coll = collections
+                        .get(events)
+                        .expect("Events collection not found")
+                        .as_scalar();
+                    let transform = Arc::clone(transform);
+                    AnyCollection::Scalar(operators::hold_state(
+                        initial_coll,
+                        events_coll,
+                        initial_value.clone(),
+                        move |state, event| transform(state, event),
+                    ))
+                }
 
-            CollectionSpec::ListLatest(source) => {
-                let list = collections
-                    .get(source)
-                    .expect("ListLatest source not found")
-                    .as_keyed();
-                AnyCollection::Scalar(operators::list_latest(list))
-            }
+                CollectionSpec::Then { source, body } => {
+                    let source_coll = collections
+                        .get(source)
+                        .expect("Source collection not found")
+                        .as_scalar();
+                    let body = Arc::clone(body);
+                    AnyCollection::Scalar(operators::then(source_coll, move |v| body(&v)))
+                }
 
-            CollectionSpec::ListEvery { source, predicate } => {
-                let list = collections
-                    .get(source)
-                    .expect("ListEvery source not found")
-                    .as_keyed();
-                let predicate = Arc::clone(predicate);
-                AnyCollection::Scalar(operators::list_every(list, move |v| predicate(v)))
-            }
+                CollectionSpec::Map { source, f } => {
+                    let source_coll = collections
+                        .get(source)
+                        .expect("Source collection not found")
+                        .as_scalar();
+                    let f = Arc::clone(f);
+                    AnyCollection::Scalar(source_coll.map(move |v| f(&v)))
+                }
 
-            CollectionSpec::ListAny { source, predicate } => {
-                let list = collections
-                    .get(source)
-                    .expect("ListAny source not found")
-                    .as_keyed();
-                let predicate = Arc::clone(predicate);
-                AnyCollection::Scalar(operators::list_any(list, move |v| predicate(v)))
-            }
+                CollectionSpec::FlatMap { source, f } => {
+                    let source_coll = collections
+                        .get(source)
+                        .expect("Source collection not found")
+                        .as_scalar();
+                    let f = Arc::clone(f);
+                    AnyCollection::Scalar(operators::when_match(source_coll, move |v| f(v)))
+                }
 
-            CollectionSpec::ListRetain { source, predicate } => {
-                let list = collections
-                    .get(source)
-                    .expect("ListRetain source not found")
-                    .as_keyed();
-                let predicate = Arc::clone(predicate);
-                AnyCollection::Keyed(operators::list_retain(list, move |v| predicate(v)))
-            }
+                CollectionSpec::Join {
+                    left,
+                    right,
+                    combine,
+                } => {
+                    let left_coll = collections
+                        .get(left)
+                        .expect("Left collection not found")
+                        .as_scalar();
+                    let right_coll = collections
+                        .get(right)
+                        .expect("Right collection not found")
+                        .as_scalar();
+                    let combine = Arc::clone(combine);
+                    AnyCollection::Scalar(operators::while_reactive(
+                        left_coll,
+                        right_coll,
+                        move |a, b| combine(a, b),
+                    ))
+                }
 
-            CollectionSpec::ListRetainReactive {
-                list,
-                filter_state,
-                predicate,
-            } => {
-                let list_coll = collections
-                    .get(list)
-                    .expect("ListRetainReactive list not found")
-                    .as_keyed();
-                let filter_coll = collections
-                    .get(filter_state)
-                    .expect("ListRetainReactive filter_state not found")
-                    .as_scalar();
-                let predicate = Arc::clone(predicate);
-                AnyCollection::Keyed(operators::list_retain_reactive(
-                    list_coll,
-                    filter_coll,
-                    move |v, f| predicate(v, f),
-                ))
-            }
+                CollectionSpec::SampleOnEvent { event, dep, f } => {
+                    let event_coll = collections
+                        .get(event)
+                        .expect("SampleOnEvent event not found")
+                        .as_scalar();
+                    let dep_coll = collections
+                        .get(dep)
+                        .expect("SampleOnEvent dep not found")
+                        .as_scalar();
+                    let f = Arc::clone(f);
+                    AnyCollection::Scalar(operators::sample_on_event(
+                        event_coll,
+                        dep_coll,
+                        move |event, dep| f(event, dep),
+                    ))
+                }
 
-            CollectionSpec::ListMap { source, f } => {
-                let list = collections
-                    .get(source)
-                    .expect("ListMap source not found")
-                    .as_keyed();
-                let f = Arc::clone(f);
-                AnyCollection::Keyed(operators::list_map(list, move |v| f(&v)))
-            }
-
-            CollectionSpec::ListMapWithKey { source, f } => {
-                let list = collections
-                    .get(source)
-                    .expect("ListMapWithKey source not found")
-                    .as_keyed();
-                let f = Arc::clone(f);
-                AnyCollection::Keyed(operators::list_map_with_key(list, move |k, v| f(k, &v)))
-            }
-
-            CollectionSpec::ListMapWithKeyReactive { source, dep, f } => {
-                let list = collections
-                    .get(source)
-                    .expect("ListMapWithKeyReactive source not found")
-                    .as_keyed();
-                let dep = collections
-                    .get(dep)
-                    .expect("ListMapWithKeyReactive dep not found")
-                    .as_scalar();
-                let f = Arc::clone(f);
-                AnyCollection::Keyed(operators::list_map_with_key_reactive(
-                    list,
-                    dep,
-                    move |key, item, dep| f(key, item, dep),
-                ))
-            }
-
-            CollectionSpec::ListAppend { list, new_items } => {
-                let list_coll = collections
-                    .get(list)
-                    .expect("ListAppend list not found")
-                    .as_keyed();
-                let new_items_coll = collections
-                    .get(new_items)
-                    .expect("ListAppend new_items not found")
-                    .as_keyed();
-                AnyCollection::Keyed(operators::list_append(list_coll, new_items_coll))
-            }
-
-            CollectionSpec::ListRemove { list, remove_keys } => {
-                let list_coll = collections
-                    .get(list)
-                    .expect("ListRemove list not found")
-                    .as_keyed();
-                let remove_coll = collections
-                    .get(remove_keys)
-                    .expect("ListRemove remove_keys not found")
-                    .as_keyed();
-                AnyCollection::Keyed(operators::list_remove(list_coll, remove_coll))
-            }
-
-            CollectionSpec::KeyedHoldState {
-                initial,
-                events,
-                transform,
-                broadcasts,
-                broadcast_handler,
-            } => {
-                let initial_coll = collections
-                    .get(initial)
-                    .expect("KeyedHoldState initial not found")
-                    .as_keyed();
-                let events_coll = collections
-                    .get(events)
-                    .expect("KeyedHoldState events not found")
-                    .as_keyed();
-                let transform = Arc::clone(transform);
-                let bcast_coll = broadcasts.as_ref().map(|var| {
-                    collections
-                        .get(var)
-                        .expect("KeyedHoldState broadcasts not found")
+                CollectionSpec::HoldLatest(sources) => {
+                    let mut concatted = collections
+                        .get(&sources[0])
+                        .expect("First source not found")
                         .as_scalar()
-                });
-                let bcast_handler = broadcast_handler.as_ref().map(Arc::clone);
-                AnyCollection::Keyed(operators::keyed_hold_state(
-                    initial_coll,
-                    events_coll,
-                    move |s, e| transform(s, e),
-                    bcast_coll,
-                    bcast_handler,
-                ))
-            }
-
-            CollectionSpec::MapToKeyed { source, classify } => {
-                let source_coll = collections
-                    .get(source)
-                    .expect("MapToKeyed source not found")
-                    .as_scalar();
-                let classify = Arc::clone(classify);
-                AnyCollection::Keyed(operators::map_to_keyed(source_coll, move |v| classify(v)))
-            }
-
-            CollectionSpec::KeyedEventMap { items, events, f } => {
-                let items_coll = collections
-                    .get(items)
-                    .expect("KeyedEventMap items not found")
-                    .as_keyed();
-                let events_coll = collections
-                    .get(events)
-                    .expect("KeyedEventMap events not found")
-                    .as_keyed();
-                let f = Arc::clone(f);
-                AnyCollection::Scalar(operators::keyed_event_map(
-                    items_coll,
-                    events_coll,
-                    move |item, event| f(item, event),
-                ))
-            }
-
-            CollectionSpec::AppendNewKeyed {
-                source,
-                f,
-                initial_counter,
-            } => {
-                let source_coll = collections
-                    .get(source)
-                    .expect("AppendNewKeyed source not found")
-                    .as_scalar();
-                let f = Arc::clone(f);
-                AnyCollection::Keyed(operators::append_new_keyed(
-                    source_coll,
-                    move |v| f(v),
-                    *initial_counter,
-                ))
-            }
-        };
-
-        #[cfg(test)]
-        if std::env::var_os("BOON_DD_TRACE_CRUD").is_some() {
-            let name = var_id.as_str().to_string();
-            let should_trace = name == "store.person_to_add"
-                || name == "store.people"
-                || name.contains("append_keyed")
-                || name.contains("membership")
-                || name.contains("keyed_hold")
-                || name.contains("assemble_raw");
-            if should_trace {
-                match &any_collection {
-                    AnyCollection::Scalar(coll) => {
-                        let traced_name = name.clone();
-                        coll.inspect(move |(value, time, diff)| {
-                            eprintln!(
-                                "[dd-trace] scalar {traced_name} @{} diff={} value={}",
-                                time,
-                                diff,
-                                value
-                            );
-                        });
+                        .clone();
+                    for src in &sources[1..] {
+                        let other = collections.get(src).expect("Source not found").as_scalar();
+                        concatted = concatted.concat(other);
                     }
-                    AnyCollection::Keyed(coll) => {
-                        let traced_name = name.clone();
-                        coll.inspect(move |((key, value), time, diff)| {
-                            eprintln!(
-                                "[dd-trace] keyed {traced_name} @{} diff={} key={} value={}",
-                                time,
-                                diff,
-                                key.0,
-                                value
-                            );
-                        });
+                    AnyCollection::Scalar(operators::hold_latest(&concatted))
+                }
+
+                CollectionSpec::Concat(sources) => {
+                    let mut result = collections
+                        .get(&sources[0])
+                        .expect("First source not found")
+                        .as_scalar()
+                        .clone();
+                    for src in &sources[1..] {
+                        let other = collections.get(src).expect("Source not found").as_scalar();
+                        result = result.concat(other);
+                    }
+                    AnyCollection::Scalar(result)
+                }
+
+                CollectionSpec::CombineLatest(sources) => {
+                    let source_colls: Vec<_> = sources
+                        .iter()
+                        .map(|src| {
+                            collections
+                                .get(src)
+                                .expect("CombineLatest source not found")
+                                .as_scalar()
+                                .clone()
+                        })
+                        .collect();
+                    AnyCollection::Scalar(operators::combine_latest_scalars(&source_colls))
+                }
+
+                CollectionSpec::Skip { source, count } => {
+                    let source_coll = collections
+                        .get(source)
+                        .expect("Source collection not found")
+                        .as_scalar();
+                    AnyCollection::Scalar(operators::skip(source_coll, *count))
+                }
+
+                CollectionSpec::SideEffect { source, effect } => {
+                    let source_coll = collections
+                        .get(source)
+                        .expect("SideEffect source collection not found")
+                        .as_scalar();
+                    let effect_clone = effect.clone();
+                    let callback = on_side_effect.clone();
+                    source_coll.inspect(move |(value, _time, diff)| {
+                        if *diff > 0 {
+                            callback(&effect_clone, value);
+                        }
+                    });
+                    // SideEffect is transparent — passes through the source collection
+                    AnyCollection::Scalar(source_coll.clone())
+                }
+
+                // ---------------------------------------------------------------
+                // List operations — real DD operators
+                // ---------------------------------------------------------------
+                CollectionSpec::ListAssemble(source) => {
+                    let list = collections
+                        .get(source)
+                        .expect("ListAssemble source not found")
+                        .as_keyed();
+                    AnyCollection::Scalar(operators::list_assemble(list))
+                }
+
+                CollectionSpec::ListCount(source) => {
+                    let list = collections
+                        .get(source)
+                        .expect("ListCount source not found")
+                        .as_keyed();
+                    AnyCollection::Scalar(operators::list_count(list))
+                }
+
+                CollectionSpec::ListLatest(source) => {
+                    let list = collections
+                        .get(source)
+                        .expect("ListLatest source not found")
+                        .as_keyed();
+                    AnyCollection::Scalar(operators::list_latest(list))
+                }
+
+                CollectionSpec::ListEvery { source, predicate } => {
+                    let list = collections
+                        .get(source)
+                        .expect("ListEvery source not found")
+                        .as_keyed();
+                    let predicate = Arc::clone(predicate);
+                    AnyCollection::Scalar(operators::list_every(list, move |v| predicate(v)))
+                }
+
+                CollectionSpec::ListAny { source, predicate } => {
+                    let list = collections
+                        .get(source)
+                        .expect("ListAny source not found")
+                        .as_keyed();
+                    let predicate = Arc::clone(predicate);
+                    AnyCollection::Scalar(operators::list_any(list, move |v| predicate(v)))
+                }
+
+                CollectionSpec::ListRetain { source, predicate } => {
+                    let list = collections
+                        .get(source)
+                        .expect("ListRetain source not found")
+                        .as_keyed();
+                    let predicate = Arc::clone(predicate);
+                    AnyCollection::Keyed(operators::list_retain(list, move |v| predicate(v)))
+                }
+
+                CollectionSpec::ListRetainReactive {
+                    list,
+                    filter_state,
+                    predicate,
+                } => {
+                    let list_coll = collections
+                        .get(list)
+                        .expect("ListRetainReactive list not found")
+                        .as_keyed();
+                    let filter_coll = collections
+                        .get(filter_state)
+                        .expect("ListRetainReactive filter_state not found")
+                        .as_scalar();
+                    let predicate = Arc::clone(predicate);
+                    AnyCollection::Keyed(operators::list_retain_reactive(
+                        list_coll,
+                        filter_coll,
+                        move |v, f| predicate(v, f),
+                    ))
+                }
+
+                CollectionSpec::ListMap { source, f } => {
+                    let list = collections
+                        .get(source)
+                        .expect("ListMap source not found")
+                        .as_keyed();
+                    let f = Arc::clone(f);
+                    AnyCollection::Keyed(operators::list_map(list, move |v| f(&v)))
+                }
+
+                CollectionSpec::ListMapWithKey { source, f } => {
+                    let list = collections
+                        .get(source)
+                        .expect("ListMapWithKey source not found")
+                        .as_keyed();
+                    let f = Arc::clone(f);
+                    AnyCollection::Keyed(operators::list_map_with_key(list, move |k, v| f(k, &v)))
+                }
+
+                CollectionSpec::ListMapWithKeyReactive { source, dep, f } => {
+                    let list = collections
+                        .get(source)
+                        .expect("ListMapWithKeyReactive source not found")
+                        .as_keyed();
+                    let dep = collections
+                        .get(dep)
+                        .expect("ListMapWithKeyReactive dep not found")
+                        .as_scalar();
+                    let f = Arc::clone(f);
+                    AnyCollection::Keyed(operators::list_map_with_key_reactive(
+                        list,
+                        dep,
+                        move |key, item, dep| f(key, item, dep),
+                    ))
+                }
+
+                CollectionSpec::ListAppend { list, new_items } => {
+                    let list_coll = collections
+                        .get(list)
+                        .expect("ListAppend list not found")
+                        .as_keyed();
+                    let new_items_coll = collections
+                        .get(new_items)
+                        .expect("ListAppend new_items not found")
+                        .as_keyed();
+                    AnyCollection::Keyed(operators::list_append(list_coll, new_items_coll))
+                }
+
+                CollectionSpec::ListRemove { list, remove_keys } => {
+                    let list_coll = collections
+                        .get(list)
+                        .expect("ListRemove list not found")
+                        .as_keyed();
+                    let remove_coll = collections
+                        .get(remove_keys)
+                        .expect("ListRemove remove_keys not found")
+                        .as_keyed();
+                    AnyCollection::Keyed(operators::list_remove(list_coll, remove_coll))
+                }
+
+                CollectionSpec::KeyedHoldState {
+                    initial,
+                    events,
+                    transform,
+                    broadcasts,
+                    broadcast_handler,
+                } => {
+                    let initial_coll = collections
+                        .get(initial)
+                        .expect("KeyedHoldState initial not found")
+                        .as_keyed();
+                    let events_coll = collections
+                        .get(events)
+                        .expect("KeyedHoldState events not found")
+                        .as_keyed();
+                    let transform = Arc::clone(transform);
+                    let bcast_coll = broadcasts.as_ref().map(|var| {
+                        collections
+                            .get(var)
+                            .expect("KeyedHoldState broadcasts not found")
+                            .as_scalar()
+                    });
+                    let bcast_handler = broadcast_handler.as_ref().map(Arc::clone);
+                    AnyCollection::Keyed(operators::keyed_hold_state(
+                        initial_coll,
+                        events_coll,
+                        move |s, e| transform(s, e),
+                        bcast_coll,
+                        bcast_handler,
+                    ))
+                }
+
+                CollectionSpec::MapToKeyed { source, classify } => {
+                    let source_coll = collections
+                        .get(source)
+                        .expect("MapToKeyed source not found")
+                        .as_scalar();
+                    let classify = Arc::clone(classify);
+                    AnyCollection::Keyed(operators::map_to_keyed(source_coll, move |v| classify(v)))
+                }
+
+                CollectionSpec::KeyedEventMap { items, events, f } => {
+                    let items_coll = collections
+                        .get(items)
+                        .expect("KeyedEventMap items not found")
+                        .as_keyed();
+                    let events_coll = collections
+                        .get(events)
+                        .expect("KeyedEventMap events not found")
+                        .as_keyed();
+                    let f = Arc::clone(f);
+                    AnyCollection::Scalar(operators::keyed_event_map(
+                        items_coll,
+                        events_coll,
+                        move |item, event| f(item, event),
+                    ))
+                }
+
+                CollectionSpec::AppendNewKeyed {
+                    source,
+                    f,
+                    initial_counter,
+                } => {
+                    let source_coll = collections
+                        .get(source)
+                        .expect("AppendNewKeyed source not found")
+                        .as_scalar();
+                    let f = Arc::clone(f);
+                    AnyCollection::Keyed(operators::append_new_keyed(
+                        source_coll,
+                        move |v| f(v),
+                        *initial_counter,
+                    ))
+                }
+            };
+
+            #[cfg(test)]
+            if std::env::var_os("BOON_DD_TRACE_CRUD").is_some() {
+                let name = var_id.as_str().to_string();
+                let should_trace = name == "store.person_to_add"
+                    || name == "store.people"
+                    || name.contains("append_keyed")
+                    || name.contains("membership")
+                    || name.contains("keyed_hold")
+                    || name.contains("assemble_raw");
+                if should_trace {
+                    match &any_collection {
+                        AnyCollection::Scalar(coll) => {
+                            let traced_name = name.clone();
+                            coll.inspect(move |(value, time, diff)| {
+                                eprintln!(
+                                    "[dd-trace] scalar {traced_name} @{} diff={} value={}",
+                                    time, diff, value
+                                );
+                            });
+                        }
+                        AnyCollection::Keyed(coll) => {
+                            let traced_name = name.clone();
+                            coll.inspect(move |((key, value), time, diff)| {
+                                eprintln!(
+                                    "[dd-trace] keyed {traced_name} @{} diff={} key={} value={}",
+                                    time, diff, key.0, value
+                                );
+                            });
+                        }
                     }
                 }
             }
-        }
 
             collections.insert(var_id.clone(), any_collection);
             progressed = true;
@@ -677,7 +674,12 @@ where
                 .iter()
                 .map(|(var_id, spec)| {
                     let missing = missing_collection_deps(spec, &collections).join(", ");
-                    format!("{} <= {:?} missing [{}]", var_id.as_str(), std::mem::discriminant(*spec), missing)
+                    format!(
+                        "{} <= {:?} missing [{}]",
+                        var_id.as_str(),
+                        std::mem::discriminant(*spec),
+                        missing
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(", ");

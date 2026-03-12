@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use boon_scene::{PhysicalSceneParams, RenderRootHandle, RenderSurface, SceneHandles};
 use boon_renderer_zoon::empty_text;
+use boon_scene::{PhysicalSceneParams, RenderRootHandle, RenderSurface, SceneHandles};
 use zoon::futures_util::stream::LocalBoxStream;
 use zoon::futures_util::{StreamExt, future, select, stream};
 use zoon::*;
@@ -59,7 +59,8 @@ async fn derive_scene_params(scene: &SceneHandles<Arc<Variable>>) -> PhysicalSce
     let mut params = PhysicalSceneParams::default();
 
     if let Some(geometry_var) = &scene.geometry {
-        if let Ok(Value::Object(geometry_obj, _)) = geometry_var.value_actor().current_value().await {
+        if let Ok(Value::Object(geometry_obj, _)) = geometry_var.value_actor().current_value().await
+        {
             if let Some(bevel_angle) =
                 read_number_variable(geometry_obj.variable("bevel_angle")).await
             {
@@ -82,9 +83,9 @@ async fn derive_scene_params(scene: &SceneHandles<Arc<Variable>>) -> PhysicalSce
                             params.directional_intensity = intensity;
                         }
                         if let Some(spread) = read_number_variable(light.variable("spread")).await {
-                            params.shadow_blur_per_depth =
-                                PhysicalSceneParams::DEFAULT.shadow_blur_per_depth
-                                    * spread.clamp(0.25, 4.0);
+                            params.shadow_blur_per_depth = PhysicalSceneParams::DEFAULT
+                                .shadow_blur_per_depth
+                                * spread.clamp(0.25, 4.0);
                         }
                         if let (Some(azimuth), Some(altitude)) = (
                             read_number_variable(light.variable("azimuth")).await,
@@ -95,14 +96,12 @@ async fn derive_scene_params(scene: &SceneHandles<Arc<Variable>>) -> PhysicalSce
                             // Interpret azimuth like a compass heading and project the shadow
                             // opposite the light direction. Keep the default scale around 45deg.
                             let altitude_factor = (1.0 / altitude_radians.tan()).clamp(0.35, 2.0);
-                            params.shadow_dx_per_depth =
-                                -azimuth_radians.sin()
-                                    * PhysicalSceneParams::DEFAULT.shadow_dx_per_depth
-                                    * altitude_factor;
-                            params.shadow_dy_per_depth =
-                                azimuth_radians.cos()
-                                    * PhysicalSceneParams::DEFAULT.shadow_dy_per_depth
-                                    * altitude_factor;
+                            params.shadow_dx_per_depth = -azimuth_radians.sin()
+                                * PhysicalSceneParams::DEFAULT.shadow_dx_per_depth
+                                * altitude_factor;
+                            params.shadow_dy_per_depth = azimuth_radians.cos()
+                                * PhysicalSceneParams::DEFAULT.shadow_dy_per_depth
+                                * altitude_factor;
                         }
                     }
                     "AmbientLight" => {
@@ -240,8 +239,7 @@ async fn physical_css_from_style_value(
                             },
                             None => "rgba(100,150,255,0.5)".to_string(),
                         };
-                        let intensity =
-                            read_number(&glow_obj, "intensity").await.unwrap_or(0.1);
+                        let intensity = read_number(&glow_obj, "intensity").await.unwrap_or(0.1);
                         let blur = intensity * 40.0;
                         let spread = intensity * 10.0;
                         shadows.push(format!("0 0 {blur:.1}px {spread:.1}px {color}"));
@@ -532,23 +530,22 @@ fn apply_physical_css<E: RawEl>(
                             .boxed_local(),
                         };
 
-                    let intensity_sub: LocalBoxStream<'static, GlowComp> =
-                        match glow_obj.variable("intensity") {
-                            Some(iv) => iv
-                                .stream()
-                                .filter_map(|v| {
-                                    future::ready(match v {
-                                        Value::Number(n, _) => {
-                                            Some(GlowComp::Intensity(n.number()))
-                                        }
-                                        _ => None,
-                                    })
+                    let intensity_sub: LocalBoxStream<'static, GlowComp> = match glow_obj
+                        .variable("intensity")
+                    {
+                        Some(iv) => iv
+                            .stream()
+                            .filter_map(|v| {
+                                future::ready(match v {
+                                    Value::Number(n, _) => Some(GlowComp::Intensity(n.number())),
+                                    _ => None,
                                 })
-                                .boxed_local(),
-                            None => stream::once(future::ready(GlowComp::Intensity(0.1)))
-                                .chain(stream::pending())
-                                .boxed_local(),
-                        };
+                            })
+                            .boxed_local(),
+                        None => stream::once(future::ready(GlowComp::Intensity(0.1)))
+                            .chain(stream::pending())
+                            .boxed_local(),
+                    };
 
                     stream::select_all([color_sub, intensity_sub])
                         .scan(
@@ -560,10 +557,7 @@ fn apply_physical_css<E: RawEl>(
                                 }
                                 let blur = state.1 * 40.0;
                                 let spread = state.1 * 10.0;
-                                let css = format!(
-                                    "0 0 {blur:.1}px {spread:.1}px {}",
-                                    state.0
-                                );
+                                let css = format!("0 0 {blur:.1}px {spread:.1}px {}", state.0);
                                 future::ready(Some(ShadowComponent::Glow(css)))
                             },
                         )
@@ -695,18 +689,14 @@ fn apply_physical_css<E: RawEl>(
                     let range = extend.max(compress);
                     if range > 0.0 {
                         let duration = (range * 0.04).clamp(0.08, 0.5);
-                        Some(format!(
-                            "all {duration:.2}s cubic-bezier(0.34,1.56,0.64,1)"
-                        ))
+                        Some(format!("all {duration:.2}s cubic-bezier(0.34,1.56,0.64,1)"))
                     } else {
                         None
                     }
                 }
                 Value::Number(n, _) => {
                     let duration = (n.number() * 0.15).clamp(0.05, 0.8);
-                    Some(format!(
-                        "all {duration:.2}s cubic-bezier(0.34,1.56,0.64,1)"
-                    ))
+                    Some(format!("all {duration:.2}s cubic-bezier(0.34,1.56,0.64,1)"))
                 }
                 _ => None,
             }
@@ -2991,17 +2981,27 @@ fn oklch_to_css_reactive(value: Value) -> LocalBoxStream<'static, String> {
 
                 // Step 2: Subscribe to future changes via stream_from_now()
                 #[derive(Clone, Copy)]
-                enum Comp { L, C, H, A }
+                enum Comp {
+                    L,
+                    C,
+                    H,
+                    A,
+                }
 
-                fn comp_stream(tagged: &TaggedObject, name: &str, comp: Comp)
-                    -> LocalBoxStream<'static, (Comp, f64)>
-                {
+                fn comp_stream(
+                    tagged: &TaggedObject,
+                    name: &str,
+                    comp: Comp,
+                ) -> LocalBoxStream<'static, (Comp, f64)> {
                     match tagged.variable(name) {
-                        Some(v) => v.stream_from_now()
-                            .filter_map(move |val| future::ready(match val {
-                                Value::Number(n, _) => Some((comp, n.number())),
-                                _ => None,
-                            }))
+                        Some(v) => v
+                            .stream_from_now()
+                            .filter_map(move |val| {
+                                future::ready(match val {
+                                    Value::Number(n, _) => Some((comp, n.number())),
+                                    _ => None,
+                                })
+                            })
                             .boxed_local(),
                         None => stream::pending().boxed_local(),
                     }
@@ -5103,39 +5103,37 @@ fn element_select(
     let options_stream = switch_map(settings_variable.stream(), |value| {
         value.expect_object().expect_variable("options").stream()
     })
-    .then(move |value| {
-        async move {
-            match value {
-                Value::List(list, _) => {
-                    let snapshot = list.snapshot().await;
-                    let mut pairs = Vec::new();
-                    for (_item_id, actor) in snapshot {
-                        if let Ok(Value::Object(obj, _)) = actor.current_value().await {
-                            let val = if let Some(var) = obj.variable("value") {
-                                if let Ok(Value::Text(t, _)) = var.value_actor().current_value().await {
-                                    t.text().to_string()
-                                } else {
-                                    String::new()
-                                }
+    .then(move |value| async move {
+        match value {
+            Value::List(list, _) => {
+                let snapshot = list.snapshot().await;
+                let mut pairs = Vec::new();
+                for (_item_id, actor) in snapshot {
+                    if let Ok(Value::Object(obj, _)) = actor.current_value().await {
+                        let val = if let Some(var) = obj.variable("value") {
+                            if let Ok(Value::Text(t, _)) = var.value_actor().current_value().await {
+                                t.text().to_string()
                             } else {
                                 String::new()
-                            };
-                            let label = if let Some(var) = obj.variable("label") {
-                                if let Ok(Value::Text(t, _)) = var.value_actor().current_value().await {
-                                    t.text().to_string()
-                                } else {
-                                    val.clone()
-                                }
+                            }
+                        } else {
+                            String::new()
+                        };
+                        let label = if let Some(var) = obj.variable("label") {
+                            if let Ok(Value::Text(t, _)) = var.value_actor().current_value().await {
+                                t.text().to_string()
                             } else {
                                 val.clone()
-                            };
-                            pairs.push((val, label));
-                        }
+                            }
+                        } else {
+                            val.clone()
+                        };
+                        pairs.push((val, label));
                     }
-                    pairs
                 }
-                _ => Vec::new(),
+                pairs
             }
+            _ => Vec::new(),
         }
     });
     let options_signal = signal::from_stream(options_stream.boxed_local());
@@ -5170,19 +5168,14 @@ fn element_select(
             .style_signal("width", width_signal)
             .attr_signal("value", selected_signal)
             .attr_signal("disabled", disabled_sig)
-            .inner_markup_signal(
-                options_signal.map(|opt| {
-                    let pairs = opt.unwrap_or_default();
-                    let mut html = String::new();
-                    for (val, label) in pairs {
-                        html.push_str(&format!(
-                            "<option value=\"{}\">{}</option>",
-                            val, label
-                        ));
-                    }
-                    html
-                }),
-            )
+            .inner_markup_signal(options_signal.map(|opt| {
+                let pairs = opt.unwrap_or_default();
+                let mut html = String::new();
+                for (val, label) in pairs {
+                    html.push_str(&format!("<option value=\"{}\">{}</option>", val, label));
+                }
+                html
+            }))
             .event_handler(move |event: events::Input| {
                 let target: web_sys::HtmlInputElement = event.target().unwrap().unchecked_into();
                 let value = target.value();
@@ -5377,16 +5370,14 @@ fn element_svg(
             let y = f64::from(event.offset_y());
             click_sender.send_or_drop(TimestampedEvent::now((x, y)));
         })
-        .children_signal_vec(
-            VecDiffStreamSignalVec(children_vec_diff_stream).map_signal(
-                move |value_actor| {
-                    signal::from_stream(value_actor.stream().map({
-                        let construct_context = construct_context.clone();
-                        move |value| value_to_element(value, construct_context.clone())
-                    }))
-                },
-            ),
-        )
+        .children_signal_vec(VecDiffStreamSignalVec(children_vec_diff_stream).map_signal(
+            move |value_actor| {
+                signal::from_stream(value_actor.stream().map({
+                    let construct_context = construct_context.clone();
+                    move |value| value_to_element(value, construct_context.clone())
+                }))
+            },
+        ))
         .after_remove(move |_| drop(event_handler_loop))
 }
 
@@ -5397,11 +5388,10 @@ fn element_svg_circle(
     let settings_variable = tagged_object.expect_variable("settings");
 
     // Click event with coordinates
-    let (click_sender, mut click_receiver) =
-        NamedChannel::<TimestampedEvent<(f64, f64)>>::new(
-            "svg_circle.click",
-            BRIDGE_PRESS_EVENT_CAPACITY,
-        );
+    let (click_sender, mut click_receiver) = NamedChannel::<TimestampedEvent<(f64, f64)>>::new(
+        "svg_circle.click",
+        BRIDGE_PRESS_EVENT_CAPACITY,
+    );
 
     let element_variable = tagged_object.expect_variable("element");
     let mut click_stream = switch_map(
@@ -5913,10 +5903,7 @@ fn element_label(
                     .strike_signal(strikethrough_bool_signal.map(|opt| opt.unwrap_or(false))),
             ))
         .s(Padding::all_signal(padding_all_signal))
-        .label_signal(
-            signal::from_stream(label_stream)
-                .map(|l| l.unwrap_or_else(empty_text)),
-        )
+        .label_signal(signal::from_stream(label_stream).map(|l| l.unwrap_or_else(empty_text)))
         .on_double_click({
             let sender = double_click_sender.clone();
             move || {
@@ -6094,10 +6081,7 @@ fn element_link(
     });
 
     Link::new()
-        .label_signal(
-            signal::from_stream(label_stream)
-                .map(|l| l.unwrap_or_else(empty_text)),
-        )
+        .label_signal(signal::from_stream(label_stream).map(|l| l.unwrap_or_else(empty_text)))
         .to_signal(signal::from_stream(to_stream).map(|t| t.unwrap_or_default()))
         .new_tab(NewTab::new())
         .on_hovered_change(move |is_hovered| {
@@ -6195,16 +6179,11 @@ fn element_text(
     });
 
     El::new()
-        .s(Font::new()
-            .size_signal(font_size_signal.map(|opt| opt.unwrap_or(16)))
-        )
+        .s(Font::new().size_signal(font_size_signal.map(|opt| opt.unwrap_or(16))))
         .update_raw_el(|raw_el| {
             // Use Option<String> so dominator removes the property on None
             // instead of panicking on empty string
-            raw_el.style_signal(
-                "color",
-                font_color_signal,
-            )
+            raw_el.style_signal("color", font_color_signal)
         })
         .child_signal(signal::from_stream(text_stream))
         .update_raw_el(move |raw_el| apply_physical_css(raw_el, &sv_physical, &ctx_physical))
@@ -6292,66 +6271,76 @@ fn element_block(
         let style_stream = switch_map(sv_style.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
         });
-        style_stream.filter_map(|value| async move {
-            let obj = match value {
-                Value::Object(obj, _) => obj,
-                _ => return None,
-            };
-            let mut css = String::new();
+        style_stream
+            .filter_map(|value| async move {
+                let obj = match value {
+                    Value::Object(obj, _) => obj,
+                    _ => return None,
+                };
+                let mut css = String::new();
 
-            // Padding
-            if let Some(v) = obj.variable("padding") {
-                match v.value_actor().current_value().await {
-                    Ok(Value::Number(n, _)) => {
-                        css.push_str(&format!("padding:{}px;", n.number()));
-                    }
-                    Ok(Value::Object(pad_obj, _)) => {
-                        let get = |obj: &Arc<Object>, key: &str, fallback: &str| {
-                            let obj = obj.clone();
-                            let key = key.to_string();
-                            let fallback = fallback.to_string();
-                            async move {
-                                if let Some(v) = obj.variable(&key) {
-                                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                        return n.number();
+                // Padding
+                if let Some(v) = obj.variable("padding") {
+                    match v.value_actor().current_value().await {
+                        Ok(Value::Number(n, _)) => {
+                            css.push_str(&format!("padding:{}px;", n.number()));
+                        }
+                        Ok(Value::Object(pad_obj, _)) => {
+                            let get = |obj: &Arc<Object>, key: &str, fallback: &str| {
+                                let obj = obj.clone();
+                                let key = key.to_string();
+                                let fallback = fallback.to_string();
+                                async move {
+                                    if let Some(v) = obj.variable(&key) {
+                                        if let Ok(Value::Number(n, _)) =
+                                            v.value_actor().current_value().await
+                                        {
+                                            return n.number();
+                                        }
                                     }
-                                }
-                                if let Some(v) = obj.variable(&fallback) {
-                                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                        return n.number();
+                                    if let Some(v) = obj.variable(&fallback) {
+                                        if let Ok(Value::Number(n, _)) =
+                                            v.value_actor().current_value().await
+                                        {
+                                            return n.number();
+                                        }
                                     }
+                                    0.0
                                 }
-                                0.0
-                            }
-                        };
-                        let top = get(&pad_obj, "top", "column").await;
-                        let right = get(&pad_obj, "right", "row").await;
-                        let bottom = get(&pad_obj, "bottom", "column").await;
-                        let left = get(&pad_obj, "left", "row").await;
-                        css.push_str(&format!("padding:{}px {}px {}px {}px;", top, right, bottom, left));
+                            };
+                            let top = get(&pad_obj, "top", "column").await;
+                            let right = get(&pad_obj, "right", "row").await;
+                            let bottom = get(&pad_obj, "bottom", "column").await;
+                            let left = get(&pad_obj, "left", "row").await;
+                            css.push_str(&format!(
+                                "padding:{}px {}px {}px {}px;",
+                                top, right, bottom, left
+                            ));
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
 
-            // Align
-            if let Some(v) = obj.variable("align") {
-                if let Ok(Value::Object(align_obj, _)) = v.value_actor().current_value().await {
-                    if let Some(row_v) = align_obj.variable("row") {
-                        if let Ok(Value::Tag(tag, _)) = row_v.value_actor().current_value().await {
-                            match tag.tag() {
-                                "Center" => css.push_str("text-align:center;"),
-                                "Right" => css.push_str("text-align:right;"),
-                                _ => {}
+                // Align
+                if let Some(v) = obj.variable("align") {
+                    if let Ok(Value::Object(align_obj, _)) = v.value_actor().current_value().await {
+                        if let Some(row_v) = align_obj.variable("row") {
+                            if let Ok(Value::Tag(tag, _)) =
+                                row_v.value_actor().current_value().await
+                            {
+                                match tag.tag() {
+                                    "Center" => css.push_str("text-align:center;"),
+                                    "Right" => css.push_str("text-align:right;"),
+                                    _ => {}
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            Some(css)
-        })
-        .boxed_local()
+                Some(css)
+            })
+            .boxed_local()
     });
 
     // Reactive background-image from style.background.url
@@ -6388,9 +6377,7 @@ fn element_block(
             raw_el.update_dom_builder(|dom_builder| {
                 let element: web_sys::Element = dom_builder.__internal_element().into();
                 dom_builder.future(style_css_signal.for_each(move |css_opt| {
-                    let style = element
-                        .unchecked_ref::<web_sys::HtmlElement>()
-                        .style();
+                    let style = element.unchecked_ref::<web_sys::HtmlElement>().style();
                     async move {
                         let css = css_opt.unwrap_or_default();
                         for pair in css.split(';') {

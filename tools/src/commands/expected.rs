@@ -12,6 +12,7 @@ pub struct ExpectedSpec {
     pub test: TestMeta,
 
     /// Expected output specification
+    #[serde(default)]
     pub output: OutputSpec,
 
     /// Interaction sequences for interactive examples
@@ -52,7 +53,7 @@ pub struct TestMeta {
     pub skip_engines: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct OutputSpec {
     /// Match mode: contains (default), exact, regex
     #[serde(default)]
@@ -162,7 +163,9 @@ impl Action {
                         let key = arr
                             .get(1)
                             .and_then(|v| v.as_str())
-                            .context("key requires key name (Enter, Tab, Escape, Backspace, Delete)")?
+                            .context(
+                                "key requires key name (Enter, Tab, Escape, Backspace, Delete)",
+                            )?
                             .to_string();
                         Ok(ParsedAction::Key { key })
                     }
@@ -171,7 +174,9 @@ impl Action {
                             .get(1)
                             .and_then(|v| v.as_u64())
                             .context("focus_input requires index (0-indexed)")?;
-                        Ok(ParsedAction::FocusInput { index: index as u32 })
+                        Ok(ParsedAction::FocusInput {
+                            index: index as u32,
+                        })
                     }
                     "click_text" => {
                         let text = arr
@@ -186,7 +191,9 @@ impl Action {
                             .get(1)
                             .and_then(|v| v.as_u64())
                             .context("click_button requires index (0-indexed)")?;
-                        Ok(ParsedAction::ClickButton { index: index as u32 })
+                        Ok(ParsedAction::ClickButton {
+                            index: index as u32,
+                        })
                     }
                     "click_button_near_text" => {
                         // ["click_button_near_text", "Walk the dog"] or ["click_button_near_text", "Walk the dog", "×"]
@@ -195,10 +202,8 @@ impl Action {
                             .and_then(|v| v.as_str())
                             .context("click_button_near_text requires target text")?
                             .to_string();
-                        let button_text = arr
-                            .get(2)
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
+                        let button_text =
+                            arr.get(2).and_then(|v| v.as_str()).map(|s| s.to_string());
                         Ok(ParsedAction::ClickButtonNearText { text, button_text })
                     }
                     "click_checkbox" => {
@@ -206,7 +211,9 @@ impl Action {
                             .get(1)
                             .and_then(|v| v.as_u64())
                             .context("click_checkbox requires index (0-indexed)")?;
-                        Ok(ParsedAction::ClickCheckbox { index: index as u32 })
+                        Ok(ParsedAction::ClickCheckbox {
+                            index: index as u32,
+                        })
                     }
                     "click_at" => {
                         let x = arr
@@ -273,6 +280,43 @@ impl Action {
                             column: column as u32,
                         })
                     }
+                    "assert_cells_cell_text" => {
+                        let row = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_cells_cell_text requires 1-based row")?;
+                        let column = arr
+                            .get(2)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_cells_cell_text requires 1-based column")?;
+                        let expected = arr
+                            .get(3)
+                            .and_then(|v| v.as_str())
+                            .context("assert_cells_cell_text requires expected text")?
+                            .to_string();
+                        Ok(ParsedAction::AssertCellsCellText {
+                            row: row as u32,
+                            column: column as u32,
+                            expected,
+                        })
+                    }
+                    "assert_cells_row_visible" => {
+                        let row = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_cells_row_visible requires 1-based row")?;
+                        Ok(ParsedAction::AssertCellsRowVisible { row: row as u32 })
+                    }
+                    "assert_preview_direct_text_visible" => {
+                        let text = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context(
+                                "assert_preview_direct_text_visible requires visible direct text",
+                            )?
+                            .to_string();
+                        Ok(ParsedAction::AssertPreviewDirectTextVisible { text })
+                    }
                     "hover_text" => {
                         let text = arr
                             .get(1)
@@ -282,11 +326,16 @@ impl Action {
                         Ok(ParsedAction::HoverText { text })
                     }
                     "assert_focused" => {
-                        let index = arr
-                            .get(1)
-                            .and_then(|v| v.as_u64())
-                            .map(|i| i as u32);
+                        let index = arr.get(1).and_then(|v| v.as_u64()).map(|i| i as u32);
                         Ok(ParsedAction::AssertFocused { input_index: index })
+                    }
+                    "assert_focused_input_value" => {
+                        let expected = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("assert_focused_input_value requires expected value")?
+                            .to_string();
+                        Ok(ParsedAction::AssertFocusedInputValue { expected })
                     }
                     "assert_input_placeholder" => {
                         let index = arr
@@ -298,7 +347,10 @@ impl Action {
                             .and_then(|v| v.as_str())
                             .context("assert_input_placeholder requires expected placeholder text")?
                             .to_string();
-                        Ok(ParsedAction::AssertInputPlaceholder { index: index as u32, expected })
+                        Ok(ParsedAction::AssertInputPlaceholder {
+                            index: index as u32,
+                            expected,
+                        })
                     }
                     "assert_url" => {
                         let pattern = arr
@@ -313,50 +365,59 @@ impl Action {
                             .get(1)
                             .and_then(|v| v.as_u64())
                             .context("assert_input_typeable requires index (0-indexed)")?;
-                        Ok(ParsedAction::AssertInputTypeable { index: index as u32 })
+                        Ok(ParsedAction::AssertInputTypeable {
+                            index: index as u32,
+                        })
                     }
                     "assert_button_count" => {
                         let expected_count = arr
                             .get(1)
                             .and_then(|v| v.as_u64())
                             .context("assert_button_count requires expected count")?;
-                        Ok(ParsedAction::AssertButtonCount { expected: expected_count as u32 })
+                        Ok(ParsedAction::AssertButtonCount {
+                            expected: expected_count as u32,
+                        })
                     }
                     "assert_checkbox_count" => {
                         let expected_count = arr
                             .get(1)
                             .and_then(|v| v.as_u64())
                             .context("assert_checkbox_count requires expected count")?;
-                        Ok(ParsedAction::AssertCheckboxCount { expected: expected_count as u32 })
+                        Ok(ParsedAction::AssertCheckboxCount {
+                            expected: expected_count as u32,
+                        })
                     }
                     "assert_not_contains" => {
                         let text = arr
                             .get(1)
                             .and_then(|v| v.as_str())
-                            .context("assert_not_contains requires text that should NOT be present")?
+                            .context(
+                                "assert_not_contains requires text that should NOT be present",
+                            )?
                             .to_string();
                         Ok(ParsedAction::AssertNotContains { text })
                     }
                     "assert_not_focused" => {
-                        let index = arr
-                            .get(1)
-                            .and_then(|v| v.as_u64())
-                            .context("assert_not_focused requires input index")?;
-                        Ok(ParsedAction::AssertNotFocused { input_index: index as u32 })
+                        let index = arr.get(1).and_then(|v| v.as_u64()).map(|i| i as u32);
+                        Ok(ParsedAction::AssertNotFocused { input_index: index })
                     }
                     "assert_checkbox_unchecked" => {
                         let index = arr
                             .get(1)
                             .and_then(|v| v.as_u64())
                             .context("assert_checkbox_unchecked requires checkbox index")?;
-                        Ok(ParsedAction::AssertCheckboxUnchecked { index: index as u32 })
+                        Ok(ParsedAction::AssertCheckboxUnchecked {
+                            index: index as u32,
+                        })
                     }
                     "assert_checkbox_checked" => {
                         let index = arr
                             .get(1)
                             .and_then(|v| v.as_u64())
                             .context("assert_checkbox_checked requires checkbox index")?;
-                        Ok(ParsedAction::AssertCheckboxChecked { index: index as u32 })
+                        Ok(ParsedAction::AssertCheckboxChecked {
+                            index: index as u32,
+                        })
                     }
                     "assert_button_has_outline" => {
                         let text = arr
@@ -372,7 +433,9 @@ impl Action {
                             .get(1)
                             .and_then(|v| v.as_u64())
                             .context("assert_input_empty requires input index")?;
-                        Ok(ParsedAction::AssertInputEmpty { index: index as u32 })
+                        Ok(ParsedAction::AssertInputEmpty {
+                            index: index as u32,
+                        })
                     }
                     "assert_contains" => {
                         let text = arr
@@ -387,7 +450,9 @@ impl Action {
                             .get(1)
                             .and_then(|v| v.as_u64())
                             .context("assert_checkbox_clickable requires checkbox index")?;
-                        Ok(ParsedAction::AssertCheckboxClickable { index: index as u32 })
+                        Ok(ParsedAction::AssertCheckboxClickable {
+                            index: index as u32,
+                        })
                     }
                     "assert_element_style" => {
                         let target = arr
@@ -405,7 +470,11 @@ impl Action {
                             .and_then(|v| v.as_str())
                             .context("assert_element_style requires expected value substring")?
                             .to_string();
-                        Ok(ParsedAction::AssertElementStyle { target, property, expected })
+                        Ok(ParsedAction::AssertElementStyle {
+                            target,
+                            property,
+                            expected,
+                        })
                     }
                     "assert_input_value" => {
                         let index = arr
@@ -417,16 +486,16 @@ impl Action {
                             .and_then(|v| v.as_str())
                             .context("assert_input_value requires expected value")?
                             .to_string();
-                        Ok(ParsedAction::AssertInputValue { index: index as u32, expected })
+                        Ok(ParsedAction::AssertInputValue {
+                            index: index as u32,
+                            expected,
+                        })
                     }
                     "set_slider_value" => {
-                        let index = arr
-                            .get(1)
-                            .and_then(|v| v.as_u64())
-                            .context("set_slider_value requires slider index (0-indexed among range inputs)")?;
-                        let raw = arr
-                            .get(2)
-                            .context("set_slider_value requires value")?;
+                        let index = arr.get(1).and_then(|v| v.as_u64()).context(
+                            "set_slider_value requires slider index (0-indexed among range inputs)",
+                        )?;
+                        let raw = arr.get(2).context("set_slider_value requires value")?;
                         // Handle both string and number values from TOML
                         let value_str = if let Some(s) = raw.as_str() {
                             s.to_string()
@@ -435,7 +504,10 @@ impl Action {
                         } else {
                             raw.to_string()
                         };
-                        Ok(ParsedAction::SetSliderValue { index: index as u32, value: value_str })
+                        Ok(ParsedAction::SetSliderValue {
+                            index: index as u32,
+                            value: value_str,
+                        })
                     }
                     "select_option" => {
                         // ["select_option", index, "value"] - select dropdown option by value
@@ -448,7 +520,10 @@ impl Action {
                             .and_then(|v| v.as_str())
                             .context("select_option requires option value")?
                             .to_string();
-                        Ok(ParsedAction::SelectOption { index: index as u32, value })
+                        Ok(ParsedAction::SelectOption {
+                            index: index as u32,
+                            value,
+                        })
                     }
                     "set_input_value" => {
                         let index = arr
@@ -465,6 +540,14 @@ impl Action {
                             value,
                         })
                     }
+                    "set_focused_input_value" => {
+                        let value = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("set_focused_input_value requires value")?
+                            .to_string();
+                        Ok(ParsedAction::SetFocusedInputValue { value })
+                    }
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -474,44 +557,144 @@ impl Action {
 
 #[derive(Debug, Clone)]
 pub enum ParsedAction {
-    Click { selector: String },
-    Type { selector: String, text: String },
-    TypeText { text: String },  // Type into currently focused element
-    Wait { ms: u64 },
+    Click {
+        selector: String,
+    },
+    Type {
+        selector: String,
+        text: String,
+    },
+    TypeText {
+        text: String,
+    }, // Type into currently focused element
+    Wait {
+        ms: u64,
+    },
     ClearStates,
-    Run,  // Trigger code execution
-    Key { key: String },
-    FocusInput { index: u32 },
-    ClickText { text: String },    // Click by text content
-    ClickButton { index: u32 },    // Click button by index
-    ClickButtonNearText { text: String, button_text: Option<String> },  // Click button near text (e.g., × button for a todo)
-    ClickCheckbox { index: u32 },  // Click checkbox by index
-    ClickAt { x: i32, y: i32 },    // Click preview coordinates
-    DblClickText { text: String }, // Double-click by text content
-    DblClickTextNth { text: String, index: usize }, // Double-click nth exact match by text
-    DblClickAt { x: i32, y: i32 }, // Double-click preview coordinates
-    DblClickCellsCell { row: u32, column: u32 }, // Double-click a 7GUIs Cells grid cell by 1-based row/column
-    HoverText { text: String },    // Hover over element by text content
-    AssertFocused { input_index: Option<u32> },  // Assert input has focus
-    AssertInputPlaceholder { index: u32, expected: String },  // Assert input placeholder
-    AssertUrl { pattern: String },  // Assert current URL contains pattern
-    AssertInputTypeable { index: u32 },  // Assert input is actually typeable (not disabled/readonly/hidden)
-    AssertButtonCount { expected: u32 },  // Assert number of visible buttons in preview
-    AssertCheckboxCount { expected: u32 },  // Assert number of visible checkboxes in preview
-    AssertNotContains { text: String },  // Assert preview does NOT contain text
-    AssertNotFocused { input_index: u32 },  // Assert input does NOT have focus
-    AssertCheckboxUnchecked { index: u32 },  // Assert checkbox is NOT checked
-    AssertCheckboxChecked { index: u32 },  // Assert checkbox IS checked
-    AssertButtonHasOutline { text: String },  // Assert button has visible outline
-    AssertToggleAllDarker,  // Assert toggle all icon is dark (all todos completed)
-    AssertInputEmpty { index: u32 },  // Assert input value is empty
-    AssertContains { text: String },  // Assert preview contains text
-    AssertCheckboxClickable { index: u32 },  // Assert checkbox is clickable by real user (not obscured)
-    AssertElementStyle { target: String, property: String, expected: String },  // Assert computed CSS style on element found by text
-    AssertInputValue { index: u32, expected: String },  // Assert input's current value
-    SetInputValue { index: u32, value: String },  // Set text input value and dispatch input/change
-    SetSliderValue { index: u32, value: String },  // Set range input value
-    SelectOption { index: u32, value: String },  // Select dropdown option by value
+    Run, // Trigger code execution
+    Key {
+        key: String,
+    },
+    FocusInput {
+        index: u32,
+    },
+    ClickText {
+        text: String,
+    }, // Click by text content
+    ClickButton {
+        index: u32,
+    }, // Click button by index
+    ClickButtonNearText {
+        text: String,
+        button_text: Option<String>,
+    }, // Click button near text (e.g., × button for a todo)
+    ClickCheckbox {
+        index: u32,
+    }, // Click checkbox by index
+    ClickAt {
+        x: i32,
+        y: i32,
+    }, // Click preview coordinates
+    DblClickText {
+        text: String,
+    }, // Double-click by text content
+    DblClickTextNth {
+        text: String,
+        index: usize,
+    }, // Double-click nth exact match by text
+    DblClickAt {
+        x: i32,
+        y: i32,
+    }, // Double-click preview coordinates
+    DblClickCellsCell {
+        row: u32,
+        column: u32,
+    }, // Double-click a 7GUIs Cells grid cell by 1-based row/column
+    AssertCellsCellText {
+        row: u32,
+        column: u32,
+        expected: String,
+    }, // Assert a 7GUIs Cells grid cell text by 1-based row/column
+    AssertCellsRowVisible {
+        row: u32,
+    }, // Assert a 7GUIs Cells row label exists in the rendered sheet
+    AssertPreviewDirectTextVisible {
+        text: String,
+    }, // Assert visible direct text exists in preview without serializing whole preview
+    HoverText {
+        text: String,
+    }, // Hover over element by text content
+    AssertFocused {
+        input_index: Option<u32>,
+    }, // Assert input has focus
+    AssertFocusedInputValue {
+        expected: String,
+    }, // Assert currently focused input value
+    AssertInputPlaceholder {
+        index: u32,
+        expected: String,
+    }, // Assert input placeholder
+    AssertUrl {
+        pattern: String,
+    }, // Assert current URL contains pattern
+    AssertInputTypeable {
+        index: u32,
+    }, // Assert input is actually typeable (not disabled/readonly/hidden)
+    AssertButtonCount {
+        expected: u32,
+    }, // Assert number of visible buttons in preview
+    AssertCheckboxCount {
+        expected: u32,
+    }, // Assert number of visible checkboxes in preview
+    AssertNotContains {
+        text: String,
+    }, // Assert preview does NOT contain text
+    AssertNotFocused {
+        input_index: Option<u32>,
+    }, // Assert input does NOT have focus
+    AssertCheckboxUnchecked {
+        index: u32,
+    }, // Assert checkbox is NOT checked
+    AssertCheckboxChecked {
+        index: u32,
+    }, // Assert checkbox IS checked
+    AssertButtonHasOutline {
+        text: String,
+    }, // Assert button has visible outline
+    AssertToggleAllDarker, // Assert toggle all icon is dark (all todos completed)
+    AssertInputEmpty {
+        index: u32,
+    }, // Assert input value is empty
+    AssertContains {
+        text: String,
+    }, // Assert preview contains text
+    AssertCheckboxClickable {
+        index: u32,
+    }, // Assert checkbox is clickable by real user (not obscured)
+    AssertElementStyle {
+        target: String,
+        property: String,
+        expected: String,
+    }, // Assert computed CSS style on element found by text
+    AssertInputValue {
+        index: u32,
+        expected: String,
+    }, // Assert input's current value
+    SetInputValue {
+        index: u32,
+        value: String,
+    }, // Set text input value and dispatch input/change
+    SetFocusedInputValue {
+        value: String,
+    }, // Set currently focused text input value
+    SetSliderValue {
+        index: u32,
+        value: String,
+    }, // Set range input value
+    SelectOption {
+        index: u32,
+        value: String,
+    }, // Select dropdown option by value
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -556,8 +739,7 @@ impl ExpectedSpec {
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        Self::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", path.display()))
+        Self::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
     }
 
     /// Parse from TOML string
@@ -573,6 +755,10 @@ impl ExpectedSpec {
 }
 
 impl OutputSpec {
+    pub fn is_configured(&self) -> bool {
+        self.text.is_some() || self.pattern.is_some()
+    }
+
     /// Check if the given text matches this output specification
     pub fn matches(&self, text: &str) -> Result<bool> {
         let text = text.trim();
@@ -675,7 +861,10 @@ expect = "1"
 "#;
         let spec = ExpectedSpec::from_str(toml).unwrap();
         assert_eq!(spec.sequence.len(), 1);
-        assert_eq!(spec.sequence[0].description, Some("Click increment".to_string()));
+        assert_eq!(
+            spec.sequence[0].description,
+            Some("Click increment".to_string())
+        );
         assert_eq!(spec.sequence[0].expect, Some("1".to_string()));
     }
 }

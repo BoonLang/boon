@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 boon-scene = { path = "../boon-scene" }
 zoon = { git = "https://github.com/MoonZoon/MoonZoon", rev = "19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d" }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["EventTarget", "HtmlInputElement", "HtmlSelectElement", "HtmlTextAreaElement"] }
+ulid = "1.2.1"

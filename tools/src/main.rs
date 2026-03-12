@@ -383,7 +383,7 @@ enum ExecAction {
         #[arg(long)]
         no_launch: bool,
 
-        /// Engine to test against: Actors, DD, or Wasm (default: use current engine)
+        /// Engine to test against: Actors, DD, Wasm, or WasmPro (default: use current engine)
         #[arg(long)]
         engine: Option<String>,
 
@@ -417,12 +417,12 @@ enum ExecAction {
         examples_dir: Option<PathBuf>,
     },
 
-    /// Get the currently selected engine (Actors, DD, or Wasm)
+    /// Get the currently selected engine (Actors, DD, Wasm, or WasmPro)
     GetEngine,
 
     /// Set the engine and trigger re-run
     SetEngine {
-        /// Engine to use: "Actors", "DD", or "Wasm"
+        /// Engine to use: "Actors", "DD", "Wasm", or "WasmPro"
         engine: String,
     },
 
@@ -510,7 +510,11 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Server { action } => match action {
-            ServerAction::Start { port, watch, no_watch } => {
+            ServerAction::Start {
+                port,
+                watch,
+                no_watch,
+            } => {
                 let ws_port = port.unwrap_or(ports.ws_port);
                 let rt = tokio::runtime::Runtime::new()?;
 
@@ -574,7 +578,9 @@ fn main() -> Result<()> {
                 zoom_scale,
                 analyze_semantic,
             };
-            if let Err(e) = commands::pixel_diff::run_with_options(&reference, &current, threshold, options) {
+            if let Err(e) =
+                commands::pixel_diff::run_with_options(&reference, &current, threshold, options)
+            {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
@@ -602,6 +608,8 @@ async fn handle_browser(action: BrowserAction, ports: &port_config::PortConfig) 
                 headless,
                 keep_open,
                 browser_path: browser,
+                initial_engine: None,
+                initial_example: None,
             };
 
             let resolved_ws_port = opts.ws_port;
@@ -626,17 +634,15 @@ async fn handle_browser(action: BrowserAction, ports: &port_config::PortConfig) 
             browser::kill_browser_instances()?;
         }
 
-        BrowserAction::Check => {
-            match browser::check_chromium_available() {
-                Ok(path) => {
-                    println!("Chromium found: {}", path.display());
-                }
-                Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
-                }
+        BrowserAction::Check => match browser::check_chromium_available() {
+            Ok(path) => {
+                println!("Chromium found: {}", path.display());
             }
-        }
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        },
     }
 
     Ok(())
@@ -655,7 +661,14 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             } else {
                 code
             };
-            let response = send_command_to_server(port, WsCommand::InjectCode { code, filename: None }).await?;
+            let response = send_command_to_server(
+                port,
+                WsCommand::InjectCode {
+                    code,
+                    filename: None,
+                },
+            )
+            .await?;
             print_response(response);
         }
 
@@ -691,22 +704,39 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             }
         }
 
-        ExecAction::ScreenshotPreview { output, width, height, hidpi } => {
+        ExecAction::ScreenshotPreview {
+            output,
+            width,
+            height,
+            hidpi,
+        } => {
             // Use new ScreenshotPreview command with size params
-            let response = send_command_to_server(port, WsCommand::ScreenshotPreview {
-                width: Some(width),
-                height: Some(height),
-                hidpi: Some(hidpi),
-            }).await?;
+            let response = send_command_to_server(
+                port,
+                WsCommand::ScreenshotPreview {
+                    width: Some(width),
+                    height: Some(height),
+                    hidpi: Some(hidpi),
+                },
+            )
+            .await?;
             match response {
-                WsResponse::Screenshot { base64, width: w, height: h, dpr } => {
+                WsResponse::Screenshot {
+                    base64,
+                    width: w,
+                    height: h,
+                    dpr,
+                } => {
                     let data = base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
                         &base64,
                     )?;
                     std::fs::write(&output, data)?;
                     if let (Some(w), Some(h)) = (w, h) {
-                        println!("Preview screenshot saved to: {} ({}x{} px, dpr: {:?})", output, w, h, dpr);
+                        println!(
+                            "Preview screenshot saved to: {} ({}x{} px, dpr: {:?})",
+                            output, w, h, dpr
+                        );
                     } else {
                         println!("Preview screenshot saved to: {}", output);
                     }
@@ -770,7 +800,8 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         }
 
         ExecAction::HoverText { text, exact } => {
-            let response = send_command_to_server(port, WsCommand::HoverByText { text, exact }).await?;
+            let response =
+                send_command_to_server(port, WsCommand::HoverByText { text, exact }).await?;
             print_response(response);
         }
 
@@ -801,10 +832,18 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             }
         }
 
-        ExecAction::Scroll { y, delta, to_bottom } => {
+        ExecAction::Scroll {
+            y,
+            delta,
+            to_bottom,
+        } => {
             let response = send_command_to_server(
                 port,
-                WsCommand::Scroll { y, delta, to_bottom },
+                WsCommand::Scroll {
+                    y,
+                    delta,
+                    to_bottom,
+                },
             )
             .await?;
             print_response(response);
@@ -823,13 +862,19 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         }
 
         ExecAction::Reload => {
-            eprintln!("WARNING: 'reload' disconnects the extension. Consider using 'refresh' instead.");
+            eprintln!(
+                "WARNING: 'reload' disconnects the extension. Consider using 'refresh' instead."
+            );
             println!("Sending reload command to extension...");
             let response = send_command_to_server(port, WsCommand::Reload).await?;
             print_response(response);
         }
 
-        ExecAction::Test { code, expect, screenshot } => {
+        ExecAction::Test {
+            code,
+            expect,
+            screenshot,
+        } => {
             // Support @filename syntax to read code from file
             let code = if code.starts_with('@') {
                 let path = &code[1..];
@@ -840,7 +885,14 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             };
             // Inject code
             println!("Injecting code...");
-            let response = send_command_to_server(port, WsCommand::InjectCode { code, filename: None }).await?;
+            let response = send_command_to_server(
+                port,
+                WsCommand::InjectCode {
+                    code,
+                    filename: None,
+                },
+            )
+            .await?;
             if matches!(response, WsResponse::Error { .. }) {
                 print_response(response);
                 return Ok(());
@@ -892,7 +944,10 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         ExecAction::Dom { selector, depth } => {
             let response = send_command_to_server(
                 port,
-                WsCommand::GetDOM { selector, depth: Some(depth) },
+                WsCommand::GetDOM {
+                    selector,
+                    depth: Some(depth),
+                },
             )
             .await?;
             match response {
@@ -932,7 +987,8 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                         let x = element.x + element.width / 2;
                         let y = element.y + element.height / 2;
                         println!("Found '{}' at ({}, {}), clicking...", text, x, y);
-                        let response = send_command_to_server(port, WsCommand::ClickAt { x, y }).await?;
+                        let response =
+                            send_command_to_server(port, WsCommand::ClickAt { x, y }).await?;
                         print_response(response);
                     } else {
                         eprintln!("Error: No element found containing text '{}'", text);
@@ -976,7 +1032,8 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                         let x = element.x + element.width / 2;
                         let y = element.y + element.height / 2;
                         println!("Found '{}' at ({}, {}), double-clicking...", text, x, y);
-                        let response = send_command_to_server(port, WsCommand::DoubleClickAt { x, y }).await?;
+                        let response =
+                            send_command_to_server(port, WsCommand::DoubleClickAt { x, y }).await?;
                         print_response(response);
                     } else {
                         eprintln!("Error: No element found containing text '{}'", text);
@@ -1024,13 +1081,13 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             engine,
             skip_persistence,
         } => {
-            use commands::test_examples::{run_tests, TestOptions};
+            use commands::test_examples::{TestOptions, run_tests};
 
             // Validate engine if provided
             if let Some(ref eng) = engine {
-                if eng != "Actors" && eng != "DD" && eng != "Wasm" {
+                if eng != "Actors" && eng != "DD" && eng != "Wasm" && eng != "WasmPro" {
                     anyhow::bail!(
-                        "Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'",
+                        "Invalid engine '{}'. Must be 'Actors', 'DD', 'Wasm', or 'WasmPro'",
                         eng
                     );
                 }
@@ -1059,7 +1116,7 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         }
 
         ExecAction::SmokeExamples { filter, no_launch } => {
-            use commands::test_examples::{run_builtin_smoke, SmokeOptions};
+            use commands::test_examples::{SmokeOptions, run_builtin_smoke};
 
             let opts = SmokeOptions {
                 port,
@@ -1077,7 +1134,8 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         }
 
         ExecAction::LocalStorage { pattern } => {
-            let response = send_command_to_server(port, WsCommand::GetLocalStorage { pattern }).await?;
+            let response =
+                send_command_to_server(port, WsCommand::GetLocalStorage { pattern }).await?;
             match response {
                 WsResponse::LocalStorage { entries } => {
                     if let Some(obj) = entries.as_object() {
@@ -1129,9 +1187,15 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             }
         }
 
-        ExecAction::Persistence { enable, disable, status } => {
+        ExecAction::Persistence {
+            enable,
+            disable,
+            status,
+        } => {
             if enable {
-                let response = send_command_to_server(port, WsCommand::SetPersistence { enabled: true }).await?;
+                let response =
+                    send_command_to_server(port, WsCommand::SetPersistence { enabled: true })
+                        .await?;
                 match response {
                     WsResponse::Success { data } => {
                         println!("Persistence: enabled");
@@ -1139,7 +1203,9 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                     _ => print_response(response),
                 }
             } else if disable {
-                let response = send_command_to_server(port, WsCommand::SetPersistence { enabled: false }).await?;
+                let response =
+                    send_command_to_server(port, WsCommand::SetPersistence { enabled: false })
+                        .await?;
                 match response {
                     WsResponse::Success { data } => {
                         println!("Persistence: disabled");
@@ -1152,8 +1218,12 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                 match response {
                     WsResponse::Success { data } => {
                         if let Some(d) = data {
-                            let enabled = d.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-                            println!("Persistence: {}", if enabled { "enabled" } else { "disabled" });
+                            let enabled =
+                                d.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                            println!(
+                                "Persistence: {}",
+                                if enabled { "enabled" } else { "disabled" }
+                            );
                         } else {
                             println!("Persistence: unknown");
                         }
@@ -1165,14 +1235,20 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
 
         ExecAction::SetEngine { engine } => {
             // Validate engine value
-            if engine != "Actors" && engine != "DD" && engine != "Wasm" {
+            if engine != "Actors" && engine != "DD" && engine != "Wasm" && engine != "WasmPro" {
                 anyhow::bail!(
-                    "Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'",
+                    "Invalid engine '{}'. Must be 'Actors', 'DD', 'Wasm', or 'WasmPro'",
                     engine
                 );
             }
             println!("Setting engine to: {}", engine);
-            let response = send_command_to_server(port, WsCommand::SetEngine { engine: engine.clone() }).await?;
+            let response = send_command_to_server(
+                port,
+                WsCommand::SetEngine {
+                    engine: engine.clone(),
+                },
+            )
+            .await?;
             match response {
                 WsResponse::Success { data } => {
                     if let Some(d) = data {
@@ -1190,7 +1266,11 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         ExecAction::GetFocusedElement => {
             let response = send_command_to_server(port, WsCommand::GetFocusedElement).await?;
             match response {
-                WsResponse::FocusedElement { tag_name, input_type, input_index } => {
+                WsResponse::FocusedElement {
+                    tag_name,
+                    input_type,
+                    input_index,
+                } => {
                     let tag = tag_name.as_deref().unwrap_or("none");
                     println!("tag={}", tag.to_uppercase());
                     if let Some(idx) = input_index {
@@ -1205,7 +1285,8 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         }
 
         ExecAction::GetCheckboxState { index } => {
-            let response = send_command_to_server(port, WsCommand::GetCheckboxState { index }).await?;
+            let response =
+                send_command_to_server(port, WsCommand::GetCheckboxState { index }).await?;
             match response {
                 WsResponse::CheckboxState { found, checked } => {
                     println!("found={} checked={}", found, checked);
@@ -1215,9 +1296,15 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         }
 
         ExecAction::GetInputProps { index } => {
-            let response = send_command_to_server(port, WsCommand::GetInputProperties { index }).await?;
+            let response =
+                send_command_to_server(port, WsCommand::GetInputProperties { index }).await?;
             match response {
-                WsResponse::InputProperties { found, placeholder, value, input_type } => {
+                WsResponse::InputProperties {
+                    found,
+                    placeholder,
+                    value,
+                    input_type,
+                } => {
                     println!("found={}", found);
                     if let Some(v) = value {
                         println!("value={}", v);
@@ -1234,9 +1321,12 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         }
 
         ExecAction::VerifyInputTypeable { index } => {
-            let response = send_command_to_server(port, WsCommand::VerifyInputTypeable { index }).await?;
+            let response =
+                send_command_to_server(port, WsCommand::VerifyInputTypeable { index }).await?;
             match response {
-                WsResponse::InputTypeableStatus { typeable, reason, .. } => {
+                WsResponse::InputTypeableStatus {
+                    typeable, reason, ..
+                } => {
                     if typeable {
                         println!("typeable=true");
                     } else {
@@ -1249,7 +1339,11 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         }
 
         ExecAction::AssertButtonOutline { text } => {
-            let response = send_command_to_server(port, WsCommand::AssertButtonHasOutline { text: text.clone() }).await?;
+            let response = send_command_to_server(
+                port,
+                WsCommand::AssertButtonHasOutline { text: text.clone() },
+            )
+            .await?;
             match response {
                 WsResponse::Success { .. } => {
                     println!("outline=true");
@@ -1295,7 +1389,6 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                 _ => print_response(response),
             }
         }
-
     }
 
     Ok(())
@@ -1345,13 +1438,21 @@ struct ElementBounds {
 }
 
 /// Recursively find an element containing the specified text
-fn find_element_by_text(data: &serde_json::Value, text: &str, exact: bool) -> Option<ElementBounds> {
+fn find_element_by_text(
+    data: &serde_json::Value,
+    text: &str,
+    exact: bool,
+) -> Option<ElementBounds> {
     // Try to find a matching element in the JSON structure
     // The GetPreviewElements returns a nested structure with text and bounds
     find_element_by_text_recursive(data, text, exact)
 }
 
-fn find_element_by_text_recursive(value: &serde_json::Value, text: &str, exact: bool) -> Option<ElementBounds> {
+fn find_element_by_text_recursive(
+    value: &serde_json::Value,
+    text: &str,
+    exact: bool,
+) -> Option<ElementBounds> {
     match value {
         serde_json::Value::Object(obj) => {
             // Check if this element has matching text
@@ -1442,7 +1543,11 @@ fn print_response(response: WsResponse) {
         WsResponse::Pong => {
             println!("Pong");
         }
-        WsResponse::Status { connected, page_url, api_ready } => {
+        WsResponse::Status {
+            connected,
+            page_url,
+            api_ready,
+        } => {
             println!("Connected: {}", connected);
             println!("Page URL: {:?}", page_url);
             println!("API Ready: {}", api_ready);

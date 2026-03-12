@@ -5,7 +5,7 @@
 //! - Chromium keeps all developer flags permanently (open-source project)
 //! - Available via `apt install chromium-browser`
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -124,6 +124,8 @@ pub struct LaunchOptions {
     pub headless: bool,
     pub keep_open: bool,
     pub browser_path: Option<PathBuf>,
+    pub initial_engine: Option<String>,
+    pub initial_example: Option<String>,
 }
 
 impl Default for LaunchOptions {
@@ -135,7 +137,19 @@ impl Default for LaunchOptions {
             headless: false,
             keep_open: false,
             browser_path: None,
+            initial_engine: None,
+            initial_example: None,
         }
+    }
+}
+
+fn engine_query_value(engine: &str) -> &str {
+    match engine {
+        "Actors" => "actors",
+        "DD" => "dd",
+        "Wasm" => "wasm",
+        "WasmPro" => "wasm-pro",
+        other => other,
     }
 }
 
@@ -187,8 +201,18 @@ pub fn launch_browser(opts: LaunchOptions) -> Result<Child> {
     }
 
     // Open the playground URL with safe defaults to avoid loading a heavy example
-    // on DD/Wasm engine from a previous session (which can hang the page).
-    cmd.arg(&format!("http://localhost:{}/?engine=actors&example=counter", opts.playground_port));
+    // from a previous session. Allow callers to override the initial engine/example
+    // when the automation flow wants to boot directly into a specific backend.
+    let initial_engine = opts
+        .initial_engine
+        .as_deref()
+        .map(engine_query_value)
+        .unwrap_or("actors");
+    let initial_example = opts.initial_example.as_deref().unwrap_or("counter");
+    cmd.arg(&format!(
+        "http://localhost:{}/?engine={}&example={}",
+        opts.playground_port, initial_engine, initial_example
+    ));
 
     // Suppress browser output unless in debug mode
     if std::env::var("RUST_LOG").is_err() {
@@ -214,18 +238,15 @@ pub fn launch_browser(opts: LaunchOptions) -> Result<Child> {
 
 /// Wait for the extension to connect to the WebSocket server
 pub async fn wait_for_extension_connection(port: u16, timeout: Duration) -> Result<()> {
-    use tokio::time::{sleep, Instant};
+    use tokio::time::{Instant, sleep};
 
     let start = Instant::now();
     let check_interval = Duration::from_millis(500);
 
     while start.elapsed() < timeout {
         // Try to get status from the server
-        match crate::ws_server::send_command_to_server(
-            port,
-            crate::ws_server::Command::GetStatus,
-        )
-        .await
+        match crate::ws_server::send_command_to_server(port, crate::ws_server::Command::GetStatus)
+            .await
         {
             Ok(crate::ws_server::Response::Status { connected, .. }) => {
                 if connected {

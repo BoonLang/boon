@@ -425,10 +425,12 @@ impl ExpressionConverter {
                 path: path.iter().map(|s| self.str_to_slice(s)).collect(),
             },
             // Postfix field access: expr.field
-            parser::Expression::PostfixFieldAccess { expr, field } => Expression::PostfixFieldAccess {
-                expr: Box::new(self.convert_spanned(expr)),
-                field: self.str_to_slice(field),
-            },
+            parser::Expression::PostfixFieldAccess { expr, field } => {
+                Expression::PostfixFieldAccess {
+                    expr: Box::new(self.convert_spanned(expr)),
+                    field: self.str_to_slice(field),
+                }
+            }
         }
     }
 
@@ -552,7 +554,10 @@ impl ExpressionConverter {
             parser::Pattern::Alias { name } => Pattern::Alias {
                 name: self.str_to_slice(name),
             },
-            parser::Pattern::ValueComparison { path, referenced_span } => Pattern::ValueComparison {
+            parser::Pattern::ValueComparison {
+                path,
+                referenced_span,
+            } => Pattern::ValueComparison {
                 path: path.iter().map(|s| self.str_to_slice(s)).collect(),
                 referenced_span: *referenced_span,
             },

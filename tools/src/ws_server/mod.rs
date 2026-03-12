@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 pub use protocol::*;
@@ -27,8 +27,7 @@ const SCREENSHOT_DIR: &str = "/tmp/boon-screenshots";
 /// Save base64 screenshot to file and return the path
 fn save_screenshot_to_file(base64_data: &str, name_hint: &str) -> Result<String> {
     // Ensure screenshot directory exists
-    std::fs::create_dir_all(SCREENSHOT_DIR)
-        .context("Failed to create screenshot directory")?;
+    std::fs::create_dir_all(SCREENSHOT_DIR).context("Failed to create screenshot directory")?;
 
     // Generate filename with timestamp
     let timestamp = std::time::SystemTime::now()
@@ -43,8 +42,7 @@ fn save_screenshot_to_file(base64_data: &str, name_hint: &str) -> Result<String>
         .decode(base64_data)
         .context("Failed to decode base64")?;
 
-    std::fs::write(&filepath, decoded)
-        .context("Failed to write screenshot")?;
+    std::fs::write(&filepath, decoded).context("Failed to write screenshot")?;
 
     Ok(filepath)
 }
@@ -121,19 +119,24 @@ impl ServerState {
         // Send request
         let request = Request { id, command };
         let json = serde_json::to_string(&request)?;
-        tx.send(json)
-            .await
-            .context("Failed to send to extension")?;
+        tx.send(json).await.context("Failed to send to extension")?;
 
         // Wait for response with timeout
-        let response = tokio::time::timeout(std::time::Duration::from_secs(30), resp_rx)
+        // Heavy examples like Cells on Wasm can keep the page busy longer than 30s
+        // before the content script answers a command, especially in debug builds.
+        let response = tokio::time::timeout(std::time::Duration::from_secs(120), resp_rx)
             .await
             .context("Extension response timeout")?
             .context("Response channel closed")?;
 
         // Transform screenshot responses: save to file and return filepath
         let response = match response {
-            Response::Screenshot { base64, width, height, dpr } => {
+            Response::Screenshot {
+                base64,
+                width,
+                height,
+                dpr,
+            } => {
                 let hint = screenshot_hint.unwrap_or("screenshot");
                 match save_screenshot_to_file(&base64, hint) {
                     Ok(filepath) => {
@@ -240,7 +243,9 @@ fn setup_file_watcher(path: &Path, state: Arc<ServerState>) -> Result<Recommende
     use std::time::{Duration, Instant};
 
     // Debounce: track last reload time to avoid rapid reloads
-    let last_reload = Arc::new(std::sync::Mutex::new(Instant::now() - Duration::from_secs(10)));
+    let last_reload = Arc::new(std::sync::Mutex::new(
+        Instant::now() - Duration::from_secs(10),
+    ));
     let debounce_duration = Duration::from_millis(500);
 
     let watcher_state = state.clone();
@@ -249,43 +254,44 @@ fn setup_file_watcher(path: &Path, state: Arc<ServerState>) -> Result<Recommende
     // Capture the tokio runtime handle for spawning from the notify callback thread
     let runtime_handle = tokio::runtime::Handle::current();
 
-    let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        if let Ok(event) = res {
-            // Only react to file modifications and creations
-            match event.kind {
-                EventKind::Modify(_) | EventKind::Create(_) => {
-                    // Check if any of the paths are actual extension files (not temp files)
-                    let is_extension_file = event.paths.iter().any(|p| {
-                        let ext = p.extension().and_then(|e| e.to_str());
-                        matches!(ext, Some("js") | Some("json") | Some("html") | Some("css"))
-                    });
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                // Only react to file modifications and creations
+                match event.kind {
+                    EventKind::Modify(_) | EventKind::Create(_) => {
+                        // Check if any of the paths are actual extension files (not temp files)
+                        let is_extension_file = event.paths.iter().any(|p| {
+                            let ext = p.extension().and_then(|e| e.to_str());
+                            matches!(ext, Some("js") | Some("json") | Some("html") | Some("css"))
+                        });
 
-                    if !is_extension_file {
-                        return;
-                    }
-
-                    // Debounce
-                    let mut last = watcher_last_reload.lock().unwrap();
-                    if last.elapsed() < debounce_duration {
-                        return;
-                    }
-                    *last = Instant::now();
-                    drop(last);
-
-                    println!("Extension file changed: {:?}", event.paths);
-
-                    // Send reload command using the captured runtime handle
-                    let state_clone = watcher_state.clone();
-                    runtime_handle.spawn(async move {
-                        if let Err(e) = state_clone.broadcast_reload().await {
-                            eprintln!("Failed to broadcast reload: {}", e);
+                        if !is_extension_file {
+                            return;
                         }
-                    });
+
+                        // Debounce
+                        let mut last = watcher_last_reload.lock().unwrap();
+                        if last.elapsed() < debounce_duration {
+                            return;
+                        }
+                        *last = Instant::now();
+                        drop(last);
+
+                        println!("Extension file changed: {:?}", event.paths);
+
+                        // Send reload command using the captured runtime handle
+                        let state_clone = watcher_state.clone();
+                        runtime_handle.spawn(async move {
+                            if let Err(e) = state_clone.broadcast_reload().await {
+                                eprintln!("Failed to broadcast reload: {}", e);
+                            }
+                        });
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-    })?;
+        })?;
 
     watcher.watch(path, RecursiveMode::Recursive)?;
     Ok(watcher)
@@ -402,7 +408,13 @@ async fn handle_extension_connection(
     // Cleanup
     {
         let mut extension_tx = state.extension_tx.write().await;
-        *extension_tx = None;
+        let should_clear = extension_tx
+            .as_ref()
+            .map(|current| current.same_channel(&msg_tx))
+            .unwrap_or(false);
+        if should_clear {
+            *extension_tx = None;
+        }
     }
 
     forward_task.abort();

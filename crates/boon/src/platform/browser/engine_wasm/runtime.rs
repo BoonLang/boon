@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use boon_scene::PhysicalSceneParams;
-use js_sys::{Array, Object, Reflect, Uint8Array, WebAssembly};
+use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array, WebAssembly};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use zoon::*;
@@ -97,7 +97,11 @@ fn find_node_for_cell(program: &IrProgram, cell: super::ir::CellId) -> Option<&I
             lights,
             geometry,
             ..
-        } => *root == cell || lights.is_some_and(|c| c == cell) || geometry.is_some_and(|c| c == cell),
+        } => {
+            *root == cell
+                || lights.is_some_and(|c| c == cell)
+                || geometry.is_some_and(|c| c == cell)
+        }
         IrNode::Timer { .. } => false,
     })
 }
@@ -207,12 +211,6 @@ impl CellStore {
         self.inner
             .revision
             .set(self.inner.revision.get().wrapping_add(1));
-        if self.inner.cells.len() <= 128 {
-            console_log(&format!(
-                "[boon wasm] set_cell_text {}={:?}",
-                cell_id, self.inner.text_cells.borrow()[cell_id as usize]
-            ));
-        }
     }
 
     pub fn clear_cell_text(&self, cell_id: u32) {
@@ -223,9 +221,6 @@ impl CellStore {
         self.inner
             .revision
             .set(self.inner.revision.get().wrapping_add(1));
-        if self.inner.cells.len() <= 128 {
-            console_log(&format!("[boon wasm] clear_cell_text {}", cell_id));
-        }
     }
 
     pub fn get_cell_text(&self, cell_id: u32) -> String {
@@ -665,11 +660,11 @@ struct Segment {
 
 struct ItemCellStoreInner {
     /// [item_idx][flat_offset] = Mutable<f64> for signal delivery.
-    cells: RefCell<Vec<Vec<Mutable<f64>>>>,
+    cells: RefCell<HashMap<u32, Vec<Mutable<f64>>>>,
     /// [item_idx][flat_offset] = Mutable<u64> revision for any value or text change.
-    revisions: RefCell<Vec<Vec<Mutable<u64>>>>,
+    revisions: RefCell<HashMap<u32, Vec<Mutable<u64>>>>,
     /// [item_idx][flat_offset] = String for text.
-    text_cells: RefCell<Vec<Vec<String>>>,
+    text_cells: RefCell<HashMap<u32, Vec<String>>>,
     /// Tracks which (item_idx, cell_id) pairs have had text explicitly set (even to "").
     text_initialized: RefCell<HashSet<(u32, u32)>>,
     /// Template cell segments (one per ListMap).
@@ -695,9 +690,9 @@ impl ItemCellStore {
         }
         Self {
             inner: Rc::new(ItemCellStoreInner {
-                cells: RefCell::new(Vec::new()),
-                revisions: RefCell::new(Vec::new()),
-                text_cells: RefCell::new(Vec::new()),
+                cells: RefCell::new(HashMap::new()),
+                revisions: RefCell::new(HashMap::new()),
+                text_cells: RefCell::new(HashMap::new()),
                 text_initialized: RefCell::new(HashSet::new()),
                 segments,
                 total_count: offset,
@@ -727,20 +722,26 @@ impl ItemCellStore {
 
     /// Ensure storage exists for the given item index, growing if needed.
     pub fn ensure_item(&self, item_idx: u32) {
-        let idx = item_idx as usize;
         let count = self.inner.total_count;
-        let mut cells = self.inner.cells.borrow_mut();
-        while cells.len() <= idx {
-            cells.push((0..count).map(|_| Mutable::new(f64::NAN)).collect());
-        }
-        let mut revisions = self.inner.revisions.borrow_mut();
-        while revisions.len() <= idx {
-            revisions.push((0..count).map(|_| Mutable::new(0_u64)).collect());
-        }
-        let mut text_cells = self.inner.text_cells.borrow_mut();
-        while text_cells.len() <= idx {
-            text_cells.push(vec![String::new(); count]);
-        }
+        self.inner
+            .cells
+            .borrow_mut()
+            .entry(item_idx)
+            .or_insert_with(|| (0..count).map(|_| Mutable::new(f64::NAN)).collect());
+        self.inner
+            .revisions
+            .borrow_mut()
+            .entry(item_idx)
+            .or_insert_with(|| (0..count).map(|_| Mutable::new(0_u64)).collect());
+        self.inner
+            .text_cells
+            .borrow_mut()
+            .entry(item_idx)
+            .or_insert_with(|| vec![String::new(); count]);
+    }
+
+    pub fn has_item(&self, item_idx: u32) -> bool {
+        self.inner.cells.borrow().contains_key(&item_idx)
     }
 
     /// Check if a cell_id is in any template range.
@@ -754,7 +755,7 @@ impl ItemCellStore {
             return;
         };
         let cells = self.inner.cells.borrow();
-        if let Some(item) = cells.get(item_idx as usize) {
+        if let Some(item) = cells.get(&item_idx) {
             if let Some(cell) = item.get(local) {
                 // Only fire signal when value actually changes.
                 if cell.get().to_bits() != value.to_bits() {
@@ -768,15 +769,11 @@ impl ItemCellStore {
     /// Get a signal for a per-item cell.
     pub fn get_signal(&self, item_idx: u32, cell_id: u32) -> Box<dyn Signal<Item = f64> + Unpin> {
         let local = self.local_index(cell_id).unwrap_or(0);
-        let revisions = self.inner.revisions.borrow();
-        if let Some(item) = revisions.get(item_idx as usize) {
-            if let Some(revision) = item.get(local) {
-                let store = self.clone();
-                return Box::new(
-                    revision
-                        .signal()
-                        .map(move |_| store.get_value(item_idx, cell_id)),
-                );
+        let cells = self.inner.cells.borrow();
+        if let Some(item) = cells.get(&item_idx) {
+            if let Some(cell) = item.get(local) {
+                let cell = cell.clone();
+                return Box::new(cell.signal());
             }
         }
         // Fallback: return a static signal (shouldn't happen if ensure_item was called).
@@ -789,7 +786,7 @@ impl ItemCellStore {
             return f64::NAN;
         };
         let cells = self.inner.cells.borrow();
-        if let Some(item) = cells.get(item_idx as usize) {
+        if let Some(item) = cells.get(&item_idx) {
             if let Some(cell) = item.get(local) {
                 return cell.get();
             }
@@ -804,7 +801,7 @@ impl ItemCellStore {
         };
         let mut changed = false;
         let mut text_cells = self.inner.text_cells.borrow_mut();
-        if let Some(item) = text_cells.get_mut(item_idx as usize) {
+        if let Some(item) = text_cells.get_mut(&item_idx) {
             if let Some(entry) = item.get_mut(local) {
                 if *entry != text {
                     *entry = text;
@@ -836,7 +833,7 @@ impl ItemCellStore {
             return String::new();
         };
         let text_cells = self.inner.text_cells.borrow();
-        if let Some(item) = text_cells.get(item_idx as usize) {
+        if let Some(item) = text_cells.get(&item_idx) {
             if let Some(entry) = item.get(local) {
                 return entry.clone();
             }
@@ -846,20 +843,9 @@ impl ItemCellStore {
 
     /// Remove an item (clear its cells). Doesn't shrink the vec.
     pub fn remove_item(&self, item_idx: u32) {
-        let idx = item_idx as usize;
-        let count = self.inner.total_count;
-        let mut cells = self.inner.cells.borrow_mut();
-        if let Some(item) = cells.get_mut(idx) {
-            *item = (0..count).map(|_| Mutable::new(f64::NAN)).collect();
-        }
-        let mut revisions = self.inner.revisions.borrow_mut();
-        if let Some(item) = revisions.get_mut(idx) {
-            *item = (0..count).map(|_| Mutable::new(0_u64)).collect();
-        }
-        let mut text_cells = self.inner.text_cells.borrow_mut();
-        if let Some(item) = text_cells.get_mut(idx) {
-            *item = vec![String::new(); count];
-        }
+        self.inner.cells.borrow_mut().remove(&item_idx);
+        self.inner.revisions.borrow_mut().remove(&item_idx);
+        self.inner.text_cells.borrow_mut().remove(&item_idx);
         // Clear text_initialized entries for this item.
         self.inner
             .text_initialized
@@ -869,11 +855,7 @@ impl ItemCellStore {
 
     /// First segment's start cell (for backward compatibility with persistence).
     pub fn template_cell_start(&self) -> u32 {
-        self.inner
-            .segments
-            .first()
-            .map(|s| s.start)
-            .unwrap_or(0)
+        self.inner.segments.first().map(|s| s.start).unwrap_or(0)
     }
 
     /// Total cell count across all segments.
@@ -886,11 +868,17 @@ impl ItemCellStore {
         self.inner.cells.borrow().len()
     }
 
+    pub fn item_indices(&self) -> Vec<u32> {
+        let mut indices: Vec<u32> = self.inner.cells.borrow().keys().copied().collect();
+        indices.sort_unstable();
+        indices
+    }
+
     /// Dump all f64 cell values for an item. Returns (cell_id, value) pairs for non-NaN cells.
     pub fn all_cell_values(&self, item_idx: u32) -> Vec<(u32, f64)> {
         let cells = self.inner.cells.borrow();
         let mut result = Vec::new();
-        if let Some(item) = cells.get(item_idx as usize) {
+        if let Some(item) = cells.get(&item_idx) {
             for (local, cell) in item.iter().enumerate() {
                 let val = cell.get();
                 if !val.is_nan() {
@@ -907,7 +895,7 @@ impl ItemCellStore {
     pub fn all_text_values(&self, item_idx: u32) -> Vec<(u32, String)> {
         let text_cells = self.inner.text_cells.borrow();
         let mut result = Vec::new();
-        if let Some(item) = text_cells.get(item_idx as usize) {
+        if let Some(item) = text_cells.get(&item_idx) {
             for (local, text) in item.iter().enumerate() {
                 if !text.is_empty() {
                     if let Some(cell_id) = self.cell_id_for_local(local) {
@@ -921,7 +909,7 @@ impl ItemCellStore {
 
     fn bump_revision(&self, item_idx: u32, local: usize) {
         let revisions = self.inner.revisions.borrow();
-        if let Some(item) = revisions.get(item_idx as usize) {
+        if let Some(item) = revisions.get(&item_idx) {
             if let Some(revision) = item.get(local) {
                 revision.set(revision.get().wrapping_add(1));
             }
@@ -964,8 +952,10 @@ pub struct WasmInstance {
     rerun_retain_filters_fn: js_sys::Function,
     refresh_item_fn: js_sys::Function,
     initialized_item_maps: Rc<RefCell<HashSet<(u32, u32)>>>,
-    /// Post-event hooks for cross-scope event propagation (global events → per-item updates).
-    post_event_hooks: Rc<RefCell<Vec<Box<dyn Fn(u32)>>>>,
+    /// Post-event hooks for cross-scope event propagation.
+    /// `propagated_item_idx` is `Some(..)` for item-local events and identifies
+    /// the stable ancestor item that should receive cross-scope updates.
+    post_event_hooks: Rc<RefCell<Vec<Box<dyn Fn(u32, Option<u32>)>>>>,
     /// Persistence hook: called after all event processing (global + per-item) completes.
     save_hook: Rc<RefCell<Option<Box<dyn Fn()>>>>,
     /// Guard: save hook only fires after init_item has completed for all items.
@@ -1053,22 +1043,6 @@ impl WasmInstance {
                     return;
                 }
             }
-            if let Some(cell) = program_clone.cells.get(cid as usize) {
-                let should_log = program_clone.cells.len() <= 128
-                    || matches!(
-                        cell.name.as_str(),
-                        "store.todos_count"
-                            | "store.completed_todos_count"
-                            | "store.active_todos_count"
-                            | "store.all_completed"
-                    );
-                if should_log {
-                    console_log(&format!(
-                        "[boon wasm] set_cell_f64 {}={} ({})",
-                        cid, value, cell.name
-                    ));
-                }
-            }
             store_clone.set_cell_f64(cid, value);
         }) as Box<dyn FnMut(i32, f64)>);
         Reflect::set(
@@ -1094,9 +1068,7 @@ impl WasmInstance {
         // host_list_create() -> f64 (returns list_id)
         let ls_clone = list_store.clone();
         let list_create = Closure::wrap(
-            Box::new(move || -> f64 {
-                ls_clone.create()
-            }) as Box<dyn FnMut() -> f64>
+            Box::new(move || -> f64 { ls_clone.create() }) as Box<dyn FnMut() -> f64>
         );
         Reflect::set(
             &env,
@@ -1229,21 +1201,7 @@ impl WasmInstance {
         let list_replace = Closure::wrap(Box::new(move |dest_cell: i32, source_cell: i32| {
             let dest_list_id = cs_clone.get_cell_value(dest_cell as u32);
             let source_list_id = cs_clone.get_cell_value(source_cell as u32);
-            console_log(&format!(
-                "[boon wasm] host_list_replace dest_cell={} source_cell={} dest_list_id={} source_list_id={} dest_before={:?} source_before={:?}",
-                dest_cell,
-                source_cell,
-                dest_list_id,
-                source_list_id,
-                ls_clone.items(dest_list_id),
-                ls_clone.items(source_list_id),
-            ));
             ls_clone.replace_contents(dest_list_id, source_list_id);
-            console_log(&format!(
-                "[boon wasm] host_list_replace after dest_list_id={} dest_after={:?}",
-                dest_list_id,
-                ls_clone.items(dest_list_id),
-            ));
         }) as Box<dyn FnMut(i32, i32)>);
         Reflect::set(
             &env,
@@ -1402,7 +1360,11 @@ impl WasmInstance {
                 } else {
                     cs_clone.get_cell_text(prefix_cell as u32)
                 };
-                if source_text.starts_with(&prefix_text) { 1.0 } else { 0.0 }
+                if source_text.starts_with(&prefix_text) {
+                    1.0
+                } else {
+                    0.0
+                }
             }) as Box<dyn FnMut(i32, i32) -> f64>);
         Reflect::set(
             &env,
@@ -1718,7 +1680,9 @@ impl WasmInstance {
             let idx = item_idx as u32;
             CURRENT_ITEM_CTX.with(|c| c.set(Some(idx)));
             if let Some(store) = &ics_clone {
-                store.ensure_item(idx);
+                if !store.has_item(idx) {
+                    store.ensure_item(idx);
+                }
             }
         }) as Box<dyn FnMut(i32)>);
         Reflect::set(
@@ -1827,9 +1791,17 @@ impl WasmInstance {
         let exports = self.instance.exports();
         if let Ok(mem_val) = Reflect::get(&exports, &"memory".into()) {
             let mem: WebAssembly::Memory = mem_val.unchecked_into();
-            let buffer = mem.buffer();
-            let view =
-                Uint8Array::new_with_byte_offset_and_length(&buffer, offset as u32, len as u32);
+            let buffer: ArrayBuffer = mem.buffer().unchecked_into();
+            let total_len = buffer.byte_length() as usize;
+            if offset >= total_len {
+                return Vec::new();
+            }
+            let safe_len = len.min(total_len - offset);
+            let view = Uint8Array::new_with_byte_offset_and_length(
+                &buffer,
+                offset as u32,
+                safe_len as u32,
+            );
             view.to_vec()
         } else {
             Vec::new()
@@ -1841,13 +1813,18 @@ impl WasmInstance {
         let exports = self.instance.exports();
         if let Ok(mem_val) = Reflect::get(&exports, &"memory".into()) {
             let mem: WebAssembly::Memory = mem_val.unchecked_into();
-            let buffer = mem.buffer();
+            let buffer: ArrayBuffer = mem.buffer().unchecked_into();
+            let total_len = buffer.byte_length() as usize;
+            if offset >= total_len || data.is_empty() {
+                return;
+            }
+            let safe_len = data.len().min(total_len - offset);
             let view = Uint8Array::new_with_byte_offset_and_length(
                 &buffer,
                 offset as u32,
-                data.len() as u32,
+                safe_len as u32,
             );
-            view.copy_from(data);
+            view.copy_from(&data[..safe_len]);
         }
     }
 
@@ -1873,13 +1850,8 @@ impl WasmInstance {
             if let IrNode::Timer { event, interval_ms } = node {
                 let ms = eval_const_f64(interval_ms).unwrap_or(1000.0);
                 let event_id = event.0;
-                console_log(&format!(
-                    "[boon wasm] register timer event={} ms={}",
-                    event_id, ms
-                ));
                 let inst = self.clone();
                 let cb = Closure::wrap(Box::new(move || {
-                    console_log(&format!("[boon wasm] timer fired event={}", event_id));
                     if let Err(err) = inst.fire_event(event_id) {
                         console_log(&format!(
                             "[boon wasm] timer event {} failed: {}",
@@ -1950,22 +1922,12 @@ impl WasmInstance {
     /// After the WASM handler runs, calls any registered post-event hooks
     /// (used for cross-scope event propagation to per-item templates).
     pub fn fire_event(&self, event_id: u32) -> Result<(), String> {
-        let event_name = self
-            .program
-            .events
-            .get(event_id as usize)
-            .map(|info| info.name.as_str())
-            .unwrap_or("<unknown>");
-        console_log(&format!(
-            "[boon wasm] fire_event {} ({})",
-            event_id, event_name
-        ));
         self.on_event_fn
             .call1(&JsValue::NULL, &JsValue::from(event_id as f64))
             .map_err(|e| format!("on_event({}) failed: {:?}", event_id, e))?;
         // Run post-event hooks (cross-scope event propagation).
         for hook in self.post_event_hooks.borrow().iter() {
-            hook(event_id);
+            hook(event_id, None);
         }
         // After all event handlers (global + per-item) have run,
         // re-evaluate per-item retain filters with updated values.
@@ -1976,7 +1938,7 @@ impl WasmInstance {
 
     /// Register a hook that runs after every fire_event call.
     /// Used by the bridge to propagate global events to per-item templates.
-    pub fn add_post_event_hook(&self, hook: Box<dyn Fn(u32)>) {
+    pub fn add_post_event_hook(&self, hook: Box<dyn Fn(u32, Option<u32>)>) {
         self.post_event_hooks.borrow_mut().push(hook);
     }
 
@@ -2043,45 +2005,29 @@ impl WasmInstance {
     /// Call `on_item_event(item_idx, event_id)` to handle a per-item event.
     /// Does NOT call rerun_retain_filters — caller is responsible for batching.
     fn call_on_item_event_raw(&self, item_idx: u32, event_id: u32) -> Result<(), String> {
-        self.ensure_item_initialized_for_all_maps(item_idx)?;
-        self.on_item_event_fn
-            .call2(
-                &JsValue::NULL,
-                &JsValue::from(item_idx as f64),
-                &JsValue::from(event_id as f64),
-            )
-            .map_err(|e| format!("on_item_event({}, {}) failed: {:?}", item_idx, event_id, e))?;
-        Ok(())
-    }
-
-    fn ensure_item_initialized_for_all_maps(&self, item_idx: u32) -> Result<(), String> {
-        let map_cells: Vec<u32> = self
-            .program
-            .nodes
-            .iter()
-            .filter_map(|node| match node {
-                IrNode::ListMap { cell, .. } => Some(cell.0),
-                _ => None,
-            })
-            .collect();
-
-        for map_cell in map_cells {
-            let already_initialized = self
-                .initialized_item_maps
-                .borrow()
-                .contains(&(item_idx, map_cell));
-            if !already_initialized {
-                self.call_init_item(item_idx, map_cell)?;
-            }
+        if let Err(err) = self.on_item_event_fn.call2(
+            &JsValue::NULL,
+            &JsValue::from(item_idx as f64),
+            &JsValue::from(event_id as f64),
+        ) {
+            let _ = err;
+            return Err("on_item_event failed".to_string());
         }
-
         Ok(())
     }
 
     /// Call `on_item_event(item_idx, event_id)` and re-run retain filters.
     /// Use this for single per-item events from the bridge (click, blur, etc.).
-    pub fn call_on_item_event(&self, item_idx: u32, event_id: u32) -> Result<(), String> {
+    pub fn call_on_item_event(
+        &self,
+        item_idx: u32,
+        event_id: u32,
+        propagated_item_idx: u32,
+    ) -> Result<(), String> {
         self.call_on_item_event_raw(item_idx, event_id)?;
+        for hook in self.post_event_hooks.borrow().iter() {
+            hook(event_id, Some(propagated_item_idx));
+        }
         let _ = self.call_rerun_retain_filters();
         self.run_save_hook();
         Ok(())
@@ -2089,7 +2035,13 @@ impl WasmInstance {
 
     /// Call `on_item_event` for multiple items without re-running retain filters
     /// after each one. Caller must call `rerun_retain_filters` once when done.
-    pub fn call_on_item_event_batch(&self, item_idx: u32, event_id: u32) -> Result<(), String> {
+    pub fn call_on_item_event_batch(
+        &self,
+        item_idx: u32,
+        event_id: u32,
+        propagated_item_idx: u32,
+    ) -> Result<(), String> {
+        let _ = propagated_item_idx;
         self.call_on_item_event_raw(item_idx, event_id)
     }
 

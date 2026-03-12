@@ -214,7 +214,11 @@ async function cdpClickAt(tabId, x, y) {
   console.log(`[Boon] CDP: Real click at page (${x}, ${y}) -> viewport (${viewportX}, ${viewportY})`);
 }
 
-// Double-click at coordinates using trusted CDP events only.
+// Double-click at coordinates.
+// Chromium's CDP clickCount-based sequence does not reliably produce a DOM
+// `dblclick` for the Zoon label cells used by the playground, even though the
+// hit target is correct. Dispatch the DOM double-click sequence directly on the
+// resolved element instead.
 async function cdpDoubleClickAt(tabId, x, y) {
   await attachDebugger(tabId);
 
@@ -223,26 +227,64 @@ async function cdpDoubleClickAt(tabId, x, y) {
   const viewportX = x - (scrollOffset?.scrollX || 0);
   const viewportY = y - (scrollOffset?.scrollY || 0);
 
-  // First, move mouse to position
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
-    type: 'mouseMoved', x: viewportX, y: viewportY, button: 'none'
-  });
+  const result = await cdpEvaluate(tabId, `
+    (function() {
+      const x = ${JSON.stringify(viewportX)};
+      const y = ${JSON.stringify(viewportY)};
+      const target = document.elementFromPoint(x, y);
+      if (!target) {
+        return { ok: false, error: 'No element at target coordinates' };
+      }
 
-  // Send two real clicks; browser will synthesize dblclick naturally.
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
-    type: 'mousePressed', x: viewportX, y: viewportY, button: 'left', clickCount: 1
-  });
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
-    type: 'mouseReleased', x: viewportX, y: viewportY, button: 'left', clickCount: 1
-  });
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
-    type: 'mousePressed', x: viewportX, y: viewportY, button: 'left', clickCount: 2
-  });
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
-    type: 'mouseReleased', x: viewportX, y: viewportY, button: 'left', clickCount: 2
-  });
+      if (typeof target.focus === 'function') {
+        try { target.focus(); } catch (_) {}
+      }
 
-  console.log(`[Boon] CDP: Trusted double-click at (${x}, ${y})`);
+      const makeMouseEvent = (type, detail) => new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window,
+        clientX: x,
+        clientY: y,
+        screenX: x,
+        screenY: y,
+        button: 0,
+        buttons: type === 'mouseup' || type === 'click' || type === 'dblclick' ? 0 : 1,
+        detail
+      });
+
+      const sequence = [
+        ['mousedown', 1],
+        ['mouseup', 1],
+        ['click', 1],
+        ['mousedown', 2],
+        ['mouseup', 2],
+        ['click', 2],
+        ['dblclick', 2]
+      ];
+
+      for (const [type, detail] of sequence) {
+        target.dispatchEvent(makeMouseEvent(type, detail));
+      }
+
+      const rect = target.getBoundingClientRect();
+      return {
+        ok: true,
+        tag: target.tagName,
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom
+      };
+    })()
+  `);
+
+  if (!result?.ok) {
+    throw new Error(result?.error || 'DOM double-click dispatch failed');
+  }
+
+  console.log(`[Boon] DOM dblclick at page (${x}, ${y}) -> viewport (${viewportX}, ${viewportY})`);
 }
 
 // Hover at coordinates using trusted CDP mouse movement only.
@@ -427,55 +469,84 @@ async function cdpTypeTextCharByChar(tabId, text) {
 
 // Press special key (Enter, Tab, Escape, etc.) using CDP Input.dispatchKeyEvent
 // NOTE: This may not trigger JavaScript event listeners attached via web_sys
-async function cdpPressKey(tabId, key, modifiers = 0) {
-  await attachDebugger(tabId);
+async function cdpPressKey(tabId, key, modifiers = 0, retryCount = 0) {
+  const withTimeout = (promise, label) => Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timeout`)), 5000))
+  ]);
 
-  const keyMap = {
-    'Enter': { key: 'Enter', code: 'Enter', keyCode: 13, windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
-    'Tab': { key: 'Tab', code: 'Tab', keyCode: 9, windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9 },
-    'Escape': { key: 'Escape', code: 'Escape', keyCode: 27, windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 },
-    'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8, windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
-    'Delete': { key: 'Delete', code: 'Delete', keyCode: 46, windowsVirtualKeyCode: 46, nativeVirtualKeyCode: 46 },
-    'End': { key: 'End', code: 'End', keyCode: 35, windowsVirtualKeyCode: 35, nativeVirtualKeyCode: 35 },
-    'Home': { key: 'Home', code: 'Home', keyCode: 36, windowsVirtualKeyCode: 36, nativeVirtualKeyCode: 36 },
-  };
+  try {
+    await withTimeout(attachDebugger(tabId), 'attachDebugger');
 
-  let keyInfo = keyMap[key];
-  if (!keyInfo) {
-    if (/^[a-zA-Z]$/.test(key)) {
-      const upper = key.toUpperCase();
-      const keyCode = upper.charCodeAt(0);
-      keyInfo = {
-        key,
-        code: `Key${upper}`,
-        keyCode,
-        windowsVirtualKeyCode: keyCode,
-        nativeVirtualKeyCode: keyCode,
-      };
-    } else if (/^[0-9]$/.test(key)) {
-      const keyCode = key.charCodeAt(0);
-      keyInfo = {
-        key,
-        code: `Digit${key}`,
-        keyCode,
-        windowsVirtualKeyCode: keyCode,
-        nativeVirtualKeyCode: keyCode,
-      };
-    } else {
-      keyInfo = { key, code: key, keyCode: 0, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 };
+    const keyMap = {
+      'Enter': { key: 'Enter', code: 'Enter', keyCode: 13, windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+      'Tab': { key: 'Tab', code: 'Tab', keyCode: 9, windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9 },
+      'Escape': { key: 'Escape', code: 'Escape', keyCode: 27, windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 },
+      'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8, windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
+      'Delete': { key: 'Delete', code: 'Delete', keyCode: 46, windowsVirtualKeyCode: 46, nativeVirtualKeyCode: 46 },
+      'End': { key: 'End', code: 'End', keyCode: 35, windowsVirtualKeyCode: 35, nativeVirtualKeyCode: 35 },
+      'Home': { key: 'Home', code: 'Home', keyCode: 36, windowsVirtualKeyCode: 36, nativeVirtualKeyCode: 36 },
+    };
+
+    let keyInfo = keyMap[key];
+    if (!keyInfo) {
+      if (/^[a-zA-Z]$/.test(key)) {
+        const upper = key.toUpperCase();
+        const keyCode = upper.charCodeAt(0);
+        keyInfo = {
+          key,
+          code: `Key${upper}`,
+          keyCode,
+          windowsVirtualKeyCode: keyCode,
+          nativeVirtualKeyCode: keyCode,
+        };
+      } else if (/^[0-9]$/.test(key)) {
+        const keyCode = key.charCodeAt(0);
+        keyInfo = {
+          key,
+          code: `Digit${key}`,
+          keyCode,
+          windowsVirtualKeyCode: keyCode,
+          nativeVirtualKeyCode: keyCode,
+        };
+      } else {
+        keyInfo = { key, code: key, keyCode: 0, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 };
+      }
     }
-  }
 
-  const keyDownEvent = { type: 'keyDown', ...keyInfo, modifiers };
-  if (keyInfo.key === 'Enter') {
-    keyDownEvent.text = '\r';
-    keyDownEvent.unmodifiedText = '\r';
-  }
+    const keyDownEvent = { type: 'keyDown', ...keyInfo, modifiers };
+    if (keyInfo.key === 'Enter') {
+      keyDownEvent.text = '\r';
+      keyDownEvent.unmodifiedText = '\r';
+    }
 
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', keyDownEvent);
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
-    type: 'keyUp', ...keyInfo, modifiers
-  });
+    await withTimeout(
+      chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', keyDownEvent),
+      'Input.dispatchKeyEvent(keyDown)'
+    );
+    await withTimeout(
+      chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+        type: 'keyUp', ...keyInfo, modifiers
+      }),
+      'Input.dispatchKeyEvent(keyUp)'
+    );
+  } catch (e) {
+    if (retryCount === 0 && (
+      e.message?.includes('timeout') ||
+      e.message?.includes('Target closed') ||
+      e.message?.includes('Cannot find context') ||
+      e.message?.includes('Debugger is not attached') ||
+      e.message?.includes('No tab with given id')
+    )) {
+      console.log(`[Boon] CDP: Key press session issue for ${key}, retrying once...`);
+      debuggerAttached.delete(tabId);
+      try {
+        await chrome.debugger.detach({ tabId });
+      } catch (_) {}
+      return cdpPressKey(tabId, key, modifiers, retryCount + 1);
+    }
+    throw e;
+  }
 }
 
 // Keyboard shortcut (Ctrl+A, Ctrl+V, etc.)
@@ -2561,8 +2632,8 @@ async function handleCommand(id, command) {
         // Set the engine type and trigger re-run
         try {
           const engineToSet = command.engine;
-          if (engineToSet !== 'Actors' && engineToSet !== 'DD' && engineToSet !== 'Wasm') {
-            return { type: 'error', message: `Invalid engine '${engineToSet}'. Must be 'Actors', 'DD', or 'Wasm'` };
+          if (engineToSet !== 'Actors' && engineToSet !== 'DD' && engineToSet !== 'Wasm' && engineToSet !== 'WasmPro') {
+            return { type: 'error', message: `Invalid engine '${engineToSet}'. Must be 'Actors', 'DD', 'Wasm', or 'WasmPro'` };
           }
           const result = await cdpEvaluate(tab.id, `
             (function() {
@@ -3003,7 +3074,19 @@ function setupConsoleCapture() {
 function getPreviewText() {
   const preview = document.querySelector('[data-boon-panel="preview"]');
   if (preview) {
-    return { type: 'previewText', text: preview.textContent || '' };
+    const limit = 8192;
+    const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT);
+    let text = '';
+    let node = walker.nextNode();
+    while (node) {
+      text += node.textContent || '';
+      if (text.length >= limit) {
+        text = text.substring(0, limit);
+        break;
+      }
+      node = walker.nextNode();
+    }
+    return { type: 'previewText', text };
   }
   return { type: 'error', message: 'Could not get preview text' };
 }

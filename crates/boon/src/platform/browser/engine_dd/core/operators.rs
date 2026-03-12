@@ -260,10 +260,7 @@ where
                         let new_output = Value::Object(Arc::new(fields));
                         #[cfg(not(target_arch = "wasm32"))]
                         if source_count >= 5 {
-                            std::eprintln!(
-                                "[dd-combine-latest] output={}",
-                                new_output
-                            );
+                            std::eprintln!("[dd-combine-latest] output={}", new_output);
                         }
                         if last_output.as_ref() != Some(&new_output) {
                             let mut session = output.session(&time);
@@ -463,42 +460,38 @@ where
     let mut current_result: Option<bool> = None;
 
     list.inner
-        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
-            Pipeline,
-            "ListEvery",
-            |_cap, _info| {
-                move |input, output| {
-                    input.for_each(|time, data| {
-                        for ((key, value), _ts, diff) in data.drain(..) {
-                            if diff > 0 {
-                                items.insert(key, predicate(&value));
-                            } else {
-                                items.remove(&key);
-                            }
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(Pipeline, "ListEvery", |_cap, _info| {
+            move |input, output| {
+                input.for_each(|time, data| {
+                    for ((key, value), _ts, diff) in data.drain(..) {
+                        if diff > 0 {
+                            items.insert(key, predicate(&value));
+                        } else {
+                            items.remove(&key);
                         }
-                        let new_result = !items.is_empty() && items.values().all(|&b| b);
-                        if current_result != Some(new_result) {
-                            let mut session = output.session(&time);
-                            if let Some(old) = current_result {
-                                let old_val = if old {
-                                    Value::tag("True")
-                                } else {
-                                    Value::tag("False")
-                                };
-                                session.give((old_val, *time.time(), -1isize));
-                            }
-                            let new_val = if new_result {
+                    }
+                    let new_result = !items.is_empty() && items.values().all(|&b| b);
+                    if current_result != Some(new_result) {
+                        let mut session = output.session(&time);
+                        if let Some(old) = current_result {
+                            let old_val = if old {
                                 Value::tag("True")
                             } else {
                                 Value::tag("False")
                             };
-                            session.give((new_val, *time.time(), 1isize));
-                            current_result = Some(new_result);
+                            session.give((old_val, *time.time(), -1isize));
                         }
-                    });
-                }
-            },
-        )
+                        let new_val = if new_result {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        };
+                        session.give((new_val, *time.time(), 1isize));
+                        current_result = Some(new_result);
+                    }
+                });
+            }
+        })
         .as_collection()
 }
 
@@ -517,42 +510,38 @@ where
     let mut current_result: Option<bool> = None;
 
     list.inner
-        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
-            Pipeline,
-            "ListAny",
-            |_cap, _info| {
-                move |input, output| {
-                    input.for_each(|time, data| {
-                        for ((key, value), _ts, diff) in data.drain(..) {
-                            if diff > 0 {
-                                items.insert(key, predicate(&value));
-                            } else {
-                                items.remove(&key);
-                            }
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(Pipeline, "ListAny", |_cap, _info| {
+            move |input, output| {
+                input.for_each(|time, data| {
+                    for ((key, value), _ts, diff) in data.drain(..) {
+                        if diff > 0 {
+                            items.insert(key, predicate(&value));
+                        } else {
+                            items.remove(&key);
                         }
-                        let new_result = items.values().any(|&b| b);
-                        if current_result != Some(new_result) {
-                            let mut session = output.session(&time);
-                            if let Some(old) = current_result {
-                                let old_val = if old {
-                                    Value::tag("True")
-                                } else {
-                                    Value::tag("False")
-                                };
-                                session.give((old_val, *time.time(), -1isize));
-                            }
-                            let new_val = if new_result {
+                    }
+                    let new_result = items.values().any(|&b| b);
+                    if current_result != Some(new_result) {
+                        let mut session = output.session(&time);
+                        if let Some(old) = current_result {
+                            let old_val = if old {
                                 Value::tag("True")
                             } else {
                                 Value::tag("False")
                             };
-                            session.give((new_val, *time.time(), 1isize));
-                            current_result = Some(new_result);
+                            session.give((old_val, *time.time(), -1isize));
                         }
-                    });
-                }
-            },
-        )
+                        let new_val = if new_result {
+                            Value::tag("True")
+                        } else {
+                            Value::tag("False")
+                        };
+                        session.give((new_val, *time.time(), 1isize));
+                        current_result = Some(new_result);
+                    }
+                });
+            }
+        })
         .as_collection()
 }
 
@@ -730,8 +719,7 @@ where
     let combined = tagged_items.concat(&tagged_dep);
 
     let mut items: std::collections::HashMap<ListKey, Value> = std::collections::HashMap::new();
-    let mut rendered: std::collections::HashMap<ListKey, Value> =
-        std::collections::HashMap::new();
+    let mut rendered: std::collections::HashMap<ListKey, Value> = std::collections::HashMap::new();
     let mut current_dep: Option<Value> = None;
 
     combined

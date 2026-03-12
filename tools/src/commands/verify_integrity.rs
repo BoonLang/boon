@@ -10,17 +10,50 @@ use std::path::{Path, PathBuf};
 /// Expected SHA256 hashes for all 11 main examples
 /// Generated from canonical versions in commit qzsxmpzxqwwy
 const EXPECTED_HASHES: &[(&str, &str)] = &[
-    ("minimal", "d8c852ef3b7e898a07fa923c53e2392ed9db6330b20d7ef7be79c626da2f3ee7"),
-    ("hello_world", "a02ce6feade8f4d84fdd179229ef0255cc731066b8911bc29b55ca526435c7f2"),
-    ("interval", "7d23d08939f69f1eb81363ee30e965a8de79c1e35bf898d28dc692110a1d76a9"),
-    ("interval_hold", "78ae5dc83ad227bb5792c9ef57d8333051d77492e915e4c2dc31d0f376b532e9"),
-    ("counter", "59c0124830f65c832ecd34db2f52958ad39aaa36830ba79eb42a2f0067382351"),
-    ("counter_hold", "4f78a3767c0e4fdddf26a43d1f10c890e8630d6100735b60efc3fecdfcf4c76b"),
-    ("fibonacci", "efc1a761753ee89004b4538d985abf47dd81d515693a5d6c0294e711a7caa1d5"),
-    ("layers", "829642462434bb7cec23e2a299ca6a82a73d43bf259a85247ef0853a106b9f6b"),
-    ("shopping_list", "185b9c003201d3815e770cf3188a49737fff727775fab64088bd58f725f3b872"),
-    ("pages", "3a7998d291daaaba37cb7dd20fbf9fecb7944d913b015258e0f0ab96d8c1ff76"),
-    ("todo_mvc", "134cececd1672b9f4fa796e3b7474d605e699b40f5dc1c20d54a872506939b7a"),
+    (
+        "minimal",
+        "d8c852ef3b7e898a07fa923c53e2392ed9db6330b20d7ef7be79c626da2f3ee7",
+    ),
+    (
+        "hello_world",
+        "a02ce6feade8f4d84fdd179229ef0255cc731066b8911bc29b55ca526435c7f2",
+    ),
+    (
+        "interval",
+        "7d23d08939f69f1eb81363ee30e965a8de79c1e35bf898d28dc692110a1d76a9",
+    ),
+    (
+        "interval_hold",
+        "78ae5dc83ad227bb5792c9ef57d8333051d77492e915e4c2dc31d0f376b532e9",
+    ),
+    (
+        "counter",
+        "59c0124830f65c832ecd34db2f52958ad39aaa36830ba79eb42a2f0067382351",
+    ),
+    (
+        "counter_hold",
+        "4f78a3767c0e4fdddf26a43d1f10c890e8630d6100735b60efc3fecdfcf4c76b",
+    ),
+    (
+        "fibonacci",
+        "efc1a761753ee89004b4538d985abf47dd81d515693a5d6c0294e711a7caa1d5",
+    ),
+    (
+        "layers",
+        "829642462434bb7cec23e2a299ca6a82a73d43bf259a85247ef0853a106b9f6b",
+    ),
+    (
+        "shopping_list",
+        "185b9c003201d3815e770cf3188a49737fff727775fab64088bd58f725f3b872",
+    ),
+    (
+        "pages",
+        "3a7998d291daaaba37cb7dd20fbf9fecb7944d913b015258e0f0ab96d8c1ff76",
+    ),
+    (
+        "todo_mvc",
+        "134cececd1672b9f4fa796e3b7474d605e699b40f5dc1c20d54a872506939b7a",
+    ),
 ];
 
 /// Result of integrity verification
@@ -100,7 +133,10 @@ pub fn run_integrity_check(examples_dir: Option<PathBuf>) -> Result<bool> {
                 println!();
                 println!("         DO NOT modify example files as a shortcut!");
                 println!("         Fix the engine instead, or restore with:");
-                println!("         jj restore --from qzsxmpzxqwwy playground/frontend/src/examples/{0}/{0}.bn", result.example_name);
+                println!(
+                    "         jj restore --from qzsxmpzxqwwy playground/frontend/src/examples/{0}/{0}.bn",
+                    result.example_name
+                );
             }
             failed_count += 1;
             all_passed = false;

@@ -122,9 +122,7 @@ fn capture_snapshot(instance: &WasmInstance) -> WasmSnapshot {
     // 3. Per-item cells.
     let mut item_cells = Vec::new();
     if let Some(ref ics) = instance.item_cell_store {
-        let item_count = ics.item_count();
-        for idx in 0..item_count {
-            let item_idx = idx as u32;
+        for item_idx in ics.item_indices() {
             let cell_vals = ics.all_cell_values(item_idx);
             let text_vals = ics.all_text_values(item_idx);
             if !cell_vals.is_empty() || !text_vals.is_empty() {

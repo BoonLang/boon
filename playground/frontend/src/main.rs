@@ -1,32 +1,35 @@
 // @TODO remove
 #![allow(unused_variables)]
 
+use boon::zoon::{Rgba, map_ref};
 use boon::zoon::{eprintln, println, *};
-use boon::zoon::{map_ref, Rgba};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use ulid::Ulid;
 
+use boon::platform::browser::common::{EngineType, available_engines, default_engine};
+
+#[cfg(feature = "engine-actors")]
 use boon::platform::browser::{
     bridge::object_with_document_to_element_signal,
-    common::{EngineType, available_engines, default_engine},
     engine::VirtualFilesystem,
-    evaluator::{parse_module, FunctionRegistry},
+    evaluator::{FunctionRegistry, StaticFunctionDefinition, parse_module},
     interpreter,
 };
 
 // DD engine imports (feature-gated)
 #[cfg(feature = "engine-dd")]
 use boon::platform::browser::engine_dd::{
-    render_dd_result_reactive_signal,
-    run_dd_reactive_with_persistence,
-    clear_dd_persisted_states,
+    clear_dd_persisted_states, render_dd_result_reactive_signal, run_dd_reactive_with_persistence,
 };
 
 // WASM engine imports (feature-gated)
 #[cfg(feature = "engine-wasm")]
 use boon::platform::browser::engine_wasm::clear_wasm_persisted_states;
+
+#[cfg(feature = "engine-wasm-pro")]
+use boon::platform::browser::engine_wasm_pro::clear_wasm_pro_persisted_states;
 
 mod code_editor;
 use code_editor::CodeEditor;
@@ -132,6 +135,7 @@ fn engine_query_value(engine: EngineType) -> &'static str {
         EngineType::Actors => "actors",
         EngineType::DifferentialDataflow => "dd",
         EngineType::Wasm => "wasm",
+        EngineType::WasmPro => "wasm-pro",
     }
 }
 
@@ -183,17 +187,21 @@ fn get_engine_from_url() -> Option<EngineType> {
         Some("actors") => Some(EngineType::Actors),
         Some("dd") => Some(EngineType::DifferentialDataflow),
         Some("wasm") => Some(EngineType::Wasm),
+        Some("wasm-pro") => Some(EngineType::WasmPro),
         _ => None,
     }
 }
 
 /// Load engine type from localStorage
 fn load_engine_from_storage() -> Option<EngineType> {
-    let stored = local_storage().get::<String>(ENGINE_TYPE_STORAGE_KEY)?.ok()?;
+    let stored = local_storage()
+        .get::<String>(ENGINE_TYPE_STORAGE_KEY)?
+        .ok()?;
     match stored.as_str() {
         "Actors" => Some(EngineType::Actors),
         "DD" => Some(EngineType::DifferentialDataflow),
         "Wasm" => Some(EngineType::Wasm),
+        "WasmPro" => Some(EngineType::WasmPro),
         _ => None,
     }
 }
@@ -205,9 +213,11 @@ fn save_engine_to_storage(engine: EngineType) {
 
 /// Find example data by name (filename without .bn extension)
 fn find_example_by_name(name: &str) -> Option<ExampleData> {
-    EXAMPLE_DATAS.iter().chain(OTHER_EXAMPLE_DATAS.iter()).find(|e| {
-        e.filename.trim_end_matches(".bn") == name || e.filename == name
-    }).copied()
+    EXAMPLE_DATAS
+        .iter()
+        .chain(OTHER_EXAMPLE_DATAS.iter())
+        .find(|e| e.filename.trim_end_matches(".bn") == name || e.filename == name)
+        .copied()
 }
 
 /// Multi-file example data (e.g., todo_mvc_physical with 8 files)
@@ -220,36 +230,58 @@ struct MultiFileExampleData {
 
 static TODO_MVC_PHYSICAL_FILES: [(&str, &str); 8] = [
     ("RUN.bn", include_str!("examples/todo_mvc_physical/RUN.bn")),
-    ("BUILD.bn", include_str!("examples/todo_mvc_physical/BUILD.bn")),
-    ("Generated/Assets.bn", include_str!("examples/todo_mvc_physical/Generated/Assets.bn")),
-    ("Theme/Theme.bn", include_str!("examples/todo_mvc_physical/Theme/Theme.bn")),
-    ("Theme/Professional.bn", include_str!("examples/todo_mvc_physical/Theme/Professional.bn")),
-    ("Theme/Glassmorphism.bn", include_str!("examples/todo_mvc_physical/Theme/Glassmorphism.bn")),
-    ("Theme/Neobrutalism.bn", include_str!("examples/todo_mvc_physical/Theme/Neobrutalism.bn")),
-    ("Theme/Neumorphism.bn", include_str!("examples/todo_mvc_physical/Theme/Neumorphism.bn")),
+    (
+        "BUILD.bn",
+        include_str!("examples/todo_mvc_physical/BUILD.bn"),
+    ),
+    (
+        "Generated/Assets.bn",
+        include_str!("examples/todo_mvc_physical/Generated/Assets.bn"),
+    ),
+    (
+        "Theme/Theme.bn",
+        include_str!("examples/todo_mvc_physical/Theme/Theme.bn"),
+    ),
+    (
+        "Theme/Professional.bn",
+        include_str!("examples/todo_mvc_physical/Theme/Professional.bn"),
+    ),
+    (
+        "Theme/Glassmorphism.bn",
+        include_str!("examples/todo_mvc_physical/Theme/Glassmorphism.bn"),
+    ),
+    (
+        "Theme/Neobrutalism.bn",
+        include_str!("examples/todo_mvc_physical/Theme/Neobrutalism.bn"),
+    ),
+    (
+        "Theme/Neumorphism.bn",
+        include_str!("examples/todo_mvc_physical/Theme/Neumorphism.bn"),
+    ),
 ];
 
-static MULTI_FILE_EXAMPLES: [MultiFileExampleData; 1] = [
-    MultiFileExampleData {
-        name: "todo_mvc_physical",
-        entry_file: "RUN.bn",
-        files: &TODO_MVC_PHYSICAL_FILES,
-    },
-];
+static MULTI_FILE_EXAMPLES: [MultiFileExampleData; 1] = [MultiFileExampleData {
+    name: "todo_mvc_physical",
+    entry_file: "RUN.bn",
+    files: &TODO_MVC_PHYSICAL_FILES,
+}];
 
 static OTHER_MULTI_FILE_EXAMPLES: [MultiFileExampleData; 0] = [];
 
 /// Find multi-file example by name
 fn find_multi_file_example_by_name(name: &str) -> Option<&'static MultiFileExampleData> {
-    MULTI_FILE_EXAMPLES.iter()
+    MULTI_FILE_EXAMPLES
+        .iter()
         .chain(OTHER_MULTI_FILE_EXAMPLES.iter())
         .find(|e| e.name == name)
 }
 
 /// Parse module files and return external function definitions in the universal tuple format.
-/// Used by DD and WASM engines. The Actors engine converts these to `FunctionRegistry`.
+/// Used by DD and Wasm-family engines. The Actors engine converts these to `FunctionRegistry`.
 ///
-/// Returns: Vec of (qualified_name, params, body, module_name)
+/// Standalone non-Actors builds temporarily return no external functions. That keeps
+/// single-engine Wasm-family builds compiling while Wasm Pro is still a scaffold.
+#[cfg(feature = "engine-actors")]
 fn parse_module_files(
     files: &BTreeMap<String, String>,
     entry_filename: &str,
@@ -293,6 +325,19 @@ fn parse_module_files(
         }
     }
     result
+}
+
+#[cfg(not(feature = "engine-actors"))]
+fn parse_module_files(
+    _files: &BTreeMap<String, String>,
+    _entry_filename: &str,
+) -> Vec<(
+    String,
+    Vec<String>,
+    boon::parser::static_expression::Spanned<boon::parser::static_expression::Expression>,
+    Option<String>,
+)> {
+    Vec::new()
 }
 
 /// Panel layout mode for screenshot and viewing modes
@@ -425,74 +470,87 @@ impl Playground {
             .unwrap_or_default();
 
         // Check for ?custom-example= URL parameter first
-        let custom_example_from_url = get_custom_example_from_url()
-            .and_then(|name| {
-                custom_examples_value.iter()
-                    .find(|(_, n, _)| n == &name)
-                    .map(|(id, name, code)| (id.clone(), name.clone(), code.clone()))
-            });
+        let custom_example_from_url = get_custom_example_from_url().and_then(|name| {
+            custom_examples_value
+                .iter()
+                .find(|(_, n, _)| n == &name)
+                .map(|(id, name, code)| (id.clone(), name.clone(), code.clone()))
+        });
 
         // Determine initial selected custom example ID (if loading from URL)
-        let initial_selected_custom_example = custom_example_from_url.as_ref().map(|(id, _, _)| id.clone());
+        let initial_selected_custom_example = custom_example_from_url
+            .as_ref()
+            .map(|(id, _, _)| id.clone());
 
         // Load URL-selected examples before local storage so shareable example links
         // are deterministic and do not silently reopen stale editor state.
-        let (files, current_file, current_content) = if let Some((_, name, code)) = custom_example_from_url {
-            // Load custom example from URL
-            let filename = format!("{}.bn", name);
-            let mut files = BTreeMap::new();
-            files.insert(filename.clone(), code.clone());
-            (files, filename, code)
-        } else if let Some(multi_example) = get_example_from_url()
-            .as_deref()
-            .and_then(find_multi_file_example_by_name)
-        {
-            // Multi-file example from URL parameter
-            let mut files = BTreeMap::new();
-            for (filename, content) in multi_example.files {
-                files.insert(filename.to_string(), content.to_string());
-            }
-            let entry_content = multi_example.files.iter()
-                .find(|(name, _)| *name == multi_example.entry_file)
-                .map(|(_, content)| content.to_string())
-                .unwrap_or_default();
-            (files, multi_example.entry_file.to_string(), entry_content)
-        } else if let Some(example_data) = get_example_from_url()
-            .and_then(|name| find_example_by_name(&name))
-        {
-            // Built-in single-file example from URL parameter
-            let mut files = BTreeMap::new();
-            files.insert(
-                example_data.filename.to_string(),
-                example_data.source_code.to_string(),
-            );
-            (files, example_data.filename.to_string(), example_data.source_code.to_string())
-        } else if let Some(Ok(stored_files)) =
-            local_storage().get::<BTreeMap<String, String>>(PROJECT_FILES_STORAGE_KEY)
-        {
-            let current = local_storage()
-                .get::<String>(CURRENT_FILE_STORAGE_KEY)
-                .and_then(Result::ok)
-                .unwrap_or_else(|| {
-                    stored_files
-                        .keys()
-                        .next()
-                        .cloned()
-                        .unwrap_or_else(|| DEFAULT_FILE_NAME.to_string())
-                });
-            let content = stored_files.get(&current).cloned().unwrap_or_default();
-            (stored_files, current, content)
-        } else {
-            // Fall back to the default built-in example.
-            let example_data = EXAMPLE_DATAS[0];
+        let (files, current_file, current_content) =
+            if let Some((_, name, code)) = custom_example_from_url {
+                // Load custom example from URL
+                let filename = format!("{}.bn", name);
+                let mut files = BTreeMap::new();
+                files.insert(filename.clone(), code.clone());
+                (files, filename, code)
+            } else if let Some(multi_example) = get_example_from_url()
+                .as_deref()
+                .and_then(find_multi_file_example_by_name)
+            {
+                // Multi-file example from URL parameter
+                let mut files = BTreeMap::new();
+                for (filename, content) in multi_example.files {
+                    files.insert(filename.to_string(), content.to_string());
+                }
+                let entry_content = multi_example
+                    .files
+                    .iter()
+                    .find(|(name, _)| *name == multi_example.entry_file)
+                    .map(|(_, content)| content.to_string())
+                    .unwrap_or_default();
+                (files, multi_example.entry_file.to_string(), entry_content)
+            } else if let Some(example_data) =
+                get_example_from_url().and_then(|name| find_example_by_name(&name))
+            {
+                // Built-in single-file example from URL parameter
+                let mut files = BTreeMap::new();
+                files.insert(
+                    example_data.filename.to_string(),
+                    example_data.source_code.to_string(),
+                );
+                (
+                    files,
+                    example_data.filename.to_string(),
+                    example_data.source_code.to_string(),
+                )
+            } else if let Some(Ok(stored_files)) =
+                local_storage().get::<BTreeMap<String, String>>(PROJECT_FILES_STORAGE_KEY)
+            {
+                let current = local_storage()
+                    .get::<String>(CURRENT_FILE_STORAGE_KEY)
+                    .and_then(Result::ok)
+                    .unwrap_or_else(|| {
+                        stored_files
+                            .keys()
+                            .next()
+                            .cloned()
+                            .unwrap_or_else(|| DEFAULT_FILE_NAME.to_string())
+                    });
+                let content = stored_files.get(&current).cloned().unwrap_or_default();
+                (stored_files, current, content)
+            } else {
+                // Fall back to the default built-in example.
+                let example_data = EXAMPLE_DATAS[0];
 
-            let mut files = BTreeMap::new();
-            files.insert(
-                example_data.filename.to_string(),
-                example_data.source_code.to_string(),
-            );
-            (files, example_data.filename.to_string(), example_data.source_code.to_string())
-        };
+                let mut files = BTreeMap::new();
+                files.insert(
+                    example_data.filename.to_string(),
+                    example_data.source_code.to_string(),
+                );
+                (
+                    files,
+                    example_data.filename.to_string(),
+                    example_data.source_code.to_string(),
+                )
+            };
 
         let files = Mutable::new(Rc::new(files));
         let current_file = Mutable::new(current_file);
@@ -511,16 +569,11 @@ impl Playground {
         // Auto-save files to storage
         let _store_files_task = Rc::new(Task::start_droppable(
             files.signal_cloned().for_each_sync(|files| {
-                eprintln!(
-                    "[files-store] start count={} total_bytes={}",
-                    files.len(),
-                    files.values().map(|s| s.len()).sum::<usize>()
-                );
-                if let Err(error) = local_storage().insert(PROJECT_FILES_STORAGE_KEY, files.as_ref())
+                if let Err(error) =
+                    local_storage().insert(PROJECT_FILES_STORAGE_KEY, files.as_ref())
                 {
                     eprintln!("Failed to store project files: {error:#?}");
                 }
-                eprintln!("[files-store] done");
             }),
         ));
 
@@ -534,13 +587,11 @@ impl Playground {
         ));
 
         let _store_panel_split_task = Rc::new(Task::start_droppable(
-            panel_split_ratio
-                .signal_cloned()
-                .for_each_sync(|ratio| {
-                    if let Err(error) = local_storage().insert(PANEL_SPLIT_STORAGE_KEY, &ratio) {
-                        eprintln!("Failed to store panel split ratio: {error:#?}");
-                    }
-                }),
+            panel_split_ratio.signal_cloned().for_each_sync(|ratio| {
+                if let Err(error) = local_storage().insert(PANEL_SPLIT_STORAGE_KEY, &ratio) {
+                    eprintln!("Failed to store panel split ratio: {error:#?}");
+                }
+            }),
         ));
 
         // Load debug collapsed state from storage (default: collapsed)
@@ -551,48 +602,47 @@ impl Playground {
         let debug_collapsed = Mutable::new(debug_collapsed_value);
 
         let _store_debug_collapsed_task = Rc::new(Task::start_droppable(
-            debug_collapsed
-                .signal()
-                .for_each_sync(|collapsed| {
-                    if let Err(error) = local_storage().insert(DEBUG_COLLAPSED_STORAGE_KEY, &collapsed) {
-                        eprintln!("Failed to store debug collapsed state: {error:#?}");
-                    }
-                }),
+            debug_collapsed.signal().for_each_sync(|collapsed| {
+                if let Err(error) = local_storage().insert(DEBUG_COLLAPSED_STORAGE_KEY, &collapsed)
+                {
+                    eprintln!("Failed to store debug collapsed state: {error:#?}");
+                }
+            }),
         ));
 
         // custom_examples already loaded at the start for URL parameter check
 
         let _store_custom_examples_task = Rc::new(Task::start_droppable(
-            custom_examples
-                .signal_cloned()
-                .for_each_sync(|examples| {
-                    if let Err(error) = local_storage().insert(CUSTOM_EXAMPLES_STORAGE_KEY, examples.as_ref()) {
-                        eprintln!("Failed to store custom examples: {error:#?}");
-                    }
-                }),
+            custom_examples.signal_cloned().for_each_sync(|examples| {
+                if let Err(error) =
+                    local_storage().insert(CUSTOM_EXAMPLES_STORAGE_KEY, examples.as_ref())
+                {
+                    eprintln!("Failed to store custom examples: {error:#?}");
+                }
+            }),
         ));
 
         // Load forced preview size from storage
         let forced_preview_size: Mutable<Option<(u32, u32)>> = Mutable::new(
             local_storage()
                 .get::<(u32, u32)>(FORCED_PREVIEW_SIZE_STORAGE_KEY)
-                .and_then(Result::ok)
+                .and_then(Result::ok),
         );
         let force_size_expanded = Mutable::new(forced_preview_size.get().is_some());
 
         let _store_forced_preview_size_task = Rc::new(Task::start_droppable({
             let forced_preview_size = forced_preview_size.clone();
-            forced_preview_size
-                .signal()
-                .for_each_sync(move |size| {
-                    if let Some(size) = size {
-                        if let Err(error) = local_storage().insert(FORCED_PREVIEW_SIZE_STORAGE_KEY, &size) {
-                            eprintln!("Failed to store forced preview size: {error:#?}");
-                        }
-                    } else {
-                        local_storage().remove(FORCED_PREVIEW_SIZE_STORAGE_KEY);
+            forced_preview_size.signal().for_each_sync(move |size| {
+                if let Some(size) = size {
+                    if let Err(error) =
+                        local_storage().insert(FORCED_PREVIEW_SIZE_STORAGE_KEY, &size)
+                    {
+                        eprintln!("Failed to store forced preview size: {error:#?}");
                     }
-                })
+                } else {
+                    local_storage().remove(FORCED_PREVIEW_SIZE_STORAGE_KEY);
+                }
+            })
         }));
 
         // Load panel layout from storage (default: Normal).
@@ -606,13 +656,11 @@ impl Playground {
 
         let _store_panel_layout_task = Rc::new(Task::start_droppable({
             let panel_layout = panel_layout.clone();
-            panel_layout
-                .signal()
-                .for_each_sync(move |layout| {
-                    if let Err(error) = local_storage().insert(PANEL_LAYOUT_STORAGE_KEY, &layout) {
-                        eprintln!("Failed to store panel layout: {error:#?}");
-                    }
-                })
+            panel_layout.signal().for_each_sync(move |layout| {
+                if let Err(error) = local_storage().insert(PANEL_LAYOUT_STORAGE_KEY, &layout) {
+                    eprintln!("Failed to store panel layout: {error:#?}");
+                }
+            })
         }));
 
         // Load engine type: URL param > localStorage > default
@@ -623,17 +671,16 @@ impl Playground {
                 EngineType::Actors => cfg!(feature = "engine-actors"),
                 EngineType::DifferentialDataflow => cfg!(feature = "engine-dd"),
                 EngineType::Wasm => cfg!(feature = "engine-wasm"),
+                EngineType::WasmPro => cfg!(feature = "engine-wasm-pro"),
             })
             .unwrap_or_else(default_engine);
         let engine_type = Mutable::new(engine_type_value);
 
         let _store_engine_type_task = Rc::new(Task::start_droppable({
             let engine_type = engine_type.clone();
-            engine_type
-                .signal()
-                .for_each_sync(move |engine| {
-                    save_engine_to_storage(engine);
-                })
+            engine_type.signal().for_each_sync(move |engine| {
+                save_engine_to_storage(engine);
+            })
         }));
 
         // Sync source_code changes back to files map
@@ -653,7 +700,8 @@ impl Playground {
 
         // Track currently selected custom example for syncing code changes
         // Initialize with URL parameter value if a custom example was requested
-        let selected_custom_example: Mutable<Option<String>> = Mutable::new(initial_selected_custom_example);
+        let selected_custom_example: Mutable<Option<String>> =
+            Mutable::new(initial_selected_custom_example);
 
         // Sync source_code changes to the currently selected custom example
         let _sync_source_to_custom_example_task = {
@@ -664,7 +712,9 @@ impl Playground {
                     // If a custom example is selected, update its code
                     if let Some(ref id) = *selected_custom_example.lock_ref() {
                         let mut examples = (**custom_examples.lock_ref()).clone();
-                        if let Some((_, _, code)) = examples.iter_mut().find(|(eid, _, _)| eid == id) {
+                        if let Some((_, _, code)) =
+                            examples.iter_mut().find(|(eid, _, _)| eid == id)
+                        {
                             *code = content.to_string();
                             custom_examples.set(Rc::new(examples));
                         }
@@ -936,8 +986,9 @@ impl Playground {
                             "Actors" => EngineType::Actors,
                             "DD" => EngineType::DifferentialDataflow,
                             "Wasm" => EngineType::Wasm,
+                            "WasmPro" => EngineType::WasmPro,
                             _ => {
-                                js_sys::Reflect::set(&result, &"error".into(), &format!("Invalid engine '{}'. Use 'Actors', 'DD', or 'Wasm'", engine_str).into()).ok();
+                                js_sys::Reflect::set(&result, &"error".into(), &format!("Invalid engine '{}'. Use 'Actors', 'DD', 'Wasm', or 'WasmPro'", engine_str).into()).ok();
                                 return result.into();
                             }
                         };
@@ -992,6 +1043,11 @@ impl Playground {
                                 #[cfg(feature = "engine-wasm")]
                                 if engine_type_for_select.get() == EngineType::Wasm {
                                     clear_wasm_persisted_states();
+                                }
+
+                                #[cfg(feature = "engine-wasm-pro")]
+                                if engine_type_for_select.get() == EngineType::WasmPro {
+                                    clear_wasm_pro_persisted_states();
                                 }
                             }
                         };
@@ -1150,10 +1206,12 @@ impl Playground {
             .s(Scrollbars::both())
             .item_signal(self.panel_layout.signal().map({
                 let this = self.clone();
-                move |layout| if layout != PanelLayout::Normal {
-                    None
-                } else {
-                    Some(this.header_bar())
+                move |layout| {
+                    if layout != PanelLayout::Normal {
+                        None
+                    } else {
+                        Some(this.header_bar())
+                    }
                 }
             }))
             .item(
@@ -1161,15 +1219,17 @@ impl Playground {
                     .s(Width::fill())
                     .s(Height::fill())
                     .s(Scrollbars::both())
-                    .child(self.shell_surface(
-                        Column::new()
-                            .s(Width::fill())
-                            .s(Height::fill())
-                            .s(Scrollbars::both())
-                            .s(Gap::new().y(8))
-                            .item(self.controls_row())
-                            .item(self.panels_row()),
-                    )),
+                    .child(
+                        self.shell_surface(
+                            Column::new()
+                                .s(Width::fill())
+                                .s(Height::fill())
+                                .s(Scrollbars::both())
+                                .s(Gap::new().y(8))
+                                .item(self.controls_row())
+                                .item(self.panels_row()),
+                        ),
+                    ),
             )
     }
 
@@ -1179,25 +1239,21 @@ impl Playground {
             .s(Height::fill())
             .s(Scrollbars::both())
             .s(Background::new().color(shell_surface_color()))
-            .s(
-                RoundedCorners::new()
-                    .top(32)
-                    .bottom_signal(
-                        self.panel_layout
-                            .signal()
-                            .map(|layout| if layout != PanelLayout::Normal { 0 } else { 32 }),
-                    ),
-            )
-            .s(Borders::all(
-                Border::new().color(color!("rgba(255, 255, 255, 0.05)")).width(1),
+            .s(RoundedCorners::new().top(32).bottom_signal(
+                self.panel_layout
+                    .signal()
+                    .map(|layout| if layout != PanelLayout::Normal { 0 } else { 32 }),
             ))
-            .s(Shadows::new([
-                Shadow::new()
-                    .color(color!("rgba(5, 10, 18, 0.55)"))
-                    .y(34)
-                    .blur(60)
-                    .spread(-18),
-            ]))
+            .s(Borders::all(
+                Border::new()
+                    .color(color!("rgba(255, 255, 255, 0.05)"))
+                    .width(1),
+            ))
+            .s(Shadows::new([Shadow::new()
+                .color(color!("rgba(5, 10, 18, 0.55)"))
+                .y(34)
+                .blur(60)
+                .spread(-18)]))
             .update_raw_el(|raw_el| raw_el.style("backdrop-filter", "blur(24px)"))
             .child(
                 El::new()
@@ -1216,15 +1272,15 @@ impl Playground {
             .s(RoundedCorners::all(28))
             .s(Padding::new().x(18).y(12))
             .s(Borders::all(
-                Border::new().color(color!("rgba(255, 255, 255, 0.06)")).width(1),
+                Border::new()
+                    .color(color!("rgba(255, 255, 255, 0.06)"))
+                    .width(1),
             ))
-            .s(Shadows::new([
-                Shadow::new()
-                    .color(color!("rgba(5, 10, 20, 0.45)"))
-                    .y(26)
-                    .blur(48)
-                    .spread(-12),
-            ]))
+            .s(Shadows::new([Shadow::new()
+                .color(color!("rgba(5, 10, 20, 0.45)"))
+                .y(26)
+                .blur(48)
+                .spread(-12)]))
             .update_raw_el(|raw_el| raw_el.style("backdrop-filter", "blur(24px)"))
             .child(self.example_tabs())
     }
@@ -1232,35 +1288,24 @@ impl Playground {
     fn header_title(&self) -> impl Element + use<> {
         Row::new()
             .s(Align::new().center_y())
-            .s(
-                Font::new()
-                    .size(18)
-                    .weight(FontWeight::SemiBold)
-                    .family([
-                        FontFamily::new("JetBrains Mono"),
-                        FontFamily::Monospace,
-                    ])
-                    .no_wrap(),
-            )
+            .s(Font::new()
+                .size(18)
+                .weight(FontWeight::SemiBold)
+                .family([FontFamily::new("JetBrains Mono"), FontFamily::Monospace])
+                .no_wrap())
             .s(Transform::new().move_up(2))
             .item(
                 Link::new()
-                    .s(
-                        Font::new().color(color!("#6cb6ff")).line(
-                            FontLine::new()
-                                .underline()
-                                .color(color!("#6cb6ff"))
-                                .offset(4),
-                        ),
-                    )
+                    .s(Font::new().color(color!("#6cb6ff")).line(
+                        FontLine::new()
+                            .underline()
+                            .color(color!("#6cb6ff"))
+                            .offset(4),
+                    ))
                     .label("Boon")
                     .to("https://boon.run"),
             )
-            .item(
-                El::new()
-                    .s(Font::new().color(color!("#d2691e")))
-                    .child("/"),
-            )
+            .item(El::new().s(Font::new().color(color!("#d2691e"))).child("/"))
             .item(
                 El::new()
                     .s(Font::new().color(color!("#fcbf49")))
@@ -1280,10 +1325,18 @@ impl Playground {
                     .s(Gap::new().x(10).y(6))
                     .multiline()
                     .item(self.header_title())
-                    .items(EXAMPLE_DATAS.iter().map(|&example_data| self.example_button(example_data)))
-                    .items(MULTI_FILE_EXAMPLES.iter().map(|example| self.multi_file_example_button(example)))
+                    .items(
+                        EXAMPLE_DATAS
+                            .iter()
+                            .map(|&example_data| self.example_button(example_data)),
+                    )
+                    .items(
+                        MULTI_FILE_EXAMPLES
+                            .iter()
+                            .map(|example| self.multi_file_example_button(example)),
+                    )
                     .item(self.add_custom_example_button())
-                    .item(self.other_section_toggle())
+                    .item(self.other_section_toggle()),
             )
             .item_signal(
                 // "Other" expandable section: 7GUIs examples + custom examples
@@ -1296,7 +1349,7 @@ impl Playground {
                             Some(this.other_section_content())
                         }
                     }
-                })
+                }),
             )
     }
 
@@ -1308,29 +1361,42 @@ impl Playground {
             .s(Padding::new().left(10))
             .multiline()
             // 7GUIs examples (items() on empty array is a no-op)
-            .items(OTHER_EXAMPLE_DATAS.iter().map(|&example_data| self.example_button(example_data)))
-            .items(OTHER_MULTI_FILE_EXAMPLES.iter().map(|example| self.multi_file_example_button(example)))
-            // Custom examples row (only shown when custom examples exist)
-            .item_signal(
-                self.custom_examples.signal_cloned().map({
-                    let this = self.clone();
-                    move |custom_examples| {
-                        if custom_examples.is_empty() {
-                            None
-                        } else {
-                            let id_names: Vec<(String, String)> = custom_examples.iter().map(|(id, name, _)| (id.clone(), name.clone())).collect();
-                            Some(
-                                Row::new()
-                                    .s(Width::fill())
-                                    .s(Align::new().center_y())
-                                    .s(Gap::new().x(10).y(6))
-                                    .multiline()
-                                    .items(id_names.into_iter().map(|(id, name)| this.custom_example_button(id, name)))
-                            )
-                        }
-                    }
-                })
+            .items(
+                OTHER_EXAMPLE_DATAS
+                    .iter()
+                    .map(|&example_data| self.example_button(example_data)),
             )
+            .items(
+                OTHER_MULTI_FILE_EXAMPLES
+                    .iter()
+                    .map(|example| self.multi_file_example_button(example)),
+            )
+            // Custom examples row (only shown when custom examples exist)
+            .item_signal(self.custom_examples.signal_cloned().map({
+                let this = self.clone();
+                move |custom_examples| {
+                    if custom_examples.is_empty() {
+                        None
+                    } else {
+                        let id_names: Vec<(String, String)> = custom_examples
+                            .iter()
+                            .map(|(id, name, _)| (id.clone(), name.clone()))
+                            .collect();
+                        Some(
+                            Row::new()
+                                .s(Width::fill())
+                                .s(Align::new().center_y())
+                                .s(Gap::new().x(10).y(6))
+                                .multiline()
+                                .items(
+                                    id_names
+                                        .into_iter()
+                                        .map(|(id, name)| this.custom_example_button(id, name)),
+                                ),
+                        )
+                    }
+                }
+            }))
     }
 
     fn other_section_toggle(&self) -> impl Element + use<> {
@@ -1339,17 +1405,17 @@ impl Playground {
             .s(Padding::new().x(10).y(7))
             .s(RoundedCorners::all(24))
             .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
-            .s(Background::new().color_signal(
-                hovered.signal().map(|h| {
-                    if h {
-                        color!("rgba(60, 70, 100, 0.4)")
-                    } else {
-                        color!("rgba(40, 50, 80, 0.3)")
-                    }
-                })
-            ))
+            .s(Background::new().color_signal(hovered.signal().map(|h| {
+                if h {
+                    color!("rgba(60, 70, 100, 0.4)")
+                } else {
+                    color!("rgba(40, 50, 80, 0.3)")
+                }
+            })))
             .s(Borders::all(
-                Border::new().color(color!("rgba(88, 126, 194, 0.25)")).width(1),
+                Border::new()
+                    .color(color!("rgba(88, 126, 194, 0.25)"))
+                    .width(1),
             ))
             .s(Font::new().color(muted_text_color()))
             .label_signal(self.debug_collapsed.signal().map(|collapsed| {
@@ -1374,18 +1440,32 @@ impl Playground {
             .s(Align::new().center_y())
             .s(Gap::new().x(12).y(8))
             .multiline()
-            .item(El::new().s(Align::new().left()).child(self.panel_layout_button()))
+            .item(
+                El::new()
+                    .s(Align::new().left())
+                    .child(self.panel_layout_button()),
+            )
             .item(self.format_button())
             .item(
                 El::new()
-                    .s(Font::new().size(12).color(color!("rgba(255, 255, 255, 0.5)")))
-                    .child("F12 → dev tools for logs & errors")
+                    .s(Font::new()
+                        .size(12)
+                        .color(color!("rgba(255, 255, 255, 0.5)")))
+                    .child("F12 → dev tools for logs & errors"),
             )
             .item(self.engine_button_group())
-            .item(El::new().s(Align::new().center_x()).child(self.run_button()))
+            .item(
+                El::new()
+                    .s(Align::new().center_x())
+                    .child(self.run_button()),
+            )
             .item(self.force_size_controls())
             .item(self.persistence_toggle_button())
-            .item(El::new().s(Align::new().right()).child(self.clear_saved_states_button()))
+            .item(
+                El::new()
+                    .s(Align::new().right())
+                    .child(self.clear_saved_states_button()),
+            )
     }
 
     /// Engine selector button group — one button per available engine.
@@ -1394,15 +1474,17 @@ impl Playground {
         Row::new()
             .s(RoundedCorners::all(22))
             .s(Background::new().color(color!("rgba(26, 36, 58, 0.32)")))
-            .s(Shadows::new([
-                Shadow::new()
-                    .color(color!("rgba(8, 13, 28, 0.26)"))
-                    .y(12)
-                    .blur(22)
-                    .spread(-8),
-            ]))
+            .s(Shadows::new([Shadow::new()
+                .color(color!("rgba(8, 13, 28, 0.26)"))
+                .y(12)
+                .blur(22)
+                .spread(-8)]))
             .s(Padding::all(3))
-            .items(engines.into_iter().map(|engine| self.engine_segment(engine)))
+            .items(
+                engines
+                    .into_iter()
+                    .map(|engine| self.engine_segment(engine)),
+            )
     }
 
     fn engine_segment(&self, engine: EngineType) -> impl Element + use<> {
@@ -1448,36 +1530,49 @@ impl Playground {
             .s(Height::fill())
             .s(Scrollbars::both())
             .s(Background::new().color(primary_surface_color()))
-            .s(RoundedCorners::all_signal(self.panel_layout.signal().map(|layout| {
-                match layout {
-                    PanelLayout::PreviewOnly => Some(0),  // No rounded corners for screenshots
-                    _ => Some(24),
-                }
-            })))
-            .s(Borders::all_signal(self.panel_layout.signal().map(|layout| {
-                match layout {
-                    PanelLayout::PreviewOnly => Border::new(),  // No border for screenshots
-                    _ => Border::new().color(color!("rgba(255, 255, 255, 0.05)")).width(1),
-                }
-            })))
-            .s(Shadows::with_signal_self(self.panel_layout.signal().map(|layout| {
-                match layout {
-                    PanelLayout::PreviewOnly => None,  // No shadow for screenshots
-                    _ => Some(Shadows::new([
-                        Shadow::new()
+            .s(RoundedCorners::all_signal(self.panel_layout.signal().map(
+                |layout| {
+                    match layout {
+                        PanelLayout::PreviewOnly => Some(0), // No rounded corners for screenshots
+                        _ => Some(24),
+                    }
+                },
+            )))
+            .s(Borders::all_signal(self.panel_layout.signal().map(
+                |layout| {
+                    match layout {
+                        PanelLayout::PreviewOnly => Border::new(), // No border for screenshots
+                        _ => Border::new()
+                            .color(color!("rgba(255, 255, 255, 0.05)"))
+                            .width(1),
+                    }
+                },
+            )))
+            .s(Shadows::with_signal_self(self.panel_layout.signal().map(
+                |layout| {
+                    match layout {
+                        PanelLayout::PreviewOnly => None, // No shadow for screenshots
+                        _ => Some(Shadows::new([Shadow::new()
                             .color(color!("rgba(4, 12, 24, 0.32)"))
                             .y(30)
                             .blur(60)
-                            .spread(-18),
-                    ])),
-                }
-            })))
+                            .spread(-18)])),
+                    }
+                },
+            )))
             .update_raw_el({
                 let panel_layout = self.panel_layout.clone();
                 move |raw_el| {
-                    raw_el.style_signal("backdrop-filter", panel_layout.signal().map(|layout| {
-                        if layout == PanelLayout::PreviewOnly { "none" } else { "blur(20px)" }
-                    }))
+                    raw_el.style_signal(
+                        "backdrop-filter",
+                        panel_layout.signal().map(|layout| {
+                            if layout == PanelLayout::PreviewOnly {
+                                "none"
+                            } else {
+                                "blur(20px)"
+                            }
+                        }),
+                    )
                 }
             })
             .child(content)
@@ -1590,13 +1685,11 @@ impl Playground {
                 }
             }))
             .s(RoundedCorners::all(18))
-            .s(Shadows::new([
-                Shadow::new()
-                    .color(color!("rgba(8, 14, 30, 0.55)"))
-                    .y(12)
-                    .blur(24)
-                    .spread(-8),
-            ]))
+            .s(Shadows::new([Shadow::new()
+                .color(color!("rgba(8, 14, 30, 0.55)"))
+                .y(12)
+                .blur(24)
+                .spread(-8)]))
             .on_hovered_change(move |is_hovered| hovered.set_neq(is_hovered))
             .text_content_selecting(TextContentSelecting::none())
             .on_pointer_down_event({
@@ -1778,21 +1871,15 @@ impl Playground {
             .s(RoundedCorners::all(22))
             .s(Font::new().color(color!("#052039")))
             .s(Font::new().weight(FontWeight::SemiBold))
-            .s(Shadows::new([
-                Shadow::new()
-                    .color(color!("rgba(15, 23, 42, 0.22)"))
-                    .y(12)
-                    .blur(22)
-                    .spread(-8),
-            ]))
-            .s(Background::new().color_signal(
-                hovered
-                    .signal()
-                    .map_bool(
-                        || color!("rgba(140, 196, 255, 0.9)"),
-                        || color!("rgba(108, 162, 255, 0.75)"),
-                    ),
-            ))
+            .s(Shadows::new([Shadow::new()
+                .color(color!("rgba(15, 23, 42, 0.22)"))
+                .y(12)
+                .blur(22)
+                .spread(-8)]))
+            .s(Background::new().color_signal(hovered.signal().map_bool(
+                || color!("rgba(140, 196, 255, 0.9)"),
+                || color!("rgba(108, 162, 255, 0.75)"),
+            )))
             .label(
                 Row::new()
                     .s(Align::new().center_y())
@@ -1803,13 +1890,14 @@ impl Playground {
                             .child("Run"),
                     )
                     .item(
-                        Column::new()
-                            .s(Gap::new().y(2))
-                            .item(
-                                El::new()
-                                    .s(Font::new().size(13).color(color!("rgba(5, 32, 57, 0.78)")).no_wrap())
-                                    .child("Shift + Enter"),
-                            ),
+                        Column::new().s(Gap::new().y(2)).item(
+                            El::new()
+                                .s(Font::new()
+                                    .size(13)
+                                    .color(color!("rgba(5, 32, 57, 0.78)"))
+                                    .no_wrap())
+                                .child("Shift + Enter"),
+                        ),
                     ),
             )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
@@ -1831,14 +1919,10 @@ impl Playground {
                     .color(color!("rgba(108, 162, 255, 0.35)"))
                     .width(1),
             ))
-            .s(Background::new().color_signal(
-                hovered
-                    .signal()
-                    .map_bool(
-                        || color!("rgba(108, 162, 255, 0.15)"),
-                        || color!("rgba(108, 162, 255, 0.08)"),
-                    ),
-            ))
+            .s(Background::new().color_signal(hovered.signal().map_bool(
+                || color!("rgba(108, 162, 255, 0.15)"),
+                || color!("rgba(108, 162, 255, 0.08)"),
+            )))
             .s(Font::new()
                 .size(13)
                 .weight(FontWeight::Medium)
@@ -1866,7 +1950,9 @@ impl Playground {
                             }
                         }
                         None => {
-                            eprintln!("[Format] Failed: code has syntax errors (fix errors and try again)");
+                            eprintln!(
+                                "[Format] Failed: code has syntax errors (fix errors and try again)"
+                            );
                         }
                     }
                 }
@@ -1877,13 +1963,11 @@ impl Playground {
         Row::new()
             .s(RoundedCorners::all(22))
             .s(Background::new().color(color!("rgba(26, 36, 58, 0.32)")))
-            .s(Shadows::new([
-                Shadow::new()
-                    .color(color!("rgba(8, 13, 28, 0.26)"))
-                    .y(12)
-                    .blur(22)
-                    .spread(-8),
-            ]))
+            .s(Shadows::new([Shadow::new()
+                .color(color!("rgba(8, 13, 28, 0.26)"))
+                .y(12)
+                .blur(22)
+                .spread(-8)]))
             .s(Padding::all(3))
             .item(self.layout_segment("Both", PanelLayout::Normal))
             .item(self.layout_segment("Code", PanelLayout::CodeOnly))
@@ -1935,11 +2019,15 @@ impl Playground {
             .s(Borders::all_signal(
                 persistence_enabled_for_border.signal().map(|enabled| {
                     if enabled {
-                        Border::new().color(color!("rgba(134, 255, 134, 0.45)")).width(1)
+                        Border::new()
+                            .color(color!("rgba(134, 255, 134, 0.45)"))
+                            .width(1)
                     } else {
-                        Border::new().color(color!("rgba(255, 255, 255, 0.2)")).width(1)
+                        Border::new()
+                            .color(color!("rgba(255, 255, 255, 0.2)"))
+                            .width(1)
                     }
-                })
+                }),
             ))
             .s(Background::new().color_signal(map_ref! {
                 let enabled = persistence_enabled_for_bg.signal(),
@@ -1967,7 +2055,11 @@ impl Playground {
                 El::new()
                     .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
                     .child_signal(persistence_enabled_for_label.signal().map(|enabled| {
-                        if enabled { "Persistence: On" } else { "Persistence: Off" }
+                        if enabled {
+                            "Persistence: On"
+                        } else {
+                            "Persistence: Off"
+                        }
                     })),
             )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
@@ -1986,11 +2078,10 @@ impl Playground {
                     .color(color!("rgba(255, 134, 134, 0.45)"))
                     .width(1),
             ))
-            .s(Background::new().color_signal(
-                hovered
-                    .signal()
-                    .map_bool(|| color!("rgba(255, 134, 134, 0.12)"), || color!("rgba(255, 134, 134, 0.08)")),
-            ))
+            .s(Background::new().color_signal(hovered.signal().map_bool(
+                || color!("rgba(255, 134, 134, 0.12)"),
+                || color!("rgba(255, 134, 134, 0.08)"),
+            )))
             .s(Font::new()
                 .size(13)
                 .weight(FontWeight::Medium)
@@ -2013,22 +2104,37 @@ impl Playground {
                 #[cfg(feature = "engine-wasm")]
                 clear_wasm_persisted_states();
 
+                #[cfg(feature = "engine-wasm-pro")]
+                clear_wasm_pro_persisted_states();
+
                 local_storage().remove(STATES_STORAGE_KEY);
                 local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                 local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                 local_storage().remove(PROJECT_FILES_STORAGE_KEY);
                 local_storage().remove(CURRENT_FILE_STORAGE_KEY);
                 // Clear dynamically-keyed persistence data (list calls, removed sets, DD engine state)
-                clear_prefixed_storage_keys(&["list_calls:", "list_removed:", "dd_", "wasm_"]);
+                clear_prefixed_storage_keys(&[
+                    "list_calls:",
+                    "list_removed:",
+                    "dd_",
+                    "wasm_",
+                    "wasm_pro_",
+                ]);
             })
     }
 
     fn force_size_controls(&self) -> impl Element + use<> {
         let width_input = Mutable::new(
-            self.forced_preview_size.get().map(|(w, _)| w.to_string()).unwrap_or_else(|| "700".to_string())
+            self.forced_preview_size
+                .get()
+                .map(|(w, _)| w.to_string())
+                .unwrap_or_else(|| "700".to_string()),
         );
         let height_input = Mutable::new(
-            self.forced_preview_size.get().map(|(_, h)| h.to_string()).unwrap_or_else(|| "700".to_string())
+            self.forced_preview_size
+                .get()
+                .map(|(_, h)| h.to_string())
+                .unwrap_or_else(|| "700".to_string()),
         );
 
         Row::new()
@@ -2046,14 +2152,28 @@ impl Playground {
                         let force_size_expanded = force_size_expanded.clone();
                         let width_input = width_input.clone();
                         let height_input = height_input.clone();
-                        Some(Row::new()
-                            .s(Gap::new().x(4))
-                            .s(Align::new().center_y())
-                            .item(self::force_size_input(width_input.clone(), "W"))
-                            .item(El::new().s(Font::new().size(12).color(color!("rgba(255,255,255,0.5)"))).child("×"))
-                            .item(self::force_size_input(height_input.clone(), "H"))
-                            .item(self::force_size_apply_button(width_input, height_input, forced_preview_size.clone()))
-                            .item(self::force_size_auto_button(forced_preview_size, force_size_expanded))
+                        Some(
+                            Row::new()
+                                .s(Gap::new().x(4))
+                                .s(Align::new().center_y())
+                                .item(self::force_size_input(width_input.clone(), "W"))
+                                .item(
+                                    El::new()
+                                        .s(Font::new()
+                                            .size(12)
+                                            .color(color!("rgba(255,255,255,0.5)")))
+                                        .child("×"),
+                                )
+                                .item(self::force_size_input(height_input.clone(), "H"))
+                                .item(self::force_size_apply_button(
+                                    width_input,
+                                    height_input,
+                                    forced_preview_size.clone(),
+                                ))
+                                .item(self::force_size_auto_button(
+                                    forced_preview_size,
+                                    force_size_expanded,
+                                )),
                         )
                     } else {
                         None
@@ -2130,7 +2250,8 @@ impl Playground {
             .s(Height::fill())
             .item_signal({
                 let this = self.clone();
-                self.files.signal_cloned()
+                self.files
+                    .signal_cloned()
                     .map(|files| {
                         let mut keys: Vec<String> = files.keys().cloned().collect();
                         keys.sort();
@@ -2145,9 +2266,13 @@ impl Playground {
                         let mut sorted_keys = keys;
                         sorted_keys.sort_by(|a, b| {
                             let rank = |name: &str| -> u8 {
-                                if name == "RUN.bn" { 0 }
-                                else if name == "BUILD.bn" { 1 }
-                                else { 2 }
+                                if name == "RUN.bn" {
+                                    0
+                                } else if name == "BUILD.bn" {
+                                    1
+                                } else {
+                                    2
+                                }
                             };
                             rank(a).cmp(&rank(b)).then(a.cmp(b))
                         });
@@ -2157,9 +2282,11 @@ impl Playground {
                                 .s(Gap::new().x(2).y(2))
                                 .s(Padding::new().x(10).top(6).bottom(0))
                                 .multiline()
-                                .items(sorted_keys.into_iter().map(|filename| {
-                                    this.file_tab(filename)
-                                }))
+                                .items(
+                                    sorted_keys
+                                        .into_iter()
+                                        .map(|filename| this.file_tab(filename)),
+                                ),
                         )
                     })
             })
@@ -2180,16 +2307,21 @@ impl Playground {
                                     .s(Background::new().color(color!("rgba(11, 18, 35, 0.7)")))
                                     .s(Font::new()
                                         .size(11)
-                                        .family([FontFamily::new("JetBrains Mono"), FontFamily::Monospace])
+                                        .family([
+                                            FontFamily::new("JetBrains Mono"),
+                                            FontFamily::Monospace,
+                                        ])
                                         .color(color!("rgba(255, 255, 255, 0.5)")))
                                     .update_raw_el(|raw_el| {
                                         raw_el
                                             .style("pointer-events", "none")
                                             .style("z-index", "10")
                                     })
-                                    .child_signal(self.cursor_position.signal().map(|(line, col)| {
-                                        format!("Ln {line}, Col {col}")
-                                    })),
+                                    .child_signal(
+                                        self.cursor_position
+                                            .signal()
+                                            .map(|(line, col)| format!("Ln {line}, Col {col}")),
+                                    ),
                             ),
                     ),
             )
@@ -2243,28 +2375,21 @@ impl Playground {
                     ),
                     None => (None, filename_for_label),
                 };
-                Row::new()
-                    .s(Gap::new().x(0))
-                    .items({
-                        let mut items: Vec<RawElOrText> = Vec::new();
-                        if let Some(prefix) = prefix {
-                            items.push(
-                                El::new()
-                                    .s(Font::new()
-                                        .size(12)
-                                        .color(color!("rgba(140, 160, 200, 0.5)")))
-                                    .child(prefix)
-                                    .unify(),
-                            );
-                        }
+                Row::new().s(Gap::new().x(0)).items({
+                    let mut items: Vec<RawElOrText> = Vec::new();
+                    if let Some(prefix) = prefix {
                         items.push(
                             El::new()
-                                .s(Font::new().size(12))
-                                .child(basename)
+                                .s(Font::new()
+                                    .size(12)
+                                    .color(color!("rgba(140, 160, 200, 0.5)")))
+                                .child(prefix)
                                 .unify(),
                         );
-                        items
-                    })
+                    }
+                    items.push(El::new().s(Font::new().size(12)).child(basename).unify());
+                    items
+                })
             })
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press({
@@ -2284,7 +2409,8 @@ impl Playground {
                     files.set(Rc::new(files_map));
 
                     // Switch to target file
-                    let target_content = files.lock_ref()
+                    let target_content = files
+                        .lock_ref()
                         .get(&filename_for_click)
                         .cloned()
                         .unwrap_or_default();
@@ -2386,7 +2512,9 @@ impl Playground {
             .s(Height::fill())
             .content_signal(self.source_code.signal_cloned())
             .snippet_screenshot_mode_signal(
-                self.panel_layout.signal().map(|layout| layout == PanelLayout::CodeOnly)
+                self.panel_layout
+                    .signal()
+                    .map(|layout| layout == PanelLayout::CodeOnly),
             )
             .on_change({
                 let source_code = self.source_code.clone();
@@ -2487,19 +2615,15 @@ impl Playground {
     }
 
     fn preview_placeholder(&self) -> impl Element + use<> {
-        Stack::new()
-            .s(Width::fill())
-            .s(Height::fill())
-            .layer(
-                El::new()
-                    .s(Align::new().center_x().center_y())
-                    .s(Font::new().size(14).color(muted_text_color()).no_wrap())
-                    .child("Run to see preview"),
-            )
+        Stack::new().s(Width::fill()).s(Height::fill()).layer(
+            El::new()
+                .s(Align::new().center_x().center_y())
+                .s(Font::new().size(14).color(muted_text_color()).no_wrap())
+                .child("Run to see preview"),
+        )
     }
 
     fn example_runner(&self, run_command: RunCommand) -> impl Element + use<> {
-
         // Get all files and current file info
         let files = self.files.lock_ref();
         let current_file_name = self.current_file.lock_ref().clone();
@@ -2512,8 +2636,30 @@ impl Playground {
         #[cfg(feature = "engine-wasm")]
         if engine_type == EngineType::Wasm {
             let external_fns = parse_module_files(&files, filename);
-            let ext = if external_fns.is_empty() { None } else { Some(external_fns.as_slice()) };
+            let ext = if external_fns.is_empty() {
+                None
+            } else {
+                Some(external_fns.as_slice())
+            };
             let element = boon::platform::browser::engine_wasm::run_wasm(
+                &source_code,
+                ext,
+                persistence_enabled,
+            );
+            drop(source_code);
+            drop(files);
+            return element;
+        }
+
+        #[cfg(feature = "engine-wasm-pro")]
+        if engine_type == EngineType::WasmPro {
+            let external_fns = parse_module_files(&files, filename);
+            let ext = if external_fns.is_empty() {
+                None
+            } else {
+                Some(external_fns.as_slice())
+            };
+            let element = boon::platform::browser::engine_wasm_pro::run_wasm_pro(
                 &source_code,
                 ext,
                 persistence_enabled,
@@ -2526,23 +2672,26 @@ impl Playground {
         #[cfg(feature = "engine-dd")]
         if engine_type == EngineType::DifferentialDataflow {
             let external_fns = parse_module_files(&files, filename);
-            let ext = if external_fns.is_empty() { None } else { Some(external_fns.as_slice()) };
+            let ext = if external_fns.is_empty() {
+                None
+            } else {
+                Some(external_fns.as_slice())
+            };
             // Run with DD engine (reactive evaluation)
-            let dd_storage_key = if persistence_enabled { Some(STATES_STORAGE_KEY) } else { None };
-            let result = run_dd_reactive_with_persistence(
-                filename,
-                &source_code,
-                dd_storage_key,
-                ext,
-            );
+            let dd_storage_key = if persistence_enabled {
+                Some(STATES_STORAGE_KEY)
+            } else {
+                None
+            };
+            let result =
+                run_dd_reactive_with_persistence(filename, &source_code, dd_storage_key, ext);
             drop(source_code);
             drop(files);
 
             if let Some(dd_result) = result {
                 if let Some(document) = dd_result.document.clone() {
                     // Always use full rendering (handles all element types, events, timers)
-                    return render_dd_result_reactive_signal(dd_result)
-                        .unify();
+                    return render_dd_result_reactive_signal(dd_result).unify();
                 }
             }
 
@@ -2552,77 +2701,107 @@ impl Playground {
                 .unify();
         }
 
-        // Create VirtualFilesystem with all project files
-        let virtual_fs = VirtualFilesystem::with_files(
-            files
-                .iter()
-                .map(|(name, content)| (name.clone(), content.clone()))
-                .collect(),
-        );
-
-        // Pre-parse module files for cross-file calls (e.g., `Theme/material()`).
-        // Uses shared parse_module_files() — same data feeds Actors, DD, and WASM engines.
-        let external_fns = parse_module_files(&files, filename);
-
-        // Convert to Actors' FunctionRegistry format
-        let mut module_registry: FunctionRegistry = std::collections::HashMap::new();
-        for (qualified_name, params, body, module_name) in &external_fns {
-            use boon::platform::browser::evaluator::StaticFunctionDefinition;
-            module_registry.insert(
-                qualified_name.clone(),
-                StaticFunctionDefinition {
-                    parameters: params.clone(),
-                    body: body.clone(),
-                    module_name: module_name.clone(),
-                },
+        #[cfg(feature = "engine-actors")]
+        {
+            // Create VirtualFilesystem with all project files
+            let virtual_fs = VirtualFilesystem::with_files(
+                files
+                    .iter()
+                    .map(|(name, content)| (name.clone(), content.clone()))
+                    .collect(),
             );
+
+            // Pre-parse module files for cross-file calls (e.g., `Theme/material()`).
+            // Uses shared parse_module_files() — same data feeds Actors, DD, and WASM engines.
+            let external_fns = parse_module_files(&files, filename);
+
+            // Convert to Actors' FunctionRegistry format
+            let mut module_registry: FunctionRegistry = std::collections::HashMap::new();
+            for (qualified_name, params, body, module_name) in &external_fns {
+                module_registry.insert(
+                    qualified_name.clone(),
+                    StaticFunctionDefinition {
+                        parameters: params.clone(),
+                        body: body.clone(),
+                        module_name: module_name.clone(),
+                    },
+                );
+            }
+
+            drop(files);
+
+            // BUILD.bn is a build script (generates Assets.bn from SVG files).
+            // In the playground, generated files are already statically included,
+            // so we skip running BUILD.bn (its build-time functions like
+            // Directory/entries, File/read_text aren't available in the browser).
+
+            // Run the main file with pre-registered module functions.
+            // We keep reference_connector and link_connector alive to preserve all actors.
+            // Dropping them (via after_remove) will trigger cleanup of all actors.
+            let registry = if module_registry.is_empty() {
+                None
+            } else {
+                Some(module_registry)
+            };
+            let actors_storage_key = if persistence_enabled {
+                STATES_STORAGE_KEY
+            } else {
+                ""
+            };
+            let evaluation_result = interpreter::run_with_registry(
+                filename,
+                &source_code,
+                actors_storage_key,
+                OLD_SOURCE_CODE_STORAGE_KEY,
+                OLD_SPAN_ID_PAIRS_STORAGE_KEY,
+                virtual_fs,
+                registry,
+            );
+            drop(source_code);
+            if let Some((
+                object,
+                construct_context,
+                _registry,
+                _module_loader,
+                reference_connector,
+                link_connector,
+                pass_through_connector,
+                root_scope_guard,
+            )) = evaluation_result
+            {
+                El::new()
+                    .s(Width::fill())
+                    .s(Height::fill())
+                    .child_signal(object_with_document_to_element_signal(
+                        object.clone(),
+                        construct_context,
+                    ))
+                    .after_remove(move |_| {
+                        // Drop object first, then drop connectors to trigger actor cleanup.
+                        // The root_scope_guard is dropped last to recursively destroy all
+                        // registry scopes and their actors.
+                        drop(object);
+                        drop(reference_connector);
+                        drop(link_connector);
+                        drop(pass_through_connector);
+                        drop(root_scope_guard);
+                    })
+                    .unify()
+            } else {
+                El::new()
+                    .s(Font::new().color(color!("LightCoral")))
+                    .child("Failed to run the example. See errors in dev console.")
+                    .unify()
+            }
         }
 
-        drop(files);
-
-        // BUILD.bn is a build script (generates Assets.bn from SVG files).
-        // In the playground, generated files are already statically included,
-        // so we skip running BUILD.bn (its build-time functions like
-        // Directory/entries, File/read_text aren't available in the browser).
-
-        // Run the main file with pre-registered module functions.
-        // We keep reference_connector and link_connector alive to preserve all actors.
-        // Dropping them (via after_remove) will trigger cleanup of all actors.
-        let registry = if module_registry.is_empty() { None } else { Some(module_registry) };
-        let actors_storage_key = if persistence_enabled { STATES_STORAGE_KEY } else { "" };
-        let evaluation_result = interpreter::run_with_registry(
-            filename,
-            &source_code,
-            actors_storage_key,
-            OLD_SOURCE_CODE_STORAGE_KEY,
-            OLD_SPAN_ID_PAIRS_STORAGE_KEY,
-            virtual_fs,
-            registry,
-        );
-        drop(source_code);
-        if let Some((object, construct_context, _registry, _module_loader, reference_connector, link_connector, pass_through_connector, root_scope_guard)) = evaluation_result {
-            El::new()
-                .s(Width::fill())
-                .s(Height::fill())
-                .child_signal(object_with_document_to_element_signal(
-                    object.clone(),
-                    construct_context,
-                ))
-                .after_remove(move |_| {
-                    // Drop object first, then drop connectors to trigger actor cleanup.
-                    // The root_scope_guard is dropped last to recursively destroy all
-                    // registry scopes and their actors.
-                    drop(object);
-                    drop(reference_connector);
-                    drop(link_connector);
-                    drop(pass_through_connector);
-                    drop(root_scope_guard);
-                })
-                .unify()
-        } else {
+        #[cfg(not(feature = "engine-actors"))]
+        {
+            drop(source_code);
+            drop(files);
             El::new()
                 .s(Font::new().color(color!("LightCoral")))
-                .child("Failed to run the example. See errors in dev console.")
+                .child("Actors engine is not available in this build.")
                 .unify()
         }
     }
@@ -2647,7 +2826,9 @@ impl Playground {
                 }
             }))
             .s(Borders::all(
-                Border::new().color(color!("rgba(88, 126, 194, 0.4)")).width(1),
+                Border::new()
+                    .color(color!("rgba(88, 126, 194, 0.4)"))
+                    .width(1),
             ))
             .s(Font::new().color_signal(map_ref! {
                 let hovered = hovered_signal.signal(),
@@ -2683,7 +2864,9 @@ impl Playground {
                     if let Some(prev_id) = prev_selected_id {
                         let current_code = source_code.lock_ref().to_string();
                         let mut examples = (**custom_examples.lock_ref()).clone();
-                        if let Some((_, _, code)) = examples.iter_mut().find(|(id, _, _)| id == &prev_id) {
+                        if let Some((_, _, code)) =
+                            examples.iter_mut().find(|(id, _, _)| id == &prev_id)
+                        {
                             *code = current_code;
                         }
                         custom_examples.set(Rc::new(examples));
@@ -2711,6 +2894,11 @@ impl Playground {
                         #[cfg(feature = "engine-wasm")]
                         if engine_type.get() == EngineType::Wasm {
                             clear_wasm_persisted_states();
+                        }
+
+                        #[cfg(feature = "engine-wasm-pro")]
+                        if engine_type.get() == EngineType::WasmPro {
+                            clear_wasm_pro_persisted_states();
                         }
                     }
 
@@ -2763,7 +2951,9 @@ impl Playground {
                 }
             }))
             .s(Borders::all(
-                Border::new().color(color!("rgba(88, 126, 194, 0.4)")).width(1),
+                Border::new()
+                    .color(color!("rgba(88, 126, 194, 0.4)"))
+                    .width(1),
             ))
             .s(Font::new().color_signal(map_ref! {
                 let hovered = hovered_signal.signal(),
@@ -2802,7 +2992,9 @@ impl Playground {
                     if let Some(prev_id) = prev_selected_id {
                         let current_code = source_code.lock_ref().to_string();
                         let mut examples = (**custom_examples.lock_ref()).clone();
-                        if let Some((_, _, code)) = examples.iter_mut().find(|(id, _, _)| id == &prev_id) {
+                        if let Some((_, _, code)) =
+                            examples.iter_mut().find(|(id, _, _)| id == &prev_id)
+                        {
                             *code = current_code;
                         }
                         custom_examples.set(Rc::new(examples));
@@ -2827,6 +3019,11 @@ impl Playground {
                         if engine_type.get() == EngineType::Wasm {
                             clear_wasm_persisted_states();
                         }
+
+                        #[cfg(feature = "engine-wasm-pro")]
+                        if engine_type.get() == EngineType::WasmPro {
+                            clear_wasm_pro_persisted_states();
+                        }
                     }
 
                     set_example_in_url(example.name);
@@ -2838,7 +3035,9 @@ impl Playground {
                     }
                     files.set(Rc::new(new_files));
                     current_file.set(example.entry_file.to_string());
-                    let entry_content = example.files.iter()
+                    let entry_content = example
+                        .files
+                        .iter()
                         .find(|(name, _)| *name == example.entry_file)
                         .map(|(_, content)| *content)
                         .unwrap_or("");
@@ -2856,27 +3055,25 @@ impl Playground {
             .s(Padding::new().x(12).y(7))
             .s(RoundedCorners::all(24))
             .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
-            .s(Background::new().color_signal(
-                hovered.signal().map(|h| {
-                    if h {
-                        color!("rgba(60, 140, 100, 0.45)")
-                    } else {
-                        color!("rgba(40, 100, 70, 0.35)")
-                    }
-                })
-            ))
+            .s(Background::new().color_signal(hovered.signal().map(|h| {
+                if h {
+                    color!("rgba(60, 140, 100, 0.45)")
+                } else {
+                    color!("rgba(40, 100, 70, 0.35)")
+                }
+            })))
             .s(Borders::all(
-                Border::new().color(color!("rgba(80, 180, 120, 0.5)")).width(1),
+                Border::new()
+                    .color(color!("rgba(80, 180, 120, 0.5)"))
+                    .width(1),
             ))
-            .s(Font::new().color_signal(
-                hovered.signal().map(|h| {
-                    if h {
-                        color!("rgba(180, 255, 200, 0.95)")
-                    } else {
-                        color!("rgba(150, 220, 170, 0.85)")
-                    }
-                })
-            ))
+            .s(Font::new().color_signal(hovered.signal().map(|h| {
+                if h {
+                    color!("rgba(180, 255, 200, 0.95)")
+                } else {
+                    color!("rgba(150, 220, 170, 0.85)")
+                }
+            })))
             .label(
                 El::new()
                     .s(Font::new().size(14).weight(FontWeight::SemiBold).no_wrap())
@@ -2896,7 +3093,9 @@ impl Playground {
                     if let Some(prev_id) = prev_selected_id {
                         let current_code = source_code.lock_ref().to_string();
                         let mut examples = (**custom_examples.lock_ref()).clone();
-                        if let Some((_, _, code)) = examples.iter_mut().find(|(id, _, _)| id == &prev_id) {
+                        if let Some((_, _, code)) =
+                            examples.iter_mut().find(|(id, _, _)| id == &prev_id)
+                        {
                             *code = current_code;
                         }
                         custom_examples.set(Rc::new(examples));
@@ -2916,7 +3115,8 @@ impl Playground {
                     drop(examples);
 
                     // Default code for new custom example
-                    let default_code = "-- My custom example\ndocument: TEXT { Hello! } |> Document/new()";
+                    let default_code =
+                        "-- My custom example\ndocument: TEXT { Hello! } |> Document/new()";
 
                     // Add to custom examples (push to end to preserve order)
                     let mut new_examples = (**custom_examples.lock_ref()).clone();
@@ -2963,257 +3163,305 @@ impl Playground {
         Row::new()
             .s(Align::new().center_y())
             .s(Gap::new().x(0))
-            .item_signal(
-                editing_signal.signal_cloned().map({
-                    let id = id.clone();
-                    let name = name.clone();
-                    let hovered = hovered.clone();
-                    let hovered_signal = hovered_signal.clone();
-                    let selected_signal = selected_signal.clone();
-                    let custom_examples_signal = custom_examples_signal.clone();
-                    let custom_examples = self.custom_examples.clone();
-                    let selected_custom_example = self.selected_custom_example.clone();
-                    let editing_custom_example = self.editing_custom_example.clone();
-                    let files = self.files.clone();
-                    let current_file = self.current_file.clone();
-                    let source_code = self.source_code.clone();
-                    let run_command = self.run_command.clone();
-                    let id_for_bg = id_for_bg.clone();
-                    let id_for_font = id_for_font.clone();
-                    let edit_text = edit_text.clone();
-                    move |editing| {
-                        // editing_custom_example stores the ID
-                        let is_editing = editing.as_ref() == Some(&id_for_editing_check);
-                        if is_editing {
-                            // Editing mode: show text input
-                            let id_for_rename = id.clone();
-                            let name_for_rename = name.clone();
-                            let custom_examples_for_rename = custom_examples.clone();
-                            let editing_custom_example_for_rename = editing_custom_example.clone();
-                            let edit_text_for_input = edit_text.clone();
+            .item_signal(editing_signal.signal_cloned().map({
+                let id = id.clone();
+                let name = name.clone();
+                let hovered = hovered.clone();
+                let hovered_signal = hovered_signal.clone();
+                let selected_signal = selected_signal.clone();
+                let custom_examples_signal = custom_examples_signal.clone();
+                let custom_examples = self.custom_examples.clone();
+                let selected_custom_example = self.selected_custom_example.clone();
+                let editing_custom_example = self.editing_custom_example.clone();
+                let files = self.files.clone();
+                let current_file = self.current_file.clone();
+                let source_code = self.source_code.clone();
+                let run_command = self.run_command.clone();
+                let id_for_bg = id_for_bg.clone();
+                let id_for_font = id_for_font.clone();
+                let edit_text = edit_text.clone();
+                move |editing| {
+                    // editing_custom_example stores the ID
+                    let is_editing = editing.as_ref() == Some(&id_for_editing_check);
+                    if is_editing {
+                        // Editing mode: show text input
+                        let id_for_rename = id.clone();
+                        let name_for_rename = name.clone();
+                        let custom_examples_for_rename = custom_examples.clone();
+                        let editing_custom_example_for_rename = editing_custom_example.clone();
+                        let edit_text_for_input = edit_text.clone();
 
-                            TextInput::new()
-                                .s(Padding::new().left(14).right(6).y(4))
-                                .s(RoundedCorners::new().left(24))
-                                .s(Font::new().size(14).weight(FontWeight::Medium).color(color!("#e8ffe8")))
-                                .s(Background::new().color(color!("rgba(100, 140, 100, 0.55)")))
-                                .s(Borders::new()
-                                    .left(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
-                                    .top(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
-                                    .bottom(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
+                        TextInput::new()
+                            .s(Padding::new().left(14).right(6).y(4))
+                            .s(RoundedCorners::new().left(24))
+                            .s(Font::new()
+                                .size(14)
+                                .weight(FontWeight::Medium)
+                                .color(color!("#e8ffe8")))
+                            .s(Background::new().color(color!("rgba(100, 140, 100, 0.55)")))
+                            .s(Borders::new()
+                                .left(
+                                    Border::new()
+                                        .color(color!("rgba(100, 160, 100, 0.4)"))
+                                        .width(1),
                                 )
-                                .s(Width::exact(100))
-                                .focus(true)
-                                .label_hidden("Rename example")
-                                .text_signal(edit_text_for_input.signal_cloned())
-                                .on_change({
-                                    let edit_text = edit_text.clone();
-                                    move |new_text| edit_text.set(new_text)
-                                })
-                                .update_raw_el({
-                                    let id = id_for_rename.clone();
-                                    let name = name_for_rename.clone();
-                                    let custom_examples = custom_examples_for_rename.clone();
-                                    let editing_custom_example = editing_custom_example_for_rename.clone();
-                                    let edit_text = edit_text.clone();
-                                    move |raw_el| {
-                                        raw_el.event_handler(move |event: events::KeyDown| {
-                                            if event.key() == "Enter" {
-                                                let new_name = edit_text.lock_ref().trim().to_string();
-                                                if !new_name.is_empty() && new_name != name {
-                                                    // Rename the custom example (in place to preserve order)
-                                                    // Find by ID, update name
-                                                    let mut new_examples = (**custom_examples.lock_ref()).clone();
-                                                    if let Some((_, n, _)) = new_examples.iter_mut().find(|(eid, _, _)| eid == &id) {
-                                                        *n = new_name.clone();
-                                                        custom_examples.set(Rc::new(new_examples));
-                                                        // Update URL to reflect new name
-                                                        set_custom_example_in_url(&new_name);
-                                                    }
+                                .top(
+                                    Border::new()
+                                        .color(color!("rgba(100, 160, 100, 0.4)"))
+                                        .width(1),
+                                )
+                                .bottom(
+                                    Border::new()
+                                        .color(color!("rgba(100, 160, 100, 0.4)"))
+                                        .width(1),
+                                ))
+                            .s(Width::exact(100))
+                            .focus(true)
+                            .label_hidden("Rename example")
+                            .text_signal(edit_text_for_input.signal_cloned())
+                            .on_change({
+                                let edit_text = edit_text.clone();
+                                move |new_text| edit_text.set(new_text)
+                            })
+                            .update_raw_el({
+                                let id = id_for_rename.clone();
+                                let name = name_for_rename.clone();
+                                let custom_examples = custom_examples_for_rename.clone();
+                                let editing_custom_example =
+                                    editing_custom_example_for_rename.clone();
+                                let edit_text = edit_text.clone();
+                                move |raw_el| {
+                                    raw_el.event_handler(move |event: events::KeyDown| {
+                                        if event.key() == "Enter" {
+                                            let new_name = edit_text.lock_ref().trim().to_string();
+                                            if !new_name.is_empty() && new_name != name {
+                                                // Rename the custom example (in place to preserve order)
+                                                // Find by ID, update name
+                                                let mut new_examples =
+                                                    (**custom_examples.lock_ref()).clone();
+                                                if let Some((_, n, _)) = new_examples
+                                                    .iter_mut()
+                                                    .find(|(eid, _, _)| eid == &id)
+                                                {
+                                                    *n = new_name.clone();
+                                                    custom_examples.set(Rc::new(new_examples));
+                                                    // Update URL to reflect new name
+                                                    set_custom_example_in_url(&new_name);
                                                 }
-                                                editing_custom_example.set(None);
-                                            } else if event.key() == "Escape" {
-                                                editing_custom_example.set(None);
                                             }
-                                        })
-                                    }
-                                })
-                                .on_blur({
-                                    let id = id_for_rename;
-                                    let name = name_for_rename;
-                                    let custom_examples = custom_examples_for_rename;
-                                    let editing_custom_example = editing_custom_example_for_rename;
-                                    let edit_text = edit_text.clone();
-                                    move || {
-                                        let new_name = edit_text.lock_ref().trim().to_string();
-                                        if !new_name.is_empty() && new_name != name {
-                                            // Rename the custom example (in place to preserve order)
-                                            // Find by ID, update name
-                                            let mut new_examples = (**custom_examples.lock_ref()).clone();
-                                            if let Some((_, n, _)) = new_examples.iter_mut().find(|(eid, _, _)| eid == &id) {
-                                                *n = new_name.clone();
-                                                custom_examples.set(Rc::new(new_examples));
-                                                // Update URL to reflect new name
-                                                set_custom_example_in_url(&new_name);
-                                            }
+                                            editing_custom_example.set(None);
+                                        } else if event.key() == "Escape" {
+                                            editing_custom_example.set(None);
                                         }
-                                        editing_custom_example.set(None);
-                                    }
-                                })
-                                .left_either()
-                        } else {
-                            // Normal mode: show button
-                            let id_for_bg = id_for_bg.clone();
-                            let id_for_font = id_for_font.clone();
-                            let id_for_click = id.clone();
-                            let id_for_dblclick = id.clone();
-                            let name_for_click = name.clone();
-                            let name_for_dblclick = name.clone();
-                            Button::new()
-                                .s(Padding::new().left(14).right(6).y(7))
-                                .s(RoundedCorners::new().left(24))
-                                .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
-                                .s(Background::new().color_signal(map_ref! {
-                                    let hovered = hovered_signal.signal(),
-                                    let selected = selected_signal.signal_cloned() => {
-                                        let is_active = selected.as_ref() == Some(&id_for_bg);
-                                        match (is_active, *hovered) {
-                                            (true, _) => color!("rgba(100, 140, 100, 0.55)"),
-                                            (false, true) => color!("rgba(50, 70, 50, 0.45)"),
-                                            (false, false) => color!("rgba(35, 50, 35, 0.35)"),
+                                    })
+                                }
+                            })
+                            .on_blur({
+                                let id = id_for_rename;
+                                let name = name_for_rename;
+                                let custom_examples = custom_examples_for_rename;
+                                let editing_custom_example = editing_custom_example_for_rename;
+                                let edit_text = edit_text.clone();
+                                move || {
+                                    let new_name = edit_text.lock_ref().trim().to_string();
+                                    if !new_name.is_empty() && new_name != name {
+                                        // Rename the custom example (in place to preserve order)
+                                        // Find by ID, update name
+                                        let mut new_examples =
+                                            (**custom_examples.lock_ref()).clone();
+                                        if let Some((_, n, _)) =
+                                            new_examples.iter_mut().find(|(eid, _, _)| eid == &id)
+                                        {
+                                            *n = new_name.clone();
+                                            custom_examples.set(Rc::new(new_examples));
+                                            // Update URL to reflect new name
+                                            set_custom_example_in_url(&new_name);
                                         }
                                     }
-                                }))
-                                .s(Borders::new()
-                                    .left(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
-                                    .top(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
-                                    .bottom(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
+                                    editing_custom_example.set(None);
+                                }
+                            })
+                            .left_either()
+                    } else {
+                        // Normal mode: show button
+                        let id_for_bg = id_for_bg.clone();
+                        let id_for_font = id_for_font.clone();
+                        let id_for_click = id.clone();
+                        let id_for_dblclick = id.clone();
+                        let name_for_click = name.clone();
+                        let name_for_dblclick = name.clone();
+                        Button::new()
+                            .s(Padding::new().left(14).right(6).y(7))
+                            .s(RoundedCorners::new().left(24))
+                            .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
+                            .s(Background::new().color_signal(map_ref! {
+                                let hovered = hovered_signal.signal(),
+                                let selected = selected_signal.signal_cloned() => {
+                                    let is_active = selected.as_ref() == Some(&id_for_bg);
+                                    match (is_active, *hovered) {
+                                        (true, _) => color!("rgba(100, 140, 100, 0.55)"),
+                                        (false, true) => color!("rgba(50, 70, 50, 0.45)"),
+                                        (false, false) => color!("rgba(35, 50, 35, 0.35)"),
+                                    }
+                                }
+                            }))
+                            .s(Borders::new()
+                                .left(
+                                    Border::new()
+                                        .color(color!("rgba(100, 160, 100, 0.4)"))
+                                        .width(1),
                                 )
-                                .s(Font::new().color_signal(map_ref! {
-                                    let hovered = hovered_signal.signal(),
-                                    let selected = selected_signal.signal_cloned() =>
+                                .top(
+                                    Border::new()
+                                        .color(color!("rgba(100, 160, 100, 0.4)"))
+                                        .width(1),
+                                )
+                                .bottom(
+                                    Border::new()
+                                        .color(color!("rgba(100, 160, 100, 0.4)"))
+                                        .width(1),
+                                ))
+                            .s(Font::new().color_signal(map_ref! {
+                                let hovered = hovered_signal.signal(),
+                                let selected = selected_signal.signal_cloned() =>
+                                {
+                                    let is_active = selected.as_ref() == Some(&id_for_font);
+                                    if is_active {
+                                        color!("#e8ffe8")
+                                    } else if *hovered {
+                                        color!("rgba(200, 240, 200, 0.86)")
+                                    } else {
+                                        color!("rgba(150, 200, 150, 0.7)")
+                                    }
+                                }
+                            }))
+                            .label(
+                                El::new()
+                                    .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
+                                    .child(name.clone()),
+                            )
+                            .on_hovered_change({
+                                let hovered = hovered.clone();
+                                move |is_hovered| hovered.set(is_hovered)
+                            })
+                            .on_press({
+                                let id = id_for_click;
+                                let name = name_for_click;
+                                let custom_examples = custom_examples.clone();
+                                let selected_custom_example = selected_custom_example.clone();
+                                let files = files.clone();
+                                let current_file = current_file.clone();
+                                let source_code = source_code.clone();
+                                let run_command = run_command.clone();
+                                move || {
+                                    // If already selected, do nothing (don't reset code)
+                                    if selected_custom_example.lock_ref().as_ref() == Some(&id) {
+                                        return;
+                                    }
+
+                                    // Save current code to previously selected custom example
+                                    let prev_selected_id =
+                                        selected_custom_example.lock_ref().clone();
+                                    if let Some(prev_id) = prev_selected_id {
+                                        let current_code = source_code.lock_ref().to_string();
+                                        let mut examples = (**custom_examples.lock_ref()).clone();
+                                        if let Some((_, _, code)) =
+                                            examples.iter_mut().find(|(eid, _, _)| eid == &prev_id)
+                                        {
+                                            *code = current_code;
+                                        }
+                                        custom_examples.set(Rc::new(examples));
+                                    }
+
+                                    // Load new example's code
+                                    let examples = custom_examples.lock_ref();
+                                    if let Some((_, _, code)) =
+                                        examples.iter().find(|(eid, _, _)| eid == &id)
                                     {
-                                        let is_active = selected.as_ref() == Some(&id_for_font);
-                                        if is_active {
-                                            color!("#e8ffe8")
-                                        } else if *hovered {
-                                            color!("rgba(200, 240, 200, 0.86)")
-                                        } else {
-                                            color!("rgba(150, 200, 150, 0.7)")
-                                        }
+                                        let code = code.clone();
+                                        drop(examples);
+
+                                        // Clear saved state
+                                        local_storage().remove(STATES_STORAGE_KEY);
+                                        local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
+                                        local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+                                        clear_prefixed_storage_keys(&[
+                                            "list_calls:",
+                                            "list_removed:",
+                                        ]);
+
+                                        // Update URL (use custom-example parameter)
+                                        set_custom_example_in_url(&name);
+
+                                        // Set as current file
+                                        let filename = format!("{}.bn", name);
+                                        let mut new_files = BTreeMap::new();
+                                        new_files.insert(filename.clone(), code.clone());
+                                        files.set(Rc::new(new_files));
+                                        current_file.set(filename);
+                                        source_code.set(Rc::new(Cow::from(code)));
+                                        run_command.set(Some(RunCommand { filename: None }));
+
+                                        // Update selection (by ID)
+                                        selected_custom_example.set(Some(id.clone()));
                                     }
-                                }))
-                                .label(
-                                    El::new()
-                                        .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
-                                        .child(name.clone()),
-                                )
-                                .on_hovered_change({
-                                    let hovered = hovered.clone();
-                                    move |is_hovered| hovered.set(is_hovered)
-                                })
-                                .on_press({
-                                    let id = id_for_click;
-                                    let name = name_for_click;
-                                    let custom_examples = custom_examples.clone();
-                                    let selected_custom_example = selected_custom_example.clone();
-                                    let files = files.clone();
-                                    let current_file = current_file.clone();
-                                    let source_code = source_code.clone();
-                                    let run_command = run_command.clone();
-                                    move || {
-                                        // If already selected, do nothing (don't reset code)
-                                        if selected_custom_example.lock_ref().as_ref() == Some(&id) {
-                                            return;
-                                        }
-
-                                        // Save current code to previously selected custom example
-                                        let prev_selected_id = selected_custom_example.lock_ref().clone();
-                                        if let Some(prev_id) = prev_selected_id {
-                                            let current_code = source_code.lock_ref().to_string();
-                                            let mut examples = (**custom_examples.lock_ref()).clone();
-                                            if let Some((_, _, code)) = examples.iter_mut().find(|(eid, _, _)| eid == &prev_id) {
-                                                *code = current_code;
-                                            }
-                                            custom_examples.set(Rc::new(examples));
-                                        }
-
-                                        // Load new example's code
-                                        let examples = custom_examples.lock_ref();
-                                        if let Some((_, _, code)) = examples.iter().find(|(eid, _, _)| eid == &id) {
-                                            let code = code.clone();
-                                            drop(examples);
-
-                                            // Clear saved state
-                                            local_storage().remove(STATES_STORAGE_KEY);
-                                            local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
-                                            local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
-                                            clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
-
-                                            // Update URL (use custom-example parameter)
-                                            set_custom_example_in_url(&name);
-
-                                            // Set as current file
-                                            let filename = format!("{}.bn", name);
-                                            let mut new_files = BTreeMap::new();
-                                            new_files.insert(filename.clone(), code.clone());
-                                            files.set(Rc::new(new_files));
-                                            current_file.set(filename);
-                                            source_code.set(Rc::new(Cow::from(code)));
-                                            run_command.set(Some(RunCommand { filename: None }));
-
-                                            // Update selection (by ID)
-                                            selected_custom_example.set(Some(id.clone()));
-                                        }
-                                    }
-                                })
-                                .update_raw_el({
-                                    let editing_custom_example = editing_custom_example.clone();
-                                    let edit_text = edit_text.clone();
-                                    let name_for_dblclick = name_for_dblclick.clone();
-                                    let id_for_dblclick = id_for_dblclick.clone();
-                                    move |raw_el| {
-                                        raw_el.event_handler(move |_: events::DoubleClick| {
-                                            // Start editing on double-click (store ID)
-                                            edit_text.set(name_for_dblclick.clone());
-                                            editing_custom_example.set(Some(id_for_dblclick.clone()));
-                                        })
-                                    }
-                                })
-                                .right_either()
-                        }
+                                }
+                            })
+                            .update_raw_el({
+                                let editing_custom_example = editing_custom_example.clone();
+                                let edit_text = edit_text.clone();
+                                let name_for_dblclick = name_for_dblclick.clone();
+                                let id_for_dblclick = id_for_dblclick.clone();
+                                move |raw_el| {
+                                    raw_el.event_handler(move |_: events::DoubleClick| {
+                                        // Start editing on double-click (store ID)
+                                        edit_text.set(name_for_dblclick.clone());
+                                        editing_custom_example.set(Some(id_for_dblclick.clone()));
+                                    })
+                                }
+                            })
+                            .right_either()
                     }
-                })
-            )
+                }
+            }))
             .item(
                 // Delete button (×)
                 Button::new()
                     .s(Padding::new().left(4).right(10).y(7))
                     .s(RoundedCorners::new().right(24))
                     .s(Font::new().size(12).weight(FontWeight::Bold))
-                    .s(Background::new().color_signal(
-                        delete_hovered.signal().map(|h| {
+                    .s(
+                        Background::new().color_signal(delete_hovered.signal().map(|h| {
                             if h {
                                 color!("rgba(180, 80, 80, 0.55)")
                             } else {
                                 color!("rgba(35, 50, 35, 0.35)")
                             }
-                        })
-                    ))
-                    .s(Borders::new()
-                        .right(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
-                        .top(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
-                        .bottom(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
+                        })),
                     )
-                    .s(Font::new().color_signal(
-                        delete_hovered.signal().map(|h| {
-                            if h {
-                                color!("rgba(255, 200, 200, 0.95)")
-                            } else {
-                                color!("rgba(150, 200, 150, 0.6)")
-                            }
-                        })
-                    ))
+                    .s(Borders::new()
+                        .right(
+                            Border::new()
+                                .color(color!("rgba(100, 160, 100, 0.4)"))
+                                .width(1),
+                        )
+                        .top(
+                            Border::new()
+                                .color(color!("rgba(100, 160, 100, 0.4)"))
+                                .width(1),
+                        )
+                        .bottom(
+                            Border::new()
+                                .color(color!("rgba(100, 160, 100, 0.4)"))
+                                .width(1),
+                        ))
+                    .s(Font::new().color_signal(delete_hovered.signal().map(|h| {
+                        if h {
+                            color!("rgba(255, 200, 200, 0.95)")
+                        } else {
+                            color!("rgba(150, 200, 150, 0.6)")
+                        }
+                    })))
                     .label("×")
                     .on_hovered_change(move |is_hovered| delete_hovered.set(is_hovered))
                     .on_press({
@@ -3227,15 +3475,16 @@ impl Playground {
                             }
                             // Remove custom example by ID
                             let mut new_examples = (**custom_examples.lock_ref()).clone();
-                            if let Some(idx) = new_examples.iter().position(|(eid, _, _)| eid == &id) {
+                            if let Some(idx) =
+                                new_examples.iter().position(|(eid, _, _)| eid == &id)
+                            {
                                 new_examples.remove(idx);
                             }
                             custom_examples.set(Rc::new(new_examples));
                         }
-                    })
+                    }),
             )
     }
-
 }
 
 // Force size UI helper functions
@@ -3247,7 +3496,7 @@ fn force_size_input(value: Mutable<String>, label_text: &'static str) -> impl El
         .item(
             El::new()
                 .s(Font::new().size(10).color(color!("rgba(255,255,255,0.4)")))
-                .child(label_text)
+                .child(label_text),
         )
         .item(
             TextInput::new()
@@ -3255,19 +3504,23 @@ fn force_size_input(value: Mutable<String>, label_text: &'static str) -> impl El
                 .s(Height::exact(22))
                 .s(Padding::new().x(4))
                 .s(Font::new().size(12).color(color!("rgba(255,255,255,0.9)")))
-                .s(Background::new().color_signal(
-                    focused.signal().map_bool(
-                        || color!("rgba(255,255,255,0.15)"),
-                        || color!("rgba(255,255,255,0.08)")
-                    )
-                ))
+                .s(Background::new().color_signal(focused.signal().map_bool(
+                    || color!("rgba(255,255,255,0.15)"),
+                    || color!("rgba(255,255,255,0.08)"),
+                )))
                 .s(RoundedCorners::all(4))
-                .s(Borders::all_signal(
-                    focused.signal().map_bool(
-                        || Border::new().width(1).color(color!("rgba(100,150,255,0.5)")),
-                        || Border::new().width(1).color(color!("rgba(255,255,255,0.1)"))
-                    )
-                ))
+                .s(Borders::all_signal(focused.signal().map_bool(
+                    || {
+                        Border::new()
+                            .width(1)
+                            .color(color!("rgba(100,150,255,0.5)"))
+                    },
+                    || {
+                        Border::new()
+                            .width(1)
+                            .color(color!("rgba(255,255,255,0.1)"))
+                    },
+                )))
                 .label_hidden(label_text)
                 .text_signal(value.signal_cloned())
                 .on_focused_change(move |is_focused| focused.set(is_focused))
@@ -3275,7 +3528,7 @@ fn force_size_input(value: Mutable<String>, label_text: &'static str) -> impl El
                     let value = value.clone();
                     move |text| value.set(text)
                 })
-                .placeholder(Placeholder::new("700"))
+                .placeholder(Placeholder::new("700")),
         )
 }
 
@@ -3288,13 +3541,14 @@ fn force_size_apply_button(
     Button::new()
         .s(Padding::new().x(8).y(4))
         .s(RoundedCorners::all(4))
-        .s(Background::new().color_signal(
-            hovered.signal().map_bool(
-                || color!("rgba(100,180,100,0.3)"),
-                || color!("rgba(100,180,100,0.15)")
-            )
-        ))
-        .s(Font::new().size(11).weight(FontWeight::Medium).color(color!("rgba(180,255,180,0.9)")))
+        .s(Background::new().color_signal(hovered.signal().map_bool(
+            || color!("rgba(100,180,100,0.3)"),
+            || color!("rgba(100,180,100,0.15)"),
+        )))
+        .s(Font::new()
+            .size(11)
+            .weight(FontWeight::Medium)
+            .color(color!("rgba(180,255,180,0.9)")))
         .label("Apply")
         .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
         .on_press(move || {
@@ -3312,13 +3566,14 @@ fn force_size_auto_button(
     Button::new()
         .s(Padding::new().x(8).y(4))
         .s(RoundedCorners::all(4))
-        .s(Background::new().color_signal(
-            hovered.signal().map_bool(
-                || color!("rgba(180,180,255,0.3)"),
-                || color!("rgba(180,180,255,0.15)")
-            )
-        ))
-        .s(Font::new().size(11).weight(FontWeight::Medium).color(color!("rgba(200,200,255,0.9)")))
+        .s(Background::new().color_signal(hovered.signal().map_bool(
+            || color!("rgba(180,180,255,0.3)"),
+            || color!("rgba(180,180,255,0.15)"),
+        )))
+        .s(Font::new()
+            .size(11)
+            .weight(FontWeight::Medium)
+            .color(color!("rgba(200,200,255,0.9)")))
         .label("Auto")
         .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
         .on_press(move || {
@@ -3332,13 +3587,14 @@ fn force_size_toggle_button(force_size_expanded: Mutable<bool>) -> impl Element 
     Button::new()
         .s(Padding::new().x(10).y(5))
         .s(RoundedCorners::all(4))
-        .s(Background::new().color_signal(
-            hovered.signal().map_bool(
-                || color!("rgba(255,255,255,0.12)"),
-                || color!("rgba(255,255,255,0.06)")
-            )
-        ))
-        .s(Font::new().size(12).weight(FontWeight::Medium).color(color!("rgba(255,255,255,0.7)")))
+        .s(Background::new().color_signal(hovered.signal().map_bool(
+            || color!("rgba(255,255,255,0.12)"),
+            || color!("rgba(255,255,255,0.06)"),
+        )))
+        .s(Font::new()
+            .size(12)
+            .weight(FontWeight::Medium)
+            .color(color!("rgba(255,255,255,0.7)")))
         .label("Force size")
         .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
         .on_press(move || {

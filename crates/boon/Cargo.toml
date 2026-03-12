@@ -58,8 +58,9 @@ default = ["debug-channels", "engine-dd"]
 engine-actors = []
 engine-dd = ["dep:ordered-float", "dep:indexmap", "dep:js-sys", "dep:timely", "dep:differential-dataflow"]
 engine-wasm = ["dep:wasm-encoder", "dep:js-sys", "dep:wasm-bindgen", "dep:serde_json"]
+engine-wasm-pro = ["dep:wasm-encoder", "dep:js-sys", "dep:wasm-bindgen", "dep:serde_json"]
 engine-both = ["engine-actors", "engine-dd"]
-engine-all = ["engine-actors", "engine-dd", "engine-wasm"]
+engine-all = ["engine-actors", "engine-dd", "engine-wasm", "engine-wasm-pro"]
 
 # Enable debug logging and timeouts for channel operations.
 # Useful for detecting deadlocks and monitoring backpressure.

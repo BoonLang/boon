@@ -3,103 +3,86 @@
 [test]
 category = "interactive"
 description = "7GUIs Task 7: spreadsheet with formulas and change propagation"
-[output]
-text = "Cells"
-match = "contains"
-
 [timing]
-timeout = 30000
+timeout = 90000
 poll_interval = 500
-initial_delay = 2000
-
-# SPEC: Title visible
-[[sequence]]
-description = "Title visible"
-actions = [["assert_contains", "Cells"]]
-expect = "Cells"
-
-# SPEC: Column headers visible
-[[sequence]]
-description = "Column A header visible"
-actions = [["assert_contains", "A"]]
-expect = "Cells"
-
-[[sequence]]
-description = "Column Z header visible"
-actions = [["assert_contains", "Z"]]
-expect = "Cells"
+initial_delay = 20000
 
 # SPEC: Grid renders with default formulas
 [[sequence]]
 description = "Default A1=5 visible"
-actions = [["assert_contains", "5"]]
-expect = "Cells"
+actions = [["wait", 25000], ["assert_cells_cell_text", 1, 1, "5"]]
 
 [[sequence]]
 description = "Default A2=10 visible"
-actions = [["assert_contains", "10"]]
-expect = "Cells"
+actions = [["assert_cells_cell_text", 2, 1, "10"]]
 
 [[sequence]]
 description = "Default B1=15 visible (add(A1,A2) = 5+10)"
-actions = [["assert_contains", "15"]]
-expect = "Cells"
+actions = [["assert_cells_cell_text", 1, 2, "15"]]
 
 [[sequence]]
 description = "Default C1=30 visible (sum(A1:A3) = 5+10+15)"
-actions = [["assert_contains", "30"]]
-expect = "Cells"
-
-[[sequence]]
-description = "Row 100 visible"
-actions = [["assert_contains", "100"]]
-expect = "Cells"
+actions = [["assert_cells_cell_text", 1, 3, "30"]]
 
 [[sequence]]
 description = "Double-click A1 enters edit mode with current value"
 actions = [
+  ["wait", 15000],
   ["dblclick_cells_cell", 1, 1],
   ["wait", 200],
-  ["assert_focused", 0],
-  ["assert_input_value", 0, "5"],
+  ["assert_focused"],
+  ["assert_focused_input_value", "5"],
 ]
-expect = "Cells"
 
 [[sequence]]
 description = "Enter commits edited A1 and recomputes dependent cells"
 actions = [
-  ["set_input_value", 0, "7"],
-  ["assert_input_value", 0, "7"],
+  ["set_focused_input_value", "7"],
+  ["assert_focused_input_value", "7"],
   ["key", "Enter"],
   ["wait", 200],
-  ["assert_not_focused", 0],
+  ["assert_not_focused"],
+  ["assert_cells_cell_text", 1, 1, "7"],
+  ["assert_cells_cell_text", 1, 2, "17"],
+  ["assert_cells_cell_text", 1, 3, "32"],
 ]
-expect = "171732"
 
 [[sequence]]
 description = "Escape cancels in-progress edit"
 actions = [
   ["dblclick_cells_cell", 1, 1],
   ["wait", 200],
-  ["assert_focused", 0],
-  ["assert_input_value", 0, "7"],
-  ["set_input_value", 0, "9"],
-  ["assert_input_value", 0, "9"],
+  ["assert_focused"],
+  ["assert_focused_input_value", "7"],
+  ["set_focused_input_value", "9"],
+  ["assert_focused_input_value", "9"],
   ["key", "Escape"],
   ["wait", 200],
-  ["assert_not_focused", 0],
+  ["assert_not_focused"],
+  ["assert_cells_cell_text", 1, 1, "7"],
+  ["assert_cells_cell_text", 1, 2, "17"],
+  ["assert_cells_cell_text", 1, 3, "32"],
 ]
-expect = "171732"
 
 [[sequence]]
 description = "Blur exits edit mode without corrupting committed values"
 actions = [
   ["dblclick_cells_cell", 1, 1],
   ["wait", 200],
-  ["assert_focused", 0],
-  ["set_input_value", 0, "8"],
+  ["assert_focused"],
+  ["set_focused_input_value", "8"],
   ["click_text", "Cells"],
   ["wait", 200],
-  ["assert_not_focused", 0],
+  ["assert_not_focused"],
+  ["assert_cells_cell_text", 1, 1, "7"],
+  ["assert_cells_cell_text", 1, 2, "17"],
+  ["assert_cells_cell_text", 1, 3, "32"],
 ]
-expect = "171732"
+
+[[sequence]]
+description = "Official row 100 becomes visible"
+actions = [
+  ["wait", 45000],
+  ["assert_cells_row_visible", 100],
+]

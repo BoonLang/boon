@@ -151,7 +151,11 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                     &mut variable.value,
                     reachable_referenceables.clone(),
                     level,
-                    if variable.name.is_empty() { None } else { Some(variable.name) },
+                    if variable.name.is_empty() {
+                        None
+                    } else {
+                        Some(variable.name)
+                    },
                     errors,
                     all_referenced,
                 );
@@ -207,7 +211,11 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                     &mut variable.value,
                     reachable_referenceables.clone(),
                     level,
-                    if variable.name.is_empty() { None } else { Some(variable.name) },
+                    if variable.name.is_empty() {
+                        None
+                    } else {
+                        Some(variable.name)
+                    },
                     errors,
                     all_referenced,
                 );
@@ -889,7 +897,10 @@ fn resolve_pattern_references<'code>(
                 }
             }
         }
-        Pattern::ValueComparison { path, referenced_span } => {
+        Pattern::ValueComparison {
+            path,
+            referenced_span,
+        } => {
             // Resolve the base variable of the path (like TEXT interpolation)
             let base_var = path[0];
             let reachable: BTreeMap<&str, Referenceable> =

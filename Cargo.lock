@@ -175,6 +175,9 @@ name = "boon-renderer-zoon"
 version = "0.1.0"
 dependencies = [
  "boon-scene",
+ "ulid",
+ "wasm-bindgen",
+ "web-sys",
  "zoon",
 ]
 
@@ -183,6 +186,7 @@ name = "boon-scene"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "ulid",
 ]
 

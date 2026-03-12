@@ -36,11 +36,19 @@ pub struct BoundingBox {
 
 impl BoundingBox {
     pub fn width(&self) -> u32 {
-        if self.x2 > self.x1 { self.x2 - self.x1 } else { 0 }
+        if self.x2 > self.x1 {
+            self.x2 - self.x1
+        } else {
+            0
+        }
     }
 
     pub fn height(&self) -> u32 {
-        if self.y2 > self.y1 { self.y2 - self.y1 } else { 0 }
+        if self.y2 > self.y1 {
+            self.y2 - self.y1
+        } else {
+            0
+        }
     }
 
     pub fn area(&self) -> u32 {
@@ -167,10 +175,15 @@ const DEFAULT_GRID_SIZE: u32 = 7;
 /// Compare two images using SSIM with full spatial analysis.
 #[allow(dead_code)]
 pub fn run(reference: &str, current: &str, output: Option<&str>, threshold: f64) -> Result<()> {
-    run_with_options(reference, current, threshold, OutputOptions {
-        diff_path: output.map(String::from),
-        ..Default::default()
-    })
+    run_with_options(
+        reference,
+        current,
+        threshold,
+        OutputOptions {
+            diff_path: output.map(String::from),
+            ..Default::default()
+        },
+    )
 }
 
 /// Compare two images with full options.
@@ -191,7 +204,10 @@ pub fn run_with_options(
     if ref_img.dimensions() != cur_img.dimensions() {
         anyhow::bail!(
             "Dimension mismatch: reference {}x{}, current {}x{}",
-            ref_w, ref_h, cur_w, cur_h
+            ref_w,
+            ref_h,
+            cur_w,
+            cur_h
         );
     }
 
@@ -200,12 +216,9 @@ pub fn run_with_options(
     let cur_gray: GrayImage = cur_img.to_luma8();
 
     // Calculate SSIM
-    let result = image_compare::gray_similarity_structure(
-        &Algorithm::MSSIMSimple,
-        &ref_gray,
-        &cur_gray,
-    )
-    .map_err(|e| anyhow::anyhow!("SSIM calculation failed: {:?}", e))?;
+    let result =
+        image_compare::gray_similarity_structure(&Algorithm::MSSIMSimple, &ref_gray, &cur_gray)
+            .map_err(|e| anyhow::anyhow!("SSIM calculation failed: {:?}", e))?;
 
     let ssim = result.score;
     let passed = ssim >= threshold;
@@ -229,7 +242,9 @@ pub fn run_with_options(
     // Handle zoom region if specified
     if let Some(ref region_str) = options.zoom_region {
         let (row, col) = parse_region_string(region_str)?;
-        let output_path = options.diff_path.as_ref()
+        let output_path = options
+            .diff_path
+            .as_ref()
             .map(|p| p.clone())
             .unwrap_or_else(|| format!("/tmp/boon-visual-debug/zoom_{}_{}.png", row, col));
 
@@ -245,7 +260,12 @@ pub fn run_with_options(
         )?;
     }
     // Generate diff visualizations if needed (skip if zoom_region was specified)
-    else if !passed || options.diff_path.is_some() || options.grid || options.heatmap || options.composite {
+    else if !passed
+        || options.diff_path.is_some()
+        || options.grid
+        || options.heatmap
+        || options.composite
+    {
         if let Some(ref path) = options.diff_path {
             if options.heatmap {
                 generate_heatmap(&ref_img, &cur_img, path, &analysis)?;
@@ -283,15 +303,17 @@ fn analyze_differences(
 
     // Initialize region data
     let mut regions: Vec<RegionReport> = (0..grid_size)
-        .flat_map(|row| (0..grid_size).map(move |col| RegionReport {
-            row,
-            col,
-            diff_pixel_count: 0,
-            diff_percentage: 0.0,
-            max_delta: 0,
-            dominant_channel: ' ',
-            total_delta: 0,
-        }))
+        .flat_map(|row| {
+            (0..grid_size).map(move |col| RegionReport {
+                row,
+                col,
+                diff_pixel_count: 0,
+                diff_percentage: 0.0,
+                max_delta: 0,
+                dominant_channel: ' ',
+                total_delta: 0,
+            })
+        })
         .collect();
 
     // Track line differences
@@ -306,7 +328,8 @@ fn analyze_differences(
     let mut total_diff_pixels = 0u32;
 
     // Track channel totals for each region
-    let mut region_channel_totals: Vec<[u64; 3]> = vec![[0, 0, 0]; (grid_size * grid_size) as usize];
+    let mut region_channel_totals: Vec<[u64; 3]> =
+        vec![[0, 0, 0]; (grid_size * grid_size) as usize];
 
     // Scan all pixels
     for y in 0..h {
@@ -432,7 +455,9 @@ pub fn run_semantic_analysis(
 
     // Phase 7b: Position shift detection
     if let Some(pos_analysis) = detect_position_shift(ref_img, cur_img, basic_analysis) {
-        if pos_analysis.confidence >= 0.5 && (pos_analysis.offset_x != 0 || pos_analysis.offset_y != 0) {
+        if pos_analysis.confidence >= 0.5
+            && (pos_analysis.offset_x != 0 || pos_analysis.offset_y != 0)
+        {
             recommendations.push(format!(
                 "POSITION_SHIFT: {}px horizontal, {}px vertical - check CSS margin/padding/transform",
                 pos_analysis.offset_x, pos_analysis.offset_y
@@ -444,8 +469,16 @@ pub fn run_semantic_analysis(
     // Phase 7c: Font change detection
     if let Some(font_analysis) = detect_font_change(ref_img, cur_img, basic_analysis) {
         if font_analysis.confidence >= 0.5 {
-            let ref_style = if font_analysis.ref_appears_cursive { "cursive/script" } else { "sans-serif" };
-            let cur_style = if font_analysis.cur_appears_cursive { "cursive/script" } else { "sans-serif" };
+            let ref_style = if font_analysis.ref_appears_cursive {
+                "cursive/script"
+            } else {
+                "sans-serif"
+            };
+            let cur_style = if font_analysis.cur_appears_cursive {
+                "cursive/script"
+            } else {
+                "sans-serif"
+            };
             if font_analysis.ref_appears_cursive != font_analysis.cur_appears_cursive {
                 recommendations.push(format!(
                     "FONT_CHANGE: Reference uses {}, current uses {} - check font-family loading",
@@ -458,11 +491,18 @@ pub fn run_semantic_analysis(
 
     // Phase 7d: Size change detection
     if let Some(size_analysis) = detect_size_change(ref_img, cur_img, basic_analysis) {
-        if size_analysis.confidence >= 0.5 && (size_analysis.scale_factor < 0.95 || size_analysis.scale_factor > 1.05) {
-            let direction = if size_analysis.scale_factor < 1.0 { "smaller" } else { "larger" };
+        if size_analysis.confidence >= 0.5
+            && (size_analysis.scale_factor < 0.95 || size_analysis.scale_factor > 1.05)
+        {
+            let direction = if size_analysis.scale_factor < 1.0 {
+                "smaller"
+            } else {
+                "larger"
+            };
             recommendations.push(format!(
                 "SIZE_CHANGE: Current is {:.0}% {} than reference - check font-size/zoom",
-                ((1.0 - size_analysis.scale_factor).abs() * 100.0), direction
+                ((1.0 - size_analysis.scale_factor).abs() * 100.0),
+                direction
             ));
         }
         semantic.size_change = Some(size_analysis);
@@ -578,9 +618,11 @@ fn compute_edge_variance(gray: &GrayImage, bbox: &BoundingBox) -> f32 {
 
     // Compute variance of gradient magnitudes
     let mean: f32 = gradient_magnitudes.iter().sum::<f32>() / gradient_magnitudes.len() as f32;
-    let variance: f32 = gradient_magnitudes.iter()
+    let variance: f32 = gradient_magnitudes
+        .iter()
         .map(|&m| (m - mean) * (m - mean))
-        .sum::<f32>() / gradient_magnitudes.len() as f32;
+        .sum::<f32>()
+        / gradient_magnitudes.len() as f32;
 
     variance.sqrt() // Return standard deviation for easier interpretation
 }
@@ -713,19 +755,12 @@ fn detect_position_shift(
     // Search range for offset detection
     const MAX_OFFSET: i32 = 15;
 
-    let (best_offset, best_score) = find_best_offset(
-        &ref_gray,
-        &cur_gray,
-        roi_x, roi_y, roi_w, roi_h,
-        MAX_OFFSET,
-    );
+    let (best_offset, best_score) =
+        find_best_offset(&ref_gray, &cur_gray, roi_x, roi_y, roi_w, roi_h, MAX_OFFSET);
 
     // Calculate baseline score (no offset)
-    let baseline_score = calculate_region_similarity(
-        &ref_gray, &cur_gray,
-        roi_x, roi_y, roi_w, roi_h,
-        0, 0,
-    );
+    let baseline_score =
+        calculate_region_similarity(&ref_gray, &cur_gray, roi_x, roi_y, roi_w, roi_h, 0, 0);
 
     // If offset doesn't improve alignment significantly, confidence is low
     let improvement = best_score - baseline_score;
@@ -754,7 +789,10 @@ fn detect_position_shift(
 fn find_best_offset(
     ref_gray: &GrayImage,
     cur_gray: &GrayImage,
-    roi_x: u32, roi_y: u32, roi_w: u32, roi_h: u32,
+    roi_x: u32,
+    roi_y: u32,
+    roi_w: u32,
+    roi_h: u32,
     max_offset: i32,
 ) -> ((i32, i32), f64) {
     let mut best_score = 0.0f64;
@@ -763,11 +801,8 @@ fn find_best_offset(
     // Search all offsets in the range
     for dy in -max_offset..=max_offset {
         for dx in -max_offset..=max_offset {
-            let score = calculate_region_similarity(
-                ref_gray, cur_gray,
-                roi_x, roi_y, roi_w, roi_h,
-                dx, dy,
-            );
+            let score =
+                calculate_region_similarity(ref_gray, cur_gray, roi_x, roi_y, roi_w, roi_h, dx, dy);
 
             if score > best_score {
                 best_score = score;
@@ -785,8 +820,12 @@ fn find_best_offset(
 fn calculate_region_similarity(
     ref_gray: &GrayImage,
     cur_gray: &GrayImage,
-    roi_x: u32, roi_y: u32, roi_w: u32, roi_h: u32,
-    dx: i32, dy: i32,
+    roi_x: u32,
+    roi_y: u32,
+    roi_w: u32,
+    roi_h: u32,
+    dx: i32,
+    dy: i32,
 ) -> f64 {
     let (w, h) = ref_gray.dimensions();
 
@@ -882,10 +921,8 @@ fn detect_color_shift(
                 total_b_delta += db as i64;
 
                 // Calculate LAB ΔE for perceptual difference
-                let delta_e = calculate_delta_e(
-                    ref_p[0], ref_p[1], ref_p[2],
-                    cur_p[0], cur_p[1], cur_p[2],
-                );
+                let delta_e =
+                    calculate_delta_e(ref_p[0], ref_p[1], ref_p[2], cur_p[0], cur_p[1], cur_p[2]);
                 total_delta_e += delta_e as f64;
                 diff_count += 1;
             }
@@ -1074,13 +1111,19 @@ fn find_dense_bands(lines: &[u32]) -> Vec<LineRange> {
 
 /// Print console report with ASCII grid visualization.
 fn print_console_report(analysis: &DiffAnalysis) {
-    println!("SSIM: {:.4} (threshold: {:.4})", analysis.ssim, analysis.threshold);
+    println!(
+        "SSIM: {:.4} (threshold: {:.4})",
+        analysis.ssim, analysis.threshold
+    );
     println!();
 
     // ASCII grid visualization
-    println!("=== Region Analysis ({}x{} grid, {}px cells) ===",
-             analysis.grid_size, analysis.grid_size,
-             analysis.image_width / analysis.grid_size);
+    println!(
+        "=== Region Analysis ({}x{} grid, {}px cells) ===",
+        analysis.grid_size,
+        analysis.grid_size,
+        analysis.image_width / analysis.grid_size
+    );
 
     // Header row
     print!("   ");
@@ -1120,7 +1163,9 @@ fn print_console_report(analysis: &DiffAnalysis) {
     println!();
 
     // Hot regions (sorted by diff percentage)
-    let mut hot_regions: Vec<_> = analysis.regions.iter()
+    let mut hot_regions: Vec<_> = analysis
+        .regions
+        .iter()
         .filter(|r| r.diff_percentage >= 0.1)
         .collect();
     hot_regions.sort_by(|a, b| b.diff_percentage.partial_cmp(&a.diff_percentage).unwrap());
@@ -1129,13 +1174,16 @@ fn print_console_report(analysis: &DiffAnalysis) {
         println!("Hot regions:");
         for (i, region) in hot_regions.iter().enumerate() {
             let marker = if i == 0 { " << WORST" } else { "" };
-            println!("  [{},{}] {:.1}% diff ({} pixels), max_delta={}, channel={}{}",
-                     region.row, region.col,
-                     region.diff_percentage,
-                     region.diff_pixel_count,
-                     region.max_delta,
-                     region.dominant_channel,
-                     marker);
+            println!(
+                "  [{},{}] {:.1}% diff ({} pixels), max_delta={}, channel={}{}",
+                region.row,
+                region.col,
+                region.diff_percentage,
+                region.diff_pixel_count,
+                region.max_delta,
+                region.dominant_channel,
+                marker
+            );
         }
         println!();
     }
@@ -1144,14 +1192,23 @@ fn print_console_report(analysis: &DiffAnalysis) {
     println!("=== Affected Lines ===");
     println!("Lines with differences: {}", analysis.affected_lines.len());
     if !analysis.affected_lines.is_empty() {
-        println!("First affected: line {}", analysis.affected_lines.first().unwrap());
-        println!("Last affected: line {}", analysis.affected_lines.last().unwrap());
+        println!(
+            "First affected: line {}",
+            analysis.affected_lines.first().unwrap()
+        );
+        println!(
+            "Last affected: line {}",
+            analysis.affected_lines.last().unwrap()
+        );
     }
 
     if !analysis.dense_bands.is_empty() {
         println!("Dense bands:");
         for band in &analysis.dense_bands {
-            println!("  - lines {}-{} (continuous differences)", band.start, band.end);
+            println!(
+                "  - lines {}-{} (continuous differences)",
+                band.start, band.end
+            );
         }
     }
     println!();
@@ -1161,15 +1218,22 @@ fn print_console_report(analysis: &DiffAnalysis) {
         println!("=== Difference Bounding Box ===");
         println!("Top-left:     ({}, {})", bbox.x1, bbox.y1);
         println!("Bottom-right: ({}, {})", bbox.x2, bbox.y2);
-        println!("Size:         {} x {} pixels ({:.1}% of image area)",
-                 bbox.width(), bbox.height(),
-                 (bbox.area() as f32 / (analysis.image_width * analysis.image_height) as f32) * 100.0);
+        println!(
+            "Size:         {} x {} pixels ({:.1}% of image area)",
+            bbox.width(),
+            bbox.height(),
+            (bbox.area() as f32 / (analysis.image_width * analysis.image_height) as f32) * 100.0
+        );
 
         // CSS coordinates (assuming 2x HiDPI)
         println!();
         println!("CSS coordinates (assuming 2x HiDPI):");
         println!("  top: {}px, left: {}px", bbox.y1 / 2, bbox.x1 / 2);
-        println!("  width: {}px, height: {}px", bbox.width() / 2, bbox.height() / 2);
+        println!(
+            "  width: {}px, height: {}px",
+            bbox.width() / 2,
+            bbox.height() / 2
+        );
     }
     println!();
 
@@ -1190,9 +1254,18 @@ fn print_console_report(analysis: &DiffAnalysis) {
 
             println!("COLOR_SHIFT detected ({} confidence):", confidence);
             println!("  Interpretation: {}", color.interpretation);
-            println!("  Affected: {:.1}% of pixels ({} pixels)", color.affected_percentage, color.affected_pixels);
-            println!("  RGB delta: R={:+.1}, G={:+.1}, B={:+.1}", color.avg_r_delta, color.avg_g_delta, color.avg_b_delta);
-            println!("  Perceptual ΔE: {:.1} (>5 = clearly visible)", color.avg_delta_e);
+            println!(
+                "  Affected: {:.1}% of pixels ({} pixels)",
+                color.affected_percentage, color.affected_pixels
+            );
+            println!(
+                "  RGB delta: R={:+.1}, G={:+.1}, B={:+.1}",
+                color.avg_r_delta, color.avg_g_delta, color.avg_b_delta
+            );
+            println!(
+                "  Perceptual ΔE: {:.1} (>5 = clearly visible)",
+                color.avg_delta_e
+            );
             println!("  Action: Check CSS `color` or `background` properties");
             println!();
         }
@@ -1201,7 +1274,10 @@ fn print_console_report(analysis: &DiffAnalysis) {
         if let Some(ref pos) = semantic.position_shift {
             if pos.confidence >= 0.5 {
                 println!("POSITION_SHIFT detected:");
-                println!("  Offset: {}px horizontal, {}px vertical", pos.offset_x, pos.offset_y);
+                println!(
+                    "  Offset: {}px horizontal, {}px vertical",
+                    pos.offset_x, pos.offset_y
+                );
                 println!("  Confidence: {:.0}%", pos.confidence * 100.0);
                 println!("  Action: Check `margin`, `padding`, or `transform` CSS");
                 println!();
@@ -1212,13 +1288,36 @@ fn print_console_report(analysis: &DiffAnalysis) {
         // NOTE: Only shown if confidence is reasonably high
         if let Some(ref font) = semantic.font_change {
             if font.confidence >= 0.4 {
-                let conf_label = if font.confidence >= 0.7 { "HIGH" } else { "LOW" };
+                let conf_label = if font.confidence >= 0.7 {
+                    "HIGH"
+                } else {
+                    "LOW"
+                };
                 println!("FONT_CHANGE detected ({} confidence):", conf_label);
-                println!("  Reference appears: {}", if font.ref_appears_cursive { "cursive/script" } else { "sans-serif/serif" });
-                println!("  Current appears: {}", if font.cur_appears_cursive { "cursive/script" } else { "sans-serif/serif" });
-                println!("  Edge variance: ref={:.2}, cur={:.2}", font.ref_edge_variance, font.cur_edge_variance);
+                println!(
+                    "  Reference appears: {}",
+                    if font.ref_appears_cursive {
+                        "cursive/script"
+                    } else {
+                        "sans-serif/serif"
+                    }
+                );
+                println!(
+                    "  Current appears: {}",
+                    if font.cur_appears_cursive {
+                        "cursive/script"
+                    } else {
+                        "sans-serif/serif"
+                    }
+                );
+                println!(
+                    "  Edge variance: ref={:.2}, cur={:.2}",
+                    font.ref_edge_variance, font.cur_edge_variance
+                );
                 println!("  ⚠ LIMITATION: Cannot detect italic vs regular - verify visually!");
-                println!("  Action: Check `font-family` loading, verify @font-face or web font import");
+                println!(
+                    "  Action: Check `font-family` loading, verify @font-face or web font import"
+                );
                 println!();
             }
         }
@@ -1227,9 +1326,15 @@ fn print_console_report(analysis: &DiffAnalysis) {
         if let Some(ref size) = semantic.size_change {
             if size.confidence >= 0.5 {
                 println!("SIZE_CHANGE detected:");
-                println!("  Scale factor: {:.2}x (current {} than reference)",
-                         size.scale_factor,
-                         if size.scale_factor < 1.0 { "smaller" } else { "larger" });
+                println!(
+                    "  Scale factor: {:.2}x (current {} than reference)",
+                    size.scale_factor,
+                    if size.scale_factor < 1.0 {
+                        "smaller"
+                    } else {
+                        "larger"
+                    }
+                );
                 println!("  Action: Check `font-size`, `width`, `height`, or `zoom` CSS");
                 println!();
             }
@@ -1245,12 +1350,16 @@ fn print_console_report(analysis: &DiffAnalysis) {
         }
 
         // Always suggest visual verification for worst region
-        let worst_region = analysis.regions.iter()
+        let worst_region = analysis
+            .regions
+            .iter()
             .max_by(|a, b| a.diff_percentage.partial_cmp(&b.diff_percentage).unwrap());
         if let Some(worst) = worst_region {
             if worst.diff_percentage >= 1.0 {
-                println!("💡 Verify visually: --zoom-region {},{} --output /tmp/zoom.png",
-                         worst.row, worst.col);
+                println!(
+                    "💡 Verify visually: --zoom-region {},{} --output /tmp/zoom.png",
+                    worst.row, worst.col
+                );
                 println!();
             }
         }
@@ -1258,9 +1367,15 @@ fn print_console_report(analysis: &DiffAnalysis) {
 
     // Final verdict
     if analysis.passed {
-        println!("PASS: SSIM {:.4} meets threshold {:.4}", analysis.ssim, analysis.threshold);
+        println!(
+            "PASS: SSIM {:.4} meets threshold {:.4}",
+            analysis.ssim, analysis.threshold
+        );
     } else {
-        println!("FAIL: SSIM {:.4} is below threshold {:.4}", analysis.ssim, analysis.threshold);
+        println!(
+            "FAIL: SSIM {:.4} is below threshold {:.4}",
+            analysis.ssim, analysis.threshold
+        );
     }
 }
 
@@ -1278,31 +1393,49 @@ fn print_json_report(analysis: &DiffAnalysis) {
 
     // Bounding box
     if let Some(ref bbox) = analysis.bounding_box {
-        println!("  \"bounding_box\": {{\"x1\": {}, \"y1\": {}, \"x2\": {}, \"y2\": {}}},",
-                 bbox.x1, bbox.y1, bbox.x2, bbox.y2);
+        println!(
+            "  \"bounding_box\": {{\"x1\": {}, \"y1\": {}, \"x2\": {}, \"y2\": {}}},",
+            bbox.x1, bbox.y1, bbox.x2, bbox.y2
+        );
     } else {
         println!("  \"bounding_box\": null,");
     }
 
     // Hot regions (only those with >= 0.1% diff)
-    let hot_regions: Vec<_> = analysis.regions.iter()
+    let hot_regions: Vec<_> = analysis
+        .regions
+        .iter()
         .filter(|r| r.diff_percentage >= 0.1)
         .collect();
 
     println!("  \"regions\": [");
     for (i, region) in hot_regions.iter().enumerate() {
         let comma = if i < hot_regions.len() - 1 { "," } else { "" };
-        println!("    {{\"row\": {}, \"col\": {}, \"diff_pct\": {:.2}, \"pixels\": {}, \"max_delta\": {}, \"channel\": \"{}\"}}{}",
-                 region.row, region.col, region.diff_percentage,
-                 region.diff_pixel_count, region.max_delta, region.dominant_channel, comma);
+        println!(
+            "    {{\"row\": {}, \"col\": {}, \"diff_pct\": {:.2}, \"pixels\": {}, \"max_delta\": {}, \"channel\": \"{}\"}}{}",
+            region.row,
+            region.col,
+            region.diff_percentage,
+            region.diff_pixel_count,
+            region.max_delta,
+            region.dominant_channel,
+            comma
+        );
     }
     println!("  ],");
 
     // Dense bands
-    println!("  \"affected_line_count\": {},", analysis.affected_lines.len());
+    println!(
+        "  \"affected_line_count\": {},",
+        analysis.affected_lines.len()
+    );
     println!("  \"dense_bands\": [");
     for (i, band) in analysis.dense_bands.iter().enumerate() {
-        let comma = if i < analysis.dense_bands.len() - 1 { "," } else { "" };
+        let comma = if i < analysis.dense_bands.len() - 1 {
+            ","
+        } else {
+            ""
+        };
         println!("    [{}, {}]{}", band.start, band.end, comma);
     }
     println!("  ]");
@@ -1470,7 +1603,8 @@ fn generate_heatmap(
         }
     }
 
-    heatmap.save(output_path)
+    heatmap
+        .save(output_path)
         .with_context(|| format!("Failed to save heatmap image: {}", output_path))?;
 
     Ok(())
@@ -1568,7 +1702,8 @@ fn generate_composite(
         }
     }
 
-    composite.save(output_path)
+    composite
+        .save(output_path)
         .with_context(|| format!("Failed to save composite image: {}", output_path))?;
 
     Ok(())
@@ -1610,7 +1745,13 @@ fn generate_zoom_region(
 
     // Validate region bounds
     if row >= grid_size || col >= grid_size {
-        anyhow::bail!("Region [{},{}] out of bounds for {}x{} grid", row, col, grid_size, grid_size);
+        anyhow::bail!(
+            "Region [{},{}] out of bounds for {}x{} grid",
+            row,
+            col,
+            grid_size,
+            grid_size
+        );
     }
 
     // Extract regions from both images
@@ -1621,16 +1762,10 @@ fn generate_zoom_region(
     let scaled_w = cell_w * scale;
     let scaled_h = cell_h * scale;
 
-    let ref_scaled = ref_region.resize_exact(
-        scaled_w,
-        scaled_h,
-        image::imageops::FilterType::Nearest,
-    );
-    let cur_scaled = cur_region.resize_exact(
-        scaled_w,
-        scaled_h,
-        image::imageops::FilterType::Nearest,
-    );
+    let ref_scaled =
+        ref_region.resize_exact(scaled_w, scaled_h, image::imageops::FilterType::Nearest);
+    let cur_scaled =
+        cur_region.resize_exact(scaled_w, scaled_h, image::imageops::FilterType::Nearest);
 
     // Create output image: side-by-side with separator and title bar
     let separator_w = 4;
@@ -1674,30 +1809,64 @@ fn generate_zoom_region(
     // Draw simple labels in the title bar using basic shapes
     // "REF" on left, "CUR" on right
     let label_y = 8;
-    draw_text_simple(&mut output, "REFERENCE", 10, label_y, Rgba([200, 200, 200, 255]));
-    draw_text_simple(&mut output, "CURRENT", right_offset + 10, label_y, Rgba([200, 200, 200, 255]));
+    draw_text_simple(
+        &mut output,
+        "REFERENCE",
+        10,
+        label_y,
+        Rgba([200, 200, 200, 255]),
+    );
+    draw_text_simple(
+        &mut output,
+        "CURRENT",
+        right_offset + 10,
+        label_y,
+        Rgba([200, 200, 200, 255]),
+    );
 
     // Find region stats for subtitle
-    let region_stats = analysis.regions.iter()
+    let region_stats = analysis
+        .regions
+        .iter()
         .find(|r| r.row == row && r.col == col);
 
     // Draw region info
     if let Some(stats) = region_stats {
         let info = format!("[{},{}] {:.1}% diff", row, col, stats.diff_percentage);
-        draw_text_simple(&mut output, &info, 10, label_y + 12, Rgba([150, 150, 150, 255]));
+        draw_text_simple(
+            &mut output,
+            &info,
+            10,
+            label_y + 12,
+            Rgba([150, 150, 150, 255]),
+        );
 
         let css_x = region_x / 2; // Assuming 2x HiDPI
         let css_y = region_y / 2;
         let css_info = format!("CSS: top={}px left={}px", css_y, css_x);
-        draw_text_simple(&mut output, &css_info, right_offset + 10, label_y + 12, Rgba([150, 150, 150, 255]));
+        draw_text_simple(
+            &mut output,
+            &css_info,
+            right_offset + 10,
+            label_y + 12,
+            Rgba([150, 150, 150, 255]),
+        );
     }
 
-    output.save(output_path)
+    output
+        .save(output_path)
         .with_context(|| format!("Failed to save zoom region image: {}", output_path))?;
 
     println!("Zoom region [{},{}] saved to: {}", row, col, output_path);
-    println!("  Scale: {}x ({}x{} → {}x{})", scale, cell_w, cell_h, scaled_w, scaled_h);
-    println!("  CSS coordinates: top={}px, left={}px", region_y / 2, region_x / 2);
+    println!(
+        "  Scale: {}x ({}x{} → {}x{})",
+        scale, cell_w, cell_h, scaled_w, scaled_h
+    );
+    println!(
+        "  CSS coordinates: top={}px, left={}px",
+        region_y / 2,
+        region_x / 2
+    );
 
     Ok(())
 }
@@ -1709,40 +1878,108 @@ fn draw_text_simple(img: &mut RgbaImage, text: &str, x: u32, y: u32, color: Rgba
     // Each char is represented as a 5-wide bitmask for 7 rows
     fn char_pattern(c: char) -> [u8; 7] {
         match c.to_ascii_uppercase() {
-            'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
-            'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
-            'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
-            'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
-            'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-            'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
-            'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-            'S' => [0b01110, 0b10001, 0b10000, 0b01110, 0b00001, 0b10001, 0b01110],
-            '[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110],
-            ']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110],
-            ',' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00100],
-            '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00110],
-            '%' => [0b11001, 0b11010, 0b00100, 0b00100, 0b01000, 0b01011, 0b10011],
-            '=' => [0b00000, 0b00000, 0b11111, 0b00000, 0b11111, 0b00000, 0b00000],
-            ':' => [0b00000, 0b00110, 0b00110, 0b00000, 0b00110, 0b00110, 0b00000],
-            '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-            '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-            '2' => [0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111],
-            '3' => [0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110],
-            '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-            '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
-            '6' => [0b01110, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b01110],
-            '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-            '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-            '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
-            'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
-            'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
-            'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-            'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-            'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-            'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
-            'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-            ' ' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000],
-            _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111], // Box for unknown
+            'R' => [
+                0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+            ],
+            'E' => [
+                0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+            ],
+            'F' => [
+                0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+            ],
+            'C' => [
+                0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+            ],
+            'U' => [
+                0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+            ],
+            'N' => [
+                0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+            ],
+            'T' => [
+                0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+            ],
+            'S' => [
+                0b01110, 0b10001, 0b10000, 0b01110, 0b00001, 0b10001, 0b01110,
+            ],
+            '[' => [
+                0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110,
+            ],
+            ']' => [
+                0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110,
+            ],
+            ',' => [
+                0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00100,
+            ],
+            '.' => [
+                0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00110,
+            ],
+            '%' => [
+                0b11001, 0b11010, 0b00100, 0b00100, 0b01000, 0b01011, 0b10011,
+            ],
+            '=' => [
+                0b00000, 0b00000, 0b11111, 0b00000, 0b11111, 0b00000, 0b00000,
+            ],
+            ':' => [
+                0b00000, 0b00110, 0b00110, 0b00000, 0b00110, 0b00110, 0b00000,
+            ],
+            '0' => [
+                0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+            ],
+            '1' => [
+                0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+            ],
+            '2' => [
+                0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111,
+            ],
+            '3' => [
+                0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110,
+            ],
+            '4' => [
+                0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+            ],
+            '5' => [
+                0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+            ],
+            '6' => [
+                0b01110, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b01110,
+            ],
+            '7' => [
+                0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+            ],
+            '8' => [
+                0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+            ],
+            '9' => [
+                0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+            ],
+            'P' => [
+                0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+            ],
+            'X' => [
+                0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+            ],
+            'L' => [
+                0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+            ],
+            'A' => [
+                0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+            ],
+            'O' => [
+                0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+            ],
+            'D' => [
+                0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+            ],
+            'I' => [
+                0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+            ],
+            ' ' => [
+                0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000,
+            ],
+            _ => [
+                0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111,
+            ], // Box for unknown
         }
     }
 
@@ -1770,12 +2007,19 @@ fn draw_text_simple(img: &mut RgbaImage, text: &str, x: u32, y: u32, color: Rgba
 fn parse_region_string(s: &str) -> Result<(u32, u32)> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != 2 {
-        anyhow::bail!("Invalid region format '{}'. Expected 'row,col' (e.g., '3,3')", s);
+        anyhow::bail!(
+            "Invalid region format '{}'. Expected 'row,col' (e.g., '3,3')",
+            s
+        );
     }
 
-    let row: u32 = parts[0].trim().parse()
+    let row: u32 = parts[0]
+        .trim()
+        .parse()
         .with_context(|| format!("Invalid row number: '{}'", parts[0]))?;
-    let col: u32 = parts[1].trim().parse()
+    let col: u32 = parts[1]
+        .trim()
+        .parse()
         .with_context(|| format!("Invalid column number: '{}'", parts[1]))?;
 
     Ok((row, col))

@@ -4,7 +4,7 @@
 //! Automatically starts the WebSocket server for extension communication.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -89,7 +89,10 @@ pub async fn run_mcp_server(ws_port: u16, playground_port: u16) {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
-    eprintln!("[MCP] Boon browser server starting (ws_port: {})...", ws_port);
+    eprintln!(
+        "[MCP] Boon browser server starting (ws_port: {})...",
+        ws_port
+    );
 
     // Find extension directory for hot-reload watching
     let extension_dir = find_extension_dir();
@@ -176,8 +179,16 @@ async fn handle_request(request: McpRequest, ws_port: u16, playground_port: u16)
         },
 
         "tools/call" => {
-            let tool_name = request.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let arguments = request.params.get("arguments").cloned().unwrap_or(json!({}));
+            let tool_name = request
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let arguments = request
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(json!({}));
 
             match call_tool(tool_name, arguments, ws_port, playground_port).await {
                 Ok(result) => McpResponse {
@@ -642,7 +653,7 @@ fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "boon_get_engine".to_string(),
-            description: "Get the currently selected Boon engine. Returns 'Actors' or 'DD'. Also indicates whether engine switching is available.".to_string(),
+            description: "Get the currently selected Boon engine. Returns 'Actors', 'DD', 'Wasm', or 'WasmPro'. Also indicates whether engine switching is available.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -651,14 +662,14 @@ fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "boon_set_engine".to_string(),
-            description: "Set the Boon engine and trigger re-run. Use 'Actors' for the actor-based reactive engine, 'DD' for the Differential Dataflow engine, or 'Wasm' for the WASM compilation engine.".to_string(),
+            description: "Set the Boon engine and trigger re-run. Use 'Actors' for the actor-based reactive engine, 'DD' for the Differential Dataflow engine, 'Wasm' for the current WASM compilation engine, or 'WasmPro' for the next-generation WASM backend.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "engine": {
                         "type": "string",
-                        "enum": ["Actors", "DD", "Wasm"],
-                        "description": "Engine to use: 'Actors' (actor-based reactive), 'DD' (Differential Dataflow), or 'Wasm' (WASM compilation)"
+                        "enum": ["Actors", "DD", "Wasm", "WasmPro"],
+                        "description": "Engine to use: 'Actors' (actor-based reactive), 'DD' (Differential Dataflow), 'Wasm' (current WASM compilation), or 'WasmPro' (next-generation WASM backend)"
                     }
                 },
                 "required": ["engine"]
@@ -719,7 +730,12 @@ fn find_boon_root() -> Option<PathBuf> {
     None
 }
 
-async fn call_tool(name: &str, args: Value, ws_port: u16, playground_port: u16) -> Result<String, String> {
+async fn call_tool(
+    name: &str,
+    args: Value,
+    ws_port: u16,
+    playground_port: u16,
+) -> Result<String, String> {
     // Handle playground status check (no WebSocket)
     if name == "boon_playground_status" {
         return check_playground_status(playground_port).await;
@@ -791,13 +807,20 @@ async fn call_tool(name: &str, args: Value, ws_port: u16, playground_port: u16) 
         return match response {
             Response::Success { data } => {
                 if let Some(d) = data {
-                    Ok(format!("Clicked checkbox {}: {}", index, serde_json::to_string_pretty(&d).unwrap_or_default()))
+                    Ok(format!(
+                        "Clicked checkbox {}: {}",
+                        index,
+                        serde_json::to_string_pretty(&d).unwrap_or_default()
+                    ))
                 } else {
                     Ok(format!("Clicked checkbox {}", index))
                 }
             }
             Response::Error { message } => Err(format!("Click checkbox failed: {}", message)),
-            other => Err(format!("Click checkbox failed: unexpected response type: {:?}", other)),
+            other => Err(format!(
+                "Click checkbox failed: unexpected response type: {:?}",
+                other
+            )),
         };
     }
 
@@ -815,13 +838,20 @@ async fn call_tool(name: &str, args: Value, ws_port: u16, playground_port: u16) 
         return match response {
             Response::Success { data } => {
                 if let Some(d) = data {
-                    Ok(format!("Clicked button {}: {}", index, serde_json::to_string_pretty(&d).unwrap_or_default()))
+                    Ok(format!(
+                        "Clicked button {}: {}",
+                        index,
+                        serde_json::to_string_pretty(&d).unwrap_or_default()
+                    ))
                 } else {
                     Ok(format!("Clicked button {}", index))
                 }
             }
             Response::Error { message } => Err(format!("Click button failed: {}", message)),
-            other => Err(format!("Click button failed: unexpected response type: {:?}", other)),
+            other => Err(format!(
+                "Click button failed: unexpected response type: {:?}",
+                other
+            )),
         };
     }
 
@@ -839,13 +869,20 @@ async fn call_tool(name: &str, args: Value, ws_port: u16, playground_port: u16) 
         return match response {
             Response::Success { data } => {
                 if let Some(d) = data {
-                    Ok(format!("Focused input {}: {}", index, serde_json::to_string_pretty(&d).unwrap_or_default()))
+                    Ok(format!(
+                        "Focused input {}: {}",
+                        index,
+                        serde_json::to_string_pretty(&d).unwrap_or_default()
+                    ))
                 } else {
                     Ok(format!("Focused input {}", index))
                 }
             }
             Response::Error { message } => Err(format!("Focus input failed: {}", message)),
-            other => Err(format!("Focus input failed: unexpected response type: {:?}", other)),
+            other => Err(format!(
+                "Focus input failed: unexpected response type: {:?}",
+                other
+            )),
         };
     }
 
@@ -857,14 +894,18 @@ async fn call_tool(name: &str, args: Value, ws_port: u16, playground_port: u16) 
             .ok_or("text parameter required")?
             .to_string();
 
-        let response = ws_server::send_command_to_server(ws_port, Command::TypeText { text: text.clone() })
-            .await
-            .map_err(|e| e.to_string())?;
+        let response =
+            ws_server::send_command_to_server(ws_port, Command::TypeText { text: text.clone() })
+                .await
+                .map_err(|e| e.to_string())?;
 
         return match response {
             Response::Success { .. } => Ok(format!("Typed: {}", text)),
             Response::Error { message } => Err(format!("Type text failed: {}", message)),
-            other => Err(format!("Type text failed: unexpected response type: {:?}", other)),
+            other => Err(format!(
+                "Type text failed: unexpected response type: {:?}",
+                other
+            )),
         };
     }
 
@@ -876,14 +917,18 @@ async fn call_tool(name: &str, args: Value, ws_port: u16, playground_port: u16) 
             .ok_or("key parameter required")?
             .to_string();
 
-        let response = ws_server::send_command_to_server(ws_port, Command::PressKey { key: key.clone() })
-            .await
-            .map_err(|e| e.to_string())?;
+        let response =
+            ws_server::send_command_to_server(ws_port, Command::PressKey { key: key.clone() })
+                .await
+                .map_err(|e| e.to_string())?;
 
         return match response {
             Response::Success { .. } => Ok(format!("Pressed: {}", key)),
             Response::Error { message } => Err(format!("Press key failed: {}", message)),
-            other => Err(format!("Press key failed: unexpected response type: {:?}", other)),
+            other => Err(format!(
+                "Press key failed: unexpected response type: {:?}",
+                other
+            )),
         };
     }
 
@@ -901,7 +946,10 @@ async fn call_tool(name: &str, args: Value, ws_port: u16, playground_port: u16) 
 
                 if let Some(elements) = data.get("elements").and_then(|v| v.as_array()) {
                     for (i, elem) in elements.iter().enumerate() {
-                        let direct_text = elem.get("directText").and_then(|v| v.as_str()).unwrap_or("");
+                        let direct_text = elem
+                            .get("directText")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         let full_text = elem.get("fullText").and_then(|v| v.as_str()).unwrap_or("");
                         let tag = elem.get("tagName").and_then(|v| v.as_str()).unwrap_or("?");
                         let role = elem.get("role").and_then(|v| v.as_str());
@@ -913,11 +961,12 @@ async fn call_tool(name: &str, args: Value, ws_port: u16, playground_port: u16) 
                         // Always include inputs (even if empty), otherwise only show elements with text
                         let is_input = tag == "input" || tag == "textarea";
                         if is_input || !direct_text.is_empty() || !full_text.is_empty() {
-                            let display_text = if is_input && direct_text.is_empty() && full_text.is_empty() {
-                                "[empty input]"
-                            } else {
-                                direct_text
-                            };
+                            let display_text =
+                                if is_input && direct_text.is_empty() && full_text.is_empty() {
+                                    "[empty input]"
+                                } else {
+                                    direct_text
+                                };
                             output.push_str(&format!(
                                 "[{}] <{}{}> at ({},{}) {}x{}\n  directText: {:?}\n  fullText: {:?}\n\n",
                                 i,
@@ -950,11 +999,17 @@ async fn call_tool(name: &str, args: Value, ws_port: u16, playground_port: u16) 
 
     // Handle browser launch separately (doesn't use WebSocket command)
     if name == "boon_launch_browser" {
-        let headless = args.get("headless").and_then(|v| v.as_bool()).unwrap_or(false);
+        let headless = args
+            .get("headless")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Reuse existing connected extension session if available.
-        if let Ok(Response::Status { connected, api_ready, page_url }) =
-            ws_server::send_command_to_server(ws_port, Command::GetStatus).await
+        if let Ok(Response::Status {
+            connected,
+            api_ready,
+            page_url,
+        }) = ws_server::send_command_to_server(ws_port, Command::GetStatus).await
         {
             if connected && api_ready {
                 return Ok(format!(
@@ -990,8 +1045,10 @@ async fn call_tool(name: &str, args: Value, ws_port: u16, playground_port: u16) 
             playground_port,
             ws_port,
             headless,
-            keep_open: true,  // Don't block waiting
+            keep_open: true, // Don't block waiting
             browser_path: None,
+            initial_engine: None,
+            initial_example: None,
         };
 
         match browser::launch_browser(opts) {
@@ -1006,7 +1063,9 @@ async fn call_tool(name: &str, args: Value, ws_port: u16, playground_port: u16) 
                     Err(e) => Ok(format!(
                         "Browser launched (PID: {}) but extension connection timed out: {}\n\
                         Check that the playground is running at localhost:{}",
-                        child.id(), e, playground_port
+                        child.id(),
+                        e,
+                        playground_port
                     )),
                 }
             }
@@ -1049,16 +1108,26 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
                 .and_then(|v| v.as_str())
                 .ok_or("code parameter required")?
                 .to_string();
-            Command::InjectCode { code, filename: None }
+            Command::InjectCode {
+                code,
+                filename: None,
+            }
         }
 
         "boon_get_code" => Command::GetEditorCode,
 
         "boon_screenshot_preview" => {
             let width = args.get("width").and_then(|v| v.as_u64()).map(|v| v as u32);
-            let height = args.get("height").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let height = args
+                .get("height")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
             let hidpi = args.get("hidpi").and_then(|v| v.as_bool());
-            Command::ScreenshotPreview { width, height, hidpi }
+            Command::ScreenshotPreview {
+                width,
+                height,
+                hidpi,
+            }
         }
 
         "boon_screenshot_element" => {
@@ -1075,14 +1144,21 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
         "boon_clear_states" => Command::ClearStates,
 
         "boon_navigate" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("/").to_string();
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("/")
+                .to_string();
             Command::NavigateTo { path }
-        },
+        }
 
         "boon_run_and_capture" => Command::RunAndCaptureInitial,
 
         "boon_localstorage" => {
-            let pattern = args.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let pattern = args
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             Command::GetLocalStorage { pattern }
         }
 
@@ -1097,8 +1173,11 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
                 .ok_or("engine parameter required")?
                 .to_string();
             // Validate engine value
-            if engine != "Actors" && engine != "DD" && engine != "Wasm" {
-                return Err(format!("Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'", engine));
+            if engine != "Actors" && engine != "DD" && engine != "Wasm" && engine != "WasmPro" {
+                return Err(format!(
+                    "Invalid engine '{}'. Must be 'Actors', 'DD', 'Wasm', or 'WasmPro'",
+                    engine
+                ));
             }
             Command::SetEngine { engine }
         }
@@ -1141,25 +1220,43 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
 
         Response::PreviewText { text } => Ok(text),
 
-        Response::RunAndCaptureInitial { success, initial_preview, timestamp } => {
+        Response::RunAndCaptureInitial {
+            success,
+            initial_preview,
+            timestamp,
+        } => {
             if success {
-                Ok(format!("Initial preview (captured at {}): {}", timestamp,
-                    if initial_preview.is_empty() { "(empty)" } else { &initial_preview }))
+                Ok(format!(
+                    "Initial preview (captured at {}): {}",
+                    timestamp,
+                    if initial_preview.is_empty() {
+                        "(empty)"
+                    } else {
+                        &initial_preview
+                    }
+                ))
             } else {
                 Err("RunAndCaptureInitial command failed".to_string())
             }
         }
 
-        Response::Screenshot { base64: _, width: _, height: _, dpr: _ } => {
+        Response::Screenshot {
+            base64: _,
+            width: _,
+            height: _,
+            dpr: _,
+        } => {
             // This shouldn't happen - WS server transforms to ScreenshotFile
             Err("Unexpected base64 screenshot response".to_string())
         }
 
-        Response::ScreenshotFile { filepath } => {
-            Ok(format!("Screenshot saved: {}", filepath))
-        }
+        Response::ScreenshotFile { filepath } => Ok(format!("Screenshot saved: {}", filepath)),
 
-        Response::Status { connected, page_url, api_ready } => {
+        Response::Status {
+            connected,
+            page_url,
+            api_ready,
+        } => {
             let mut status = format!("Connected: {}", connected);
             if let Some(url) = page_url {
                 status.push_str(&format!("\nPage URL: {}", url));
@@ -1170,7 +1267,10 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
 
         Response::Success { data } => {
             if let Some(d) = data {
-                Ok(format!("Success: {}", serde_json::to_string(&d).unwrap_or_default()))
+                Ok(format!(
+                    "Success: {}",
+                    serde_json::to_string(&d).unwrap_or_default()
+                ))
             } else {
                 Ok("Success".to_string())
             }
@@ -1206,7 +1306,10 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
             let (truncated_tree, node_count) = truncate_json_tree(&tree, 100);
             let mut result = serde_json::to_string(&truncated_tree).unwrap_or_default();
             if node_count > 100 {
-                result.push_str(&format!("\n[truncated: showing ~100 of {} nodes]", node_count));
+                result.push_str(&format!(
+                    "\n[truncated: showing ~100 of {} nodes]",
+                    node_count
+                ));
             }
             Ok(result)
         }
@@ -1236,7 +1339,11 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
             }
         }
 
-        Response::FocusedElement { tag_name, input_type, input_index } => {
+        Response::FocusedElement {
+            tag_name,
+            input_type,
+            input_index,
+        } => {
             let mut result = String::new();
             if let Some(tag) = tag_name {
                 result.push_str(&format!("Focused element: {}", tag));
@@ -1252,7 +1359,12 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
             Ok(result)
         }
 
-        Response::InputProperties { found, placeholder, value, input_type } => {
+        Response::InputProperties {
+            found,
+            placeholder,
+            value,
+            input_type,
+        } => {
             if !found {
                 Ok("Input not found".to_string())
             } else {
@@ -1272,18 +1384,32 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
 
         Response::CurrentUrl { url } => Ok(format!("URL: {}", url)),
 
-        Response::InputTypeableStatus { typeable, disabled, readonly, hidden, reason } => {
+        Response::InputTypeableStatus {
+            typeable,
+            disabled,
+            readonly,
+            hidden,
+            reason,
+        } => {
             if typeable {
                 Ok("Input is typeable".to_string())
             } else {
-                Ok(format!("Input NOT typeable: {} (disabled={}, readonly={}, hidden={})",
-                    reason.unwrap_or_default(), disabled, readonly, hidden))
+                Ok(format!(
+                    "Input NOT typeable: {} (disabled={}, readonly={}, hidden={})",
+                    reason.unwrap_or_default(),
+                    disabled,
+                    readonly,
+                    hidden
+                ))
             }
         }
 
         Response::CheckboxState { found, checked } => {
             if found {
-                Ok(format!("Checkbox state: {}", if checked { "checked" } else { "unchecked" }))
+                Ok(format!(
+                    "Checkbox state: {}",
+                    if checked { "checked" } else { "unchecked" }
+                ))
             } else {
                 Ok("Checkbox not found".to_string())
             }
@@ -1299,11 +1425,16 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
             Ok(result)
         }
 
-        Response::ElementStyle { found, styles, error } => {
+        Response::ElementStyle {
+            found,
+            styles,
+            error,
+        } => {
             if !found {
                 Ok(format!("Element not found: {}", error.unwrap_or_default()))
             } else if let Some(styles) = styles {
-                let formatted: Vec<String> = styles.iter()
+                let formatted: Vec<String> = styles
+                    .iter()
                     .map(|(k, v)| format!("  {}: {}", k, v))
                     .collect();
                 Ok(format!("Element styles:\n{}", formatted.join("\n")))
@@ -1318,7 +1449,10 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
 
 /// Send a WS command and, if extension is temporarily disconnected while browser is running,
 /// wait for reconnect and retry once.
-async fn send_ws_command_with_reconnect(ws_port: u16, command: Command) -> Result<Response, String> {
+async fn send_ws_command_with_reconnect(
+    ws_port: u16,
+    command: Command,
+) -> Result<Response, String> {
     let first = ws_server::send_command_to_server(ws_port, command.clone())
         .await
         .map_err(|e| e.to_string())?;
@@ -1357,7 +1491,13 @@ async fn check_playground_status(playground_port: u16) -> Result<String, String>
 
     // Check if playground port is listening
     let port_check = StdCommand::new("sh")
-        .args(["-c", &format!("lsof -i :{} 2>/dev/null | grep LISTEN | head -5", playground_port)])
+        .args([
+            "-c",
+            &format!(
+                "lsof -i :{} 2>/dev/null | grep LISTEN | head -5",
+                playground_port
+            ),
+        ])
         .output();
 
     match port_check {
@@ -1380,7 +1520,11 @@ async fn check_playground_status(playground_port: u16) -> Result<String, String>
         .build()
         .map_err(|e| e.to_string())?;
 
-    match client.get(format!("http://localhost:{}", playground_port)).send().await {
+    match client
+        .get(format!("http://localhost:{}", playground_port))
+        .send()
+        .await
+    {
         Ok(response) => {
             status.push_str(&format!("HTTP Status: {}\n", response.status()));
 
@@ -1410,7 +1554,10 @@ async fn check_playground_status(playground_port: u16) -> Result<String, String>
 
     // Check for recent mzoon/cargo processes
     let mzoon_check = StdCommand::new("sh")
-        .args(["-c", "ps aux | grep -E 'mzoon|cargo.*boon' | grep -v grep | head -5"])
+        .args([
+            "-c",
+            "ps aux | grep -E 'mzoon|cargo.*boon' | grep -v grep | head -5",
+        ])
         .output();
 
     if let Ok(output) = mzoon_check {
@@ -1467,7 +1614,14 @@ async fn get_filtered_console(
 
             // Apply limit with tail/head
             let limited: Vec<_> = if tail {
-                filtered.into_iter().rev().take(limit).collect::<Vec<_>>().into_iter().rev().collect()
+                filtered
+                    .into_iter()
+                    .rev()
+                    .take(limit)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
             } else {
                 filtered.into_iter().take(limit).collect()
             };
@@ -1507,7 +1661,10 @@ async fn click_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<
     // Use the new ClickByText command which searches directly in the extension
     let response = ws_server::send_command_to_server(
         ws_port,
-        Command::ClickByText { text: text.to_string(), exact },
+        Command::ClickByText {
+            text: text.to_string(),
+            exact,
+        },
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1533,7 +1690,10 @@ async fn dblclick_element_by_text(text: &str, exact: bool, ws_port: u16) -> Resu
     // (avoids viewport/scroll issues with coordinate-based CDP clicking)
     let response = ws_server::send_command_to_server(
         ws_port,
-        Command::DoubleClickByText { text: text.to_string(), exact },
+        Command::DoubleClickByText {
+            text: text.to_string(),
+            exact,
+        },
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1549,7 +1709,10 @@ async fn dblclick_element_by_text(text: &str, exact: bool, ws_port: u16) -> Resu
             }
         }
         Response::Error { message } => Err(format!("Double-click failed: {}", message)),
-        other => Err(format!("Double-click failed: unexpected response type: {:?}", other)),
+        other => Err(format!(
+            "Double-click failed: unexpected response type: {:?}",
+            other
+        )),
     }
 }
 
@@ -1559,7 +1722,10 @@ async fn hover_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<
     // (avoids viewport/scroll issues with coordinate-based CDP hovering)
     let response = ws_server::send_command_to_server(
         ws_port,
-        Command::HoverByText { text: text.to_string(), exact },
+        Command::HoverByText {
+            text: text.to_string(),
+            exact,
+        },
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1575,12 +1741,19 @@ async fn hover_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<
             }
         }
         Response::Error { message } => Err(format!("Hover failed: {}", message)),
-        other => Err(format!("Hover failed: unexpected response type: {:?}", other)),
+        other => Err(format!(
+            "Hover failed: unexpected response type: {:?}",
+            other
+        )),
     }
 }
 
 /// Recursively find element bounds by text content
-fn find_element_bounds_by_text(value: &Value, text: &str, exact: bool) -> Option<(i32, i32, i32, i32)> {
+fn find_element_bounds_by_text(
+    value: &Value,
+    text: &str,
+    exact: bool,
+) -> Option<(i32, i32, i32, i32)> {
     match value {
         Value::Object(obj) => {
             // Check if this element has matching text
@@ -1616,7 +1789,8 @@ fn find_element_bounds_by_text(value: &Value, text: &str, exact: bool) -> Option
                     // Extract text content from HTML (simple extraction between > and <)
                     if exact {
                         // For exact match, look for >text< pattern
-                        html.contains(&format!(">{}<", text)) || html.contains(&format!(">{}\"", text))
+                        html.contains(&format!(">{}<", text))
+                            || html.contains(&format!(">{}\"", text))
                     } else {
                         html.contains(text)
                     }
@@ -1646,7 +1820,12 @@ fn find_element_bounds_by_text(value: &Value, text: &str, exact: bool) -> Option
 
             // Search in other object values (skip text fields to avoid re-matching)
             for (key, val) in obj {
-                if key != "text" && key != "directText" && key != "fullText" && key != "html" && key != "children" {
+                if key != "text"
+                    && key != "directText"
+                    && key != "fullText"
+                    && key != "html"
+                    && key != "children"
+                {
                     if let Some(result) = find_element_bounds_by_text(val, text, exact) {
                         return Some(result);
                     }
@@ -1669,21 +1848,26 @@ fn find_element_bounds_by_text(value: &Value, text: &str, exact: bool) -> Option
 async fn start_playground() -> Result<String, String> {
     use std::process::Command as StdCommand;
 
-    let boon_root = find_boon_root()
-        .ok_or("Could not find boon repository root")?;
+    let boon_root = find_boon_root().ok_or("Could not find boon repository root")?;
 
     let playground_dir = boon_root.join("playground");
 
     if !playground_dir.exists() {
-        return Err(format!("Playground directory not found: {}", playground_dir.display()));
+        return Err(format!(
+            "Playground directory not found: {}",
+            playground_dir.display()
+        ));
     }
 
     // Start mzoon in background
     let result = StdCommand::new("sh")
-        .args(["-c", &format!(
-            "cd {} && nohup makers mzoon start > /tmp/mzoon.log 2>&1 &",
-            playground_dir.display()
-        )])
+        .args([
+            "-c",
+            &format!(
+                "cd {} && nohup makers mzoon start > /tmp/mzoon.log 2>&1 &",
+                playground_dir.display()
+            ),
+        ])
         .output();
 
     match result {
@@ -1730,7 +1914,10 @@ fn truncate_json_tree_recursive(
                     new_obj.insert(key.clone(), Value::String("[truncated]".to_string()));
                     break;
                 }
-                new_obj.insert(key.clone(), truncate_json_tree_recursive(val, max_nodes, count));
+                new_obj.insert(
+                    key.clone(),
+                    truncate_json_tree_recursive(val, max_nodes, count),
+                );
             }
             Value::Object(new_obj)
         }
@@ -1739,7 +1926,10 @@ fn truncate_json_tree_recursive(
             for item in arr {
                 *count += 1;
                 if *count > max_nodes {
-                    new_arr.push(Value::String(format!("[...{} more items truncated]", arr.len() - new_arr.len())));
+                    new_arr.push(Value::String(format!(
+                        "[...{} more items truncated]",
+                        arr.len() - new_arr.len()
+                    )));
                     break;
                 }
                 new_arr.push(truncate_json_tree_recursive(item, max_nodes, count));
@@ -1823,7 +2013,10 @@ async fn run_visual_debug(reference: &str, threshold: f64, ws_port: u16) -> Resu
     }
 
     // Add file paths at the end
-    result.push_str(&format!("\n\nScreenshot: {}\nDiff image: {}", current, diff));
+    result.push_str(&format!(
+        "\n\nScreenshot: {}\nDiff image: {}",
+        current, diff
+    ));
 
     Ok(result)
 }

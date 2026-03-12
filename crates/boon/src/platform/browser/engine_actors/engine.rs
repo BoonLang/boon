@@ -533,7 +533,6 @@ impl<T> NamedChannel<T> {
         }
         result
     }
-
 }
 
 /// Debug flag to trace actor flow: stream subscriptions, value broadcasts,
@@ -2007,7 +2006,10 @@ impl Drop for ScopeDestroyGuard {
             let after = live_actor_count();
             zoon::println!(
                 "[actors] ScopeDestroyGuard: destroyed scope {:?}, actors {} → {} (freed {})",
-                scope_id, before, after, before - after
+                scope_id,
+                before,
+                after,
+                before - after
             );
         }
     }
@@ -2897,9 +2899,7 @@ impl VariableOrArgumentReference {
                     // This occurs transiently when e.g. WHEN arm pattern tags flow through
                     // a field access chain before switch_map cancels them. Return pending —
                     // switch_map will cancel this stream when the correct Object arrives.
-                    _non_object => {
-                        stream::pending::<Value>().boxed_local()
-                    }
+                    _non_object => stream::pending::<Value>().boxed_local(),
                 }
             });
         }
@@ -7716,6 +7716,10 @@ use crate::parser::static_expression::{Expression as StaticExpression, Spanned a
 /// - Serialized for distributed evaluation
 pub struct ListBindingFunction;
 
+fn list_item_scope_id(index: usize, persistence_id: parser::PersistenceId) -> String {
+    format!("list_item_{}_{}", index, persistence_id.as_u128())
+}
+
 /// Configuration for a list binding operation.
 #[derive(Clone)]
 pub struct ListBindingConfig {
@@ -9616,8 +9620,7 @@ impl ListBindingFunction {
         // Without the index, items from `LIST { fn(), fn(), fn() }` all get the same scope
         // because they share the same persistence_id (from the function's return object AST position).
         // This caused the list_object_state bug where clicking any button incremented all counters.
-        let pid_suffix = format!("{}", item_actor.persistence_id().as_u128());
-        let scope_id = format!("list_item_{}_{}", index, pid_suffix);
+        let scope_id = list_item_scope_id(index, item_actor.persistence_id());
         let child_scope = actor_context.with_child_scope(&scope_id);
         // Create a child registry scope for this list item so all actors created
         // within the transform expression are owned by this scope.
@@ -10022,5 +10025,35 @@ impl ListBindingFunction {
                 (ListChange::Clear, 0)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::list_item_scope_id;
+    use crate::parser::PersistenceId;
+
+    #[test]
+    fn list_item_scope_id_is_stable_for_same_inputs() {
+        let pid = PersistenceId::new();
+        let first = list_item_scope_id(3, pid);
+        let second = list_item_scope_id(3, pid);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn list_item_scope_id_changes_for_index_and_persistence_id() {
+        let first_pid = PersistenceId::new();
+        let second_pid = PersistenceId::new();
+
+        assert_ne!(
+            list_item_scope_id(0, first_pid),
+            list_item_scope_id(1, first_pid)
+        );
+        assert_ne!(
+            list_item_scope_id(0, first_pid),
+            list_item_scope_id(0, second_pid)
+        );
     }
 }

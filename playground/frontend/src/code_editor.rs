@@ -89,10 +89,7 @@ impl CodeEditor {
         })
     }
 
-    pub fn on_cursor_change(
-        self,
-        mut on_cursor_change: impl FnMut(u32, u32) + 'static,
-    ) -> Self {
+    pub fn on_cursor_change(self, mut on_cursor_change: impl FnMut(u32, u32) + 'static) -> Self {
         let closure = Rc::new(Closure::new(move |line: u32, col: u32| {
             on_cursor_change(line, col);
         }));

@@ -1,5 +1,15 @@
 # Correct Cells and Zoon Parity Plan
 
+## Status
+
+- Historical milestone plan.
+- Engine-independence constraints here are still valid.
+- The active semantic-oracle direction now lives in [reference_kernel_plan.md](/home/martinkavik/repos/boon/docs/plans/reference_kernel_plan.md).
+- Important clarification:
+  - we still do **not** want a shared production runtime core across Actors, DD, and Wasm
+  - the new internal reference kernel is only for semantics, diagnostics, and conformance tests
+  - each engine still keeps its own runtime and later crate boundary
+
 ## 1. Goal
 
 Use Cells as the forcing benchmark for a broader milestone:

@@ -1638,9 +1638,7 @@ fn schedule_expression(
             // Push the EvaluateWithPiped work item FIRST (LIFO - processed second)
             let field_access_expr = static_expression::Spanned {
                 span,
-                node: static_expression::Expression::FieldAccess {
-                    path: vec![field],
-                },
+                node: static_expression::Expression::FieldAccess { path: vec![field] },
                 persistence,
             };
             state.push(WorkItem::EvaluateWithPiped {
@@ -2215,12 +2213,10 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                         if let Ok(value) = spread_actor.value().await {
                             match value {
                                 Value::Object(obj, _) => {
-                                    all_variables
-                                        .extend(obj.variables().iter().cloned());
+                                    all_variables.extend(obj.variables().iter().cloned());
                                 }
                                 Value::TaggedObject(obj, _) => {
-                                    all_variables
-                                        .extend(obj.variables().iter().cloned());
+                                    all_variables.extend(obj.variables().iter().cloned());
                                 }
                                 _ => {} // Non-object spread silently ignored
                             }
@@ -2475,12 +2471,10 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                         if let Ok(value) = spread_actor.value().await {
                             match value {
                                 Value::Object(obj, _) => {
-                                    all_variables
-                                        .extend(obj.variables().iter().cloned());
+                                    all_variables.extend(obj.variables().iter().cloned());
                                 }
                                 Value::TaggedObject(obj, _) => {
-                                    all_variables
-                                        .extend(obj.variables().iter().cloned());
+                                    all_variables.extend(obj.variables().iter().cloned());
                                 }
                                 _ => {}
                             }
@@ -3639,12 +3633,19 @@ fn build_when_actor(
                 }
 
                 // Pre-resolve ValueComparison patterns from scope
-                let comparison_values = resolve_comparison_values(&arms_clone, &actor_context_clone, &reference_connector_clone).await;
+                let comparison_values = resolve_comparison_values(
+                    &arms_clone,
+                    &actor_context_clone,
+                    &reference_connector_clone,
+                )
+                .await;
 
                 // Try to match against each arm
                 for arm in &arms_clone {
                     // Use async pattern matching to properly extract bindings from Objects
-                    if let Some(bindings) = match_pattern(&arm.pattern, &value, &comparison_values).await {
+                    if let Some(bindings) =
+                        match_pattern(&arm.pattern, &value, &comparison_values).await
+                    {
                         if LOG_DEBUG {
                             zoon::println!("[WHEN] Pattern MATCHED: {:?}", arm.pattern);
                         }
@@ -3752,9 +3753,7 @@ fn build_when_actor(
                                     stream::once(
                                         async move { result_actor_for_value.value().await },
                                     )
-                                    .filter_map(move |v| {
-                                        future::ready(v.ok())
-                                    })
+                                    .filter_map(move |v| future::ready(v.ok()))
                                     .map(
                                         move |mut result_value| {
                                             // Prevent drop: captured by `move` closure, lives as long as stream combinator
@@ -3883,7 +3882,12 @@ fn build_while_actor(
         // any async work and the forwarded body stream) and start a new one.
         stream::once(async move {
             // Pre-resolve ValueComparison patterns from scope
-            let comparison_values = resolve_comparison_values(&arms_clone, &actor_context_clone, &reference_connector_clone).await;
+            let comparison_values = resolve_comparison_values(
+                &arms_clone,
+                &actor_context_clone,
+                &reference_connector_clone,
+            )
+            .await;
 
             // Find matching arm using async pattern matching
             let mut matched_arm_with_bindings: Option<(
@@ -3892,7 +3896,9 @@ fn build_while_actor(
                 HashMap<String, Value>,
             )> = None;
             for (arm_idx, arm) in arms_clone.iter().enumerate() {
-                if let Some(bindings) = match_pattern(&arm.pattern, &value, &comparison_values).await {
+                if let Some(bindings) =
+                    match_pattern(&arm.pattern, &value, &comparison_values).await
+                {
                     matched_arm_with_bindings = Some((arm_idx, arm, bindings));
                     break;
                 }
@@ -4129,7 +4135,11 @@ fn build_field_access_actor(
     // This prevents stale subscriptions when intermediate elements are recreated.
     for (idx, field_name) in path.iter().enumerate() {
         let field_name = field_name.clone();
-        let path_display_for_log = if LOG_DEBUG { Some(path_display.clone()) } else { None };
+        let path_display_for_log = if LOG_DEBUG {
+            Some(path_display.clone())
+        } else {
+            None
+        };
         let field_idx = idx;
 
         value_stream = switch_map(value_stream, move |value| {
@@ -4627,7 +4637,9 @@ fn build_text_literal_actor(
                         // First check object_locals for instance-specific resolution
                         // This prevents span-based overwrites when multiple Objects are created
                         // from the same function definition (e.g., BLOCK inside List/map)
-                        if let Some(local_actor) = ctx.actor_context.object_locals.get(ref_span).cloned() {
+                        if let Some(local_actor) =
+                            ctx.actor_context.object_locals.get(ref_span).cloned()
+                        {
                             Some(local_actor)
                         } else {
                             // Fall back to async lookup via ReferenceConnector for outer scope
@@ -5588,7 +5600,7 @@ fn call_function(
     if let Some(func_def) = func_def_opt {
         // User-defined functions don't capture caller parameter maps.
         // Carry only the explicit call arguments into the callee.
-        let mut parameters = arg_map;
+        let parameters = arg_map;
 
         // Check if piped value should be bound to an unbound function parameter.
         // For `position |> fibonacci()`, bind `position` to the first parameter of `fibonacci`.
@@ -5910,7 +5922,11 @@ async fn resolve_comparison_values(
 ) -> HashMap<String, Value> {
     let mut resolved = HashMap::new();
     for arm in arms {
-        if let static_expression::Pattern::ValueComparison { path, referenced_span } = &arm.pattern {
+        if let static_expression::Pattern::ValueComparison {
+            path,
+            referenced_span,
+        } = &arm.pattern
+        {
             let base_name = path[0].as_str().to_string();
 
             // Try parameters first, then fall back to reference_connector
@@ -5934,9 +5950,16 @@ async fn resolve_comparison_values(
                     if path.len() == 1 {
                         resolved.insert(base_name, base_value);
                     } else {
-                        let field_path: Vec<String> = path[1..].iter().map(|s| s.as_str().to_string()).collect();
-                        if let Some(field_value) = extract_field_path(&base_value, &field_path).await {
-                            let key = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(".");
+                        let field_path: Vec<String> =
+                            path[1..].iter().map(|s| s.as_str().to_string()).collect();
+                        if let Some(field_value) =
+                            extract_field_path(&base_value, &field_path).await
+                        {
+                            let key = path
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(".");
                             resolved.insert(key, field_value);
                         }
                     }
@@ -6005,8 +6028,12 @@ async fn match_pattern(
                                 // Handle nested patterns if present
                                 if let Some(ref nested_pattern) = pattern_var.value {
                                     // Recursively match nested pattern
-                                    if let Some(nested_bindings) =
-                                        Box::pin(match_pattern(nested_pattern, &field_value, comparison_values)).await
+                                    if let Some(nested_bindings) = Box::pin(match_pattern(
+                                        nested_pattern,
+                                        &field_value,
+                                        comparison_values,
+                                    ))
+                                    .await
                                     {
                                         bindings.extend(nested_bindings);
                                     } else {
@@ -6050,8 +6077,12 @@ async fn match_pattern(
                             // Handle nested patterns if present
                             if let Some(ref nested_pattern) = pattern_var.value {
                                 // Recursively match nested pattern
-                                if let Some(nested_bindings) =
-                                    Box::pin(match_pattern(nested_pattern, &field_value, comparison_values)).await
+                                if let Some(nested_bindings) = Box::pin(match_pattern(
+                                    nested_pattern,
+                                    &field_value,
+                                    comparison_values,
+                                ))
+                                .await
                                 {
                                     bindings.extend(nested_bindings);
                                 } else {
@@ -6072,13 +6103,27 @@ async fn match_pattern(
             }
 
             if let Value::Object(obj, _) = value {
-                if extract_object_bindings(obj.variables(), variables, &mut bindings, comparison_values).await {
+                if extract_object_bindings(
+                    obj.variables(),
+                    variables,
+                    &mut bindings,
+                    comparison_values,
+                )
+                .await
+                {
                     Some(bindings)
                 } else {
                     None
                 }
             } else if let Value::TaggedObject(to, _) = value {
-                if extract_object_bindings(to.variables(), variables, &mut bindings, comparison_values).await {
+                if extract_object_bindings(
+                    to.variables(),
+                    variables,
+                    &mut bindings,
+                    comparison_values,
+                )
+                .await
+                {
                     Some(bindings)
                 } else {
                     None
@@ -6104,7 +6149,8 @@ async fn match_pattern(
                     if let Some(item_value) = item_actor.clone().current_value().await.ok() {
                         // Recursively match the pattern
                         if let Some(nested_bindings) =
-                            Box::pin(match_pattern(item_pattern, &item_value, comparison_values)).await
+                            Box::pin(match_pattern(item_pattern, &item_value, comparison_values))
+                                .await
                         {
                             bindings.extend(nested_bindings);
                         } else {
@@ -6121,13 +6167,23 @@ async fn match_pattern(
         }
 
         static_expression::Pattern::ValueComparison { path, .. } => {
-            let key = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(".");
+            let key = path
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
             if let Some(comparison_value) = comparison_values.get(&key) {
                 // Compare like literals: check tag, text, or number equality
                 match (comparison_value, value) {
                     (Value::Tag(a, _), Value::Tag(b, _)) if a.tag() == b.tag() => Some(bindings),
-                    (Value::Text(a, _), Value::Text(b, _)) if a.text() == b.text() => Some(bindings),
-                    (Value::Number(a, _), Value::Number(b, _)) if (a.number() - b.number()).abs() < f64::EPSILON => Some(bindings),
+                    (Value::Text(a, _), Value::Text(b, _)) if a.text() == b.text() => {
+                        Some(bindings)
+                    }
+                    (Value::Number(a, _), Value::Number(b, _))
+                        if (a.number() - b.number()).abs() < f64::EPSILON =>
+                    {
+                        Some(bindings)
+                    }
                     _ => None,
                 }
             } else {
@@ -6421,11 +6477,7 @@ pub fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
         .into_output_errors();
     if !errors.is_empty() {
         for err in &errors {
-            zoon::eprintln!(
-                "[ModuleLoader] Parse error in '{}': {:?}",
-                filename,
-                err
-            );
+            zoon::eprintln!("[ModuleLoader] Parse error in '{}': {:?}", filename, err);
         }
         return None;
     }
@@ -7062,16 +7114,18 @@ fn static_function_call_path_to_definition(
             )
             .boxed_local()
         },
-        ["List", "remove_last"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_list_remove_last(
-                arguments,
-                id,
-                persistence_id,
-                construct_context,
-                actor_context,
-            )
-            .boxed_local()
-        },
+        ["List", "remove_last"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_list_remove_last(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
         ["List", "is_empty"] => {
             |arguments, id, persistence_id, construct_context, actor_context| {
                 api::function_list_is_empty(
@@ -7166,56 +7220,66 @@ fn static_function_call_path_to_definition(
             )
             .boxed_local()
         },
-        ["Text", "find_closing"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_text_find_closing(
-                arguments,
-                id,
-                persistence_id,
-                construct_context,
-                actor_context,
-            )
-            .boxed_local()
-        },
-        ["Text", "substring"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_text_substring(
-                arguments,
-                id,
-                persistence_id,
-                construct_context,
-                actor_context,
-            )
-            .boxed_local()
-        },
-        ["Text", "to_uppercase"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_text_to_uppercase(
-                arguments,
-                id,
-                persistence_id,
-                construct_context,
-                actor_context,
-            )
-            .boxed_local()
-        },
-        ["Text", "char_code"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_text_char_code(
-                arguments,
-                id,
-                persistence_id,
-                construct_context,
-                actor_context,
-            )
-            .boxed_local()
-        },
-        ["Text", "from_char_code"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_text_from_char_code(
-                arguments,
-                id,
-                persistence_id,
-                construct_context,
-                actor_context,
-            )
-            .boxed_local()
-        },
+        ["Text", "find_closing"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_text_find_closing(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Text", "substring"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_text_substring(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Text", "to_uppercase"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_text_to_uppercase(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Text", "char_code"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_text_char_code(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Text", "from_char_code"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_text_from_char_code(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
         ["Math", "modulo"] => |arguments, id, persistence_id, construct_context, actor_context| {
             api::function_math_modulo(
                 arguments,
@@ -7364,18 +7428,16 @@ fn static_function_call_path_to_definition(
                 .boxed_local()
             }
         }
-        ["Element", "svg"] => {
-            |arguments, id, persistence_id, construct_context, actor_context| {
-                api::function_element_svg(
-                    arguments,
-                    id,
-                    persistence_id,
-                    construct_context,
-                    actor_context,
-                )
-                .boxed_local()
-            }
-        }
+        ["Element", "svg"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_svg(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
+        },
         ["Element", "svg_circle"] => {
             |arguments, id, persistence_id, construct_context, actor_context| {
                 api::function_element_svg_circle(
@@ -7487,53 +7549,186 @@ fn static_function_call_path_to_definition(
             .boxed_local()
         },
         // --- Scene/Element/* aliases (call the same underlying Element/* functions) ---
-        ["Scene", "Element", "stripe"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_stripe(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
-        ["Scene", "Element", "container"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_container(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
-        ["Scene", "Element", "stack"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_stack(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
-        ["Scene", "Element", "button"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_button(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
-        ["Scene", "Element", "text_input"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_text_input(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
-        ["Scene", "Element", "checkbox"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_checkbox(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
-        ["Scene", "Element", "label"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_label(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
-        ["Scene", "Element", "paragraph"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_paragraph(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
-        ["Scene", "Element", "link"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_link(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
+        ["Scene", "Element", "stripe"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_stripe(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Scene", "Element", "container"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_container(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Scene", "Element", "stack"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_stack(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Scene", "Element", "button"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_button(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Scene", "Element", "text_input"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_text_input(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Scene", "Element", "checkbox"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_checkbox(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Scene", "Element", "label"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_label(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Scene", "Element", "paragraph"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_paragraph(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Scene", "Element", "link"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_link(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
         // --- Element/text and Element/block (new element types) ---
         ["Element", "text"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_text(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
+            api::function_element_text(
+                arguments,
+                id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )
+            .boxed_local()
         },
-        ["Element", "block"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_block(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
-        ["Scene", "Element", "text"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_text(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
-        ["Scene", "Element", "block"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_element_block(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
+        ["Element", "block"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_block(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Scene", "Element", "text"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_text(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Scene", "Element", "block"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_element_block(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
         // --- Light/* data constructors ---
-        ["Light", "directional"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_light_directional(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
-        ["Light", "ambient"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_light_ambient(arguments, id, persistence_id, construct_context, actor_context).boxed_local()
-        },
+        ["Light", "directional"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_light_directional(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
+        ["Light", "ambient"] => {
+            |arguments, id, persistence_id, construct_context, actor_context| {
+                api::function_light_ambient(
+                    arguments,
+                    id,
+                    persistence_id,
+                    construct_context,
+                    actor_context,
+                )
+                .boxed_local()
+            }
+        }
         ["Theme", "background_color"] => {
             |arguments, id, persistence_id, construct_context, actor_context| {
                 api::function_theme_background_color(
@@ -7735,4 +7930,250 @@ fn spawn_recorded_calls_storage_actor(
             zoon::println!("[DEBUG] Storage actor for {} shutting down", storage_key);
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flatten_pipe_chain;
+    use crate::parser::{
+        SourceCode, Spanned, Token, lexer, parser, resolve_references, span_at, static_expression,
+    };
+    use crate::platform::browser::kernel::{
+        KernelValue, LatestCandidate, TickId, TickSeq, select_latest,
+    };
+    use chumsky::Parser as ChumskyParser;
+    use chumsky::input::Input as ChumskyInput;
+    use std::collections::HashMap;
+
+    fn latest_conformance_source() -> &'static str {
+        r#"
+left_button: LINK
+right_button: LINK
+
+selected: LATEST {
+    left_button.event.press |> THEN { TEXT { left } }
+    right_button.event.press |> THEN { TEXT { right } }
+}
+"#
+    }
+
+    fn hold_conformance_source() -> &'static str {
+        r#"
+increment_button: LINK
+
+counter: 0 |> HOLD state {
+    increment_button.event.press |> THEN { state + 1 }
+}
+"#
+    }
+
+    fn link_conformance_source() -> &'static str {
+        r#"
+increment_button: LINK
+
+pressed: increment_button.event.press |> THEN { TEXT { pressed } }
+"#
+    }
+
+    fn parse_static_variables(
+        source: &str,
+    ) -> (
+        SourceCode,
+        HashMap<String, static_expression::Spanned<static_expression::Expression>>,
+    ) {
+        let source_code = SourceCode::new(source.to_string());
+        let source_str = source_code.as_str();
+        let (mut tokens, lex_errors) = lexer().parse(source_str).into_output_errors();
+        assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
+        let Some(mut tokens) = tokens.take() else {
+            panic!("source should lex");
+        };
+        tokens.retain(|spanned_token| !matches!(spanned_token.node, Token::Comment(_)));
+
+        let (ast, parse_errors) = parser()
+            .parse(tokens.map(
+                span_at(source_str.len()),
+                |Spanned {
+                     node,
+                     span,
+                     persistence: _,
+                 }| { (node, span) },
+            ))
+            .into_output_errors();
+        assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+        let ast = ast.expect("source should parse");
+        let ast = resolve_references(ast).expect("source should resolve references");
+        let static_ast = static_expression::convert_expressions(source_code.clone(), ast);
+
+        let mut variables = HashMap::new();
+        for expr in static_ast {
+            if let static_expression::Expression::Variable(variable) = expr.node {
+                variables.insert(variable.name.to_string(), variable.value);
+            }
+        }
+        (source_code, variables)
+    }
+
+    #[test]
+    fn latest_press_sequence_preserves_two_then_arms_for_evaluator() {
+        let (_source_code, variables) = parse_static_variables(latest_conformance_source());
+        let selected = variables
+            .get("selected")
+            .cloned()
+            .expect("selected variable should exist");
+
+        let static_expression::Expression::Latest { inputs } = selected.node else {
+            panic!("expected selected to remain a LATEST expression");
+        };
+
+        assert_eq!(inputs.len(), 2, "expected two LATEST inputs");
+
+        let arm_texts: Vec<String> = inputs
+            .iter()
+            .map(|input| {
+                let chain = flatten_pipe_chain(input.clone());
+                assert_eq!(
+                    chain.len(),
+                    2,
+                    "expected each LATEST arm to stay a two-step pipe for Actors evaluation"
+                );
+
+                let then_expr = chain.last().expect("pipe should have THEN step");
+                let static_expression::Expression::Then { body } = &then_expr.node else {
+                    panic!("expected LATEST arm to end in THEN");
+                };
+                match &body.node {
+                    static_expression::Expression::TextLiteral { parts, .. }
+                        if parts.len() == 1 =>
+                    {
+                        match &parts[0] {
+                            static_expression::TextPart::Text(text) => text.to_string(),
+                            other => panic!("expected text literal part, got {other:?}"),
+                        }
+                    }
+                    other => {
+                        panic!("expected THEN body to be single-part TEXT literal, got {other:?}")
+                    }
+                }
+            })
+            .collect();
+
+        assert_eq!(arm_texts, vec!["left".to_string(), "right".to_string()]);
+
+        let expected = select_latest(&[
+            LatestCandidate::new(KernelValue::from("left"), TickSeq::new(TickId(1), 1)),
+            LatestCandidate::new(KernelValue::from("right"), TickSeq::new(TickId(1), 2)),
+        ]);
+        assert_eq!(expected, KernelValue::from("right"));
+    }
+
+    #[test]
+    fn hold_press_sequence_preserves_initial_state_and_then_body_shape() {
+        let (_source_code, variables) = parse_static_variables(hold_conformance_source());
+        let counter = variables
+            .get("counter")
+            .cloned()
+            .expect("counter variable should exist");
+
+        let chain = flatten_pipe_chain(counter);
+        assert_eq!(
+            chain.len(),
+            2,
+            "expected HOLD expression to remain a two-step pipe in Actors evaluator input"
+        );
+        assert!(
+            matches!(chain[0].node, static_expression::Expression::Literal(static_expression::Literal::Number(n)) if (n - 0.0).abs() < f64::EPSILON),
+            "expected HOLD initial value to stay as literal 0"
+        );
+
+        let static_expression::Expression::Hold { state_param, body } = &chain[1].node else {
+            panic!("expected second pipe step to be HOLD");
+        };
+        assert_eq!(state_param.to_string(), "state");
+
+        let body_chain = flatten_pipe_chain((**body).clone());
+        assert_eq!(
+            body_chain.len(),
+            2,
+            "expected HOLD body to remain an event |> THEN pipeline"
+        );
+        let static_expression::Expression::Then { body: then_body } = &body_chain[1].node else {
+            panic!("expected HOLD body to end in THEN");
+        };
+        match &then_body.node {
+            static_expression::Expression::ArithmeticOperator(
+                static_expression::ArithmeticOperator::Add {
+                    operand_a,
+                    operand_b,
+                },
+            ) => {
+                assert!(
+                    matches!(
+                        operand_a.node,
+                        static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed { ref parts, .. }
+                        ) if parts.len() == 1 && parts[0].to_string() == "state"
+                    ),
+                    "expected HOLD body lhs to reference state"
+                );
+                assert!(
+                    matches!(
+                        operand_b.node,
+                        static_expression::Expression::Literal(
+                            static_expression::Literal::Number(n)
+                        ) if (n - 1.0).abs() < f64::EPSILON
+                    ),
+                    "expected HOLD body rhs to stay literal 1"
+                );
+            }
+            other => panic!("expected HOLD THEN body to be `state + 1`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_press_sequence_preserves_alias_path_into_then() {
+        let (_source_code, variables) = parse_static_variables(link_conformance_source());
+
+        let increment_button = variables
+            .get("increment_button")
+            .cloned()
+            .expect("increment_button variable should exist");
+        assert!(
+            matches!(increment_button.node, static_expression::Expression::Link),
+            "expected increment_button to stay a LINK placeholder"
+        );
+
+        let pressed = variables
+            .get("pressed")
+            .cloned()
+            .expect("pressed variable should exist");
+        let chain = flatten_pipe_chain(pressed);
+        assert_eq!(
+            chain.len(),
+            2,
+            "expected LINK event consumer to remain a two-step pipe"
+        );
+        assert!(
+            matches!(
+                &chain[0].node,
+                static_expression::Expression::Alias(
+                    static_expression::Alias::WithoutPassed { parts, .. }
+                ) if parts.iter().map(|part| part.to_string()).collect::<Vec<_>>()
+                    == vec!["increment_button".to_string(), "event".to_string(), "press".to_string()]
+            ),
+            "expected first step to keep increment_button.event.press alias path"
+        );
+        let static_expression::Expression::Then { body } = &chain[1].node else {
+            panic!("expected LINK event consumer to end in THEN");
+        };
+        assert!(
+            matches!(
+                body.node,
+                static_expression::Expression::TextLiteral { ref parts, .. }
+                    if parts.len() == 1
+                        && matches!(&parts[0], static_expression::TextPart::Text(text) if text.to_string() == "pressed")
+            ),
+            "expected THEN body to stay TEXT {{ pressed }}"
+        );
+    }
 }

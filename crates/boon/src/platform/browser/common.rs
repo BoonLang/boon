@@ -11,6 +11,8 @@ pub enum EngineType {
     DifferentialDataflow,
     /// Compiled WASM engine (direct compilation to WebAssembly bytecode)
     Wasm,
+    /// Next-generation compiled WASM engine with renderer-agnostic diff output
+    WasmPro,
 }
 
 impl EngineType {
@@ -20,6 +22,7 @@ impl EngineType {
             Self::Actors => "Actors",
             Self::DifferentialDataflow => "DD",
             Self::Wasm => "Wasm",
+            Self::WasmPro => "WasmPro",
         }
     }
 
@@ -29,6 +32,7 @@ impl EngineType {
             Self::Actors => "Actor-based reactive streams",
             Self::DifferentialDataflow => "Differential Dataflow",
             Self::Wasm => "Compiled WASM",
+            Self::WasmPro => "Wasm Pro",
         }
     }
 
@@ -40,6 +44,7 @@ impl EngineType {
                 "Incremental computation based on the Differential Dataflow library"
             }
             Self::Wasm => "Compiled to WebAssembly bytecode",
+            Self::WasmPro => "Next-generation WebAssembly backend with renderer-agnostic diffs",
         }
     }
 }
@@ -51,7 +56,7 @@ impl Default for EngineType {
 }
 
 /// Returns all engines available in this build, based on compile-time feature flags.
-/// Order: Actors, DD, Wasm (priority order for default selection).
+/// Order: Actors, DD, Wasm, WasmPro (priority order for default selection).
 pub fn available_engines() -> Vec<EngineType> {
     let mut engines = Vec::new();
     #[cfg(feature = "engine-actors")]
@@ -60,11 +65,13 @@ pub fn available_engines() -> Vec<EngineType> {
     engines.push(EngineType::DifferentialDataflow);
     #[cfg(feature = "engine-wasm")]
     engines.push(EngineType::Wasm);
+    #[cfg(feature = "engine-wasm-pro")]
+    engines.push(EngineType::WasmPro);
     engines
 }
 
 /// Returns the default engine based on compile-time feature flags.
-/// First available engine wins (priority: Actors > DD > Wasm).
+/// First available engine wins (priority: Actors > DD > Wasm > WasmPro).
 pub fn default_engine() -> EngineType {
     available_engines()
         .into_iter()

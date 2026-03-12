@@ -35,8 +35,8 @@ pub use persistence_resolver::{
 mod source;
 pub use source::{SourceCode, StrSlice};
 
-pub mod static_expression;
 pub mod formatter;
+pub mod static_expression;
 
 pub use chumsky::prelude::{Input, Parser};
 

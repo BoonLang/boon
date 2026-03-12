@@ -301,10 +301,18 @@ pub enum IrNode {
     TextIsNotEmpty { cell: CellId, source: CellId },
 
     /// Text/to_number: parse text to number. Returns NaN tag index if invalid.
-    TextToNumber { cell: CellId, source: CellId, nan_tag_value: f64 },
+    TextToNumber {
+        cell: CellId,
+        source: CellId,
+        nan_tag_value: f64,
+    },
 
     /// Text/starts_with: check if source text starts with prefix text.
-    TextStartsWith { cell: CellId, source: CellId, prefix: CellId },
+    TextStartsWith {
+        cell: CellId,
+        source: CellId,
+        prefix: CellId,
+    },
 
     /// Math/round: round number to nearest integer.
     MathRound { cell: CellId, source: CellId },
@@ -463,6 +471,9 @@ pub struct IrProgram {
     /// Used by codegen to resolve text from namespace cells (e.g., finding the
     /// "title" field of a todo item for list display).
     pub cell_field_cells: HashMap<CellId, HashMap<String, CellId>>,
+    /// Precomputed plan for each List/map node. The bridge consumes these
+    /// instead of rescanning the IR at render time.
+    pub list_map_plans: HashMap<CellId, ListMapPlan>,
 }
 
 impl IrProgram {
@@ -491,6 +502,1080 @@ impl IrProgram {
             }
         })
     }
+
+    #[must_use]
+    pub fn list_map_plan(&self, cell: CellId) -> Option<&ListMapPlan> {
+        self.list_map_plans.get(&cell)
+    }
+
+    #[must_use]
+    pub fn compute_list_map_plans(&self) -> HashMap<CellId, ListMapPlan> {
+        let mut plans = HashMap::new();
+        for node in &self.nodes {
+            let IrNode::ListMap {
+                cell,
+                source,
+                item_cell,
+                template,
+                template_cell_range,
+                template_event_range,
+                ..
+            } = node
+            else {
+                continue;
+            };
+
+            let template_root_cell = match template.as_ref() {
+                IrNode::Derived {
+                    expr: IrExpr::CellRead(cell),
+                    ..
+                } => Some(*cell),
+                _ => None,
+            };
+
+            let template = TemplatePlan {
+                root_cell: template_root_cell,
+                cell_range: *template_cell_range,
+                event_range: *template_event_range,
+                seed_cells: self.template_seed_cells(*template_cell_range),
+                global_deps: self.collect_template_global_dependencies(*template_cell_range),
+                cross_scope_events: self
+                    .collect_cross_scope_events(*template_cell_range, *template_event_range),
+            };
+
+            let resolved_item_store = self.resolve_to_object_store(*item_cell);
+            let field_hold_sources = self
+                .cell_field_cells
+                .get(item_cell)
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter_map(|(name, field_cell)| {
+                            self.find_node_for_cell(*field_cell).and_then(|node| {
+                                if let IrNode::Hold { init, .. } = node {
+                                    if let IrExpr::CellRead(src) = init {
+                                        return Some((name.clone(), *src));
+                                    }
+                                }
+                                None
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            plans.insert(
+                *cell,
+                ListMapPlan {
+                    map_cell: *cell,
+                    source: *source,
+                    fanout_source: self.resolve_cross_scope_fanout_source(*source),
+                    item_cell: *item_cell,
+                    resolved_item_store,
+                    field_hold_sources,
+                    template,
+                },
+            );
+        }
+        plans
+    }
+
+    #[must_use]
+    pub fn find_node_for_cell(&self, cell: CellId) -> Option<&IrNode> {
+        self.nodes.iter().find(|node| match node {
+            IrNode::Derived { cell: c, .. }
+            | IrNode::Hold { cell: c, .. }
+            | IrNode::Latest { target: c, .. }
+            | IrNode::Then { cell: c, .. }
+            | IrNode::When { cell: c, .. }
+            | IrNode::While { cell: c, .. }
+            | IrNode::MathSum { cell: c, .. }
+            | IrNode::PipeThrough { cell: c, .. }
+            | IrNode::StreamSkip { cell: c, .. }
+            | IrNode::TextInterpolation { cell: c, .. }
+            | IrNode::CustomCall { cell: c, .. }
+            | IrNode::Element { cell: c, .. }
+            | IrNode::ListAppend { cell: c, .. }
+            | IrNode::ListClear { cell: c, .. }
+            | IrNode::ListCount { cell: c, .. }
+            | IrNode::ListMap { cell: c, .. }
+            | IrNode::ListRemove { cell: c, .. }
+            | IrNode::ListRetain { cell: c, .. }
+            | IrNode::ListEvery { cell: c, .. }
+            | IrNode::ListAny { cell: c, .. }
+            | IrNode::ListIsEmpty { cell: c, .. }
+            | IrNode::RouterGoTo { cell: c, .. }
+            | IrNode::TextTrim { cell: c, .. }
+            | IrNode::TextIsNotEmpty { cell: c, .. }
+            | IrNode::TextToNumber { cell: c, .. }
+            | IrNode::MathRound { cell: c, .. }
+            | IrNode::MathMin { cell: c, .. }
+            | IrNode::MathMax { cell: c, .. }
+            | IrNode::TextStartsWith { cell: c, .. }
+            | IrNode::HoldLoop { cell: c, .. } => *c == cell,
+            IrNode::Document { root, .. } => *root == cell,
+            IrNode::Timer { .. } => false,
+        })
+    }
+
+    #[must_use]
+    pub fn resolve_to_object_store(&self, cell: CellId) -> CellId {
+        if self.cell_field_cells.contains_key(&cell) {
+            return cell;
+        }
+        if let Some(node) = self.find_node_for_cell(cell) {
+            match node {
+                IrNode::Derived {
+                    expr: IrExpr::CellRead(src),
+                    ..
+                } => return self.resolve_to_object_store(*src),
+                IrNode::PipeThrough { source, .. } => return self.resolve_to_object_store(*source),
+                _ => {}
+            }
+        }
+        cell
+    }
+
+    fn resolve_cross_scope_fanout_source(&self, source: CellId) -> CellId {
+        let mut current = source;
+        let mut seen = std::collections::HashSet::new();
+        let mut unwrapped_retain = false;
+
+        while seen.insert(current) {
+            match self.find_node_for_cell(current) {
+                Some(IrNode::Derived {
+                    expr: IrExpr::CellRead(next),
+                    ..
+                }) => current = *next,
+                Some(IrNode::PipeThrough { source: next, .. }) => current = *next,
+                Some(IrNode::ListRetain { source: next, .. }) if !unwrapped_retain => {
+                    current = *next;
+                    unwrapped_retain = true;
+                }
+                _ => break,
+            }
+        }
+
+        current
+    }
+
+    fn collect_cross_scope_events(
+        &self,
+        template_cell_range: (u32, u32),
+        root_event_range: (u32, u32),
+    ) -> Vec<u32> {
+        let mut result = Vec::new();
+        let mut seen_ranges = std::collections::HashSet::new();
+        self.collect_cross_scope_events_in_range(
+            template_cell_range,
+            root_event_range,
+            false,
+            &mut seen_ranges,
+            &mut result,
+        );
+        result
+    }
+
+    fn collect_cross_scope_events_in_range(
+        &self,
+        scan_cell_range: (u32, u32),
+        root_event_range: (u32, u32),
+        include_local_events: bool,
+        seen_ranges: &mut std::collections::HashSet<(u32, u32)>,
+        result: &mut Vec<u32>,
+    ) {
+        if !seen_ranges.insert(scan_cell_range) {
+            return;
+        }
+
+        let (cell_start, cell_end) = scan_cell_range;
+        let (event_start, event_end) = root_event_range;
+
+        for node in &self.nodes {
+            let triggers: Vec<u32> = match node {
+                IrNode::Hold {
+                    cell,
+                    trigger_bodies,
+                    ..
+                } if cell.0 >= cell_start && cell.0 < cell_end => {
+                    trigger_bodies.iter().map(|(t, _)| t.0).collect()
+                }
+                IrNode::Then { cell, trigger, .. } if cell.0 >= cell_start && cell.0 < cell_end => {
+                    vec![trigger.0]
+                }
+                IrNode::Latest { target, arms }
+                    if target.0 >= cell_start && target.0 < cell_end =>
+                {
+                    arms.iter()
+                        .filter_map(|arm| arm.trigger.map(|t| t.0))
+                        .collect()
+                }
+                IrNode::ListMap {
+                    template_cell_range: child_range,
+                    ..
+                } if child_range.0 >= cell_start
+                    && child_range.1 <= cell_end
+                    && *child_range != scan_cell_range =>
+                {
+                    self.collect_cross_scope_events_in_range(
+                        *child_range,
+                        root_event_range,
+                        true,
+                        seen_ranges,
+                        result,
+                    );
+                    continue;
+                }
+                _ => continue,
+            };
+
+            for trigger in triggers {
+                if (include_local_events || trigger < event_start || trigger >= event_end)
+                    && !result.contains(&trigger)
+                {
+                    result.push(trigger);
+                }
+            }
+        }
+    }
+
+    fn collect_template_global_dependencies(&self, template_cell_range: (u32, u32)) -> Vec<CellId> {
+        let mut deps = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut seen_funcs = std::collections::HashSet::new();
+        let local_params = std::collections::HashSet::new();
+        let nested_ranges: Vec<(u32, u32)> = self
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                IrNode::ListMap {
+                    template_cell_range: nested,
+                    ..
+                } if *nested != template_cell_range
+                    && nested.0 >= template_cell_range.0
+                    && nested.1 <= template_cell_range.1 =>
+                {
+                    Some(*nested)
+                }
+                _ => None,
+            })
+            .collect();
+
+        for cell_id in template_cell_range.0..template_cell_range.1 {
+            if nested_ranges
+                .iter()
+                .any(|range| cell_id >= range.0 && cell_id < range.1)
+            {
+                continue;
+            }
+            self.collect_template_cell_dependencies(
+                CellId(cell_id),
+                template_cell_range,
+                &local_params,
+                &mut deps,
+                &mut seen,
+                &mut seen_funcs,
+            );
+        }
+
+        let mut deps: Vec<_> = deps.into_iter().collect();
+        deps.sort_by_key(|cell| cell.0);
+        deps
+    }
+
+    fn collect_template_cell_dependencies(
+        &self,
+        cell: CellId,
+        template_cell_range: (u32, u32),
+        local_param_cells: &std::collections::HashSet<CellId>,
+        deps: &mut std::collections::HashSet<CellId>,
+        seen: &mut std::collections::HashSet<CellId>,
+        seen_funcs: &mut std::collections::HashSet<FuncId>,
+    ) {
+        if local_param_cells.contains(&cell) || !seen.insert(cell) {
+            return;
+        }
+
+        if cell.0 < template_cell_range.0 || cell.0 >= template_cell_range.1 {
+            deps.insert(cell);
+            return;
+        }
+
+        let Some(node) = self.find_node_for_cell(cell) else {
+            return;
+        };
+
+        match node {
+            IrNode::Derived { expr, .. } => {
+                self.collect_template_expr_dependencies(
+                    expr,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+            }
+            IrNode::PipeThrough { source, .. }
+            | IrNode::TextTrim { source, .. }
+            | IrNode::TextIsNotEmpty { source, .. }
+            | IrNode::TextToNumber { source, .. }
+            | IrNode::MathRound { source, .. } => {
+                self.collect_template_cell_dependencies(
+                    *source,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+            }
+            IrNode::TextStartsWith { source, prefix, .. }
+            | IrNode::MathMin {
+                source, b: prefix, ..
+            }
+            | IrNode::MathMax {
+                source, b: prefix, ..
+            } => {
+                self.collect_template_cell_dependencies(
+                    *source,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                self.collect_template_cell_dependencies(
+                    *prefix,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+            }
+            IrNode::When { source, arms, .. } => {
+                self.collect_template_cell_dependencies(
+                    *source,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                for (_, body) in arms {
+                    self.collect_template_expr_dependencies(
+                        body,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+            IrNode::While {
+                source,
+                deps: extra,
+                arms,
+                ..
+            } => {
+                self.collect_template_cell_dependencies(
+                    *source,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                for dep in extra {
+                    self.collect_template_cell_dependencies(
+                        *dep,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+                for (_, body) in arms {
+                    self.collect_template_expr_dependencies(
+                        body,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+            IrNode::Then { body, .. } => {
+                self.collect_template_expr_dependencies(
+                    body,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+            }
+            IrNode::Latest { arms, .. } => {
+                for arm in arms {
+                    self.collect_template_expr_dependencies(
+                        &arm.body,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+            IrNode::Hold {
+                init,
+                trigger_bodies,
+                ..
+            } => {
+                self.collect_template_expr_dependencies(
+                    init,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                for (_, body) in trigger_bodies {
+                    self.collect_template_expr_dependencies(
+                        body,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+            IrNode::Element {
+                kind, hovered_cell, ..
+            } => {
+                self.collect_element_kind_dependencies(
+                    kind,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                if let Some(hovered_cell) = hovered_cell {
+                    self.collect_template_cell_dependencies(
+                        *hovered_cell,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+            IrNode::TextInterpolation { parts, .. } => {
+                for part in parts {
+                    if let TextSegment::Expr(expr) = part {
+                        self.collect_template_expr_dependencies(
+                            expr,
+                            template_cell_range,
+                            local_param_cells,
+                            deps,
+                            seen,
+                            seen_funcs,
+                        );
+                    }
+                }
+            }
+            IrNode::Document { root, .. } => {
+                self.collect_template_cell_dependencies(
+                    *root,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_element_kind_dependencies(
+        &self,
+        kind: &ElementKind,
+        template_cell_range: (u32, u32),
+        local_param_cells: &std::collections::HashSet<CellId>,
+        deps: &mut std::collections::HashSet<CellId>,
+        seen: &mut std::collections::HashSet<CellId>,
+        seen_funcs: &mut std::collections::HashSet<FuncId>,
+    ) {
+        match kind {
+            ElementKind::Button { label, style }
+            | ElementKind::Label { label, style }
+            | ElementKind::Text { label, style }
+            | ElementKind::Paragraph {
+                content: label,
+                style,
+            }
+            | ElementKind::Link {
+                label, url: style, ..
+            } => {
+                self.collect_template_expr_dependencies(
+                    label,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                self.collect_template_expr_dependencies(
+                    style,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+            }
+            ElementKind::TextInput {
+                placeholder,
+                style,
+                text_cell,
+                ..
+            } => {
+                if let Some(placeholder) = placeholder {
+                    self.collect_template_expr_dependencies(
+                        placeholder,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+                self.collect_template_expr_dependencies(
+                    style,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                if let Some(text_cell) = text_cell {
+                    self.collect_template_cell_dependencies(
+                        *text_cell,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+            ElementKind::Checkbox {
+                checked,
+                style,
+                icon,
+            } => {
+                if let Some(checked) = checked {
+                    self.collect_template_cell_dependencies(
+                        *checked,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+                self.collect_template_expr_dependencies(
+                    style,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                if let Some(icon) = icon {
+                    self.collect_template_cell_dependencies(
+                        *icon,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+            ElementKind::Container { child, style } | ElementKind::Block { child, style } => {
+                self.collect_template_cell_dependencies(
+                    *child,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                self.collect_template_expr_dependencies(
+                    style,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+            }
+            ElementKind::Stack { layers, style }
+            | ElementKind::Svg {
+                children: layers,
+                style,
+            } => {
+                self.collect_template_cell_dependencies(
+                    *layers,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                self.collect_template_expr_dependencies(
+                    style,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+            }
+            ElementKind::Stripe {
+                items,
+                gap,
+                style,
+                element_settings,
+                ..
+            } => {
+                self.collect_template_cell_dependencies(
+                    *items,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                self.collect_template_expr_dependencies(
+                    gap,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                self.collect_template_expr_dependencies(
+                    style,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                self.collect_template_expr_dependencies(
+                    element_settings,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+            }
+            ElementKind::Slider {
+                style, value_cell, ..
+            } => {
+                self.collect_template_expr_dependencies(
+                    style,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                if let Some(value_cell) = value_cell {
+                    self.collect_template_cell_dependencies(
+                        *value_cell,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+            ElementKind::Select {
+                style, selected, ..
+            } => {
+                self.collect_template_expr_dependencies(
+                    style,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                if let Some(selected) = selected {
+                    self.collect_template_expr_dependencies(
+                        selected,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+            ElementKind::SvgCircle { cx, cy, r, style } => {
+                for expr in [cx, cy, r, style] {
+                    self.collect_template_expr_dependencies(
+                        expr,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+        }
+    }
+
+    fn collect_template_expr_dependencies(
+        &self,
+        expr: &IrExpr,
+        template_cell_range: (u32, u32),
+        local_param_cells: &std::collections::HashSet<CellId>,
+        deps: &mut std::collections::HashSet<CellId>,
+        seen: &mut std::collections::HashSet<CellId>,
+        seen_funcs: &mut std::collections::HashSet<FuncId>,
+    ) {
+        match expr {
+            IrExpr::Constant(_) => {}
+            IrExpr::CellRead(cell) => self.collect_template_cell_dependencies(
+                *cell,
+                template_cell_range,
+                local_param_cells,
+                deps,
+                seen,
+                seen_funcs,
+            ),
+            IrExpr::FieldAccess { object, .. } | IrExpr::UnaryNeg(object) | IrExpr::Not(object) => {
+                self.collect_template_expr_dependencies(
+                    object,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+            }
+            IrExpr::BinOp { lhs, rhs, .. } | IrExpr::Compare { lhs, rhs, .. } => {
+                self.collect_template_expr_dependencies(
+                    lhs,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                self.collect_template_expr_dependencies(
+                    rhs,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+            }
+            IrExpr::TextConcat(parts) => {
+                for part in parts {
+                    if let TextSegment::Expr(expr) = part {
+                        self.collect_template_expr_dependencies(
+                            expr,
+                            template_cell_range,
+                            local_param_cells,
+                            deps,
+                            seen,
+                            seen_funcs,
+                        );
+                    }
+                }
+            }
+            IrExpr::FunctionCall { func, args } => {
+                if seen_funcs.insert(*func) {
+                    for arg in args {
+                        self.collect_template_expr_dependencies(
+                            arg,
+                            template_cell_range,
+                            local_param_cells,
+                            deps,
+                            seen,
+                            seen_funcs,
+                        );
+                    }
+                    if let Some(function) = self.functions.get(func.0 as usize) {
+                        let param_cells: std::collections::HashSet<_> =
+                            function.param_cells.iter().copied().collect();
+                        self.collect_template_expr_dependencies(
+                            &function.body,
+                            template_cell_range,
+                            &param_cells,
+                            deps,
+                            seen,
+                            seen_funcs,
+                        );
+                    }
+                    seen_funcs.remove(func);
+                }
+            }
+            IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => {
+                for (_, value) in fields {
+                    self.collect_template_expr_dependencies(
+                        value,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+            IrExpr::ListConstruct(items) => {
+                for item in items {
+                    self.collect_template_expr_dependencies(
+                        item,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+            IrExpr::PatternMatch { source, arms } => {
+                self.collect_template_cell_dependencies(
+                    *source,
+                    template_cell_range,
+                    local_param_cells,
+                    deps,
+                    seen,
+                    seen_funcs,
+                );
+                for (_, body) in arms {
+                    self.collect_template_expr_dependencies(
+                        body,
+                        template_cell_range,
+                        local_param_cells,
+                        deps,
+                        seen,
+                        seen_funcs,
+                    );
+                }
+            }
+        }
+    }
+
+    fn nested_template_cell_ranges(&self, template_cell_range: (u32, u32)) -> Vec<(u32, u32)> {
+        self.nodes
+            .iter()
+            .filter_map(|node| match node {
+                IrNode::ListMap {
+                    template_cell_range: nested,
+                    ..
+                } if *nested != template_cell_range
+                    && nested.0 >= template_cell_range.0
+                    && nested.1 <= template_cell_range.1 =>
+                {
+                    Some(*nested)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn collect_expr_cell_reads(expr: &IrExpr, cells: &mut std::collections::HashSet<CellId>) {
+        match expr {
+            IrExpr::Constant(_) => {}
+            IrExpr::CellRead(cell) => {
+                cells.insert(*cell);
+            }
+            IrExpr::FieldAccess { object, .. } => Self::collect_expr_cell_reads(object, cells),
+            IrExpr::BinOp { lhs, rhs, .. } | IrExpr::Compare { lhs, rhs, .. } => {
+                Self::collect_expr_cell_reads(lhs, cells);
+                Self::collect_expr_cell_reads(rhs, cells);
+            }
+            IrExpr::UnaryNeg(inner) | IrExpr::Not(inner) => {
+                Self::collect_expr_cell_reads(inner, cells)
+            }
+            IrExpr::TextConcat(parts) => {
+                for part in parts {
+                    if let TextSegment::Expr(expr) = part {
+                        Self::collect_expr_cell_reads(expr, cells);
+                    }
+                }
+            }
+            IrExpr::FunctionCall { args, .. } | IrExpr::ListConstruct(args) => {
+                for arg in args {
+                    Self::collect_expr_cell_reads(arg, cells);
+                }
+            }
+            IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => {
+                for (_, value) in fields {
+                    Self::collect_expr_cell_reads(value, cells);
+                }
+            }
+            IrExpr::PatternMatch { source, arms } => {
+                cells.insert(*source);
+                for (_, body) in arms {
+                    Self::collect_expr_cell_reads(body, cells);
+                }
+            }
+        }
+    }
+
+    fn template_seed_cells(&self, template_cell_range: (u32, u32)) -> Vec<CellId> {
+        let mut cells = std::collections::HashSet::new();
+        let nested_ranges = self.nested_template_cell_ranges(template_cell_range);
+        let in_nested_range = |cell: CellId| {
+            nested_ranges
+                .iter()
+                .any(|(start, end)| cell.0 >= *start && cell.0 < *end)
+        };
+
+        for node in &self.nodes {
+            match node {
+                IrNode::Element {
+                    cell,
+                    kind,
+                    hovered_cell,
+                    ..
+                } if cell.0 >= template_cell_range.0 && cell.0 < template_cell_range.1 => {
+                    let mut expr_cells = std::collections::HashSet::new();
+                    match kind {
+                        ElementKind::Button { label, style }
+                        | ElementKind::Label { label, style }
+                        | ElementKind::Text { label, style }
+                        | ElementKind::Paragraph {
+                            content: label,
+                            style,
+                        }
+                        | ElementKind::Link {
+                            label, url: style, ..
+                        } => {
+                            Self::collect_expr_cell_reads(label, &mut expr_cells);
+                            Self::collect_expr_cell_reads(style, &mut expr_cells);
+                        }
+                        ElementKind::TextInput {
+                            placeholder,
+                            style,
+                            text_cell,
+                            ..
+                        } => {
+                            if let Some(placeholder) = placeholder {
+                                Self::collect_expr_cell_reads(placeholder, &mut expr_cells);
+                            }
+                            Self::collect_expr_cell_reads(style, &mut expr_cells);
+                            if let Some(text_cell) = text_cell {
+                                expr_cells.insert(*text_cell);
+                            }
+                        }
+                        ElementKind::Checkbox {
+                            checked,
+                            style,
+                            icon,
+                        } => {
+                            if let Some(checked) = checked {
+                                expr_cells.insert(*checked);
+                            }
+                            Self::collect_expr_cell_reads(style, &mut expr_cells);
+                            if let Some(icon) = icon {
+                                expr_cells.insert(*icon);
+                            }
+                        }
+                        ElementKind::Container { style, .. }
+                        | ElementKind::Block { style, .. }
+                        | ElementKind::Stack { style, .. }
+                        | ElementKind::Svg { style, .. } => {
+                            Self::collect_expr_cell_reads(style, &mut expr_cells)
+                        }
+                        ElementKind::Stripe { gap, style, .. } => {
+                            Self::collect_expr_cell_reads(gap, &mut expr_cells);
+                            Self::collect_expr_cell_reads(style, &mut expr_cells);
+                        }
+                        ElementKind::Slider {
+                            style, value_cell, ..
+                        } => {
+                            Self::collect_expr_cell_reads(style, &mut expr_cells);
+                            if let Some(value_cell) = value_cell {
+                                expr_cells.insert(*value_cell);
+                            }
+                        }
+                        ElementKind::Select {
+                            style, selected, ..
+                        } => {
+                            Self::collect_expr_cell_reads(style, &mut expr_cells);
+                            if let Some(selected) = selected {
+                                Self::collect_expr_cell_reads(selected, &mut expr_cells);
+                            }
+                        }
+                        ElementKind::SvgCircle { cx, cy, r, style } => {
+                            Self::collect_expr_cell_reads(cx, &mut expr_cells);
+                            Self::collect_expr_cell_reads(cy, &mut expr_cells);
+                            Self::collect_expr_cell_reads(r, &mut expr_cells);
+                            Self::collect_expr_cell_reads(style, &mut expr_cells);
+                        }
+                    }
+                    if let Some(hovered_cell) = hovered_cell {
+                        expr_cells.insert(*hovered_cell);
+                    }
+                    for expr_cell in expr_cells {
+                        if expr_cell.0 >= template_cell_range.0
+                            && expr_cell.0 < template_cell_range.1
+                            && !in_nested_range(expr_cell)
+                        {
+                            cells.insert(expr_cell);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut cells: Vec<_> = cells.into_iter().collect();
+        cells.sort_by_key(|cell| cell.0);
+        cells
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TemplatePlan {
+    pub root_cell: Option<CellId>,
+    pub cell_range: (u32, u32),
+    pub event_range: (u32, u32),
+    pub seed_cells: Vec<CellId>,
+    pub global_deps: Vec<CellId>,
+    pub cross_scope_events: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListMapPlan {
+    pub map_cell: CellId,
+    pub source: CellId,
+    pub fanout_source: CellId,
+    pub item_cell: CellId,
+    pub resolved_item_store: CellId,
+    pub field_hold_sources: HashMap<String, CellId>,
+    pub template: TemplatePlan,
 }
 
 #[derive(Debug)]
@@ -726,8 +1811,15 @@ pub fn node_debug_short(node: &IrNode) -> String {
         IrNode::TextToNumber { cell, source, .. } => {
             format!("TextToNumber(cell={}, source={})", cell.0, source.0)
         }
-        IrNode::TextStartsWith { cell, source, prefix } => {
-            format!("TextStartsWith(cell={}, source={}, prefix={})", cell.0, source.0, prefix.0)
+        IrNode::TextStartsWith {
+            cell,
+            source,
+            prefix,
+        } => {
+            format!(
+                "TextStartsWith(cell={}, source={}, prefix={})",
+                cell.0, source.0, prefix.0
+            )
         }
         IrNode::MathRound { cell, source } => {
             format!("MathRound(cell={}, source={})", cell.0, source.0)
@@ -804,6 +1896,7 @@ mod tests {
             functions: Vec::new(),
             tag_table: Vec::new(),
             cell_field_cells: HashMap::new(),
+            list_map_plans: HashMap::new(),
         };
 
         let render_root = program.render_root().expect("render root should exist");
