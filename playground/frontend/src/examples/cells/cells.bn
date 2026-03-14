@@ -154,7 +154,7 @@ FUNCTION default_formula(column, row) {
 }
 FUNCTION row_cell(row_cells, column) { row_cells |> List/get(index: column) }
 FUNCTION edit_started_from_cell(cell) { cell.cell_elements.display.event.double_click |> THEN { [row: cell.row, column: cell.column] } }
-FUNCTION edit_changed_from_cell(cell) { cell.cell_elements.editing.event.change |> THEN { [text: cell.cell_elements.editing.event.change.text] } }
+FUNCTION edit_changed_from_cell(cell) { cell.cell_elements.editing.event.input |> THEN { [text: cell.cell_elements.editing.event.input.text] } }
 FUNCTION enter_pressed_from_cell(cell) { cell.cell_elements.editing.event.key_down.key |> WHEN { Enter => [row: cell.row, column: cell.column, text: cell.cell_elements.editing.event.key_down.text] __ => SKIP } }
 FUNCTION edit_cancelled_from_cell(cell) { cell.cell_elements.editing.event.key_down.key |> WHEN { Escape => True __ => SKIP } }
 FUNCTION blurred_from_cell(cell) { cell.cell_elements.editing.event.blur |> THEN { True } }
@@ -203,9 +203,9 @@ FUNCTION make_cell_element(cell) {
         formula_text: cell_formula(column: cell.column, row: cell.row)
         display_value: compute_value(formula_text: formula_text)
         is_editing: is_editing_cell(cell: cell)
-        input_text: editing_text |> Text/is_empty() |> WHEN { True => formula_text __ => editing_text }
+        input_text: editing_dirty |> WHEN { True => editing_text __ => formula_text }
         is_editing |> WHILE {
-            True => Element/text_input(element: [event: [change: LINK, key_down: LINK, blur: LINK]] style: [width: 80] label: Hidden[text: TEXT { cell }] text: input_text placeholder: [text: Text/empty()] focus: True) |> LINK { cell.cell_elements.editing }
+            True => Element/text_input(element: [event: [input: LINK, key_down: LINK, blur: LINK]] style: [width: 80] label: Hidden[text: TEXT { cell }] text: input_text placeholder: [text: Text/empty()] focus: True) |> LINK { cell.cell_elements.editing }
             False => Element/label(element: [event: [double_click: LINK]] style: [width: 80, height: 22] label: formula_text |> Text/is_empty() |> WHILE { True => TEXT { . } __ => TEXT { {display_value} } }) |> LINK { cell.cell_elements.display }
         }
     }
@@ -238,16 +238,29 @@ edit_changed: all_row_cells |> List/map(row_data, new: edit_changed_in_row(row_c
 
 editing_text: TEXT {  } |> HOLD state {
     LATEST {
-        edit_started |> THEN { TEXT {  } }
         edit_changed |> THEN { edit_changed.text }
         edit_committed |> THEN { TEXT {  } }
         edit_cancelled |> THEN { TEXT {  } }
     }
 }
 
+editing_dirty: False |> HOLD state {
+    LATEST {
+        edit_started |> THEN { False }
+        edit_changed |> THEN { True }
+        edit_committed |> THEN { False }
+        edit_cancelled |> THEN { False }
+    }
+}
+
 enter_pressed: all_row_cells |> List/map(row_data, new: enter_pressed_in_row(row_cells: row_data.cells)) |> List/latest()
 
-edit_committed: enter_pressed |> THEN { [row: enter_pressed.row, column: enter_pressed.column, text: enter_pressed.text] }
+edit_committed: enter_pressed |> THEN {
+    editing_dirty |> WHEN {
+        True => [row: enter_pressed.row, column: enter_pressed.column, text: enter_pressed.text]
+        __ => [row: enter_pressed.row, column: enter_pressed.column, text: cell_formula(column: enter_pressed.column, row: enter_pressed.row)]
+    }
+}
 
 edit_cancelled: LATEST {
     all_row_cells |> List/map(row_data, new: edit_cancelled_in_row(row_cells: row_data.cells)) |> List/latest()

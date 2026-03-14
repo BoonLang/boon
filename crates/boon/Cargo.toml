@@ -47,6 +47,7 @@ differential-dataflow = { version = "0.19", optional = true }
 # WASM compilation engine dependencies (optional, used with engine-wasm feature)
 wasm-encoder = { version = "0.225", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
 
 [features]
 default = ["debug-channels", "engine-dd"]
@@ -57,10 +58,9 @@ default = ["debug-channels", "engine-dd"]
 # Use engine-both to enable runtime engine switching
 engine-actors = []
 engine-dd = ["dep:ordered-float", "dep:indexmap", "dep:js-sys", "dep:timely", "dep:differential-dataflow"]
-engine-wasm = ["dep:wasm-encoder", "dep:js-sys", "dep:wasm-bindgen", "dep:serde_json"]
-engine-wasm-pro = ["dep:wasm-encoder", "dep:js-sys", "dep:wasm-bindgen", "dep:serde_json"]
+engine-wasm = ["dep:wasm-encoder", "dep:js-sys", "dep:wasm-bindgen", "dep:serde_json", "dep:serde-wasm-bindgen"]
 engine-both = ["engine-actors", "engine-dd"]
-engine-all = ["engine-actors", "engine-dd", "engine-wasm", "engine-wasm-pro"]
+engine-all = ["engine-actors", "engine-dd", "engine-wasm"]
 
 # Enable debug logging and timeouts for channel operations.
 # Useful for detecting deadlocks and monitoring backpressure.

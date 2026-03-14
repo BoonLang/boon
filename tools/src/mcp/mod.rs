@@ -4,11 +4,11 @@
 //! Automatically starts the WebSocket server for extension communication.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use crate::commands::browser;
+use crate::commands::{browser, resolve_requested_engine};
 use crate::ws_server::{self, Command, Response};
 
 /// MCP JSON-RPC request
@@ -653,7 +653,7 @@ fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "boon_get_engine".to_string(),
-            description: "Get the currently selected Boon engine. Returns 'Actors', 'DD', 'Wasm', or 'WasmPro'. Also indicates whether engine switching is available.".to_string(),
+            description: "Get the currently selected Boon engine plus the normal user-facing engine list.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -662,14 +662,14 @@ fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "boon_set_engine".to_string(),
-            description: "Set the Boon engine and trigger re-run. Use 'Actors' for the actor-based reactive engine, 'DD' for the Differential Dataflow engine, 'Wasm' for the current WASM compilation engine, or 'WasmPro' for the next-generation WASM backend.".to_string(),
+            description: "Set the Boon engine and trigger re-run. Use 'Actors' for the actor-based reactive engine, 'DD' for the Differential Dataflow engine, or 'Wasm' for the WebAssembly backend.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "engine": {
                         "type": "string",
-                        "enum": ["Actors", "DD", "Wasm", "WasmPro"],
-                        "description": "Engine to use: 'Actors' (actor-based reactive), 'DD' (Differential Dataflow), 'Wasm' (current WASM compilation), or 'WasmPro' (next-generation WASM backend)"
+                        "enum": ["Actors", "DD", "Wasm"],
+                        "description": "Engine to use: 'Actors' (actor-based reactive), 'DD' (Differential Dataflow), or 'Wasm' (WebAssembly backend)"
                     }
                 },
                 "required": ["engine"]
@@ -1173,9 +1173,9 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
                 .ok_or("engine parameter required")?
                 .to_string();
             // Validate engine value
-            if engine != "Actors" && engine != "DD" && engine != "Wasm" && engine != "WasmPro" {
+            if engine != "Actors" && engine != "DD" && engine != "Wasm" {
                 return Err(format!(
-                    "Invalid engine '{}'. Must be 'Actors', 'DD', 'Wasm', or 'WasmPro'",
+                    "Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'",
                     engine
                 ));
             }
@@ -1267,10 +1267,18 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
 
         Response::Success { data } => {
             if let Some(d) = data {
-                Ok(format!(
-                    "Success: {}",
-                    serde_json::to_string(&d).unwrap_or_default()
-                ))
+                if let Some(warning) = d.get("warning").and_then(|v| v.as_str()) {
+                    Ok(format!(
+                        "Success: {}\nWarning: {}",
+                        serde_json::to_string(&d).unwrap_or_default(),
+                        warning
+                    ))
+                } else {
+                    Ok(format!(
+                        "Success: {}",
+                        serde_json::to_string(&d).unwrap_or_default()
+                    ))
+                }
             } else {
                 Ok("Success".to_string())
             }
@@ -1415,10 +1423,37 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
             }
         }
 
-        Response::EngineInfo { engine, switchable } => {
-            let mut result = format!("Engine: {}", engine);
+        Response::EngineInfo {
+            engine,
+            engine_label,
+            switchable,
+            available_engines,
+            display_available_engines,
+            preferred_wasm_engine,
+        } => {
+            let mut result = format!("Engine: {}", engine_label.unwrap_or(engine));
+            let listed_engines = display_available_engines
+                .as_deref()
+                .unwrap_or(&available_engines);
+            if !listed_engines.is_empty() {
+                result.push_str(&format!("\nAvailable: {}", listed_engines.join(", ")));
+            }
+            let hidden_engines: Vec<_> = available_engines
+                .iter()
+                .filter(|engine| !listed_engines.iter().any(|listed| listed == *engine))
+                .cloned()
+                .collect();
+            if !hidden_engines.is_empty() {
+                result.push_str(&format!(
+                    "\nExplicit fallback only: {}",
+                    hidden_engines.join(", ")
+                ));
+            }
+            if let Some(preferred) = preferred_wasm_engine {
+                result.push_str(&format!("\nPreferred Wasm engine: {}", preferred));
+            }
             if switchable {
-                result.push_str("\nSwitching: available (both engines compiled)");
+                result.push_str("\nSwitching: available (multiple engines compiled)");
             } else {
                 result.push_str("\nSwitching: not available (single engine only)");
             }
@@ -1453,6 +1488,20 @@ async fn send_ws_command_with_reconnect(
     ws_port: u16,
     command: Command,
 ) -> Result<Response, String> {
+    let command = match command {
+        Command::SetEngine { engine } => {
+            match ws_server::send_command_to_server(ws_port, Command::GetEngine).await {
+                Ok(Response::EngineInfo {
+                    available_engines, ..
+                }) => Command::SetEngine {
+                    engine: resolve_requested_engine(&engine, &available_engines),
+                },
+                _ => Command::SetEngine { engine },
+            }
+        }
+        other => other,
+    };
+
     let first = ws_server::send_command_to_server(ws_port, command.clone())
         .await
         .map_err(|e| e.to_string())?;

@@ -2,9 +2,9 @@
 //!
 //! Generates a WASM module with:
 //! - One mutable f64 global per cell (cell values)
-//! - Host imports for DOM updates: host_set_cell_f64, host_set_cell_text, host_log
-//! - `init()` — sets initial cell values, calls host emit for initial render
-//! - `on_event(event_id: i32)` — dispatches events, updates cells, re-emits
+//! - Legacy host imports for text/list/item bridge operations
+//! - `init()` — sets initial cell values
+//! - `on_event(event_id: i32)` — dispatches events and updates cells
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -23,31 +23,30 @@ use super::ir::*;
 // ---------------------------------------------------------------------------
 
 const IMPORT_HOST_SET_CELL_F64: u32 = 0;
-const IMPORT_HOST_NOTIFY_INIT_DONE: u32 = 1;
-const IMPORT_HOST_LIST_CREATE: u32 = 2;
-const IMPORT_HOST_LIST_APPEND: u32 = 3;
-const IMPORT_HOST_LIST_CLEAR: u32 = 4;
-const IMPORT_HOST_LIST_COUNT: u32 = 5;
-const IMPORT_HOST_TEXT_TRIM: u32 = 6;
-const IMPORT_HOST_TEXT_IS_NOT_EMPTY: u32 = 7;
-const IMPORT_HOST_COPY_TEXT: u32 = 8;
-const IMPORT_HOST_LIST_APPEND_TEXT: u32 = 9;
-const IMPORT_HOST_TEXT_MATCHES: u32 = 10;
-const IMPORT_HOST_SET_CELL_TEXT_PATTERN: u32 = 11;
-const IMPORT_HOST_TEXT_BUILD_START: u32 = 12;
-const IMPORT_HOST_TEXT_BUILD_LITERAL: u32 = 13;
-const IMPORT_HOST_TEXT_BUILD_CELL: u32 = 14;
-const IMPORT_HOST_SET_ITEM_CONTEXT: u32 = 15;
-const IMPORT_HOST_CLEAR_ITEM_CONTEXT: u32 = 16;
-const IMPORT_HOST_LIST_COPY_ITEM: u32 = 17;
-const IMPORT_HOST_LIST_ITEM_MEMORY_INDEX: u32 = 18;
-const IMPORT_HOST_LIST_GET_ITEM_F64: u32 = 19;
-const IMPORT_HOST_LIST_REPLACE: u32 = 20;
-const IMPORT_HOST_GET_CELL_F64: u32 = 21;
-const IMPORT_HOST_TEXT_TO_NUMBER: u32 = 22;
-const IMPORT_HOST_TEXT_STARTS_WITH: u32 = 23;
+const IMPORT_HOST_LIST_CREATE: u32 = 1;
+const IMPORT_HOST_LIST_APPEND: u32 = 2;
+const IMPORT_HOST_LIST_CLEAR: u32 = 3;
+const IMPORT_HOST_LIST_COUNT: u32 = 4;
+const IMPORT_HOST_TEXT_TRIM: u32 = 5;
+const IMPORT_HOST_TEXT_IS_NOT_EMPTY: u32 = 6;
+const IMPORT_HOST_COPY_TEXT: u32 = 7;
+const IMPORT_HOST_LIST_APPEND_TEXT: u32 = 8;
+const IMPORT_HOST_TEXT_MATCHES: u32 = 9;
+const IMPORT_HOST_SET_CELL_TEXT_PATTERN: u32 = 10;
+const IMPORT_HOST_TEXT_BUILD_START: u32 = 11;
+const IMPORT_HOST_TEXT_BUILD_LITERAL: u32 = 12;
+const IMPORT_HOST_TEXT_BUILD_CELL: u32 = 13;
+const IMPORT_HOST_SET_ITEM_CONTEXT: u32 = 14;
+const IMPORT_HOST_CLEAR_ITEM_CONTEXT: u32 = 15;
+const IMPORT_HOST_LIST_COPY_ITEM: u32 = 16;
+const IMPORT_HOST_LIST_ITEM_MEMORY_INDEX: u32 = 17;
+const IMPORT_HOST_LIST_GET_ITEM_F64: u32 = 18;
+const IMPORT_HOST_LIST_REPLACE: u32 = 19;
+const IMPORT_HOST_GET_CELL_F64: u32 = 20;
+const IMPORT_HOST_TEXT_TO_NUMBER: u32 = 21;
+const IMPORT_HOST_TEXT_STARTS_WITH: u32 = 22;
 
-const NUM_IMPORTS: u32 = 24;
+const NUM_IMPORTS: u32 = 23;
 
 // Exported function indices (offset by NUM_IMPORTS)
 const FN_INIT: u32 = NUM_IMPORTS;
@@ -81,13 +80,13 @@ const REEVALUATE_CHUNK_SIZE: usize = 4_096;
 // ---------------------------------------------------------------------------
 
 /// Result of WASM code generation: binary + text patterns for host-side matching.
-pub struct WasmOutput {
-    pub wasm_bytes: Vec<u8>,
+pub(super) struct WasmOutput {
+    pub(super) wasm_bytes: Vec<u8>,
     /// Text patterns used in WHEN/WHILE arms, indexed by pattern_idx.
-    pub text_patterns: Vec<String>,
+    pub(super) text_patterns: Vec<String>,
 }
 
-pub fn emit_wasm(program: &IrProgram) -> WasmOutput {
+pub(super) fn emit_wasm(program: &IrProgram) -> WasmOutput {
     let emitter = WasmEmitter::new(program);
     let wasm_bytes = emitter.emit();
     WasmOutput {
@@ -1462,7 +1461,7 @@ impl<'a> WasmEmitter<'a> {
         let mut types = TypeSection::new();
         // Type 0: (i32, f64) -> () [host_set_cell_f64, host_list_append, set_global]
         types.ty().function([ValType::I32, ValType::F64], []);
-        // Type 1: () -> () [host_notify_init_done]
+        // Type 1: () -> () [host_clear_item_context]
         types.ty().function([], []);
         // Type 2: () -> f64 [host_list_create]
         types.ty().function([], [ValType::F64]);
@@ -1502,11 +1501,6 @@ impl<'a> WasmEmitter<'a> {
             "env",
             "host_set_cell_f64",
             wasm_encoder::EntityType::Function(0),
-        );
-        imports.import(
-            "env",
-            "host_notify_init_done",
-            wasm_encoder::EntityType::Function(1),
         );
         imports.import(
             "env",
@@ -1914,7 +1908,6 @@ impl<'a> WasmEmitter<'a> {
                     first_chunk_fn + num_chunks as u32 + i as u32,
                 ));
             }
-            func.instruction(&Instruction::Call(IMPORT_HOST_NOTIFY_INIT_DONE));
             func.instruction(&Instruction::End);
             func
         } else {
@@ -1943,7 +1936,6 @@ impl<'a> WasmEmitter<'a> {
             self.emit_init_phase2_setup_filter_locals(num_hold_loop_locals, num_f64_locals);
             self.emit_init_phase2_nodes(&mut func, &self.program.nodes);
 
-            func.instruction(&Instruction::Call(IMPORT_HOST_NOTIFY_INIT_DONE));
             func.instruction(&Instruction::End);
             *self.filter_locals.borrow_mut() = None;
             func

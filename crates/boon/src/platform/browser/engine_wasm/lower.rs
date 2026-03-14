@@ -24,7 +24,7 @@ struct FuncDef {
 
 /// External function definition for multi-file support.
 /// (qualified_name, params, body, module_name)
-pub type ExternalFunction = (String, Vec<String>, Spanned<Expression>, Option<String>);
+pub(super) type ExternalFunction = (String, Vec<String>, Spanned<Expression>, Option<String>);
 
 use super::ir::*;
 
@@ -54,9 +54,9 @@ struct SavedElementBindings {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub struct CompileError {
-    pub span: Span,
-    pub message: String,
+pub(super) struct CompileError {
+    pub(super) span: Span,
+    pub(super) message: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1779,7 +1779,7 @@ impl Lowerer {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn lower(
+pub(super) fn lower(
     ast: &[Spanned<Expression>],
     external_functions: Option<&[ExternalFunction]>,
 ) -> Result<IrProgram, Vec<CompileError>> {

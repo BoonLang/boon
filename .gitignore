@@ -4,6 +4,7 @@
 
 # Chromium profile for browser automation testing (persists developer mode)
 tools/.chrome-profile/
+tools/.chrome-profile.tmp.*/
 preview.png
 screenshot.png
 

@@ -1,5 +1,8 @@
 # Wasm Pro Execution Backlog
 
+> Superseded by [wasm_single_engine_cutover.md](/home/martinkavik/repos/boon/docs/plans/wasm_single_engine_cutover.md).
+> Keep this file as implementation history for the parallel-backend migration phase.
+
 **Status:** Ready for implementation
 **Date:** 2026-03-14
 **Depends on:** `wasm_pro.md`, `reference_kernel_plan.md`
@@ -389,6 +392,7 @@ Validate that Wasm Pro solves the current scale problem, not just correctness.
 ### Deliverables
 
 - benchmark harness for current Wasm vs Wasm Pro
+- stable command/report path for benchmark capture, e.g. `boon-tools metrics cells-backend`
 - metrics capture for:
   - `.wasm` byte size
   - import count
@@ -419,6 +423,8 @@ Switch the preferred Wasm path and remove obsolete architecture.
 ### Deliverables
 
 - Wasm Pro becomes the preferred Wasm backend
+- Wasm Pro becomes the preferred Wasm-family engine in backend selection wiring before deletion
+- legacy `Wasm` is demoted in user-facing selection UX while explicit fallback access remains available during cutover
 - old import-heavy helper ABI is deleted from the production Wasm path
 - old bridge-time list/template reconstruction is deleted from the production Wasm path
 - docs are updated to demote the old architecture to legacy status
@@ -462,4 +468,3 @@ If implementation starts now, do this order:
 6. emit first working Wasm Pro module
 
 That sequence keeps risk low and exposes architecture mistakes early.
-

@@ -5,7 +5,7 @@
 //! - Chromium keeps all developer flags permanently (open-source project)
 //! - Available via `apt install chromium-browser`
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -148,7 +148,6 @@ fn engine_query_value(engine: &str) -> &str {
         "Actors" => "actors",
         "DD" => "dd",
         "Wasm" => "wasm",
-        "WasmPro" => "wasm-pro",
         other => other,
     }
 }
@@ -238,7 +237,7 @@ pub fn launch_browser(opts: LaunchOptions) -> Result<Child> {
 
 /// Wait for the extension to connect to the WebSocket server
 pub async fn wait_for_extension_connection(port: u16, timeout: Duration) -> Result<()> {
-    use tokio::time::{Instant, sleep};
+    use tokio::time::{sleep, Instant};
 
     let start = Instant::now();
     let check_interval = Duration::from_millis(500);

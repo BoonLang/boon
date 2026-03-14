@@ -11,6 +11,10 @@ pub struct SemanticProgram {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticNode {
     Fragment(Vec<SemanticNode>),
+    Keyed {
+        key: u64,
+        node: Box<SemanticNode>,
+    },
     Element {
         tag: String,
         text: Option<String>,
@@ -177,6 +181,7 @@ pub struct ObjectListItem {
     pub bool_fields: BTreeMap<String, bool>,
     pub scalar_fields: BTreeMap<String, i64>,
     pub object_lists: BTreeMap<String, Vec<ObjectListItem>>,
+    pub nested_item_actions: BTreeMap<String, Vec<ObjectItemActionSpec>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +195,9 @@ pub struct ObjectItemActionSpec {
 pub enum ObjectItemActionKind {
     ToggleBoolField {
         field: String,
+    },
+    UpdateNestedObjectLists {
+        updates: Vec<NestedObjectListAction>,
     },
     SetBoolField {
         field: String,
@@ -210,6 +218,11 @@ pub enum ObjectItemActionKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NestedObjectListAction {
+    AppendObject { field: String, item: ObjectListItem },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemScalarUpdate {
     SetStatic { binding: String, value: i64 },
     SetFromField { binding: String, field: String },
@@ -217,10 +230,21 @@ pub enum ItemScalarUpdate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemTextUpdate {
-    SetStatic { binding: String, value: String },
-    SetFromField { binding: String, field: String },
-    SetFromPayload { binding: String },
-    SetFromInputSource { binding: String, source_suffix: String },
+    SetStatic {
+        binding: String,
+        value: String,
+    },
+    SetFromField {
+        binding: String,
+        field: String,
+    },
+    SetFromPayload {
+        binding: String,
+    },
+    SetFromInputSource {
+        binding: String,
+        source_suffix: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,11 +290,26 @@ pub enum SemanticStyleFragment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticAction {
-    UpdateScalars { updates: Vec<ScalarUpdate> },
-    UpdateTexts { updates: Vec<TextUpdate> },
-    UpdateTextLists { updates: Vec<TextListUpdate> },
-    UpdateObjectLists { updates: Vec<ObjectListUpdate> },
-    Batch { actions: Vec<SemanticAction> },
+    UpdateScalars {
+        updates: Vec<ScalarUpdate>,
+    },
+    UpdateTexts {
+        updates: Vec<TextUpdate>,
+    },
+    UpdateTextLists {
+        updates: Vec<TextListUpdate>,
+    },
+    UpdateObjectLists {
+        updates: Vec<ObjectListUpdate>,
+    },
+    UpdateNestedObjectLists {
+        parent_binding: String,
+        parent_item_id: u64,
+        updates: Vec<NestedObjectListUpdate>,
+    },
+    Batch {
+        actions: Vec<SemanticAction>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,9 +381,22 @@ pub struct StateRuntimeModel {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScalarUpdate {
-    Set { binding: String, value: i64 },
-    Add { binding: String, delta: i64 },
-    ToggleBool { binding: String },
+    Set {
+        binding: String,
+        value: i64,
+    },
+    SetFiltered {
+        binding: String,
+        value: i64,
+        payload_filter: String,
+    },
+    Add {
+        binding: String,
+        delta: i64,
+    },
+    ToggleBool {
+        binding: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,6 +433,10 @@ pub enum TextListUpdate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectListUpdate {
+    AppendObject {
+        binding: String,
+        item: ObjectListItem,
+    },
     AppendDraftObject {
         binding: String,
         source_binding: String,
@@ -423,7 +479,21 @@ pub enum ObjectListUpdate {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NestedObjectListUpdate {
+    AppendObject { field: String, item: ObjectListItem },
+    RemoveItem { field: String, item_id: u64 },
+}
+
 impl SemanticNode {
+    #[must_use]
+    pub fn keyed(key: u64, node: SemanticNode) -> Self {
+        Self::Keyed {
+            key,
+            node: Box::new(node),
+        }
+    }
+
     #[must_use]
     pub fn element(
         tag: impl Into<String>,
@@ -653,7 +723,7 @@ pub fn bootstrap_runtime_scaffold(
     SemanticProgram {
         root: SemanticNode::element(
             "section",
-            Some("WasmPro runtime scaffold".to_string()),
+            Some("Wasm runtime scaffold".to_string()),
             Vec::new(),
             Vec::new(),
             vec![

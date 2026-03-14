@@ -590,7 +590,7 @@ async function cdpEvaluate(tabId, expression, retryCount = 0) {
 
   try {
     const { result, exceptionDetails } = await chrome.debugger.sendCommand(
-      { tabId }, 'Runtime.evaluate', { expression, returnByValue: true }
+      { tabId }, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }
     );
 
     if (exceptionDetails) {
@@ -2623,7 +2623,15 @@ async function handleCommand(id, command) {
           if (result && result.error) {
             return { type: 'error', message: result.error };
           }
-          return { type: 'engineInfo', engine: result.engine, switchable: result.switchable };
+          return {
+            type: 'engineInfo',
+            engine: result.engine,
+            engineLabel: result.engineLabel || null,
+            switchable: result.switchable,
+            availableEngines: result.availableEngines || [],
+            displayAvailableEngines: result.displayAvailableEngines || null,
+            preferredWasmEngine: result.preferredWasmEngine || null
+          };
         } catch (e) {
           return { type: 'error', message: 'GetEngine failed: ' + e.message };
         }
@@ -2632,8 +2640,8 @@ async function handleCommand(id, command) {
         // Set the engine type and trigger re-run
         try {
           const engineToSet = command.engine;
-          if (engineToSet !== 'Actors' && engineToSet !== 'DD' && engineToSet !== 'Wasm' && engineToSet !== 'WasmPro') {
-            return { type: 'error', message: `Invalid engine '${engineToSet}'. Must be 'Actors', 'DD', 'Wasm', or 'WasmPro'` };
+          if (engineToSet !== 'Actors' && engineToSet !== 'DD' && engineToSet !== 'Wasm') {
+            return { type: 'error', message: `Invalid engine '${engineToSet}'. Must be 'Actors', 'DD', or 'Wasm'` };
           }
           const result = await cdpEvaluate(tab.id, `
             (function() {
@@ -2649,7 +2657,14 @@ async function handleCommand(id, command) {
           if (result && result.error) {
             return { type: 'error', message: result.error };
           }
-          return { type: 'success', data: { engine: result.engine, previous: result.previous } };
+          return {
+            type: 'success',
+            data: {
+              engine: result.engine,
+              previous: result.previous,
+              warning: result.warning || null
+            }
+          };
         } catch (e) {
           return { type: 'error', message: 'SetEngine failed: ' + e.message };
         }

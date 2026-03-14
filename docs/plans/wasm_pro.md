@@ -1,5 +1,8 @@
 # Wasm Pro Architecture Plan
 
+> Superseded by [wasm_single_engine_cutover.md](/home/martinkavik/repos/boon/docs/plans/wasm_single_engine_cutover.md).
+> Keep this file as implementation history for the parallel-backend migration phase.
+
 **Status:** Proposed redesign direction
 **Date:** 2026-03-14
 **Audience:** Boon compiler/runtime maintainers
@@ -406,6 +409,12 @@ Track current Wasm engine vs Wasm Pro on:
 - event latency
 - `cells` edit latency
 
+The intended implementation path is a stable tooling command, not ad hoc test output scraping.
+For the current repo shape that means a dedicated metrics entry point such as:
+
+- `cargo run --manifest-path tools/Cargo.toml -- metrics cells-backend --json`
+- `cargo run --manifest-path tools/Cargo.toml -- metrics cells-backend --check`
+
 Success means Wasm Pro wins on those metrics for `cells`, not just on tiny examples.
 
 ## Relationship To Existing Plans
@@ -430,3 +439,5 @@ Success means Wasm Pro wins on those metrics for `cells`, not just on tiny examp
 - phase-1 memory strategy: typed arenas plus ownership-driven subtree drop
 - optimization toolchain: Binaryen release pipeline
 - rollout model: parallel backend, then cutover
+- during cutover, prefer `WasmPro` over legacy `Wasm` in Wasm-family engine selection before deletion
+- during cutover, user-facing pickers should stop advertising legacy `Wasm` as the normal Wasm choice when `WasmPro` is compiled, while explicit fallback/debug paths may remain temporarily available

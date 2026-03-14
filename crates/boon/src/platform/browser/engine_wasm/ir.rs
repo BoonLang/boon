@@ -15,20 +15,20 @@ use crate::parser::Span;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CellId(pub u32);
+pub(super) struct CellId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EventId(pub u32);
+pub(super) struct EventId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FuncId(pub u32);
+pub(super) struct FuncId(pub u32);
 
 // ---------------------------------------------------------------------------
 // Expressions (evaluated to produce values)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub enum IrExpr {
+pub(super) enum IrExpr {
     Constant(IrValue),
     CellRead(CellId),
     FieldAccess {
@@ -69,13 +69,13 @@ pub enum IrExpr {
 }
 
 #[derive(Debug, Clone)]
-pub enum TextSegment {
+pub(super) enum TextSegment {
     Literal(String),
     Expr(IrExpr),
 }
 
 #[derive(Debug, Clone)]
-pub enum IrValue {
+pub(super) enum IrValue {
     Number(f64),
     Text(String),
     Bool(bool),
@@ -92,10 +92,10 @@ pub enum IrValue {
 /// We compare this exact bit pattern via i64.reinterpret_f64 + i64.eq in codegen
 /// to detect SKIP. Do NOT use generic NaN checks (f64.ne with self) because
 /// text-only cells have regular NaN f64 values that should not be treated as SKIP.
-pub const SKIP_SENTINEL_BITS: u64 = 0x7FF8_0000_0000_0001; // quiet NaN with payload 1
+pub(super) const SKIP_SENTINEL_BITS: u64 = 0x7FF8_0000_0000_0001; // quiet NaN with payload 1
 
 #[derive(Debug, Clone, Copy)]
-pub enum BinOp {
+pub(super) enum BinOp {
     Add,
     Sub,
     Mul,
@@ -103,7 +103,7 @@ pub enum BinOp {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum CmpOp {
+pub(super) enum CmpOp {
     Eq,
     Ne,
     Gt,
@@ -117,7 +117,7 @@ pub enum CmpOp {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub enum IrNode {
+pub(super) enum IrNode {
     /// Derived cell: value computed from expression (no external trigger).
     Derived { cell: CellId, expr: IrExpr },
 
@@ -351,7 +351,7 @@ pub enum IrNode {
 }
 
 #[derive(Clone, Debug)]
-pub struct LatestArm {
+pub(super) struct LatestArm {
     pub trigger: Option<EventId>,
     pub body: IrExpr,
 }
@@ -361,7 +361,7 @@ pub struct LatestArm {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub enum IrPattern {
+pub(super) enum IrPattern {
     Number(f64),
     Text(String),
     Tag(String),
@@ -374,7 +374,7 @@ pub enum IrPattern {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub enum ElementKind {
+pub(super) enum ElementKind {
     Button {
         label: IrExpr,
         style: IrExpr,
@@ -457,33 +457,33 @@ pub enum ElementKind {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub struct IrProgram {
-    pub cells: Vec<CellInfo>,
-    pub events: Vec<EventInfo>,
-    pub nodes: Vec<IrNode>,
-    pub document: Option<CellId>,
-    pub render_surface: Option<RenderSurface>,
-    pub functions: Vec<IrFunction>,
+pub(super) struct IrProgram {
+    pub(super) cells: Vec<CellInfo>,
+    pub(super) events: Vec<EventInfo>,
+    pub(super) nodes: Vec<IrNode>,
+    pub(super) document: Option<CellId>,
+    pub(super) render_surface: Option<RenderSurface>,
+    pub(super) functions: Vec<IrFunction>,
     /// Tag string → encoded f64 value mapping.
     /// Tags are encoded as positive f64 values starting at 1.0.
-    pub tag_table: Vec<String>,
+    pub(super) tag_table: Vec<String>,
     /// Map from parent CellId → field sub-cells for object-typed cells.
     /// Used by codegen to resolve text from namespace cells (e.g., finding the
     /// "title" field of a todo item for list display).
-    pub cell_field_cells: HashMap<CellId, HashMap<String, CellId>>,
+    pub(super) cell_field_cells: HashMap<CellId, HashMap<String, CellId>>,
     /// Precomputed plan for each List/map node. The bridge consumes these
     /// instead of rescanning the IR at render time.
-    pub list_map_plans: HashMap<CellId, ListMapPlan>,
+    pub(super) list_map_plans: HashMap<CellId, ListMapPlan>,
 }
 
 impl IrProgram {
     #[must_use]
-    pub fn render_surface(&self) -> RenderSurface {
+    pub(super) fn render_surface(&self) -> RenderSurface {
         self.render_surface.unwrap_or(RenderSurface::Document)
     }
 
     #[must_use]
-    pub fn render_root(&self) -> Option<RenderRootHandle<CellId>> {
+    pub(super) fn render_root(&self) -> Option<RenderRootHandle<CellId>> {
         self.nodes.iter().find_map(|node| {
             if let IrNode::Document {
                 kind,
@@ -504,12 +504,12 @@ impl IrProgram {
     }
 
     #[must_use]
-    pub fn list_map_plan(&self, cell: CellId) -> Option<&ListMapPlan> {
+    pub(super) fn list_map_plan(&self, cell: CellId) -> Option<&ListMapPlan> {
         self.list_map_plans.get(&cell)
     }
 
     #[must_use]
-    pub fn compute_list_map_plans(&self) -> HashMap<CellId, ListMapPlan> {
+    pub(super) fn compute_list_map_plans(&self) -> HashMap<CellId, ListMapPlan> {
         let mut plans = HashMap::new();
         for node in &self.nodes {
             let IrNode::ListMap {
@@ -581,7 +581,7 @@ impl IrProgram {
     }
 
     #[must_use]
-    pub fn find_node_for_cell(&self, cell: CellId) -> Option<&IrNode> {
+    pub(super) fn find_node_for_cell(&self, cell: CellId) -> Option<&IrNode> {
         self.nodes.iter().find(|node| match node {
             IrNode::Derived { cell: c, .. }
             | IrNode::Hold { cell: c, .. }
@@ -619,7 +619,7 @@ impl IrProgram {
     }
 
     #[must_use]
-    pub fn resolve_to_object_store(&self, cell: CellId) -> CellId {
+    pub(super) fn resolve_to_object_store(&self, cell: CellId) -> CellId {
         if self.cell_field_cells.contains_key(&cell) {
             return cell;
         }
@@ -1558,7 +1558,7 @@ impl IrProgram {
 }
 
 #[derive(Debug, Clone)]
-pub struct TemplatePlan {
+pub(super) struct TemplatePlan {
     pub root_cell: Option<CellId>,
     pub cell_range: (u32, u32),
     pub event_range: (u32, u32),
@@ -1568,7 +1568,7 @@ pub struct TemplatePlan {
 }
 
 #[derive(Debug, Clone)]
-pub struct ListMapPlan {
+pub(super) struct ListMapPlan {
     pub map_cell: CellId,
     pub source: CellId,
     pub fanout_source: CellId,
@@ -1579,13 +1579,13 @@ pub struct ListMapPlan {
 }
 
 #[derive(Debug)]
-pub struct CellInfo {
+pub(super) struct CellInfo {
     pub name: String,
     pub span: Span,
 }
 
 #[derive(Debug)]
-pub struct EventInfo {
+pub(super) struct EventInfo {
     pub name: String,
     pub source: EventSource,
     pub span: Span,
@@ -1595,7 +1595,7 @@ pub struct EventInfo {
 }
 
 #[derive(Debug)]
-pub enum EventSource {
+pub(super) enum EventSource {
     Link { element: CellId, event_name: String },
     Timer,
     Router,
@@ -1603,7 +1603,7 @@ pub enum EventSource {
 }
 
 #[derive(Debug)]
-pub struct IrFunction {
+pub(super) struct IrFunction {
     pub name: String,
     pub params: Vec<String>,
     pub param_cells: Vec<CellId>,
@@ -1611,7 +1611,7 @@ pub struct IrFunction {
 }
 
 /// Short debug representation of an IrNode (for logging).
-pub fn node_debug_short(node: &IrNode) -> String {
+pub(super) fn node_debug_short(node: &IrNode) -> String {
     match node {
         IrNode::Derived { cell, expr } => {
             format!("Derived(cell={}, expr={:?})", cell.0, expr_short(expr))
@@ -1843,7 +1843,7 @@ pub fn node_debug_short(node: &IrNode) -> String {
     }
 }
 
-pub fn expr_short(expr: &IrExpr) -> String {
+pub(super) fn expr_short(expr: &IrExpr) -> String {
     match expr {
         IrExpr::Constant(v) => format!("Const({:?})", v),
         IrExpr::CellRead(c) => format!("Cell({})", c.0),

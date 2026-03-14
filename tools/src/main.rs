@@ -98,6 +98,12 @@ enum Commands {
         #[arg(long)]
         analyze_semantic: bool,
     },
+
+    /// Collect backend metrics without a browser session
+    Metrics {
+        #[command(subcommand)]
+        action: MetricsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -151,6 +157,24 @@ enum ServerAction {
         /// Disable file watching for extension hot reload
         #[arg(long)]
         no_watch: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum MetricsAction {
+    /// Measure current Wasm cells backend metrics
+    CellsBackend {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+
+        /// Exit nonzero if the current Wasm budget gate fails
+        #[arg(long)]
+        check: bool,
+
+        /// Cargo target dir to reuse for the focused metrics build/test
+        #[arg(long)]
+        target_dir: Option<PathBuf>,
     },
 }
 
@@ -383,7 +407,7 @@ enum ExecAction {
         #[arg(long)]
         no_launch: bool,
 
-        /// Engine to test against: Actors, DD, Wasm, or WasmPro (default: use current engine)
+        /// Engine to test against: Actors, DD, or Wasm
         #[arg(long)]
         engine: Option<String>,
 
@@ -417,12 +441,12 @@ enum ExecAction {
         examples_dir: Option<PathBuf>,
     },
 
-    /// Get the currently selected engine (Actors, DD, Wasm, or WasmPro)
+    /// Get the currently selected engine and the normal user-facing engine list
     GetEngine,
 
     /// Set the engine and trigger re-run
     SetEngine {
-        /// Engine to use: "Actors", "DD", "Wasm", or "WasmPro"
+        /// Engine to use: "Actors", "DD", or "Wasm"
         engine: String,
     },
 
@@ -585,6 +609,21 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+
+        Commands::Metrics { action } => match action {
+            MetricsAction::CellsBackend {
+                json,
+                check,
+                target_dir,
+            } => {
+                if let Err(e) =
+                    commands::backend_metrics::run_cells_backend_metrics(json, check, target_dir)
+                {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 
     Ok(())
@@ -1081,13 +1120,13 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             engine,
             skip_persistence,
         } => {
-            use commands::test_examples::{TestOptions, run_tests};
+            use commands::test_examples::{run_tests, TestOptions};
 
             // Validate engine if provided
             if let Some(ref eng) = engine {
-                if eng != "Actors" && eng != "DD" && eng != "Wasm" && eng != "WasmPro" {
+                if eng != "Actors" && eng != "DD" && eng != "Wasm" {
                     anyhow::bail!(
-                        "Invalid engine '{}'. Must be 'Actors', 'DD', 'Wasm', or 'WasmPro'",
+                        "Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'",
                         eng
                     );
                 }
@@ -1116,7 +1155,7 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         }
 
         ExecAction::SmokeExamples { filter, no_launch } => {
-            use commands::test_examples::{SmokeOptions, run_builtin_smoke};
+            use commands::test_examples::{run_builtin_smoke, SmokeOptions};
 
             let opts = SmokeOptions {
                 port,
@@ -1175,10 +1214,34 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         ExecAction::GetEngine => {
             let response = send_command_to_server(port, WsCommand::GetEngine).await?;
             match response {
-                WsResponse::EngineInfo { engine, switchable } => {
-                    println!("Engine: {}", engine);
+                WsResponse::EngineInfo {
+                    engine,
+                    engine_label,
+                    switchable,
+                    available_engines,
+                    display_available_engines,
+                    preferred_wasm_engine,
+                } => {
+                    println!("Engine: {}", engine_label.unwrap_or(engine));
+                    let listed_engines = display_available_engines
+                        .as_deref()
+                        .unwrap_or(&available_engines);
+                    if !listed_engines.is_empty() {
+                        println!("Available: {}", listed_engines.join(", "));
+                    }
+                    let hidden_engines: Vec<_> = available_engines
+                        .iter()
+                        .filter(|engine| !listed_engines.iter().any(|listed| listed == *engine))
+                        .cloned()
+                        .collect();
+                    if !hidden_engines.is_empty() {
+                        println!("Explicit fallback only: {}", hidden_engines.join(", "));
+                    }
+                    if let Some(preferred) = preferred_wasm_engine {
+                        println!("Preferred Wasm engine: {}", preferred);
+                    }
                     if switchable {
-                        println!("Switching: available (both engines compiled)");
+                        println!("Switching: available (multiple engines compiled)");
                     } else {
                         println!("Switching: not available (single engine only)");
                     }
@@ -1235,17 +1298,33 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
 
         ExecAction::SetEngine { engine } => {
             // Validate engine value
-            if engine != "Actors" && engine != "DD" && engine != "Wasm" && engine != "WasmPro" {
+            if !commands::is_valid_engine_name(&engine) {
                 anyhow::bail!(
-                    "Invalid engine '{}'. Must be 'Actors', 'DD', 'Wasm', or 'WasmPro'",
+                    "Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'",
                     engine
                 );
             }
-            println!("Setting engine to: {}", engine);
+
+            let mut effective_engine = engine.clone();
+            if let Ok(WsResponse::EngineInfo {
+                available_engines, ..
+            }) = send_command_to_server(port, WsCommand::GetEngine).await
+            {
+                let resolved = commands::resolve_requested_engine(&engine, &available_engines);
+                if resolved != engine {
+                    println!(
+                        "Requested engine '{}' is not available in this build; using '{}' instead.",
+                        engine, resolved
+                    );
+                }
+                effective_engine = resolved;
+            }
+
+            println!("Setting engine to: {}", effective_engine);
             let response = send_command_to_server(
                 port,
                 WsCommand::SetEngine {
-                    engine: engine.clone(),
+                    engine: effective_engine.clone(),
                 },
             )
             .await?;
@@ -1253,10 +1332,16 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                 WsResponse::Success { data } => {
                     if let Some(d) = data {
                         let prev = d.get("previous").and_then(|v| v.as_str()).unwrap_or("?");
-                        let curr = d.get("engine").and_then(|v| v.as_str()).unwrap_or(&engine);
+                        let curr = d
+                            .get("engine")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&effective_engine);
                         println!("Switched: {} -> {}", prev, curr);
+                        if let Some(warning) = d.get("warning").and_then(|v| v.as_str()) {
+                            println!("Warning: {}", warning);
+                        }
                     } else {
-                        println!("Engine set to: {}", engine);
+                        println!("Engine set to: {}", effective_engine);
                     }
                 }
                 _ => print_response(response),

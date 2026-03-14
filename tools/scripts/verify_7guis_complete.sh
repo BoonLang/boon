@@ -32,7 +32,7 @@ fail() { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 skip() { SKIP=$((SKIP+1)); echo "  [SKIP] $1"; }
 
 EXAMPLES="temperature_converter flight_booker timer crud circle_drawer cells"
-# Milestone target is all three engines. Actual per-example support is still
+# Run the current three public engines. Actual per-example support is still
 # encoded in each `.expected` file via `skip_engines`.
 ENGINES="Actors DD Wasm"
 
@@ -230,7 +230,7 @@ fi
 
 # Cells grid size (official 7GUIs target: 26 columns x 100 rows)
 CELLS_BN="$EXAMPLES_DIR/cells/cells.bn"
-elif grep -q "List/range(from: 1, to: 100)" "$CELLS_BN"; then
+if grep -q "List/range(from: 1, to: 100)" "$CELLS_BN"; then
     ok "Cells uses 100 rows"
 elif grep -q "List/range(from: 1, to: 30)" "$CELLS_BN"; then
     fail "Cells still uses 30 rows (official target is 100)"

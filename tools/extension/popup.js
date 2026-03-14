@@ -74,9 +74,10 @@ async function updateStatus() {
             });
             const info = engineResults && engineResults[0] && engineResults[0].result;
             if (info && info.engine) {
+              const engineLabel = info.engineLabel || info.engine;
               engineInfo.textContent = info.switchable
-                ? `${info.engine} (switchable)`
-                : info.engine;
+                ? `${engineLabel} (switchable)`
+                : engineLabel;
             } else {
               engineInfo.textContent = 'Unknown';
             }

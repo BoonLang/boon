@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
-use crate::commands::browser;
+use crate::commands::{browser, resolve_requested_engine};
 use crate::ws_server::{
-    self, Command as WsCommand, Response as WsResponse, send_command_to_server,
+    self, send_command_to_server, Command as WsCommand, Response as WsResponse,
 };
 
-use super::expected::{ExpectedSpec, MatchMode, ParsedAction, matches_inline};
+use super::expected::{matches_inline, ExpectedSpec, MatchMode, ParsedAction};
 
 /// Options for test-examples command
 pub struct TestOptions {
@@ -390,11 +390,10 @@ async fn ensure_browser_connection(
                         println!("Extension connected!");
                     }
                     Err(e) => {
-                        anyhow::bail!(
-                            "Browser launched but extension connection timed out: {}\n\
-                            Check that the playground is running at localhost:{}",
-                            e,
-                            playground_port
+                        println!(
+                            "Browser launched but extension connection timed out during initial wait: {}\n\
+                            Continuing with readiness polling in case the extension reconnects.",
+                            e
                         );
                     }
                 }
@@ -547,10 +546,19 @@ pub async fn run_tests(opts: TestOptions) -> Result<Vec<TestResult>> {
 async fn run_tests_inner(opts: &TestOptions) -> Result<Vec<TestResult>> {
     // Switch engine if requested
     if let Some(ref engine) = opts.engine {
-        let already_on_requested_engine = match send_command_to_server(opts.port, WsCommand::GetEngine).await {
-            Ok(WsResponse::EngineInfo { engine: current, .. }) => current == *engine,
-            _ => false,
-        };
+        let mut effective_engine = engine.clone();
+        let already_on_requested_engine =
+            match send_command_to_server(opts.port, WsCommand::GetEngine).await {
+                Ok(WsResponse::EngineInfo {
+                    available_engines,
+                    engine: current,
+                    ..
+                }) => {
+                    effective_engine = resolve_requested_engine(engine, &available_engines);
+                    current == effective_engine
+                }
+                _ => false,
+            };
 
         // Select a lightweight example before switching engines to avoid the new engine
         // choking on whatever heavy example was loaded (e.g. cells on DD causes hang).
@@ -564,21 +572,31 @@ async fn run_tests_inner(opts: &TestOptions) -> Result<Vec<TestResult>> {
             .await;
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            println!("Setting engine to: {}", engine);
+            if effective_engine != *engine {
+                println!(
+                    "Requested engine '{}' is not available in this build; using '{}' instead.",
+                    engine, effective_engine
+                );
+            }
+            println!("Setting engine to: {}", effective_engine);
             let response = send_command_to_server(
                 opts.port,
                 WsCommand::SetEngine {
-                    engine: engine.clone(),
+                    engine: effective_engine.clone(),
                 },
             )
             .await?;
             if let WsResponse::Error { message } = response {
-                anyhow::bail!("Failed to set engine to '{}': {}", engine, message);
+                anyhow::bail!(
+                    "Failed to set engine to '{}': {}",
+                    effective_engine,
+                    message
+                );
             }
             // Wait for engine switch and recompilation
             tokio::time::sleep(Duration::from_millis(500)).await;
         } else {
-            println!("Engine already set to: {}", engine);
+            println!("Engine already set to: {}", effective_engine);
         }
     }
 
@@ -1261,6 +1279,19 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 r#"(function() {{
                     const preview = document.querySelector('[data-boon-panel="preview"]');
                     if (!preview) return {{ handled: false }};
+                    const collectInputs = () => Array.from(
+                        preview.querySelectorAll('input, textarea')
+                    ).map((element) => ({{
+                        nodeId: element.getAttribute('data-boon-node-id'),
+                        inputPort: element.getAttribute('data-boon-port-input'),
+                        keyDownPort: element.getAttribute('data-boon-port-key-down'),
+                        changePort: element.getAttribute('data-boon-port-change'),
+                        focused: element === document.activeElement,
+                        boonFocused: element.getAttribute('data-boon-focused'),
+                        autofocus: element.getAttribute('autofocus'),
+                        value: element.value || '',
+                        connected: element.isConnected,
+                    }}));
                     const isTextInput = (element) =>
                         element
                         && element !== document.body
@@ -1277,7 +1308,7 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                                 || preview.querySelector('[focused=\"true\"]')
                                 || preview.querySelector('input[autofocus], textarea[autofocus]');
                     }}
-                    if (!isTextInput(input)) return {{ handled: false }};
+                    if (!isTextInput(input)) return {{ handled: false, reason: 'no-input', inputs: collectInputs() }};
                     if (typeof input.focus === 'function') input.focus();
                     window.__boonLastPreviewTextInput = input;
                     const key = {key_json};
@@ -1286,7 +1317,15 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                     if (typeof dispatchEvent === 'function' && keyDownPort) {{
                         const keyPayload = key + '\u001F' + (input.value || '');
                         dispatchEvent(keyDownPort, 'KeyDown', keyPayload);
-                        return {{ handled: true }};
+                        return {{
+                            handled: true,
+                            path: 'hook',
+                            keyDownPort,
+                            nodeId: input.getAttribute('data-boon-node-id'),
+                            value: input.value || '',
+                            inputs: collectInputs(),
+                            wasmProDebug: window.__boonWasmProDebug || null
+                        }};
                     }}
                     const keyMap = {{
                         Enter: {{ code: 'Enter', keyCode: 13, which: 13 }},
@@ -1321,14 +1360,26 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                     if (key === 'Enter' || key === 'Escape') {{
                         input.dispatchEvent(new Event('change', {{ bubbles: true }}));
                     }}
-                    return {{ handled: true }};
+                    return {{
+                        handled: true,
+                        path: 'dom',
+                        keyDownPort,
+                        nodeId: input.getAttribute('data-boon-node-id'),
+                        value: input.value || '',
+                        inputs: collectInputs(),
+                        wasmProDebug: window.__boonWasmProDebug || null
+                    }};
                 }})()"#,
                 key_json = serde_json::to_string(key)?,
             );
-            let response = send_command_to_server(port, WsCommand::EvalJs { expression: js }).await?;
+            let response =
+                send_command_to_server(port, WsCommand::EvalJs { expression: js }).await?;
             let mut handled = false;
             match response {
                 WsResponse::Success { data } => {
+                    if let Some(debug) = data.as_ref() {
+                        eprintln!("[boon-tools:key] {debug}");
+                    }
                     handled = data
                         .as_ref()
                         .and_then(|value| value.get("handled"))
@@ -1340,8 +1391,7 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
             }
             if !handled {
                 let response =
-                send_command_to_server(port, WsCommand::Key { key: key.clone() }).await?
-                ;
+                    send_command_to_server(port, WsCommand::Key { key: key.clone() }).await?;
                 if let WsResponse::Error { message } = response {
                     anyhow::bail!("Key press failed: {}", message);
                 }
@@ -1829,7 +1879,13 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                     if (!rowLabel) return {{ error: `row label ${{targetRow}} not found` }};
                     const target = selected.cells[targetColumn - 1];
                     if (!target) return {{ error: `cell (${{targetRow}}, ${{targetColumn}}) not found` }};
-                    return {{ ok: true, text: target.text }};
+                    return {{
+                        ok: true,
+                        text: target.text,
+                        rowMatchCount: rowMatches.length,
+                        viableRowCount: viableRows.length,
+                        firstRowCells: selected.cells.map((cell) => cell.text),
+                    }};
                 }})()"#,
                 target_row = row,
                 target_column = column,
@@ -1861,12 +1917,27 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                             .and_then(|v| v.as_str())
                             .unwrap_or_default();
                         if actual != expected {
+                            let row_match_count = value
+                                .get("rowMatchCount")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or_default();
+                            let viable_row_count = value
+                                .get("viableRowCount")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or_default();
+                            let first_row_cells = value
+                                .get("firstRowCells")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
                             anyhow::bail!(
-                                "Assert cells cell text failed: expected cell ({}, {}) to be '{}', got '{}'",
+                                "Assert cells cell text failed: expected cell ({}, {}) to be '{}', got '{}' (row matches: {}, viable rows: {}, first row cells: {})",
                                 row,
                                 column,
                                 expected,
-                                actual
+                                actual,
+                                row_match_count,
+                                viable_row_count,
+                                first_row_cells
                             );
                         }
                         break;
@@ -2545,6 +2616,19 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 r#"(function() {{
                     const preview = document.querySelector('[data-boon-panel="preview"]');
                     if (!preview) return 'ERROR: preview root not found';
+                    const collectInputs = () => Array.from(
+                        preview.querySelectorAll('input, textarea')
+                    ).map((element) => ({{
+                        nodeId: element.getAttribute('data-boon-node-id'),
+                        inputPort: element.getAttribute('data-boon-port-input'),
+                        keyDownPort: element.getAttribute('data-boon-port-key-down'),
+                        changePort: element.getAttribute('data-boon-port-change'),
+                        focused: element === document.activeElement,
+                        boonFocused: element.getAttribute('data-boon-focused'),
+                        autofocus: element.getAttribute('autofocus'),
+                        value: element.value || '',
+                        connected: element.isConnected,
+                    }}));
                     const isTextInput = (element) =>
                         element
                         && element !== document.body
@@ -2579,9 +2663,12 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                     const nodeId = input.getAttribute('data-boon-node-id');
                     const dispatchFact = window.__boonDispatchUiFact;
                     const dispatchEvent = window.__boonDispatchUiEvent;
+                    const inputPort = input.getAttribute('data-boon-port-input');
                     const changePort = input.getAttribute('data-boon-port-change');
+                    let path = 'dom';
                     if (typeof dispatchFact === 'function' && nodeId) {{
                         dispatchFact(nodeId, 'DraftText', {value_json});
+                        path = 'hook-fact';
                     }} else {{
                         input.dispatchEvent(new InputEvent('input', {{
                             bubbles: true,
@@ -2590,12 +2677,26 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                             inputType: 'insertReplacementText'
                         }}));
                     }}
+                    if (typeof dispatchEvent === 'function' && inputPort) {{
+                        dispatchEvent(inputPort, 'Input', {value_json});
+                        path = path === 'hook-fact' ? 'hook-fact-input' : 'hook-input';
+                    }}
                     if (typeof dispatchEvent === 'function' && changePort) {{
                         dispatchEvent(changePort, 'Change', {value_json});
-                    }} else {{
-                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        path = path.startsWith('hook')
+                            ? `${{path}}-change`
+                            : 'hook-change';
                     }}
-                    return 'OK';
+                    return {{
+                        ok: true,
+                        path,
+                        nodeId,
+                        inputPort,
+                        changePort,
+                        value: input.value || '',
+                        inputs: collectInputs(),
+                        wasmProDebug: window.__boonWasmProDebug || null
+                    }};
                 }})()"#,
                 value_json = serde_json::to_string(value)?,
             );
@@ -2603,6 +2704,9 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 send_command_to_server(port, WsCommand::EvalJs { expression: js }).await?;
             match response {
                 WsResponse::Success { data } => {
+                    if let Some(debug) = data.as_ref() {
+                        eprintln!("[boon-tools:set-focused-input] {debug}");
+                    }
                     if let Some(serde_json::Value::String(ref d)) = data {
                         if d.starts_with("ERROR") {
                             anyhow::bail!("Set focused input value failed: {}", d);

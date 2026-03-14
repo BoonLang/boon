@@ -455,7 +455,7 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
 
 /// Clear persisted DD states (localStorage).
 /// Also disables saving so the running program doesn't re-persist its in-memory state.
-pub fn clear_dd_persisted_states() {
+pub(crate) fn clear_dd_persisted_states() {
     SAVE_DISABLED.with(|f| f.set(true));
 
     if let Ok(Some(storage)) = web_sys::window().unwrap().local_storage() {

@@ -198,7 +198,7 @@ pub enum Command {
 
     /// Set the engine type and trigger re-run
     SetEngine {
-        /// Engine name: "Actors", "DD", "Wasm", or "WasmPro"
+        /// Engine name: "Actors", "DD", or "Wasm"
         engine: String,
     },
 
@@ -355,10 +355,22 @@ pub enum Response {
 
     /// Engine info response
     EngineInfo {
-        /// Current engine: "Actors", "DD", "Wasm", or "WasmPro"
+        /// Current engine: "Actors", "DD", or "Wasm"
         engine: String,
+        /// Human-facing label for the current engine
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        engine_label: Option<String>,
         /// Whether engine switching is available
         switchable: bool,
+        /// Engine names compiled into the current build
+        #[serde(default)]
+        available_engines: Vec<String>,
+        /// Engine names surfaced in normal user-facing selection UX
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_available_engines: Option<Vec<String>>,
+        /// Preferred compiled Wasm-family engine, if any
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preferred_wasm_engine: Option<String>,
     },
 }
 

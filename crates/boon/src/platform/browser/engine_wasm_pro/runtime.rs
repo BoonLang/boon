@@ -10,15 +10,14 @@ use super::codegen;
 use super::exec_ir::ExecProgram;
 use super::semantic_ir::{
     DerivedArithmeticOp, DerivedScalarOperand, DerivedScalarSpec, IntCompareOp, ItemScalarUpdate,
-    ItemTextUpdate, ObjectDerivedScalarOperand, ObjectItemActionKind, ObjectItemActionSpec,
-    ObjectListFilter, ObjectListItem, ObjectListUpdate, RuntimeModel, ScalarUpdate,
-    SemanticAction, SemanticFactBinding, SemanticFactKind, SemanticInputValue, SemanticNode,
-    SemanticProgram, SemanticStyleFragment, SemanticTextPart, StateRuntimeModel, TextListFilter,
-    TextListUpdate, TextUpdate,
-    bootstrap_runtime_scaffold,
+    ItemTextUpdate, NestedObjectListAction, NestedObjectListUpdate, ObjectDerivedScalarOperand,
+    ObjectItemActionKind, ObjectItemActionSpec, ObjectListFilter, ObjectListItem, ObjectListUpdate,
+    RuntimeModel, ScalarUpdate, SemanticAction, SemanticFactBinding, SemanticFactKind,
+    SemanticInputValue, SemanticNode, SemanticProgram, SemanticStyleFragment, SemanticTextPart,
+    StateRuntimeModel, TextListFilter, TextListUpdate, TextUpdate, bootstrap_runtime_scaffold,
 };
 
-const KEYDOWN_TEXT_SEPARATOR: char = '\u{1F}';
+pub(crate) const KEYDOWN_TEXT_SEPARATOR: char = '\u{1F}';
 
 #[derive(Debug, Default)]
 pub struct WasmProRuntime {
@@ -32,6 +31,8 @@ pub struct WasmProRuntime {
     draft_text: String,
     focused: bool,
     active_program: Option<SemanticProgram>,
+    incremental_diff_enabled: bool,
+    last_exec: Option<ExecProgram>,
     active_actions: HashMap<boon_scene::EventPortId, SemanticAction>,
     active_input_bindings: HashMap<boon_scene::EventPortId, String>,
     active_input_nodes: HashMap<boon_scene::NodeId, String>,
@@ -43,6 +44,7 @@ pub struct WasmProRuntime {
     input_texts: BTreeMap<String, String>,
     derived_scalars: Vec<DerivedScalarSpec>,
     next_object_item_id: u64,
+    action_history: Vec<String>,
 }
 
 impl WasmProRuntime {
@@ -57,6 +59,7 @@ impl WasmProRuntime {
     }
 
     pub fn init(&mut self, program: &ExecProgram) -> u64 {
+        self.last_exec = None;
         self.active_program = Some(SemanticProgram {
             root: program.semantic_root.clone(),
             runtime: program.runtime.clone(),
@@ -91,7 +94,7 @@ impl WasmProRuntime {
             .object_lists
             .values()
             .flatten()
-            .map(|item| item.id)
+            .map(max_object_item_id)
             .max()
             .unwrap_or_default()
             + 1;
@@ -104,14 +107,18 @@ impl WasmProRuntime {
         if self.active_program.is_some() {
             let mut changed = false;
             for event in &batch.events {
+                self.apply_event_effect(event);
                 if let Some(action) = self.active_actions.get(&event.target).cloned() {
-                    changed |= self.apply_action(action, event);
+                    let event_changed = self.apply_action(action.clone(), event);
+                    self.record_action(event, &action, event_changed);
+                    changed |= event_changed;
+                } else {
+                    self.record_missing_action(event);
                 }
             }
             if changed {
                 self.refresh_derived_scalars();
             }
-            self.apply_event_effects(&batch);
             self.event_history.push(batch);
             return Ok(if changed {
                 self.render_active_program()
@@ -119,7 +126,9 @@ impl WasmProRuntime {
                 0
             });
         }
-        self.apply_event_effects(&batch);
+        for event in &batch.events {
+            self.apply_event_effect(event);
+        }
         self.event_history.push(batch);
         Ok(self.queue_commands(self.status_batch()))
     }
@@ -156,6 +165,36 @@ impl WasmProRuntime {
         decode_render_diff_batch(bytes)
     }
 
+    #[must_use]
+    pub fn debug_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "draftText": self.draft_text,
+            "focused": self.focused,
+            "eventCount": self.event_history.len(),
+            "factCount": self.fact_history.len(),
+            "lastEvent": self.last_event_summary(),
+            "lastAction": self.last_action_summary(),
+            "lastFact": self.last_fact_summary(),
+            "recentEvents": self.recent_event_summaries(8),
+            "recentActions": self.recent_action_summaries(8),
+            "recentFacts": self.recent_fact_summaries(8),
+            "activeActions": self.active_actions.len(),
+            "activeInputBindings": self.active_input_bindings,
+            "activeInputBindingEntries": self.active_input_bindings
+                .iter()
+                .map(|(port, binding)| (port.0.to_string(), binding.clone()))
+                .collect::<Vec<_>>(),
+            "activeInputNodes": self.active_input_nodes,
+            "activeInputNodeEntries": self.active_input_nodes
+                .iter()
+                .map(|(node_id, binding)| (node_id.0.to_string(), binding.clone()))
+                .collect::<Vec<_>>(),
+            "scalarValues": self.scalar_values,
+            "textValues": self.text_values,
+            "inputTexts": self.input_texts,
+        })
+    }
+
     fn queue_commands(&mut self, batch: RenderDiffBatch) -> u64 {
         let bytes = encode_render_diff_batch(&batch);
         let start = self.memory.len() as u32;
@@ -175,6 +214,14 @@ impl WasmProRuntime {
             runtime: program.runtime.clone(),
         };
         let exec = ExecProgram::from_semantic(&materialized);
+        let batch = if self.incremental_diff_enabled {
+            self.last_exec.as_ref().map_or_else(
+                || codegen::emit_render_batch(&exec),
+                |previous| codegen::emit_render_diff(previous, &exec),
+            )
+        } else {
+            codegen::emit_render_batch(&exec)
+        };
         self.active_actions = exec
             .event_bindings
             .iter()
@@ -213,7 +260,12 @@ impl WasmProRuntime {
             .iter()
             .map(|binding| ((binding.id, binding.kind.clone()), binding.binding.clone()))
             .collect();
-        self.queue_commands(codegen::emit_render_batch(&exec))
+        self.last_exec = Some(exec);
+        self.queue_commands(batch)
+    }
+
+    pub fn enable_incremental_diff(&mut self) {
+        self.incremental_diff_enabled = true;
     }
 
     fn status_batch(&self) -> RenderDiffBatch {
@@ -253,6 +305,10 @@ impl WasmProRuntime {
                     })
                     .collect(),
             ),
+            SemanticNode::Keyed { key, node } => SemanticNode::Keyed {
+                key: *key,
+                node: Box::new(self.materialize_node_with_scope(node, path, current_element_scope)),
+            },
             SemanticNode::Element {
                 tag,
                 text,
@@ -437,16 +493,18 @@ impl WasmProRuntime {
             } => SemanticNode::Fragment(
                 self.filtered_object_list_items(binding, filter.as_ref())
                     .into_iter()
-                    .enumerate()
-                    .map(|(index, item)| {
-                        let child_path = child_path(path, index);
-                        self.materialize_object_template(
-                            binding,
-                            &item,
-                            item_actions,
-                            template.as_ref(),
-                            &child_path,
-                            None,
+                    .map(|item| {
+                        let child_path = keyed_child_path(path, item.id);
+                        SemanticNode::keyed(
+                            item.id,
+                            self.materialize_object_template(
+                                binding,
+                                &item,
+                                item_actions,
+                                template.as_ref(),
+                                &child_path,
+                                None,
+                            ),
                         )
                     })
                     .collect(),
@@ -468,6 +526,20 @@ impl WasmProRuntime {
                 for update in updates {
                     match update {
                         ScalarUpdate::Set { binding, value } => {
+                            let entry = self.scalar_values.entry(binding).or_default();
+                            if *entry != value {
+                                *entry = value;
+                                changed = true;
+                            }
+                        }
+                        ScalarUpdate::SetFiltered {
+                            binding,
+                            value,
+                            payload_filter,
+                        } => {
+                            if !event_payload_matches(event, &payload_filter) {
+                                continue;
+                            }
                             let entry = self.scalar_values.entry(binding).or_default();
                             if *entry != value {
                                 *entry = value;
@@ -528,6 +600,21 @@ impl WasmProRuntime {
                                 .input_texts
                                 .get(&source_binding)
                                 .cloned()
+                                .or_else(|| {
+                                    self.active_input_bindings
+                                        .get(&event.target)
+                                        .and_then(|binding| self.input_texts.get(binding))
+                                        .cloned()
+                                })
+                                .or_else(|| {
+                                    if event.kind == boon_scene::UiEventKind::KeyDown {
+                                        event_keydown_text(event)
+                                            .map(ToString::to_string)
+                                            .or_else(|| Some(self.draft_text.clone()))
+                                    } else {
+                                        None
+                                    }
+                                })
                                 .unwrap_or_default();
                             let entry = self.text_values.entry(binding).or_default();
                             if *entry != next {
@@ -598,6 +685,11 @@ impl WasmProRuntime {
                 let mut changed = false;
                 for update in updates {
                     match update {
+                        ObjectListUpdate::AppendObject { binding, item } => {
+                            let item = self.assign_fresh_object_item_ids(item);
+                            self.object_lists.entry(binding).or_default().push(item);
+                            changed = true;
+                        }
                         ObjectListUpdate::AppendDraftObject {
                             binding,
                             source_binding,
@@ -635,6 +727,7 @@ impl WasmProRuntime {
                                     bool_fields,
                                     scalar_fields: BTreeMap::new(),
                                     object_lists: BTreeMap::new(),
+                                    nested_item_actions: BTreeMap::new(),
                                 });
                             self.next_object_item_id += 1;
                             if clear_draft {
@@ -729,7 +822,8 @@ impl WasmProRuntime {
                             else {
                                 continue;
                             };
-                            let mut title = event_primary_payload(event).unwrap_or_default().to_string();
+                            let mut title =
+                                event_primary_payload(event).unwrap_or_default().to_string();
                             if trim {
                                 title = title.trim().to_string();
                             }
@@ -772,6 +866,57 @@ impl WasmProRuntime {
                             items.retain(|item| {
                                 !object_list_item_matches_filter(item, &filter, &self.scalar_values)
                             });
+                            if items.len() != before {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                changed
+            }
+            SemanticAction::UpdateNestedObjectLists {
+                parent_binding,
+                parent_item_id,
+                updates,
+            } => {
+                let mut changed = false;
+                let updates = updates
+                    .into_iter()
+                    .map(|update| match update {
+                        NestedObjectListUpdate::AppendObject { field, item } => {
+                            NestedObjectListUpdate::AppendObject {
+                                field,
+                                item: self.assign_fresh_object_item_ids(item),
+                            }
+                        }
+                        NestedObjectListUpdate::RemoveItem { field, item_id } => {
+                            NestedObjectListUpdate::RemoveItem { field, item_id }
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let Some(parent_item) = self
+                    .object_lists
+                    .entry(parent_binding)
+                    .or_default()
+                    .iter_mut()
+                    .find(|item| item.id == parent_item_id)
+                else {
+                    return false;
+                };
+                for update in updates {
+                    match update {
+                        NestedObjectListUpdate::AppendObject { field, item } => {
+                            parent_item
+                                .object_lists
+                                .entry(field)
+                                .or_default()
+                                .push(item);
+                            changed = true;
+                        }
+                        NestedObjectListUpdate::RemoveItem { field, item_id } => {
+                            let items = parent_item.object_lists.entry(field).or_default();
+                            let before = items.len();
+                            items.retain(|item| item.id != item_id);
                             if items.len() != before {
                                 changed = true;
                             }
@@ -869,33 +1014,31 @@ impl WasmProRuntime {
         }
     }
 
-    fn apply_event_effects(&mut self, batch: &UiEventBatch) {
-        if let Some(event) = batch.events.last() {
-            match event.kind {
-                boon_scene::UiEventKind::Input | boon_scene::UiEventKind::Change => {
-                    self.draft_text = event_primary_payload(event).unwrap_or_default().to_string();
+    fn apply_event_effect(&mut self, event: &boon_scene::UiEvent) {
+        match event.kind {
+            boon_scene::UiEventKind::Input | boon_scene::UiEventKind::Change => {
+                self.draft_text = event_primary_payload(event).unwrap_or_default().to_string();
+                if let Some(source_binding) = self.active_input_bindings.get(&event.target) {
+                    self.input_texts
+                        .insert(source_binding.clone(), self.draft_text.clone());
+                }
+            }
+            boon_scene::UiEventKind::KeyDown => {
+                if let Some(text) = event_keydown_text(event) {
+                    self.draft_text = text.to_string();
                     if let Some(source_binding) = self.active_input_bindings.get(&event.target) {
                         self.input_texts
                             .insert(source_binding.clone(), self.draft_text.clone());
                     }
                 }
-                boon_scene::UiEventKind::KeyDown => {
-                    if let Some(text) = event_keydown_text(event) {
-                        self.draft_text = text.to_string();
-                        if let Some(source_binding) = self.active_input_bindings.get(&event.target) {
-                            self.input_texts
-                                .insert(source_binding.clone(), self.draft_text.clone());
-                        }
-                    }
-                }
-                boon_scene::UiEventKind::Focus => {
-                    self.focused = true;
-                }
-                boon_scene::UiEventKind::Blur => {
-                    self.focused = false;
-                }
-                _ => {}
             }
+            boon_scene::UiEventKind::Focus => {
+                self.focused = true;
+            }
+            boon_scene::UiEventKind::Blur => {
+                self.focused = false;
+            }
+            _ => {}
         }
     }
 
@@ -917,10 +1060,7 @@ impl WasmProRuntime {
                     }
                 }
                 boon_scene::UiFactKind::Focused(focused) => {
-                    if self.focused != *focused {
-                        self.focused = *focused;
-                        changed = true;
-                    }
+                    self.focused = *focused;
                     if let Some(binding) = self
                         .active_fact_bindings
                         .get(&(fact.id, SemanticFactKind::Focused))
@@ -1059,6 +1199,10 @@ impl WasmProRuntime {
         Some(format!("{:?} payload={payload}", event.kind))
     }
 
+    fn last_action_summary(&self) -> Option<String> {
+        self.action_history.last().cloned()
+    }
+
     fn last_fact_summary(&self) -> Option<String> {
         let fact = self.fact_history.last()?.facts.last()?;
         Some(match &fact.kind {
@@ -1070,6 +1214,70 @@ impl WasmProRuntime {
             }
             boon_scene::UiFactKind::Custom { name, value } => format!("Custom({name}={value})"),
         })
+    }
+
+    fn recent_event_summaries(&self, limit: usize) -> Vec<String> {
+        self.event_history
+            .iter()
+            .flat_map(|batch| batch.events.iter())
+            .rev()
+            .take(limit)
+            .map(|event| {
+                let payload = event.payload.as_deref().unwrap_or("none");
+                format!("{:?} payload={payload}", event.kind)
+            })
+            .collect()
+    }
+
+    fn recent_action_summaries(&self, limit: usize) -> Vec<String> {
+        self.action_history
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    fn recent_fact_summaries(&self, limit: usize) -> Vec<String> {
+        self.fact_history
+            .iter()
+            .flat_map(|batch| batch.facts.iter())
+            .rev()
+            .take(limit)
+            .map(|fact| match &fact.kind {
+                boon_scene::UiFactKind::Hovered(hovered) => format!("Hovered({hovered})"),
+                boon_scene::UiFactKind::Focused(focused) => format!("Focused({focused})"),
+                boon_scene::UiFactKind::DraftText(text) => format!("DraftText({text})"),
+                boon_scene::UiFactKind::LayoutSize { width, height } => {
+                    format!("LayoutSize({width}x{height})")
+                }
+                boon_scene::UiFactKind::Custom { name, value } => {
+                    format!("Custom({name}={value})")
+                }
+            })
+            .collect()
+    }
+
+    fn record_action(
+        &mut self,
+        event: &boon_scene::UiEvent,
+        action: &SemanticAction,
+        changed: bool,
+    ) {
+        self.action_history.push(format!(
+            "{:?} port={:?} changed={} -> {}",
+            event.kind,
+            event.target,
+            changed,
+            format_action_summary(action),
+        ));
+    }
+
+    fn record_missing_action(&mut self, event: &boon_scene::UiEvent) {
+        self.action_history.push(format!(
+            "{:?} port={:?} changed=false -> <no action>",
+            event.kind, event.target
+        ));
     }
 
     fn filtered_text_list_values(
@@ -1102,6 +1310,19 @@ impl WasmProRuntime {
         }
     }
 
+    fn assign_fresh_object_item_ids(&mut self, mut item: ObjectListItem) -> ObjectListItem {
+        item.id = self.next_object_item_id;
+        self.next_object_item_id += 1;
+        for nested_items in item.object_lists.values_mut() {
+            let drained = std::mem::take(nested_items);
+            *nested_items = drained
+                .into_iter()
+                .map(|nested_item| self.assign_fresh_object_item_ids(nested_item))
+                .collect();
+        }
+        item
+    }
+
     fn materialize_object_template(
         &self,
         list_binding: &str,
@@ -1129,6 +1350,17 @@ impl WasmProRuntime {
                     })
                     .collect(),
             ),
+            SemanticNode::Keyed { key, node } => SemanticNode::Keyed {
+                key: *key,
+                node: Box::new(self.materialize_object_template(
+                    list_binding,
+                    item,
+                    item_actions,
+                    node,
+                    path,
+                    current_element_scope,
+                )),
+            },
             SemanticNode::Element {
                 tag,
                 text,
@@ -1155,11 +1387,7 @@ impl WasmProRuntime {
                         .iter()
                         .find_map(|binding| binding.source_binding.as_deref())
                         .and_then(|source_binding| {
-                            scope_object_source_binding(
-                                Some(source_binding),
-                                list_binding,
-                                item.id,
-                            )
+                            scope_object_source_binding(Some(source_binding), list_binding, item.id)
                         })
                     {
                         let value = self
@@ -1232,13 +1460,55 @@ impl WasmProRuntime {
                                         reject_empty: *reject_empty,
                                         payload_filter: payload_filter.clone(),
                                     }),
-                                    ObjectItemActionKind::RemoveSelf => {
+                                    ObjectItemActionKind::RemoveSelf
+                                        if parse_nested_list_binding(list_binding).is_none() =>
+                                    {
                                         Some(ObjectListUpdate::RemoveItem {
                                             binding: list_binding.to_string(),
                                             item_id: item.id,
                                         })
                                     }
-                                    ObjectItemActionKind::UpdateBindings { .. } => None,
+                                    ObjectItemActionKind::RemoveSelf
+                                    | ObjectItemActionKind::UpdateBindings { .. }
+                                    | ObjectItemActionKind::UpdateNestedObjectLists { .. } => None,
+                                })
+                                .collect::<Vec<_>>();
+                            let nested_actions = matched
+                                .iter()
+                                .filter_map(|spec| match &spec.action {
+                                    ObjectItemActionKind::UpdateNestedObjectLists { updates } => {
+                                        let (parent_binding, parent_item_id) =
+                                            parse_nested_parent(list_binding, item.id)?;
+                                        Some(SemanticAction::UpdateNestedObjectLists {
+                                            parent_binding,
+                                            parent_item_id,
+                                            updates: updates
+                                                .iter()
+                                                .map(|update| match update {
+                                                    NestedObjectListAction::AppendObject {
+                                                        field,
+                                                        item,
+                                                    } => NestedObjectListUpdate::AppendObject {
+                                                        field: field.clone(),
+                                                        item: item.clone(),
+                                                    },
+                                                })
+                                                .collect(),
+                                        })
+                                    }
+                                    ObjectItemActionKind::RemoveSelf => {
+                                        let (parent_binding, parent_item_id, field) =
+                                            parse_nested_list_binding(list_binding)?;
+                                        Some(SemanticAction::UpdateNestedObjectLists {
+                                            parent_binding,
+                                            parent_item_id,
+                                            updates: vec![NestedObjectListUpdate::RemoveItem {
+                                                field,
+                                                item_id: item.id,
+                                            }],
+                                        })
+                                    }
+                                    _ => None,
                                 })
                                 .collect::<Vec<_>>();
                             let mut actions = Vec::new();
@@ -1247,6 +1517,7 @@ impl WasmProRuntime {
                                     updates: object_updates,
                                 });
                             }
+                            actions.extend(nested_actions);
                             for spec in matched {
                                 if let ObjectItemActionKind::UpdateBindings {
                                     scalar_updates,
@@ -1259,18 +1530,46 @@ impl WasmProRuntime {
                                             updates: scalar_updates
                                                 .iter()
                                                 .map(|update| match update {
-                                                    ItemScalarUpdate::SetStatic { binding, value } => {
-                                                        ScalarUpdate::Set {
+                                                    ItemScalarUpdate::SetStatic {
+                                                        binding,
+                                                        value,
+                                                    } => payload_filter.as_ref().map_or_else(
+                                                        || ScalarUpdate::Set {
                                                             binding: binding.clone(),
                                                             value: *value,
-                                                        }
-                                                    }
-                                                    ItemScalarUpdate::SetFromField { binding, field } => {
-                                                        ScalarUpdate::Set {
+                                                        },
+                                                        |payload_filter| {
+                                                            ScalarUpdate::SetFiltered {
+                                                                binding: binding.clone(),
+                                                                value: *value,
+                                                                payload_filter: payload_filter
+                                                                    .clone(),
+                                                            }
+                                                        },
+                                                    ),
+                                                    ItemScalarUpdate::SetFromField {
+                                                        binding,
+                                                        field,
+                                                    } => payload_filter.as_ref().map_or_else(
+                                                        || ScalarUpdate::Set {
                                                             binding: binding.clone(),
-                                                            value: self.object_item_field_scalar_value(item, field),
-                                                        }
-                                                    }
+                                                            value: self
+                                                                .object_item_field_scalar_value(
+                                                                    item, field,
+                                                                ),
+                                                        },
+                                                        |payload_filter| {
+                                                            ScalarUpdate::SetFiltered {
+                                                                binding: binding.clone(),
+                                                                value: self
+                                                                    .object_item_field_scalar_value(
+                                                                        item, field,
+                                                                    ),
+                                                                payload_filter: payload_filter
+                                                                    .clone(),
+                                                            }
+                                                        },
+                                                    ),
                                                 })
                                                 .collect(),
                                         });
@@ -1280,36 +1579,79 @@ impl WasmProRuntime {
                                             updates: text_updates
                                                 .iter()
                                                 .map(|update| match update {
-                                                    ItemTextUpdate::SetStatic { binding, value } => TextUpdate::SetStatic {
+                                                    ItemTextUpdate::SetStatic {
+                                                        binding,
+                                                        value,
+                                                    } => TextUpdate::SetStatic {
                                                         binding: binding.clone(),
                                                         value: value.clone(),
                                                         payload_filter: payload_filter.clone(),
                                                     },
-                                                    ItemTextUpdate::SetFromField { binding, field } => TextUpdate::SetStatic {
-                                                        binding: binding.clone(),
-                                                        value: self.object_item_field_text_value(item, field),
-                                                        payload_filter: payload_filter.clone(),
-                                                    },
-                                                    ItemTextUpdate::SetFromPayload { binding } => TextUpdate::SetFromPayload {
-                                                        binding: binding.clone(),
-                                                    },
+                                                    ItemTextUpdate::SetFromField {
+                                                        binding,
+                                                        field,
+                                                    } => {
+                                                        if field.ends_with(".event.key_down.text")
+                                                            && spec.kind
+                                                                == boon_scene::UiEventKind::KeyDown
+                                                        {
+                                                            let scoped_source = format!(
+                                                                "__item__.{}",
+                                                                spec.source_binding_suffix
+                                                            );
+                                                            let source_binding =
+                                                                scope_object_source_binding(
+                                                                    Some(&scoped_source),
+                                                                    list_binding,
+                                                                    item.id,
+                                                                )
+                                                                .unwrap_or_else(|| binding.clone());
+                                                            TextUpdate::SetFromInput {
+                                                                binding: binding.clone(),
+                                                                source_binding,
+                                                                payload_filter: payload_filter
+                                                                    .clone(),
+                                                            }
+                                                        } else {
+                                                            TextUpdate::SetStatic {
+                                                                binding: binding.clone(),
+                                                                value: self
+                                                                    .object_item_field_text_value(
+                                                                        item, field,
+                                                                    ),
+                                                                payload_filter: payload_filter
+                                                                    .clone(),
+                                                            }
+                                                        }
+                                                    }
+                                                    ItemTextUpdate::SetFromPayload { binding } => {
+                                                        TextUpdate::SetFromPayload {
+                                                            binding: binding.clone(),
+                                                        }
+                                                    }
                                                     ItemTextUpdate::SetFromInputSource {
                                                         binding,
                                                         source_suffix,
                                                     } => TextUpdate::SetFromInput {
                                                         binding: binding.clone(),
-                                                        source_binding: scope_object_source_binding(
-                                                            Some(&format!("__item__.{source_suffix}")),
-                                                            list_binding,
-                                                            item.id,
-                                                        )
-                                                        .unwrap_or_else(|| {
-                                                            format!(
-                                                                "{}.{}",
-                                                                object_item_scope(list_binding, item.id),
-                                                                source_suffix
+                                                        source_binding:
+                                                            scope_object_source_binding(
+                                                                Some(&format!(
+                                                                    "__item__.{source_suffix}"
+                                                                )),
+                                                                list_binding,
+                                                                item.id,
                                                             )
-                                                        }),
+                                                            .unwrap_or_else(|| {
+                                                                format!(
+                                                                    "{}.{}",
+                                                                    object_item_scope(
+                                                                        list_binding,
+                                                                        item.id
+                                                                    ),
+                                                                    source_suffix
+                                                                )
+                                                            }),
                                                         payload_filter: payload_filter.clone(),
                                                     },
                                                 })
@@ -1459,12 +1801,11 @@ impl WasmProRuntime {
                 truthy,
                 falsy,
             } => {
-                let branch =
-                    if self.object_scalar_compare_matches(item, left, op.clone(), right) {
-                        truthy.as_ref()
-                    } else {
-                        falsy.as_ref()
-                    };
+                let branch = if self.object_scalar_compare_matches(item, left, op.clone(), right) {
+                    truthy.as_ref()
+                } else {
+                    falsy.as_ref()
+                };
                 self.materialize_object_template(
                     list_binding,
                     item,
@@ -1570,30 +1911,42 @@ impl WasmProRuntime {
                 let Some(field) = binding.strip_prefix("__item__.") else {
                     return SemanticNode::Fragment(Vec::new());
                 };
-                let nested_list_binding = format!("{}.{}", object_item_scope(list_binding, item.id), field);
+                let nested_list_binding =
+                    format!("{}.{}", object_item_scope(list_binding, item.id), field);
+                let nested_item_actions = item
+                    .nested_item_actions
+                    .get(field)
+                    .cloned()
+                    .unwrap_or_else(|| item_actions.clone());
                 let nested_items = item.object_lists.get(field).cloned().unwrap_or_default();
                 let nested_items = match filter {
                     None => nested_items,
                     Some(filter) => nested_items
                         .into_iter()
                         .filter(|nested_item| {
-                            object_list_item_matches_filter(nested_item, filter, &self.scalar_values)
+                            object_list_item_matches_filter(
+                                nested_item,
+                                filter,
+                                &self.scalar_values,
+                            )
                         })
                         .collect(),
                 };
                 SemanticNode::Fragment(
                     nested_items
                         .into_iter()
-                        .enumerate()
-                        .map(|(index, nested_item)| {
-                            let child_path = child_path(path, index);
-                            self.materialize_object_template(
-                                &nested_list_binding,
-                                &nested_item,
-                                item_actions,
-                                template.as_ref(),
-                                &child_path,
-                                current_element_scope,
+                        .map(|nested_item| {
+                            let child_path = keyed_child_path(path, nested_item.id);
+                            SemanticNode::keyed(
+                                nested_item.id,
+                                self.materialize_object_template(
+                                    &nested_list_binding,
+                                    &nested_item,
+                                    &nested_item_actions,
+                                    template.as_ref(),
+                                    &child_path,
+                                    current_element_scope,
+                                ),
                             )
                         })
                         .collect(),
@@ -1693,7 +2046,9 @@ impl WasmProRuntime {
     ) -> String {
         match value {
             SemanticInputValue::Static(value) => value.clone(),
-            SemanticInputValue::TextParts { parts, .. } => self.render_object_text_parts(item, parts),
+            SemanticInputValue::TextParts { parts, .. } => {
+                self.render_object_text_parts(item, parts)
+            }
             SemanticInputValue::TextBindingBranch {
                 binding,
                 invert,
@@ -1751,7 +2106,9 @@ impl WasmProRuntime {
             ObjectDerivedScalarOperand::Binding(binding) => {
                 self.scalar_values.get(binding).copied().unwrap_or_default()
             }
-            ObjectDerivedScalarOperand::Field(field) => self.object_item_field_scalar_value(item, field),
+            ObjectDerivedScalarOperand::Field(field) => {
+                self.object_item_field_scalar_value(item, field)
+            }
             ObjectDerivedScalarOperand::Literal(value) => *value,
         }
     }
@@ -1760,10 +2117,14 @@ impl WasmProRuntime {
         match field {
             "formula_text" => self
                 .cell_position(item)
-                .map_or_else(String::new, |(column, row)| self.cell_formula_text(column, row)),
+                .map_or_else(String::new, |(column, row)| {
+                    self.cell_formula_text(column, row)
+                }),
             "display_value" => self
                 .cell_position(item)
-                .map_or_else(String::new, |(column, row)| self.cell_display_value_text(column, row)),
+                .map_or_else(String::new, |(column, row)| {
+                    self.cell_display_value_text(column, row)
+                }),
             "input_text" => {
                 let editing_text = self
                     .text_values
@@ -1820,12 +2181,7 @@ impl WasmProRuntime {
         self.cell_value_at(column, row, &mut visited).to_string()
     }
 
-    fn cell_value_at(
-        &self,
-        column: i64,
-        row: i64,
-        visited: &mut BTreeSet<(i64, i64)>,
-    ) -> i64 {
+    fn cell_value_at(&self, column: i64, row: i64, visited: &mut BTreeSet<(i64, i64)>) -> i64 {
         if !visited.insert((column, row)) {
             return 0;
         }
@@ -2024,7 +2380,10 @@ fn scope_object_source_binding(
     let Some(suffix) = source_binding.strip_prefix("__item__.") else {
         return Some(source_binding.to_string());
     };
-    Some(format!("{}.{suffix}", object_item_scope(list_binding, item_id)))
+    Some(format!(
+        "{}.{suffix}",
+        object_item_scope(list_binding, item_id)
+    ))
 }
 
 fn merge_style_fragments(
@@ -2151,6 +2510,14 @@ fn child_path(path: &[usize], index: usize) -> Vec<usize> {
     next
 }
 
+fn keyed_child_path(path: &[usize], key: u64) -> Vec<usize> {
+    let mut next = path.to_vec();
+    next.push(usize::MAX);
+    next.push((key >> 32) as usize);
+    next.push((key & 0xFFFF_FFFF) as usize);
+    next
+}
+
 fn path_key(path: &[usize]) -> String {
     if path.is_empty() {
         "root".to_string()
@@ -2164,6 +2531,51 @@ fn path_key(path: &[usize]) -> String {
 
 fn object_item_scope(list_binding: &str, item_id: u64) -> String {
     format!("{list_binding}.__item__.{item_id}")
+}
+
+fn parse_nested_list_binding(list_binding: &str) -> Option<(String, u64, String)> {
+    let (parent_binding, nested) = list_binding.split_once(".__item__.")?;
+    let (parent_item_id, field) = nested.split_once('.')?;
+    Some((
+        parent_binding.to_string(),
+        parent_item_id.parse().ok()?,
+        field.to_string(),
+    ))
+}
+
+fn parse_nested_parent(list_binding: &str, current_item_id: u64) -> Option<(String, u64)> {
+    if let Some((parent_binding, parent_item_id, _)) = parse_nested_list_binding(list_binding) {
+        return Some((parent_binding, parent_item_id));
+    }
+    Some((list_binding.to_string(), current_item_id))
+}
+
+fn format_action_summary(action: &SemanticAction) -> String {
+    match action {
+        SemanticAction::UpdateScalars { updates } => format!("UpdateScalars({updates:?})"),
+        SemanticAction::UpdateTexts { updates } => format!("UpdateTexts({updates:?})"),
+        SemanticAction::UpdateTextLists { updates } => format!("UpdateTextLists({updates:?})"),
+        SemanticAction::UpdateObjectLists { updates } => format!("UpdateObjectLists({updates:?})"),
+        SemanticAction::UpdateNestedObjectLists {
+            parent_binding,
+            parent_item_id,
+            updates,
+        } => format!(
+            "UpdateNestedObjectLists(parent={parent_binding}, item={parent_item_id}, updates={updates:?})"
+        ),
+        SemanticAction::Batch { actions } => format!("Batch({actions:?})"),
+    }
+}
+
+fn max_object_item_id(item: &ObjectListItem) -> u64 {
+    let nested_max = item
+        .object_lists
+        .values()
+        .flatten()
+        .map(max_object_item_id)
+        .max()
+        .unwrap_or_default();
+    item.id.max(nested_max)
 }
 
 fn local_element_scope(
@@ -2215,25 +2627,32 @@ pub fn bootstrap_runtime(
     external_functions: usize,
     persistence_enabled: bool,
 ) -> WasmProRuntime {
-    WasmProRuntime::new(source.len(), external_functions, persistence_enabled)
+    let mut runtime = WasmProRuntime::new(source.len(), external_functions, persistence_enabled);
+    runtime.enable_incremental_diff();
+    runtime
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    use boon_renderer_zoon::FakeRenderState;
     use boon_scene::{
         EventPortId, RenderDiffBatch, RenderRoot, UiEvent, UiEventBatch, UiEventKind, UiFact,
         UiFactBatch, UiFactKind, UiNodeKind,
     };
+    use serde::Serialize;
 
-    use super::{WasmProRuntime, bootstrap_runtime};
+    use super::{KEYDOWN_TEXT_SEPARATOR, WasmProRuntime, bootstrap_runtime};
     use crate::platform::browser::engine_wasm_pro::abi::{
-        encode_ui_event_batch, encode_ui_fact_batch,
+        encode_render_diff_batch, encode_ui_event_batch, encode_ui_fact_batch,
     };
     use crate::platform::browser::engine_wasm_pro::exec_ir::ExecProgram;
     use crate::platform::browser::engine_wasm_pro::lower::lower_to_semantic;
     use crate::platform::browser::engine_wasm_pro::semantic_ir::{
-        RuntimeModel, ScalarRuntimeModel, ScalarUpdate, SemanticAction, SemanticEventBinding,
-        SemanticNode, SemanticProgram, SemanticTextPart,
+        ObjectListItem, RuntimeModel, ScalarRuntimeModel, ScalarUpdate, SemanticAction,
+        SemanticEventBinding, SemanticNode, SemanticProgram, SemanticTextPart, StateRuntimeModel,
     };
 
     fn ui_text_content(node: &boon_scene::UiNode) -> Option<&str> {
@@ -2284,6 +2703,109 @@ mod tests {
                 .children
                 .iter()
                 .find_map(|child| find_first_tag(child, tag)),
+        }
+    }
+
+    fn direct_child_texts(node: &boon_scene::UiNode) -> Vec<String> {
+        node.children.iter().map(subtree_text).collect()
+    }
+
+    fn object_list_item(id: u64, title: &str) -> ObjectListItem {
+        ObjectListItem {
+            id,
+            title: title.to_string(),
+            completed: false,
+            text_fields: BTreeMap::new(),
+            bool_fields: BTreeMap::new(),
+            scalar_fields: BTreeMap::new(),
+            object_lists: BTreeMap::new(),
+            nested_item_actions: BTreeMap::new(),
+        }
+    }
+
+    fn simple_object_list_program(items: Vec<ObjectListItem>) -> SemanticProgram {
+        SemanticProgram {
+            root: SemanticNode::element(
+                "div",
+                None,
+                Vec::new(),
+                Vec::new(),
+                vec![SemanticNode::object_list(
+                    "items",
+                    None,
+                    Vec::new(),
+                    SemanticNode::element(
+                        "div",
+                        None,
+                        vec![("data-kind".to_string(), "row".to_string())],
+                        Vec::new(),
+                        vec![SemanticNode::ObjectFieldValue {
+                            field: "title".to_string(),
+                        }],
+                    ),
+                )],
+            ),
+            runtime: RuntimeModel::State(StateRuntimeModel {
+                object_lists: [("items".to_string(), items)].into_iter().collect(),
+                ..StateRuntimeModel::default()
+            }),
+        }
+    }
+
+    fn nested_object_list_program(rows: Vec<ObjectListItem>) -> SemanticProgram {
+        SemanticProgram {
+            root: SemanticNode::element(
+                "div",
+                None,
+                Vec::new(),
+                Vec::new(),
+                vec![SemanticNode::object_list(
+                    "rows",
+                    None,
+                    Vec::new(),
+                    SemanticNode::element(
+                        "section",
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        vec![
+                            SemanticNode::element(
+                                "label",
+                                None,
+                                Vec::new(),
+                                Vec::new(),
+                                vec![SemanticNode::ObjectFieldValue {
+                                    field: "title".to_string(),
+                                }],
+                            ),
+                            SemanticNode::element(
+                                "div",
+                                None,
+                                vec![("data-kind".to_string(), "cells".to_string())],
+                                Vec::new(),
+                                vec![SemanticNode::object_list(
+                                    "__item__.cells",
+                                    None,
+                                    Vec::new(),
+                                    SemanticNode::element(
+                                        "div",
+                                        None,
+                                        vec![("data-kind".to_string(), "cell".to_string())],
+                                        Vec::new(),
+                                        vec![SemanticNode::ObjectFieldValue {
+                                            field: "title".to_string(),
+                                        }],
+                                    ),
+                                )],
+                            ),
+                        ],
+                    ),
+                )],
+            ),
+            runtime: RuntimeModel::State(StateRuntimeModel {
+                object_lists: [("rows".to_string(), rows)].into_iter().collect(),
+                ..StateRuntimeModel::default()
+            }),
         }
     }
 
@@ -2412,8 +2934,13 @@ mod tests {
         })
     }
 
-    fn find_nth_port(batch: &RenderDiffBatch, kind: UiEventKind, ordinal: usize) -> Option<EventPortId> {
-        batch.ops
+    fn find_nth_port(
+        batch: &RenderDiffBatch,
+        kind: UiEventKind,
+        ordinal: usize,
+    ) -> Option<EventPortId> {
+        batch
+            .ops
             .iter()
             .filter_map(|op| match op {
                 boon_scene::RenderOp::AttachEventPort {
@@ -2431,13 +2958,12 @@ mod tests {
         kind: UiEventKind,
         ordinal: usize,
     ) -> Option<boon_scene::NodeId> {
-        batch.ops
+        batch
+            .ops
             .iter()
             .filter_map(|op| match op {
                 boon_scene::RenderOp::AttachEventPort {
-                    id,
-                    kind: op_kind,
-                    ..
+                    id, kind: op_kind, ..
                 } if *op_kind == kind => Some(*id),
                 _ => None,
             })
@@ -2484,12 +3010,427 @@ mod tests {
         find_port(batch, input_id, kind)
     }
 
+    fn find_nth_port_in_state(
+        root: &boon_scene::UiNode,
+        state: &FakeRenderState,
+        kind: UiEventKind,
+        ordinal: usize,
+    ) -> Option<boon_scene::EventPortId> {
+        fn collect(
+            node: &boon_scene::UiNode,
+            state: &FakeRenderState,
+            kind: &UiEventKind,
+            ports: &mut Vec<boon_scene::EventPortId>,
+        ) {
+            for (port, port_kind) in state.event_ports_for(node.id) {
+                if &port_kind == kind {
+                    ports.push(port);
+                }
+            }
+            for child in &node.children {
+                collect(child, state, kind, ports);
+            }
+        }
+
+        let mut ports = Vec::new();
+        collect(root, state, &kind, &mut ports);
+        ports.into_iter().nth(ordinal)
+    }
+
+    fn find_nth_port_target_in_state(
+        root: &boon_scene::UiNode,
+        state: &FakeRenderState,
+        kind: UiEventKind,
+        ordinal: usize,
+    ) -> Option<boon_scene::NodeId> {
+        fn collect(
+            node: &boon_scene::UiNode,
+            state: &FakeRenderState,
+            kind: &UiEventKind,
+            ids: &mut Vec<boon_scene::NodeId>,
+        ) {
+            if state
+                .event_ports_for(node.id)
+                .into_iter()
+                .any(|(_, port_kind)| &port_kind == kind)
+            {
+                ids.push(node.id);
+            }
+            for child in &node.children {
+                collect(child, state, kind, ids);
+            }
+        }
+
+        let mut ids = Vec::new();
+        collect(root, state, &kind, &mut ids);
+        ids.into_iter().nth(ordinal)
+    }
+
+    fn find_port_in_state(
+        state: &FakeRenderState,
+        node_id: boon_scene::NodeId,
+        kind: UiEventKind,
+    ) -> Option<boon_scene::EventPortId> {
+        state
+            .event_ports_for(node_id)
+            .into_iter()
+            .find_map(|(port, port_kind)| (port_kind == kind).then_some(port))
+    }
+
+    fn count_ports_in_state(
+        root: &boon_scene::UiNode,
+        state: &FakeRenderState,
+        kind: UiEventKind,
+    ) -> usize {
+        fn count(node: &boon_scene::UiNode, state: &FakeRenderState, kind: &UiEventKind) -> usize {
+            let local = state
+                .event_ports_for(node.id)
+                .into_iter()
+                .filter(|(_, port_kind)| port_kind == kind)
+                .count();
+            local
+                + node
+                    .children
+                    .iter()
+                    .map(|child| count(child, state, kind))
+                    .sum::<usize>()
+        }
+
+        count(root, state, &kind)
+    }
+
+    fn ui_node_count(node: &boon_scene::UiNode) -> usize {
+        1 + node.children.iter().map(ui_node_count).sum::<usize>()
+    }
+
+    fn extract_ui_root(batch: &RenderDiffBatch) -> &boon_scene::UiNode {
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &batch.ops[0] else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+        root
+    }
+
+    fn apply_batch_and_root(
+        state: &mut FakeRenderState,
+        batch: &RenderDiffBatch,
+    ) -> boon_scene::UiNode {
+        state.apply_batch(batch).expect("batch should apply");
+        let Some(RenderRoot::UiTree(root)) = state.root() else {
+            panic!("expected ui root after batch");
+        };
+        root.clone()
+    }
+
+    fn assert_node_id_and_port_kind(
+        root: &boon_scene::UiNode,
+        state: &FakeRenderState,
+        node_id: boon_scene::NodeId,
+        kind: UiEventKind,
+        message: &str,
+    ) {
+        let node = find_node_by_id(root, node_id).expect(message);
+        assert!(
+            find_port_in_state(state, node.id, kind.clone()).is_some(),
+            "{message}: expected {:?} port on {:?}",
+            kind,
+            node.id
+        );
+    }
+
+    fn init_cells_incremental_runtime() -> (WasmProRuntime, FakeRenderState, boon_scene::UiNode) {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+        (runtime, state, init_root)
+    }
+
+    fn capture_cells_double_click_ids(
+        root: &boon_scene::UiNode,
+        state: &FakeRenderState,
+        ordinals: &[usize],
+    ) -> Vec<(usize, boon_scene::NodeId)> {
+        ordinals
+            .iter()
+            .map(|ordinal| {
+                (
+                    *ordinal,
+                    find_nth_port_target_in_state(root, state, UiEventKind::DoubleClick, *ordinal)
+                        .unwrap_or_else(|| {
+                            panic!("cell ordinal {ordinal} should expose DoubleClick")
+                        }),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_cells_double_click_ids_stable(
+        root: &boon_scene::UiNode,
+        state: &FakeRenderState,
+        ids: &[(usize, boon_scene::NodeId)],
+        context: &str,
+    ) {
+        for (ordinal, node_id) in ids {
+            assert_node_id_and_port_kind(
+                root,
+                state,
+                *node_id,
+                UiEventKind::DoubleClick,
+                &format!(
+                    "{context}: sibling cell ordinal {ordinal} should keep its display identity and port"
+                ),
+            );
+        }
+    }
+
+    fn enter_edit_mode_for_nth_cells_cell(
+        runtime: &mut WasmProRuntime,
+        state: &mut FakeRenderState,
+        root: &boon_scene::UiNode,
+        ordinal: usize,
+    ) -> (
+        boon_scene::UiNode,
+        boon_scene::NodeId,
+        boon_scene::EventPortId,
+        boon_scene::EventPortId,
+        Option<boon_scene::EventPortId>,
+    ) {
+        let display_id =
+            find_nth_port_target_in_state(root, state, UiEventKind::DoubleClick, ordinal)
+                .unwrap_or_else(|| panic!("cell ordinal {ordinal} should expose DoubleClick"));
+        let double_click_port =
+            find_nth_port_in_state(root, state, UiEventKind::DoubleClick, ordinal)
+                .unwrap_or_else(|| panic!("cell ordinal {ordinal} should expose DoubleClick"));
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: double_click_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        assert!(
+            edit_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "edit entry should stay incremental",
+        );
+        let edit_root = apply_batch_and_root(state, &edit_batch);
+        let input = find_first_tag(&edit_root, "input").expect("edit mode should render input");
+        let input_port = find_port_in_state(state, input.id, UiEventKind::Input)
+            .expect("edit input should expose Input");
+        let key_down_port = find_port_in_state(state, input.id, UiEventKind::KeyDown)
+            .expect("edit input should expose KeyDown");
+        let blur_port = find_port_in_state(state, input.id, UiEventKind::Blur);
+        (edit_root, display_id, input_port, key_down_port, blur_port)
+    }
+
+    fn attached_port_count(batch: &RenderDiffBatch, expected_kind: UiEventKind) -> usize {
+        batch
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    boon_scene::RenderOp::AttachEventPort { kind, .. } if *kind == expected_kind
+                )
+            })
+            .count()
+    }
+
+    #[derive(Debug, Serialize)]
+    struct BatchMetrics {
+        encoded_bytes: usize,
+        op_count: usize,
+        ui_node_count: usize,
+        double_click_ports: usize,
+        input_ports: usize,
+        key_down_ports: usize,
+    }
+
+    fn batch_metrics(batch: &RenderDiffBatch) -> BatchMetrics {
+        BatchMetrics {
+            encoded_bytes: encode_render_diff_batch(batch).len(),
+            op_count: batch.ops.len(),
+            ui_node_count: batch
+                .ops
+                .iter()
+                .find_map(|op| match op {
+                    boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) => {
+                        Some(ui_node_count(root))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            double_click_ports: attached_port_count(batch, UiEventKind::DoubleClick),
+            input_ports: attached_port_count(batch, UiEventKind::Input),
+            key_down_ports: attached_port_count(batch, UiEventKind::KeyDown),
+        }
+    }
+
+    #[derive(Debug, Serialize)]
+    struct WasmProPipelineMetrics {
+        lower_exec_millis: u128,
+        init_millis: u128,
+        a1_commit_millis: u128,
+        init_batch: BatchMetrics,
+        a1_commit_batch: BatchMetrics,
+    }
+
+    const CELLS_26X100_INIT_MAX_ENCODED_BYTES: usize = 950_000;
+    const CELLS_26X100_INIT_MAX_OPS: usize = 3_000;
+    const CELLS_26X100_COMMIT_MAX_ENCODED_BYTES: usize = 2_000;
+    const CELLS_26X100_COMMIT_MAX_OPS: usize = 16;
+    const CELLS_26X100_COMMIT_MAX_DOUBLE_CLICK_ATTACHES: usize = 4;
+
+    fn wasm_pro_pipeline_metrics_for_cells() -> WasmProPipelineMetrics {
+        let source =
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn");
+
+        let lower_started = Instant::now();
+        let semantic = lower_to_semantic(source, None, false);
+        let exec = ExecProgram::from_semantic(&semantic);
+        let lower_exec_millis = lower_started.elapsed().as_millis();
+
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+
+        let init_started = Instant::now();
+        let init_descriptor = runtime.init(&exec);
+        let init_millis = init_started.elapsed().as_millis();
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("Wasm Pro init batch should decode");
+        let init_metrics = batch_metrics(&init_batch);
+
+        let mut state = FakeRenderState::default();
+        let _ = apply_batch_and_root(&mut state, &init_batch);
+
+        let commit_started = Instant::now();
+        let a1_commit_batch =
+            edit_nth_cells_grid_cell_and_commit_batch_with_state(&mut runtime, &mut state, 0, "7");
+        let a1_commit_millis = commit_started.elapsed().as_millis();
+        let a1_commit_metrics = batch_metrics(&a1_commit_batch);
+
+        WasmProPipelineMetrics {
+            lower_exec_millis,
+            init_millis,
+            a1_commit_millis,
+            init_batch: init_metrics,
+            a1_commit_batch: a1_commit_metrics,
+        }
+    }
+
+    fn edit_nth_cells_grid_cell_and_commit(
+        runtime: &mut WasmProRuntime,
+        ordinal: usize,
+        value: &str,
+    ) -> boon_scene::UiNode {
+        let mut state = FakeRenderState::default();
+        let commit_batch = edit_nth_cells_grid_cell_and_commit_batch_with_state(
+            runtime, &mut state, ordinal, value,
+        );
+        extract_ui_root(&commit_batch).clone()
+    }
+
+    fn edit_nth_cells_grid_cell_and_commit_batch(
+        runtime: &mut WasmProRuntime,
+        ordinal: usize,
+        value: &str,
+    ) -> RenderDiffBatch {
+        let mut state = FakeRenderState::default();
+        edit_nth_cells_grid_cell_and_commit_batch_with_state(runtime, &mut state, ordinal, value)
+    }
+
+    fn edit_nth_cells_grid_cell_and_commit_batch_with_state(
+        runtime: &mut WasmProRuntime,
+        state: &mut FakeRenderState,
+        ordinal: usize,
+        value: &str,
+    ) -> RenderDiffBatch {
+        let init_descriptor = runtime.take_commands();
+        if init_descriptor != 0 {
+            let init_batch = runtime
+                .decode_commands(init_descriptor)
+                .expect("init batch should decode");
+            let _ = apply_batch_and_root(state, &init_batch);
+        }
+        let Some(RenderRoot::UiTree(root)) = state.root() else {
+            panic!("expected cells root before editing");
+        };
+        let double_click_port =
+            find_nth_port_in_state(root, state, UiEventKind::DoubleClick, ordinal)
+                .expect("target cell should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: double_click_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        let root = apply_batch_and_root(state, &edit_batch);
+        let input = find_first_tag(&root, "input").expect("edit mode should render input");
+        let input_port = find_port(&edit_batch, input.id, UiEventKind::Input)
+            .expect("edit input should expose Input");
+        let key_down_port = find_port(&edit_batch, input.id, UiEventKind::KeyDown)
+            .expect("edit input should expose KeyDown");
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some(value.to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let commit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Enter".to_string()),
+                }],
+            }))
+            .expect("enter should decode");
+        let commit_batch = runtime
+            .decode_commands(commit_descriptor)
+            .expect("commit batch should decode");
+        let _ = apply_batch_and_root(state, &commit_batch);
+        commit_batch
+    }
+
     #[test]
     fn init_queues_replace_root_batch() {
         let exec = ExecProgram::from_semantic(&SemanticProgram {
             root: SemanticNode::element(
                 "section",
-                Some("WasmPro runtime scaffold".to_string()),
+                Some("Wasm runtime scaffold".to_string()),
                 Vec::new(),
                 Vec::new(),
                 vec![SemanticNode::text("child")],
@@ -2509,7 +3450,7 @@ mod tests {
         let UiNodeKind::Element { text, .. } = &root.kind else {
             panic!("expected element root");
         };
-        assert_eq!(text.as_deref(), Some("WasmPro runtime scaffold"));
+        assert_eq!(text.as_deref(), Some("Wasm runtime scaffold"));
     }
 
     #[test]
@@ -3013,6 +3954,127 @@ FUNCTION focus_button(label) {
             panic!("expected text template child");
         };
         assert_eq!(text, "Sum: 8");
+    }
+
+    #[test]
+    fn incremental_diff_reorders_object_list_items_by_stable_item_identity() {
+        let exec = ExecProgram::from_semantic(&simple_object_list_program(vec![
+            object_list_item(11, "A"),
+            object_list_item(22, "B"),
+            object_list_item(33, "C"),
+        ]));
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+        let initial_ids = init_root
+            .children
+            .iter()
+            .map(|child| child.id)
+            .collect::<Vec<_>>();
+        assert_eq!(direct_child_texts(&init_root), vec!["A", "B", "C"]);
+
+        runtime
+            .object_lists
+            .get_mut("items")
+            .expect("items should exist")
+            .swap(0, 1);
+
+        let reorder_descriptor = runtime.render_active_program();
+        let reorder_batch = runtime
+            .decode_commands(reorder_descriptor)
+            .expect("reorder batch should decode");
+        assert!(
+            reorder_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "reorder should be incremental",
+        );
+        assert!(
+            reorder_batch
+                .ops
+                .iter()
+                .any(|op| matches!(op, boon_scene::RenderOp::MoveChild { .. })),
+            "reorder should emit MoveChild",
+        );
+        assert!(
+            reorder_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::SetText { .. })),
+            "pure reorder should not rewrite text payloads",
+        );
+
+        let reorder_root = apply_batch_and_root(&mut state, &reorder_batch);
+        assert_eq!(direct_child_texts(&reorder_root), vec!["B", "A", "C"]);
+        assert_eq!(reorder_root.children[0].id, initial_ids[1]);
+        assert_eq!(reorder_root.children[1].id, initial_ids[0]);
+        assert_eq!(reorder_root.children[2].id, initial_ids[2]);
+    }
+
+    #[test]
+    fn incremental_diff_removes_object_list_item_without_reidentifying_survivors() {
+        let exec = ExecProgram::from_semantic(&simple_object_list_program(vec![
+            object_list_item(11, "A"),
+            object_list_item(22, "B"),
+            object_list_item(33, "C"),
+        ]));
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+        let removed_id = init_root.children[0].id;
+        let survivor_ids = init_root.children[1..]
+            .iter()
+            .map(|child| child.id)
+            .collect::<Vec<_>>();
+
+        runtime
+            .object_lists
+            .get_mut("items")
+            .expect("items should exist")
+            .remove(0);
+
+        let remove_descriptor = runtime.render_active_program();
+        let remove_batch = runtime
+            .decode_commands(remove_descriptor)
+            .expect("remove batch should decode");
+        assert!(
+            remove_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "remove should be incremental",
+        );
+        assert!(
+            remove_batch.ops.iter().any(
+                |op| matches!(op, boon_scene::RenderOp::RemoveNode { id } if *id == removed_id)
+            ),
+            "remove should target the removed item's stable node id",
+        );
+        assert!(
+            remove_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::SetText { .. })),
+            "remove should not rewrite surviving rows as text churn",
+        );
+
+        let remove_root = apply_batch_and_root(&mut state, &remove_batch);
+        assert_eq!(direct_child_texts(&remove_root), vec!["B", "C"]);
+        assert_eq!(remove_root.children[0].id, survivor_ids[0]);
+        assert_eq!(remove_root.children[1].id, survivor_ids[1]);
     }
 
     #[test]
@@ -3887,9 +4949,18 @@ document: Document/new(root: Element/stripe(
         let first_row_input_id = rows_container.children[0].id;
         let second_row_input_id = rows_container.children[1].id;
 
-        assert_eq!(property_value(&init_batch, source_input_id, "value"), Some("Draft"));
-        assert_eq!(property_value(&init_batch, first_row_input_id, "value"), Some("Draft"));
-        assert_eq!(property_value(&init_batch, second_row_input_id, "value"), Some("=A1"));
+        assert_eq!(
+            property_value(&init_batch, source_input_id, "value"),
+            Some("Draft")
+        );
+        assert_eq!(
+            property_value(&init_batch, first_row_input_id, "value"),
+            Some("Draft")
+        );
+        assert_eq!(
+            property_value(&init_batch, second_row_input_id, "value"),
+            Some("=A1")
+        );
 
         let source_input_port = init_batch
             .ops
@@ -4627,6 +5698,393 @@ document: Document/new(root: Element/stripe(
     }
 
     #[test]
+    fn incremental_diff_runtime_object_list_append_toggle_and_remove_preserves_survivor_identity() {
+        let semantic = lower_to_semantic(
+            r#"
+store: [
+    input: LINK
+
+    title_to_add: store.input.event.key_down.key |> WHEN {
+        Enter => BLOCK {
+            trimmed: store.input.text |> Text/trim()
+
+            trimmed |> Text/is_not_empty() |> WHEN {
+                True => trimmed
+                False => SKIP
+            }
+        }
+        __ => SKIP
+    }
+
+    todos:
+        LIST {
+            new_todo(title: TEXT { Buy milk })
+            new_todo(title: TEXT { Clean room })
+        }
+        |> List/append(item: title_to_add |> new_todo())
+        |> List/remove(item, on: item.remove_button.event.click)
+]
+
+FUNCTION new_todo(title) {
+    [
+        toggle_button: LINK
+        remove_button: LINK
+        title: title
+
+        completed: False |> HOLD state {
+            toggle_button.event.click |> THEN { state |> Bool/not() }
+        }
+    ]
+}
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    gap: 10
+    style: []
+
+    items: LIST {
+        Element/text_input(
+            element: [event: [key_down: LINK, change: LINK]]
+            style: []
+            label: Hidden[text: TEXT { Add todo }]
+
+            text: LATEST {
+                Text/empty()
+                element.event.change.text
+            }
+
+            placeholder: [text: TEXT { Type and press Enter }]
+            focus: True
+        )
+        |> LINK { store.input }
+
+        Element/label(element: [], style: [], label: BLOCK {
+            count: store.todos |> List/count()
+
+            TEXT { Count: {count} }
+        })
+
+        Element/stripe(
+            element: []
+            direction: Column
+            gap: 5
+            style: []
+
+            items: store.todos |> List/map(item, new: Element/stripe(
+                element: []
+                direction: Row
+                gap: 10
+                style: []
+
+                items: LIST {
+                    Element/checkbox(
+                        element: [event: [click: LINK]]
+                        style: []
+                        label: TEXT { Toggle }
+                        checked: item.completed
+
+                        icon: item.completed |> WHEN {
+                            True => TEXT { [X] }
+                            False => TEXT { [ ] }
+                        }
+                    )
+                    |> LINK { item.toggle_button }
+
+                    Element/label(element: [], style: [], label: item.title)
+
+                    Element/label(element: [], style: [], label: item.completed |> WHEN {
+                        True => TEXT { (done) }
+                        False => TEXT { (active) }
+                    })
+
+                    Element/button(
+                        element: [event: [click: LINK]]
+                        style: []
+                        label: TEXT { Remove }
+                    )
+                    |> LINK { item.remove_button }
+                }
+            ))
+        )
+    }
+))
+"#,
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+
+        let input_id = init_root.children[0].id;
+        let list_id = init_root.children[2].id;
+        let first_row_id = init_root.children[2].children[0].id;
+        let second_row_id = init_root.children[2].children[1].id;
+        assert_eq!(init_root.children[2].children.len(), 2);
+
+        let first_toggle_port = find_port_in_state(
+            &state,
+            init_root.children[2].children[0].children[0].id,
+            UiEventKind::Click,
+        )
+        .expect("first checkbox should expose Click");
+        let toggle_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: first_toggle_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("toggle batch should decode");
+        let toggle_batch = runtime
+            .decode_commands(toggle_descriptor)
+            .expect("toggle diff should decode");
+        assert!(
+            toggle_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "toggle should be incremental",
+        );
+        let toggled_root = apply_batch_and_root(&mut state, &toggle_batch);
+        assert_eq!(toggled_root.children[2].children[0].id, first_row_id);
+        assert_eq!(toggled_root.children[2].children[1].id, second_row_id);
+        let UiNodeKind::Text { text } =
+            &toggled_root.children[2].children[0].children[2].children[0].kind
+        else {
+            panic!("expected toggled status text");
+        };
+        assert_eq!(text, "(done)");
+
+        let second_remove_port = find_port_in_state(
+            &state,
+            toggled_root.children[2].children[1].children[3].id,
+            UiEventKind::Click,
+        )
+        .expect("second remove button should expose Click");
+        let remove_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: second_remove_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("remove batch should decode");
+        let remove_batch = runtime
+            .decode_commands(remove_descriptor)
+            .expect("remove diff should decode");
+        assert!(
+            remove_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "remove should be incremental",
+        );
+        assert!(
+            remove_batch.ops.iter().any(
+                |op| matches!(op, boon_scene::RenderOp::RemoveNode { id } if *id == second_row_id)
+            ),
+            "remove should target the removed row's stable id",
+        );
+        let removed_root = apply_batch_and_root(&mut state, &remove_batch);
+        assert_eq!(removed_root.children[2].children.len(), 1);
+        assert_eq!(removed_root.children[2].children[0].id, first_row_id);
+
+        let input_port = find_port_in_state(&state, input_id, UiEventKind::Input)
+            .expect("input should expose Input");
+        let key_port = find_port_in_state(&state, input_id, UiEventKind::KeyDown)
+            .expect("input should expose KeyDown");
+        runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("Wash car".to_string()),
+                }],
+            }))
+            .expect("input batch should decode");
+        let append_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Enter".to_string()),
+                }],
+            }))
+            .expect("append batch should decode");
+        let append_batch = runtime
+            .decode_commands(append_descriptor)
+            .expect("append diff should decode");
+        assert!(
+            append_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "append should be incremental",
+        );
+        assert!(
+            append_batch
+                .ops
+                .iter()
+                .any(|op| matches!(op, boon_scene::RenderOp::InsertChild { parent, .. } if *parent == list_id)),
+            "append should insert a new row into the list container",
+        );
+        let appended_root = apply_batch_and_root(&mut state, &append_batch);
+        assert_eq!(appended_root.children[2].children.len(), 2);
+        assert_eq!(appended_root.children[2].children[0].id, first_row_id);
+        assert_ne!(appended_root.children[2].children[1].id, first_row_id);
+        assert_ne!(appended_root.children[2].children[1].id, second_row_id);
+        let UiNodeKind::Text { text } =
+            &appended_root.children[2].children[1].children[1].children[0].kind
+        else {
+            panic!("expected appended todo title");
+        };
+        assert_eq!(text, "Wash car");
+    }
+
+    #[test]
+    fn incremental_diff_nested_object_list_remove_and_append_preserve_parent_identity() {
+        let mut first_row = object_list_item(100, "Row 1");
+        first_row.object_lists.insert(
+            "cells".to_string(),
+            vec![object_list_item(101, "A1"), object_list_item(102, "B1")],
+        );
+        let mut second_row = object_list_item(200, "Row 2");
+        second_row.object_lists.insert(
+            "cells".to_string(),
+            vec![object_list_item(201, "A2"), object_list_item(202, "B2")],
+        );
+
+        let exec = ExecProgram::from_semantic(&nested_object_list_program(vec![
+            first_row.clone(),
+            second_row.clone(),
+        ]));
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+        assert_eq!(
+            direct_child_texts(&init_root),
+            vec!["Row 1A1B1", "Row 2A2B2"]
+        );
+
+        let row_one_id = init_root.children[0].id;
+        let row_two_id = init_root.children[1].id;
+        let row_one_cells_id = init_root.children[0].children[1].id;
+        let row_one_a_id = init_root.children[0].children[1].children[0].id;
+        let row_one_b_id = init_root.children[0].children[1].children[1].id;
+        let row_two_a_id = init_root.children[1].children[1].children[0].id;
+
+        runtime
+            .object_lists
+            .get_mut("rows")
+            .expect("rows should exist")[0]
+            .object_lists
+            .get_mut("cells")
+            .expect("row one cells should exist")
+            .remove(0);
+
+        let remove_descriptor = runtime.render_active_program();
+        let remove_batch = runtime
+            .decode_commands(remove_descriptor)
+            .expect("remove batch should decode");
+        assert!(
+            remove_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "nested remove should stay incremental",
+        );
+        assert!(
+            remove_batch.ops.iter().any(
+                |op| matches!(op, boon_scene::RenderOp::RemoveNode { id } if *id == row_one_a_id)
+            ),
+            "nested remove should target the removed child id",
+        );
+        let removed_root = apply_batch_and_root(&mut state, &remove_batch);
+        assert_eq!(removed_root.children[0].id, row_one_id);
+        assert_eq!(removed_root.children[1].id, row_two_id);
+        assert_eq!(removed_root.children[0].children[1].id, row_one_cells_id);
+        assert_eq!(removed_root.children[0].children[1].children.len(), 1);
+        assert_eq!(
+            removed_root.children[0].children[1].children[0].id,
+            row_one_b_id
+        );
+        assert_eq!(
+            removed_root.children[1].children[1].children[0].id,
+            row_two_a_id
+        );
+
+        runtime
+            .object_lists
+            .get_mut("rows")
+            .expect("rows should exist")[0]
+            .object_lists
+            .get_mut("cells")
+            .expect("row one cells should exist")
+            .push(object_list_item(103, "C1"));
+
+        let append_descriptor = runtime.render_active_program();
+        let append_batch = runtime
+            .decode_commands(append_descriptor)
+            .expect("append batch should decode");
+        assert!(
+            append_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "nested append should stay incremental",
+        );
+        assert!(
+            append_batch.ops.iter().any(|op| matches!(
+                op,
+                boon_scene::RenderOp::InsertChild { parent, index, .. }
+                    if *parent == row_one_cells_id && *index == 1
+            )),
+            "nested append should insert into the row one cells container",
+        );
+        let appended_root = apply_batch_and_root(&mut state, &append_batch);
+        assert_eq!(appended_root.children[0].id, row_one_id);
+        assert_eq!(appended_root.children[1].id, row_two_id);
+        assert_eq!(appended_root.children[0].children[1].id, row_one_cells_id);
+        assert_eq!(
+            appended_root.children[0].children[1].children[0].id,
+            row_one_b_id
+        );
+        assert_eq!(
+            appended_root.children[1].children[1].children[0].id,
+            row_two_a_id
+        );
+        assert_eq!(
+            direct_child_texts(&appended_root.children[0].children[1]),
+            vec!["B1", "C1"]
+        );
+        assert_ne!(
+            appended_root.children[0].children[1].children[1].id,
+            row_one_a_id
+        );
+        assert_ne!(
+            appended_root.children[0].children[1].children[1].id,
+            row_one_b_id
+        );
+    }
+
+    #[test]
     fn helper_filtered_object_list_counts_and_rows_follow_toggle() {
         let semantic = lower_to_semantic(
             r#"
@@ -4952,6 +6410,255 @@ document: Document/new(root: Element/stripe(
         };
 
         assert!(root.children[2].children.is_empty());
+    }
+
+    #[test]
+    fn incremental_diff_filtered_object_list_preserves_row_identity_across_filter_switches() {
+        let semantic = lower_to_semantic(
+            r#"
+store: [
+    elements: [
+        filter_buttons: [all: LINK, active: LINK, completed: LINK]
+        remove_completed_button: LINK
+        toggle_all_checkbox: LINK
+    ]
+
+    navigation_result:
+        LATEST {
+            elements.filter_buttons.all.event.press |> THEN { TEXT { / } }
+            elements.filter_buttons.active.event.press |> THEN { TEXT { /active } }
+            elements.filter_buttons.completed.event.press |> THEN { TEXT { /completed } }
+        }
+        |> Router/go_to()
+
+    selected_filter: Router/route() |> WHILE {
+        TEXT { / } => All
+        TEXT { /active } => Active
+        TEXT { /completed } => Completed
+        __ => All
+    }
+
+    todos:
+        LIST {
+            new_todo(title: TEXT { Buy groceries })
+            new_todo(title: TEXT { Clean room })
+        }
+]
+
+FUNCTION new_todo(title) {
+    [
+        todo_elements: [todo_checkbox: LINK]
+        title: title
+
+        completed: False |> HOLD state {
+            todo_elements.todo_checkbox.event.click |> THEN { state |> Bool/not() }
+        }
+    ]
+}
+
+FUNCTION todo_item(todo) {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: []
+
+        items: LIST {
+            Element/checkbox(
+                element: [event: [click: LINK]]
+                style: []
+                label: TEXT { Toggle }
+                checked: todo.completed
+
+                icon: todo.completed |> WHEN {
+                    True => TEXT { [X] }
+                    False => TEXT { [ ] }
+                }
+            )
+            |> LINK { todo.todo_elements.todo_checkbox }
+
+            Element/label(element: [], style: [], label: todo.title)
+        }
+    )
+}
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    gap: 10
+    style: []
+
+    items: LIST {
+        Element/button(element: [event: [press: LINK]], style: [], label: TEXT { All })
+        |> LINK { store.elements.filter_buttons.all }
+
+        Element/button(element: [event: [press: LINK]], style: [], label: TEXT { Active })
+        |> LINK { store.elements.filter_buttons.active }
+
+        Element/button(element: [event: [press: LINK]], style: [], label: TEXT { Completed })
+        |> LINK { store.elements.filter_buttons.completed }
+
+        Element/stripe(
+            element: []
+            direction: Column
+            gap: 5
+            style: []
+
+            items:
+                store.todos
+                |> List/retain(item, if: store.selected_filter |> WHILE {
+                    All => True
+                    Active => item.completed |> Bool/not()
+                    Completed => item.completed
+                })
+                |> List/map(item, new: todo_item(todo: item))
+        )
+    }
+))
+"#,
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+
+        let all_button_id = init_root.children[0].id;
+        let active_button_id = init_root.children[1].id;
+        let completed_button_id = init_root.children[2].id;
+        let list_id = init_root.children[3].id;
+        let buy_row_id = init_root.children[3].children[0].id;
+        let clean_row_id = init_root.children[3].children[1].id;
+        assert_eq!(
+            direct_child_texts(&init_root.children[3]),
+            vec!["[ ]Buy groceries", "[ ]Clean room"]
+        );
+
+        let first_checkbox_port = find_port_in_state(
+            &state,
+            init_root.children[3].children[0].children[0].id,
+            UiEventKind::Click,
+        )
+        .expect("first checkbox should expose Click");
+        let toggle_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: first_checkbox_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("toggle batch should decode");
+        let toggle_batch = runtime
+            .decode_commands(toggle_descriptor)
+            .expect("toggle diff should decode");
+        let toggled_root = apply_batch_and_root(&mut state, &toggle_batch);
+        assert_eq!(
+            direct_child_texts(&toggled_root.children[3]),
+            vec!["[X]Buy groceries", "[ ]Clean room"]
+        );
+        assert_eq!(toggled_root.children[3].children[0].id, buy_row_id);
+        assert_eq!(toggled_root.children[3].children[1].id, clean_row_id);
+
+        let active_port = find_port_in_state(&state, active_button_id, UiEventKind::Click)
+            .expect("active button should expose Click");
+        let active_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: active_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("active filter batch should decode");
+        let active_batch = runtime
+            .decode_commands(active_descriptor)
+            .expect("active filter diff should decode");
+        assert!(
+            active_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "active filter should be incremental",
+        );
+        assert!(
+            active_batch.ops.iter().any(
+                |op| matches!(op, boon_scene::RenderOp::RemoveNode { id } if *id == buy_row_id)
+            ),
+            "active filter should remove the completed row by stable id",
+        );
+        let active_root = apply_batch_and_root(&mut state, &active_batch);
+        assert_eq!(active_root.children[3].id, list_id);
+        assert_eq!(
+            direct_child_texts(&active_root.children[3]),
+            vec!["[ ]Clean room"]
+        );
+        assert_eq!(active_root.children[3].children[0].id, clean_row_id);
+
+        let completed_port = find_port_in_state(&state, completed_button_id, UiEventKind::Click)
+            .expect("completed button should expose Click");
+        let completed_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: completed_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("completed filter batch should decode");
+        let completed_batch = runtime
+            .decode_commands(completed_descriptor)
+            .expect("completed filter diff should decode");
+        assert!(
+            completed_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "completed filter should be incremental",
+        );
+        assert!(
+            completed_batch
+                .ops
+                .iter()
+                .any(|op| matches!(op, boon_scene::RenderOp::InsertChild { parent, .. } if *parent == list_id)),
+            "completed filter should insert the completed row into the filtered list",
+        );
+        let completed_root = apply_batch_and_root(&mut state, &completed_batch);
+        assert_eq!(completed_root.children[3].id, list_id);
+        assert_eq!(
+            direct_child_texts(&completed_root.children[3]),
+            vec!["[X]Buy groceries"]
+        );
+        assert_eq!(completed_root.children[3].children[0].id, buy_row_id);
+
+        let all_port = find_port_in_state(&state, all_button_id, UiEventKind::Click)
+            .expect("all button should expose Click");
+        let all_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: all_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("all filter batch should decode");
+        let all_batch = runtime
+            .decode_commands(all_descriptor)
+            .expect("all filter diff should decode");
+        let all_root = apply_batch_and_root(&mut state, &all_batch);
+        assert_eq!(
+            direct_child_texts(&all_root.children[3]),
+            vec!["[X]Buy groceries", "[ ]Clean room"]
+        );
+        assert_eq!(all_root.children[3].children[0].id, buy_row_id);
+        assert_eq!(all_root.children[3].children[1].id, clean_row_id);
     }
 
     #[test]
@@ -5933,6 +7640,49 @@ document: Document/new(root: Element/stripe(
             nth_port_target_text(root, &init_batch, UiEventKind::DoubleClick, 26).as_deref(),
             Some("10")
         );
+        let double_click_ports = init_batch
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    boon_scene::RenderOp::AttachEventPort {
+                        kind: UiEventKind::DoubleClick,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            double_click_ports,
+            26 * 100,
+            "cells should expose one DoubleClick port per grid cell"
+        );
+    }
+
+    #[test]
+    fn cells_real_file_runtime_exposes_row_100_and_last_cell_ports() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &init_batch.ops[0] else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+
+        assert!(tree_contains_text(root, "100"));
+        assert_eq!(
+            nth_port_target_text(root, &init_batch, UiEventKind::DoubleClick, 2599).as_deref(),
+            Some(".")
+        );
     }
 
     #[test]
@@ -5973,8 +7723,7 @@ document: Document/new(root: Element/stripe(
         let edit_batch = runtime
             .decode_commands(edit_descriptor)
             .expect("edit batch should decode");
-        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0]
-        else {
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
             panic!("expected ReplaceRoot(UiTree)");
         };
 
@@ -6017,8 +7766,7 @@ document: Document/new(root: Element/stripe(
         let edit_batch = runtime
             .decode_commands(edit_descriptor)
             .expect("edit batch should decode");
-        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0]
-        else {
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
             panic!("expected ReplaceRoot(UiTree)");
         };
         let input = find_first_tag(root, "input").expect("edit mode should render input");
@@ -6077,8 +7825,8 @@ document: Document/new(root: Element/stripe(
             panic!("expected ReplaceRoot(UiTree)");
         };
 
-        let double_click_port =
-            find_nth_port(&init_batch, UiEventKind::DoubleClick, 0).expect("A1 should expose DoubleClick");
+        let double_click_port = find_nth_port(&init_batch, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
 
         let edit_descriptor = runtime
             .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
@@ -6092,8 +7840,7 @@ document: Document/new(root: Element/stripe(
         let edit_batch = runtime
             .decode_commands(edit_descriptor)
             .expect("edit batch should decode");
-        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0]
-        else {
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
             panic!("expected ReplaceRoot(UiTree)");
         };
         let input = find_first_tag(root, "input").expect("edit mode should render input");
@@ -6128,6 +7875,222 @@ document: Document/new(root: Element/stripe(
             }))
             .expect("input should decode");
         assert_eq!(input_descriptor, 0);
+    }
+
+    #[test]
+    fn cells_real_file_fact_rerender_then_keydown_commits_value() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let double_click_port = find_nth_port(&init_batch, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: double_click_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+        let input = find_first_tag(root, "input").expect("edit mode should render input");
+
+        let fact_descriptor = runtime
+            .apply_facts(&encode_ui_fact_batch(&UiFactBatch {
+                facts: vec![boon_scene::UiFact {
+                    id: input.id,
+                    kind: boon_scene::UiFactKind::DraftText("7".to_string()),
+                }],
+            }))
+            .expect("draft fact should decode");
+        let fact_batch = runtime
+            .decode_commands(fact_descriptor)
+            .expect("draft fact batch should decode");
+
+        let key_down_port = find_input_without_focus_port(&fact_batch, UiEventKind::KeyDown)
+            .expect("rerendered input should expose KeyDown");
+
+        let commit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some(format!("Enter{KEYDOWN_TEXT_SEPARATOR}7")),
+                }],
+            }))
+            .expect("enter should decode");
+        let commit_batch = runtime
+            .decode_commands(commit_descriptor)
+            .expect("commit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &commit_batch.ops[0]
+        else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+
+        assert!(find_first_tag(root, "input").is_none());
+        assert!(tree_contains_text(&root, "7"));
+        assert!(tree_contains_text(root, "17"));
+        assert!(tree_contains_text(root, "32"));
+    }
+
+    #[test]
+    fn cells_real_file_fact_input_then_plain_enter_commits_value() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let double_click_port = find_nth_port(&init_batch, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: double_click_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+        let input = find_first_tag(root, "input").expect("edit mode should render input");
+        let input_port = find_port(&edit_batch, input.id, UiEventKind::Input)
+            .expect("edit input should expose Input");
+        let key_down_port = find_port(&edit_batch, input.id, UiEventKind::KeyDown)
+            .expect("edit input should expose KeyDown");
+
+        let fact_descriptor = runtime
+            .apply_facts(&encode_ui_fact_batch(&UiFactBatch {
+                facts: vec![UiFact {
+                    id: input.id,
+                    kind: UiFactKind::DraftText("7".to_string()),
+                }],
+            }))
+            .expect("draft fact should decode");
+        let fact_batch = runtime
+            .decode_commands(fact_descriptor)
+            .expect("fact batch should decode");
+        assert!(fact_batch.ops.iter().any(|op| matches!(
+            op,
+            boon_scene::RenderOp::SetProperty { name, value, .. }
+                if name == "value" && value.as_deref() == Some("7")
+        )));
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("7".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let commit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Enter".to_string()),
+                }],
+            }))
+            .expect("enter should decode");
+        let commit_batch = runtime
+            .decode_commands(commit_descriptor)
+            .expect("commit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &commit_batch.ops[0]
+        else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+
+        assert!(find_first_tag(root, "input").is_none());
+        assert!(tree_contains_text(&root, "7"));
+        assert!(tree_contains_text(root, "17"));
+        assert!(tree_contains_text(root, "32"));
+    }
+
+    #[test]
+    fn cells_real_file_focus_facts_do_not_rerender_edit_input_without_binding() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let double_click_port = find_nth_port(&init_batch, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: double_click_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+        let input = find_first_tag(root, "input").expect("edit mode should render input");
+
+        let focus_descriptor = runtime
+            .apply_facts(&encode_ui_fact_batch(&UiFactBatch {
+                facts: vec![UiFact {
+                    id: input.id,
+                    kind: UiFactKind::Focused(true),
+                }],
+            }))
+            .expect("focus fact should decode");
+        assert_eq!(focus_descriptor, 0);
+
+        let blur_descriptor = runtime
+            .apply_facts(&encode_ui_fact_batch(&UiFactBatch {
+                facts: vec![UiFact {
+                    id: input.id,
+                    kind: UiFactKind::Focused(false),
+                }],
+            }))
+            .expect("blur fact should decode");
+        assert_eq!(blur_descriptor, 0);
     }
 
     #[test]
@@ -6173,8 +8136,7 @@ document: Document/new(root: Element/stripe(
         let edit_batch = runtime
             .decode_commands(edit_descriptor)
             .expect("edit batch should decode");
-        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0]
-        else {
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
             panic!("expected ReplaceRoot(UiTree)");
         };
 
@@ -6212,7 +8174,7 @@ document: Document/new(root: Element/stripe(
             panic!("expected ReplaceRoot(UiTree)");
         };
 
-        assert!(tree_contains_text(root, "7"));
+        assert!(tree_contains_text(&root, "7"));
         assert!(tree_contains_text(root, "17"));
         assert!(tree_contains_text(root, "32"));
     }
@@ -6231,8 +8193,8 @@ document: Document/new(root: Element/stripe(
         let init_batch = runtime
             .decode_commands(init_descriptor)
             .expect("init batch should decode");
-        let double_click_port =
-            find_nth_port(&init_batch, UiEventKind::DoubleClick, 0).expect("A1 should expose DoubleClick");
+        let double_click_port = find_nth_port(&init_batch, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
 
         let edit_descriptor = runtime
             .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
@@ -6246,8 +8208,7 @@ document: Document/new(root: Element/stripe(
         let edit_batch = runtime
             .decode_commands(edit_descriptor)
             .expect("edit batch should decode");
-        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0]
-        else {
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
             panic!("expected ReplaceRoot(UiTree)");
         };
         let input = find_first_tag(root, "input").expect("edit mode should render input");
@@ -6285,8 +8246,8 @@ document: Document/new(root: Element/stripe(
         };
 
         assert!(find_first_tag(root, "input").is_none());
-        assert!(tree_contains_text(root, "5"));
-        assert!(!tree_contains_text(root, "1234"));
+        assert!(tree_contains_text(&root, "5"));
+        assert!(!tree_contains_text(&root, "1234"));
     }
 
     #[test]
@@ -6303,8 +8264,8 @@ document: Document/new(root: Element/stripe(
         let init_batch = runtime
             .decode_commands(init_descriptor)
             .expect("init batch should decode");
-        let double_click_port =
-            find_nth_port(&init_batch, UiEventKind::DoubleClick, 0).expect("A1 should expose DoubleClick");
+        let double_click_port = find_nth_port(&init_batch, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
 
         let edit_descriptor = runtime
             .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
@@ -6318,8 +8279,7 @@ document: Document/new(root: Element/stripe(
         let edit_batch = runtime
             .decode_commands(edit_descriptor)
             .expect("edit batch should decode");
-        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0]
-        else {
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
             panic!("expected ReplaceRoot(UiTree)");
         };
         let input = find_first_tag(root, "input").expect("edit mode should render input");
@@ -6351,8 +8311,7 @@ document: Document/new(root: Element/stripe(
         let blur_batch = runtime
             .decode_commands(blur_descriptor)
             .expect("blur batch should decode");
-        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &blur_batch.ops[0]
-        else {
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &blur_batch.ops[0] else {
             panic!("expected ReplaceRoot(UiTree)");
         };
 
@@ -6375,8 +8334,8 @@ document: Document/new(root: Element/stripe(
         let init_batch = runtime
             .decode_commands(init_descriptor)
             .expect("init batch should decode");
-        let double_click_port =
-            find_nth_port(&init_batch, UiEventKind::DoubleClick, 1).expect("B1 should expose DoubleClick");
+        let double_click_port = find_nth_port(&init_batch, UiEventKind::DoubleClick, 1)
+            .expect("B1 should expose DoubleClick");
 
         let edit_descriptor = runtime
             .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
@@ -6390,8 +8349,7 @@ document: Document/new(root: Element/stripe(
         let edit_batch = runtime
             .decode_commands(edit_descriptor)
             .expect("edit batch should decode");
-        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0]
-        else {
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
             panic!("expected ReplaceRoot(UiTree)");
         };
         let input = find_first_tag(root, "input").expect("edit mode should render input");
@@ -6430,6 +8388,2384 @@ document: Document/new(root: Element/stripe(
 
         assert!(find_first_tag(root, "input").is_none());
         assert!(tree_contains_text(root, "25"));
+    }
+
+    #[test]
+    fn cells_real_file_editing_a2_recomputes_b1_and_c1() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let double_click_port = find_nth_port(&init_batch, UiEventKind::DoubleClick, 26)
+            .expect("A2 should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: double_click_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+        let input = find_first_tag(root, "input").expect("edit mode should render input");
+        let input_port = find_port(&edit_batch, input.id, UiEventKind::Input)
+            .expect("edit input should expose Input");
+        let key_down_port = find_port(&edit_batch, input.id, UiEventKind::KeyDown)
+            .expect("edit input should expose KeyDown");
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("20".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let commit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Enter".to_string()),
+                }],
+            }))
+            .expect("enter should decode");
+        let commit_batch = runtime
+            .decode_commands(commit_descriptor)
+            .expect("commit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &commit_batch.ops[0]
+        else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+
+        assert!(find_first_tag(root, "input").is_none());
+        assert!(tree_contains_text(root, "20"));
+        assert!(tree_contains_text(root, "25"));
+        assert!(tree_contains_text(root, "40"));
+    }
+
+    #[test]
+    fn cells_real_file_editing_a3_recomputes_c1_without_changing_b1() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let double_click_port = find_nth_port(&init_batch, UiEventKind::DoubleClick, 52)
+            .expect("A3 should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: double_click_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+        let input = find_first_tag(root, "input").expect("edit mode should render input");
+        let input_port = find_port(&edit_batch, input.id, UiEventKind::Input)
+            .expect("edit input should expose Input");
+        let key_down_port = find_port(&edit_batch, input.id, UiEventKind::KeyDown)
+            .expect("edit input should expose KeyDown");
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("30".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let commit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Enter".to_string()),
+                }],
+            }))
+            .expect("enter should decode");
+        let commit_batch = runtime
+            .decode_commands(commit_descriptor)
+            .expect("commit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &commit_batch.ops[0]
+        else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+
+        assert!(find_first_tag(root, "input").is_none());
+        assert!(tree_contains_text(root, "30"));
+        assert!(tree_contains_text(root, "15"));
+        assert!(tree_contains_text(root, "45"));
+    }
+
+    #[test]
+    fn cells_real_file_formula_commit_then_base_edit_recomputes_formula_cell() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+
+        let formula_port = find_nth_port(&init_batch, UiEventKind::DoubleClick, 1)
+            .expect("B1 should expose DoubleClick");
+
+        let formula_edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: formula_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let formula_edit_batch = runtime
+            .decode_commands(formula_edit_descriptor)
+            .expect("edit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) =
+            &formula_edit_batch.ops[0]
+        else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+        let formula_input = find_first_tag(root, "input").expect("edit mode should render input");
+        let formula_input_port =
+            find_port(&formula_edit_batch, formula_input.id, UiEventKind::Input)
+                .expect("edit input should expose Input");
+        let formula_key_down_port =
+            find_port(&formula_edit_batch, formula_input.id, UiEventKind::KeyDown)
+                .expect("edit input should expose KeyDown");
+
+        let formula_input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: formula_input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("=add(A2, A3)".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(formula_input_descriptor, 0);
+
+        let formula_commit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: formula_key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Enter".to_string()),
+                }],
+            }))
+            .expect("enter should decode");
+        let formula_commit_batch = runtime
+            .decode_commands(formula_commit_descriptor)
+            .expect("commit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) =
+            &formula_commit_batch.ops[0]
+        else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+        assert!(tree_contains_text(root, "25"));
+
+        let a2_port = find_nth_port(&formula_commit_batch, UiEventKind::DoubleClick, 26)
+            .expect("A2 should expose DoubleClick");
+        let a2_edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: a2_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let a2_edit_batch = runtime
+            .decode_commands(a2_edit_descriptor)
+            .expect("edit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &a2_edit_batch.ops[0]
+        else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+        let a2_input = find_first_tag(root, "input").expect("edit mode should render input");
+        let a2_input_port = find_port(&a2_edit_batch, a2_input.id, UiEventKind::Input)
+            .expect("edit input should expose Input");
+        let a2_key_down_port = find_port(&a2_edit_batch, a2_input.id, UiEventKind::KeyDown)
+            .expect("edit input should expose KeyDown");
+
+        let a2_input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: a2_input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("20".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(a2_input_descriptor, 0);
+
+        let a2_commit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: a2_key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Enter".to_string()),
+                }],
+            }))
+            .expect("enter should decode");
+        let a2_commit_batch = runtime
+            .decode_commands(a2_commit_descriptor)
+            .expect("commit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &a2_commit_batch.ops[0]
+        else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+
+        assert!(tree_contains_text(root, "20"));
+        assert!(tree_contains_text(root, "35"));
+        assert!(tree_contains_text(root, "40"));
+    }
+
+    #[test]
+    fn cells_real_file_chained_base_edits_keep_dependency_graph_consistent() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+
+        let init_descriptor = runtime.init(&exec);
+        assert_ne!(init_descriptor, 0, "init should queue cells root");
+
+        let root = edit_nth_cells_grid_cell_and_commit(&mut runtime, 0, "7");
+        assert!(tree_contains_text(&root, "7"));
+        assert!(tree_contains_text(&root, "17"));
+        assert!(tree_contains_text(&root, "32"));
+
+        let root = edit_nth_cells_grid_cell_and_commit(&mut runtime, 26, "20");
+        assert!(tree_contains_text(&root, "7"));
+        assert!(tree_contains_text(&root, "20"));
+        assert!(tree_contains_text(&root, "27"));
+        assert!(tree_contains_text(&root, "42"));
+
+        let root = edit_nth_cells_grid_cell_and_commit(&mut runtime, 52, "30");
+        assert!(tree_contains_text(&root, "7"));
+        assert!(tree_contains_text(&root, "20"));
+        assert!(tree_contains_text(&root, "30"));
+        assert!(tree_contains_text(&root, "27"));
+        assert!(tree_contains_text(&root, "57"));
+    }
+
+    #[test]
+    fn cells_real_file_formula_commit_then_multiple_base_edits_stays_reactive() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+
+        let init_descriptor = runtime.init(&exec);
+        assert_ne!(init_descriptor, 0, "init should queue cells root");
+
+        let root = edit_nth_cells_grid_cell_and_commit(&mut runtime, 1, "=add(A2, A3)");
+        assert!(tree_contains_text(&root, "25"));
+        assert!(tree_contains_text(&root, "30"));
+
+        let root = edit_nth_cells_grid_cell_and_commit(&mut runtime, 26, "20");
+        assert!(tree_contains_text(&root, "20"));
+        assert!(tree_contains_text(&root, "35"));
+        assert!(tree_contains_text(&root, "40"));
+
+        let root = edit_nth_cells_grid_cell_and_commit(&mut runtime, 52, "30");
+        assert!(tree_contains_text(&root, "20"));
+        assert!(tree_contains_text(&root, "30"));
+        assert!(tree_contains_text(&root, "50"));
+        assert!(tree_contains_text(&root, "55"));
+    }
+
+    #[test]
+    fn cells_real_file_multiple_commits_preserve_full_grid_event_surface() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+        assert_eq!(
+            attached_port_count(&init_batch, UiEventKind::DoubleClick),
+            26 * 100
+        );
+        assert!(tree_contains_text(&init_root, "100"));
+
+        let a1_commit_batch =
+            edit_nth_cells_grid_cell_and_commit_batch_with_state(&mut runtime, &mut state, 0, "7");
+        let a1_root = apply_batch_and_root(&mut state, &a1_commit_batch);
+        assert_eq!(
+            count_ports_in_state(&a1_root, &state, UiEventKind::DoubleClick),
+            26 * 100
+        );
+        assert!(tree_contains_text(&a1_root, "100"));
+        assert!(tree_contains_text(&a1_root, "7"));
+        assert!(tree_contains_text(&a1_root, "17"));
+        assert!(tree_contains_text(&a1_root, "32"));
+
+        let formula_commit_batch = edit_nth_cells_grid_cell_and_commit_batch_with_state(
+            &mut runtime,
+            &mut state,
+            1,
+            "=add(A2, A3)",
+        );
+        let formula_root = apply_batch_and_root(&mut state, &formula_commit_batch);
+        assert_eq!(
+            count_ports_in_state(&formula_root, &state, UiEventKind::DoubleClick),
+            26 * 100
+        );
+        assert!(tree_contains_text(&formula_root, "100"));
+        assert!(tree_contains_text(&formula_root, "25"));
+        assert!(tree_contains_text(&formula_root, "30"));
+
+        let far_commit_batch = edit_nth_cells_grid_cell_and_commit_batch_with_state(
+            &mut runtime,
+            &mut state,
+            26 * 100 - 1,
+            "99",
+        );
+        let far_root = apply_batch_and_root(&mut state, &far_commit_batch);
+        assert_eq!(
+            count_ports_in_state(&far_root, &state, UiEventKind::DoubleClick),
+            26 * 100
+        );
+        assert!(tree_contains_text(&far_root, "100"));
+        assert!(tree_contains_text(&far_root, "99"));
+    }
+
+    #[test]
+    fn cells_real_file_scale_metrics_report_current_batch_sizes() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_metrics = batch_metrics(&init_batch);
+
+        let mut state = FakeRenderState::default();
+        let _ = apply_batch_and_root(&mut state, &init_batch);
+
+        let a1_commit_batch =
+            edit_nth_cells_grid_cell_and_commit_batch_with_state(&mut runtime, &mut state, 0, "7");
+        let a1_metrics = batch_metrics(&a1_commit_batch);
+
+        let formula_commit_batch = edit_nth_cells_grid_cell_and_commit_batch_with_state(
+            &mut runtime,
+            &mut state,
+            1,
+            "=add(A2, A3)",
+        );
+        let formula_metrics = batch_metrics(&formula_commit_batch);
+
+        let far_commit_batch = edit_nth_cells_grid_cell_and_commit_batch_with_state(
+            &mut runtime,
+            &mut state,
+            26 * 100 - 1,
+            "99",
+        );
+        let far_metrics = batch_metrics(&far_commit_batch);
+
+        eprintln!(
+            "[cells-scale-metrics] init={:?} a1_commit={:?} formula_commit={:?} far_commit={:?}",
+            init_metrics, a1_metrics, formula_metrics, far_metrics
+        );
+
+        assert_eq!(init_metrics.double_click_ports, 26 * 100);
+        assert!(a1_metrics.double_click_ports <= 4);
+        assert!(formula_metrics.double_click_ports <= 4);
+        assert!(far_metrics.double_click_ports <= 4);
+        assert!(init_metrics.ui_node_count >= 26 * 100);
+        assert!(init_metrics.encoded_bytes > 0);
+        assert!(a1_metrics.encoded_bytes > 0);
+        assert!(formula_metrics.encoded_bytes > 0);
+        assert!(far_metrics.encoded_bytes > 0);
+        assert!(a1_metrics.op_count > 0);
+        assert!(formula_metrics.op_count > 0);
+        assert!(far_metrics.op_count > 0);
+        assert!(a1_metrics.encoded_bytes < init_metrics.encoded_bytes / 100);
+        assert!(formula_metrics.encoded_bytes < init_metrics.encoded_bytes / 100);
+        assert!(far_metrics.encoded_bytes < init_metrics.encoded_bytes / 100);
+        assert!(a1_metrics.input_ports == 0);
+        assert!(formula_metrics.input_ports == 0);
+        assert!(far_metrics.input_ports == 0);
+        assert!(a1_metrics.key_down_ports == 0);
+        assert!(formula_metrics.key_down_ports == 0);
+        assert!(far_metrics.key_down_ports == 0);
+    }
+
+    #[test]
+    fn cells_real_file_incremental_commit_preserves_unedited_nested_cell_identity() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+
+        let b1_id = find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 1)
+            .expect("B1 should expose DoubleClick");
+        let a2_id = find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 26)
+            .expect("A2 should expose DoubleClick");
+        let z100_id =
+            find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 2599)
+                .expect("Z100 should expose DoubleClick");
+
+        let commit_batch =
+            edit_nth_cells_grid_cell_and_commit_batch_with_state(&mut runtime, &mut state, 0, "7");
+        assert!(
+            commit_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "cells commit should stay incremental",
+        );
+
+        let Some(RenderRoot::UiTree(root)) = state.root() else {
+            panic!("expected cells root after commit");
+        };
+        assert_eq!(
+            find_nth_port_target_in_state(root, &state, UiEventKind::DoubleClick, 1),
+            Some(b1_id),
+            "B1 identity should survive an A1 commit",
+        );
+        assert_node_id_and_port_kind(
+            root,
+            &state,
+            b1_id,
+            UiEventKind::DoubleClick,
+            "B1 should keep its display port after A1 commit",
+        );
+        assert_eq!(
+            find_nth_port_target_in_state(root, &state, UiEventKind::DoubleClick, 26),
+            Some(a2_id),
+            "A2 identity should survive an A1 commit",
+        );
+        assert_node_id_and_port_kind(
+            root,
+            &state,
+            a2_id,
+            UiEventKind::DoubleClick,
+            "A2 should keep its display port after A1 commit",
+        );
+        assert_eq!(
+            find_nth_port_target_in_state(root, &state, UiEventKind::DoubleClick, 2599),
+            Some(z100_id),
+            "far-grid identity should survive an A1 commit",
+        );
+        assert_node_id_and_port_kind(
+            root,
+            &state,
+            z100_id,
+            UiEventKind::DoubleClick,
+            "Z100 should keep its display port after A1 commit",
+        );
+        assert!(tree_contains_text(&root, "7"));
+        assert!(tree_contains_text(root, "17"));
+        assert!(tree_contains_text(root, "32"));
+    }
+
+    #[test]
+    fn cells_real_file_incremental_edit_entry_preserves_visible_sibling_cell_ports() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+        let b1_id = find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 1)
+            .expect("B1 should expose DoubleClick");
+        let a2_id = find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 26)
+            .expect("A2 should expose DoubleClick");
+        let z100_id =
+            find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 2599)
+                .expect("Z100 should expose DoubleClick");
+        let a1_port = find_nth_port_in_state(&init_root, &state, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: a1_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        assert!(
+            edit_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "edit entry should stay incremental",
+        );
+        let edit_root = apply_batch_and_root(&mut state, &edit_batch);
+        assert_node_id_and_port_kind(
+            &edit_root,
+            &state,
+            b1_id,
+            UiEventKind::DoubleClick,
+            "B1 should stay visible and clickable during A1 edit",
+        );
+        assert_node_id_and_port_kind(
+            &edit_root,
+            &state,
+            a2_id,
+            UiEventKind::DoubleClick,
+            "A2 should stay visible and clickable during A1 edit",
+        );
+        assert_node_id_and_port_kind(
+            &edit_root,
+            &state,
+            z100_id,
+            UiEventKind::DoubleClick,
+            "Z100 should stay visible and clickable during A1 edit",
+        );
+    }
+
+    #[test]
+    fn cells_real_file_incremental_commit_restores_same_edited_cell_identity() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+        let a1_id = find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
+        let a1_port = find_nth_port_in_state(&init_root, &state, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: a1_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        assert!(
+            edit_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "edit entry should stay incremental",
+        );
+        let edit_root = apply_batch_and_root(&mut state, &edit_batch);
+        let input = find_first_tag(&edit_root, "input").expect("edit mode should render input");
+        let input_port = find_port_in_state(&state, input.id, UiEventKind::Input)
+            .expect("edit input should expose Input");
+        let key_down_port = find_port_in_state(&state, input.id, UiEventKind::KeyDown)
+            .expect("edit input should expose KeyDown");
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("7".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let commit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Enter".to_string()),
+                }],
+            }))
+            .expect("enter should decode");
+        let commit_batch = runtime
+            .decode_commands(commit_descriptor)
+            .expect("commit batch should decode");
+        assert!(
+            commit_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "commit should stay incremental",
+        );
+        let root = apply_batch_and_root(&mut state, &commit_batch);
+        assert_eq!(
+            find_nth_port_target_in_state(&root, &state, UiEventKind::DoubleClick, 0),
+            Some(a1_id),
+            "edited A1 should regain the same display identity after commit",
+        );
+        assert!(tree_contains_text(&root, "7"));
+    }
+
+    #[test]
+    fn cells_real_file_incremental_cancel_restores_same_edited_cell_identity() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+        let a1_id = find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
+        let a1_port = find_nth_port_in_state(&init_root, &state, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: a1_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        let edit_root = apply_batch_and_root(&mut state, &edit_batch);
+        let input = find_first_tag(&edit_root, "input").expect("edit mode should render input");
+        let input_port = find_port_in_state(&state, input.id, UiEventKind::Input)
+            .expect("edit input should expose Input");
+        let key_down_port = find_port_in_state(&state, input.id, UiEventKind::KeyDown)
+            .expect("edit input should expose KeyDown");
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("1234".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let cancel_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Escape".to_string()),
+                }],
+            }))
+            .expect("escape should decode");
+        let cancel_batch = runtime
+            .decode_commands(cancel_descriptor)
+            .expect("cancel batch should decode");
+        assert!(
+            cancel_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "cancel should stay incremental",
+        );
+        let root = apply_batch_and_root(&mut state, &cancel_batch);
+        assert_eq!(
+            find_nth_port_target_in_state(&root, &state, UiEventKind::DoubleClick, 0),
+            Some(a1_id),
+            "edited A1 should regain the same display identity after cancel",
+        );
+        assert!(tree_contains_text(&root, "5"));
+        assert!(!tree_contains_text(&root, "1234"));
+    }
+
+    #[test]
+    fn cells_real_file_incremental_cancel_preserves_visible_sibling_cell_ports() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+        let b1_id = find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 1)
+            .expect("B1 should expose DoubleClick");
+        let a2_id = find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 26)
+            .expect("A2 should expose DoubleClick");
+        let z100_id =
+            find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 2599)
+                .expect("Z100 should expose DoubleClick");
+        let a1_port = find_nth_port_in_state(&init_root, &state, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: a1_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        let edit_root = apply_batch_and_root(&mut state, &edit_batch);
+        let input = find_first_tag(&edit_root, "input").expect("edit mode should render input");
+        let input_port = find_port_in_state(&state, input.id, UiEventKind::Input)
+            .expect("edit input should expose Input");
+        let key_down_port = find_port_in_state(&state, input.id, UiEventKind::KeyDown)
+            .expect("edit input should expose KeyDown");
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("1234".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let cancel_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Escape".to_string()),
+                }],
+            }))
+            .expect("escape should decode");
+        let cancel_batch = runtime
+            .decode_commands(cancel_descriptor)
+            .expect("cancel batch should decode");
+        let root = apply_batch_and_root(&mut state, &cancel_batch);
+        assert_node_id_and_port_kind(
+            &root,
+            &state,
+            b1_id,
+            UiEventKind::DoubleClick,
+            "B1 should keep its display port after A1 cancel",
+        );
+        assert_node_id_and_port_kind(
+            &root,
+            &state,
+            a2_id,
+            UiEventKind::DoubleClick,
+            "A2 should keep its display port after A1 cancel",
+        );
+        assert_node_id_and_port_kind(
+            &root,
+            &state,
+            z100_id,
+            UiEventKind::DoubleClick,
+            "Z100 should keep its display port after A1 cancel",
+        );
+    }
+
+    #[test]
+    fn cells_real_file_incremental_blur_restores_same_edited_cell_identity() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+        let a1_id = find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
+        let a1_port = find_nth_port_in_state(&init_root, &state, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: a1_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        let edit_root = apply_batch_and_root(&mut state, &edit_batch);
+        let input = find_first_tag(&edit_root, "input").expect("edit mode should render input");
+        let input_port = find_port_in_state(&state, input.id, UiEventKind::Input)
+            .expect("edit input should expose Input");
+        let blur_port = find_port_in_state(&state, input.id, UiEventKind::Blur)
+            .expect("edit input should expose Blur");
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("2345".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let blur_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: blur_port,
+                    kind: UiEventKind::Blur,
+                    payload: None,
+                }],
+            }))
+            .expect("blur should decode");
+        let blur_batch = runtime
+            .decode_commands(blur_descriptor)
+            .expect("blur batch should decode");
+        assert!(
+            blur_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "blur exit should stay incremental",
+        );
+        let root = apply_batch_and_root(&mut state, &blur_batch);
+        assert_eq!(
+            find_nth_port_target_in_state(&root, &state, UiEventKind::DoubleClick, 0),
+            Some(a1_id),
+            "edited A1 should regain the same display identity after blur",
+        );
+        assert!(tree_contains_text(&root, "5"));
+        assert!(!tree_contains_text(&root, "2345"));
+    }
+
+    #[test]
+    fn cells_real_file_incremental_blur_preserves_visible_sibling_cell_ports() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+        let b1_id = find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 1)
+            .expect("B1 should expose DoubleClick");
+        let a2_id = find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 26)
+            .expect("A2 should expose DoubleClick");
+        let z100_id =
+            find_nth_port_target_in_state(&init_root, &state, UiEventKind::DoubleClick, 2599)
+                .expect("Z100 should expose DoubleClick");
+        let a1_port = find_nth_port_in_state(&init_root, &state, UiEventKind::DoubleClick, 0)
+            .expect("A1 should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: a1_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        let edit_root = apply_batch_and_root(&mut state, &edit_batch);
+        let input = find_first_tag(&edit_root, "input").expect("edit mode should render input");
+        let input_port = find_port_in_state(&state, input.id, UiEventKind::Input)
+            .expect("edit input should expose Input");
+        let blur_port = find_port_in_state(&state, input.id, UiEventKind::Blur)
+            .expect("edit input should expose Blur");
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("2345".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let blur_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: blur_port,
+                    kind: UiEventKind::Blur,
+                    payload: None,
+                }],
+            }))
+            .expect("blur should decode");
+        let blur_batch = runtime
+            .decode_commands(blur_descriptor)
+            .expect("blur batch should decode");
+        let root = apply_batch_and_root(&mut state, &blur_batch);
+        assert_node_id_and_port_kind(
+            &root,
+            &state,
+            b1_id,
+            UiEventKind::DoubleClick,
+            "B1 should keep its display port after A1 blur",
+        );
+        assert_node_id_and_port_kind(
+            &root,
+            &state,
+            a2_id,
+            UiEventKind::DoubleClick,
+            "A2 should keep its display port after A1 blur",
+        );
+        assert_node_id_and_port_kind(
+            &root,
+            &state,
+            z100_id,
+            UiEventKind::DoubleClick,
+            "Z100 should keep its display port after A1 blur",
+        );
+    }
+
+    #[test]
+    fn cells_real_file_incremental_a2_edit_entry_preserves_siblings_and_target_identity() {
+        let (mut runtime, mut state, init_root) = init_cells_incremental_runtime();
+        let sibling_ids = capture_cells_double_click_ids(&init_root, &state, &[0, 1, 779, 2599]);
+
+        let (edit_root, a2_id, ..) =
+            enter_edit_mode_for_nth_cells_cell(&mut runtime, &mut state, &init_root, 26);
+
+        assert_cells_double_click_ids_stable(&edit_root, &state, &sibling_ids, "A2 edit entry");
+        assert!(
+            find_port_in_state(&state, a2_id, UiEventKind::DoubleClick).is_none(),
+            "A2 display port should leave the tree while A2 is in edit mode",
+        );
+    }
+
+    #[test]
+    fn cells_real_file_incremental_a2_commit_restores_identity_and_preserves_siblings() {
+        let (mut runtime, mut state, init_root) = init_cells_incremental_runtime();
+        let sibling_ids = capture_cells_double_click_ids(&init_root, &state, &[0, 1, 779, 2599]);
+
+        let (_edit_root, a2_id, input_port, key_down_port, _) =
+            enter_edit_mode_for_nth_cells_cell(&mut runtime, &mut state, &init_root, 26);
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("20".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let commit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Enter".to_string()),
+                }],
+            }))
+            .expect("enter should decode");
+        let commit_batch = runtime
+            .decode_commands(commit_descriptor)
+            .expect("commit batch should decode");
+        let root = apply_batch_and_root(&mut state, &commit_batch);
+
+        assert_eq!(
+            find_nth_port_target_in_state(&root, &state, UiEventKind::DoubleClick, 26),
+            Some(a2_id),
+            "A2 should regain the same display identity after commit",
+        );
+        assert_node_id_and_port_kind(
+            &root,
+            &state,
+            a2_id,
+            UiEventKind::DoubleClick,
+            "A2 should regain its display port after commit",
+        );
+        assert_cells_double_click_ids_stable(&root, &state, &sibling_ids, "A2 commit");
+        assert!(tree_contains_text(&root, "20"));
+    }
+
+    #[test]
+    fn cells_real_file_incremental_a2_cancel_restores_identity_and_preserves_siblings() {
+        let (mut runtime, mut state, init_root) = init_cells_incremental_runtime();
+        let sibling_ids = capture_cells_double_click_ids(&init_root, &state, &[0, 1, 779, 2599]);
+
+        let (_edit_root, a2_id, input_port, key_down_port, _) =
+            enter_edit_mode_for_nth_cells_cell(&mut runtime, &mut state, &init_root, 26);
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("2000".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let cancel_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Escape".to_string()),
+                }],
+            }))
+            .expect("escape should decode");
+        let cancel_batch = runtime
+            .decode_commands(cancel_descriptor)
+            .expect("cancel batch should decode");
+        let root = apply_batch_and_root(&mut state, &cancel_batch);
+
+        assert_eq!(
+            find_nth_port_target_in_state(&root, &state, UiEventKind::DoubleClick, 26),
+            Some(a2_id),
+            "A2 should regain the same display identity after cancel",
+        );
+        assert_node_id_and_port_kind(
+            &root,
+            &state,
+            a2_id,
+            UiEventKind::DoubleClick,
+            "A2 should regain its display port after cancel",
+        );
+        assert_cells_double_click_ids_stable(&root, &state, &sibling_ids, "A2 cancel");
+        assert!(!tree_contains_text(&root, "2000"));
+    }
+
+    #[test]
+    fn cells_real_file_incremental_a2_blur_restores_identity_and_preserves_siblings() {
+        let (mut runtime, mut state, init_root) = init_cells_incremental_runtime();
+        let sibling_ids = capture_cells_double_click_ids(&init_root, &state, &[0, 1, 779, 2599]);
+
+        let (_edit_root, a2_id, input_port, _key_down_port, blur_port) =
+            enter_edit_mode_for_nth_cells_cell(&mut runtime, &mut state, &init_root, 26);
+        let blur_port = blur_port.expect("A2 edit input should expose Blur");
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("2222".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let blur_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: blur_port,
+                    kind: UiEventKind::Blur,
+                    payload: None,
+                }],
+            }))
+            .expect("blur should decode");
+        let blur_batch = runtime
+            .decode_commands(blur_descriptor)
+            .expect("blur batch should decode");
+        let root = apply_batch_and_root(&mut state, &blur_batch);
+
+        assert_eq!(
+            find_nth_port_target_in_state(&root, &state, UiEventKind::DoubleClick, 26),
+            Some(a2_id),
+            "A2 should regain the same display identity after blur",
+        );
+        assert_node_id_and_port_kind(
+            &root,
+            &state,
+            a2_id,
+            UiEventKind::DoubleClick,
+            "A2 should regain its display port after blur",
+        );
+        assert_cells_double_click_ids_stable(&root, &state, &sibling_ids, "A2 blur");
+        assert!(!tree_contains_text(&root, "2222"));
+    }
+
+    #[test]
+    fn cells_real_file_incremental_26x30_milestone_gate() {
+        {
+            let (mut runtime, mut state, init_root) = init_cells_incremental_runtime();
+            let sibling_ids = capture_cells_double_click_ids(&init_root, &state, &[1, 26, 779]);
+
+            let (_edit_root, a1_id, input_port, key_down_port, _) =
+                enter_edit_mode_for_nth_cells_cell(&mut runtime, &mut state, &init_root, 0);
+
+            let input_descriptor = runtime
+                .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                    events: vec![UiEvent {
+                        target: input_port,
+                        kind: UiEventKind::Input,
+                        payload: Some("7".to_string()),
+                    }],
+                }))
+                .expect("A1 input should decode");
+            assert_eq!(input_descriptor, 0);
+
+            let commit_descriptor = runtime
+                .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                    events: vec![UiEvent {
+                        target: key_down_port,
+                        kind: UiEventKind::KeyDown,
+                        payload: Some("Enter".to_string()),
+                    }],
+                }))
+                .expect("A1 enter should decode");
+            let commit_batch = runtime
+                .decode_commands(commit_descriptor)
+                .expect("A1 commit batch should decode");
+            let root = apply_batch_and_root(&mut state, &commit_batch);
+
+            assert_node_id_and_port_kind(
+                &root,
+                &state,
+                a1_id,
+                UiEventKind::DoubleClick,
+                "A1 should regain its display identity after commit",
+            );
+            assert_cells_double_click_ids_stable(&root, &state, &sibling_ids, "26x30 A1 commit");
+            assert!(tree_contains_text(&root, "7"));
+        }
+
+        {
+            let (mut runtime, mut state, init_root) = init_cells_incremental_runtime();
+            let sibling_ids = capture_cells_double_click_ids(&init_root, &state, &[0, 26, 779]);
+
+            let (_edit_root, b1_id, input_port, key_down_port, _) =
+                enter_edit_mode_for_nth_cells_cell(&mut runtime, &mut state, &init_root, 1);
+
+            let input_descriptor = runtime
+                .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                    events: vec![UiEvent {
+                        target: input_port,
+                        kind: UiEventKind::Input,
+                        payload: Some("add(100,200)".to_string()),
+                    }],
+                }))
+                .expect("B1 input should decode");
+            assert_eq!(input_descriptor, 0);
+
+            let cancel_descriptor = runtime
+                .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                    events: vec![UiEvent {
+                        target: key_down_port,
+                        kind: UiEventKind::KeyDown,
+                        payload: Some("Escape".to_string()),
+                    }],
+                }))
+                .expect("B1 escape should decode");
+            let cancel_batch = runtime
+                .decode_commands(cancel_descriptor)
+                .expect("B1 cancel batch should decode");
+            let root = apply_batch_and_root(&mut state, &cancel_batch);
+
+            assert_node_id_and_port_kind(
+                &root,
+                &state,
+                b1_id,
+                UiEventKind::DoubleClick,
+                "B1 should regain its display identity after cancel",
+            );
+            assert_cells_double_click_ids_stable(&root, &state, &sibling_ids, "26x30 B1 cancel");
+            assert!(!tree_contains_text(&root, "add(100,200)"));
+        }
+
+        {
+            let (mut runtime, mut state, init_root) = init_cells_incremental_runtime();
+            let sibling_ids = capture_cells_double_click_ids(&init_root, &state, &[0, 1, 779]);
+
+            let (_edit_root, a2_id, input_port, _key_down_port, blur_port) =
+                enter_edit_mode_for_nth_cells_cell(&mut runtime, &mut state, &init_root, 26);
+            let blur_port = blur_port.expect("A2 edit input should expose Blur");
+
+            let input_descriptor = runtime
+                .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                    events: vec![UiEvent {
+                        target: input_port,
+                        kind: UiEventKind::Input,
+                        payload: Some("2222".to_string()),
+                    }],
+                }))
+                .expect("A2 input should decode");
+            assert_eq!(input_descriptor, 0);
+
+            let blur_descriptor = runtime
+                .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                    events: vec![UiEvent {
+                        target: blur_port,
+                        kind: UiEventKind::Blur,
+                        payload: None,
+                    }],
+                }))
+                .expect("A2 blur should decode");
+            let blur_batch = runtime
+                .decode_commands(blur_descriptor)
+                .expect("A2 blur batch should decode");
+            let root = apply_batch_and_root(&mut state, &blur_batch);
+
+            assert_node_id_and_port_kind(
+                &root,
+                &state,
+                a2_id,
+                UiEventKind::DoubleClick,
+                "A2 should regain its display identity after blur",
+            );
+            assert_cells_double_click_ids_stable(&root, &state, &sibling_ids, "26x30 A2 blur");
+            assert!(!tree_contains_text(&root, "2222"));
+        }
+
+        {
+            let (mut runtime, mut state, init_root) = init_cells_incremental_runtime();
+            let sibling_ids = capture_cells_double_click_ids(&init_root, &state, &[0, 1, 26]);
+
+            let (edit_root, z30_id, ..) =
+                enter_edit_mode_for_nth_cells_cell(&mut runtime, &mut state, &init_root, 779);
+
+            assert_cells_double_click_ids_stable(
+                &edit_root,
+                &state,
+                &sibling_ids,
+                "26x30 Z30 edit entry",
+            );
+            assert!(
+                find_port_in_state(&state, z30_id, UiEventKind::DoubleClick).is_none(),
+                "Z30 display port should leave the tree while Z30 is in edit mode",
+            );
+        }
+    }
+
+    #[test]
+    fn cells_real_file_incremental_26x100_scale_gate() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_metrics = batch_metrics(&init_batch);
+        let init_root = apply_batch_and_root(&mut state, &init_batch);
+
+        assert_eq!(init_metrics.double_click_ports, 26 * 100);
+        assert!(tree_contains_text(&init_root, "100"));
+
+        let stable_ids = capture_cells_double_click_ids(&init_root, &state, &[0, 1, 26, 2599]);
+
+        {
+            let a1_commit_batch = edit_nth_cells_grid_cell_and_commit_batch_with_state(
+                &mut runtime,
+                &mut state,
+                0,
+                "7",
+            );
+            let a1_metrics = batch_metrics(&a1_commit_batch);
+            let root = apply_batch_and_root(&mut state, &a1_commit_batch);
+
+            assert_eq!(
+                find_nth_port_target_in_state(&root, &state, UiEventKind::DoubleClick, 0),
+                Some(stable_ids[0].1),
+                "A1 should regain the same display identity after commit at full 26x100 scale",
+            );
+            assert_cells_double_click_ids_stable(
+                &root,
+                &state,
+                &stable_ids[1..],
+                "26x100 A1 commit",
+            );
+            assert!(tree_contains_text(&root, "7"));
+            assert!(a1_metrics.double_click_ports <= 4);
+            assert!(a1_metrics.input_ports == 0);
+            assert!(a1_metrics.key_down_ports == 0);
+            assert!(a1_metrics.encoded_bytes < init_metrics.encoded_bytes / 100);
+            assert!(a1_metrics.op_count <= 16);
+        }
+
+        {
+            let current_root = match state.root().expect("cells root should exist") {
+                RenderRoot::UiTree(root) => root.clone(),
+                _ => panic!("expected ui tree root"),
+            };
+            let (_edit_root, b1_id, input_port, key_down_port, _) =
+                enter_edit_mode_for_nth_cells_cell(&mut runtime, &mut state, &current_root, 1);
+
+            let input_descriptor = runtime
+                .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                    events: vec![UiEvent {
+                        target: input_port,
+                        kind: UiEventKind::Input,
+                        payload: Some("add(100,200)".to_string()),
+                    }],
+                }))
+                .expect("B1 input should decode");
+            assert_eq!(input_descriptor, 0);
+
+            let cancel_descriptor = runtime
+                .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                    events: vec![UiEvent {
+                        target: key_down_port,
+                        kind: UiEventKind::KeyDown,
+                        payload: Some("Escape".to_string()),
+                    }],
+                }))
+                .expect("B1 escape should decode");
+            let cancel_batch = runtime
+                .decode_commands(cancel_descriptor)
+                .expect("B1 cancel batch should decode");
+            let cancel_metrics = batch_metrics(&cancel_batch);
+            let root = apply_batch_and_root(&mut state, &cancel_batch);
+
+            assert_node_id_and_port_kind(
+                &root,
+                &state,
+                b1_id,
+                UiEventKind::DoubleClick,
+                "B1 should regain its display identity after cancel at full 26x100 scale",
+            );
+            assert_node_id_and_port_kind(
+                &root,
+                &state,
+                stable_ids[0].1,
+                UiEventKind::DoubleClick,
+                "A1 should keep its display identity after B1 cancel",
+            );
+            assert_node_id_and_port_kind(
+                &root,
+                &state,
+                stable_ids[2].1,
+                UiEventKind::DoubleClick,
+                "A2 should keep its display identity after B1 cancel",
+            );
+            assert_node_id_and_port_kind(
+                &root,
+                &state,
+                stable_ids[3].1,
+                UiEventKind::DoubleClick,
+                "Z100 should keep its display identity after B1 cancel",
+            );
+            assert!(!tree_contains_text(&root, "add(100,200)"));
+            assert!(cancel_metrics.double_click_ports <= 4);
+            assert!(cancel_metrics.input_ports == 0);
+            assert!(cancel_metrics.key_down_ports == 0);
+            assert!(cancel_metrics.encoded_bytes < init_metrics.encoded_bytes / 100);
+            assert!(cancel_metrics.op_count <= 16);
+        }
+
+        {
+            let current_root = match state.root().expect("cells root should exist") {
+                RenderRoot::UiTree(root) => root.clone(),
+                _ => panic!("expected ui tree root"),
+            };
+            let (_edit_root, a2_id, input_port, _key_down_port, blur_port) =
+                enter_edit_mode_for_nth_cells_cell(&mut runtime, &mut state, &current_root, 26);
+            let blur_port = blur_port.expect("A2 edit input should expose Blur");
+
+            let input_descriptor = runtime
+                .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                    events: vec![UiEvent {
+                        target: input_port,
+                        kind: UiEventKind::Input,
+                        payload: Some("2222".to_string()),
+                    }],
+                }))
+                .expect("A2 input should decode");
+            assert_eq!(input_descriptor, 0);
+
+            let blur_descriptor = runtime
+                .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                    events: vec![UiEvent {
+                        target: blur_port,
+                        kind: UiEventKind::Blur,
+                        payload: None,
+                    }],
+                }))
+                .expect("A2 blur should decode");
+            let blur_batch = runtime
+                .decode_commands(blur_descriptor)
+                .expect("A2 blur batch should decode");
+            let blur_metrics = batch_metrics(&blur_batch);
+            let root = apply_batch_and_root(&mut state, &blur_batch);
+
+            assert_node_id_and_port_kind(
+                &root,
+                &state,
+                a2_id,
+                UiEventKind::DoubleClick,
+                "A2 should regain its display identity after blur at full 26x100 scale",
+            );
+            assert_node_id_and_port_kind(
+                &root,
+                &state,
+                stable_ids[0].1,
+                UiEventKind::DoubleClick,
+                "A1 should keep its display identity after A2 blur",
+            );
+            assert_node_id_and_port_kind(
+                &root,
+                &state,
+                stable_ids[1].1,
+                UiEventKind::DoubleClick,
+                "B1 should keep its display identity after A2 blur",
+            );
+            assert_node_id_and_port_kind(
+                &root,
+                &state,
+                stable_ids[3].1,
+                UiEventKind::DoubleClick,
+                "Z100 should keep its display identity after A2 blur",
+            );
+            assert!(!tree_contains_text(&root, "2222"));
+            assert!(blur_metrics.double_click_ports <= 4);
+            assert!(blur_metrics.input_ports == 0);
+            assert!(blur_metrics.key_down_ports == 0);
+            assert!(blur_metrics.encoded_bytes < init_metrics.encoded_bytes / 100);
+            assert!(blur_metrics.op_count <= 16);
+        }
+
+        {
+            let current_root = match state.root().expect("cells root should exist") {
+                RenderRoot::UiTree(root) => root.clone(),
+                _ => panic!("expected ui tree root"),
+            };
+            let (edit_root, z100_id, ..) =
+                enter_edit_mode_for_nth_cells_cell(&mut runtime, &mut state, &current_root, 2599);
+
+            assert_cells_double_click_ids_stable(
+                &edit_root,
+                &state,
+                &stable_ids[..3],
+                "26x100 Z100 edit entry",
+            );
+            assert!(
+                find_port_in_state(&state, z100_id, UiEventKind::DoubleClick).is_none(),
+                "Z100 display port should leave the tree while Z100 is in edit mode at full 26x100 scale",
+            );
+        }
+    }
+
+    #[test]
+    fn cells_real_file_scale_metrics_meet_milestone_thresholds() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let init_metrics = batch_metrics(&init_batch);
+
+        let mut state = FakeRenderState::default();
+        let _ = apply_batch_and_root(&mut state, &init_batch);
+
+        let a1_commit_metrics = batch_metrics(
+            &edit_nth_cells_grid_cell_and_commit_batch_with_state(&mut runtime, &mut state, 0, "7"),
+        );
+        let formula_commit_metrics =
+            batch_metrics(&edit_nth_cells_grid_cell_and_commit_batch_with_state(
+                &mut runtime,
+                &mut state,
+                1,
+                "=add(A2, A3)",
+            ));
+        let far_commit_metrics =
+            batch_metrics(&edit_nth_cells_grid_cell_and_commit_batch_with_state(
+                &mut runtime,
+                &mut state,
+                26 * 100 - 1,
+                "99",
+            ));
+
+        assert_eq!(init_metrics.double_click_ports, 26 * 100);
+        assert!(init_metrics.ui_node_count >= 26 * 100);
+        assert!(
+            init_metrics.encoded_bytes <= CELLS_26X100_INIT_MAX_ENCODED_BYTES,
+            "init batch too large: {:?}",
+            init_metrics
+        );
+        assert!(
+            init_metrics.op_count <= CELLS_26X100_INIT_MAX_OPS,
+            "init batch too many ops: {:?}",
+            init_metrics
+        );
+
+        for (label, metrics) in [
+            ("A1 commit", a1_commit_metrics),
+            ("formula commit", formula_commit_metrics),
+            ("far commit", far_commit_metrics),
+        ] {
+            assert!(
+                metrics.encoded_bytes <= CELLS_26X100_COMMIT_MAX_ENCODED_BYTES,
+                "{label} batch too large: {:?}",
+                metrics
+            );
+            assert!(
+                metrics.op_count <= CELLS_26X100_COMMIT_MAX_OPS,
+                "{label} batch too many ops: {:?}",
+                metrics
+            );
+            assert!(
+                metrics.double_click_ports <= CELLS_26X100_COMMIT_MAX_DOUBLE_CLICK_ATTACHES,
+                "{label} reattached too many DoubleClick ports: {:?}",
+                metrics
+            );
+            assert_eq!(
+                metrics.input_ports, 0,
+                "{label} should not reattach Input ports after commit"
+            );
+            assert_eq!(
+                metrics.key_down_ports, 0,
+                "{label} should not reattach KeyDown ports after commit"
+            );
+        }
+    }
+
+    #[test]
+    fn cells_backend_metrics_snapshot_reports_current_numbers() {
+        let shared_metrics = crate::platform::browser::cells_backend_metrics_snapshot()
+            .expect("shared cells backend metrics snapshot should build");
+        let wasm_pro_metrics = wasm_pro_pipeline_metrics_for_cells();
+
+        eprintln!("[cells-backend-metrics] wasm={:?}", shared_metrics.wasm);
+        eprintln!("[cells-backend-metrics] wasm_pipeline={wasm_pro_metrics:?}");
+        eprintln!(
+            "[cells-backend-metrics-json] {}",
+            serde_json::json!({
+                "wasm": &shared_metrics.wasm,
+                "wasm_pipeline": &wasm_pro_metrics,
+            })
+        );
+
+        assert!(wasm_pro_metrics.init_batch.encoded_bytes > 0);
+        assert!(wasm_pro_metrics.a1_commit_batch.encoded_bytes > 0);
+        assert!(wasm_pro_metrics.init_batch.double_click_ports == 26 * 100);
+        assert!(
+            wasm_pro_metrics.a1_commit_batch.encoded_bytes <= CELLS_26X100_COMMIT_MAX_ENCODED_BYTES
+        );
+        assert!(wasm_pro_metrics.a1_commit_batch.op_count <= CELLS_26X100_COMMIT_MAX_OPS);
+        assert!(
+            wasm_pro_metrics.a1_commit_batch.double_click_ports
+                <= CELLS_26X100_COMMIT_MAX_DOUBLE_CLICK_ATTACHES
+        );
+    }
+
+    #[test]
+    fn todo_mvc_real_file_incremental_add_filter_remove_preserves_survivor_identity() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let root = apply_batch_and_root(&mut state, &init_batch);
+
+        let input = find_first_tag(&root, "input").expect("todo_mvc should render an input");
+        let input_port = find_port_in_state(&state, input.id, UiEventKind::Input)
+            .expect("input should expose Input");
+        let key_port = find_port_in_state(&state, input.id, UiEventKind::KeyDown)
+            .expect("input should expose KeyDown");
+
+        runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("Write tests".to_string()),
+                }],
+            }))
+            .expect("input event should decode");
+
+        let add_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Enter".to_string()),
+                }],
+            }))
+            .expect("add event should decode");
+        let add_batch = runtime
+            .decode_commands(add_descriptor)
+            .expect("add batch should decode");
+        assert!(
+            add_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "todo add should stay incremental",
+        );
+        let root = apply_batch_and_root(&mut state, &add_batch);
+        let clean_room_id = find_first_tag_with_text(&root, "div", "Clean room")
+            .map(|node| node.id)
+            .expect("Clean room row should exist after add");
+        let write_tests_id = find_first_tag_with_text(&root, "div", "Write tests")
+            .map(|node| node.id)
+            .expect("Write tests row should exist after add");
+
+        let groceries_row = find_first_tag_with_text(&root, "div", "Buy groceries")
+            .expect("Buy groceries row should exist");
+        let groceries_toggle = find_first_tag(groceries_row, "button")
+            .expect("todo row should render a checkbox button");
+        let groceries_toggle_port =
+            find_port_in_state(&state, groceries_toggle.id, UiEventKind::Click)
+                .expect("todo checkbox should expose Click");
+
+        let toggle_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: groceries_toggle_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("toggle event should decode");
+        let toggle_batch = runtime
+            .decode_commands(toggle_descriptor)
+            .expect("toggle batch should decode");
+        assert!(
+            toggle_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "todo toggle should stay incremental",
+        );
+        let root = apply_batch_and_root(&mut state, &toggle_batch);
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "Clean room").map(|node| node.id),
+            Some(clean_room_id),
+            "Clean room row identity should survive another row toggle",
+        );
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "Write tests").map(|node| node.id),
+            Some(write_tests_id),
+            "newly added row identity should survive another row toggle",
+        );
+
+        let completed_button = find_first_tag_with_text(&root, "button", "Completed")
+            .expect("Completed filter button should render");
+        let completed_port = find_port_in_state(&state, completed_button.id, UiEventKind::Click)
+            .expect("Completed filter should expose Click");
+
+        let completed_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: completed_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("completed filter event should decode");
+        let completed_batch = runtime
+            .decode_commands(completed_descriptor)
+            .expect("completed filter batch should decode");
+        assert!(
+            completed_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "todo completed filter should stay incremental",
+        );
+        let root = apply_batch_and_root(&mut state, &completed_batch);
+        assert!(
+            find_first_tag_with_text(&root, "div", "Clean room").is_none(),
+            "Clean room should be hidden in Completed view",
+        );
+        assert!(
+            find_first_tag_with_text(&root, "div", "Write tests").is_none(),
+            "Write tests should be hidden in Completed view",
+        );
+
+        let remove_completed_button = find_first_tag_with_text(&root, "button", "Clear completed")
+            .expect("remove completed button should render");
+        let remove_completed_port =
+            find_port_in_state(&state, remove_completed_button.id, UiEventKind::Click)
+                .expect("remove completed should expose Click");
+
+        let remove_completed_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: remove_completed_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("remove completed event should decode");
+        let remove_completed_batch = runtime
+            .decode_commands(remove_completed_descriptor)
+            .expect("remove completed batch should decode");
+        assert!(
+            remove_completed_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "todo remove completed should stay incremental",
+        );
+        let root = apply_batch_and_root(&mut state, &remove_completed_batch);
+        assert!(
+            find_first_tag_with_text(&root, "div", "Buy groceries").is_none(),
+            "completed row should be removed after Clear completed",
+        );
+
+        let all_button = find_first_tag_with_text(&root, "button", "All")
+            .expect("All filter button should render");
+        let all_port = find_port_in_state(&state, all_button.id, UiEventKind::Click)
+            .expect("All filter should expose Click");
+
+        let all_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: all_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("all filter event should decode");
+        let all_batch = runtime
+            .decode_commands(all_descriptor)
+            .expect("all filter batch should decode");
+        assert!(
+            all_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "todo all filter should stay incremental",
+        );
+        let root = apply_batch_and_root(&mut state, &all_batch);
+
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "Clean room").map(|node| node.id),
+            Some(clean_room_id),
+            "Clean room row should regain the same identity after filter changes and removal",
+        );
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "Write tests").map(|node| node.id),
+            Some(write_tests_id),
+            "Write tests row should regain the same identity after filter changes and removal",
+        );
+        assert!(
+            find_first_tag_with_text(&root, "div", "Buy groceries").is_none(),
+            "removed completed row should not reappear",
+        );
+    }
+
+    #[test]
+    fn nested_runtime_object_list_real_source_append_and_remove_stay_incremental() {
+        let semantic = lower_to_semantic(
+            r#"
+FUNCTION new_cell(title) {
+    [title: title remove: LINK]
+}
+
+FUNCTION make_row() {
+    [
+        add: LINK
+        cells:
+            LIST {
+                new_cell(title: TEXT { A })
+                new_cell(title: TEXT { B })
+            }
+            |> List/append(item: add.event.press |> THEN { new_cell(title: TEXT { C }) })
+            |> List/remove(item, on: item.remove.event.press)
+    ]
+}
+
+store: [rows: LIST { make_row() }]
+
+document: Document/new(root:
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: []
+        items:
+            store.rows
+            |> List/map(row, new:
+                Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 0
+                    style: []
+                    items: LIST {
+                        Element/button(
+                            element: [event: [press: LINK]]
+                            style: []
+                            label: TEXT { Add }
+                        )
+                        |> LINK { row.add }
+
+                        Element/stripe(
+                            element: []
+                            direction: Row
+                            gap: 0
+                            style: []
+                            items:
+                                row.cells
+                                |> List/map(cell, new:
+                                    Element/stripe(
+                                        element: []
+                                        direction: Row
+                                        gap: 0
+                                        style: []
+                                        items: LIST {
+                                            Element/label(
+                                                element: []
+                                                style: []
+                                                label: cell.title
+                                            )
+                                            Element/button(
+                                                element: [event: [press: LINK]]
+                                                style: []
+                                                label: TEXT { x }
+                                            )
+                                            |> LINK { cell.remove }
+                                        }
+                                    )
+                                )
+                        )
+                    }
+                )
+            )
+    )
+)
+"#,
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let root = apply_batch_and_root(&mut state, &init_batch);
+        let row = find_first_tag_with_text(&root, "div", "Add")
+            .expect("row containing Add button should render");
+        let row_id = row.id;
+        let add_button =
+            find_first_tag_with_text(&root, "button", "Add").expect("Add button should render");
+        let add_port = find_port_in_state(&state, add_button.id, UiEventKind::Click)
+            .expect("Add button should expose Click");
+        let b_row_id = find_first_tag_with_text(&root, "div", "B")
+            .map(|node| node.id)
+            .expect("B row should render");
+
+        let add_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: add_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("add should decode");
+        let add_batch = runtime
+            .decode_commands(add_descriptor)
+            .expect("add batch should decode");
+        assert!(
+            add_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "nested add should stay incremental",
+        );
+        let root = apply_batch_and_root(&mut state, &add_batch);
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "B").map(|node| node.id),
+            Some(b_row_id),
+            "existing nested child should preserve identity after nested append",
+        );
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "Add").map(|node| node.id),
+            Some(row_id),
+            "parent row should preserve identity after nested append",
+        );
+        let c_row =
+            find_first_tag_with_text(&root, "div", "C").expect("C row should render after add");
+        let remove_button = find_first_tag_with_text(c_row, "button", "x")
+            .expect("nested remove button should render");
+        let remove_port = find_port_in_state(&state, remove_button.id, UiEventKind::Click)
+            .expect("nested remove should expose Click");
+
+        let remove_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: remove_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("remove should decode");
+        let remove_batch = runtime
+            .decode_commands(remove_descriptor)
+            .expect("remove batch should decode");
+        assert!(
+            remove_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "nested remove should stay incremental",
+        );
+        let root = apply_batch_and_root(&mut state, &remove_batch);
+        assert!(
+            find_first_tag_with_text(&root, "div", "C").is_none(),
+            "removed nested child should disappear",
+        );
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "B").map(|node| node.id),
+            Some(b_row_id),
+            "surviving nested child should preserve identity after nested remove",
+        );
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "Add").map(|node| node.id),
+            Some(row_id),
+            "parent row should preserve identity after nested remove",
+        );
+    }
+
+    #[test]
+    fn nested_runtime_object_list_multi_row_mutation_preserves_sibling_identity() {
+        let semantic = lower_to_semantic(
+            r#"
+FUNCTION new_cell(title) {
+    [title: title remove: LINK]
+}
+
+FUNCTION make_row(row_name, first_title, second_title) {
+    [
+        row_name: row_name
+        add: LINK
+        cells:
+            LIST {
+                new_cell(title: first_title)
+                new_cell(title: second_title)
+            }
+            |> List/append(item: add.event.press |> THEN { new_cell(title: TEXT { C }) })
+            |> List/remove(item, on: item.remove.event.press)
+    ]
+}
+
+store: [rows: LIST {
+    make_row(
+        row_name: TEXT { Row 1 }
+        first_title: TEXT { A }
+        second_title: TEXT { B }
+    )
+    make_row(
+        row_name: TEXT { Row 2 }
+        first_title: TEXT { X }
+        second_title: TEXT { Y }
+    )
+}]
+
+document: Document/new(root:
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: []
+        items:
+            store.rows
+            |> List/map(row, new:
+                Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 0
+                    style: []
+                    items: LIST {
+                        Element/label(
+                            element: []
+                            style: []
+                            label: row.row_name
+                        )
+                        Element/button(
+                            element: [event: [press: LINK]]
+                            style: []
+                            label: TEXT { Add }
+                        )
+                        |> LINK { row.add }
+
+                        Element/stripe(
+                            element: []
+                            direction: Row
+                            gap: 0
+                            style: []
+                            items:
+                                row.cells
+                                |> List/map(cell, new:
+                                    Element/stripe(
+                                        element: []
+                                        direction: Row
+                                        gap: 0
+                                        style: []
+                                        items: LIST {
+                                            Element/label(
+                                                element: []
+                                                style: []
+                                                label: cell.title
+                                            )
+                                            Element/button(
+                                                element: [event: [press: LINK]]
+                                                style: []
+                                                label: TEXT { x }
+                                            )
+                                            |> LINK { cell.remove }
+                                        }
+                                    )
+                                )
+                        )
+                    }
+                )
+            )
+    )
+)
+"#,
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+        runtime.enable_incremental_diff();
+        let mut state = FakeRenderState::default();
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let root = apply_batch_and_root(&mut state, &init_batch);
+
+        let row_1_id = find_first_tag_with_text(&root, "div", "Row 1")
+            .map(|node| node.id)
+            .expect("row 1 should render");
+        let row_2_id = find_first_tag_with_text(&root, "div", "Row 2")
+            .map(|node| node.id)
+            .expect("row 2 should render");
+        let x_row_id = find_first_tag_with_text(&root, "div", "X")
+            .map(|node| node.id)
+            .expect("X row should render");
+        let y_row_id = find_first_tag_with_text(&root, "div", "Y")
+            .map(|node| node.id)
+            .expect("Y row should render");
+
+        let row_1 =
+            find_first_tag_with_text(&root, "div", "Row 1").expect("row 1 container should exist");
+        let row_1_add_button =
+            find_first_tag_with_text(row_1, "button", "Add").expect("row 1 add should render");
+        let row_1_add_port = find_port_in_state(&state, row_1_add_button.id, UiEventKind::Click)
+            .expect("row 1 add should expose click");
+
+        let add_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: row_1_add_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("nested add should decode");
+        let add_batch = runtime
+            .decode_commands(add_descriptor)
+            .expect("nested add batch should decode");
+        assert!(
+            add_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "multi-row nested add should stay incremental",
+        );
+        let root = apply_batch_and_root(&mut state, &add_batch);
+        let c_row = find_first_tag_with_text(&root, "div", "C")
+            .expect("row 1 nested C should appear after add");
+        let c_row_id = c_row.id;
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "Row 1").map(|node| node.id),
+            Some(row_1_id),
+            "mutated parent row should preserve identity",
+        );
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "Row 2").map(|node| node.id),
+            Some(row_2_id),
+            "sibling parent row should preserve identity",
+        );
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "X").map(|node| node.id),
+            Some(x_row_id),
+            "sibling nested child X should preserve identity",
+        );
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "Y").map(|node| node.id),
+            Some(y_row_id),
+            "sibling nested child Y should preserve identity",
+        );
+
+        let remove_button =
+            find_first_tag_with_text(c_row, "button", "x").expect("nested remove should render");
+        let remove_port = find_port_in_state(&state, remove_button.id, UiEventKind::Click)
+            .expect("nested remove should expose click");
+        let remove_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: remove_port,
+                    kind: UiEventKind::Click,
+                    payload: None,
+                }],
+            }))
+            .expect("nested remove should decode");
+        let remove_batch = runtime
+            .decode_commands(remove_descriptor)
+            .expect("nested remove batch should decode");
+        assert!(
+            remove_batch
+                .ops
+                .iter()
+                .all(|op| !matches!(op, boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(_)))),
+            "multi-row nested remove should stay incremental",
+        );
+        let root = apply_batch_and_root(&mut state, &remove_batch);
+        assert!(
+            find_first_tag_with_text(&root, "div", "C").is_none(),
+            "appended nested child should disappear after remove",
+        );
+        assert_ne!(
+            c_row_id, x_row_id,
+            "test should track distinct nested children"
+        );
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "Row 1").map(|node| node.id),
+            Some(row_1_id),
+            "mutated parent row should preserve identity after remove",
+        );
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "Row 2").map(|node| node.id),
+            Some(row_2_id),
+            "sibling parent row should preserve identity after remove",
+        );
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "X").map(|node| node.id),
+            Some(x_row_id),
+            "sibling nested child X should preserve identity after remove",
+        );
+        assert_eq!(
+            find_first_tag_with_text(&root, "div", "Y").map(|node| node.id),
+            Some(y_row_id),
+            "sibling nested child Y should preserve identity after remove",
+        );
+    }
+
+    #[test]
+    fn cells_real_file_editing_last_cell_commits_far_grid_value() {
+        let semantic = lower_to_semantic(
+            include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn"),
+            None,
+            false,
+        );
+        let exec = ExecProgram::from_semantic(&semantic);
+        let mut runtime = WasmProRuntime::new(0, 0, false);
+
+        let init_descriptor = runtime.init(&exec);
+        let init_batch = runtime
+            .decode_commands(init_descriptor)
+            .expect("init batch should decode");
+        let last_cell_port = find_nth_port(&init_batch, UiEventKind::DoubleClick, 26 * 100 - 1)
+            .expect("Z100 should expose DoubleClick");
+
+        let edit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: last_cell_port,
+                    kind: UiEventKind::DoubleClick,
+                    payload: None,
+                }],
+            }))
+            .expect("double click should decode");
+        let edit_batch = runtime
+            .decode_commands(edit_descriptor)
+            .expect("edit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &edit_batch.ops[0] else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+        let input = find_first_tag(root, "input").expect("edit mode should render input");
+        let input_port = find_port(&edit_batch, input.id, UiEventKind::Input)
+            .expect("edit input should expose Input");
+        let key_down_port = find_port(&edit_batch, input.id, UiEventKind::KeyDown)
+            .expect("edit input should expose KeyDown");
+
+        let input_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: input_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("99".to_string()),
+                }],
+            }))
+            .expect("input should decode");
+        assert_eq!(input_descriptor, 0);
+
+        let commit_descriptor = runtime
+            .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
+                events: vec![UiEvent {
+                    target: key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some("Enter".to_string()),
+                }],
+            }))
+            .expect("enter should decode");
+        let commit_batch = runtime
+            .decode_commands(commit_descriptor)
+            .expect("commit batch should decode");
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &commit_batch.ops[0]
+        else {
+            panic!("expected ReplaceRoot(UiTree)");
+        };
+
+        assert!(find_first_tag(root, "input").is_none());
+        assert!(tree_contains_text(root, "99"));
+        assert!(tree_contains_text(root, "100"));
     }
 
     #[test]

@@ -6,12 +6,12 @@
 //! For large programs (>4MB WASM binary), async compilation is used to bypass
 //! Chrome's 8MB synchronous WebAssembly.Module.new() limit.
 
-pub mod bridge;
+mod bridge;
 mod codegen;
-pub mod ir;
+mod ir;
 mod lower;
 mod persistence;
-pub mod runtime;
+mod runtime;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -25,14 +25,14 @@ use crate::parser::{
     static_expression,
 };
 
-pub use persistence::clear_wasm_persisted_states;
+pub(crate) use persistence::clear_wasm_persisted_states;
 
 thread_local! {
     static ACTIVE_WASM_INSTANCE: RefCell<Option<Rc<runtime::WasmInstance>>> = const { RefCell::new(None) };
 }
 
 /// External function definition for multi-file support.
-pub use lower::ExternalFunction;
+use lower::ExternalFunction;
 
 /// Threshold above which async compilation is used (4MB).
 /// Chrome's sync limit is 8MB, so 4MB gives safety margin.
@@ -42,9 +42,16 @@ const ASYNC_COMPILE_THRESHOLD: usize = 4_000_000;
 /// Returns a Zoon element tree.
 ///
 /// `external_functions` provides pre-parsed functions from other module files.
-pub fn run_wasm(
+pub(super) fn run_wasm(
     source: &str,
-    external_functions: Option<&[ExternalFunction]>,
+    external_functions: Option<
+        &[(
+            String,
+            Vec<String>,
+            crate::parser::static_expression::Spanned<crate::parser::static_expression::Expression>,
+            Option<String>,
+        )],
+    >,
     persistence_enabled: bool,
 ) -> RawElOrText {
     // 1. Parse and lower to IR.
@@ -60,31 +67,24 @@ pub fn run_wasm(
     if wasm_output.wasm_bytes.len() > ASYNC_COMPILE_THRESHOLD {
         run_wasm_async(program, wasm_output, source, persistence_enabled)
     } else {
-        match run_wasm_sync(program, wasm_output, source, persistence_enabled) {
-            Ok(el) => el,
+        // Compile and instantiate synchronously for small modules.
+        let wasm_buffer = js_sys::Uint8Array::from(&wasm_output.wasm_bytes[..]);
+        let module = match js_sys::WebAssembly::Module::new(&wasm_buffer.into()) {
+            Ok(module) => module,
+            Err(error) => return error_element(&format!("WASM compile error: {:?}", error)),
+        };
+        let instance =
+            match runtime::WasmInstance::new(&module, program.clone(), wasm_output.text_patterns) {
+                Ok(instance) => instance,
+                Err(error) => {
+                    return error_element(&format!("WASM instantiation failed: {}", error));
+                }
+            };
+        match finish_setup(instance, program, source, persistence_enabled) {
+            Ok(ui) => ui,
             Err(msg) => error_element(&msg),
         }
     }
-}
-
-/// Synchronous path: compile and instantiate immediately.
-/// Used for small WASM binaries (<4MB).
-fn run_wasm_sync(
-    program: Rc<ir::IrProgram>,
-    wasm_output: codegen::WasmOutput,
-    source: &str,
-    persistence_enabled: bool,
-) -> Result<RawElOrText, String> {
-    // Compile synchronously.
-    let wasm_buffer = js_sys::Uint8Array::from(&wasm_output.wasm_bytes[..]);
-    let module = js_sys::WebAssembly::Module::new(&wasm_buffer.into())
-        .map_err(|e| format!("WASM compile error: {:?}", e))?;
-
-    // Instantiate synchronously (fine for small modules).
-    let instance = runtime::WasmInstance::new(&module, program.clone(), wasm_output.text_patterns)
-        .map_err(|e| format!("WASM instantiation failed: {}", e))?;
-
-    finish_setup(instance, program, source, persistence_enabled)
 }
 
 /// Async path: compile in background, show loading indicator, swap to real UI.
@@ -198,7 +198,182 @@ fn finish_setup(
             old.shutdown();
         }
     });
-    install_debug_api(instance.clone(), program.clone());
+    if let Some(window) = web_sys::window() {
+        let api = Object::new();
+        let instance_for_cell = instance.clone();
+        let program_for_cell = program.clone();
+        let program_for_find = program.clone();
+        let get_cell = Closure::wrap(Box::new(move |name: String| -> JsValue {
+            let result = Object::new();
+            let found = program_for_cell
+                .cells
+                .iter()
+                .enumerate()
+                .find_map(|(idx, cell)| (cell.name == name).then_some(idx as u32));
+            match found {
+                Some(cell_id) => {
+                    let _ = Reflect::set(&result, &"found".into(), &JsValue::TRUE);
+                    let _ = Reflect::set(&result, &"id".into(), &JsValue::from(cell_id));
+                    let _ = Reflect::set(
+                        &result,
+                        &"value".into(),
+                        &JsValue::from(instance_for_cell.cell_store.get_cell_value(cell_id)),
+                    );
+                    let _ = Reflect::set(
+                        &result,
+                        &"text".into(),
+                        &JsValue::from(instance_for_cell.cell_store.get_cell_text(cell_id)),
+                    );
+                }
+                None => {
+                    let _ = Reflect::set(&result, &"found".into(), &JsValue::FALSE);
+                }
+            }
+            result.into()
+        }) as Box<dyn Fn(String) -> JsValue>);
+        let _ = Reflect::set(&api, &"getCell".into(), get_cell.as_ref());
+        get_cell.forget();
+
+        let find_cells = Closure::wrap(Box::new(move |pattern: String| -> JsValue {
+            let result = js_sys::Array::new();
+            for (idx, cell) in program_for_find.cells.iter().enumerate() {
+                if cell.name.contains(&pattern) {
+                    let entry = Object::new();
+                    let _ = Reflect::set(&entry, &"id".into(), &JsValue::from(idx as u32));
+                    let _ = Reflect::set(&entry, &"name".into(), &JsValue::from(cell.name.clone()));
+                    result.push(&entry);
+                }
+            }
+            result.into()
+        }) as Box<dyn Fn(String) -> JsValue>);
+        let _ = Reflect::set(&api, &"findCells".into(), find_cells.as_ref());
+        find_cells.forget();
+
+        let program_for_find_events = program.clone();
+        let find_events = Closure::wrap(Box::new(move |pattern: String| -> JsValue {
+            let result = js_sys::Array::new();
+            for (idx, event) in program_for_find_events.events.iter().enumerate() {
+                if event.name.contains(&pattern) {
+                    let entry = Object::new();
+                    let _ = Reflect::set(&entry, &"id".into(), &JsValue::from(idx as u32));
+                    let _ =
+                        Reflect::set(&entry, &"name".into(), &JsValue::from(event.name.clone()));
+                    result.push(&entry);
+                }
+            }
+            result.into()
+        }) as Box<dyn Fn(String) -> JsValue>);
+        let _ = Reflect::set(&api, &"findEvents".into(), find_events.as_ref());
+        find_events.forget();
+
+        let instance_for_item = instance.clone();
+        let get_item_cell = Closure::wrap(Box::new(move |item_idx: u32, cell_id: u32| -> JsValue {
+            let result = Object::new();
+            if let Some(item_store) = instance_for_item.item_cell_store.as_ref() {
+                let _ = Reflect::set(&result, &"found".into(), &JsValue::TRUE);
+                let _ = Reflect::set(
+                    &result,
+                    &"value".into(),
+                    &JsValue::from(item_store.get_value(item_idx, cell_id)),
+                );
+                let _ = Reflect::set(
+                    &result,
+                    &"text".into(),
+                    &JsValue::from(item_store.get_text(item_idx, cell_id)),
+                );
+            } else {
+                let _ = Reflect::set(&result, &"found".into(), &JsValue::FALSE);
+            }
+            result.into()
+        }) as Box<dyn Fn(u32, u32) -> JsValue>);
+        let _ = Reflect::set(&api, &"getItemCell".into(), get_item_cell.as_ref());
+        get_item_cell.forget();
+
+        let instance_for_dump = instance.clone();
+        let program_for_dump = program.clone();
+        let dump_item_cells = Closure::wrap(Box::new(move |item_idx: u32| -> JsValue {
+            let result = js_sys::Array::new();
+            let Some(item_store) = instance_for_dump.item_cell_store.as_ref() else {
+                return result.into();
+            };
+
+            for (cell_id, value) in item_store.all_cell_values(item_idx) {
+                let entry = Object::new();
+                let _ = Reflect::set(&entry, &"id".into(), &JsValue::from(cell_id));
+                if let Some(cell) = program_for_dump.cells.get(cell_id as usize) {
+                    let _ = Reflect::set(&entry, &"name".into(), &JsValue::from(cell.name.clone()));
+                }
+                let _ = Reflect::set(&entry, &"value".into(), &JsValue::from(value));
+                let text = item_store.get_text(item_idx, cell_id);
+                if !text.is_empty() {
+                    let _ = Reflect::set(&entry, &"text".into(), &JsValue::from(text));
+                }
+                result.push(&entry);
+            }
+
+            for (cell_id, text) in item_store.all_text_values(item_idx) {
+                if text.is_empty() {
+                    continue;
+                }
+                if item_store.get_value(item_idx, cell_id).is_nan() {
+                    let entry = Object::new();
+                    let _ = Reflect::set(&entry, &"id".into(), &JsValue::from(cell_id));
+                    if let Some(cell) = program_for_dump.cells.get(cell_id as usize) {
+                        let _ =
+                            Reflect::set(&entry, &"name".into(), &JsValue::from(cell.name.clone()));
+                    }
+                    let _ = Reflect::set(&entry, &"text".into(), &JsValue::from(text));
+                    result.push(&entry);
+                }
+            }
+
+            result.into()
+        }) as Box<dyn Fn(u32) -> JsValue>);
+        let _ = Reflect::set(&api, &"dumpItemCells".into(), dump_item_cells.as_ref());
+        dump_item_cells.forget();
+
+        let program_for_name = program.clone();
+        let cell_name = Closure::wrap(Box::new(move |cell_id: u32| -> JsValue {
+            program_for_name
+                .cells
+                .get(cell_id as usize)
+                .map(|cell| JsValue::from(cell.name.clone()))
+                .unwrap_or(JsValue::NULL)
+        }) as Box<dyn Fn(u32) -> JsValue>);
+        let _ = Reflect::set(&api, &"cellName".into(), cell_name.as_ref());
+        cell_name.forget();
+
+        let program_for_event_name = program.clone();
+        let event_name = Closure::wrap(Box::new(move |event_id: u32| -> JsValue {
+            program_for_event_name
+                .events
+                .get(event_id as usize)
+                .map(|event| JsValue::from(event.name.clone()))
+                .unwrap_or(JsValue::NULL)
+        }) as Box<dyn Fn(u32) -> JsValue>);
+        let _ = Reflect::set(&api, &"eventName".into(), event_name.as_ref());
+        event_name.forget();
+
+        let instance_for_item_event = instance.clone();
+        let fire_item_event =
+            Closure::wrap(Box::new(move |item_idx: u32, event_id: u32| -> JsValue {
+                let result = Object::new();
+                match instance_for_item_event.call_on_item_event(item_idx, event_id, item_idx) {
+                    Ok(()) => {
+                        let _ = Reflect::set(&result, &"ok".into(), &JsValue::TRUE);
+                    }
+                    Err(error) => {
+                        let _ = Reflect::set(&result, &"ok".into(), &JsValue::FALSE);
+                        let _ = Reflect::set(&result, &"error".into(), &JsValue::from(error));
+                    }
+                }
+                result.into()
+            }) as Box<dyn Fn(u32, u32) -> JsValue>);
+        let _ = Reflect::set(&api, &"fireItemEvent".into(), fire_item_event.as_ref());
+        fire_item_event.forget();
+
+        let _ = Reflect::set(window.as_ref(), &"__boonWasmDebug".into(), &api);
+    }
 
     // 3. Set up router BEFORE init so WHEN/WHILE arms see route text.
     bridge::setup_router(&program, &instance);
@@ -240,184 +415,6 @@ fn finish_setup(
     Ok(ui)
 }
 
-fn install_debug_api(instance: Rc<runtime::WasmInstance>, program: Rc<ir::IrProgram>) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-
-    let api = Object::new();
-    let instance_for_cell = instance.clone();
-    let program_for_cell = program.clone();
-    let program_for_find = program.clone();
-    let get_cell = Closure::wrap(Box::new(move |name: String| -> JsValue {
-        let result = Object::new();
-        let found = program_for_cell
-            .cells
-            .iter()
-            .enumerate()
-            .find_map(|(idx, cell)| (cell.name == name).then_some(idx as u32));
-        match found {
-            Some(cell_id) => {
-                let _ = Reflect::set(&result, &"found".into(), &JsValue::TRUE);
-                let _ = Reflect::set(&result, &"id".into(), &JsValue::from(cell_id));
-                let _ = Reflect::set(
-                    &result,
-                    &"value".into(),
-                    &JsValue::from(instance_for_cell.cell_store.get_cell_value(cell_id)),
-                );
-                let _ = Reflect::set(
-                    &result,
-                    &"text".into(),
-                    &JsValue::from(instance_for_cell.cell_store.get_cell_text(cell_id)),
-                );
-            }
-            None => {
-                let _ = Reflect::set(&result, &"found".into(), &JsValue::FALSE);
-            }
-        }
-        result.into()
-    }) as Box<dyn Fn(String) -> JsValue>);
-    let _ = Reflect::set(&api, &"getCell".into(), get_cell.as_ref());
-    get_cell.forget();
-
-    let find_cells = Closure::wrap(Box::new(move |pattern: String| -> JsValue {
-        let result = js_sys::Array::new();
-        for (idx, cell) in program_for_find.cells.iter().enumerate() {
-            if cell.name.contains(&pattern) {
-                let entry = Object::new();
-                let _ = Reflect::set(&entry, &"id".into(), &JsValue::from(idx as u32));
-                let _ = Reflect::set(&entry, &"name".into(), &JsValue::from(cell.name.clone()));
-                result.push(&entry);
-            }
-        }
-        result.into()
-    }) as Box<dyn Fn(String) -> JsValue>);
-    let _ = Reflect::set(&api, &"findCells".into(), find_cells.as_ref());
-    find_cells.forget();
-
-    let program_for_find_events = program.clone();
-    let find_events = Closure::wrap(Box::new(move |pattern: String| -> JsValue {
-        let result = js_sys::Array::new();
-        for (idx, event) in program_for_find_events.events.iter().enumerate() {
-            if event.name.contains(&pattern) {
-                let entry = Object::new();
-                let _ = Reflect::set(&entry, &"id".into(), &JsValue::from(idx as u32));
-                let _ = Reflect::set(&entry, &"name".into(), &JsValue::from(event.name.clone()));
-                result.push(&entry);
-            }
-        }
-        result.into()
-    }) as Box<dyn Fn(String) -> JsValue>);
-    let _ = Reflect::set(&api, &"findEvents".into(), find_events.as_ref());
-    find_events.forget();
-
-    let instance_for_item = instance.clone();
-    let get_item_cell = Closure::wrap(Box::new(move |item_idx: u32, cell_id: u32| -> JsValue {
-        let result = Object::new();
-        if let Some(item_store) = instance_for_item.item_cell_store.as_ref() {
-            let _ = Reflect::set(&result, &"found".into(), &JsValue::TRUE);
-            let _ = Reflect::set(
-                &result,
-                &"value".into(),
-                &JsValue::from(item_store.get_value(item_idx, cell_id)),
-            );
-            let _ = Reflect::set(
-                &result,
-                &"text".into(),
-                &JsValue::from(item_store.get_text(item_idx, cell_id)),
-            );
-        } else {
-            let _ = Reflect::set(&result, &"found".into(), &JsValue::FALSE);
-        }
-        result.into()
-    }) as Box<dyn Fn(u32, u32) -> JsValue>);
-    let _ = Reflect::set(&api, &"getItemCell".into(), get_item_cell.as_ref());
-    get_item_cell.forget();
-
-    let instance_for_dump = instance.clone();
-    let program_for_dump = program.clone();
-    let dump_item_cells = Closure::wrap(Box::new(move |item_idx: u32| -> JsValue {
-        let result = js_sys::Array::new();
-        let Some(item_store) = instance_for_dump.item_cell_store.as_ref() else {
-            return result.into();
-        };
-
-        for (cell_id, value) in item_store.all_cell_values(item_idx) {
-            let entry = Object::new();
-            let _ = Reflect::set(&entry, &"id".into(), &JsValue::from(cell_id));
-            if let Some(cell) = program_for_dump.cells.get(cell_id as usize) {
-                let _ = Reflect::set(&entry, &"name".into(), &JsValue::from(cell.name.clone()));
-            }
-            let _ = Reflect::set(&entry, &"value".into(), &JsValue::from(value));
-            let text = item_store.get_text(item_idx, cell_id);
-            if !text.is_empty() {
-                let _ = Reflect::set(&entry, &"text".into(), &JsValue::from(text));
-            }
-            result.push(&entry);
-        }
-
-        for (cell_id, text) in item_store.all_text_values(item_idx) {
-            if text.is_empty() {
-                continue;
-            }
-            if item_store.get_value(item_idx, cell_id).is_nan() {
-                let entry = Object::new();
-                let _ = Reflect::set(&entry, &"id".into(), &JsValue::from(cell_id));
-                if let Some(cell) = program_for_dump.cells.get(cell_id as usize) {
-                    let _ = Reflect::set(&entry, &"name".into(), &JsValue::from(cell.name.clone()));
-                }
-                let _ = Reflect::set(&entry, &"text".into(), &JsValue::from(text));
-                result.push(&entry);
-            }
-        }
-
-        result.into()
-    }) as Box<dyn Fn(u32) -> JsValue>);
-    let _ = Reflect::set(&api, &"dumpItemCells".into(), dump_item_cells.as_ref());
-    dump_item_cells.forget();
-
-    let program_for_name = program.clone();
-    let cell_name = Closure::wrap(Box::new(move |cell_id: u32| -> JsValue {
-        program_for_name
-            .cells
-            .get(cell_id as usize)
-            .map(|cell| JsValue::from(cell.name.clone()))
-            .unwrap_or(JsValue::NULL)
-    }) as Box<dyn Fn(u32) -> JsValue>);
-    let _ = Reflect::set(&api, &"cellName".into(), cell_name.as_ref());
-    cell_name.forget();
-
-    let program_for_event_name = program.clone();
-    let event_name = Closure::wrap(Box::new(move |event_id: u32| -> JsValue {
-        program_for_event_name
-            .events
-            .get(event_id as usize)
-            .map(|event| JsValue::from(event.name.clone()))
-            .unwrap_or(JsValue::NULL)
-    }) as Box<dyn Fn(u32) -> JsValue>);
-    let _ = Reflect::set(&api, &"eventName".into(), event_name.as_ref());
-    event_name.forget();
-
-    let instance_for_item_event = instance.clone();
-    let fire_item_event = Closure::wrap(Box::new(move |item_idx: u32, event_id: u32| -> JsValue {
-        let result = Object::new();
-        match instance_for_item_event.call_on_item_event(item_idx, event_id, item_idx) {
-            Ok(()) => {
-                let _ = Reflect::set(&result, &"ok".into(), &JsValue::TRUE);
-            }
-            Err(error) => {
-                let _ = Reflect::set(&result, &"ok".into(), &JsValue::FALSE);
-                let _ = Reflect::set(&result, &"error".into(), &JsValue::from(error));
-            }
-        }
-        result.into()
-    }) as Box<dyn Fn(u32, u32) -> JsValue>);
-    let _ = Reflect::set(&api, &"fireItemEvent".into(), fire_item_event.as_ref());
-    fire_item_event.forget();
-
-    let _ = Reflect::set(window.as_ref(), &"__boonWasmDebug".into(), &api);
-}
-
 fn error_element(msg: &str) -> RawElOrText {
     El::new()
         .s(Font::new().color(color!("LightCoral")))
@@ -431,6 +428,69 @@ fn compile(
 ) -> Result<ir::IrProgram, String> {
     let ast = parse_source(source)?;
     lower::lower(&ast, external_functions).map_err(|errors| format_errors(source, &errors))
+}
+
+fn compile_ir_for_metrics(
+    source: &str,
+    external_functions: Option<&[ExternalFunction]>,
+) -> Result<(ir::IrProgram, u128), String> {
+    let started = std::time::Instant::now();
+    let program = compile(source, external_functions)?;
+    Ok((program, started.elapsed().as_millis()))
+}
+
+fn emit_wasm_output_for_metrics(program: &ir::IrProgram) -> codegen::WasmOutput {
+    codegen::emit_wasm(program)
+}
+
+fn cells_bridge_metrics_for_metrics(
+    program: &ir::IrProgram,
+) -> Result<bridge::LegacyWasmBridgeMetrics, String> {
+    bridge::cells_bridge_metrics_for_program(program)
+}
+
+fn legacy_wasm_module_metrics_for_metrics(
+    source: &str,
+    external_functions: Option<&[ExternalFunction]>,
+) -> Result<super::LegacyWasmModuleMetrics, String> {
+    let started = std::time::Instant::now();
+    let (program, parse_lower_millis) = compile_ir_for_metrics(source, external_functions)?;
+    let bridge_metrics = cells_bridge_metrics_for_metrics(&program)?;
+    let emit_started = std::time::Instant::now();
+    let wasm_output = emit_wasm_output_for_metrics(&program);
+    let emit_millis = emit_started.elapsed().as_millis();
+    let compile_millis = started.elapsed().as_millis();
+    let first_render_total_proxy_millis =
+        compile_millis.saturating_add(bridge_metrics.initial_materialize_millis);
+
+    let mut import_count = 0;
+    let mut export_count = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm_output.wasm_bytes) {
+        match payload.map_err(|error| error.to_string())? {
+            wasmparser::Payload::ImportSection(reader) => import_count += reader.count() as usize,
+            wasmparser::Payload::ExportSection(reader) => export_count += reader.count() as usize,
+            _ => {}
+        }
+    }
+
+    Ok(super::LegacyWasmModuleMetrics {
+        parse_lower_millis,
+        emit_millis,
+        bridge_initial_materialize_millis: bridge_metrics.initial_materialize_millis,
+        bridge_edit_entry_proxy_millis: bridge_metrics.edit_entry_proxy_millis,
+        bridge_dependent_recompute_proxy_millis: bridge_metrics.dependent_recompute_proxy_millis,
+        first_render_total_proxy_millis,
+        encoded_bytes: wasm_output.wasm_bytes.len(),
+        import_count,
+        export_count,
+        compile_millis,
+    })
+}
+
+pub(super) fn legacy_wasm_module_metrics_for_cells()
+-> Result<super::LegacyWasmModuleMetrics, String> {
+    let source = include_str!("../../../../../../playground/frontend/src/examples/cells/cells.bn");
+    legacy_wasm_module_metrics_for_metrics(source, None)
 }
 
 fn format_errors(source: &str, errors: &[lower::CompileError]) -> String {

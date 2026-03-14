@@ -48,7 +48,7 @@ pub struct TestMeta {
     #[serde(default)]
     pub engines: Option<Vec<String>>,
 
-    /// Skip on these engines (e.g., ["Wasm"])
+    /// Skip on these engines (e.g., ["Wasm"] for the WebAssembly backend)
     #[serde(default)]
     pub skip_engines: Option<Vec<String>>,
 }

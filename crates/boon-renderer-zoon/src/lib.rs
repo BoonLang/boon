@@ -5,8 +5,8 @@ pub use boon_scene::{
 };
 pub use zoon;
 
-use std::collections::HashMap;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use ulid::Ulid;
@@ -141,14 +141,22 @@ impl RenderInteractionHandlers {
         }
     }
 
+    pub fn dispatch_event_batch(&self, batch: UiEventBatch) {
+        (self.on_ui_events)(batch);
+    }
+
+    pub fn dispatch_fact_batch(&self, batch: UiFactBatch) {
+        (self.on_ui_facts)(batch);
+    }
+
     fn emit_event(&self, event: UiEvent) {
-        (self.on_ui_events)(UiEventBatch {
+        self.dispatch_event_batch(UiEventBatch {
             events: vec![event],
         });
     }
 
     fn emit_fact(&self, fact: UiFact) {
-        (self.on_ui_facts)(UiFactBatch { facts: vec![fact] });
+        self.dispatch_fact_batch(UiFactBatch { facts: vec![fact] });
     }
 }
 
@@ -201,7 +209,7 @@ impl FakeRenderState {
             .filter_map(|(class_name, enabled)| enabled.then_some(class_name))
     }
 
-    fn event_ports_for(&self, id: NodeId) -> Vec<(EventPortId, UiEventKind)> {
+    pub fn event_ports_for(&self, id: NodeId) -> Vec<(EventPortId, UiEventKind)> {
         self.event_ports.get(&id).cloned().unwrap_or_default()
     }
 
@@ -563,10 +571,13 @@ fn render_ui_node(
                 })
                 .event_handler({
                     let handlers = handlers.clone();
-                    move |_: zoon::events::Blur| {
-                        handlers.emit_fact(UiFact {
-                            id: node_id_value,
-                            kind: UiFactKind::Focused(false),
+                    move |event: zoon::events::Blur| {
+                        let handlers = handlers.clone();
+                        defer_real_blur(event.target(), node_id_value, move || {
+                            handlers.emit_fact(UiFact {
+                                id: node_id_value,
+                                kind: UiFactKind::Focused(false),
+                            });
                         });
                     }
                 });
@@ -596,9 +607,7 @@ fn render_ui_node(
                     el = el.attr("value", value);
                 }
                 if should_focus_after_insert {
-                    el = el
-                        .attr("data-boon-focused", "true")
-                        .attr("focused", "true");
+                    el = el.attr("data-boon-focused", "true").attr("focused", "true");
                 }
             }
             for (port, kind) in state.event_ports_for(node_id_value) {
@@ -616,10 +625,14 @@ fn render_ui_node(
                     if let Some(window) = web_sys::window() {
                         let delayed_element = element.clone();
                         let callback = wasm_bindgen::closure::Closure::once(move || {
-                            if let Some(input) = delayed_element.dyn_ref::<web_sys::HtmlInputElement>() {
+                            if let Some(input) =
+                                delayed_element.dyn_ref::<web_sys::HtmlInputElement>()
+                            {
                                 let _ = input.focus();
                                 let _ = input.select();
-                            } else if let Some(html) = delayed_element.dyn_ref::<web_sys::HtmlElement>() {
+                            } else if let Some(html) =
+                                delayed_element.dyn_ref::<web_sys::HtmlElement>()
+                            {
                                 let _ = html.focus();
                             }
                         });
@@ -721,11 +734,14 @@ fn attach_ui_handler(
                 payload,
             });
         }),
-        UiEventKind::Blur => raw_el.event_handler(move |_: zoon::events::Blur| {
-            handlers.emit_event(UiEvent {
-                target: port,
-                kind: UiEventKind::Blur,
-                payload: None,
+        UiEventKind::Blur => raw_el.event_handler(move |event: zoon::events::Blur| {
+            let handlers = handlers.clone();
+            defer_real_blur(event.target(), node_id, move || {
+                handlers.emit_event(UiEvent {
+                    target: port,
+                    kind: UiEventKind::Blur,
+                    payload: None,
+                });
             });
         }),
         UiEventKind::Focus => raw_el.event_handler(move |_: zoon::events::Focus| {
@@ -786,6 +802,50 @@ fn input_event_value(target: Option<web_sys::EventTarget>) -> Option<String> {
                 .dyn_ref::<web_sys::HtmlSelectElement>()
                 .map(|select| select.value())
         })
+}
+
+fn event_target_is_connected(target: Option<web_sys::EventTarget>) -> bool {
+    target
+        .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
+        .is_some_and(|node| node.is_connected())
+}
+
+fn active_text_input_node_id() -> Option<String> {
+    let document = web_sys::window()?.document()?;
+    let active = document.active_element()?;
+    let tag = active.tag_name();
+    if tag == "INPUT" || tag == "TEXTAREA" {
+        active.get_attribute("data-boon-node-id")
+    } else {
+        None
+    }
+}
+
+fn defer_real_blur(
+    target: Option<web_sys::EventTarget>,
+    node_id: NodeId,
+    callback: impl FnOnce() + 'static,
+) {
+    if !event_target_is_connected(target.clone()) {
+        return;
+    }
+    let expected_node_id = node_id.0.to_string();
+    let callback = Closure::once(move || {
+        if !event_target_is_connected(target) {
+            return;
+        }
+        if active_text_input_node_id().as_deref() == Some(expected_node_id.as_str()) {
+            return;
+        }
+        callback();
+    });
+    if let Some(window) = web_sys::window() {
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            callback.as_ref().unchecked_ref(),
+            16,
+        );
+    }
+    callback.forget();
 }
 
 fn find_ui_node_mut(node: &mut UiNode, id: NodeId) -> Option<&mut UiNode> {

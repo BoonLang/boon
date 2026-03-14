@@ -6,14 +6,13 @@ AST, has its own analysis + codegen pipeline.
 
 ## Current Direction
 
-1. **`../wasm_pro.md`** — redesign memo for the next Wasm architecture.
-   Use this for the long-term boundary/runtime plan: Wasm-owned semantics, renderer-
-   agnostic diff output, small ABI, and migration from the current partial-compilation
-   design.
+1. **`../wasm_single_engine_cutover.md`** — current single-engine WebAssembly plan.
+   Use this for the canonical cutover order, Wasm-only budgets, and browser-first
+   acceptance criteria.
 
-2. **`../wasm_pro_execution_backlog.md`** — execution backlog for Wasm Pro.
-   Use this for milestone order, file targets, acceptance checks, and the first coding
-   sequence.
+2. **`../wasm_pro.md`** and **`../wasm_pro_execution_backlog.md`** — migration history.
+   Keep these as archived context for the parallel-backend phase that led to the
+   single-engine cutover.
 
 ## Reading Order
 

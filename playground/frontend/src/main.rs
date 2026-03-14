@@ -8,7 +8,11 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use ulid::Ulid;
 
-use boon::platform::browser::common::{EngineType, available_engines, default_engine};
+use boon::platform::browser::common::{
+    EngineType, available_engines, clear_all_compiled_engine_persisted_states,
+    clear_selected_engine_persisted_states, default_engine, is_engine_available,
+    picker_engines, preferred_wasm_family_engine, resolve_engine_for_current_build,
+};
 
 #[cfg(feature = "engine-actors")]
 use boon::platform::browser::{
@@ -21,15 +25,8 @@ use boon::platform::browser::{
 // DD engine imports (feature-gated)
 #[cfg(feature = "engine-dd")]
 use boon::platform::browser::engine_dd::{
-    clear_dd_persisted_states, render_dd_result_reactive_signal, run_dd_reactive_with_persistence,
+    render_dd_result_reactive_signal, run_dd_reactive_with_persistence,
 };
-
-// WASM engine imports (feature-gated)
-#[cfg(feature = "engine-wasm")]
-use boon::platform::browser::engine_wasm::clear_wasm_persisted_states;
-
-#[cfg(feature = "engine-wasm-pro")]
-use boon::platform::browser::engine_wasm_pro::clear_wasm_pro_persisted_states;
 
 mod code_editor;
 use code_editor::CodeEditor;
@@ -130,27 +127,6 @@ fn set_example_in_url(example_name: &str) {
     }
 }
 
-fn engine_query_value(engine: EngineType) -> &'static str {
-    match engine {
-        EngineType::Actors => "actors",
-        EngineType::DifferentialDataflow => "dd",
-        EngineType::Wasm => "wasm",
-        EngineType::WasmPro => "wasm-pro",
-    }
-}
-
-fn hard_reload_example(example_name: &str, engine: EngineType) {
-    if let Some(window) = web_sys::window() {
-        let encoded_name = js_sys::encode_uri_component(example_name);
-        let url = format!(
-            "?engine={}&example={}",
-            engine_query_value(engine),
-            encoded_name
-        );
-        let _ = window.location().set_href(&url);
-    }
-}
-
 /// Get custom example name from URL query parameter (?custom-example=name)
 fn get_custom_example_from_url() -> Option<String> {
     let window = web_sys::window()?;
@@ -187,7 +163,6 @@ fn get_engine_from_url() -> Option<EngineType> {
         Some("actors") => Some(EngineType::Actors),
         Some("dd") => Some(EngineType::DifferentialDataflow),
         Some("wasm") => Some(EngineType::Wasm),
-        Some("wasm-pro") => Some(EngineType::WasmPro),
         _ => None,
     }
 }
@@ -201,7 +176,6 @@ fn load_engine_from_storage() -> Option<EngineType> {
         "Actors" => Some(EngineType::Actors),
         "DD" => Some(EngineType::DifferentialDataflow),
         "Wasm" => Some(EngineType::Wasm),
-        "WasmPro" => Some(EngineType::WasmPro),
         _ => None,
     }
 }
@@ -279,8 +253,9 @@ fn find_multi_file_example_by_name(name: &str) -> Option<&'static MultiFileExamp
 /// Parse module files and return external function definitions in the universal tuple format.
 /// Used by DD and Wasm-family engines. The Actors engine converts these to `FunctionRegistry`.
 ///
-/// Standalone non-Actors builds temporarily return no external functions. That keeps
-/// single-engine Wasm-family builds compiling while Wasm Pro is still a scaffold.
+/// Standalone non-Actors builds still return no external functions for now. That
+/// keeps single-engine Wasm-family builds compiling until shared module parsing
+/// is generalized outside the Actors-specific path.
 #[cfg(feature = "engine-actors")]
 fn parse_module_files(
     files: &BTreeMap<String, String>,
@@ -667,12 +642,7 @@ impl Playground {
         // Validate that loaded engine is actually available in this build
         let engine_type_value = get_engine_from_url()
             .or_else(load_engine_from_storage)
-            .filter(|engine| match engine {
-                EngineType::Actors => cfg!(feature = "engine-actors"),
-                EngineType::DifferentialDataflow => cfg!(feature = "engine-dd"),
-                EngineType::Wasm => cfg!(feature = "engine-wasm"),
-                EngineType::WasmPro => cfg!(feature = "engine-wasm-pro"),
-            })
+            .and_then(resolve_engine_for_current_build)
             .unwrap_or_else(default_engine);
         let engine_type = Mutable::new(engine_type_value);
 
@@ -797,7 +767,6 @@ impl Playground {
                 let persistence_enabled = self.persistence_enabled.clone();
                 move |raw_el| {
                     use wasm_bindgen::prelude::*;
-                    use wasm_bindgen::JsCast;
 
                     let window = web_sys::window().unwrap();
 
@@ -960,9 +929,39 @@ impl Playground {
                     let engine_type_for_get = engine_type.clone();
                     let get_engine = Closure::wrap(Box::new(move || -> JsValue {
                         let result = js_sys::Object::new();
-                        let engine_name = engine_type_for_get.get().short_name();
+                        let current_engine = engine_type_for_get.get();
+                        let engine_name = current_engine.short_name();
+                        let available = js_sys::Array::new();
+                        let display_available = js_sys::Array::new();
+                        for engine in available_engines() {
+                            available.push(&engine.short_name().into());
+                        }
+                        for engine in picker_engines(Some(current_engine)) {
+                            display_available.push(&engine.short_name().into());
+                        }
                         js_sys::Reflect::set(&result, &"engine".into(), &engine_name.into()).ok();
+                        js_sys::Reflect::set(
+                            &result,
+                            &"engineLabel".into(),
+                            &current_engine.picker_label().into(),
+                        )
+                        .ok();
                         js_sys::Reflect::set(&result, &"switchable".into(), &boon::platform::browser::common::is_engine_switchable().into()).ok();
+                        js_sys::Reflect::set(&result, &"availableEngines".into(), &available).ok();
+                        js_sys::Reflect::set(
+                            &result,
+                            &"displayAvailableEngines".into(),
+                            &display_available,
+                        )
+                        .ok();
+                        if let Some(preferred) = preferred_wasm_family_engine() {
+                            js_sys::Reflect::set(
+                                &result,
+                                &"preferredWasmEngine".into(),
+                                &preferred.short_name().into(),
+                            )
+                            .ok();
+                        }
                         result.into()
                     }) as Box<dyn Fn() -> JsValue>);
                     js_sys::Reflect::set(&api, &"getEngine".into(), get_engine.as_ref()).ok();
@@ -986,12 +985,25 @@ impl Playground {
                             "Actors" => EngineType::Actors,
                             "DD" => EngineType::DifferentialDataflow,
                             "Wasm" => EngineType::Wasm,
-                            "WasmPro" => EngineType::WasmPro,
                             _ => {
-                                js_sys::Reflect::set(&result, &"error".into(), &format!("Invalid engine '{}'. Use 'Actors', 'DD', 'Wasm', or 'WasmPro'", engine_str).into()).ok();
+                                js_sys::Reflect::set(&result, &"error".into(), &format!("Invalid engine '{}'. Use 'Actors', 'DD', or 'Wasm'", engine_str).into()).ok();
                                 return result.into();
                             }
                         };
+
+                        if !is_engine_available(new_engine) {
+                            js_sys::Reflect::set(
+                                &result,
+                                &"error".into(),
+                                &format!(
+                                    "Engine '{}' is not compiled in this build. Use one of the visible engine buttons instead.",
+                                    engine_str
+                                )
+                                .into(),
+                            )
+                            .ok();
+                            return result.into();
+                        }
 
                         // Set the engine
                         engine_type_for_set.set(new_engine);
@@ -1034,21 +1046,9 @@ impl Playground {
                                 local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                                 local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                                 clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
-
-                                #[cfg(feature = "engine-dd")]
-                                if engine_type_for_select.get() == EngineType::DifferentialDataflow {
-                                    clear_dd_persisted_states();
-                                }
-
-                                #[cfg(feature = "engine-wasm")]
-                                if engine_type_for_select.get() == EngineType::Wasm {
-                                    clear_wasm_persisted_states();
-                                }
-
-                                #[cfg(feature = "engine-wasm-pro")]
-                                if engine_type_for_select.get() == EngineType::WasmPro {
-                                    clear_wasm_pro_persisted_states();
-                                }
+                                clear_selected_engine_persisted_states(
+                                    engine_type_for_select.get(),
+                                );
                             }
                         };
 
@@ -1056,14 +1056,6 @@ impl Playground {
                         if let Some(example_data) = find_example_by_name(&name) {
                             let is_same = *current_file_for_select.lock_ref() == example_data.filename;
                             pre_switch(is_same);
-
-                            if example_data.filename == "cells.bn" {
-                                hard_reload_example(
-                                    example_data.filename.trim_end_matches(".bn"),
-                                    engine_type_for_select.get(),
-                                );
-                                return true;
-                            }
 
                             set_example_in_url(example_data.filename.trim_end_matches(".bn"));
 
@@ -1164,20 +1156,6 @@ impl Playground {
                         Timer::sleep(100).await;
                         run_command_for_autorun.set(Some(RunCommand { filename: None }));
                     });
-
-                    // Also keep the legacy boon-run event listener for backwards compatibility
-                    let run_command_clone = run_command.clone();
-                    let closure = Closure::wrap(Box::new(move |_: web_sys::Event| {
-                        let run_command_inner = run_command_clone.clone();
-                        Task::start(async move {
-                            run_command_inner.set(Some(RunCommand { filename: None }));
-                        });
-                    }) as Box<dyn FnMut(_)>);
-
-                    window
-                        .add_event_listener_with_callback("boon-run", closure.as_ref().unchecked_ref())
-                        .unwrap();
-                    closure.forget();
 
                     raw_el
                 }
@@ -1470,7 +1448,7 @@ impl Playground {
 
     /// Engine selector button group — one button per available engine.
     fn engine_button_group(&self) -> impl Element + use<> {
-        let engines = available_engines();
+        let engines = picker_engines(Some(self.engine_type.get()));
         Row::new()
             .s(RoundedCorners::all(22))
             .s(Background::new().color(color!("rgba(26, 36, 58, 0.32)")))
@@ -1510,7 +1488,7 @@ impl Playground {
             .label(
                 El::new()
                     .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
-                    .child(engine.short_name()),
+                    .child(engine.picker_label()),
             )
             .update_raw_el(|raw_el| raw_el.attr("title", engine.description()))
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
@@ -2098,14 +2076,7 @@ impl Playground {
             .on_press(|| {
                 // Clear DD in-memory state (HOLD_STATES) and localStorage
                 // Note: Previous stop_dd_engine() call was removed as it was a no-op stub
-                #[cfg(feature = "engine-dd")]
-                clear_dd_persisted_states();
-
-                #[cfg(feature = "engine-wasm")]
-                clear_wasm_persisted_states();
-
-                #[cfg(feature = "engine-wasm-pro")]
-                clear_wasm_pro_persisted_states();
+                clear_all_compiled_engine_persisted_states();
 
                 local_storage().remove(STATES_STORAGE_KEY);
                 local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
@@ -2634,32 +2605,15 @@ impl Playground {
 
         // Check which engine to use
         #[cfg(feature = "engine-wasm")]
-        if engine_type == EngineType::Wasm {
+        if matches!(engine_type, EngineType::Wasm) {
             let external_fns = parse_module_files(&files, filename);
             let ext = if external_fns.is_empty() {
                 None
             } else {
                 Some(external_fns.as_slice())
             };
-            let element = boon::platform::browser::engine_wasm::run_wasm(
-                &source_code,
-                ext,
-                persistence_enabled,
-            );
-            drop(source_code);
-            drop(files);
-            return element;
-        }
-
-        #[cfg(feature = "engine-wasm-pro")]
-        if engine_type == EngineType::WasmPro {
-            let external_fns = parse_module_files(&files, filename);
-            let ext = if external_fns.is_empty() {
-                None
-            } else {
-                Some(external_fns.as_slice())
-            };
-            let element = boon::platform::browser::engine_wasm_pro::run_wasm_pro(
+            let element = boon::platform::browser::run_wasm_family_engine(
+                engine_type,
                 &source_code,
                 ext,
                 persistence_enabled,
@@ -2883,32 +2837,7 @@ impl Playground {
                         local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                         local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                         clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
-
-                        // Clear DD in-memory HOLD states AND localStorage (counter values, todo lists, etc.)
-                        // Only clear when DD engine is actually selected (not just compiled in)
-                        #[cfg(feature = "engine-dd")]
-                        if engine_type.get() == EngineType::DifferentialDataflow {
-                            clear_dd_persisted_states();
-                        }
-
-                        #[cfg(feature = "engine-wasm")]
-                        if engine_type.get() == EngineType::Wasm {
-                            clear_wasm_persisted_states();
-                        }
-
-                        #[cfg(feature = "engine-wasm-pro")]
-                        if engine_type.get() == EngineType::WasmPro {
-                            clear_wasm_pro_persisted_states();
-                        }
-                    }
-
-                    // Update URL to share this example
-                    if example_data.filename == "cells.bn" {
-                        hard_reload_example(
-                            example_data.filename.trim_end_matches(".bn"),
-                            engine_type.get(),
-                        );
-                        return;
+                        clear_selected_engine_persisted_states(engine_type.get());
                     }
 
                     set_example_in_url(example_data.filename.trim_end_matches(".bn"));
@@ -3009,21 +2938,7 @@ impl Playground {
                         local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                         local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                         clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
-
-                        #[cfg(feature = "engine-dd")]
-                        if engine_type.get() == EngineType::DifferentialDataflow {
-                            clear_dd_persisted_states();
-                        }
-
-                        #[cfg(feature = "engine-wasm")]
-                        if engine_type.get() == EngineType::Wasm {
-                            clear_wasm_persisted_states();
-                        }
-
-                        #[cfg(feature = "engine-wasm-pro")]
-                        if engine_type.get() == EngineType::WasmPro {
-                            clear_wasm_pro_persisted_states();
-                        }
+                        clear_selected_engine_persisted_states(engine_type.get());
                     }
 
                     set_example_in_url(example.name);

@@ -68,7 +68,7 @@ struct ItemCellSnapshot {
 // ---------------------------------------------------------------------------
 
 /// Derive a stable localStorage key from the source code.
-pub fn storage_key(source: &str) -> String {
+pub(super) fn storage_key(source: &str) -> String {
     let mut hasher = DefaultHasher::new();
     source.hash(&mut hasher);
     format!("wasm_{:016x}", hasher.finish())
@@ -79,7 +79,7 @@ pub fn storage_key(source: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Capture current engine state and save to localStorage.
-pub fn save_and_store(instance: &WasmInstance, key: &str) {
+pub(super) fn save_and_store(instance: &WasmInstance, key: &str) {
     let snapshot = capture_snapshot(instance);
     if let Ok(json) = serde_json::to_string(&snapshot) {
         local_storage_set(key, &json);
@@ -177,7 +177,7 @@ fn capture_snapshot(instance: &WasmInstance) -> WasmSnapshot {
 
 /// Load a snapshot from localStorage.
 /// Returns the opaque snapshot for two-phase restore, or None if no snapshot.
-pub fn load_snapshot(key: &str) -> Option<Box<WasmSnapshot>> {
+pub(super) fn load_snapshot(key: &str) -> Option<Box<WasmSnapshot>> {
     let snap = load_from_storage(key)?;
     Some(Box::new(snap))
 }
@@ -186,7 +186,7 @@ pub fn load_snapshot(key: &str) -> Option<Box<WasmSnapshot>> {
 /// Call BEFORE build_ui so the list has the right items when the bridge renders.
 /// Also restores WASM linear memory and re-runs retain filters so that filtered
 /// lists (e.g., All/Active/Completed) have the correct items for the first render.
-pub fn restore_phase1(instance: &WasmInstance, snapshot: &WasmSnapshot) {
+pub(super) fn restore_phase1(instance: &WasmInstance, snapshot: &WasmSnapshot) {
     let cs = &instance.cell_store;
     let ls = &instance.list_store;
 
@@ -294,7 +294,7 @@ fn load_from_storage(key: &str) -> Option<WasmSnapshot> {
 // ---------------------------------------------------------------------------
 
 /// Clear all WASM persistence keys from localStorage.
-pub fn clear_wasm_persisted_states() {
+pub(crate) fn clear_wasm_persisted_states() {
     if let Some(storage) = get_local_storage() {
         let len = storage.length().unwrap_or(0);
         let mut keys_to_remove = Vec::new();

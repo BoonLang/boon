@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# TodoMVC WASM Engine — Definitive Test Suite
+# TodoMVC Wasm Engine Regression Suite
 #
-# This is the SINGLE SOURCE OF TRUTH for TodoMVC completeness in the WASM engine.
-# When every test passes (zero FAILs, zero SKIPs), TodoMVC is 100% working.
-# Current failures are expected — they map to follow-up milestones M7-M11.
+# This script targets the current single Wasm backend.
+#
+# When every test passes (zero FAILs, zero SKIPs), TodoMVC is 100% working on
+# the Wasm path.
 #
 # 23 sections, ~80 assertions covering every behavior from todo_mvc.expected
 # plus visual regression.
@@ -210,7 +211,7 @@ rerun() {
     sleep 2
 }
 
-echo "=== TodoMVC WASM Engine — Definitive Test Suite ==="
+echo "=== TodoMVC Legacy Wasm Engine — Fallback/Debug Regression Suite ==="
 echo ""
 
 # ──────────────────────────────────────────────

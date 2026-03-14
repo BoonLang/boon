@@ -9,11 +9,12 @@ use crate::parser::{
 use super::ExternalFunction;
 use super::semantic_ir::{
     DerivedArithmeticOp, DerivedScalarOperand, DerivedScalarSpec, IntCompareOp, ItemScalarUpdate,
-    ItemTextUpdate, ObjectDerivedScalarOperand, ObjectItemActionKind, ObjectItemActionSpec,
-    ObjectListFilter, ObjectListItem, ObjectListUpdate, RuntimeModel, ScalarRuntimeModel,
-    ScalarUpdate, SemanticAction, SemanticEventBinding, SemanticFactBinding, SemanticFactKind,
-    SemanticNode, SemanticInputValue, SemanticProgram, SemanticStyleFragment, SemanticTextPart,
-    StateRuntimeModel, TextListFilter, TextListTemplate, TextListUpdate, TextUpdate,
+    ItemTextUpdate, NestedObjectListAction, ObjectDerivedScalarOperand, ObjectItemActionKind,
+    ObjectItemActionSpec, ObjectListFilter, ObjectListItem, ObjectListUpdate, RuntimeModel,
+    ScalarRuntimeModel, ScalarUpdate, SemanticAction, SemanticEventBinding, SemanticFactBinding,
+    SemanticFactKind, SemanticInputValue, SemanticNode, SemanticProgram, SemanticStyleFragment,
+    SemanticTextPart, StateRuntimeModel, TextListFilter, TextListTemplate, TextListUpdate,
+    TextUpdate,
 };
 
 type StaticExpression = static_expression::Expression;
@@ -166,14 +167,11 @@ fn parse_and_lower(source: &str) -> Result<SemanticProgram, String> {
     let path_bindings = flatten_binding_paths(&bindings);
     let mut scalar_plan = detect_scalar_plan(&path_bindings, &functions)
         .map_err(|error| format!("detect_scalar_plan: {error}"))?;
-    let static_object_lists = detect_static_object_list_plan(
-        &path_bindings,
-        &functions,
-        &mut scalar_plan,
-    )
-    .map_err(|error| format!("detect_static_object_list_plan: {error}"))?;
-    let text_plan = detect_text_plan(&path_bindings)
-        .map_err(|error| format!("detect_text_plan: {error}"))?;
+    let static_object_lists =
+        detect_static_object_list_plan(&path_bindings, &functions, &mut scalar_plan)
+            .map_err(|error| format!("detect_static_object_list_plan: {error}"))?;
+    let text_plan =
+        detect_text_plan(&path_bindings).map_err(|error| format!("detect_text_plan: {error}"))?;
     let object_list_plan = detect_object_list_plan(&path_bindings, &functions)
         .map_err(|error| format!("detect_object_list_plan: {error}"))?;
     let mut context = LowerContext {
@@ -496,13 +494,9 @@ fn lower_ui_node<'a>(
         StaticExpression::Block { variables, output } => {
             let mut scope = BTreeMap::new();
             for variable in variables {
-                let object_base = infer_argument_object_base(
-                    &variable.node.value,
-                    context,
-                    locals,
-                    passed,
-                )
-                .or_else(|| active_object_scope(locals));
+                let object_base =
+                    infer_argument_object_base(&variable.node.value, context, locals, passed)
+                        .or_else(|| active_object_scope(locals));
                 scope.insert(
                     variable.node.name.as_str().to_string(),
                     LocalBinding {
@@ -825,10 +819,9 @@ fn text_empty_branch_condition(
     let StaticExpression::Pipe { from, to } = &expression.node else {
         return Ok(None);
     };
-    let Some(binding) =
-        canonical_expression_path(from, context, locals, passed, &mut Vec::new())
-            .ok()
-            .filter(|path| context.text_plan.initial_values.contains_key(path))
+    let Some(binding) = canonical_expression_path(from, context, locals, passed, &mut Vec::new())
+        .ok()
+        .filter(|path| context.text_plan.initial_values.contains_key(path))
     else {
         return Ok(None);
     };
@@ -1118,8 +1111,14 @@ fn object_scalar_compare_branch_operands(
     locals: &LocalScopes<'_>,
     passed: &PassedScopes,
     stack: &mut Vec<String>,
-) -> Result<Option<(ObjectDerivedScalarOperand, IntCompareOp, ObjectDerivedScalarOperand)>, String>
-{
+) -> Result<
+    Option<(
+        ObjectDerivedScalarOperand,
+        IntCompareOp,
+        ObjectDerivedScalarOperand,
+    )>,
+    String,
+> {
     let expression = resolve_alias(expression, context, locals, passed, stack)?;
     let StaticExpression::Comparator(comparator) = &expression.node else {
         return Ok(None);
@@ -1938,8 +1937,9 @@ fn lower_background_url_style_fragment<'a>(
                 if let Some(condition) =
                     style_condition_fragment(from, context, locals, passed, stack)?
                 {
-                    let Some(truthy) =
-                        lower_background_url_style_fragment(truthy, context, stack, locals, passed)?
+                    let Some(truthy) = lower_background_url_style_fragment(
+                        truthy, context, stack, locals, passed,
+                    )?
                     else {
                         return Ok(None);
                     };
@@ -2552,7 +2552,11 @@ fn lower_text_input_branch_source<'a>(
     };
     let truthy = lower_text_input_value_source(truthy_body, context, stack, locals, passed)?
         .unwrap_or(SemanticInputValue::Static(lower_text_input_initial_value(
-            truthy_body, context, stack, locals, passed,
+            truthy_body,
+            context,
+            stack,
+            locals,
+            passed,
         )?));
     let falsy = lower_text_input_value_source(falsy_body, context, stack, locals, passed)?
         .unwrap_or(SemanticInputValue::Static(lower_text_input_initial_value(
@@ -2871,14 +2875,9 @@ fn lower_text_value_inner<'a>(
     let expression = resolve_alias(expression, context, locals, passed, stack)?;
     match &expression.node {
         StaticExpression::PostfixFieldAccess { expr, field } => {
-            if let Some(field_expression) = resolve_postfix_field_expression(
-                expr,
-                field,
-                context,
-                locals,
-                passed,
-                stack,
-            )? {
+            if let Some(field_expression) =
+                resolve_postfix_field_expression(expr, field, context, locals, passed, stack)?
+            {
                 return lower_text_value(field_expression, context, stack, locals, passed);
             }
             Err(format!(
@@ -3150,14 +3149,9 @@ fn initial_scalar_value_in_context_inner<'a>(
     let expression = resolve_alias(expression, context, locals, passed, stack)?;
     match &expression.node {
         StaticExpression::PostfixFieldAccess { expr, field } => {
-            if let Some(field_expression) = resolve_postfix_field_expression(
-                expr,
-                field,
-                context,
-                locals,
-                passed,
-                stack,
-            )? {
+            if let Some(field_expression) =
+                resolve_postfix_field_expression(expr, field, context, locals, passed, stack)?
+            {
                 return initial_scalar_value_in_context(
                     field_expression,
                     context,
@@ -3617,8 +3611,7 @@ fn lower_text_parts<'a>(
                 output.push(SemanticTextPart::Static(text.as_str().to_string()))
             }
             StaticTextPart::Interpolation { var, .. } => {
-                if let Some(binding_path) =
-                    text_binding_path(var.as_str(), context, locals, passed)
+                if let Some(binding_path) = text_binding_path(var.as_str(), context, locals, passed)
                 {
                     output.push(SemanticTextPart::TextBinding(binding_path));
                     continue;
@@ -3636,8 +3629,7 @@ fn lower_text_parts<'a>(
                     continue;
                 }
                 let expression = resolve_named_binding(var.as_str(), context, locals, stack)?;
-                if let Some(field) =
-                    placeholder_object_field(expression, context, locals, passed)?
+                if let Some(field) = placeholder_object_field(expression, context, locals, passed)?
                 {
                     stack.pop();
                     output.push(SemanticTextPart::ObjectFieldBinding(field));
@@ -4544,18 +4536,15 @@ fn lookup_local_object_base<'a>(
 }
 
 fn active_object_scope(locals: &LocalScopes<'_>) -> Option<String> {
-    locals
-        .iter()
-        .rev()
-        .find_map(|scope| {
-            scope.values().find_map(|binding| {
-                binding
-                    .object_base
-                    .as_ref()
-                    .filter(|base| base.starts_with("__item__"))
-                    .cloned()
-            })
+    locals.iter().rev().find_map(|scope| {
+        scope.values().find_map(|binding| {
+            binding
+                .object_base
+                .as_ref()
+                .filter(|base| base.starts_with("__item__"))
+                .cloned()
         })
+    })
 }
 
 fn resolve_local_field_expression<'a>(
@@ -4788,7 +4777,7 @@ fn resolve_object_field_expression<'a>(
             }
         } else {
             field_expression
-    };
+        };
     resolve_object_field_expression(resolved_field, &extra_parts[1..], context)
 }
 
@@ -5413,10 +5402,22 @@ fn ui_event_kind_for_name(event_name: &str) -> Option<boon_scene::UiEventKind> {
     match event_name {
         "press" | "click" => Some(boon_scene::UiEventKind::Click),
         "double_click" => Some(boon_scene::UiEventKind::DoubleClick),
-        "change" => Some(boon_scene::UiEventKind::Input),
+        "change" | "input" => Some(boon_scene::UiEventKind::Input),
         "blur" => Some(boon_scene::UiEventKind::Blur),
         "focus" => Some(boon_scene::UiEventKind::Focus),
         "key_down" => Some(boon_scene::UiEventKind::KeyDown),
+        _ => None,
+    }
+}
+
+fn ui_event_name(kind: &boon_scene::UiEventKind) -> Option<&'static str> {
+    match kind {
+        boon_scene::UiEventKind::Click => Some("click"),
+        boon_scene::UiEventKind::DoubleClick => Some("double_click"),
+        boon_scene::UiEventKind::Input => Some("input"),
+        boon_scene::UiEventKind::Blur => Some("blur"),
+        boon_scene::UiEventKind::Focus => Some("focus"),
+        boon_scene::UiEventKind::KeyDown => Some("key_down"),
         _ => None,
     }
 }
@@ -5969,13 +5970,9 @@ fn expression_depends_on_item_scope(
                 || expression_depends_on_item_scope(to, context, locals, passed)
         }
         StaticExpression::FunctionCall { arguments, .. } => arguments.iter().any(|argument| {
-            argument
-                .node
-                .value
-                .as_ref()
-                .is_some_and(|value| {
-                    expression_depends_on_item_scope(value, context, locals, passed)
-                })
+            argument.node.value.as_ref().is_some_and(|value| {
+                expression_depends_on_item_scope(value, context, locals, passed)
+            })
         }),
         StaticExpression::Block { variables, output } => {
             variables.iter().any(|variable| {
@@ -5985,15 +5982,14 @@ fn expression_depends_on_item_scope(
         StaticExpression::Latest { inputs } | StaticExpression::List { items: inputs } => inputs
             .iter()
             .any(|item| expression_depends_on_item_scope(item, context, locals, passed)),
-        StaticExpression::When { arms } | StaticExpression::While { arms } => arms.iter().any(|arm| {
-            expression_depends_on_item_scope(&arm.body, context, locals, passed)
-        }),
-        StaticExpression::Object(object) | StaticExpression::TaggedObject { object, .. } => object
-            .variables
+        StaticExpression::When { arms } | StaticExpression::While { arms } => arms
             .iter()
-            .any(|variable| {
+            .any(|arm| expression_depends_on_item_scope(&arm.body, context, locals, passed)),
+        StaticExpression::Object(object) | StaticExpression::TaggedObject { object, .. } => {
+            object.variables.iter().any(|variable| {
                 expression_depends_on_item_scope(&variable.node.value, context, locals, passed)
-            }),
+            })
+        }
         StaticExpression::TextLiteral { parts, .. } => parts.iter().any(|part| match part {
             StaticTextPart::Text(_) => false,
             StaticTextPart::Interpolation { var, .. } => {
@@ -6166,7 +6162,8 @@ fn detect_text_plan(
         if let Some((initial_value, event_updates)) =
             latest_text_spec_for_expression(expression, path_bindings, binding_name)?
         {
-            plan.initial_values.insert(binding_name.clone(), initial_value);
+            plan.initial_values
+                .insert(binding_name.clone(), initial_value);
             for ((trigger_binding, event_name), update) in event_updates {
                 plan.event_updates
                     .entry((trigger_binding, event_name))
@@ -6178,7 +6175,8 @@ fn detect_text_plan(
         if let Some((initial_value, event_updates)) =
             hold_text_spec_for_expression(expression, path_bindings, binding_name)?
         {
-            plan.initial_values.insert(binding_name.clone(), initial_value);
+            plan.initial_values
+                .insert(binding_name.clone(), initial_value);
             for ((trigger_binding, event_name), update) in event_updates {
                 plan.event_updates
                     .entry((trigger_binding, event_name))
@@ -7195,14 +7193,8 @@ fn resolve_static_object_field_expression<'a>(
     let function = functions.get(path[0].as_str())?;
     let object = resolve_object(function.body)?;
     let field = find_object_field(object, field_name)?;
-    if let StaticExpression::Alias(static_expression::Alias::WithoutPassed { parts, .. }) =
-        &field.node
-    {
-        if parts.len() == 1 {
-            return find_named_argument(arguments, parts[0].as_str()).or(Some(field));
-        }
-    }
-    Some(field)
+    let bindings = function_argument_bindings(function, arguments).ok()?;
+    Some(specialize_static_expression(field, &bindings))
 }
 
 fn detect_local_counter_spec(
@@ -7542,8 +7534,13 @@ fn augment_top_level_object_field_runtime(context: &mut LowerContext<'_>) -> Res
         let Some(expression) = context.bindings.get(binding_name).copied() else {
             continue;
         };
-        let field_kinds =
-            detect_initial_object_field_kinds(expression, context, &mut Vec::new(), &mut Vec::new(), &mut Vec::new())?;
+        let field_kinds = detect_initial_object_field_kinds(
+            expression,
+            context,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )?;
         if field_kinds.is_empty() {
             continue;
         }
@@ -7561,10 +7558,18 @@ fn augment_top_level_object_field_runtime(context: &mut LowerContext<'_>) -> Res
     }
     for plan in plans {
         for (binding, value) in plan.scalar_initials {
-            context.scalar_plan.initial_values.entry(binding).or_insert(value);
+            context
+                .scalar_plan
+                .initial_values
+                .entry(binding)
+                .or_insert(value);
         }
         for (binding, value) in plan.text_initials {
-            context.text_plan.initial_values.entry(binding).or_insert(value);
+            context
+                .text_plan
+                .initial_values
+                .entry(binding)
+                .or_insert(value);
         }
         for (binding, actions) in plan.item_actions {
             context
@@ -7634,12 +7639,7 @@ fn detect_initial_object_field_kinds<'a>(
                 {
                     kinds.insert(field_name, ObjectFieldKind::Scalar);
                 } else if extract_static_text_value(&variable.node.value)?.is_some()
-                    || is_event_text_expression(
-                        &variable.node.value,
-                        context,
-                        locals,
-                        passed,
-                    )?
+                    || is_event_text_expression(&variable.node.value, context, locals, passed)?
                     || expression_path(&variable.node.value, context, locals, passed)?
                         .as_deref()
                         .is_some_and(|path| path.ends_with(".text"))
@@ -7655,24 +7655,21 @@ fn detect_initial_object_field_kinds<'a>(
                 }
             }
         }
-        StaticExpression::Pipe { from, to } if matches!(&to.node, StaticExpression::Hold { .. }) => {
+        StaticExpression::Pipe { from, to }
+            if matches!(&to.node, StaticExpression::Hold { .. }) =>
+        {
             return detect_initial_object_field_kinds(from, context, stack, locals, passed);
         }
         StaticExpression::Pipe { from, to } => {
             if let StaticExpression::Then { body } = &to.node {
-                let next =
-                    detect_initial_object_field_kinds(body, context, stack, locals, passed)?;
+                let next = detect_initial_object_field_kinds(body, context, stack, locals, passed)?;
                 kinds.extend(next);
                 return Ok(kinds);
             }
             if let StaticExpression::When { arms } = &to.node {
                 for arm in arms {
                     let next = detect_initial_object_field_kinds(
-                        &arm.body,
-                        context,
-                        stack,
-                        locals,
-                        passed,
+                        &arm.body, context, stack, locals, passed,
                     )?;
                     kinds.extend(next);
                 }
@@ -7825,10 +7822,8 @@ fn detect_top_level_bool_item_actions<'a>(
                     return Ok(output);
                 };
                 if let Some(list_binding) = current_object_list_binding {
-                    output
-                        .entry(list_binding.to_string())
-                        .or_default()
-                        .push(ObjectItemActionSpec {
+                    output.entry(list_binding.to_string()).or_default().push(
+                        ObjectItemActionSpec {
                             source_binding_suffix: source_suffix.to_string(),
                             kind,
                             action: ObjectItemActionKind::UpdateBindings {
@@ -7839,7 +7834,8 @@ fn detect_top_level_bool_item_actions<'a>(
                                 text_updates: Vec::new(),
                                 payload_filter,
                             },
-                        });
+                        },
+                    );
                 }
                 return Ok(output);
             }
@@ -7894,7 +7890,9 @@ fn bool_item_event_update(
     expression: &StaticSpannedExpression,
 ) -> Result<Option<(bool, Option<String>)>, String> {
     match &expression.node {
-        StaticExpression::Then { body } => Ok(extract_bool_literal_opt(body)?.map(|value| (value, None))),
+        StaticExpression::Then { body } => {
+            Ok(extract_bool_literal_opt(body)?.map(|value| (value, None)))
+        }
         StaticExpression::When { arms } => {
             for arm in arms {
                 let payload_filter = match &arm.pattern {
@@ -7999,9 +7997,19 @@ fn detect_top_level_object_field_plan<'a>(
                 }
             }
         }
-        StaticExpression::Pipe { from, to } if matches!(&to.node, StaticExpression::Hold { .. }) => {
-            let initial =
-                detect_top_level_object_field_plan(target_base, from, context, field_kinds, stack, locals, passed, current_object_list_binding)?;
+        StaticExpression::Pipe { from, to }
+            if matches!(&to.node, StaticExpression::Hold { .. }) =>
+        {
+            let initial = detect_top_level_object_field_plan(
+                target_base,
+                from,
+                context,
+                field_kinds,
+                stack,
+                locals,
+                passed,
+                current_object_list_binding,
+            )?;
             merge_top_level_object_field_plan(&mut plan, initial);
             if let StaticExpression::Hold { body, .. } = &to.node {
                 let dynamic = detect_top_level_object_field_plan(
@@ -8036,8 +8044,8 @@ fn detect_top_level_object_field_plan<'a>(
             if let Some(source_binding_name) = alias_binding_name(from)? {
                 let resolved = resolve_named_binding(source_binding_name, context, locals, stack)?;
                 let rewritten = match &to.node {
-                    StaticExpression::Then { body } => Some(
-                        rewrite_top_level_object_field_plan_from_body(
+                    StaticExpression::Then { body } => {
+                        Some(rewrite_top_level_object_field_plan_from_body(
                             target_base,
                             source_binding_name,
                             resolved,
@@ -8048,8 +8056,8 @@ fn detect_top_level_object_field_plan<'a>(
                             locals,
                             passed,
                             current_object_list_binding,
-                        )?,
-                    ),
+                        )?)
+                    }
                     _ => None,
                 };
                 stack.pop();
@@ -8272,6 +8280,7 @@ fn rewrite_object_item_action_from_body(
     let ObjectItemActionKind::UpdateBindings { payload_filter, .. } = &action.action else {
         return Ok(action.clone());
     };
+    let action_event_name = ui_event_name(&action.kind);
     let mut scalar_updates = Vec::new();
     let mut text_updates = Vec::new();
     for variable in &object.variables {
@@ -8309,6 +8318,25 @@ fn rewrite_object_item_action_from_body(
                     text_updates.push(ItemTextUpdate::SetFromField { binding, field });
                     continue;
                 }
+                if let Some(event_name) = action_event_name {
+                    if item_event_text_source(
+                        &variable.node.value,
+                        context,
+                        locals,
+                        passed,
+                        &action.source_binding_suffix,
+                        event_name,
+                    )? {
+                        match event_name {
+                            "key_down" => text_updates.push(ItemTextUpdate::SetFromInputSource {
+                                binding,
+                                source_suffix: action.source_binding_suffix.clone(),
+                            }),
+                            _ => text_updates.push(ItemTextUpdate::SetFromPayload { binding }),
+                        }
+                        continue;
+                    }
+                }
             }
         }
     }
@@ -8333,7 +8361,10 @@ fn merge_top_level_object_field_plan(
     into.scalar_initials.extend(next.scalar_initials);
     into.text_initials.extend(next.text_initials);
     for (binding, actions) in next.item_actions {
-        into.item_actions.entry(binding).or_default().extend(actions);
+        into.item_actions
+            .entry(binding)
+            .or_default()
+            .extend(actions);
     }
 }
 
@@ -8364,7 +8395,10 @@ fn detect_item_event_source(
     let Some(suffix) = path.strip_prefix("__item__.") else {
         return Ok(None);
     };
-    Ok(Some(format!("{suffix}:{}", parts[event_index + 1].as_str())))
+    Ok(Some(format!(
+        "{suffix}:{}",
+        parts[event_index + 1].as_str()
+    )))
 }
 
 fn object_literal_item_update_action(
@@ -8558,6 +8592,7 @@ fn build_static_object_list_item<'a>(
         bool_fields: BTreeMap::new(),
         scalar_fields: BTreeMap::new(),
         object_lists: BTreeMap::new(),
+        nested_item_actions: BTreeMap::new(),
     };
     for variable in &object.variables {
         let name = variable.node.name.as_str();
@@ -8567,8 +8602,9 @@ fn build_static_object_list_item<'a>(
         let value = resolve_static_object_field_expression(expression, functions, name)
             .unwrap_or(&variable.node.value);
         if name == "title" {
-            if let Some(title) = resolve_initial_static_object_text_field(value, functions, "title")?
-                .or_else(|| static_text_item(value).ok())
+            if let Some(title) =
+                resolve_initial_static_object_text_field(value, functions, "title")?
+                    .or_else(|| static_text_item(value).ok())
             {
                 item.title = title;
                 continue;
@@ -8773,10 +8809,6 @@ fn detect_dynamic_object_list_item<'a>(
 > {
     let object = resolve_static_object_runtime_expression(expression, functions)?
         .ok_or_else(|| "expected object runtime item".to_string())?;
-    let title = resolve_initial_static_object_text_field(expression, functions, "title")?;
-    let Some(title) = title else {
-        return Ok(None);
-    };
     let bool_fields = detect_dynamic_object_bool_fields(expression, functions)?;
     let mut item_actions = Vec::new();
     let mut global_actions = Vec::new();
@@ -8821,20 +8853,69 @@ fn detect_dynamic_object_list_item<'a>(
     }
     let mut item = ObjectListItem {
         id,
-        title,
+        title: resolve_initial_static_object_text_field(expression, functions, "title")?
+            .unwrap_or_default(),
         completed: initial_completed,
         text_fields: BTreeMap::new(),
         bool_fields: initial_extra_bools,
         scalar_fields: BTreeMap::new(),
         object_lists: BTreeMap::new(),
+        nested_item_actions: BTreeMap::new(),
     };
     for variable in &object.variables {
         let name = variable.node.name.as_str();
-        if name.is_empty() || name == "title" || name == "completed" {
+        if name.is_empty() || name == "completed" {
             continue;
         }
         let value = resolve_static_object_field_expression(expression, functions, name)
             .unwrap_or(&variable.node.value);
+        if name == "title" {
+            if let Some(value) = resolve_initial_static_object_text_field(value, functions, name)?
+                .or_else(|| static_text_item(value).ok())
+            {
+                item.title = value;
+                continue;
+            }
+        }
+        if let Some((nested_items, nested_updates, nested_actions, nested_globals)) =
+            detect_object_list_pipeline(
+                value,
+                &BTreeMap::new(),
+                functions,
+                &format!("__item__.{name}"),
+            )?
+        {
+            if !nested_globals.is_empty() {
+                return Ok(None);
+            }
+            item.object_lists.insert(name.to_string(), nested_items);
+            if !nested_actions.is_empty() {
+                item.nested_item_actions
+                    .insert(name.to_string(), nested_actions);
+            }
+            for ((trigger_binding, event_name), update) in nested_updates {
+                let Some(kind) = ui_event_kind_for_name(&event_name) else {
+                    continue;
+                };
+                let action = match update {
+                    ObjectListUpdate::AppendObject { item: appended, .. } => {
+                        ObjectItemActionKind::UpdateNestedObjectLists {
+                            updates: vec![NestedObjectListAction::AppendObject {
+                                field: name.to_string(),
+                                item: appended,
+                            }],
+                        }
+                    }
+                    _ => return Ok(None),
+                };
+                item_actions.push(ObjectItemActionSpec {
+                    source_binding_suffix: trigger_binding,
+                    kind,
+                    action,
+                });
+            }
+            continue;
+        }
         if let Some(value) = extract_integer_literal_opt(value)? {
             item.scalar_fields.insert(name.to_string(), value);
             continue;
@@ -8843,9 +8924,8 @@ fn detect_dynamic_object_list_item<'a>(
             item.bool_fields.entry(name.to_string()).or_insert(value);
             continue;
         }
-        if let Some(value) =
-            resolve_initial_static_object_text_field(value, functions, name)?
-                .or_else(|| static_text_item(value).ok())
+        if let Some(value) = resolve_initial_static_object_text_field(value, functions, name)?
+            .or_else(|| static_text_item(value).ok())
         {
             item.text_fields.insert(name.to_string(), value);
             continue;
@@ -8906,7 +8986,7 @@ fn detect_dynamic_object_title_action(
     else {
         return Ok(None);
     };
-    if event_name != "change" || payload_field != "text" {
+    if !matches!(event_name.as_str(), "change" | "input") || payload_field != "text" {
         return Ok(None);
     }
     let Some((trim, reject_empty, payload_filter)) = title_event_update(trigger_then)? else {
@@ -9115,6 +9195,15 @@ fn detect_object_list_append_update<'a>(
             );
         }
     };
+    if let Some(update) = detect_static_object_append_update(
+        source_expression,
+        target_expression,
+        path_bindings,
+        binding_path,
+        functions,
+    )? {
+        return Ok(update);
+    }
     if !object_append_target_supported(target_expression, functions) {
         return Err(
             "runtime object list append subset requires a supported object item factory"
@@ -9148,6 +9237,33 @@ fn detect_object_list_append_update<'a>(
     ))
 }
 
+fn detect_static_object_append_update<'a>(
+    source_expression: &'a StaticSpannedExpression,
+    target_expression: &'a StaticSpannedExpression,
+    path_bindings: &BTreeMap<String, &'a StaticSpannedExpression>,
+    binding_path: &str,
+    functions: &BTreeMap<String, FunctionSpec<'a>>,
+) -> Result<Option<((String, String), ObjectListUpdate)>, String> {
+    let StaticExpression::Then { body } = &target_expression.node else {
+        return Ok(None);
+    };
+    if !object_runtime_item_supported(body, functions) {
+        return Ok(None);
+    }
+    let Some((trigger_binding, event_name)) =
+        canonical_event_source_path(source_expression, path_bindings, binding_path)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        (trigger_binding, event_name),
+        ObjectListUpdate::AppendObject {
+            binding: binding_path.to_string(),
+            item: build_static_object_list_item(body, functions, 0)?,
+        },
+    )))
+}
+
 fn object_append_target_supported<'a>(
     expression: &'a StaticSpannedExpression,
     functions: &BTreeMap<String, FunctionSpec<'a>>,
@@ -9159,6 +9275,16 @@ fn object_append_target_supported<'a>(
         && functions.contains_key(path[0].as_str())
         && resolve_static_object_field_expression(expression, functions, "title").is_some()
         && resolve_static_object_field_expression(expression, functions, "completed").is_some()
+}
+
+fn object_runtime_item_supported<'a>(
+    expression: &'a StaticSpannedExpression,
+    functions: &BTreeMap<String, FunctionSpec<'a>>,
+) -> bool {
+    resolve_static_object_runtime_expression(expression, functions)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn object_append_bool_field_defaults<'a>(
@@ -9922,10 +10048,19 @@ fn text_event_update(
         canonical_event_payload_source_path(expression, path_bindings, binding_path)?
     {
         if payload_field == "text" {
+            let key_down_text = event_name == "key_down";
             return Ok(Some((
                 (trigger_binding, event_name),
-                TextUpdate::SetFromPayload {
-                    binding: binding_path.to_string(),
+                if key_down_text {
+                    TextUpdate::SetFromInput {
+                        binding: binding_path.to_string(),
+                        source_binding: binding_path.to_string(),
+                        payload_filter: None,
+                    }
+                } else {
+                    TextUpdate::SetFromPayload {
+                        binding: binding_path.to_string(),
+                    }
                 },
             )));
         }
@@ -9942,7 +10077,8 @@ fn text_event_update(
     if let Some((trigger_binding, event_name)) =
         canonical_event_source_path(trigger_source, path_bindings, binding_path)?
     {
-        if let Some(update) = text_update_from_body(trigger_then, path_bindings, binding_path, None)?
+        if let Some(update) =
+            text_update_from_body(trigger_then, path_bindings, binding_path, None)?
         {
             return Ok(Some(((trigger_binding, event_name), update)));
         }
@@ -9956,8 +10092,7 @@ fn text_event_update(
 
     match &trigger_then.node {
         StaticExpression::Then { body } => {
-            let Some(update) =
-                text_update_from_body(body, path_bindings, binding_path, None)?
+            let Some(update) = text_update_from_body(body, path_bindings, binding_path, None)?
             else {
                 return Ok(None);
             };
@@ -9976,10 +10111,19 @@ fn text_event_update(
                                 }) if parts.len() == 1 && parts[0].as_str() == name.as_str()
                             )
                         {
+                            let key_down_text = event_name == "key_down";
                             return Ok(Some((
                                 (trigger_binding, event_name),
-                                TextUpdate::SetFromPayload {
-                                    binding: binding_path.to_string(),
+                                if key_down_text {
+                                    TextUpdate::SetFromInput {
+                                        binding: binding_path.to_string(),
+                                        source_binding: binding_path.to_string(),
+                                        payload_filter: None,
+                                    }
+                                } else {
+                                    TextUpdate::SetFromPayload {
+                                        binding: binding_path.to_string(),
+                                    }
                                 },
                             )));
                         }
@@ -9991,7 +10135,8 @@ fn text_event_update(
                             path_bindings,
                             binding_path,
                             Some(tag.as_str().to_string()),
-                        )? else {
+                        )?
+                        else {
                             continue;
                         };
                         return Ok(Some(((trigger_binding, event_name), update)));
@@ -10011,6 +10156,23 @@ fn text_update_from_body(
     binding_path: &str,
     payload_filter: Option<String>,
 ) -> Result<Option<TextUpdate>, String> {
+    if let Some((_trigger_binding, event_name, payload_field)) =
+        canonical_event_payload_source_path(expression, path_bindings, binding_path)?
+    {
+        if payload_field == "text" {
+            return Ok(Some(if event_name == "key_down" {
+                TextUpdate::SetFromInput {
+                    binding: binding_path.to_string(),
+                    source_binding: binding_path.to_string(),
+                    payload_filter,
+                }
+            } else {
+                TextUpdate::SetFromPayload {
+                    binding: binding_path.to_string(),
+                }
+            }));
+        }
+    }
     if let Some(value) = extract_static_text_value(expression)? {
         return Ok(Some(TextUpdate::SetStatic {
             binding: binding_path.to_string(),
@@ -11231,11 +11393,11 @@ fn unsupported_program(error: String) -> SemanticProgram {
     SemanticProgram {
         root: SemanticNode::element(
             "section",
-            Some("WasmPro parser-backed lowering".to_string()),
+            Some("Wasm lowering".to_string()),
             Vec::new(),
             Vec::new(),
             vec![
-                SemanticNode::text("This example is not supported by Wasm Pro yet."),
+                SemanticNode::text("This example is not supported by Wasm yet."),
                 SemanticNode::text(error),
             ],
         ),
@@ -11246,13 +11408,13 @@ fn unsupported_program(error: String) -> SemanticProgram {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalBinding, LowerContext, StaticExpression, augment_top_level_bool_item_runtime,
-        augment_top_level_object_field_runtime, detect_list_plan,
-        detect_object_list_plan, detect_scalar_plan, detect_static_object_list_plan,
-        detect_text_plan, flatten_binding_paths, invocation_marker,
+        LocalBinding, LowerContext, StaticExpression, StaticSpannedExpression,
+        augment_top_level_bool_item_runtime, augment_top_level_object_field_runtime,
+        detect_list_plan, detect_object_list_plan, detect_scalar_plan,
+        detect_static_object_list_plan, detect_text_plan, flatten_binding_paths, invocation_marker,
         latest_value_spec_for_expression, lower_text_value, lower_to_semantic,
         parse_static_expressions, top_level_bindings, top_level_functions,
-        with_invoked_function_scope, StaticSpannedExpression,
+        with_invoked_function_scope,
     };
     use crate::platform::browser::engine_wasm_pro::semantic_ir::{
         IntCompareOp, ObjectItemActionKind, ObjectListFilter, RuntimeModel, ScalarUpdate,
@@ -12149,7 +12311,10 @@ document: Document/new(root: Element/stripe(
         let RuntimeModel::State(model) = &program.runtime else {
             panic!("expected state runtime model for text binding branch");
         };
-        assert_eq!(model.text_values.get("store.value").map(String::as_str), Some(""));
+        assert_eq!(
+            model.text_values.get("store.value").map(String::as_str),
+            Some("")
+        );
 
         let SemanticNode::Element { children, .. } = &program.root else {
             panic!("expected text binding root stripe");
@@ -13479,6 +13644,111 @@ document: Document/new(root: Element/button(
     }
 
     #[test]
+    fn lower_to_semantic_detects_nested_runtime_object_list_append_and_remove() {
+        let program = lower_to_semantic(
+            r#"
+FUNCTION new_cell(title) {
+    [title: title remove: LINK]
+}
+
+FUNCTION make_row() {
+    [
+        add: LINK
+        cells:
+            LIST {
+                new_cell(title: TEXT { A })
+                new_cell(title: TEXT { B })
+            }
+            |> List/append(item: add.event.press |> THEN { new_cell(title: TEXT { C }) })
+            |> List/remove(item, on: item.remove.event.press)
+    ]
+}
+
+store: [rows: LIST { make_row() }]
+
+document: Document/new(root:
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: []
+        items:
+            store.rows
+            |> List/map(row, new:
+                Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 0
+                    style: []
+                    items: LIST {
+                        Element/button(
+                            element: [event: [press: LINK]]
+                            style: []
+                            label: TEXT { Add }
+                        )
+                        |> LINK { row.add }
+
+                        Element/stripe(
+                            element: []
+                            direction: Row
+                            gap: 0
+                            style: []
+                            items:
+                                row.cells
+                                |> List/map(cell, new:
+                                    Element/stripe(
+                                        element: []
+                                        direction: Row
+                                        gap: 0
+                                        style: []
+                                        items: LIST {
+                                            Element/label(
+                                                element: []
+                                                style: []
+                                                label: cell.title
+                                            )
+                                            Element/button(
+                                                element: [event: [press: LINK]]
+                                                style: []
+                                                label: TEXT { x }
+                                            )
+                                            |> LINK { cell.remove }
+                                        }
+                                    )
+                                )
+                        )
+                    }
+                )
+            )
+    )
+)
+"#,
+            None,
+            false,
+        );
+
+        let RuntimeModel::State(model) = &program.runtime else {
+            panic!("expected state runtime model for nested runtime object list test");
+        };
+        let rows = model
+            .object_lists
+            .get("store.rows")
+            .expect("rows object list should exist");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].object_lists.get("cells").map(Vec::len), Some(2));
+
+        let SemanticNode::Element { children, .. } = &program.root else {
+            panic!("expected element root for nested runtime object list test");
+        };
+        assert!(matches!(
+            &children[0],
+            SemanticNode::ObjectList { binding, template, .. }
+                if binding == "store.rows"
+                    && semantic_tree_contains_object_list_binding(template, "__item__.cells")
+        ));
+    }
+
+    #[test]
     fn lower_to_semantic_cells_real_file_smoke() {
         let program = super::parse_and_lower(include_str!(
             "../../../../../../playground/frontend/src/examples/cells/cells.bn"
@@ -13498,7 +13768,10 @@ document: Document/new(root: Element/button(
             model.text_lists.keys().collect::<Vec<_>>(),
             model.object_lists.keys().collect::<Vec<_>>()
         );
-        assert_eq!(model.object_lists.get("all_row_cells").map(Vec::len), Some(100));
+        assert_eq!(
+            model.object_lists.get("all_row_cells").map(Vec::len),
+            Some(100)
+        );
         let first_row = model
             .object_lists
             .get("all_row_cells")
@@ -13601,18 +13874,20 @@ document: Document/new(root: Element/button(
             panic!("probe output should be a function call");
         };
         assert_eq!(path[0].as_str(), "default_formula");
-        let locals = vec![variables
-            .iter()
-            .map(|variable| {
-                (
-                    variable.node.name.as_str().to_string(),
-                    LocalBinding {
-                        expr: Some(&variable.node.value),
-                        object_base: None,
-                    },
-                )
-            })
-            .collect()];
+        let locals = vec![
+            variables
+                .iter()
+                .map(|variable| {
+                    (
+                        variable.node.name.as_str().to_string(),
+                        LocalBinding {
+                            expr: Some(&variable.node.value),
+                            object_base: None,
+                        },
+                    )
+                })
+                .collect(),
+        ];
         let marker = invocation_marker(
             "default_formula",
             arguments,
@@ -13638,18 +13913,20 @@ document: Document/new(root: Element/button(
         let StaticExpression::Block { variables, output } = &probe.node else {
             panic!("probe should be a block");
         };
-        let mut locals = vec![variables
-            .iter()
-            .map(|variable| {
-                (
-                    variable.node.name.as_str().to_string(),
-                    LocalBinding {
-                        expr: Some(&variable.node.value),
-                        object_base: None,
-                    },
-                )
-            })
-            .collect()];
+        let mut locals = vec![
+            variables
+                .iter()
+                .map(|variable| {
+                    (
+                        variable.node.name.as_str().to_string(),
+                        LocalBinding {
+                            expr: Some(&variable.node.value),
+                            object_base: None,
+                        },
+                    )
+                })
+                .collect(),
+        ];
         let StaticExpression::FunctionCall { path, arguments } = &output.node else {
             panic!("probe output should be a function call");
         };
@@ -13698,17 +13975,14 @@ document: Document/new(root: Element/button(
         let bindings = top_level_bindings(expressions);
         let functions = top_level_functions(expressions);
         let path_bindings = flatten_binding_paths(&bindings);
-        let mut scalar_plan = detect_scalar_plan(&path_bindings, &functions)
-            .expect("scalar plan should build");
-        let static_object_lists = detect_static_object_list_plan(
-            &path_bindings,
-            &functions,
-            &mut scalar_plan,
-        )
-        .expect("static object list plan should build");
+        let mut scalar_plan =
+            detect_scalar_plan(&path_bindings, &functions).expect("scalar plan should build");
+        let static_object_lists =
+            detect_static_object_list_plan(&path_bindings, &functions, &mut scalar_plan)
+                .expect("static object list plan should build");
         let text_plan = detect_text_plan(&path_bindings).expect("text plan should build");
-        let object_list_plan =
-            detect_object_list_plan(&path_bindings, &functions).expect("object list plan should build");
+        let object_list_plan = detect_object_list_plan(&path_bindings, &functions)
+            .expect("object list plan should build");
         let mut context = LowerContext {
             text_plan,
             list_plan: detect_list_plan(&path_bindings).expect("list plan should build"),
@@ -13774,7 +14048,8 @@ document: Document/new(root: Element/button(
             SemanticNode::ObjectList {
                 binding, template, ..
             } => {
-                binding == expected || semantic_tree_contains_object_list_binding(template, expected)
+                binding == expected
+                    || semantic_tree_contains_object_list_binding(template, expected)
             }
             SemanticNode::Fragment(children) | SemanticNode::Element { children, .. } => children
                 .iter()
@@ -13811,9 +14086,11 @@ document: Document/new(root: Element/button(
                     SemanticTextPart::ObjectFieldBinding(field) if field == expected_field
                 )
             }),
-            SemanticNode::Element { children, .. } | SemanticNode::Fragment(children) => children
-                .iter()
-                .any(|child| semantic_tree_contains_object_text_field_branch(child, expected_field)),
+            SemanticNode::Element { children, .. } | SemanticNode::Fragment(children) => {
+                children.iter().any(|child| {
+                    semantic_tree_contains_object_text_field_branch(child, expected_field)
+                })
+            }
             SemanticNode::BoolBranch { truthy, falsy, .. }
             | SemanticNode::ScalarCompareBranch { truthy, falsy, .. }
             | SemanticNode::ObjectScalarCompareBranch { truthy, falsy, .. }
@@ -13841,7 +14118,11 @@ document: Document/new(root: Element/button(
                     SemanticTextPart::ObjectFieldBinding(field) if field == expected_field
                 )
             }),
-            SemanticNode::Element { children, input_value, .. } => {
+            SemanticNode::Element {
+                children,
+                input_value,
+                ..
+            } => {
                 children
                     .iter()
                     .any(|child| semantic_tree_contains_object_text_binding(child, expected_field))
@@ -13903,11 +14184,9 @@ document: Document/new(root: Element/button(
                 let mut output = Vec::new();
                 if binding == expected_binding {
                     output.extend(
-                        item_actions
-                            .iter()
-                            .map(|action| {
-                                (action.source_binding_suffix.clone(), action.kind.clone())
-                            }),
+                        item_actions.iter().map(|action| {
+                            (action.source_binding_suffix.clone(), action.kind.clone())
+                        }),
                     );
                 }
                 output.extend(object_list_action_summaries(template, expected_binding));
@@ -13960,16 +14239,16 @@ document: Document/new(root: Element/button(
                     expected_kind,
                 )
             }
-            SemanticNode::Element { children, .. } | SemanticNode::Fragment(children) => children
-                .iter()
-                .any(|child| {
+            SemanticNode::Element { children, .. } | SemanticNode::Fragment(children) => {
+                children.iter().any(|child| {
                     object_list_has_item_action(
                         child,
                         expected_binding,
                         expected_suffix,
                         expected_kind,
                     )
-                }),
+                })
+            }
             SemanticNode::BoolBranch { truthy, falsy, .. }
             | SemanticNode::ScalarCompareBranch { truthy, falsy, .. }
             | SemanticNode::ObjectScalarCompareBranch { truthy, falsy, .. }
@@ -13977,13 +14256,17 @@ document: Document/new(root: Element/button(
             | SemanticNode::ObjectTextFieldBranch { truthy, falsy, .. }
             | SemanticNode::TextBindingBranch { truthy, falsy, .. }
             | SemanticNode::ListEmptyBranch { truthy, falsy, .. } => {
-                object_list_has_item_action(truthy, expected_binding, expected_suffix, expected_kind)
-                    || object_list_has_item_action(
-                        falsy,
-                        expected_binding,
-                        expected_suffix,
-                        expected_kind,
-                    )
+                object_list_has_item_action(
+                    truthy,
+                    expected_binding,
+                    expected_suffix,
+                    expected_kind,
+                ) || object_list_has_item_action(
+                    falsy,
+                    expected_binding,
+                    expected_suffix,
+                    expected_kind,
+                )
             }
             _ => false,
         }

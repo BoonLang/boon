@@ -1,4 +1,5 @@
 use boon_scene::{EventPortId, NodeId, RenderOp, RenderRoot, UiNode, UiNodeKind};
+use ulid::Ulid;
 
 use super::semantic_ir::{
     DerivedScalarOperand, IntCompareOp, RuntimeModel, SemanticAction, SemanticFactKind,
@@ -39,6 +40,7 @@ impl ExecProgram {
         Self {
             root: RenderRoot::UiTree(semantic_to_ui_root(
                 &materialized_root,
+                &[],
                 &mut setup_ops,
                 &mut event_bindings,
                 &mut fact_bindings,
@@ -60,6 +62,10 @@ fn materialize_initial_bool_branches(node: &SemanticNode, runtime: &RuntimeModel
                 .map(|child| materialize_initial_bool_branches(child, runtime))
                 .collect(),
         ),
+        SemanticNode::Keyed { key, node } => SemanticNode::Keyed {
+            key: *key,
+            node: Box::new(materialize_initial_bool_branches(node, runtime)),
+        },
         SemanticNode::Element {
             tag,
             text,
@@ -211,38 +217,52 @@ fn scalar_compare_matches(
 
 fn semantic_to_ui_root(
     node: &SemanticNode,
+    path: &[usize],
     setup_ops: &mut Vec<RenderOp>,
     event_bindings: &mut Vec<ExecEventBinding>,
     fact_bindings: &mut Vec<ExecFactBinding>,
 ) -> UiNode {
     match node {
-        SemanticNode::Fragment(children) => UiNode::new(UiNodeKind::Element {
-            tag: "div".to_string(),
-            text: None,
-            event_ports: Vec::new(),
-        })
-        .with_children(semantic_children_to_ui_nodes(
-            children,
-            setup_ops,
-            event_bindings,
-            fact_bindings,
-        )),
-        _ => semantic_to_ui_node(node, setup_ops, event_bindings, fact_bindings),
+        SemanticNode::Fragment(children) => {
+            ui_element_node(path, "div".to_string(), None, Vec::new()).with_children(
+                semantic_children_to_ui_nodes(
+                    children,
+                    path,
+                    setup_ops,
+                    event_bindings,
+                    fact_bindings,
+                ),
+            )
+        }
+        _ => semantic_to_ui_node(node, path, setup_ops, event_bindings, fact_bindings),
     }
 }
 
 fn semantic_children_to_ui_nodes(
     nodes: &[SemanticNode],
+    parent_path: &[usize],
     setup_ops: &mut Vec<RenderOp>,
     event_bindings: &mut Vec<ExecEventBinding>,
     fact_bindings: &mut Vec<ExecFactBinding>,
 ) -> Vec<UiNode> {
     let mut output = Vec::new();
-    for node in nodes {
+    for (index, node) in nodes.iter().enumerate() {
         match node {
             SemanticNode::Fragment(children) => {
+                let path_for_child = child_path(parent_path, index);
                 output.extend(semantic_children_to_ui_nodes(
                     children,
+                    &path_for_child,
+                    setup_ops,
+                    event_bindings,
+                    fact_bindings,
+                ));
+            }
+            SemanticNode::Keyed { key, node } => {
+                let path_for_child = keyed_child_path(parent_path, *key);
+                output.push(semantic_to_ui_node(
+                    node,
+                    &path_for_child,
                     setup_ops,
                     event_bindings,
                     fact_bindings,
@@ -251,15 +271,14 @@ fn semantic_children_to_ui_nodes(
             SemanticNode::TextList {
                 values, template, ..
             } => {
-                output.extend(values.iter().map(|value| {
-                    let child = UiNode::new(UiNodeKind::Element {
-                        tag: template.tag.clone(),
-                        text: None,
-                        event_ports: Vec::new(),
-                    })
-                    .with_children(vec![UiNode::new(UiNodeKind::Text {
-                        text: format!("{}{}{}", template.prefix, value, template.suffix),
-                    })]);
+                let path_for_child = child_path(parent_path, index);
+                output.extend(values.iter().enumerate().map(|(list_index, value)| {
+                    let item_path = child_path(&path_for_child, list_index);
+                    let child = ui_element_node(&item_path, template.tag.clone(), None, Vec::new())
+                        .with_children(vec![ui_text_node(
+                            &child_path(&item_path, 0),
+                            format!("{}{}{}", template.prefix, value, template.suffix),
+                        )]);
                     for (name, property_value) in &template.properties {
                         setup_ops.push(RenderOp::SetProperty {
                             id: child.id,
@@ -270,12 +289,16 @@ fn semantic_children_to_ui_nodes(
                     child
                 }));
             }
-            _ => output.push(semantic_to_ui_node(
-                node,
-                setup_ops,
-                event_bindings,
-                fact_bindings,
-            )),
+            _ => {
+                let path_for_child = child_path(parent_path, index);
+                output.push(semantic_to_ui_node(
+                    node,
+                    &path_for_child,
+                    setup_ops,
+                    event_bindings,
+                    fact_bindings,
+                ))
+            }
         }
     }
     output
@@ -283,22 +306,30 @@ fn semantic_children_to_ui_nodes(
 
 fn semantic_to_ui_node(
     node: &SemanticNode,
+    path: &[usize],
     setup_ops: &mut Vec<RenderOp>,
     exec_event_bindings: &mut Vec<ExecEventBinding>,
     exec_fact_bindings: &mut Vec<ExecFactBinding>,
 ) -> UiNode {
     match node {
-        SemanticNode::Fragment(children) => UiNode::new(UiNodeKind::Element {
-            tag: "div".to_string(),
-            text: None,
-            event_ports: Vec::new(),
-        })
-        .with_children(semantic_children_to_ui_nodes(
-            children,
+        SemanticNode::Fragment(children) => {
+            ui_element_node(path, "div".to_string(), None, Vec::new()).with_children(
+                semantic_children_to_ui_nodes(
+                    children,
+                    path,
+                    setup_ops,
+                    exec_event_bindings,
+                    exec_fact_bindings,
+                ),
+            )
+        }
+        SemanticNode::Keyed { node, .. } => semantic_to_ui_node(
+            node,
+            path,
             setup_ops,
             exec_event_bindings,
             exec_fact_bindings,
-        )),
+        ),
         SemanticNode::Element {
             tag,
             text,
@@ -309,13 +340,12 @@ fn semantic_to_ui_node(
             fact_bindings,
             children,
         } => {
-            let event_ports: Vec<EventPortId> =
-                event_bindings.iter().map(|_| EventPortId::new()).collect();
-            let node = UiNode::new(UiNodeKind::Element {
-                tag: tag.clone(),
-                text: text.clone(),
-                event_ports: event_ports.clone(),
-            });
+            let event_ports: Vec<EventPortId> = event_bindings
+                .iter()
+                .enumerate()
+                .map(|(index, binding)| stable_event_port_id(path, index, &binding.kind))
+                .collect();
+            let node = ui_element_node(path, tag.clone(), text.clone(), event_ports.clone());
             let node_id = node.id;
             for (name, value) in properties {
                 setup_ops.push(RenderOp::SetProperty {
@@ -345,62 +375,79 @@ fn semantic_to_ui_node(
             }
             let children = semantic_children_to_ui_nodes(
                 children,
+                path,
                 setup_ops,
                 exec_event_bindings,
                 exec_fact_bindings,
             );
             node.with_children(children)
         }
-        SemanticNode::Text(text) => UiNode::new(UiNodeKind::Text { text: text.clone() }),
-        SemanticNode::TextTemplate { value, .. } => UiNode::new(UiNodeKind::Text {
-            text: value.clone(),
-        }),
-        SemanticNode::TextBindingBranch { falsy, .. } => {
-            semantic_to_ui_node(falsy, setup_ops, exec_event_bindings, exec_fact_bindings)
-        }
-        SemanticNode::BoolBranch { falsy, .. } => {
-            semantic_to_ui_node(falsy, setup_ops, exec_event_bindings, exec_fact_bindings)
-        }
-        SemanticNode::ScalarCompareBranch { falsy, .. } => {
-            semantic_to_ui_node(falsy, setup_ops, exec_event_bindings, exec_fact_bindings)
-        }
-        SemanticNode::ObjectScalarCompareBranch { falsy, .. } => {
-            semantic_to_ui_node(falsy, setup_ops, exec_event_bindings, exec_fact_bindings)
-        }
-        SemanticNode::ObjectBoolFieldBranch { falsy, .. } => {
-            semantic_to_ui_node(falsy, setup_ops, exec_event_bindings, exec_fact_bindings)
-        }
-        SemanticNode::ObjectTextFieldBranch { falsy, .. } => {
-            semantic_to_ui_node(falsy, setup_ops, exec_event_bindings, exec_fact_bindings)
-        }
-        SemanticNode::ListEmptyBranch { falsy, .. } => {
-            semantic_to_ui_node(falsy, setup_ops, exec_event_bindings, exec_fact_bindings)
-        }
-        SemanticNode::ScalarValue { value, .. } => UiNode::new(UiNodeKind::Text {
-            text: value.to_string(),
-        }),
-        SemanticNode::ObjectFieldValue { .. } => UiNode::new(UiNodeKind::Text {
-            text: String::new(),
-        }),
+        SemanticNode::Text(text) => ui_text_node(path, text.clone()),
+        SemanticNode::TextTemplate { value, .. } => ui_text_node(path, value.clone()),
+        SemanticNode::TextBindingBranch { falsy, .. } => semantic_to_ui_node(
+            falsy,
+            path,
+            setup_ops,
+            exec_event_bindings,
+            exec_fact_bindings,
+        ),
+        SemanticNode::BoolBranch { falsy, .. } => semantic_to_ui_node(
+            falsy,
+            path,
+            setup_ops,
+            exec_event_bindings,
+            exec_fact_bindings,
+        ),
+        SemanticNode::ScalarCompareBranch { falsy, .. } => semantic_to_ui_node(
+            falsy,
+            path,
+            setup_ops,
+            exec_event_bindings,
+            exec_fact_bindings,
+        ),
+        SemanticNode::ObjectScalarCompareBranch { falsy, .. } => semantic_to_ui_node(
+            falsy,
+            path,
+            setup_ops,
+            exec_event_bindings,
+            exec_fact_bindings,
+        ),
+        SemanticNode::ObjectBoolFieldBranch { falsy, .. } => semantic_to_ui_node(
+            falsy,
+            path,
+            setup_ops,
+            exec_event_bindings,
+            exec_fact_bindings,
+        ),
+        SemanticNode::ObjectTextFieldBranch { falsy, .. } => semantic_to_ui_node(
+            falsy,
+            path,
+            setup_ops,
+            exec_event_bindings,
+            exec_fact_bindings,
+        ),
+        SemanticNode::ListEmptyBranch { falsy, .. } => semantic_to_ui_node(
+            falsy,
+            path,
+            setup_ops,
+            exec_event_bindings,
+            exec_fact_bindings,
+        ),
+        SemanticNode::ScalarValue { value, .. } => ui_text_node(path, value.to_string()),
+        SemanticNode::ObjectFieldValue { .. } => ui_text_node(path, String::new()),
         SemanticNode::TextList {
             values, template, ..
-        } => UiNode::new(UiNodeKind::Element {
-            tag: "div".to_string(),
-            text: None,
-            event_ports: Vec::new(),
-        })
-        .with_children(
+        } => ui_element_node(path, "div".to_string(), None, Vec::new()).with_children(
             values
                 .iter()
-                .map(|value| {
-                    let child = UiNode::new(UiNodeKind::Element {
-                        tag: template.tag.clone(),
-                        text: None,
-                        event_ports: Vec::new(),
-                    })
-                    .with_children(vec![UiNode::new(UiNodeKind::Text {
-                        text: format!("{}{}{}", template.prefix, value, template.suffix),
-                    })]);
+                .enumerate()
+                .map(|(index, value)| {
+                    let item_path = child_path(path, index);
+                    let child = ui_element_node(&item_path, template.tag.clone(), None, Vec::new())
+                        .with_children(vec![ui_text_node(
+                            &child_path(&item_path, 0),
+                            format!("{}{}{}", template.prefix, value, template.suffix),
+                        )]);
                     for (name, property_value) in &template.properties {
                         setup_ops.push(RenderOp::SetProperty {
                             id: child.id,
@@ -412,11 +459,115 @@ fn semantic_to_ui_node(
                 })
                 .collect(),
         ),
-        SemanticNode::ObjectList { .. } => UiNode::new(UiNodeKind::Element {
-            tag: "div".to_string(),
-            text: None,
-            event_ports: Vec::new(),
-        }),
+        SemanticNode::ObjectList { .. } => {
+            ui_element_node(path, "div".to_string(), None, Vec::new())
+        }
+    }
+}
+
+fn child_path(path: &[usize], index: usize) -> Vec<usize> {
+    let mut child_path = path.to_vec();
+    child_path.push(index);
+    child_path
+}
+
+fn keyed_child_path(path: &[usize], key: u64) -> Vec<usize> {
+    let mut keyed_path = path.to_vec();
+    keyed_path.push(usize::MAX);
+    keyed_path.push((key >> 32) as usize);
+    keyed_path.push((key & 0xFFFF_FFFF) as usize);
+    keyed_path
+}
+
+fn ui_element_node(
+    path: &[usize],
+    tag: String,
+    text: Option<String>,
+    event_ports: Vec<EventPortId>,
+) -> UiNode {
+    UiNode {
+        id: stable_node_id(path),
+        kind: UiNodeKind::Element {
+            tag,
+            text,
+            event_ports,
+        },
+        children: Vec::new(),
+    }
+}
+
+fn ui_text_node(path: &[usize], text: String) -> UiNode {
+    UiNode {
+        id: stable_node_id(path),
+        kind: UiNodeKind::Text { text },
+        children: Vec::new(),
+    }
+}
+
+fn stable_node_id(path: &[usize]) -> NodeId {
+    NodeId(Ulid::from_bytes(stable_ulid_bytes(b"node", path, 0, None)))
+}
+
+fn stable_event_port_id(
+    path: &[usize],
+    index: usize,
+    kind: &boon_scene::UiEventKind,
+) -> EventPortId {
+    EventPortId(Ulid::from_bytes(stable_ulid_bytes(
+        b"port",
+        path,
+        index as u64,
+        Some(kind_tag(kind)),
+    )))
+}
+
+fn stable_ulid_bytes(namespace: &[u8], path: &[usize], extra: u64, tag: Option<&str>) -> [u8; 16] {
+    let left = stable_hash64(namespace, path, extra, tag);
+    let right = stable_hash64(
+        b"boon-wasm-pro-v2",
+        path,
+        extra ^ 0x9E37_79B9_7F4A_7C15,
+        tag,
+    );
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&left.to_be_bytes());
+    bytes[8..].copy_from_slice(&right.to_be_bytes());
+    bytes
+}
+
+fn stable_hash64(namespace: &[u8], path: &[usize], extra: u64, tag: Option<&str>) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn write(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(PRIME);
+        }
+    }
+
+    let mut hash = OFFSET;
+    write(&mut hash, namespace);
+    for segment in path {
+        write(&mut hash, &(*segment as u64).to_be_bytes());
+    }
+    write(&mut hash, &extra.to_be_bytes());
+    if let Some(tag) = tag {
+        write(&mut hash, tag.as_bytes());
+    }
+    hash
+}
+
+fn kind_tag(kind: &boon_scene::UiEventKind) -> &str {
+    match kind {
+        boon_scene::UiEventKind::Click => "Click",
+        boon_scene::UiEventKind::DoubleClick => "DoubleClick",
+        boon_scene::UiEventKind::Input => "Input",
+        boon_scene::UiEventKind::Change => "Change",
+        boon_scene::UiEventKind::KeyDown => "KeyDown",
+        boon_scene::UiEventKind::Blur => "Blur",
+        boon_scene::UiEventKind::Focus => "Focus",
+        boon_scene::UiEventKind::Custom(name) => name.as_str(),
     }
 }
 

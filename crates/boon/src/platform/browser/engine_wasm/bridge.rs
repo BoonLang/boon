@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::Instant;
 
 use boon_renderer_zoon::{custom_call_placeholder, unknown_placeholder, with_render_root};
 use boon_scene::PhysicalSceneParams;
@@ -31,27 +32,18 @@ const LIST_MAP_NESTED_CHUNK_SIZE: usize = 1;
 const LIST_MAP_INCREMENTAL_YIELD_MS: u32 = 0;
 const RUNTIME_RESOLVE_DEPTH_LIMIT: u32 = 128;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct LegacyWasmBridgeMetrics {
+    pub initial_materialize_millis: u128,
+    pub edit_entry_proxy_millis: u128,
+    pub dependent_recompute_proxy_millis: u128,
+    pub visible_cell_count: usize,
+}
+
 #[derive(Clone, Copy)]
 struct ListMapRenderPlan {
     use_incremental: bool,
     chunk_size: usize,
-}
-
-fn list_map_render_plan(
-    parent_item_ctx: Option<&ItemContext>,
-    item_count: usize,
-) -> ListMapRenderPlan {
-    if parent_item_ctx.is_some() {
-        ListMapRenderPlan {
-            use_incremental: item_count > LIST_MAP_NESTED_INCREMENTAL_THRESHOLD,
-            chunk_size: LIST_MAP_NESTED_CHUNK_SIZE,
-        }
-    } else {
-        ListMapRenderPlan {
-            use_incremental: item_count > LIST_MAP_TOP_LEVEL_INCREMENTAL_THRESHOLD,
-            chunk_size: LIST_MAP_TOP_LEVEL_CHUNK_SIZE,
-        }
-    }
 }
 
 #[pin_project]
@@ -77,7 +69,7 @@ where
 
 /// Build the Zoon element tree for the given IR program and WASM instance.
 /// The tag_table is cloned for reactive text display.
-pub fn build_ui(program: &IrProgram, instance: Rc<WasmInstance>) -> RawElOrText {
+pub(super) fn build_ui(program: &IrProgram, instance: Rc<WasmInstance>) -> RawElOrText {
     with_render_root(program.render_root(), |render_root| {
         initialize_scene_params(&instance);
         build_cell_element(program, &instance, render_root.root)
@@ -89,7 +81,7 @@ pub fn build_ui(program: &IrProgram, instance: Rc<WasmInstance>) -> RawElOrText 
 /// - When RouterGoTo source changes, updates route cell + pushes history.
 /// - Listens for popstate events to update route cell.
 /// Must be called BEFORE call_init() so WHEN/WHILE arms see the correct route text.
-pub fn setup_router(program: &IrProgram, instance: &Rc<WasmInstance>) {
+pub(super) fn setup_router(program: &IrProgram, instance: &Rc<WasmInstance>) {
     // Find the route cell (named "route") and its event (EventSource::Router).
     let mut route_cell = None;
     let mut route_event = None;
@@ -229,7 +221,7 @@ fn build_element(
                 BuildContext::Item(item_ctx) => {
                     build_item_text_from_segments(instance, item_ctx, parts)
                 }
-                BuildContext::Global => build_text_interpolation(instance, parts),
+                BuildContext::Global => build_text_from_segments(instance, parts),
             },
             IrNode::PipeThrough { source, .. } => build_element(program, instance, ctx, *source),
             IrNode::While { source, arms, .. } => {
@@ -269,26 +261,9 @@ fn build_element(
             | IrNode::ListRemove { source, .. }
             | IrNode::ListRetain { source, .. }
             | IrNode::RouterGoTo { source, .. } => build_element(program, instance, ctx, *source),
-            IrNode::ListMap {
-                source,
-                item_name,
-                item_cell,
-                template,
-                template_cell_range,
-                template_event_range,
-                ..
-            } => build_list_map(
-                program,
-                instance,
-                ctx.item_ctx().cloned(),
-                cell,
-                *source,
-                *item_cell,
-                item_name,
-                template,
-                *template_cell_range,
-                *template_event_range,
-            ),
+            IrNode::ListMap { .. } => {
+                legacy_build_list_map(program, instance, ctx.item_ctx().cloned(), cell)
+            }
             IrNode::Document { root, .. } => build_element(program, instance, ctx, *root),
             IrNode::CustomCall { path, .. } => custom_call_placeholder(path),
             _ => unknown_placeholder(),
@@ -319,9 +294,23 @@ fn build_reactive_text(instance: &Rc<WasmInstance>, cell: CellId) -> RawElOrText
     let program = instance.program.clone();
     let cell_id = cell.0;
     let signal = store.get_revision_signal();
-    zoon::Text::with_signal(
-        signal.map(move |_| format_runtime_cell_value(&program, &store, CellId(cell_id))),
-    )
+    zoon::Text::with_signal(signal.map(move |_| {
+        match resolve_runtime_cell_expr_with_bindings(
+            &program,
+            &store,
+            CellId(cell_id),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap_or(IrExpr::CellRead(CellId(cell_id)))
+        {
+            IrExpr::Constant(IrValue::Text(text)) => text,
+            IrExpr::Constant(IrValue::Number(number)) => format_number(number),
+            IrExpr::Constant(IrValue::Tag(tag)) => tag,
+            IrExpr::CellRead(next) => format_cell_value(&store, next.0),
+            _ => format_cell_value(&store, cell_id),
+        }
+    }))
     .unify()
 }
 
@@ -350,44 +339,212 @@ fn format_cell_value(store: &super::runtime::CellStore, cell_id: u32) -> String 
     }
 }
 
+pub(super) fn cells_bridge_metrics_for_program(
+    program: &IrProgram,
+) -> Result<LegacyWasmBridgeMetrics, String> {
+    let cell_store = CellStore::new(program.cells.len());
+    let list_store = ListStore::new();
+    let template_list_items = Rc::new(RefCell::new(HashMap::new()));
+
+    let (inner_map_cell, inner_source_cell, inner_item_cell, inner_template_cell_range) = program
+        .nodes
+        .iter()
+        .find_map(|node| match node {
+            IrNode::ListMap {
+                cell,
+                source,
+                item_name,
+                item_cell,
+                template_cell_range,
+                ..
+            } if item_name == "cell" => Some((*cell, *source, *item_cell, *template_cell_range)),
+            _ => None,
+        })
+        .ok_or_else(|| "legacy cells bridge metrics: missing inner cell list map".to_string())?;
+
+    let (outer_map_cell, outer_item_cell) = program
+        .nodes
+        .iter()
+        .find_map(|node| match node {
+            IrNode::ListMap {
+                cell,
+                item_name,
+                item_cell,
+                template_cell_range,
+                ..
+            } if item_name == "row_data"
+                && inner_map_cell.0 >= template_cell_range.0
+                && inner_map_cell.0 < template_cell_range.1 =>
+            {
+                Some((*cell, *item_cell))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| "legacy cells bridge metrics: missing outer row list map".to_string())?;
+
+    let initial_started = Instant::now();
+    let outer_item_expr = resolve_runtime_list_item_expr(program, &cell_store, outer_map_cell, 0)
+        .ok_or_else(|| {
+        "legacy cells bridge metrics: missing first row item expr".to_string()
+    })?;
+    let outer_bindings = item_bindings(program, outer_item_cell, outer_item_cell, &outer_item_expr);
+    let inner_source_expr = resolve_runtime_cell_expr_with_bindings(
+        program,
+        &cell_store,
+        inner_source_cell,
+        0,
+        &outer_bindings,
+    )
+    .ok_or_else(|| "legacy cells bridge metrics: failed to resolve row cells expr".to_string())?;
+    let inner_list_id = legacy_materialize_template_list_expr(
+        program,
+        &list_store,
+        &template_list_items,
+        &cell_store,
+        &inner_source_expr,
+        0,
+        &outer_bindings,
+    )
+    .ok_or_else(|| {
+        "legacy cells bridge metrics: failed to materialize first row cells".to_string()
+    })?;
+    let inner_items = template_list_items
+        .borrow()
+        .get(&inner_list_id.to_bits())
+        .cloned()
+        .ok_or_else(|| "legacy cells bridge metrics: missing inner row items".to_string())?;
+    let display_value_cell = program
+        .cells
+        .iter()
+        .enumerate()
+        .find_map(|(idx, cell)| {
+            let cell_id = CellId(idx as u32);
+            (cell_id.0 >= inner_template_cell_range.0
+                && cell_id.0 < inner_template_cell_range.1
+                && cell.name.contains("display_value"))
+            .then_some(cell_id)
+        })
+        .ok_or_else(|| "legacy cells bridge metrics: missing display_value cell".to_string())?;
+    let root_cell = program
+        .list_map_plan(inner_map_cell)
+        .and_then(|plan| plan.template.root_cell)
+        .ok_or_else(|| "legacy cells bridge metrics: missing inner template root".to_string())?;
+
+    for item_expr in inner_items.iter().take(3) {
+        let bindings = item_bindings(program, inner_item_cell, inner_item_cell, item_expr);
+        let active_root = resolve_active_template_root_cell(
+            program,
+            &cell_store,
+            root_cell,
+            inner_template_cell_range,
+            &bindings,
+            &mut HashSet::new(),
+        )
+        .ok_or_else(|| "legacy cells bridge metrics: failed to resolve active root".to_string())?;
+        let _ = find_node_for_cell(program, active_root)
+            .ok_or_else(|| "legacy cells bridge metrics: active root missing".to_string())?;
+    }
+    let initial_materialize_millis = initial_started.elapsed().as_millis();
+
+    let in_template_range = |cell: CellId| {
+        cell.0 >= inner_template_cell_range.0 && cell.0 < inner_template_cell_range.1
+    };
+    let editing_row_cell = program
+        .cells
+        .iter()
+        .enumerate()
+        .find_map(|(idx, cell)| {
+            let cell_id = CellId(idx as u32);
+            (cell.name == "editing_cell.row" && !in_template_range(cell_id)).then_some(cell_id)
+        })
+        .ok_or_else(|| "legacy cells bridge metrics: missing editing_cell.row".to_string())?;
+    let editing_column_cell = program
+        .cells
+        .iter()
+        .enumerate()
+        .find_map(|(idx, cell)| {
+            let cell_id = CellId(idx as u32);
+            (cell.name == "editing_cell.column" && !in_template_range(cell_id)).then_some(cell_id)
+        })
+        .ok_or_else(|| "legacy cells bridge metrics: missing editing_cell.column".to_string())?;
+
+    let edit_started = Instant::now();
+    cell_store.set_cell_f64(editing_row_cell.0, 1.0);
+    cell_store.set_cell_f64(editing_column_cell.0, 1.0);
+    let first_bindings = item_bindings(
+        program,
+        inner_item_cell,
+        inner_item_cell,
+        inner_items
+            .first()
+            .ok_or_else(|| "legacy cells bridge metrics: missing first cell item".to_string())?,
+    );
+    let second_bindings = item_bindings(
+        program,
+        inner_item_cell,
+        inner_item_cell,
+        inner_items
+            .get(1)
+            .ok_or_else(|| "legacy cells bridge metrics: missing second cell item".to_string())?,
+    );
+    let first_active_root = resolve_active_template_root_cell(
+        program,
+        &cell_store,
+        root_cell,
+        inner_template_cell_range,
+        &first_bindings,
+        &mut HashSet::new(),
+    )
+    .ok_or_else(|| "legacy cells bridge metrics: failed to resolve first edit root".to_string())?;
+    let second_active_root = resolve_active_template_root_cell(
+        program,
+        &cell_store,
+        root_cell,
+        inner_template_cell_range,
+        &second_bindings,
+        &mut HashSet::new(),
+    )
+    .ok_or_else(|| "legacy cells bridge metrics: failed to resolve second edit root".to_string())?;
+    let _ = find_node_for_cell(program, first_active_root)
+        .ok_or_else(|| "legacy cells bridge metrics: first edit root missing".to_string())?;
+    let _ = find_node_for_cell(program, second_active_root)
+        .ok_or_else(|| "legacy cells bridge metrics: second edit root missing".to_string())?;
+    let edit_entry_proxy_millis = edit_started.elapsed().as_millis();
+
+    let recompute_started = Instant::now();
+    for item_expr in inner_items.iter().skip(1).take(2) {
+        let bindings = item_bindings(program, inner_item_cell, inner_item_cell, item_expr);
+        let value_expr = resolve_runtime_cell_expr_with_bindings(
+            program,
+            &cell_store,
+            display_value_cell,
+            0,
+            &bindings,
+        )
+        .ok_or_else(|| {
+            "legacy cells bridge metrics: failed to resolve dependent display value".to_string()
+        })?;
+        match value_expr {
+            IrExpr::Constant(IrValue::Number(_)) => {}
+            other => {
+                return Err(format!(
+                    "legacy cells bridge metrics: expected numeric dependent display value, got {other:?}"
+                ));
+            }
+        }
+    }
+    let dependent_recompute_proxy_millis = recompute_started.elapsed().as_millis();
+
+    Ok(LegacyWasmBridgeMetrics {
+        initial_materialize_millis,
+        edit_entry_proxy_millis,
+        dependent_recompute_proxy_millis,
+        visible_cell_count: inner_items.len(),
+    })
+}
+
 fn visible_tag_text(tag: &str) -> Option<String> {
     (tag != "NaN").then(|| tag.to_string())
-}
-
-fn format_runtime_cell_value(
-    program: &IrProgram,
-    store: &super::runtime::CellStore,
-    cell: CellId,
-) -> String {
-    match resolve_runtime_cell_expr(program, store, cell, 0).unwrap_or(IrExpr::CellRead(cell)) {
-        IrExpr::Constant(IrValue::Text(t)) => t,
-        IrExpr::Constant(IrValue::Number(n)) => format_number(n),
-        IrExpr::Constant(IrValue::Tag(t)) => t,
-        IrExpr::CellRead(cell) => format_cell_value(store, cell.0),
-        _ => format_cell_value(store, cell.0),
-    }
-}
-
-fn format_runtime_cell_value_with_bindings(
-    program: &IrProgram,
-    store: &super::runtime::CellStore,
-    cell: CellId,
-    bindings: &HashMap<CellId, IrExpr>,
-) -> String {
-    match resolve_runtime_cell_expr_with_bindings(program, store, cell, 0, bindings)
-        .unwrap_or(IrExpr::CellRead(cell))
-    {
-        IrExpr::Constant(IrValue::Text(text)) => text,
-        IrExpr::Constant(IrValue::Number(number)) => format_number(number),
-        IrExpr::Constant(IrValue::Tag(tag)) => visible_tag_text(&tag).unwrap_or_default(),
-        IrExpr::CellRead(next) => format_cell_value(store, next.0),
-        _ => format_cell_value(store, cell.0),
-    }
-}
-
-/// Build text from TextSegment list.
-fn build_text_interpolation(instance: &Rc<WasmInstance>, parts: &[TextSegment]) -> RawElOrText {
-    build_text_from_segments(instance, parts)
 }
 
 fn build_text_from_segments(instance: &Rc<WasmInstance>, segments: &[TextSegment]) -> RawElOrText {
@@ -1597,7 +1754,7 @@ fn extract_svg_style(style: &IrExpr, program: &IrProgram) -> (f64, f64, String) 
     let fields: &[(String, IrExpr)] = match style {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
+            reconstructed = legacy_reconstruct_object_fields(program, *cell);
             &reconstructed
         }
         _ => return (300.0, 150.0, String::new()),
@@ -1747,7 +1904,7 @@ fn extract_svg_circle_style(style: &IrExpr, program: &IrProgram) -> (String, Str
     let fields: &[(String, IrExpr)] = match style {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
+            reconstructed = legacy_reconstruct_object_fields(program, *cell);
             &reconstructed
         }
         _ => return ("blue".into(), "none".into(), 0.0),
@@ -1783,7 +1940,7 @@ fn style_defines_font_color(style: &IrExpr, program: &IrProgram) -> bool {
     let style_fields: &[(String, IrExpr)] = match style {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            reconstructed_style = reconstruct_object_fields(program, *cell);
+            reconstructed_style = legacy_reconstruct_object_fields(program, *cell);
             &reconstructed_style
         }
         _ => return false,
@@ -1798,7 +1955,7 @@ fn style_defines_font_color(style: &IrExpr, program: &IrProgram) -> bool {
         let font_fields: &[(String, IrExpr)] = match value {
             IrExpr::ObjectConstruct(fields) => fields,
             IrExpr::CellRead(cell) => {
-                reconstructed_font = reconstruct_object_fields(program, *cell);
+                reconstructed_font = legacy_reconstruct_object_fields(program, *cell);
                 &reconstructed_font
             }
             _ => continue,
@@ -2746,10 +2903,9 @@ struct ItemContext {
     item_idx: u32,
     propagation_item_idx: u32,
     item_cell_id: u32,
-    resolved_item_store_id: u32,
     template_cell_range: (u32, u32),
     template_event_range: (u32, u32),
-    item_expr: Option<IrExpr>,
+    item_bindings: Option<Rc<HashMap<CellId, IrExpr>>>,
 }
 
 impl ItemContext {
@@ -2857,23 +3013,13 @@ impl<'a> BuildContext<'a> {
 }
 
 /// Build a list map element that reactively renders items with per-item elements.
-fn build_list_map(
+fn legacy_build_list_map(
     program: &IrProgram,
     instance: &Rc<WasmInstance>,
     parent_item_ctx: Option<ItemContext>,
     map_cell: CellId,
-    source: CellId,
-    item_cell: CellId,
-    item_name: &str,
-    template: &IrNode,
-    template_cell_range: (u32, u32),
-    template_event_range: (u32, u32),
 ) -> RawElOrText {
     let store = instance.cell_store.clone();
-    let _ = item_name;
-    let _ = template;
-    let _ = template_cell_range;
-    let _ = template_event_range;
 
     let list_map_plan = program
         .list_map_plan(map_cell)
@@ -2892,7 +3038,29 @@ fn build_list_map(
     // visible source is filtered to zero items.
     let fanout_source = list_map_plan.fanout_source;
     let template_global_deps = list_map_plan.template.global_deps.clone();
+    let source = list_map_plan.source;
+    let item_cell = list_map_plan.item_cell;
     let inst = instance.clone();
+    let resolve_current_list_id =
+        |inst: &Rc<WasmInstance>, parent_item_ctx: Option<&ItemContext>, source: CellId| {
+            if let Some(parent_ctx) = parent_item_ctx {
+                if parent_ctx.is_template_cell(source) {
+                    return resolve_parent_template_list_id(
+                        &inst.program,
+                        &inst.cell_store,
+                        &inst.list_store,
+                        &inst.template_list_items,
+                        inst.item_cell_store.as_ref(),
+                        parent_ctx,
+                        source,
+                        source,
+                    )
+                    .unwrap_or_else(|| inst.cell_store.get_cell_value(source.0));
+                }
+            }
+
+            inst.cell_store.get_cell_value(source.0)
+        };
 
     // Track which items have been initialized by their stable memory index.
     // On re-renders (e.g. filter changes), existing items keep their HOLD state;
@@ -2909,7 +3077,7 @@ fn build_list_map(
         let hook_parent_item_ctx = parent_item_ctx.clone();
         inst.add_post_event_hook(Box::new(move |event_id, propagated_item_idx| {
             if cross_events.contains(&event_id) {
-                let list_id = current_list_id_for_source(
+                let list_id = resolve_current_list_id(
                     &inst_hook,
                     hook_parent_item_ctx.as_ref(),
                     fanout_source,
@@ -2995,7 +3163,7 @@ fn build_list_map(
     let dedup_template_global_deps = template_global_deps.clone();
     let deduped_signal = trigger_signal.filter_map(move |(_version, _global_revision)| {
         let current_list_id =
-            current_list_id_for_source(&inst_dedup, dedup_parent_item_ctx.as_ref(), source);
+            resolve_current_list_id(&inst_dedup, dedup_parent_item_ctx.as_ref(), source);
         let text_items = inst_dedup.list_store.items_text(current_list_id);
         let f64_items = inst_dedup.list_store.items(current_list_id);
         let item_count = if !text_items.is_empty() {
@@ -3035,8 +3203,6 @@ fn build_list_map(
     // This allows us to seed the correct text on the HOLD's source cell BEFORE
     // init_item runs, so that host_copy_text propagates the right text through
     // the entire template (including derived text interpolations like labels).
-    let field_hold_sources = list_map_plan.field_hold_sources.clone();
-
     // Build a container that reactively re-renders children when the list changes.
     RawHtmlEl::new("div")
         .style("display", "contents")
@@ -3049,7 +3215,7 @@ fn build_list_map(
                 // Re-read list_id from source cell each time — the filter loop may
                 // have replaced the list with a new filtered copy.
                 let current_list_id =
-                    current_list_id_for_source(&inst, child_parent_item_ctx.as_ref(), source);
+                    resolve_current_list_id(&inst, child_parent_item_ctx.as_ref(), source);
                 let text_items = inst.list_store.items_text(current_list_id);
                 let f64_items = inst.list_store.items(current_list_id);
                 let item_count = if !text_items.is_empty() {
@@ -3081,8 +3247,17 @@ fn build_list_map(
 
                 let program = inst.program.clone();
                 let has_pending_snapshot = inst.has_pending_snapshot();
-                let mut render_plan =
-                    list_map_render_plan(child_parent_item_ctx.as_ref(), item_count);
+                let mut render_plan = if child_parent_item_ctx.is_some() {
+                    ListMapRenderPlan {
+                        use_incremental: item_count > LIST_MAP_NESTED_INCREMENTAL_THRESHOLD,
+                        chunk_size: LIST_MAP_NESTED_CHUNK_SIZE,
+                    }
+                } else {
+                    ListMapRenderPlan {
+                        use_incremental: item_count > LIST_MAP_TOP_LEVEL_INCREMENTAL_THRESHOLD,
+                        chunk_size: LIST_MAP_TOP_LEVEL_CHUNK_SIZE,
+                    }
+                };
                 // Nested rows in examples like Cells are small, but they depend on
                 // global selector state (`editing_cell`, `editing_text`, etc.).
                 // Building them incrementally can freeze early children against a
@@ -3100,17 +3275,11 @@ fn build_list_map(
                     let program = program.clone();
                     let inst_for_task = inst.clone();
                     let initialized_for_task = initialized_indices.clone();
-                    let field_hold_sources = field_hold_sources.clone();
                     let text_items = text_items.clone();
                     let f64_items = f64_items.clone();
-                    let template_global_deps = template_global_deps.clone();
+                    let list_map_plan = list_map_plan.clone();
                     let parent_item_ctx = child_parent_item_ctx.clone();
                     let current_list_id = current_list_id;
-                    let source = source;
-                    let map_cell = map_cell;
-                    let item_cell = item_cell;
-                    let template = list_map_plan.template.clone();
-                    let resolved_item_store = resolved_item_store;
                     let has_pending_snapshot = has_pending_snapshot;
                     let global_deps_changed = global_deps_changed;
                     let item_count = item_count;
@@ -3124,23 +3293,17 @@ fn build_list_map(
                             let chunk_end = (chunk_start + render_plan.chunk_size).min(item_count);
 
                             for i in chunk_start..chunk_end {
-                                let (child, did_init) = build_list_map_child(
+                                let (child, did_init) = legacy_build_list_map_child(
                                     program.as_ref(),
                                     &inst_for_task,
                                     parent_item_ctx.as_ref(),
+                                    &list_map_plan,
                                     current_list_id,
-                                    source,
-                                    map_cell,
-                                    item_cell,
-                                    &template,
-                                    resolved_item_store,
-                                    &field_hold_sources,
                                     &initialized_for_task,
                                     &text_items,
                                     &f64_items,
                                     i,
                                     has_pending_snapshot,
-                                    &template_global_deps,
                                     global_deps_changed,
                                 );
                                 initialized_any |= did_init;
@@ -3173,23 +3336,17 @@ fn build_list_map(
                     let mut initialized_any = false;
                     let children: Vec<RawElOrText> = (0..item_count)
                         .map(|i| {
-                            let (child, did_init) = build_list_map_child(
+                            let (child, did_init) = legacy_build_list_map_child(
                                 program.as_ref(),
                                 &inst,
                                 child_parent_item_ctx.as_ref(),
+                                &list_map_plan,
                                 current_list_id,
-                                source,
-                                map_cell,
-                                item_cell,
-                                &list_map_plan.template,
-                                resolved_item_store,
-                                &field_hold_sources,
                                 &initialized_indices,
                                 &text_items,
                                 &f64_items,
                                 i,
                                 has_pending_snapshot,
-                                &template_global_deps,
                                 global_deps_changed,
                             );
                             initialized_any |= did_init;
@@ -3219,26 +3376,27 @@ fn build_list_map(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_list_map_child(
+fn legacy_build_list_map_child(
     program: &IrProgram,
     inst: &Rc<WasmInstance>,
     parent_item_ctx: Option<&ItemContext>,
+    list_map_plan: &ListMapPlan,
     current_list_id: f64,
-    source: CellId,
-    map_cell: CellId,
-    item_cell: CellId,
-    template: &TemplatePlan,
-    resolved_item_store: CellId,
-    field_hold_sources: &HashMap<String, CellId>,
     initialized_indices: &Rc<RefCell<HashSet<u32>>>,
     text_items: &[String],
     f64_items: &[f64],
     i: usize,
     has_pending_snapshot: bool,
-    template_global_deps: &[CellId],
     global_deps_changed: bool,
 ) -> (RawElOrText, bool) {
     let item_idx = inst.list_store.item_memory_index(current_list_id, i) as u32;
+    let source = list_map_plan.source;
+    let map_cell = list_map_plan.map_cell;
+    let item_cell = list_map_plan.item_cell;
+    let template = &list_map_plan.template;
+    let field_hold_sources = &list_map_plan.field_hold_sources;
+    let template_global_deps = &list_map_plan.template.global_deps;
+    let resolved_item_store = list_map_plan.resolved_item_store;
 
     if let Some(ref ics) = inst.item_cell_store {
         if !ics.has_item(item_idx) {
@@ -3258,17 +3416,58 @@ fn build_list_map_child(
         }
     }
 
-    let item_expr_for_template =
-        resolve_runtime_list_item_expr_for_context(program, inst, parent_item_ctx, map_cell, i);
+    let item_expr_for_template = if let Some(parent_ctx) = parent_item_ctx {
+        if parent_ctx.is_template_cell(list_map_plan.map_cell) {
+            if let Some(list_id) = resolve_parent_template_list_id(
+                program,
+                &inst.cell_store,
+                &inst.list_store,
+                &inst.template_list_items,
+                inst.item_cell_store.as_ref(),
+                parent_ctx,
+                list_map_plan.map_cell,
+                list_map_plan.source,
+            ) {
+                if let Some(items) = inst.template_list_items.borrow().get(&list_id.to_bits()) {
+                    if let Some(item) = items.get(i) {
+                        if let Some(bindings) = parent_ctx.item_bindings.as_deref() {
+                            Some(normalize_runtime_item_expr_with_bindings(
+                                program,
+                                &inst.cell_store,
+                                item,
+                                0,
+                                bindings,
+                            ))
+                        } else {
+                            Some(item.clone())
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+    .or_else(|| resolve_runtime_list_item_expr(program, &inst.cell_store, map_cell, i));
 
     let already_initialized = initialized_indices.borrow().contains(&item_idx);
 
     if !already_initialized {
         if let Some(ref ics) = inst.item_cell_store {
             if let Some(ref item_expr) = item_expr_for_template {
-                seed_item_template_cells_from_expr(
+                seed_item_template_cells_from_expr_parts(
                     program,
-                    inst,
+                    &inst.cell_store,
+                    &inst.list_store,
+                    &inst.template_list_items,
                     ics,
                     item_idx,
                     Some(template),
@@ -3295,9 +3494,11 @@ fn build_list_map_child(
         did_init = true;
         if let Some(ref ics) = inst.item_cell_store {
             if let Some(ref item_expr) = item_expr_for_template {
-                seed_item_template_cells_from_expr(
+                seed_item_template_cells_from_expr_parts(
                     program,
-                    inst,
+                    &inst.cell_store,
+                    &inst.list_store,
+                    &inst.template_list_items,
                     ics,
                     item_idx,
                     Some(template),
@@ -3312,9 +3513,11 @@ fn build_list_map_child(
         let _ = inst.call_refresh_item(item_idx, map_cell.0);
         if let Some(ref ics) = inst.item_cell_store {
             if let Some(ref item_expr) = item_expr_for_template {
-                seed_item_template_cells_from_expr(
+                seed_item_template_cells_from_expr_parts(
                     program,
-                    inst,
+                    &inst.cell_store,
+                    &inst.list_store,
+                    &inst.template_list_items,
                     ics,
                     item_idx,
                     Some(template),
@@ -3332,10 +3535,16 @@ fn build_list_map_child(
             .map(|ctx| ctx.propagation_item_idx)
             .unwrap_or(item_idx),
         item_cell_id: item_cell.0,
-        resolved_item_store_id: resolved_item_store.0,
         template_cell_range: template.cell_range,
         template_event_range: template.event_range,
-        item_expr: item_expr_for_template.clone(),
+        item_bindings: item_expr_for_template.as_ref().map(|item_expr| {
+            Rc::new(item_bindings(
+                program,
+                item_cell,
+                resolved_item_store,
+                item_expr,
+            ))
+        }),
     };
 
     let child = if let Some(root_cell) = template.root_cell {
@@ -3351,30 +3560,6 @@ fn build_list_map_child(
     (child, did_init)
 }
 
-fn current_list_id_for_source(
-    instance: &Rc<WasmInstance>,
-    parent_item_ctx: Option<&ItemContext>,
-    source: CellId,
-) -> f64 {
-    if let Some(parent_ctx) = parent_item_ctx {
-        if parent_ctx.is_template_cell(source) {
-            if let Some(list_id) = resolve_parent_template_list_id(
-                &instance.program,
-                &instance.cell_store,
-                &instance.list_store,
-                &instance.template_list_items,
-                instance.item_cell_store.as_ref(),
-                parent_ctx,
-                source,
-                None,
-            ) {
-                return list_id;
-            }
-        }
-    }
-    instance.cell_store.get_cell_value(source.0)
-}
-
 fn resolve_parent_template_list_id(
     program: &IrProgram,
     cell_store: &CellStore,
@@ -3383,75 +3568,54 @@ fn resolve_parent_template_list_id(
     item_cell_store: Option<&ItemCellStore>,
     parent_ctx: &ItemContext,
     list_cell: CellId,
-    source_cell: Option<CellId>,
+    source_cell: CellId,
 ) -> Option<f64> {
-    let cache_list_id = |ics: &ItemCellStore, cell: CellId, list_id: f64| {
-        if parent_ctx.is_template_cell(cell) {
-            ics.set_text(parent_ctx.item_idx, cell.0, String::new());
-            ics.set_cell(parent_ctx.item_idx, cell.0, list_id);
+    let cache_resolved_list_id = |target_cell: CellId, list_id: f64| {
+        if let Some(ics) = item_cell_store {
+            for cache_cell in [target_cell, list_cell] {
+                if (cache_cell == target_cell || target_cell != list_cell)
+                    && parent_ctx.is_template_cell(cache_cell)
+                {
+                    ics.set_text(parent_ctx.item_idx, cache_cell.0, String::new());
+                    ics.set_cell(parent_ctx.item_idx, cache_cell.0, list_id);
+                }
+            }
         }
     };
+    let cached_list_id = |target_cell: CellId| {
+        item_cell_store
+            .filter(|_| parent_ctx.is_template_cell(target_cell))
+            .and_then(|store| {
+                let list_id = store.get_value(parent_ctx.item_idx, target_cell.0);
+                (!list_id.is_nan() && list_id > 0.0).then_some(list_id)
+            })
+            .or_else(|| {
+                (target_cell == source_cell)
+                    .then(|| cell_store.get_cell_value(source_cell.0))
+                    .filter(|list_id| !list_id.is_nan() && *list_id > 0.0)
+            })
+    };
 
-    if let Some(parent_item_expr) = parent_ctx.item_expr.as_ref() {
-        let bindings = item_bindings(
-            program,
-            CellId(parent_ctx.item_cell_id),
-            CellId(parent_ctx.resolved_item_store_id),
-            parent_item_expr,
-        );
-
-        for target_cell in source_cell.into_iter().chain(std::iter::once(list_cell)) {
-            let Some(resolved) = resolve_runtime_cell_expr_with_bindings(
-                program,
-                cell_store,
-                target_cell,
-                0,
-                &bindings,
-            ) else {
-                continue;
-            };
-            let Some(list_id) = materialize_template_list_expr(
+    for target_cell in [source_cell, list_cell] {
+        if target_cell == list_cell && target_cell == source_cell {
+            continue;
+        }
+        if let Some(bindings) = parent_ctx.item_bindings.as_deref() {
+            if let Some(list_id) = legacy_materialize_template_list_expr(
                 program,
                 list_store,
                 template_list_items,
                 cell_store,
-                &resolved,
+                &IrExpr::CellRead(target_cell),
                 0,
-                &bindings,
-            ) else {
-                continue;
-            };
-            if let Some(ics) = item_cell_store {
-                cache_list_id(ics, target_cell, list_id);
-                cache_list_id(ics, list_cell, list_id);
-            }
-            return Some(list_id);
-        }
-    }
-
-    if let Some(ics) = item_cell_store {
-        let list_id = ics.get_value(parent_ctx.item_idx, list_cell.0);
-        if !list_id.is_nan() && list_id > 0.0 {
-            return Some(list_id);
-        }
-    }
-
-    if let Some(source_cell) = source_cell {
-        if let Some(ics) = item_cell_store {
-            if parent_ctx.is_template_cell(source_cell) {
-                let list_id = ics.get_value(parent_ctx.item_idx, source_cell.0);
-                if !list_id.is_nan() && list_id > 0.0 {
-                    cache_list_id(ics, list_cell, list_id);
-                    return Some(list_id);
-                }
+                bindings,
+            ) {
+                cache_resolved_list_id(target_cell, list_id);
+                return Some(list_id);
             }
         }
-
-        let list_id = cell_store.get_cell_value(source_cell.0);
-        if !list_id.is_nan() && list_id > 0.0 {
-            if let Some(ics) = item_cell_store {
-                cache_list_id(ics, list_cell, list_id);
-            }
+        if let Some(list_id) = cached_list_id(target_cell) {
+            cache_resolved_list_id(target_cell, list_id);
             return Some(list_id);
         }
     }
@@ -3459,169 +3623,7 @@ fn resolve_parent_template_list_id(
     None
 }
 
-/// Resolve the list cell to use for cross-scope per-item event fanout.
-///
-/// For filtered views (`ListRetain -> ListMap`), use the retain's source so
-/// hidden items still receive global events (e.g. toggle-all in TodoMVC).
-/// We unwrap at most one retain layer plus pass-through wrappers.
-fn resolve_cross_scope_fanout_source(program: &IrProgram, source: CellId) -> CellId {
-    let mut current = source;
-    let mut seen = HashSet::new();
-    let mut unwrapped_retain = false;
-
-    while seen.insert(current) {
-        match find_node_for_cell(program, current) {
-            Some(IrNode::Derived {
-                expr: IrExpr::CellRead(next),
-                ..
-            }) => {
-                current = *next;
-            }
-            Some(IrNode::PipeThrough { source: next, .. }) => {
-                current = *next;
-            }
-            Some(IrNode::ListRetain { source: next, .. }) if !unwrapped_retain => {
-                current = *next;
-                unwrapped_retain = true;
-            }
-            _ => break,
-        }
-    }
-
-    current
-}
-
-/// Collect global event IDs that trigger template-scoped nodes (cross-scope events).
-fn collect_cross_scope_events(
-    program: &IrProgram,
-    template_cell_range: (u32, u32),
-    template_event_range: (u32, u32),
-) -> Vec<u32> {
-    let mut result = Vec::new();
-    let mut seen_ranges = HashSet::new();
-    collect_cross_scope_events_in_range(
-        program,
-        template_cell_range,
-        template_event_range,
-        false,
-        &mut seen_ranges,
-        &mut result,
-    );
-    result
-}
-
-fn collect_cross_scope_events_in_range(
-    program: &IrProgram,
-    scan_cell_range: (u32, u32),
-    root_event_range: (u32, u32),
-    include_local_events: bool,
-    seen_ranges: &mut HashSet<(u32, u32)>,
-    result: &mut Vec<u32>,
-) {
-    if !seen_ranges.insert(scan_cell_range) {
-        return;
-    }
-    let (cell_start, cell_end) = scan_cell_range;
-    let (event_start, event_end) = root_event_range;
-
-    for node in &program.nodes {
-        let triggers: Vec<u32> = match node {
-            IrNode::Hold {
-                cell,
-                trigger_bodies,
-                ..
-            } if cell.0 >= cell_start && cell.0 < cell_end => {
-                trigger_bodies.iter().map(|(t, _)| t.0).collect()
-            }
-            IrNode::Then { cell, trigger, .. } if cell.0 >= cell_start && cell.0 < cell_end => {
-                vec![trigger.0]
-            }
-            IrNode::Latest { target, arms } if target.0 >= cell_start && target.0 < cell_end => {
-                arms.iter()
-                    .filter_map(|arm| arm.trigger.map(|t| t.0))
-                    .collect()
-            }
-            IrNode::ListMap {
-                template_cell_range: child_range,
-                ..
-            } if child_range.0 >= cell_start
-                && child_range.1 <= cell_end
-                && *child_range != scan_cell_range =>
-            {
-                collect_cross_scope_events_in_range(
-                    program,
-                    *child_range,
-                    root_event_range,
-                    true,
-                    seen_ranges,
-                    result,
-                );
-                continue;
-            }
-            _ => continue,
-        };
-
-        for t in triggers {
-            if include_local_events || t < event_start || t >= event_end {
-                if !result.contains(&t) {
-                    result.push(t);
-                }
-            }
-        }
-    }
-}
-
-fn collect_template_global_dependencies(
-    program: &IrProgram,
-    template_cell_range: (u32, u32),
-) -> Vec<CellId> {
-    let mut deps = HashSet::new();
-    let mut seen = HashSet::new();
-    let mut seen_funcs = HashSet::new();
-    let local_params = HashSet::new();
-    let canonical_named_cells = canonical_named_cells(program);
-    let nested_ranges: Vec<(u32, u32)> = program
-        .nodes
-        .iter()
-        .filter_map(|node| match node {
-            IrNode::ListMap {
-                template_cell_range: nested,
-                ..
-            } if *nested != template_cell_range
-                && nested.0 >= template_cell_range.0
-                && nested.1 <= template_cell_range.1 =>
-            {
-                Some(*nested)
-            }
-            _ => None,
-        })
-        .collect();
-
-    for cell_id in template_cell_range.0..template_cell_range.1 {
-        if nested_ranges
-            .iter()
-            .any(|range| cell_id >= range.0 && cell_id < range.1)
-        {
-            continue;
-        }
-        collect_template_cell_dependencies(
-            program,
-            CellId(cell_id),
-            template_cell_range,
-            &local_params,
-            &canonical_named_cells,
-            &mut deps,
-            &mut seen,
-            &mut seen_funcs,
-        );
-    }
-
-    let mut deps: Vec<_> = deps.into_iter().collect();
-    deps.sort_by_key(|cell| cell.0);
-    deps
-}
-
-fn canonical_named_cells(program: &IrProgram) -> HashMap<String, CellId> {
+fn legacy_canonical_named_cells(program: &IrProgram) -> HashMap<String, CellId> {
     let template_ranges: Vec<(u32, u32)> = program
         .nodes
         .iter()
@@ -3657,25 +3659,23 @@ fn canonical_named_cells(program: &IrProgram) -> HashMap<String, CellId> {
     result
 }
 
-fn canonicalize_external_template_cell(
+fn canonical_named_cell(
     program: &IrProgram,
     canonical_named_cells: &HashMap<String, CellId>,
     cell: CellId,
 ) -> CellId {
-    let Some(info) = program.cells.get(cell.0 as usize) else {
-        return cell;
-    };
-    canonical_named_cells
-        .get(&info.name)
-        .copied()
+    program
+        .cells
+        .get(cell.0 as usize)
+        .and_then(|info| canonical_named_cells.get(&info.name).copied())
         .unwrap_or(cell)
 }
 
-fn effective_runtime_field_cell(
+fn effective_field_cell(
     program: &IrProgram,
+    bindings: &HashMap<CellId, IrExpr>,
     canonical_named_cells: &HashMap<String, CellId>,
     field_cell: CellId,
-    bindings: &HashMap<CellId, IrExpr>,
 ) -> CellId {
     if bindings.contains_key(&field_cell)
         || find_node_for_cell(program, field_cell).is_some()
@@ -3683,447 +3683,7 @@ fn effective_runtime_field_cell(
     {
         field_cell
     } else {
-        canonicalize_external_template_cell(program, canonical_named_cells, field_cell)
-    }
-}
-
-fn resolve_template_dependency_field_cell(
-    program: &IrProgram,
-    object: CellId,
-    field: &str,
-    depth: usize,
-) -> Option<CellId> {
-    if depth > 16 {
-        return None;
-    }
-    let object_store = resolve_to_object_store(program, object);
-    if let Some(fields) = program.cell_field_cells.get(&object_store) {
-        if let Some(field_cell) = fields.get(field) {
-            return Some(*field_cell);
-        }
-    }
-
-    match find_node_for_cell(program, object) {
-        Some(IrNode::Derived {
-            expr:
-                IrExpr::FieldAccess {
-                    object: nested_object,
-                    field: nested_field,
-                },
-            ..
-        }) => {
-            let IrExpr::CellRead(nested_cell) = nested_object.as_ref() else {
-                return None;
-            };
-            let nested_field_cell = resolve_template_dependency_field_cell(
-                program,
-                *nested_cell,
-                nested_field,
-                depth + 1,
-            )?;
-            resolve_template_dependency_field_cell(program, nested_field_cell, field, depth + 1)
-        }
-        Some(IrNode::Derived {
-            expr: IrExpr::CellRead(source),
-            ..
-        }) => resolve_template_dependency_field_cell(program, *source, field, depth + 1),
-        Some(IrNode::PipeThrough { source, .. }) => {
-            resolve_template_dependency_field_cell(program, *source, field, depth + 1)
-        }
-        _ => None,
-    }
-}
-
-fn collect_template_cell_dependencies(
-    program: &IrProgram,
-    cell: CellId,
-    template_cell_range: (u32, u32),
-    local_param_cells: &HashSet<CellId>,
-    canonical_named_cells: &HashMap<String, CellId>,
-    deps: &mut HashSet<CellId>,
-    seen: &mut HashSet<CellId>,
-    seen_funcs: &mut HashSet<FuncId>,
-) {
-    if local_param_cells.contains(&cell) {
-        return;
-    }
-
-    if !seen.insert(cell) {
-        return;
-    }
-
-    if cell.0 < template_cell_range.0 || cell.0 >= template_cell_range.1 {
-        deps.insert(canonicalize_external_template_cell(
-            program,
-            canonical_named_cells,
-            cell,
-        ));
-        return;
-    }
-
-    let Some(node) = find_node_for_cell(program, cell) else {
-        return;
-    };
-
-    match node {
-        IrNode::Derived { expr, .. } => {
-            collect_template_expr_dependencies(
-                program,
-                expr,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-        }
-        IrNode::PipeThrough { source, .. }
-        | IrNode::TextTrim { source, .. }
-        | IrNode::TextIsNotEmpty { source, .. }
-        | IrNode::TextToNumber { source, .. }
-        | IrNode::MathRound { source, .. } => {
-            collect_template_cell_dependencies(
-                program,
-                *source,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-        }
-        IrNode::TextStartsWith { source, prefix, .. }
-        | IrNode::MathMin {
-            source, b: prefix, ..
-        }
-        | IrNode::MathMax {
-            source, b: prefix, ..
-        } => {
-            collect_template_cell_dependencies(
-                program,
-                *source,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-            collect_template_cell_dependencies(
-                program,
-                *prefix,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-        }
-        IrNode::When { source, arms, .. } => {
-            collect_template_cell_dependencies(
-                program,
-                *source,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-            for (_, body) in arms {
-                collect_template_expr_dependencies(
-                    program,
-                    body,
-                    template_cell_range,
-                    local_param_cells,
-                    canonical_named_cells,
-                    deps,
-                    seen,
-                    seen_funcs,
-                );
-            }
-        }
-        IrNode::While {
-            source,
-            deps: node_deps,
-            arms,
-            ..
-        } => {
-            collect_template_cell_dependencies(
-                program,
-                *source,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-            for dep in node_deps {
-                collect_template_cell_dependencies(
-                    program,
-                    *dep,
-                    template_cell_range,
-                    local_param_cells,
-                    canonical_named_cells,
-                    deps,
-                    seen,
-                    seen_funcs,
-                );
-            }
-            for (_, body) in arms {
-                collect_template_expr_dependencies(
-                    program,
-                    body,
-                    template_cell_range,
-                    local_param_cells,
-                    canonical_named_cells,
-                    deps,
-                    seen,
-                    seen_funcs,
-                );
-            }
-        }
-        IrNode::Hold {
-            init,
-            trigger_bodies,
-            ..
-        } => {
-            collect_template_expr_dependencies(
-                program,
-                init,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-            for (_, body) in trigger_bodies {
-                collect_template_expr_dependencies(
-                    program,
-                    body,
-                    template_cell_range,
-                    local_param_cells,
-                    canonical_named_cells,
-                    deps,
-                    seen,
-                    seen_funcs,
-                );
-            }
-        }
-        IrNode::Latest { arms, .. } => {
-            for arm in arms {
-                collect_template_expr_dependencies(
-                    program,
-                    &arm.body,
-                    template_cell_range,
-                    local_param_cells,
-                    canonical_named_cells,
-                    deps,
-                    seen,
-                    seen_funcs,
-                );
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_template_expr_dependencies(
-    program: &IrProgram,
-    expr: &IrExpr,
-    template_cell_range: (u32, u32),
-    local_param_cells: &HashSet<CellId>,
-    canonical_named_cells: &HashMap<String, CellId>,
-    deps: &mut HashSet<CellId>,
-    seen: &mut HashSet<CellId>,
-    seen_funcs: &mut HashSet<FuncId>,
-) {
-    match expr {
-        IrExpr::CellRead(cell) => {
-            collect_template_cell_dependencies(
-                program,
-                *cell,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-        }
-        IrExpr::FieldAccess { object, field } => {
-            if let IrExpr::CellRead(object_cell) = object.as_ref() {
-                if let Some(field_cell) =
-                    resolve_template_dependency_field_cell(program, *object_cell, field, 0)
-                {
-                    collect_template_cell_dependencies(
-                        program,
-                        field_cell,
-                        template_cell_range,
-                        local_param_cells,
-                        canonical_named_cells,
-                        deps,
-                        seen,
-                        seen_funcs,
-                    );
-                    return;
-                }
-            }
-            collect_template_expr_dependencies(
-                program,
-                object,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-        }
-        IrExpr::TextConcat(parts) => {
-            for part in parts {
-                if let TextSegment::Expr(expr) = part {
-                    collect_template_expr_dependencies(
-                        program,
-                        expr,
-                        template_cell_range,
-                        local_param_cells,
-                        canonical_named_cells,
-                        deps,
-                        seen,
-                        seen_funcs,
-                    );
-                }
-            }
-        }
-        IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => {
-            for (_, value) in fields {
-                collect_template_expr_dependencies(
-                    program,
-                    value,
-                    template_cell_range,
-                    local_param_cells,
-                    canonical_named_cells,
-                    deps,
-                    seen,
-                    seen_funcs,
-                );
-            }
-        }
-        IrExpr::Compare { lhs, rhs, .. } | IrExpr::BinOp { lhs, rhs, .. } => {
-            collect_template_expr_dependencies(
-                program,
-                lhs,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-            collect_template_expr_dependencies(
-                program,
-                rhs,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-        }
-        IrExpr::UnaryNeg(inner) | IrExpr::Not(inner) => {
-            collect_template_expr_dependencies(
-                program,
-                inner,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-        }
-        IrExpr::FunctionCall { func, args } => {
-            for arg in args {
-                collect_template_expr_dependencies(
-                    program,
-                    arg,
-                    template_cell_range,
-                    local_param_cells,
-                    canonical_named_cells,
-                    deps,
-                    seen,
-                    seen_funcs,
-                );
-            }
-            if !seen_funcs.insert(*func) {
-                return;
-            }
-            if let Some(ir_func) = program.functions.get(func.0 as usize) {
-                let nested_local_params: HashSet<CellId> = ir_func
-                    .param_cells
-                    .iter()
-                    .copied()
-                    .chain(local_param_cells.iter().copied())
-                    .collect();
-                collect_template_expr_dependencies(
-                    program,
-                    &ir_func.body,
-                    template_cell_range,
-                    &nested_local_params,
-                    canonical_named_cells,
-                    deps,
-                    seen,
-                    seen_funcs,
-                );
-            }
-            seen_funcs.remove(func);
-        }
-        IrExpr::ListConstruct(items) => {
-            for item in items {
-                collect_template_expr_dependencies(
-                    program,
-                    item,
-                    template_cell_range,
-                    local_param_cells,
-                    canonical_named_cells,
-                    deps,
-                    seen,
-                    seen_funcs,
-                );
-            }
-        }
-        IrExpr::PatternMatch { source, arms } => {
-            collect_template_cell_dependencies(
-                program,
-                *source,
-                template_cell_range,
-                local_param_cells,
-                canonical_named_cells,
-                deps,
-                seen,
-                seen_funcs,
-            );
-            for (_, body) in arms {
-                collect_template_expr_dependencies(
-                    program,
-                    body,
-                    template_cell_range,
-                    local_param_cells,
-                    canonical_named_cells,
-                    deps,
-                    seen,
-                    seen_funcs,
-                );
-            }
-        }
-        IrExpr::Constant(_) => {}
+        canonical_named_cell(program, canonical_named_cells, field_cell)
     }
 }
 
@@ -4136,19 +3696,10 @@ fn build_item_reactive_text(
     fn resolve_item_text_fallback(
         program: &IrProgram,
         store: &CellStore,
-        item_cell_id: u32,
-        resolved_item_store_id: u32,
-        item_expr: Option<&IrExpr>,
+        item_bindings: Option<&HashMap<CellId, IrExpr>>,
         cell: CellId,
     ) -> Option<String> {
-        let item_expr = item_expr?;
-        let bindings = item_bindings(
-            program,
-            CellId(item_cell_id),
-            CellId(resolved_item_store_id),
-            item_expr,
-        );
-        match resolve_runtime_cell_expr_with_bindings(program, store, cell, 0, &bindings)? {
+        match resolve_runtime_cell_expr_with_bindings(program, store, cell, 0, item_bindings?)? {
             IrExpr::Constant(IrValue::Text(text)) => Some(text),
             IrExpr::Constant(IrValue::Tag(tag)) => visible_tag_text(&tag),
             IrExpr::Constant(IrValue::Number(number)) => Some(format_number(number)),
@@ -4162,9 +3713,7 @@ fn build_item_reactive_text(
     };
     let item_idx = ctx.item_idx;
     let cell_id = cell.0;
-    let item_cell_id = ctx.item_cell_id;
-    let resolved_item_store_id = ctx.resolved_item_store_id;
-    let item_expr = ctx.item_expr.clone();
+    let item_bindings = ctx.item_bindings.clone();
     let store = instance.cell_store.clone();
     let program = instance.program.clone();
     let signal = ics.get_signal(item_idx, cell_id);
@@ -4180,9 +3729,7 @@ fn build_item_reactive_text(
                 resolve_item_text_fallback(
                     &program,
                     &store,
-                    item_cell_id,
-                    resolved_item_store_id,
-                    item_expr.as_ref(),
+                    item_bindings.as_deref(),
                     CellId(cell_id),
                 )
                 .unwrap_or_else(|| format_number(val))
@@ -4201,24 +3748,15 @@ fn build_item_text_from_segments(
     fn resolve_item_segment_fallback(
         program: &IrProgram,
         store: &CellStore,
-        item_cell_id: u32,
-        resolved_item_store_id: u32,
-        item_expr: Option<&IrExpr>,
+        item_bindings: Option<&HashMap<CellId, IrExpr>>,
         segment_cell: u32,
     ) -> Option<String> {
-        let item_expr = item_expr?;
-        let bindings = item_bindings(
-            program,
-            CellId(item_cell_id),
-            CellId(resolved_item_store_id),
-            item_expr,
-        );
         match resolve_runtime_cell_expr_with_bindings(
             program,
             store,
             CellId(segment_cell),
             0,
-            &bindings,
+            item_bindings?,
         )? {
             IrExpr::Constant(IrValue::Text(text)) => Some(text),
             IrExpr::Constant(IrValue::Tag(tag)) => visible_tag_text(&tag),
@@ -4248,9 +3786,7 @@ fn build_item_text_from_segments(
 
     let store = instance.cell_store.clone();
     let item_idx = ctx.item_idx;
-    let item_cell_id = ctx.item_cell_id;
-    let resolved_item_store_id = ctx.resolved_item_store_id;
-    let item_expr_for_fallback = ctx.item_expr.clone();
+    let item_bindings_for_fallback = ctx.item_bindings.clone();
     let program = instance.program.clone();
 
     // Build segment descriptions for the closure.
@@ -4302,9 +3838,7 @@ fn build_item_text_from_segments(
                                 resolve_item_segment_fallback(
                                     &program,
                                     &store,
-                                    item_cell_id,
-                                    resolved_item_store_id,
-                                    item_expr_for_fallback.as_ref(),
+                                    item_bindings_for_fallback.as_deref(),
                                     *id,
                                 )
                                 .unwrap_or_else(|| format_number(value))
@@ -4336,9 +3870,7 @@ fn build_item_text_from_segments(
                                 resolve_item_segment_fallback(
                                     &program,
                                     &store,
-                                    item_cell_id,
-                                    resolved_item_store_id,
-                                    item_expr_for_fallback.as_ref(),
+                                    item_bindings_for_fallback.as_deref(),
                                     *id,
                                 )
                                 .unwrap_or_else(|| format_number(value))
@@ -5082,24 +4614,6 @@ fn find_node_for_cell(program: &IrProgram, cell: CellId) -> Option<&IrNode> {
     None
 }
 
-fn ir_node_type_name(node: &IrNode) -> String {
-    match node {
-        IrNode::Derived { expr, .. } => format!("Derived({:?})", std::mem::discriminant(expr)),
-        IrNode::Hold { .. } => "Hold".into(),
-        IrNode::Latest { .. } => "Latest".into(),
-        IrNode::Then { .. } => "Then".into(),
-        IrNode::When { source, .. } => format!("When(src={})", source.0),
-        IrNode::While { source, .. } => format!("While(src={})", source.0),
-        IrNode::Element { .. } => "Element".into(),
-        IrNode::ListMap { .. } => "ListMap".into(),
-        IrNode::PipeThrough { source, .. } => format!("PipeThrough(src={})", source.0),
-        IrNode::HoldLoop { .. } => "HoldLoop".into(),
-        IrNode::TextInterpolation { .. } => "TextInterpolation".into(),
-        IrNode::TextTrim { .. } => "TextTrim".into(),
-        _ => format!("{:?}", std::mem::discriminant(node)),
-    }
-}
-
 /// Check if a cell resolves to the NoElement tag.
 fn is_no_element(program: &IrProgram, cell: CellId) -> bool {
     if let Some(node) = find_node_for_cell(program, cell) {
@@ -5142,7 +4656,7 @@ fn extract_placeholder_text(expr: &IrExpr, program: &IrProgram) -> String {
         }
         IrExpr::CellRead(cell) => {
             // Placeholder lowered as cell store — reconstruct and look for "text" field.
-            let fields = reconstruct_object_fields(program, *cell);
+            let fields = legacy_reconstruct_object_fields(program, *cell);
             for (name, val) in &fields {
                 if name == "text" {
                     return extract_placeholder_text(val, program);
@@ -5182,7 +4696,7 @@ fn extract_placeholder_font(expr: &IrExpr, program: &IrProgram) -> Option<(bool,
         IrExpr::ObjectConstruct(fields) => {
             fields.iter().map(|(n, v)| (n.clone(), v.clone())).collect()
         }
-        IrExpr::CellRead(cell) => reconstruct_object_fields(program, *cell),
+        IrExpr::CellRead(cell) => legacy_reconstruct_object_fields(program, *cell),
         _ => return None,
     };
     extract_font_from_fields(&fields, program)
@@ -5199,7 +4713,7 @@ fn extract_font_from_fields(
                 IrExpr::ObjectConstruct(f) => {
                     f.iter().map(|(n, v)| (n.clone(), v.clone())).collect()
                 }
-                IrExpr::CellRead(cell) => reconstruct_object_fields(program, *cell),
+                IrExpr::CellRead(cell) => legacy_reconstruct_object_fields(program, *cell),
                 _ => continue,
             };
             return extract_font_from_fields(&inner, program);
@@ -5208,7 +4722,7 @@ fn extract_font_from_fields(
                 IrExpr::ObjectConstruct(f) => {
                     f.iter().map(|(n, v)| (n.clone(), v.clone())).collect()
                 }
-                IrExpr::CellRead(cell) => reconstruct_object_fields(program, *cell),
+                IrExpr::CellRead(cell) => legacy_reconstruct_object_fields(program, *cell),
                 _ => continue,
             };
             let mut is_italic = false;
@@ -5278,7 +4792,21 @@ fn resolve_static_text_depth(program: &IrProgram, expr: &IrExpr, depth: u32) -> 
                         })
                         .collect(),
                     IrNode::When { source, arms, .. } | IrNode::While { source, arms, .. } => {
-                        resolve_when_text_statically(program, *source, arms, depth + 1)
+                        let source_value =
+                            resolve_expr_constant(program, &IrExpr::CellRead(*source), depth + 1);
+
+                        for (pattern, body) in arms {
+                            let matches = match (pattern, &source_value) {
+                                (IrPattern::Tag(t), Some(ConstValue::Tag(v))) => t == v,
+                                (IrPattern::Number(n), Some(ConstValue::Number(v))) => *n == *v,
+                                (IrPattern::Wildcard | IrPattern::Binding(_), _) => true,
+                                _ => false,
+                            };
+                            if matches {
+                                return resolve_static_text_depth(program, body, depth + 1);
+                            }
+                        }
+                        String::new()
                     }
                     IrNode::PipeThrough { source, .. } => {
                         resolve_static_text_depth(program, &IrExpr::CellRead(*source), depth + 1)
@@ -5293,48 +4821,10 @@ fn resolve_static_text_depth(program: &IrProgram, expr: &IrExpr, depth: u32) -> 
     }
 }
 
-/// Try to resolve a WHEN/WHILE pattern match statically.
-fn resolve_when_text_statically(
-    program: &IrProgram,
-    source: CellId,
-    arms: &[(IrPattern, IrExpr)],
-    depth: u32,
-) -> String {
-    if depth > 20 {
-        return String::new();
-    }
-    let source_value = resolve_cell_constant(program, source, depth + 1);
-
-    for (pattern, body) in arms {
-        let matches = match (pattern, &source_value) {
-            (IrPattern::Tag(t), Some(ConstValue::Tag(v))) => t == v,
-            (IrPattern::Number(n), Some(ConstValue::Number(v))) => *n == *v,
-            (IrPattern::Wildcard | IrPattern::Binding(_), _) => true,
-            _ => false,
-        };
-        if matches {
-            return resolve_static_text_depth(program, body, depth + 1);
-        }
-    }
-    String::new()
-}
-
 enum ConstValue {
     Tag(String),
     Number(f64),
     Text(String),
-}
-
-/// Resolve a cell to its constant value (if it has one).
-fn resolve_cell_constant(program: &IrProgram, cell: CellId, depth: u32) -> Option<ConstValue> {
-    if depth > 20 {
-        return None;
-    }
-    let node = find_node_for_cell(program, cell)?;
-    match node {
-        IrNode::Derived { expr, .. } => resolve_expr_constant(program, expr, depth + 1),
-        _ => None,
-    }
 }
 
 fn resolve_expr_constant(program: &IrProgram, expr: &IrExpr, depth: u32) -> Option<ConstValue> {
@@ -5345,7 +4835,10 @@ fn resolve_expr_constant(program: &IrProgram, expr: &IrExpr, depth: u32) -> Opti
         IrExpr::Constant(IrValue::Tag(t)) => Some(ConstValue::Tag(t.clone())),
         IrExpr::Constant(IrValue::Number(n)) => Some(ConstValue::Number(*n)),
         IrExpr::Constant(IrValue::Text(t)) => Some(ConstValue::Text(t.clone())),
-        IrExpr::CellRead(cell) => resolve_cell_constant(program, *cell, depth + 1),
+        IrExpr::CellRead(cell) => match find_node_for_cell(program, *cell)? {
+            IrNode::Derived { expr, .. } => resolve_expr_constant(program, expr, depth + 1),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -5365,7 +4858,7 @@ fn extract_style_fields_vec<'a>(
     match style {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            *reconstructed_buf = reconstruct_object_fields(program, *cell);
+            *reconstructed_buf = legacy_reconstruct_object_fields(program, *cell);
             reconstructed_buf
         }
         IrExpr::Constant(IrValue::Void) => &[],
@@ -5480,16 +4973,6 @@ fn build_padding(value: &IrExpr) -> Option<Padding<'static>> {
     None
 }
 
-/// Build a typed Gap style from an IR gap expression.
-fn build_gap(value: &IrExpr) -> Option<Gap<'static>> {
-    if let IrExpr::Constant(IrValue::Number(n)) = value {
-        if *n > 0.0 {
-            return Some(Gap::both(*n as u32));
-        }
-    }
-    None
-}
-
 /// Build a typed RoundedCorners style.
 fn build_rounded_corners(value: &IrExpr) -> Option<RoundedCorners> {
     if let IrExpr::Constant(IrValue::Number(n)) = value {
@@ -5506,7 +4989,7 @@ fn build_font_static(value: &IrExpr, program: &IrProgram) -> Option<Font<'static
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
+            reconstructed = legacy_reconstruct_object_fields(program, *cell);
             &reconstructed
         }
         _ => return None,
@@ -5606,7 +5089,7 @@ fn build_font_static(value: &IrExpr, program: &IrProgram) -> Option<Font<'static
                 let line_fields: &[(String, IrExpr)] = match val {
                     IrExpr::ObjectConstruct(f) => f,
                     IrExpr::CellRead(cell) => {
-                        reconstructed_line = reconstruct_object_fields(program, *cell);
+                        reconstructed_line = legacy_reconstruct_object_fields(program, *cell);
                         &reconstructed_line
                     }
                     _ => continue,
@@ -5633,7 +5116,7 @@ fn build_background_static(value: &IrExpr, program: &IrProgram) -> Option<Backgr
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
+            reconstructed = legacy_reconstruct_object_fields(program, *cell);
             &reconstructed
         }
         _ => return None,
@@ -5749,7 +5232,7 @@ fn build_shadows(value: &IrExpr, program: &IrProgram) -> Option<Shadows<'static>
         let fields: &[(String, IrExpr)] = match item {
             IrExpr::ObjectConstruct(f) => f,
             IrExpr::CellRead(cell) => {
-                reconstructed = reconstruct_object_fields(program, *cell);
+                reconstructed = legacy_reconstruct_object_fields(program, *cell);
                 &reconstructed
             }
             _ => continue,
@@ -5822,7 +5305,7 @@ fn build_transform(value: &IrExpr, program: &IrProgram) -> Option<Transform> {
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
+            reconstructed = legacy_reconstruct_object_fields(program, *cell);
             &reconstructed
         }
         _ => return None,
@@ -5999,7 +5482,7 @@ where
     let fields: &[(String, IrExpr)] = match style {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
+            reconstructed = legacy_reconstruct_object_fields(program, *cell);
             &reconstructed
         }
         IrExpr::Constant(IrValue::Void) => return el,
@@ -6087,7 +5570,7 @@ fn apply_physical_css<T: RawEl>(
     let fields: &[(String, IrExpr)] = match style {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
+            reconstructed = legacy_reconstruct_object_fields(program, *cell);
             &reconstructed
         }
         IrExpr::Constant(IrValue::Void) => return el,
@@ -6119,7 +5602,7 @@ fn apply_physical_css<T: RawEl>(
                 let sub_fields: &[(String, IrExpr)] = match value {
                     IrExpr::ObjectConstruct(f) => f,
                     IrExpr::CellRead(c) => {
-                        sub_reconstructed = reconstruct_object_fields(program, *c);
+                        sub_reconstructed = legacy_reconstruct_object_fields(program, *c);
                         &sub_reconstructed
                     }
                     _ => continue,
@@ -6188,7 +5671,7 @@ fn apply_physical_material<T: RawEl>(
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(f) => f,
         IrExpr::CellRead(c) => {
-            reconstructed = reconstruct_object_fields(program, *c);
+            reconstructed = legacy_reconstruct_object_fields(program, *c);
             &reconstructed
         }
         _ => return el,
@@ -6312,7 +5795,7 @@ fn apply_physical_glow<T: RawEl>(
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(f) => f,
         IrExpr::CellRead(c) => {
-            reconstructed = reconstruct_object_fields(program, *c);
+            reconstructed = legacy_reconstruct_object_fields(program, *c);
             &reconstructed
         }
         _ => return el,
@@ -6400,7 +5883,7 @@ fn apply_physical_spring_range<T: RawEl>(el: T, value: &IrExpr, program: &IrProg
             }
         }
         IrExpr::CellRead(cell) => {
-            let fields = reconstruct_object_fields(program, *cell);
+            let fields = legacy_reconstruct_object_fields(program, *cell);
             let extend = fields
                 .iter()
                 .find(|(n, _)| n == "extend")
@@ -6473,7 +5956,7 @@ fn apply_font_reactive<T: RawEl>(
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
+            reconstructed = legacy_reconstruct_object_fields(program, *cell);
             &reconstructed
         }
         _ => return el,
@@ -6517,7 +6000,7 @@ where
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
+            reconstructed = legacy_reconstruct_object_fields(program, *cell);
             &reconstructed
         }
         _ => return el,
@@ -6557,21 +6040,20 @@ where
 
 /// Follow Derived(CellRead) and PipeThrough chains to find the underlying cell
 /// that has `cell_field_cells` entries. Returns the original cell if no chain is found.
-fn resolve_to_object_store(program: &IrProgram, cell: CellId) -> CellId {
-    if program.cell_field_cells.contains_key(&cell) {
-        return cell;
-    }
-    if let Some(node) = find_node_for_cell(program, cell) {
-        match node {
-            IrNode::Derived {
-                expr: IrExpr::CellRead(src),
+fn legacy_resolve_to_object_store(program: &IrProgram, mut cell: CellId) -> CellId {
+    loop {
+        if program.cell_field_cells.contains_key(&cell) {
+            return cell;
+        }
+        match find_node_for_cell(program, cell) {
+            Some(IrNode::Derived {
+                expr: IrExpr::CellRead(source),
                 ..
-            } => return resolve_to_object_store(program, *src),
-            IrNode::PipeThrough { source, .. } => return resolve_to_object_store(program, *source),
-            _ => {}
+            }) => cell = *source,
+            Some(IrNode::PipeThrough { source, .. }) => cell = *source,
+            _ => return cell,
         }
     }
-    cell
 }
 
 /// Reconstruct object fields from a cell store (namespace cell).
@@ -6582,38 +6064,27 @@ fn resolve_to_object_store(program: &IrProgram, cell: CellId) -> CellId {
 ///
 /// When a field is itself a namespace cell (Derived with Void + has cell_field_cells),
 /// recursively reconstruct it as ObjectConstruct so style handlers can process it.
-fn reconstruct_object_fields(program: &IrProgram, cell: CellId) -> Vec<(String, IrExpr)> {
+fn legacy_reconstruct_object_fields(program: &IrProgram, cell: CellId) -> Vec<(String, IrExpr)> {
     let mut fields = Vec::new();
     // Follow Derived(CellRead) and PipeThrough chains to find cell_field_cells.
-    let resolved_cell = resolve_to_object_store(program, cell);
+    let resolved_cell = legacy_resolve_to_object_store(program, cell);
     if let Some(field_map) = program.cell_field_cells.get(&resolved_cell) {
         for (name, field_cell) in field_map {
             if let Some(node) = find_node_for_cell(program, *field_cell) {
+                let nested_object = program.cell_field_cells.contains_key(field_cell).then(|| {
+                    IrExpr::ObjectConstruct(legacy_reconstruct_object_fields(program, *field_cell))
+                });
                 match node {
                     IrNode::Derived { expr, .. } => {
-                        // Check if this field is itself a namespace cell (nested object
-                        // with sub-fields in cell_field_cells). This occurs for:
-                        // - Object-store namespaces (Derived(Void) from lower_object_store)
-                        // - Spread alias cells (Derived(CellRead) from spread handling)
-                        // - WHEN-distributed namespaces (Derived(Void) from distribution)
-                        if program.cell_field_cells.contains_key(field_cell) {
-                            let inner = reconstruct_object_fields(program, *field_cell);
-                            fields.push((name.clone(), IrExpr::ObjectConstruct(inner)));
-                        } else {
-                            fields.push((name.clone(), expr.clone()));
-                        }
+                        fields.push((name.clone(), nested_object.unwrap_or_else(|| expr.clone())))
                     }
                     // Non-Derived nodes (When, While, Hold, etc.) — check for
                     // cell_field_cells first (may be namespace), otherwise expose
                     // as CellRead for reactive processing.
-                    _ => {
-                        if program.cell_field_cells.contains_key(field_cell) {
-                            let inner = reconstruct_object_fields(program, *field_cell);
-                            fields.push((name.clone(), IrExpr::ObjectConstruct(inner)));
-                        } else {
-                            fields.push((name.clone(), IrExpr::CellRead(*field_cell)));
-                        }
-                    }
+                    _ => fields.push((
+                        name.clone(),
+                        nested_object.unwrap_or(IrExpr::CellRead(*field_cell)),
+                    )),
                 }
             }
         }
@@ -6652,7 +6123,7 @@ fn resolve_runtime_object_fields_with_bindings(
                     bindings,
                 )
             } else {
-                let object_store = resolve_to_object_store(program, cell);
+                let object_store = legacy_resolve_to_object_store(program, cell);
                 if let Some(bound) = bindings.get(&object_store) {
                     resolve_runtime_object_fields_with_bindings(
                         program,
@@ -6663,15 +6134,15 @@ fn resolve_runtime_object_fields_with_bindings(
                     )
                 } else {
                     let field_map = program.cell_field_cells.get(&object_store)?;
-                    let canonical_named_cells = canonical_named_cells(program);
+                    let canonical_named_cells = legacy_canonical_named_cells(program);
                     let fields: Vec<(String, IrExpr)> = field_map
                         .iter()
                         .map(|(name, field_cell)| {
-                            let effective_field_cell = effective_runtime_field_cell(
+                            let effective_field_cell = effective_field_cell(
                                 program,
+                                bindings,
                                 &canonical_named_cells,
                                 *field_cell,
-                                bindings,
                             );
                             let value =
                                 if program.cell_field_cells.contains_key(&effective_field_cell) {
@@ -6742,92 +6213,6 @@ fn resolve_runtime_object_fields_with_bindings(
         }
         _ => None,
     }
-}
-
-fn resolve_bound_field_alias_cell(
-    program: &IrProgram,
-    cell_store: &CellStore,
-    cell: CellId,
-    depth: u32,
-    bindings: &HashMap<CellId, IrExpr>,
-) -> Option<IrExpr> {
-    let cell_name = program.cells.get(cell.0 as usize)?.name.as_str();
-    let object_prefix = cell_name
-        .rsplit_once('.')
-        .map(|(prefix, _)| prefix.to_string());
-    let mut field_names = Vec::new();
-    field_names.push(
-        cell_name
-            .rsplit('.')
-            .next()
-            .unwrap_or(cell_name)
-            .to_string(),
-    );
-    if let Some(stem) = field_names[0].strip_suffix("_number") {
-        field_names.push(stem.to_string());
-    }
-
-    for field_name in field_names {
-        if let Some(prefix) = object_prefix.as_deref() {
-            let mut matching_keys: Vec<CellId> = bindings
-                .keys()
-                .copied()
-                .filter(|bound_cell| {
-                    program
-                        .cells
-                        .get(bound_cell.0 as usize)
-                        .map(|info| {
-                            info.name == prefix || info.name.ends_with(&format!(".{prefix}"))
-                        })
-                        .unwrap_or(false)
-                })
-                .collect();
-            matching_keys.sort_by_key(|cell| cell.0);
-
-            for bound_cell in matching_keys {
-                let Some(bound) = bindings.get(&bound_cell) else {
-                    continue;
-                };
-                let fields = match bound {
-                    IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => fields,
-                    _ => continue,
-                };
-                if let Some(value) = fields
-                    .iter()
-                    .find_map(|(name, value)| (name == &field_name).then_some(value.clone()))
-                {
-                    if let Some(resolved) = resolve_runtime_expr_with_bindings(
-                        program,
-                        cell_store,
-                        &value,
-                        depth + 1,
-                        bindings,
-                    ) {
-                        return Some(resolved);
-                    }
-                    return Some(value);
-                }
-            }
-        }
-
-        if object_prefix.is_none() {
-            if let Some(value) = bindings.values().find_map(|bound| {
-                let fields = match bound {
-                    IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => fields,
-                    _ => return None,
-                };
-                let value = fields
-                    .iter()
-                    .find_map(|(name, value)| (name == &field_name).then_some(value.clone()))?;
-                resolve_runtime_expr_with_bindings(program, cell_store, &value, depth + 1, bindings)
-                    .or(Some(value))
-            }) {
-                return Some(value);
-            }
-        }
-    }
-
-    None
 }
 
 fn normalize_runtime_item_expr_with_bindings(
@@ -7064,7 +6449,7 @@ fn resolve_runtime_expr_with_bindings(
             };
 
             if let IrExpr::CellRead(object_cell) = &**object {
-                let object_store = resolve_to_object_store(program, *object_cell);
+                let object_store = legacy_resolve_to_object_store(program, *object_cell);
                 if let Some(value) = bindings
                     .get(object_cell)
                     .and_then(field_from_bound)
@@ -7078,12 +6463,12 @@ fn resolve_runtime_expr_with_bindings(
                     .get(&object_store)
                     .and_then(|fields| fields.get(field))
                 {
-                    let canonical_named_cells = canonical_named_cells(program);
-                    let effective_field_cell = effective_runtime_field_cell(
+                    let canonical_named_cells = legacy_canonical_named_cells(program);
+                    let effective_field_cell = effective_field_cell(
                         program,
+                        bindings,
                         &canonical_named_cells,
                         *field_cell,
-                        bindings,
                     );
                     return resolve_runtime_cell_expr_with_bindings(
                         program,
@@ -7255,11 +6640,25 @@ fn resolve_runtime_expr_with_bindings(
                         IrExpr::Constant(IrValue::Text(t)) => text.push_str(&t),
                         IrExpr::Constant(IrValue::Number(n)) => text.push_str(&format_number(n)),
                         IrExpr::Constant(IrValue::Tag(t)) => text.push_str(&t),
-                        IrExpr::CellRead(cell) => {
-                            text.push_str(&format_runtime_cell_value_with_bindings(
-                                program, cell_store, cell, bindings,
-                            ))
-                        }
+                        IrExpr::CellRead(cell) => match resolve_runtime_cell_expr_with_bindings(
+                            program, cell_store, cell, 0, bindings,
+                        )
+                        .unwrap_or(IrExpr::CellRead(cell))
+                        {
+                            IrExpr::Constant(IrValue::Text(text_value)) => {
+                                text.push_str(&text_value)
+                            }
+                            IrExpr::Constant(IrValue::Number(number)) => {
+                                text.push_str(&format_number(number))
+                            }
+                            IrExpr::Constant(IrValue::Tag(tag)) => {
+                                text.push_str(&visible_tag_text(&tag).unwrap_or_default())
+                            }
+                            IrExpr::CellRead(next) => {
+                                text.push_str(&format_cell_value(cell_store, next.0))
+                            }
+                            _ => text.push_str(&format_cell_value(cell_store, cell.0)),
+                        },
                         _ => {}
                     },
                 }
@@ -7376,15 +6775,6 @@ fn resolve_runtime_number_with_bindings(
     }
 }
 
-fn resolve_runtime_cell_expr(
-    program: &IrProgram,
-    cell_store: &CellStore,
-    cell: CellId,
-    depth: u32,
-) -> Option<IrExpr> {
-    resolve_runtime_cell_expr_with_bindings(program, cell_store, cell, depth, &HashMap::new())
-}
-
 fn resolve_runtime_cell_expr_with_bindings(
     program: &IrProgram,
     cell_store: &CellStore,
@@ -7402,7 +6792,78 @@ fn resolve_runtime_cell_expr_with_bindings(
     }
 
     let Some(node) = find_node_for_cell(program, cell) else {
-        return resolve_bound_field_alias_cell(program, cell_store, cell, depth + 1, bindings);
+        let cell_name = program.cells.get(cell.0 as usize)?.name.as_str();
+        let object_prefix = cell_name
+            .rsplit_once('.')
+            .map(|(prefix, _)| prefix.to_string());
+        let mut field_names = vec![
+            cell_name
+                .rsplit('.')
+                .next()
+                .unwrap_or(cell_name)
+                .to_string(),
+        ];
+        if let Some(stem) = field_names[0].strip_suffix("_number") {
+            field_names.push(stem.to_string());
+        }
+
+        for field_name in field_names {
+            if let Some(prefix) = object_prefix.as_deref() {
+                let mut matching_keys: Vec<CellId> = bindings
+                    .keys()
+                    .copied()
+                    .filter(|bound_cell| {
+                        program
+                            .cells
+                            .get(bound_cell.0 as usize)
+                            .map(|info| {
+                                info.name == prefix || info.name.ends_with(&format!(".{prefix}"))
+                            })
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                matching_keys.sort_by_key(|bound_cell| bound_cell.0);
+
+                for bound_cell in matching_keys {
+                    let Some(bound) = bindings.get(&bound_cell) else {
+                        continue;
+                    };
+                    let fields = match bound {
+                        IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => {
+                            fields
+                        }
+                        _ => continue,
+                    };
+                    if let Some(value) = fields
+                        .iter()
+                        .find_map(|(name, value)| (name == &field_name).then_some(value.clone()))
+                    {
+                        return resolve_runtime_expr_with_bindings(
+                            program,
+                            cell_store,
+                            &value,
+                            depth + 1,
+                            bindings,
+                        )
+                        .or(Some(value));
+                    }
+                }
+            } else if let Some(value) = bindings.values().find_map(|bound| {
+                let fields = match bound {
+                    IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => fields,
+                    _ => return None,
+                };
+                let value = fields
+                    .iter()
+                    .find_map(|(name, value)| (name == &field_name).then_some(value.clone()))?;
+                resolve_runtime_expr_with_bindings(program, cell_store, &value, depth + 1, bindings)
+                    .or(Some(value))
+            }) {
+                return Some(value);
+            }
+        }
+
+        return None;
     };
 
     let prefers_live_store = matches!(
@@ -7457,7 +6918,7 @@ fn resolve_runtime_cell_expr_with_bindings(
         _ => {}
     }
 
-    let object_store = resolve_to_object_store(program, cell);
+    let object_store = legacy_resolve_to_object_store(program, cell);
     let is_list_like_node = matches!(
         node,
         IrNode::Derived {
@@ -7486,7 +6947,7 @@ fn resolve_runtime_cell_expr_with_bindings(
         ) {
             return Some(IrExpr::ObjectConstruct(fields));
         }
-        return Some(IrExpr::ObjectConstruct(reconstruct_object_fields(
+        return Some(IrExpr::ObjectConstruct(legacy_reconstruct_object_fields(
             program,
             object_store,
         )));
@@ -7920,8 +7381,14 @@ fn resolve_runtime_list_item_expr(
         if !seen.insert(list_cell) {
             return None;
         }
-        let resolved = match resolve_runtime_cell_expr(program, cell_store, list_cell, 0)
-            .unwrap_or(IrExpr::CellRead(list_cell))
+        let resolved = match resolve_runtime_cell_expr_with_bindings(
+            program,
+            cell_store,
+            list_cell,
+            0,
+            &HashMap::new(),
+        )
+        .unwrap_or(IrExpr::CellRead(list_cell))
         {
             IrExpr::ListConstruct(items) => items.get(index).map(|expr| {
                 normalize_runtime_item_expr_with_bindings(
@@ -8026,56 +7493,6 @@ fn resolve_runtime_list_item_expr(
     }
 
     inner(program, cell_store, list_cell, index, &mut HashSet::new())
-}
-
-fn resolve_runtime_list_item_expr_for_context(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    parent_item_ctx: Option<&ItemContext>,
-    list_cell: CellId,
-    index: usize,
-) -> Option<IrExpr> {
-    if let Some(parent_ctx) = parent_item_ctx {
-        if parent_ctx.is_template_cell(list_cell) {
-            let source_cell = program.list_map_plan(list_cell).map(|plan| plan.source);
-            if let Some(list_id) = resolve_parent_template_list_id(
-                program,
-                &instance.cell_store,
-                &instance.list_store,
-                &instance.template_list_items,
-                instance.item_cell_store.as_ref(),
-                parent_ctx,
-                list_cell,
-                source_cell,
-            ) {
-                if let Some(items) = instance
-                    .template_list_items
-                    .borrow()
-                    .get(&list_id.to_bits())
-                {
-                    if let Some(item) = items.get(index) {
-                        if let Some(parent_item_expr) = parent_ctx.item_expr.as_ref() {
-                            let bindings = item_bindings(
-                                program,
-                                CellId(parent_ctx.item_cell_id),
-                                CellId(parent_ctx.resolved_item_store_id),
-                                parent_item_expr,
-                            );
-                            return Some(normalize_runtime_item_expr_with_bindings(
-                                program,
-                                &instance.cell_store,
-                                item,
-                                0,
-                                &bindings,
-                            ));
-                        }
-                        return Some(item.clone());
-                    }
-                }
-            }
-        }
-    }
-    resolve_runtime_list_item_expr(program, &instance.cell_store, list_cell, index)
 }
 
 fn collect_expr_cell_reads(expr: &IrExpr, cells: &mut HashSet<CellId>) {
@@ -8191,247 +7608,33 @@ fn nested_template_cell_ranges(
     ranges
 }
 
-fn template_seed_cells(program: &IrProgram, template_cell_range: (u32, u32)) -> Vec<CellId> {
-    let mut cells = HashSet::new();
-    let nested_ranges = nested_template_cell_ranges(program, template_cell_range);
-    let in_nested_range = |cell: CellId| {
-        nested_ranges
-            .iter()
-            .any(|(start, end)| cell.0 >= *start && cell.0 < *end)
-    };
-
-    for node in &program.nodes {
-        match node {
-            IrNode::Element {
-                cell,
-                kind,
-                hovered_cell,
-                ..
-            } if cell.0 >= template_cell_range.0 && cell.0 < template_cell_range.1 => {
-                let mut expr_cells = HashSet::new();
-                match kind {
-                    ElementKind::Button { label, style }
-                    | ElementKind::Label { label, style }
-                    | ElementKind::Text { label, style }
-                    | ElementKind::Paragraph {
-                        content: label,
-                        style,
-                    }
-                    | ElementKind::Link {
-                        label, url: style, ..
-                    } => {
-                        collect_expr_cell_reads(label, &mut expr_cells);
-                        collect_expr_cell_reads(style, &mut expr_cells);
-                    }
-                    ElementKind::TextInput {
-                        placeholder,
-                        style,
-                        text_cell,
-                        ..
-                    } => {
-                        if let Some(placeholder) = placeholder {
-                            collect_expr_cell_reads(placeholder, &mut expr_cells);
-                        }
-                        collect_expr_cell_reads(style, &mut expr_cells);
-                        if let Some(text_cell) = text_cell {
-                            expr_cells.insert(*text_cell);
-                        }
-                    }
-                    ElementKind::Checkbox {
-                        checked,
-                        style,
-                        icon,
-                    } => {
-                        if let Some(checked) = checked {
-                            expr_cells.insert(*checked);
-                        }
-                        collect_expr_cell_reads(style, &mut expr_cells);
-                        if let Some(icon) = icon {
-                            expr_cells.insert(*icon);
-                        }
-                    }
-                    ElementKind::Container { style, .. }
-                    | ElementKind::Block { style, .. }
-                    | ElementKind::Stack { style, .. }
-                    | ElementKind::Svg { style, .. } => {
-                        collect_expr_cell_reads(style, &mut expr_cells)
-                    }
-                    ElementKind::Stripe { gap, style, .. } => {
-                        collect_expr_cell_reads(gap, &mut expr_cells);
-                        collect_expr_cell_reads(style, &mut expr_cells);
-                    }
-                    ElementKind::Slider {
-                        style, value_cell, ..
-                    } => {
-                        collect_expr_cell_reads(style, &mut expr_cells);
-                        if let Some(value_cell) = value_cell {
-                            expr_cells.insert(*value_cell);
-                        }
-                    }
-                    ElementKind::Select {
-                        style, selected, ..
-                    } => {
-                        collect_expr_cell_reads(style, &mut expr_cells);
-                        if let Some(selected) = selected {
-                            collect_expr_cell_reads(selected, &mut expr_cells);
-                        }
-                    }
-                    ElementKind::SvgCircle { cx, cy, r, style } => {
-                        collect_expr_cell_reads(cx, &mut expr_cells);
-                        collect_expr_cell_reads(cy, &mut expr_cells);
-                        collect_expr_cell_reads(r, &mut expr_cells);
-                        collect_expr_cell_reads(style, &mut expr_cells);
-                    }
-                }
-                if let Some(hovered_cell) = hovered_cell {
-                    expr_cells.insert(*hovered_cell);
-                }
-                for expr_cell in expr_cells {
-                    if expr_cell.0 >= template_cell_range.0
-                        && expr_cell.0 < template_cell_range.1
-                        && !in_nested_range(expr_cell)
-                    {
-                        cells.insert(expr_cell);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut cells: Vec<_> = cells.into_iter().collect();
-    cells.sort_by_key(|cell| cell.0);
-    cells
-}
-
-fn template_seed_cells_for_active_root(
-    program: &IrProgram,
-    cell_store: &CellStore,
-    template: Option<&TemplatePlan>,
-    bindings: &HashMap<CellId, IrExpr>,
-) -> Vec<CellId> {
-    let Some(template) = template else {
-        return Vec::new();
-    };
-    let template_root_cell = template.root_cell;
-    let template_cell_range = template.cell_range;
-    let fallback_cells = || template.seed_cells.clone();
-
-    let Some(root_cell) = template_root_cell else {
-        return fallback_cells();
-    };
-
-    let Some(active_root_cell) = resolve_active_template_root_cell(
-        program,
-        cell_store,
-        root_cell,
-        template_cell_range,
-        bindings,
-        &mut HashSet::new(),
-    ) else {
-        return fallback_cells();
-    };
-
-    let mut cells = HashSet::new();
-    collect_root_selector_seed_cells(program, root_cell, template_cell_range, &mut cells);
-    collect_active_element_seed_cells(program, active_root_cell, template_cell_range, &mut cells);
-
-    if cells.is_empty() {
-        return fallback_cells();
-    }
-
-    let mut cells: Vec<_> = cells.into_iter().collect();
-    cells.sort_by_key(|cell| cell.0);
-    cells
-}
-
-fn template_seed_cells_for_local_events(
-    program: &IrProgram,
-    template: Option<&TemplatePlan>,
-) -> Vec<CellId> {
-    let Some(template) = template else {
-        return Vec::new();
-    };
-
-    let nested_ranges = nested_template_cell_ranges(program, template.cell_range);
-    let in_nested_range = |cell: CellId| {
-        nested_ranges
-            .iter()
-            .any(|(start, end)| cell.0 >= *start && cell.0 < *end)
-    };
-    let in_template_range = |cell: CellId| {
-        cell.0 >= template.cell_range.0 && cell.0 < template.cell_range.1 && !in_nested_range(cell)
-    };
-    let in_template_event_range = |event: EventId| {
-        (event.0 >= template.event_range.0 && event.0 < template.event_range.1)
-            || template.cross_scope_events.contains(&event.0)
-    };
-
-    let mut cells = HashSet::new();
-
-    for node in &program.nodes {
-        match node {
-            IrNode::Then { trigger, body, .. } if in_template_event_range(*trigger) => {
-                collect_expr_seed_cells(program, body, &mut cells);
-            }
-            IrNode::Hold { trigger_bodies, .. } => {
-                for (trigger, body) in trigger_bodies {
-                    if in_template_event_range(*trigger) {
-                        collect_expr_seed_cells(program, body, &mut cells);
-                    }
-                }
-            }
-            IrNode::Latest { arms, .. } => {
-                for arm in arms {
-                    if arm.trigger.is_some_and(in_template_event_range) {
-                        collect_expr_seed_cells(program, &arm.body, &mut cells);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut cells: Vec<_> = cells
-        .into_iter()
-        .filter(|cell| in_template_range(*cell))
-        .collect();
-    cells.sort_by_key(|cell| cell.0);
-    cells.dedup();
-    cells
-}
-
 fn collect_root_selector_seed_cells(
     program: &IrProgram,
     cell: CellId,
     template_cell_range: (u32, u32),
     cells: &mut HashSet<CellId>,
 ) {
-    let canonical_named_cells = canonical_named_cells(program);
+    let canonical_named_cells = legacy_canonical_named_cells(program);
     if cell.0 < template_cell_range.0 || cell.0 >= template_cell_range.1 {
         return;
     }
 
     match find_node_for_cell(program, cell) {
         Some(IrNode::When { source, .. }) => {
-            cells.insert(canonicalize_external_template_cell(
+            cells.insert(canonical_named_cell(
                 program,
                 &canonical_named_cells,
                 *source,
             ));
         }
         Some(IrNode::While { source, deps, .. }) => {
-            cells.insert(canonicalize_external_template_cell(
+            cells.insert(canonical_named_cell(
                 program,
                 &canonical_named_cells,
                 *source,
             ));
             for dep in deps {
-                cells.insert(canonicalize_external_template_cell(
-                    program,
-                    &canonical_named_cells,
-                    *dep,
-                ));
+                cells.insert(canonical_named_cell(program, &canonical_named_cells, *dep));
             }
         }
         _ => {}
@@ -8579,30 +7782,6 @@ fn collect_active_element_seed_cells(
     }
 }
 
-fn seed_item_template_cells_from_expr(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    ics: &ItemCellStore,
-    item_idx: u32,
-    template: Option<&TemplatePlan>,
-    item_cell: CellId,
-    resolved_item_store: CellId,
-    item_expr: &IrExpr,
-) {
-    seed_item_template_cells_from_expr_parts(
-        program,
-        &instance.cell_store,
-        &instance.list_store,
-        &instance.template_list_items,
-        ics,
-        item_idx,
-        template,
-        item_cell,
-        resolved_item_store,
-        item_expr,
-    )
-}
-
 fn seed_item_template_cells_from_expr_parts(
     program: &IrProgram,
     cell_store: &CellStore,
@@ -8618,7 +7797,7 @@ fn seed_item_template_cells_from_expr_parts(
     let bindings = item_bindings(program, item_cell, resolved_item_store, item_expr);
     let seed_resolved_cell =
         |raw_cell: u32, resolved: IrExpr, ics: &ItemCellStore, cell_store: &CellStore| {
-            if let Some(list_id) = materialize_template_list_expr(
+            if let Some(list_id) = legacy_materialize_template_list_expr(
                 program,
                 list_store,
                 template_list_items,
@@ -8689,7 +7868,7 @@ fn seed_item_template_cells_from_expr_parts(
             continue;
         }
 
-        if let Some(list_id) = materialize_template_list_expr(
+        if let Some(list_id) = legacy_materialize_template_list_expr(
             program,
             list_store,
             template_list_items,
@@ -8712,7 +7891,59 @@ fn seed_item_template_cells_from_expr_parts(
     // Seed the cells needed by local event-handler bodies, such as
     // `row_data.cells.row` / `row_data.cells.column` in the `cells` edit-start path,
     // without eagerly resolving every template cell up front.
-    for cell in template_seed_cells_for_local_events(program, template) {
+    let local_event_seed_cells = if let Some(template) = template {
+        let nested_ranges = nested_template_cell_ranges(program, template.cell_range);
+        let in_nested_range = |cell: CellId| {
+            nested_ranges
+                .iter()
+                .any(|(start, end)| cell.0 >= *start && cell.0 < *end)
+        };
+        let in_template_range = |cell: CellId| {
+            cell.0 >= template.cell_range.0
+                && cell.0 < template.cell_range.1
+                && !in_nested_range(cell)
+        };
+        let in_template_event_range = |event: EventId| {
+            (event.0 >= template.event_range.0 && event.0 < template.event_range.1)
+                || template.cross_scope_events.contains(&event.0)
+        };
+
+        let mut cells = HashSet::new();
+        for node in &program.nodes {
+            match node {
+                IrNode::Then { trigger, body, .. } if in_template_event_range(*trigger) => {
+                    collect_expr_seed_cells(program, body, &mut cells);
+                }
+                IrNode::Hold { trigger_bodies, .. } => {
+                    for (trigger, body) in trigger_bodies {
+                        if in_template_event_range(*trigger) {
+                            collect_expr_seed_cells(program, body, &mut cells);
+                        }
+                    }
+                }
+                IrNode::Latest { arms, .. } => {
+                    for arm in arms {
+                        if arm.trigger.is_some_and(in_template_event_range) {
+                            collect_expr_seed_cells(program, &arm.body, &mut cells);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut cells: Vec<_> = cells
+            .into_iter()
+            .filter(|cell| in_template_range(*cell))
+            .collect();
+        cells.sort_by_key(|cell| cell.0);
+        cells.dedup();
+        cells
+    } else {
+        Vec::new()
+    };
+
+    for cell in local_event_seed_cells {
         if !in_seedable_template_range(cell) {
             continue;
         }
@@ -8724,7 +7955,48 @@ fn seed_item_template_cells_from_expr_parts(
         seed_resolved_cell(cell.0, resolved, ics, cell_store);
     }
 
-    for cell in template_seed_cells_for_active_root(program, cell_store, template, &bindings) {
+    let active_root_seed_cells = if let Some(template) = template {
+        let fallback_cells = || template.seed_cells.clone();
+        if let Some(root_cell) = template.root_cell {
+            if let Some(active_root_cell) = resolve_active_template_root_cell(
+                program,
+                cell_store,
+                root_cell,
+                template.cell_range,
+                &bindings,
+                &mut HashSet::new(),
+            ) {
+                let mut cells = HashSet::new();
+                collect_root_selector_seed_cells(
+                    program,
+                    root_cell,
+                    template.cell_range,
+                    &mut cells,
+                );
+                collect_active_element_seed_cells(
+                    program,
+                    active_root_cell,
+                    template.cell_range,
+                    &mut cells,
+                );
+                if cells.is_empty() {
+                    fallback_cells()
+                } else {
+                    let mut cells: Vec<_> = cells.into_iter().collect();
+                    cells.sort_by_key(|cell| cell.0);
+                    cells
+                }
+            } else {
+                fallback_cells()
+            }
+        } else {
+            fallback_cells()
+        }
+    } else {
+        Vec::new()
+    };
+
+    for cell in active_root_seed_cells {
         let raw_cell = cell.0;
         let Some(resolved) =
             resolve_runtime_cell_expr_with_bindings(program, cell_store, cell, 0, &bindings)
@@ -8735,50 +8007,7 @@ fn seed_item_template_cells_from_expr_parts(
     }
 }
 
-fn reseed_item_template_list_cells_from_expr(
-    program: &IrProgram,
-    instance: &Rc<WasmInstance>,
-    ics: &ItemCellStore,
-    item_idx: u32,
-    template_cell_range: (u32, u32),
-    item_cell: CellId,
-    item_expr: &IrExpr,
-) {
-    let cell_store = &instance.cell_store;
-    let mut bindings = HashMap::new();
-    bindings.insert(item_cell, item_expr.clone());
-    let nested_ranges = nested_template_cell_ranges(program, template_cell_range);
-
-    for raw_cell in template_cell_range.0..template_cell_range.1 {
-        if nested_ranges
-            .iter()
-            .any(|(start, end)| raw_cell >= *start && raw_cell < *end)
-        {
-            continue;
-        }
-        let cell = CellId(raw_cell);
-        let Some(resolved) =
-            resolve_runtime_cell_expr_with_bindings(program, cell_store, cell, 0, &bindings)
-        else {
-            continue;
-        };
-        let Some(list_id) = materialize_template_list_expr(
-            program,
-            &instance.list_store,
-            &instance.template_list_items,
-            cell_store,
-            &resolved,
-            0,
-            &bindings,
-        ) else {
-            continue;
-        };
-        ics.set_text(item_idx, raw_cell, String::new());
-        ics.set_cell(item_idx, raw_cell, list_id);
-    }
-}
-
-fn materialize_template_list_expr(
+fn legacy_materialize_template_list_expr(
     program: &IrProgram,
     list_store: &ListStore,
     template_list_items: &Rc<RefCell<HashMap<u64, Vec<IrExpr>>>>,
@@ -8790,8 +8019,10 @@ fn materialize_template_list_expr(
     if depth > RUNTIME_RESOLVE_DEPTH_LIMIT {
         return None;
     }
-
     match expr {
+        IrExpr::Constant(IrValue::Number(list_id)) if !list_id.is_nan() && *list_id > 0.0 => {
+            Some(*list_id)
+        }
         IrExpr::ListConstruct(items) => {
             let list_id = list_store.create();
             list_store.set_index_based(list_id);
@@ -8803,115 +8034,50 @@ fn materialize_template_list_expr(
                 .insert(list_id.to_bits(), items.clone());
             Some(list_id)
         }
-        IrExpr::CellRead(cell) => {
-            let value = cell_store.get_cell_value(cell.0);
-            if !value.is_nan() && value > 0.0 {
-                return Some(value);
-            }
-            let resolved = resolve_runtime_cell_expr_with_bindings(
-                program,
-                cell_store,
-                *cell,
-                depth + 1,
-                bindings,
-            )?;
-            if matches!(resolved, IrExpr::CellRead(next) if next == *cell) {
-                None
-            } else {
-                materialize_template_list_expr(
+        _ => {
+            let resolved =
+                resolve_runtime_expr_with_bindings(program, cell_store, expr, depth + 1, bindings)?;
+            match resolved {
+                IrExpr::Constant(IrValue::Number(list_id))
+                    if !list_id.is_nan() && list_id > 0.0 =>
+                {
+                    Some(list_id)
+                }
+                IrExpr::ListConstruct(items) => {
+                    let list_id = list_store.create();
+                    list_store.set_index_based(list_id);
+                    for _ in &items {
+                        list_store.append_with_next_memory_index(list_id);
+                    }
+                    template_list_items
+                        .borrow_mut()
+                        .insert(list_id.to_bits(), items);
+                    Some(list_id)
+                }
+                IrExpr::CellRead(next) => match expr {
+                    IrExpr::CellRead(cell) if next == *cell => None,
+                    _ => legacy_materialize_template_list_expr(
+                        program,
+                        list_store,
+                        template_list_items,
+                        cell_store,
+                        &IrExpr::CellRead(next),
+                        depth + 1,
+                        bindings,
+                    ),
+                },
+                IrExpr::FieldAccess { .. } if matches!(expr, IrExpr::FieldAccess { .. }) => None,
+                other => legacy_materialize_template_list_expr(
                     program,
                     list_store,
                     template_list_items,
                     cell_store,
-                    &resolved,
+                    &other,
                     depth + 1,
                     bindings,
-                )
+                ),
             }
         }
-        IrExpr::FieldAccess { object, field } => {
-            let fields = resolve_runtime_object_fields_with_bindings(
-                program,
-                cell_store,
-                object,
-                depth + 1,
-                bindings,
-            )?;
-            let value = fields
-                .into_iter()
-                .find(|(name, _)| name == field)
-                .map(|(_, value)| value)?;
-            materialize_template_list_expr(
-                program,
-                list_store,
-                template_list_items,
-                cell_store,
-                &value,
-                depth + 1,
-                bindings,
-            )
-        }
-        _ => None,
-    }
-}
-
-fn resolve_scene_number(program: &IrProgram, cell_store: &CellStore, expr: &IrExpr) -> Option<f64> {
-    match resolve_runtime_expr(program, cell_store, expr, 0).unwrap_or_else(|| expr.clone()) {
-        IrExpr::Constant(IrValue::Number(n)) => Some(n),
-        IrExpr::CellRead(cell) => {
-            let value = cell_store.get_cell_value(cell.0);
-            (!value.is_nan()).then_some(value)
-        }
-        _ => None,
-    }
-}
-
-fn resolve_scene_object_fields(
-    program: &IrProgram,
-    cell_store: &CellStore,
-    expr: &IrExpr,
-) -> Option<Vec<(String, IrExpr)>> {
-    match resolve_runtime_expr(program, cell_store, expr, 0).unwrap_or_else(|| expr.clone()) {
-        IrExpr::ObjectConstruct(fields) => Some(fields),
-        IrExpr::TaggedObject { fields, .. } => Some(fields),
-        IrExpr::CellRead(cell) => Some(reconstruct_object_fields(program, cell)),
-        _ => None,
-    }
-}
-
-fn resolve_scene_list_items(
-    program: &IrProgram,
-    cell_store: &CellStore,
-    expr: &IrExpr,
-) -> Option<Vec<IrExpr>> {
-    match resolve_runtime_expr(program, cell_store, expr, 0).unwrap_or_else(|| expr.clone()) {
-        IrExpr::ListConstruct(items) => Some(items),
-        IrExpr::CellRead(cell) => match find_node_for_cell(program, cell) {
-            Some(IrNode::Derived {
-                expr: IrExpr::ListConstruct(items),
-                ..
-            }) => Some(items.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn resolve_scene_tagged_fields(
-    program: &IrProgram,
-    cell_store: &CellStore,
-    expr: &IrExpr,
-) -> Option<(String, Vec<(String, IrExpr)>)> {
-    match resolve_runtime_expr(program, cell_store, expr, 0).unwrap_or_else(|| expr.clone()) {
-        IrExpr::TaggedObject { tag, fields } => Some((tag, fields)),
-        IrExpr::CellRead(cell) => match find_node_for_cell(program, cell) {
-            Some(IrNode::Derived {
-                expr: IrExpr::TaggedObject { tag, fields },
-                ..
-            }) => Some((tag.clone(), fields.clone())),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
@@ -8923,13 +8089,22 @@ fn resolve_scene_params(program: &IrProgram, cell_store: &CellStore) -> Physical
     let Some(scene) = render_root.scene else {
         return params;
     };
+    let resolve_scene_number = |expr: &IrExpr| {
+        resolve_runtime_number_with_bindings(program, cell_store, expr, 0, &HashMap::new())
+    };
 
     if let Some(geometry) = scene.geometry {
-        if let Some(fields) =
-            resolve_scene_object_fields(program, cell_store, &IrExpr::CellRead(geometry))
-        {
+        let geometry_expr =
+            resolve_runtime_expr(program, cell_store, &IrExpr::CellRead(geometry), 0)
+                .unwrap_or_else(|| IrExpr::CellRead(geometry));
+        let geometry_fields = match geometry_expr {
+            IrExpr::ObjectConstruct(fields) | IrExpr::TaggedObject { fields, .. } => Some(fields),
+            IrExpr::CellRead(cell) => Some(legacy_reconstruct_object_fields(program, cell)),
+            _ => None,
+        };
+        if let Some(fields) = geometry_fields {
             if let Some((_, bevel_angle)) = fields.iter().find(|(name, _)| name == "bevel_angle") {
-                if let Some(bevel_angle) = resolve_scene_number(program, cell_store, bevel_angle) {
+                if let Some(bevel_angle) = resolve_scene_number(bevel_angle) {
                     params.bevel_angle = bevel_angle;
                 }
             }
@@ -8937,12 +8112,34 @@ fn resolve_scene_params(program: &IrProgram, cell_store: &CellStore) -> Physical
     }
 
     if let Some(lights) = scene.lights {
-        if let Some(items) =
-            resolve_scene_list_items(program, cell_store, &IrExpr::CellRead(lights))
-        {
+        let lights_expr = resolve_runtime_expr(program, cell_store, &IrExpr::CellRead(lights), 0)
+            .unwrap_or_else(|| IrExpr::CellRead(lights));
+        let light_items = match lights_expr {
+            IrExpr::ListConstruct(items) => Some(items),
+            IrExpr::CellRead(cell) => match find_node_for_cell(program, cell) {
+                Some(IrNode::Derived {
+                    expr: IrExpr::ListConstruct(items),
+                    ..
+                }) => Some(items.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(items) = light_items {
             for item in &items {
-                let Some((tag, fields)) = resolve_scene_tagged_fields(program, cell_store, item)
-                else {
+                let resolved_item = resolve_runtime_expr(program, cell_store, item, 0)
+                    .unwrap_or_else(|| item.clone());
+                let Some((tag, fields)) = (match resolved_item {
+                    IrExpr::TaggedObject { tag, fields } => Some((tag, fields)),
+                    IrExpr::CellRead(cell) => match find_node_for_cell(program, cell) {
+                        Some(IrNode::Derived {
+                            expr: IrExpr::TaggedObject { tag, fields },
+                            ..
+                        }) => Some((tag.clone(), fields.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                }) else {
                     continue;
                 };
                 match tag.as_str() {
@@ -8950,27 +8147,26 @@ fn resolve_scene_params(program: &IrProgram, cell_store: &CellStore) -> Physical
                         if let Some((_, intensity)) =
                             fields.iter().find(|(name, _)| name == "intensity")
                         {
-                            if let Some(intensity) =
-                                resolve_scene_number(program, cell_store, intensity)
-                            {
+                            if let Some(intensity) = resolve_scene_number(intensity) {
                                 params.directional_intensity = intensity;
                             }
                         }
                         if let Some((_, spread)) = fields.iter().find(|(name, _)| name == "spread")
                         {
-                            if let Some(spread) = resolve_scene_number(program, cell_store, spread)
-                            {
+                            if let Some(spread) = resolve_scene_number(spread) {
                                 params.shadow_blur_per_depth = PhysicalSceneParams::DEFAULT
                                     .shadow_blur_per_depth
                                     * spread.clamp(0.25, 4.0);
                             }
                         }
-                        let azimuth = fields.iter().find(|(name, _)| name == "azimuth").and_then(
-                            |(_, value)| resolve_scene_number(program, cell_store, value),
-                        );
-                        let altitude = fields.iter().find(|(name, _)| name == "altitude").and_then(
-                            |(_, value)| resolve_scene_number(program, cell_store, value),
-                        );
+                        let azimuth = fields
+                            .iter()
+                            .find(|(name, _)| name == "azimuth")
+                            .and_then(|(_, value)| resolve_scene_number(value));
+                        let altitude = fields
+                            .iter()
+                            .find(|(name, _)| name == "altitude")
+                            .and_then(|(_, value)| resolve_scene_number(value));
                         if let (Some(azimuth), Some(altitude)) = (azimuth, altitude) {
                             let azimuth_radians = azimuth.to_radians();
                             let altitude_radians = altitude.clamp(5.0, 85.0).to_radians();
@@ -8987,9 +8183,7 @@ fn resolve_scene_params(program: &IrProgram, cell_store: &CellStore) -> Physical
                         if let Some((_, intensity)) =
                             fields.iter().find(|(name, _)| name == "intensity")
                         {
-                            if let Some(intensity) =
-                                resolve_scene_number(program, cell_store, intensity)
-                            {
+                            if let Some(intensity) = resolve_scene_number(intensity) {
                                 params.ambient_factor = intensity.clamp(0.0, 1.0);
                             }
                         }
@@ -9173,7 +8367,7 @@ fn apply_font_line<T: RawEl>(
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
+            reconstructed = legacy_reconstruct_object_fields(program, *cell);
             &reconstructed
         }
         _ => return el,
@@ -9477,7 +8671,7 @@ fn apply_align<T: RawEl>(
     let fields: &[(String, IrExpr)] = match value {
         IrExpr::ObjectConstruct(fields) => fields,
         IrExpr::CellRead(cell) => {
-            reconstructed = reconstruct_object_fields(program, *cell);
+            reconstructed = legacy_reconstruct_object_fields(program, *cell);
             &reconstructed
         }
         _ => return el,
@@ -9609,7 +8803,7 @@ fn collect_outline_arm_css(
                             if matches!(expr, IrExpr::Constant(IrValue::Void))
                                 && program.cell_field_cells.contains_key(inner_cell)
                             {
-                                let fields = reconstruct_object_fields(program, *inner_cell);
+                                let fields = legacy_reconstruct_object_fields(program, *inner_cell);
                                 let obj = IrExpr::ObjectConstruct(fields);
                                 let (outline, shadow) = resolve_outline_css(&obj);
                                 result.push((source, f64_val, outline, shadow));
@@ -9785,7 +8979,7 @@ fn apply_reactive_color<T: RawEl>(
 ) -> T {
     // Case 1: TaggedObject or ObjectConstruct with reactive CellRead fields for Oklch components.
     // TaggedObject occurs when the lowerer emits Oklch directly.
-    // ObjectConstruct occurs when reconstruct_object_fields expands a distributed WHEN namespace
+    // ObjectConstruct occurs when legacy_reconstruct_object_fields expands a distributed WHEN namespace
     // (cell_field_cells with lightness/chroma/hue sub-cells) into an inline ObjectConstruct.
     let oklch_fields: Option<&[(String, IrExpr)]> = match expr {
         IrExpr::TaggedObject { tag, fields } if tag == "Oklch" => Some(fields),
@@ -9951,7 +9145,7 @@ fn apply_reactive_color<T: RawEl>(
     // Case 3: CellRead pointing to an object-store with lightness/chroma/hue sub-fields.
     // This handles distributed WHEN results where Oklch objects are split into per-component cells.
     if let IrExpr::CellRead(cell) = expr {
-        let resolved = resolve_to_object_store(program, *cell);
+        let resolved = legacy_resolve_to_object_store(program, *cell);
         if let Some(field_map) = program.cell_field_cells.get(&resolved) {
             let has_oklch_fields = field_map.contains_key("lightness")
                 || field_map.contains_key("chroma")
@@ -10252,17 +9446,18 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        CellStore, ItemContext, collect_cross_scope_events, collect_scene_param_dependency_cells,
-        collect_template_global_dependencies, compute_physical_depth_box_shadow,
-        compute_physical_gloss_background, find_data_cells_for_event, find_node_for_cell,
-        item_bindings, materialize_template_list_expr, reconstruct_object_fields,
-        refresh_scene_params, resolve_active_template_root_cell, resolve_parent_template_list_id,
-        resolve_runtime_cell_expr_with_bindings, resolve_runtime_list_item_expr,
-        resolve_scene_params, seed_item_template_cells_from_expr_parts,
-        template_seed_cells_for_active_root, template_seed_cells_for_local_events,
+        CellStore, ItemContext, collect_active_element_seed_cells, collect_expr_seed_cells,
+        collect_root_selector_seed_cells, collect_scene_param_dependency_cells,
+        compute_physical_depth_box_shadow, compute_physical_gloss_background,
+        find_data_cells_for_event, find_node_for_cell, item_bindings,
+        legacy_materialize_template_list_expr, legacy_reconstruct_object_fields,
+        nested_template_cell_ranges, refresh_scene_params, resolve_active_template_root_cell,
+        resolve_parent_template_list_id, resolve_runtime_cell_expr_with_bindings,
+        resolve_runtime_list_item_expr, resolve_scene_params,
+        seed_item_template_cells_from_expr_parts,
     };
     use crate::platform::browser::engine_wasm::{
-        ir::{CellId, ElementKind, IrExpr, IrNode, IrProgram, IrValue},
+        ir::{CellId, ElementKind, EventId, IrExpr, IrNode, IrProgram, IrValue},
         lower::lower,
         parse_source,
         runtime::{ItemCellStore, ListStore},
@@ -10270,7 +9465,7 @@ mod tests {
     use boon_scene::{PhysicalSceneParams, RenderSurface};
     use zoon::Mutable;
 
-    fn list_map_bindings(
+    fn legacy_list_map_bindings(
         program: &IrProgram,
         map_cell: CellId,
         item_cell: CellId,
@@ -10564,7 +9759,7 @@ mod tests {
 
         let item_expr =
             resolve_runtime_list_item_expr(&program, &cell_store, map_cell, 0).expect("item expr");
-        let bindings = list_map_bindings(&program, map_cell, item_cell, &item_expr);
+        let bindings = legacy_list_map_bindings(&program, map_cell, item_cell, &item_expr);
         let row_like_cells: Vec<(u32, String)> = program
             .cells
             .iter()
@@ -10605,7 +9800,7 @@ mod tests {
             "expected row 1, got {resolved:?}; item_expr={:?}; reconstructed={:?}",
             bindings.get(&item_cell),
             bindings.get(&item_cell).and_then(|expr| match expr {
-                IrExpr::CellRead(cell) => Some(reconstruct_object_fields(&program, *cell)),
+                IrExpr::CellRead(cell) => Some(legacy_reconstruct_object_fields(&program, *cell)),
                 IrExpr::ObjectConstruct(fields) => Some(fields.clone()),
                 _ => None,
             })
@@ -10641,7 +9836,7 @@ mod tests {
 
         let item_expr =
             resolve_runtime_list_item_expr(&program, &cell_store, map_cell, 0).expect("item expr");
-        let bindings = list_map_bindings(&program, map_cell, item_cell, &item_expr);
+        let bindings = legacy_list_map_bindings(&program, map_cell, item_cell, &item_expr);
         let row_cells_cell = program
             .nodes
             .iter()
@@ -10715,7 +9910,7 @@ mod tests {
 
         let item_expr =
             resolve_runtime_list_item_expr(&program, &cell_store, map_cell, 0).expect("item expr");
-        let bindings = list_map_bindings(&program, map_cell, item_cell, &item_expr);
+        let bindings = legacy_list_map_bindings(&program, map_cell, item_cell, &item_expr);
         let row_cells_cell = program
             .nodes
             .iter()
@@ -10743,7 +9938,7 @@ mod tests {
             &bindings,
         )
         .expect("resolved row_cells expr");
-        let list_id = materialize_template_list_expr(
+        let list_id = legacy_materialize_template_list_expr(
             &program,
             &list_store,
             &template_list_items,
@@ -10832,10 +10027,14 @@ mod tests {
             item_idx: 0,
             propagation_item_idx: 0,
             item_cell_id: outer_item_cell.0,
-            resolved_item_store_id: outer_plan.resolved_item_store.0,
             template_cell_range: outer_plan.template.cell_range,
             template_event_range: outer_plan.template.event_range,
-            item_expr: Some(outer_item_expr),
+            item_bindings: Some(Rc::new(item_bindings(
+                &program,
+                outer_item_cell,
+                outer_plan.resolved_item_store,
+                &outer_item_expr,
+            ))),
         };
 
         item_store.ensure_item(parent_ctx.item_idx);
@@ -10854,7 +10053,7 @@ mod tests {
             Some(&item_store),
             &parent_ctx,
             inner_map_cell,
-            Some(inner_source_cell),
+            inner_source_cell,
         )
         .expect("nested row cell list id");
 
@@ -10950,7 +10149,7 @@ mod tests {
             resolve_runtime_list_item_expr(&program, &cell_store, outer_map_cell, 0)
                 .expect("first row item expr");
         let outer_bindings =
-            list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
+            legacy_list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
 
         let inner_source_expr = resolve_runtime_cell_expr_with_bindings(
             &program,
@@ -10960,7 +10159,7 @@ mod tests {
             &outer_bindings,
         )
         .expect("resolved row cells expr");
-        let inner_list_id = materialize_template_list_expr(
+        let inner_list_id = legacy_materialize_template_list_expr(
             &program,
             &list_store,
             &template_list_items,
@@ -10977,7 +10176,7 @@ mod tests {
             .expect("first cell item expr");
 
         let inner_bindings =
-            list_map_bindings(&program, inner_map_cell, inner_item_cell, &first_cell_expr);
+            legacy_list_map_bindings(&program, inner_map_cell, inner_item_cell, &first_cell_expr);
         let interesting_cells: Vec<(u32, String)> = program
             .cells
             .iter()
@@ -11139,7 +10338,7 @@ mod tests {
             resolve_runtime_list_item_expr(&program, &cell_store, outer_map_cell, 0)
                 .expect("first row item expr");
         let outer_bindings =
-            list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
+            legacy_list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
         let inner_source_expr = resolve_runtime_cell_expr_with_bindings(
             &program,
             &cell_store,
@@ -11148,7 +10347,7 @@ mod tests {
             &outer_bindings,
         )
         .expect("resolved row cells expr");
-        let inner_list_id = materialize_template_list_expr(
+        let inner_list_id = legacy_materialize_template_list_expr(
             &program,
             &list_store,
             &template_list_items,
@@ -11196,7 +10395,7 @@ mod tests {
             .expect("display_value cell");
 
         let second_bindings =
-            list_map_bindings(&program, inner_map_cell, inner_item_cell, &inner_items[1]);
+            legacy_list_map_bindings(&program, inner_map_cell, inner_item_cell, &inner_items[1]);
         let second_formula = resolve_runtime_cell_expr_with_bindings(
             &program,
             &cell_store,
@@ -11223,7 +10422,7 @@ mod tests {
         );
 
         let third_bindings =
-            list_map_bindings(&program, inner_map_cell, inner_item_cell, &inner_items[2]);
+            legacy_list_map_bindings(&program, inner_map_cell, inner_item_cell, &inner_items[2]);
         let third_formula = resolve_runtime_cell_expr_with_bindings(
             &program,
             &cell_store,
@@ -11344,7 +10543,7 @@ mod tests {
             resolve_runtime_list_item_expr(&program, &cell_store, outer_map_cell, 0)
                 .expect("first row item expr");
         let outer_bindings =
-            list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
+            legacy_list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
         let inner_source_expr = resolve_runtime_cell_expr_with_bindings(
             &program,
             &cell_store,
@@ -11353,7 +10552,7 @@ mod tests {
             &outer_bindings,
         )
         .expect("resolved first row cells expr");
-        let inner_list_id = materialize_template_list_expr(
+        let inner_list_id = legacy_materialize_template_list_expr(
             &program,
             &list_store,
             &template_list_items,
@@ -11382,13 +10581,13 @@ mod tests {
             })
             .expect("template is_editing cell");
 
-        let first_bindings = list_map_bindings(
+        let first_bindings = legacy_list_map_bindings(
             &program,
             inner_map_cell,
             inner_item_cell,
             &inner_items.first().cloned().expect("first inner item"),
         );
-        let second_bindings = list_map_bindings(
+        let second_bindings = legacy_list_map_bindings(
             &program,
             inner_map_cell,
             inner_item_cell,
@@ -11428,21 +10627,25 @@ mod tests {
         ))
         .expect("parse");
         let program = lower(&ast, None).expect("lower");
+        let list_map_plans = program.compute_list_map_plans();
 
-        let inner_template_cell_range = program
+        let inner_map_cell = program
             .nodes
             .iter()
             .find_map(|node| match node {
                 IrNode::ListMap {
-                    item_name,
-                    template_cell_range,
-                    ..
-                } if item_name == "cell" => Some(*template_cell_range),
+                    cell, item_name, ..
+                } if item_name == "cell" => Some(*cell),
                 _ => None,
             })
             .expect("render-time inner row cell list map");
 
-        let deps = collect_template_global_dependencies(&program, inner_template_cell_range);
+        let deps = list_map_plans
+            .get(&inner_map_cell)
+            .expect("inner list map plan")
+            .template
+            .global_deps
+            .clone();
         let dep_names: Vec<String> = deps
             .iter()
             .filter_map(|cell| {
@@ -11499,6 +10702,7 @@ mod tests {
         ))
         .expect("parse");
         let program = lower(&ast, None).expect("lower");
+        let list_map_plans = program.compute_list_map_plans();
 
         let inner_map_cell = program
             .nodes
@@ -11514,7 +10718,7 @@ mod tests {
             })
             .expect("edit_started inner row cell list map");
 
-        let (_, template_cell_range, template_event_range) = program
+        let outer_map_cell = program
             .nodes
             .iter()
             .find_map(|node| match node {
@@ -11522,20 +10726,23 @@ mod tests {
                     item_name,
                     cell,
                     template_cell_range,
-                    template_event_range,
                     ..
                 } if item_name == "row_data"
                     && inner_map_cell.0 >= template_cell_range.0
                     && inner_map_cell.0 < template_cell_range.1 =>
                 {
-                    Some((*cell, *template_cell_range, *template_event_range))
+                    Some(*cell)
                 }
                 _ => None,
             })
             .expect("edit_started outer row_data list map");
 
-        let cross_scope_events =
-            collect_cross_scope_events(&program, template_cell_range, template_event_range);
+        let cross_scope_events = list_map_plans
+            .get(&outer_map_cell)
+            .expect("outer row_data list map plan")
+            .template
+            .cross_scope_events
+            .clone();
         let cross_scope_event_names: Vec<String> = cross_scope_events
             .iter()
             .filter_map(|event_id| {
@@ -11613,7 +10820,7 @@ mod tests {
             resolve_runtime_list_item_expr(&program, &cell_store, outer_map_cell, 3)
                 .expect("fourth row item expr");
         let outer_bindings =
-            list_map_bindings(&program, outer_map_cell, outer_item_cell, &fourth_row_item);
+            legacy_list_map_bindings(&program, outer_map_cell, outer_item_cell, &fourth_row_item);
         let inner_source_expr = resolve_runtime_cell_expr_with_bindings(
             &program,
             &cell_store,
@@ -11622,7 +10829,7 @@ mod tests {
             &outer_bindings,
         )
         .expect("resolved fourth row cells expr");
-        let inner_list_id = materialize_template_list_expr(
+        let inner_list_id = legacy_materialize_template_list_expr(
             &program,
             &list_store,
             &template_list_items,
@@ -11802,7 +11009,7 @@ mod tests {
             resolve_runtime_list_item_expr(&program, &cell_store, outer_map_cell, 0)
                 .expect("first row item expr");
         let outer_bindings =
-            list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
+            legacy_list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
         let inner_source_expr = resolve_runtime_cell_expr_with_bindings(
             &program,
             &cell_store,
@@ -11811,7 +11018,7 @@ mod tests {
             &outer_bindings,
         )
         .expect("resolved first row cells expr");
-        let inner_list_id = materialize_template_list_expr(
+        let inner_list_id = legacy_materialize_template_list_expr(
             &program,
             &list_store,
             &template_list_items,
@@ -11933,7 +11140,7 @@ mod tests {
             resolve_runtime_list_item_expr(&program, &cell_store, outer_map_cell, 0)
                 .expect("first row item expr");
         let outer_bindings =
-            list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
+            legacy_list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
         let inner_source_expr = resolve_runtime_cell_expr_with_bindings(
             &program,
             &cell_store,
@@ -11942,7 +11149,7 @@ mod tests {
             &outer_bindings,
         )
         .expect("resolved first row cells expr");
-        let inner_list_id = materialize_template_list_expr(
+        let inner_list_id = legacy_materialize_template_list_expr(
             &program,
             &list_store,
             &template_list_items,
@@ -12071,7 +11278,7 @@ mod tests {
             resolve_runtime_list_item_expr(&program, &cell_store, outer_map_cell, 0)
                 .expect("first row item expr");
         let outer_bindings =
-            list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
+            legacy_list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
         let inner_source_expr = resolve_runtime_cell_expr_with_bindings(
             &program,
             &cell_store,
@@ -12080,7 +11287,7 @@ mod tests {
             &outer_bindings,
         )
         .expect("resolved first row cells expr");
-        let inner_list_id = materialize_template_list_expr(
+        let inner_list_id = legacy_materialize_template_list_expr(
             &program,
             &list_store,
             &template_list_items,
@@ -12125,8 +11332,24 @@ mod tests {
             other => panic!("expected initial active root to be display label, got {other:?}"),
         }
 
-        let seed_cells =
-            template_seed_cells_for_active_root(&program, &cell_store, inner_template, &bindings);
+        let template = inner_template.expect("inner template");
+        let seed_cells = {
+            let mut cells = HashSet::new();
+            collect_root_selector_seed_cells(&program, root_cell, template.cell_range, &mut cells);
+            collect_active_element_seed_cells(
+                &program,
+                active_root,
+                template.cell_range,
+                &mut cells,
+            );
+            if cells.is_empty() {
+                template.seed_cells.clone()
+            } else {
+                let mut cells: Vec<_> = cells.into_iter().collect();
+                cells.sort_by_key(|cell| cell.0);
+                cells
+            }
+        };
         for seed_cell in seed_cells {
             let Some(info) = program.cells.get(seed_cell.0 as usize) else {
                 continue;
@@ -12245,7 +11468,7 @@ mod tests {
             resolve_runtime_list_item_expr(&program, &cell_store, outer_map_cell, 0)
                 .expect("first row item expr");
         let outer_bindings =
-            list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
+            legacy_list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
         let inner_source_expr = resolve_runtime_cell_expr_with_bindings(
             &program,
             &cell_store,
@@ -12254,7 +11477,7 @@ mod tests {
             &outer_bindings,
         )
         .expect("resolved first row cells expr");
-        let inner_list_id = materialize_template_list_expr(
+        let inner_list_id = legacy_materialize_template_list_expr(
             &program,
             &list_store,
             &template_list_items,
@@ -12276,7 +11499,8 @@ mod tests {
             .expect("inner template root cell");
 
         let resolve_active_root_for_item = |item_expr: IrExpr| {
-            let bindings = list_map_bindings(&program, inner_map_cell, inner_item_cell, &item_expr);
+            let bindings =
+                legacy_list_map_bindings(&program, inner_map_cell, inner_item_cell, &item_expr);
             resolve_active_template_root_cell(
                 &program,
                 &cell_store,
@@ -12420,7 +11644,7 @@ mod tests {
             resolve_runtime_list_item_expr(&program, &cell_store, outer_map_cell, 0)
                 .expect("first row item expr");
         let outer_bindings =
-            list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
+            legacy_list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
         let inner_source_expr = resolve_runtime_cell_expr_with_bindings(
             &program,
             &cell_store,
@@ -12429,7 +11653,7 @@ mod tests {
             &outer_bindings,
         )
         .expect("resolved first row cells expr");
-        let inner_list_id = materialize_template_list_expr(
+        let inner_list_id = legacy_materialize_template_list_expr(
             &program,
             &list_store,
             &template_list_items,
@@ -12478,13 +11702,13 @@ mod tests {
             inner_items.get(1).expect("second cell item"),
         );
 
-        let first_bindings = list_map_bindings(
+        let first_bindings = legacy_list_map_bindings(
             &program,
             inner_map_cell,
             inner_item_cell,
             inner_items.first().expect("first cell item"),
         );
-        let second_bindings = list_map_bindings(
+        let second_bindings = legacy_list_map_bindings(
             &program,
             inner_map_cell,
             inner_item_cell,
@@ -12714,7 +11938,56 @@ mod tests {
         let outer_plan = program
             .list_map_plan(outer_map_cell)
             .expect("outer row plan");
-        let seed_cells = template_seed_cells_for_local_events(&program, Some(&outer_plan.template));
+        let seed_cells = {
+            let template = &outer_plan.template;
+            let nested_ranges = nested_template_cell_ranges(&program, template.cell_range);
+            let in_nested_range = |cell: CellId| {
+                nested_ranges
+                    .iter()
+                    .any(|(start, end)| cell.0 >= *start && cell.0 < *end)
+            };
+            let in_template_range = |cell: CellId| {
+                cell.0 >= template.cell_range.0
+                    && cell.0 < template.cell_range.1
+                    && !in_nested_range(cell)
+            };
+            let in_template_event_range = |event: EventId| {
+                (event.0 >= template.event_range.0 && event.0 < template.event_range.1)
+                    || template.cross_scope_events.contains(&event.0)
+            };
+
+            let mut cells = HashSet::new();
+            for node in &program.nodes {
+                match node {
+                    IrNode::Then { trigger, body, .. } if in_template_event_range(*trigger) => {
+                        collect_expr_seed_cells(&program, body, &mut cells);
+                    }
+                    IrNode::Hold { trigger_bodies, .. } => {
+                        for (trigger, body) in trigger_bodies {
+                            if in_template_event_range(*trigger) {
+                                collect_expr_seed_cells(&program, body, &mut cells);
+                            }
+                        }
+                    }
+                    IrNode::Latest { arms, .. } => {
+                        for arm in arms {
+                            if arm.trigger.is_some_and(in_template_event_range) {
+                                collect_expr_seed_cells(&program, &arm.body, &mut cells);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut cells: Vec<_> = cells
+                .into_iter()
+                .filter(|cell| in_template_range(*cell))
+                .collect();
+            cells.sort_by_key(|cell| cell.0);
+            cells.dedup();
+            cells
+        };
 
         assert!(
             seed_cells.contains(&outer_row_cell),
@@ -12782,7 +12055,7 @@ mod tests {
             resolve_runtime_list_item_expr(&program, &cell_store, outer_map_cell, 0)
                 .expect("first row item expr");
         let outer_bindings =
-            list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
+            legacy_list_map_bindings(&program, outer_map_cell, outer_item_cell, &outer_item_expr);
         let inner_source_expr = resolve_runtime_cell_expr_with_bindings(
             &program,
             &cell_store,
@@ -12791,7 +12064,7 @@ mod tests {
             &outer_bindings,
         )
         .expect("resolved first row cells expr");
-        let inner_list_id = materialize_template_list_expr(
+        let inner_list_id = legacy_materialize_template_list_expr(
             &program,
             &list_store,
             &template_list_items,
