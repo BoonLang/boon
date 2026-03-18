@@ -1,7 +1,7 @@
 # Single Wasm Engine Cutover Plan
 
-**Status:** In progress
-**Date:** 2026-03-15
+**Status:** Completed
+**Date:** 2026-03-20
 **Supersedes:** `wasm_pro.md`, `wasm_pro_execution_backlog.md`
 
 ## Goal
@@ -67,7 +67,7 @@ Use absolute budgets rather than legacy-engine comparison:
 - A1 commit path: `<= 300 ms`
 - dependent recompute path: `<= 300 ms`
 
-Current reference snapshot before final browser-fix work:
+Reference snapshot at completion:
 
 - encoded bytes: `934301`
 - first render: about `245 ms`
@@ -82,8 +82,9 @@ Current reference snapshot before final browser-fix work:
 - `cargo run --manifest-path tools/Cargo.toml -- metrics cells-backend --check`
 - browser-driven 7GUI verification on `Wasm`
 
-## Current Open Work
+## Completion Notes
 
-- Finish the live browser `cells` Enter-commit fix on `Wasm`.
-- Remove the last unsupported-example fallback paths from the Wasm lowering/runtime path.
-- Rename remaining internal `engine_wasm_pro` implementation details when safe, after public/API cutover is stable.
+- Legacy-vs-pro browser/backend split has been removed from the live Wasm surface.
+- User-facing engine selection now exposes a single `Wasm` engine.
+- Live browser verification passes for all official 7GUIs on `Wasm`.
+- Cells absolute Wasm budgets pass without relying on legacy-engine comparison.

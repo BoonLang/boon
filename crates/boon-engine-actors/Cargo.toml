@@ -1,31 +1,33 @@
 [package]
-name = "boon"
+name = "boon-engine-actors"
 version = "0.1.0"
 edition = "2024"
 repository = "https://github.com/BoonLang/boon"
 authors = ["Martin Kavík <martin@kavik.cz>"]
-description = "Boon Lang"
+description = "Actors browser engine for Boon"
 categories = ["Compilers"]
 license = "UPL-1.0"
-readme = "../README.md"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3.19"
 
 [dependencies]
-chumsky = { version = "0.11", features = ["pratt", "serde"] }
+boon = { path = "../boon" }
 ariadne = "0.5"
+chumsky = { version = "0.11", features = ["pratt", "serde"] }
+pin-project = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json_any_key = "2.0.0"
-serde_json = { version = "1", optional = true }
 boon-scene = { path = "../boon-scene" }
 boon-monitor-protocol = { path = "../boon-monitor-protocol" }
 boon-renderer-zoon = { path = "../boon-renderer-zoon" }
-
 ulid = { version = "1.2.1", features = ["serde"] }
-# `rustflags = ["--cfg", 'getrandom_backend="wasm_js"']` has to be in workspace .cargo/config.toml
 getrandom = { version = "0.3", features = ["wasm_js"] }
-
-# zoon = { path = "../../../MoonZoon/crates/zoon" }
 zoon = { git = "https://github.com/MoonZoon/MoonZoon", rev = "19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d" }
+futures-channel = { version = "0.3", features = ["sink"] }
+smallvec = "1"
 
 [features]
-default = []
-cli = ["dep:serde_json"]
+default = ["debug-channels"]
+debug-channels = []
+actors-metrics = []

@@ -11,7 +11,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-ENGINE_DD="$REPO_ROOT/crates/boon/src/platform/browser/engine_dd"
+ENGINE_DD="$REPO_ROOT/crates/boon-engine-dd/src"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -118,18 +118,18 @@ if [ -d "$ENGINE_DD" ]; then
     # Exclude scope copies and slice-to-vec for closure captures (not DD collection materialization)
     count=$(grep -r 'to_vec()' "$ENGINE_DD" --include='*.rs' 2>/dev/null | grep -v 'local_scope' | grep -v 'fn_scope' | grep -v 'scope\.to_vec' | grep -v 'loop_scope' | grep -v 'new_scope' | grep -v 'item_scope' | grep -v 'dep_names' | wc -l)
     if [ "$count" -gt 0 ]; then
-        fail "Found to_vec() in engine_dd/ ($count) - DD v1 anti-pattern!"
+        fail "Found to_vec() in boon-engine-dd/src ($count) - DD v1 anti-pattern!"
     else
         pass "No to_vec() anti-pattern"
     fi
     count=$(grep -r 'Arc<Vec<Value>>' "$ENGINE_DD" --include='*.rs' 2>/dev/null | wc -l)
     if [ "$count" -gt 0 ]; then
-        fail "Found Arc<Vec<Value>> in engine_dd/ ($count) - DD v1 anti-pattern!"
+        fail "Found Arc<Vec<Value>> in boon-engine-dd/src ($count) - DD v1 anti-pattern!"
     else
         pass "No Arc<Vec<Value>> anti-pattern"
     fi
 else
-    warn "engine_dd/ directory not found yet (not implemented)"
+    warn "boon-engine-dd/src directory not found yet (not implemented)"
 fi
 echo ""
 
@@ -190,7 +190,7 @@ if [ -d "$ENGINE_DD" ]; then
         fi
     done
 else
-    warn "engine_dd/ not found - skipping construct coverage"
+    warn "boon-engine-dd/src not found - skipping construct coverage"
 fi
 echo ""
 

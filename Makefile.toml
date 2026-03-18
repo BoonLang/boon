@@ -52,50 +52,50 @@ filter_comments() {
 }
 
 # Forbidden: Mutable<T> (Zoon's mutable signal) - actual usage
-MATCHES=$(grep -r "Mutable<" crates/boon/src/platform/browser/engine_dd/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" | grep -v "//!" | grep -v ":.*//.*Mutable" || true)
+MATCHES=$(grep -r "Mutable<" crates/boon-engine-dd/src/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" | grep -v "//!" | grep -v ":.*//.*Mutable" || true)
 if [ -n "$MATCHES" ]; then
     echo "$MATCHES"
-    echo "❌ ERROR: Found Mutable<T> in engine_dd/ - this is cheating!"
+    echo "❌ ERROR: Found Mutable<T> in boon-engine-dd/src - this is cheating!"
     CHEAT_FOUND=1
 fi
 
 # Forbidden: RefCell<T> - actual usage
-MATCHES=$(grep -r "RefCell<" crates/boon/src/platform/browser/engine_dd/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" | grep -v "//!" | grep -v ":.*//.*RefCell" || true)
+MATCHES=$(grep -r "RefCell<" crates/boon-engine-dd/src/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" | grep -v "//!" | grep -v ":.*//.*RefCell" || true)
 if [ -n "$MATCHES" ]; then
     echo "$MATCHES"
-    echo "❌ ERROR: Found RefCell<T> in engine_dd/ - this is cheating!"
+    echo "❌ ERROR: Found RefCell<T> in boon-engine-dd/src - this is cheating!"
     CHEAT_FOUND=1
 fi
 
 # Forbidden: .borrow() / .borrow_mut() - actual usage
-MATCHES=$(grep -rE "\.borrow(_mut)?\(\)" crates/boon/src/platform/browser/engine_dd/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" | grep -v "//!" | grep -v ":.*//.*borrow" || true)
+MATCHES=$(grep -rE "\.borrow(_mut)?\(\)" crates/boon-engine-dd/src/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" | grep -v "//!" | grep -v ":.*//.*borrow" || true)
 if [ -n "$MATCHES" ]; then
     echo "$MATCHES"
-    echo "❌ ERROR: Found .borrow() in engine_dd/ - this is cheating!"
+    echo "❌ ERROR: Found .borrow() in boon-engine-dd/src - this is cheating!"
     CHEAT_FOUND=1
 fi
 
 # Forbidden: trigger_render() function call
-MATCHES=$(grep -r "trigger_render\s*(" crates/boon/src/platform/browser/engine_dd/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" | grep -v "//!" | grep -v ":.*//.*trigger_render" || true)
+MATCHES=$(grep -r "trigger_render\s*(" crates/boon-engine-dd/src/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" | grep -v "//!" | grep -v ":.*//.*trigger_render" || true)
 if [ -n "$MATCHES" ]; then
     echo "$MATCHES"
-    echo "❌ ERROR: Found trigger_render() in engine_dd/ - this is cheating!"
+    echo "❌ ERROR: Found trigger_render() in boon-engine-dd/src - this is cheating!"
     CHEAT_FOUND=1
 fi
 
 # Forbidden: handle_link_fire() function call
-MATCHES=$(grep -r "handle_link_fire\s*(" crates/boon/src/platform/browser/engine_dd/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" || true)
+MATCHES=$(grep -r "handle_link_fire\s*(" crates/boon-engine-dd/src/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" || true)
 if [ -n "$MATCHES" ]; then
     echo "$MATCHES"
-    echo "❌ ERROR: Found handle_link_fire() in engine_dd/ - this is cheating!"
+    echo "❌ ERROR: Found handle_link_fire() in boon-engine-dd/src - this is cheating!"
     CHEAT_FOUND=1
 fi
 
 # Forbidden: handle_timer_fire() function call
-MATCHES=$(grep -r "handle_timer_fire\s*(" crates/boon/src/platform/browser/engine_dd/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" || true)
+MATCHES=$(grep -r "handle_timer_fire\s*(" crates/boon-engine-dd/src/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" || true)
 if [ -n "$MATCHES" ]; then
     echo "$MATCHES"
-    echo "❌ ERROR: Found handle_timer_fire() in engine_dd/ - this is cheating!"
+    echo "❌ ERROR: Found handle_timer_fire() in boon-engine-dd/src - this is cheating!"
     CHEAT_FOUND=1
 fi
 
@@ -106,7 +106,7 @@ if [ $CHEAT_FOUND -eq 1 ]; then
     exit 1
 fi
 
-echo "✅ No cheating patterns detected in engine_dd/"
+echo "✅ No cheating patterns detected in boon-engine-dd/src"
 echo "=== Anti-cheat verification passed ==="
 '''
 

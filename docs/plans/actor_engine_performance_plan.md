@@ -17,9 +17,9 @@ This plan is designed for another AI/engineer to execute incrementally.
 ## 1. Scope and constraints
 
 In scope:
-- `crates/boon/src/platform/browser/engine_actors/engine.rs`
-- `crates/boon/src/platform/browser/engine_actors/bridge.rs`
-- `crates/boon/src/platform/browser/engine_actors/evaluator.rs`
+- `crates/boon-engine-actors/src/engine.rs`
+- `crates/boon-engine-actors/src/bridge.rs`
+- `crates/boon-engine-actors/src/evaluator.rs`
 - Supporting docs/tests/bench harnesses for Actors mode
 
 Out of scope:

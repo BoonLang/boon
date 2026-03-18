@@ -134,23 +134,11 @@ dependencies = [
  "boon-renderer-zoon",
  "boon-scene",
  "chumsky",
- "differential-dataflow",
- "futures-channel",
  "getrandom 0.3.1",
- "indexmap",
- "js-sys",
- "ordered-float",
- "pin-project",
  "serde",
- "serde-wasm-bindgen",
  "serde_json",
  "serde_json_any_key",
- "smallvec",
- "timely",
  "ulid",
- "wasm-bindgen",
- "wasm-bindgen-test",
- "wasm-encoder",
  "zoon",
 ]
 
@@ -162,6 +150,67 @@ dependencies = [
  "clap",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "boon-engine-actors"
+version = "0.1.0"
+dependencies = [
+ "ariadne",
+ "boon",
+ "boon-monitor-protocol",
+ "boon-renderer-zoon",
+ "boon-scene",
+ "chumsky",
+ "futures-channel",
+ "getrandom 0.3.1",
+ "pin-project",
+ "serde",
+ "serde_json_any_key",
+ "smallvec",
+ "ulid",
+ "wasm-bindgen-test",
+ "zoon",
+]
+
+[[package]]
+name = "boon-engine-dd"
+version = "0.1.0"
+dependencies = [
+ "boon",
+ "boon-renderer-zoon",
+ "boon-scene",
+ "chumsky",
+ "differential-dataflow",
+ "futures-channel",
+ "indexmap",
+ "js-sys",
+ "ordered-float",
+ "pin-project",
+ "serde",
+ "timely",
+ "ulid",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
+ "zoon",
+]
+
+[[package]]
+name = "boon-engine-wasm"
+version = "0.1.0"
+dependencies = [
+ "boon",
+ "boon-renderer-zoon",
+ "boon-scene",
+ "js-sys",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "ulid",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
+ "wasm-encoder",
+ "zoon",
 ]
 
 [[package]]

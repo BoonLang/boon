@@ -23,7 +23,7 @@ store: [
 
     title_to_add: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
         Enter => BLOCK {
-            trimmed: elements.new_todo_title_text_input.text |> Text/trim()
+            trimmed: elements.new_todo_title_text_input.event.key_down.text |> Text/trim()
 
             trimmed
             |> Text/is_not_empty()
@@ -36,13 +36,17 @@ store: [
         __ => SKIP
     }
 
-    todos:
+    todos_after_append:
         LIST {
             new_todo(title: TEXT { Buy groceries })
             new_todo(title: TEXT { Clean room })
         }
         |> List/append(item: title_to_add |> new_todo())
+    todos_after_remove_button:
+        todos_after_append
         |> List/remove(item, on: item.todo_elements.remove_todo_button.event.press)
+    todos:
+        todos_after_remove_button
         |> List/remove(item, on: elements.remove_completed_button.event.press |> THEN {
             item.completed |> WHEN {
                 True => []

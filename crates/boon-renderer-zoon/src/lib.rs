@@ -217,6 +217,14 @@ impl FakeRenderState {
         self.input_values.get(&id)
     }
 
+    fn checked_value_for(&self, id: NodeId) -> Option<bool> {
+        self.checked_values.get(&id).copied()
+    }
+
+    fn selected_value_for(&self, id: NodeId) -> Option<&String> {
+        self.input_values.get(&id)
+    }
+
     fn apply_op(&mut self, op: &RenderOp) -> Result<(), RenderApplyError> {
         match op {
             RenderOp::ReplaceRoot(root) => self.root = Some(root.clone()),
@@ -429,10 +437,46 @@ pub fn render_snapshot_root_with_handlers(
     handlers: &RenderInteractionHandlers,
 ) -> zoon::RawElOrText {
     install_automation_hooks(handlers.clone());
+    let active_text_input = active_text_input_state();
     match root {
-        RenderRoot::UiTree(node) => render_ui_node(node, state, handlers),
+        RenderRoot::UiTree(node) => render_ui_node(node, state, handlers, active_text_input.as_ref()),
         RenderRoot::SceneGraph(node) => render_scene_node(node),
     }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveTextInputState {
+    node_id: String,
+    selection_start: Option<u32>,
+    selection_end: Option<u32>,
+}
+
+fn active_text_input_state() -> Option<ActiveTextInputState> {
+    let window = web_sys::window()?;
+    let document = window.document()?;
+    let active = document.active_element()?;
+
+    let node_id = active.get_attribute("data-boon-node-id")?;
+    let (selection_start, selection_end) =
+        if let Some(input) = active.dyn_ref::<web_sys::HtmlInputElement>() {
+            (
+                input.selection_start().ok().flatten(),
+                input.selection_end().ok().flatten(),
+            )
+        } else if let Some(textarea) = active.dyn_ref::<web_sys::HtmlTextAreaElement>() {
+            (
+                textarea.selection_start().ok().flatten(),
+                textarea.selection_end().ok().flatten(),
+            )
+        } else {
+            return None;
+        };
+
+    Some(ActiveTextInputState {
+        node_id,
+        selection_start,
+        selection_end,
+    })
 }
 
 fn install_automation_hooks(handlers: RenderInteractionHandlers) {
@@ -527,6 +571,7 @@ fn render_ui_node(
     node: &UiNode,
     state: &FakeRenderState,
     handlers: &RenderInteractionHandlers,
+    active_text_input: Option<&ActiveTextInputState>,
 ) -> zoon::RawElOrText {
     match &node.kind {
         UiNodeKind::Text { text } => zoon::Text::new(text.clone()).unify(),
@@ -534,11 +579,19 @@ fn render_ui_node(
             let children: Vec<zoon::RawElOrText> = node
                 .children
                 .iter()
-                .map(|child| render_ui_node(child, state, handlers))
+                .map(|child| render_ui_node(child, state, handlers, active_text_input))
                 .collect();
             let node_id_value = node.id;
             let node_id = node.id.0.to_string();
             let mut should_focus_after_insert = false;
+            let restore_selection_after_insert = if tag == "input" {
+                active_text_input
+                    .filter(|input| input.node_id == node_id)
+                    .map(|input| (input.selection_start, input.selection_end))
+            } else {
+                None
+            };
+            let mut input_value_after_insert = None;
             let mut el = raw_html_el_for_tag(tag)
                 .attr("data-boon-tag", tag)
                 .attr("data-boon-node-id", &node_id)
@@ -586,6 +639,9 @@ fn render_ui_node(
                     if tag == "input" && name == "autofocus" && value == "true" {
                         should_focus_after_insert = true;
                     }
+                    if tag == "input" && name == "value" {
+                        input_value_after_insert = Some(value.clone());
+                    }
                     el = el.attr(name, value);
                 }
             }
@@ -604,43 +660,90 @@ fn render_ui_node(
             }
             if tag == "input" {
                 if let Some(value) = state.input_value_for(node_id_value) {
+                    input_value_after_insert = Some(value.clone());
                     el = el.attr("value", value);
                 }
                 if should_focus_after_insert {
                     el = el.attr("data-boon-focused", "true").attr("focused", "true");
                 }
             }
+            if let Some(checked) = state.checked_value_for(node_id_value) {
+                let checked = if checked { "true" } else { "false" };
+                el = el.attr("aria-checked", checked).attr("data-checked", checked);
+            }
+            if tag == "select" {
+                let selected_value = state.selected_value_for(node_id_value).cloned();
+                if let Some(selected_value) = selected_value {
+                    el = el.after_insert(move |element| {
+                        if let Some(select) = element.dyn_ref::<web_sys::HtmlSelectElement>() {
+                            select.set_value(&selected_value);
+                        }
+                    });
+                }
+            }
             for (port, kind) in state.event_ports_for(node_id_value) {
                 el = el.attr(event_port_attr_name(&kind), &port.0.to_string());
                 el = attach_ui_handler(el, handlers.clone(), node_id_value, port, kind);
             }
-            if should_focus_after_insert {
-                el = el.after_insert(|element| {
+            if should_focus_after_insert
+                || restore_selection_after_insert.is_some()
+                || input_value_after_insert.is_some()
+            {
+                let restore_selection_after_insert = restore_selection_after_insert;
+                let input_value_after_insert = input_value_after_insert;
+                el = el.after_insert(move |element| {
                     if let Some(input) = element.dyn_ref::<web_sys::HtmlInputElement>() {
+                        if let Some(value) = input_value_after_insert.as_deref() {
+                            input.set_value(value);
+                        }
                         let _ = input.focus();
-                        let _ = input.select();
+                        if should_focus_after_insert {
+                            let _ = input.select();
+                        } else if let Some((start, end)) = restore_selection_after_insert {
+                            if let (Some(start), Some(end)) = (start, end) {
+                                let _ = input.set_selection_range(start, end);
+                            }
+                        }
                     } else if let Some(html) = element.dyn_ref::<web_sys::HtmlElement>() {
                         let _ = html.focus();
                     }
                     if let Some(window) = web_sys::window() {
                         let delayed_element = element.clone();
-                        let callback = wasm_bindgen::closure::Closure::once(move || {
-                            if let Some(input) =
-                                delayed_element.dyn_ref::<web_sys::HtmlInputElement>()
-                            {
-                                let _ = input.focus();
-                                let _ = input.select();
-                            } else if let Some(html) =
-                                delayed_element.dyn_ref::<web_sys::HtmlElement>()
-                            {
-                                let _ = html.focus();
-                            }
-                        });
-                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                            callback.as_ref().unchecked_ref(),
-                            0,
-                        );
-                        callback.forget();
+                        let restore_selection_after_insert = restore_selection_after_insert;
+                        let input_value_after_insert = input_value_after_insert.clone();
+                        for delay_ms in [0, 50] {
+                            let delayed_element = delayed_element.clone();
+                            let restore_selection_after_insert = restore_selection_after_insert;
+                            let input_value_after_insert = input_value_after_insert.clone();
+                            let callback = wasm_bindgen::closure::Closure::once(move || {
+                                if let Some(input) =
+                                    delayed_element.dyn_ref::<web_sys::HtmlInputElement>()
+                                {
+                                    if let Some(value) = input_value_after_insert.as_deref() {
+                                        input.set_value(value);
+                                    }
+                                    let _ = input.focus();
+                                    if should_focus_after_insert {
+                                        let _ = input.select();
+                                    } else if let Some((start, end)) =
+                                        restore_selection_after_insert
+                                    {
+                                        if let (Some(start), Some(end)) = (start, end) {
+                                            let _ = input.set_selection_range(start, end);
+                                        }
+                                    }
+                                } else if let Some(html) =
+                                    delayed_element.dyn_ref::<web_sys::HtmlElement>()
+                                {
+                                    let _ = html.focus();
+                                }
+                            });
+                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                                callback.as_ref().unchecked_ref(),
+                                delay_ms,
+                            );
+                            callback.forget();
+                        }
                     }
                 });
             }
@@ -663,7 +766,9 @@ fn raw_html_el_for_tag(tag: &str) -> zoon::RawHtmlEl<web_sys::HtmlElement> {
         "input" => zoon::RawHtmlEl::new("input"),
         "label" => zoon::RawHtmlEl::new("label"),
         "p" => zoon::RawHtmlEl::new("p"),
+        "option" => zoon::RawHtmlEl::new("option"),
         "section" => zoon::RawHtmlEl::new("section"),
+        "select" => zoon::RawHtmlEl::new("select"),
         "span" => zoon::RawHtmlEl::new("span"),
         _ => zoon::RawHtmlEl::new("div"),
     }
@@ -692,11 +797,15 @@ fn attach_ui_handler(
     kind: UiEventKind,
 ) -> zoon::RawHtmlEl<web_sys::HtmlElement> {
     match kind {
-        UiEventKind::Click => raw_el.event_handler(move |_: zoon::events::Click| {
+        UiEventKind::Click => raw_el.event_handler(move |event: zoon::events::Click| {
             handlers.emit_event(UiEvent {
                 target: port,
                 kind: UiEventKind::Click,
-                payload: None,
+                payload: Some(format!(
+                    "{{\"x\":{},\"y\":{}}}",
+                    event.offset_x(),
+                    event.offset_y()
+                )),
             });
         }),
         UiEventKind::DoubleClick => raw_el.event_handler(move |_: zoon::events::DoubleClick| {
@@ -762,7 +871,46 @@ fn attach_ui_handler(
                 payload,
             });
         }),
-        UiEventKind::Custom(_) => raw_el,
+        UiEventKind::Custom(name) => {
+            if let Some(interval_ms) = name.strip_prefix("timer:").and_then(|value| value.parse::<i32>().ok()) {
+                raw_el.after_insert(move |element| {
+                    let Some(window) = web_sys::window() else {
+                        return;
+                    };
+                    let handlers = handlers.clone();
+                    let element = element.clone();
+                    let kind_name = name.clone();
+                    let interval_id = Rc::new(RefCell::new(None::<i32>));
+                    let interval_id_for_callback = interval_id.clone();
+                    let callback = Closure::<dyn FnMut()>::wrap(Box::new(move || {
+                        if !element.is_connected() {
+                            if let Some(id) = *interval_id_for_callback.borrow() {
+                                if let Some(window) = web_sys::window() {
+                                    window.clear_interval_with_handle(id);
+                                }
+                            }
+                            return;
+                        }
+                        handlers.emit_event(UiEvent {
+                            target: port,
+                            kind: UiEventKind::Custom(kind_name.clone()),
+                            payload: None,
+                        });
+                    }));
+                    if let Ok(id) = window
+                        .set_interval_with_callback_and_timeout_and_arguments_0(
+                            callback.as_ref().unchecked_ref(),
+                            interval_ms,
+                        )
+                    {
+                        *interval_id.borrow_mut() = Some(id);
+                        callback.forget();
+                    }
+                })
+            } else {
+                raw_el
+            }
+        }
     }
 }
 

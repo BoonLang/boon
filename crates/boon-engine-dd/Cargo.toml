@@ -1,0 +1,29 @@
+[package]
+name = "boon-engine-dd"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/BoonLang/boon"
+authors = ["Martin Kavík <martin@kavik.cz>"]
+description = "Differential Dataflow browser engine for Boon"
+categories = ["Compilers"]
+license = "UPL-1.0"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3.19"
+
+[dependencies]
+boon = { path = "../boon" }
+serde = { version = "1", features = ["derive"] }
+boon-scene = { path = "../boon-scene" }
+boon-renderer-zoon = { path = "../boon-renderer-zoon" }
+pin-project = "1"
+chumsky = "0.11.2"
+zoon = { git = "https://github.com/MoonZoon/MoonZoon", rev = "19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d" }
+futures-channel = { version = "0.3", features = ["sink"] }
+ordered-float = { version = "4", features = ["serde"] }
+indexmap = "2"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+timely = "0.26"
+differential-dataflow = "0.19"
+ulid = { version = "1.2.1", features = ["serde"] }

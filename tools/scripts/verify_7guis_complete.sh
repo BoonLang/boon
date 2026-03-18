@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# verify_7guis_complete.sh — Verify 7GUIs examples across all engines
+# verify_7guis_complete.sh — Verify the plan-target 7GUIs cutover state
 #
-# Runs behavioral tests (via boon-tools test-examples) for each engine,
+# Runs browser-driven Wasm behavioral tests (via boon-tools test-examples),
 # plus static checks for persistence toggle, actor instrumentation, etc.
 #
 # Prerequisites:
@@ -16,7 +16,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOLS_DIR="$(dirname "$SCRIPT_DIR")"
 REPO_DIR="$(dirname "$TOOLS_DIR")"
-BT="$REPO_DIR/target/release/boon-tools"
+BT_DEBUG="$REPO_DIR/target/debug/boon-tools"
+BT_RELEASE="$REPO_DIR/target/release/boon-tools"
+BT="$BT_DEBUG"
 EXAMPLES_DIR="$REPO_DIR/playground/frontend/src/examples"
 PASS=0; FAIL=0; SKIP=0
 STATIC_ONLY=false
@@ -32,9 +34,8 @@ fail() { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 skip() { SKIP=$((SKIP+1)); echo "  [SKIP] $1"; }
 
 EXAMPLES="temperature_converter flight_booker timer crud circle_drawer cells"
-# Run the current three public engines. Actual per-example support is still
-# encoded in each `.expected` file via `skip_engines`.
-ENGINES="Actors DD Wasm"
+# The single-engine cutover plan's browser-first gate is Wasm-only.
+LIVE_ENGINES="Wasm"
 
 # ── Section 1: Build boon-tools ──
 echo "=== 7GUIs Verification ==="
@@ -42,9 +43,13 @@ echo ""
 echo "1. Build check"
 if [ -f "$BT" ]; then
     ok "boon-tools binary exists"
+elif [ -f "$BT_RELEASE" ]; then
+    BT="$BT_RELEASE"
+    ok "boon-tools binary exists"
 else
     echo "  Building boon-tools..."
-    if (cd "$TOOLS_DIR" && cargo build --release --target-dir "$REPO_DIR/target" 2>/dev/null); then
+    if (cd "$TOOLS_DIR" && cargo build --target-dir "$REPO_DIR/target" 2>/dev/null); then
+        BT="$BT_DEBUG"
         ok "boon-tools built successfully"
     else
         fail "boon-tools build failed"
@@ -107,7 +112,7 @@ else
 fi
 
 # Actor count instrumentation
-ENGINE_RS="$REPO_DIR/crates/boon/src/platform/browser/engine_actors/engine.rs"
+ENGINE_RS="$REPO_DIR/crates/boon-engine-actors/src/engine.rs"
 if grep -q "LIVE_ACTOR_COUNT" "$ENGINE_RS"; then
     ok "LIVE_ACTOR_COUNT instrumentation"
 else
@@ -210,22 +215,23 @@ else
     ok "Cells expected file no longer skips any engines"
 fi
 
-if grep -Fq 'skip_engines = ["DD", "Wasm"]' "$EXAMPLES_DIR/flight_booker/flight_booker.expected"; then
-    ok "Flight Booker expected skip list matches current DD/Wasm status"
+if grep -q '^skip_engines' "$EXAMPLES_DIR/flight_booker/flight_booker.expected"; then
+    fail "Flight Booker expected file still skips one or more engines"
 else
-    fail "Flight Booker expected skip list drifted"
+    ok "Flight Booker expected file no longer skips any engines"
 fi
 
-if grep -Fq 'skip_engines = ["DD", "Wasm"]' "$EXAMPLES_DIR/crud/crud.expected"; then
-    ok "CRUD expected skip list matches current DD/Wasm status"
+if grep -q '^skip_engines' "$EXAMPLES_DIR/crud/crud.expected"; then
+    fail "CRUD expected file still skips one or more engines"
 else
-    fail "CRUD expected skip list drifted"
+    ok "CRUD expected file no longer skips any engines"
 fi
 
-if grep -Fq 'skip_engines = ["Wasm"]' "$EXAMPLES_DIR/timer/timer.expected"; then
-    ok "Timer expected skip list matches current Wasm status"
+if grep -Eq '^skip_engines *= *\\[[^]]+\\]' "$EXAMPLES_DIR/timer/timer.expected" \
+    && ! grep -Eq '^skip_engines *= *\\[\\]' "$EXAMPLES_DIR/timer/timer.expected"; then
+    fail "Timer expected file still skips one or more engines"
 else
-    fail "Timer expected skip list drifted"
+    ok "Timer expected file no longer skips any engines"
 fi
 
 # Cells grid size (official 7GUIs target: 26 columns x 100 rows)
@@ -252,7 +258,7 @@ fi
 if [ "$STATIC_ONLY" = true ]; then
     echo ""
     echo "4. Live browser tests (SKIPPED — --static-only)"
-    for engine in $ENGINES; do
+    for engine in $LIVE_ENGINES; do
         for ex in $EXAMPLES; do
             skip "$engine/$ex (static-only mode)"
         done
@@ -269,7 +275,7 @@ else
     if ! "$BT" exec status >/dev/null 2>&1; then
         echo "  WARNING: Cannot connect to browser. Skipping live tests."
         echo "  Ensure playground + WS server + extension are running."
-        for engine in $ENGINES; do
+        for engine in $LIVE_ENGINES; do
             for ex in $EXAMPLES; do
                 skip "$engine/$ex (no connection)"
             done
@@ -277,7 +283,7 @@ else
     else
         ok "boon-tools connected to browser"
 
-        for engine in $ENGINES; do
+        for engine in $LIVE_ENGINES; do
             echo ""
             echo "  --- $engine engine ---"
             for ex in $EXAMPLES; do

@@ -4,6 +4,7 @@ pub mod expected;
 pub mod pixel_diff;
 pub mod test_examples;
 pub mod verify_integrity;
+pub mod verify_wasm_lowering;
 
 pub fn is_valid_engine_name(engine: &str) -> bool {
     matches!(engine, "Actors" | "DD" | "Wasm")

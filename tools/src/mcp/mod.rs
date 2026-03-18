@@ -1798,6 +1798,7 @@ async fn hover_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<
 }
 
 /// Recursively find element bounds by text content
+#[allow(dead_code)]
 fn find_element_bounds_by_text(
     value: &Value,
     text: &str,

@@ -4,29 +4,108 @@
 use boon::zoon::{Rgba, map_ref};
 use boon::zoon::{eprintln, println, *};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use ulid::Ulid;
 
-use boon::platform::browser::common::{
-    EngineType, available_engines, clear_all_compiled_engine_persisted_states,
-    clear_selected_engine_persisted_states, default_engine, is_engine_available,
-    picker_engines, preferred_wasm_family_engine, resolve_engine_for_current_build,
-};
+use boon::platform::browser::common::EngineType;
 
 #[cfg(feature = "engine-actors")]
-use boon::platform::browser::{
+use boon_engine_actors::{
     bridge::object_with_document_to_element_signal,
-    engine::VirtualFilesystem,
-    evaluator::{FunctionRegistry, StaticFunctionDefinition, parse_module},
+    engine::{
+        LinkConnector, Object, PassThroughConnector, ReferenceConnector, ScopeDestroyGuard,
+        VirtualFilesystem,
+    },
+    evaluator::{FunctionRegistry, StaticFunctionDefinition},
     interpreter,
 };
 
-// DD engine imports (feature-gated)
 #[cfg(feature = "engine-dd")]
-use boon::platform::browser::engine_dd::{
-    render_dd_result_reactive_signal, run_dd_reactive_with_persistence,
+use boon_engine_dd::{
+    clear_dd_persisted_states, render_dd_result_reactive_signal,
+    run_dd_reactive_with_persistence,
 };
+
+#[cfg(feature = "engine-wasm")]
+use boon_engine_wasm::{clear_wasm_persisted_states, run_wasm};
+
+#[cfg(not(feature = "engine-wasm"))]
+fn preferred_wasm_engine() -> Option<EngineType> {
+    None
+}
+
+#[cfg(feature = "engine-wasm")]
+fn preferred_wasm_engine() -> Option<EngineType> {
+    Some(EngineType::Wasm)
+}
+
+fn is_engine_available(engine: EngineType) -> bool {
+    match engine {
+        EngineType::Actors => cfg!(feature = "engine-actors"),
+        EngineType::DifferentialDataflow => cfg!(feature = "engine-dd"),
+        EngineType::Wasm => cfg!(feature = "engine-wasm"),
+    }
+}
+
+fn available_engines() -> Vec<EngineType> {
+    let mut engines = Vec::new();
+    #[cfg(feature = "engine-actors")]
+    engines.push(EngineType::Actors);
+    #[cfg(feature = "engine-dd")]
+    engines.push(EngineType::DifferentialDataflow);
+    #[cfg(feature = "engine-wasm")]
+    engines.push(EngineType::Wasm);
+    engines
+}
+
+fn default_engine() -> EngineType {
+    available_engines()
+        .into_iter()
+        .next()
+        .expect("At least one engine must be enabled via feature flags")
+}
+
+fn picker_engines(_selected_engine: Option<EngineType>) -> Vec<EngineType> {
+    available_engines()
+}
+
+fn is_engine_switchable() -> bool {
+    available_engines().len() > 1
+}
+
+fn resolve_engine_for_current_build(engine: EngineType) -> Option<EngineType> {
+    if is_engine_available(engine) {
+        return Some(engine);
+    }
+
+    match engine {
+        EngineType::Wasm => preferred_wasm_engine(),
+        EngineType::Actors | EngineType::DifferentialDataflow => None,
+    }
+}
+
+fn clear_selected_engine_persisted_states(engine: EngineType) {
+    #[cfg(feature = "engine-dd")]
+    if engine == EngineType::DifferentialDataflow {
+        clear_dd_persisted_states();
+    }
+
+    #[cfg(feature = "engine-wasm")]
+    if engine == EngineType::Wasm {
+        clear_wasm_persisted_states();
+    }
+}
+
+fn clear_all_compiled_engine_persisted_states() {
+    #[cfg(feature = "engine-dd")]
+    clear_dd_persisted_states();
+
+    #[cfg(feature = "engine-wasm")]
+    clear_wasm_persisted_states();
+}
 
 mod code_editor;
 use code_editor::CodeEditor;
@@ -115,16 +194,97 @@ fn get_example_from_url() -> Option<String> {
     params.get("example")
 }
 
-/// Update URL query parameter without page reload (URL-encodes the name)
-fn set_example_in_url(example_name: &str) {
+fn autorun_enabled_from_url() -> bool {
+    let Some(window) = web_sys::window() else {
+        return true;
+    };
+    let Ok(search) = window.location().search() else {
+        return true;
+    };
+    if search.is_empty() {
+        return true;
+    }
+    let Ok(params) = web_sys::UrlSearchParams::new_with_str(&search) else {
+        return true;
+    };
+    !matches!(
+        params.get("autorun").as_deref(),
+        Some("0") | Some("false") | Some("False")
+    )
+}
+
+fn engine_query_value(engine: EngineType) -> &'static str {
+    match engine {
+        EngineType::Actors => "actors",
+        EngineType::DifferentialDataflow => "dd",
+        EngineType::Wasm => "wasm",
+    }
+}
+
+fn encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(&mut encoded, "%{:02X}", byte);
+            }
+        }
+    }
+
+    encoded
+}
+
+fn push_playground_url(
+    engine: Option<EngineType>,
+    example_name: Option<&str>,
+    custom_example_name: Option<&str>,
+) {
     if let Some(window) = web_sys::window() {
         if let Ok(history) = window.history() {
-            // URL-encode the example name to handle spaces and special characters
-            let encoded_name = js_sys::encode_uri_component(example_name);
-            let new_url = format!("?example={}", encoded_name);
+            let mut query_parts = Vec::new();
+
+            if let Some(engine) = engine {
+                query_parts.push(format!("engine={}", engine_query_value(engine)));
+            }
+
+            if let Some(example_name) = example_name {
+                query_parts.push(format!(
+                    "example={}",
+                    encode_query_component(example_name)
+                ));
+            }
+
+            if let Some(custom_example_name) = custom_example_name {
+                query_parts.push(format!(
+                    "custom-example={}",
+                    encode_query_component(custom_example_name)
+                ));
+            }
+
+            let new_url = format!("?{}", query_parts.join("&"));
             let _ = history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&new_url));
         }
     }
+}
+
+fn set_engine_in_url(engine: EngineType) {
+    let example_name = get_example_from_url();
+    let custom_example_name = get_custom_example_from_url();
+    push_playground_url(
+        Some(engine),
+        example_name.as_deref(),
+        custom_example_name.as_deref(),
+    );
+}
+
+/// Update URL query parameter without page reload (URL-encodes the name)
+fn set_example_in_url(engine: EngineType, example_name: &str) {
+    push_playground_url(Some(engine), Some(example_name), None);
 }
 
 /// Get custom example name from URL query parameter (?custom-example=name)
@@ -140,14 +300,8 @@ fn get_custom_example_from_url() -> Option<String> {
 }
 
 /// Update URL for custom example (uses ?custom-example= to avoid collision with built-in examples)
-fn set_custom_example_in_url(example_name: &str) {
-    if let Some(window) = web_sys::window() {
-        if let Ok(history) = window.history() {
-            let encoded_name = js_sys::encode_uri_component(example_name);
-            let new_url = format!("?custom-example={}", encoded_name);
-            let _ = history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&new_url));
-        }
-    }
+fn set_custom_example_in_url(engine: EngineType, example_name: &str) {
+    push_playground_url(Some(engine), None, Some(example_name));
 }
 
 /// Get engine type from URL query parameter (?engine=actors or ?engine=dd)
@@ -250,13 +404,6 @@ fn find_multi_file_example_by_name(name: &str) -> Option<&'static MultiFileExamp
         .find(|e| e.name == name)
 }
 
-/// Parse module files and return external function definitions in the universal tuple format.
-/// Used by DD and Wasm-family engines. The Actors engine converts these to `FunctionRegistry`.
-///
-/// Standalone non-Actors builds still return no external functions for now. That
-/// keeps single-engine Wasm-family builds compiling until shared module parsing
-/// is generalized outside the Actors-specific path.
-#[cfg(feature = "engine-actors")]
 fn parse_module_files(
     files: &BTreeMap<String, String>,
     entry_filename: &str,
@@ -266,10 +413,16 @@ fn parse_module_files(
     boon::parser::static_expression::Spanned<boon::parser::static_expression::Expression>,
     Option<String>,
 )> {
+    use boon::parser::{
+        Input as _, Parser as _, SourceCode, Spanned, Token, lexer, parser,
+        resolve_persistence, resolve_references, span_at, static_expression,
+    };
+
     let mut result = Vec::new();
     if files.len() <= 1 {
         return result;
     }
+
     for (file_path, file_content) in files.iter() {
         // Skip entry file and build file — they're not importable modules
         if file_path == entry_filename || file_path == "BUILD.bn" {
@@ -287,32 +440,75 @@ fn parse_module_files(
             .strip_suffix(".bn")
             .unwrap_or(file_path);
 
-        if let Some(module_data) = parse_module(file_path, file_content) {
-            for (func_name, func_def) in module_data.functions {
-                let qualified_name = format!("{}/{}", module_name, func_name);
+        let source_code_arc = SourceCode::new(file_content.clone());
+        let source_code = source_code_arc.as_str();
+
+        let (tokens, errors) = lexer().parse(source_code).into_output_errors();
+        if !errors.is_empty() {
+            eprintln!(
+                "[module-parser] lex errors in {}: {:?}",
+                file_path,
+                errors.len()
+            );
+            continue;
+        }
+        let Some(mut tokens) = tokens else {
+            continue;
+        };
+        tokens.retain(|spanned_token| !matches!(spanned_token.node, Token::Comment(_)));
+
+        let (ast, errors) = parser()
+            .parse(tokens.map(
+                span_at(source_code.len()),
+                |Spanned {
+                     node,
+                     span,
+                     persistence: _,
+                 }| (node, span),
+            ))
+            .into_output_errors();
+        if !errors.is_empty() {
+            eprintln!(
+                "[module-parser] parse errors in {}: {:?}",
+                file_path,
+                errors.len()
+            );
+            continue;
+        }
+        let Some(ast) = ast else {
+            continue;
+        };
+
+        let Ok(ast) = resolve_references(ast) else {
+            eprintln!("[module-parser] reference errors in {}", file_path);
+            continue;
+        };
+        let Ok((ast, _, _)) =
+            resolve_persistence(ast, None::<Vec<Spanned<boon::parser::Expression>>>, "")
+        else {
+            eprintln!("[module-parser] persistence errors in {}", file_path);
+            continue;
+        };
+
+        let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
+        for expr in static_ast {
+            if let static_expression::Expression::Function {
+                name,
+                parameters,
+                body,
+            } = expr.node
+            {
+                let qualified_name = format!("{}/{}", module_name, name);
                 result.push((
                     qualified_name,
-                    func_def.parameters,
-                    func_def.body,
+                    parameters.into_iter().map(|param| param.node.to_string()).collect(),
+                    *body,
                     Some(module_name.to_string()),
                 ));
             }
         }
     }
     result
-}
-
-#[cfg(not(feature = "engine-actors"))]
-fn parse_module_files(
-    _files: &BTreeMap<String, String>,
-    _entry_filename: &str,
-) -> Vec<(
-    String,
-    Vec<String>,
-    boon::parser::static_expression::Spanned<boon::parser::static_expression::Expression>,
-    Option<String>,
-)> {
-    Vec::new()
 }
 
 /// Panel layout mode for screenshot and viewing modes
@@ -387,6 +583,31 @@ struct RunCommand {
     filename: Option<&'static str>,
 }
 
+fn schedule_preview_restart<F>(
+    run_command: Mutable<Option<RunCommand>>,
+    before_restart: F,
+    next_run_command: RunCommand,
+) where
+    F: FnOnce() + 'static,
+{
+    run_command.set(None);
+    Task::start(async move {
+        Timer::sleep(1).await;
+        before_restart();
+        run_command.set(Some(next_run_command));
+    });
+}
+
+#[cfg(feature = "engine-actors")]
+#[allow(dead_code)]
+struct ActorsPreviewKeepalive {
+    object: Arc<Object>,
+    reference_connector: Arc<ReferenceConnector>,
+    link_connector: Arc<LinkConnector>,
+    pass_through_connector: Arc<PassThroughConnector>,
+    root_scope_guard: ScopeDestroyGuard,
+}
+
 fn main() {
     start_app("app", Playground::new);
 }
@@ -402,6 +623,8 @@ struct Playground {
     /// Current file content for the code editor
     source_code: Mutable<Rc<Cow<'static, str>>>,
     run_command: Mutable<Option<RunCommand>>,
+    #[cfg(feature = "engine-actors")]
+    actors_preview_keepalive: Rc<RefCell<Option<ActorsPreviewKeepalive>>>,
     panel_layout: Mutable<PanelLayout>,
     panel_split_ratio: Mutable<f64>,
     panel_container_width: Mutable<u32>,
@@ -698,6 +921,8 @@ impl Playground {
             current_file,
             source_code,
             run_command: Mutable::new(None),
+            #[cfg(feature = "engine-actors")]
+            actors_preview_keepalive: Rc::new(RefCell::new(None)),
             panel_layout,
             panel_split_ratio,
             panel_container_width: Mutable::new(0),
@@ -723,6 +948,11 @@ impl Playground {
             cursor_position: Mutable::new((1, 1)),
         }
         .root()
+    }
+
+    #[cfg(feature = "engine-actors")]
+    fn clear_actors_preview_keepalive(&self) {
+        self.actors_preview_keepalive.borrow_mut().take();
     }
 
     fn root(&self) -> impl Element + use<> {
@@ -946,7 +1176,7 @@ impl Playground {
                             &current_engine.picker_label().into(),
                         )
                         .ok();
-                        js_sys::Reflect::set(&result, &"switchable".into(), &boon::platform::browser::common::is_engine_switchable().into()).ok();
+                        js_sys::Reflect::set(&result, &"switchable".into(), &is_engine_switchable().into()).ok();
                         js_sys::Reflect::set(&result, &"availableEngines".into(), &available).ok();
                         js_sys::Reflect::set(
                             &result,
@@ -954,7 +1184,7 @@ impl Playground {
                             &display_available,
                         )
                         .ok();
-                        if let Some(preferred) = preferred_wasm_family_engine() {
+                        if let Some(preferred) = preferred_wasm_engine() {
                             js_sys::Reflect::set(
                                 &result,
                                 &"preferredWasmEngine".into(),
@@ -975,7 +1205,7 @@ impl Playground {
                         let previous = engine_type_for_set.get().short_name().to_string();
 
                         // Check if switching is available
-                        if !boon::platform::browser::common::is_engine_switchable() {
+                        if !is_engine_switchable() {
                             js_sys::Reflect::set(&result, &"error".into(), &"Engine switching not available (single engine compiled)".into()).ok();
                             return result.into();
                         }
@@ -1007,9 +1237,13 @@ impl Playground {
 
                         // Set the engine
                         engine_type_for_set.set(new_engine);
+                        set_engine_in_url(new_engine);
 
-                        // Trigger re-run
-                        run_command_for_engine.set(Some(RunCommand { filename: None }));
+                        schedule_preview_restart(
+                            run_command_for_engine.clone(),
+                            || {},
+                            RunCommand { filename: None },
+                        );
 
                         js_sys::Reflect::set(&result, &"engine".into(), &new_engine.short_name().into()).ok();
                         js_sys::Reflect::set(&result, &"previous".into(), &previous.into()).ok();
@@ -1057,7 +1291,10 @@ impl Playground {
                             let is_same = *current_file_for_select.lock_ref() == example_data.filename;
                             pre_switch(is_same);
 
-                            set_example_in_url(example_data.filename.trim_end_matches(".bn"));
+                            set_example_in_url(
+                                engine_type_for_select.get(),
+                                example_data.filename.trim_end_matches(".bn"),
+                            );
 
                             let mut new_files = BTreeMap::new();
                             new_files.insert(
@@ -1070,20 +1307,21 @@ impl Playground {
                             let run_command_for_select_inner = run_command_for_select.clone();
                             let filename = example_data.filename;
                             let source = example_data.source_code;
-                            Task::start(async move {
-                                Timer::sleep(1).await;
-                                eprintln!("[selectExample] setting files for {}", filename);
-                                files_for_select_inner.set(Rc::new(new_files));
-                                eprintln!("[selectExample] setting current_file for {}", filename);
-                                current_file_for_select_inner.set(filename.to_string());
-                                eprintln!("[selectExample] setting source_code for {}", filename);
-                                source_code_for_select_inner
-                                    .set_neq(Rc::new(Cow::from(source)));
-                                eprintln!("[selectExample] setting run_command for {}", filename);
-                                run_command_for_select_inner.set(Some(RunCommand {
+                            schedule_preview_restart(
+                                run_command_for_select_inner,
+                                move || {
+                                    eprintln!("[selectExample] setting files for {}", filename);
+                                    files_for_select_inner.set(Rc::new(new_files));
+                                    eprintln!("[selectExample] setting current_file for {}", filename);
+                                    current_file_for_select_inner.set(filename.to_string());
+                                    eprintln!("[selectExample] setting source_code for {}", filename);
+                                    source_code_for_select_inner
+                                        .set_neq(Rc::new(Cow::from(source)));
+                                },
+                                RunCommand {
                                     filename: Some(filename),
-                                }));
-                            });
+                                },
+                            );
                             return true;
                         }
 
@@ -1095,7 +1333,7 @@ impl Playground {
                             drop(current_files);
                             pre_switch(is_same);
 
-                            set_example_in_url(example.name);
+                            set_example_in_url(engine_type_for_select.get(), example.name);
 
                             let mut new_files = BTreeMap::new();
                             for (filename, content) in example.files {
@@ -1111,16 +1349,18 @@ impl Playground {
                             let run_command_for_select_inner = run_command_for_select.clone();
                             let entry_file = example.entry_file;
                             let entry_content = entry_content;
-                            Task::start(async move {
-                                Timer::sleep(1).await;
+                            schedule_preview_restart(
+                                run_command_for_select_inner,
+                                move || {
                                 files_for_select_inner.set(Rc::new(new_files));
                                 current_file_for_select_inner.set(entry_file.to_string());
                                 source_code_for_select_inner
                                     .set_neq(Rc::new(Cow::from(entry_content)));
-                                run_command_for_select_inner.set(Some(RunCommand {
+                                },
+                                RunCommand {
                                     filename: Some(entry_file),
-                                }));
-                            });
+                                },
+                            );
                             return true;
                         }
 
@@ -1149,13 +1389,15 @@ impl Playground {
                     // Set window.boonPlayground
                     js_sys::Reflect::set(&window, &"boonPlayground".into(), &api).ok();
 
-                    // Auto-run on startup
-                    let run_command_for_autorun = run_command.clone();
-                    Task::start(async move {
-                        // Small delay to ensure the editor and UI are fully initialized
-                        Timer::sleep(100).await;
-                        run_command_for_autorun.set(Some(RunCommand { filename: None }));
-                    });
+                    // Auto-run on startup unless explicitly disabled for deterministic automation.
+                    if autorun_enabled_from_url() {
+                        let run_command_for_autorun = run_command.clone();
+                        Task::start(async move {
+                            // Small delay to ensure the editor and UI are fully initialized
+                            Timer::sleep(100).await;
+                            run_command_for_autorun.set(Some(RunCommand { filename: None }));
+                        });
+                    }
 
                     raw_el
                 }
@@ -1497,7 +1739,12 @@ impl Playground {
                 let run_command = self.run_command.clone();
                 move || {
                     engine_type.set(engine);
-                    run_command.set(Some(RunCommand { filename: None }));
+                    set_engine_in_url(engine);
+                    schedule_preview_restart(
+                        run_command.clone(),
+                        || {},
+                        RunCommand { filename: None },
+                    );
                 }
             })
     }
@@ -2578,7 +2825,11 @@ impl Playground {
                                 let this = self.clone();
                                 move |maybe_run| Some(match maybe_run {
                                     Some(run_command) => Either::Right(this.example_runner(run_command)),
-                                    None => Either::Left(this.preview_placeholder()),
+                                    None => {
+                                        #[cfg(feature = "engine-actors")]
+                                        this.clear_actors_preview_keepalive();
+                                        Either::Left(this.preview_placeholder())
+                                    }
                                 })
                             })),
                     ),
@@ -2603,6 +2854,9 @@ impl Playground {
         let engine_type = self.engine_type.get();
         let persistence_enabled = self.persistence_enabled.get();
 
+        #[cfg(feature = "engine-actors")]
+        self.clear_actors_preview_keepalive();
+
         // Check which engine to use
         #[cfg(feature = "engine-wasm")]
         if matches!(engine_type, EngineType::Wasm) {
@@ -2612,12 +2866,7 @@ impl Playground {
             } else {
                 Some(external_fns.as_slice())
             };
-            let element = boon::platform::browser::run_wasm_family_engine(
-                engine_type,
-                &source_code,
-                ext,
-                persistence_enabled,
-            );
+            let element = run_wasm(&source_code, ext, persistence_enabled);
             drop(source_code);
             drop(files);
             return element;
@@ -2723,6 +2972,15 @@ impl Playground {
                 root_scope_guard,
             )) = evaluation_result
             {
+                self.actors_preview_keepalive
+                    .borrow_mut()
+                    .replace(ActorsPreviewKeepalive {
+                        object: object.clone(),
+                        reference_connector,
+                        link_connector,
+                        pass_through_connector,
+                        root_scope_guard,
+                    });
                 El::new()
                     .s(Width::fill())
                     .s(Height::fill())
@@ -2730,16 +2988,6 @@ impl Playground {
                         object.clone(),
                         construct_context,
                     ))
-                    .after_remove(move |_| {
-                        // Drop object first, then drop connectors to trigger actor cleanup.
-                        // The root_scope_guard is dropped last to recursively destroy all
-                        // registry scopes and their actors.
-                        drop(object);
-                        drop(reference_connector);
-                        drop(link_connector);
-                        drop(pass_through_connector);
-                        drop(root_scope_guard);
-                    })
                     .unify()
             } else {
                 El::new()
@@ -2840,7 +3088,10 @@ impl Playground {
                         clear_selected_engine_persisted_states(engine_type.get());
                     }
 
-                    set_example_in_url(example_data.filename.trim_end_matches(".bn"));
+                    set_example_in_url(
+                        engine_type.get(),
+                        example_data.filename.trim_end_matches(".bn"),
+                    );
 
                     // Replace project files with just this example
                     let mut new_files = BTreeMap::new();
@@ -2848,12 +3099,21 @@ impl Playground {
                         example_data.filename.to_string(),
                         example_data.source_code.to_string(),
                     );
-                    files.set(Rc::new(new_files));
-                    current_file.set(example_data.filename.to_string());
-                    source_code.set_neq(Rc::new(Cow::from(example_data.source_code)));
-                    run_command.set(Some(RunCommand {
-                        filename: Some(example_data.filename),
-                    }));
+                    let files_for_restart = files.clone();
+                    let current_file_for_restart = current_file.clone();
+                    let source_code_for_restart = source_code.clone();
+                    schedule_preview_restart(
+                        run_command.clone(),
+                        move || {
+                            files_for_restart.set(Rc::new(new_files));
+                            current_file_for_restart.set(example_data.filename.to_string());
+                            source_code_for_restart
+                                .set_neq(Rc::new(Cow::from(example_data.source_code)));
+                        },
+                        RunCommand {
+                            filename: Some(example_data.filename),
+                        },
+                    );
                 }
             })
     }
@@ -2941,25 +3201,33 @@ impl Playground {
                         clear_selected_engine_persisted_states(engine_type.get());
                     }
 
-                    set_example_in_url(example.name);
+                    set_example_in_url(engine_type.get(), example.name);
 
                     // Populate files map with ALL example files
                     let mut new_files = BTreeMap::new();
                     for (filename, content) in example.files {
                         new_files.insert(filename.to_string(), content.to_string());
                     }
-                    files.set(Rc::new(new_files));
-                    current_file.set(example.entry_file.to_string());
                     let entry_content = example
                         .files
                         .iter()
                         .find(|(name, _)| *name == example.entry_file)
                         .map(|(_, content)| *content)
                         .unwrap_or("");
-                    source_code.set_neq(Rc::new(Cow::from(entry_content)));
-                    run_command.set(Some(RunCommand {
-                        filename: Some(example.entry_file),
-                    }));
+                    let files_for_restart = files.clone();
+                    let current_file_for_restart = current_file.clone();
+                    let source_code_for_restart = source_code.clone();
+                    schedule_preview_restart(
+                        run_command.clone(),
+                        move || {
+                            files_for_restart.set(Rc::new(new_files));
+                            current_file_for_restart.set(example.entry_file.to_string());
+                            source_code_for_restart.set_neq(Rc::new(Cow::from(entry_content)));
+                        },
+                        RunCommand {
+                            filename: Some(example.entry_file),
+                        },
+                    );
                 }
             })
     }
@@ -3002,6 +3270,7 @@ impl Playground {
                 let current_file = self.current_file.clone();
                 let source_code = self.source_code.clone();
                 let run_command = self.run_command.clone();
+                let engine_type = self.engine_type.clone();
                 move || {
                     // Save current code to previously selected custom example before creating new one
                     let prev_selected_id = selected_custom_example.lock_ref().clone();
@@ -3048,16 +3317,24 @@ impl Playground {
                     clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
 
                     // Update URL (use custom-example parameter)
-                    set_custom_example_in_url(&name);
+                    set_custom_example_in_url(engine_type.get(), &name);
 
                     // Set as current file
                     let filename = format!("{}.bn", name);
                     let mut new_files = BTreeMap::new();
                     new_files.insert(filename.clone(), default_code.to_string());
-                    files.set(Rc::new(new_files));
-                    current_file.set(filename);
-                    source_code.set_neq(Rc::new(Cow::from(default_code)));
-                    run_command.set(Some(RunCommand { filename: None }));
+                    let files_for_restart = files.clone();
+                    let current_file_for_restart = current_file.clone();
+                    let source_code_for_restart = source_code.clone();
+                    schedule_preview_restart(
+                        run_command.clone(),
+                        move || {
+                            files_for_restart.set(Rc::new(new_files));
+                            current_file_for_restart.set(filename);
+                            source_code_for_restart.set_neq(Rc::new(Cow::from(default_code)));
+                        },
+                        RunCommand { filename: None },
+                    );
                 }
             })
     }
@@ -3092,6 +3369,7 @@ impl Playground {
                 let current_file = self.current_file.clone();
                 let source_code = self.source_code.clone();
                 let run_command = self.run_command.clone();
+                let engine_type = self.engine_type.clone();
                 let id_for_bg = id_for_bg.clone();
                 let id_for_font = id_for_font.clone();
                 let edit_text = edit_text.clone();
@@ -3145,6 +3423,7 @@ impl Playground {
                                 let editing_custom_example =
                                     editing_custom_example_for_rename.clone();
                                 let edit_text = edit_text.clone();
+                                let engine_type = engine_type.clone();
                                 move |raw_el| {
                                     raw_el.event_handler(move |event: events::KeyDown| {
                                         if event.key() == "Enter" {
@@ -3161,7 +3440,10 @@ impl Playground {
                                                     *n = new_name.clone();
                                                     custom_examples.set(Rc::new(new_examples));
                                                     // Update URL to reflect new name
-                                                    set_custom_example_in_url(&new_name);
+                                                    set_custom_example_in_url(
+                                                        engine_type.get(),
+                                                        &new_name,
+                                                    );
                                                 }
                                             }
                                             editing_custom_example.set(None);
@@ -3177,6 +3459,7 @@ impl Playground {
                                 let custom_examples = custom_examples_for_rename;
                                 let editing_custom_example = editing_custom_example_for_rename;
                                 let edit_text = edit_text.clone();
+                                let engine_type = engine_type.clone();
                                 move || {
                                     let new_name = edit_text.lock_ref().trim().to_string();
                                     if !new_name.is_empty() && new_name != name {
@@ -3190,7 +3473,10 @@ impl Playground {
                                             *n = new_name.clone();
                                             custom_examples.set(Rc::new(new_examples));
                                             // Update URL to reflect new name
-                                            set_custom_example_in_url(&new_name);
+                                            set_custom_example_in_url(
+                                                engine_type.get(),
+                                                &new_name,
+                                            );
                                         }
                                     }
                                     editing_custom_example.set(None);
@@ -3268,6 +3554,7 @@ impl Playground {
                                 let current_file = current_file.clone();
                                 let source_code = source_code.clone();
                                 let run_command = run_command.clone();
+                                let engine_type = engine_type.clone();
                                 move || {
                                     // If already selected, do nothing (don't reset code)
                                     if selected_custom_example.lock_ref().as_ref() == Some(&id) {
@@ -3306,16 +3593,25 @@ impl Playground {
                                         ]);
 
                                         // Update URL (use custom-example parameter)
-                                        set_custom_example_in_url(&name);
+                                        set_custom_example_in_url(engine_type.get(), &name);
 
                                         // Set as current file
                                         let filename = format!("{}.bn", name);
                                         let mut new_files = BTreeMap::new();
                                         new_files.insert(filename.clone(), code.clone());
-                                        files.set(Rc::new(new_files));
-                                        current_file.set(filename);
-                                        source_code.set(Rc::new(Cow::from(code)));
-                                        run_command.set(Some(RunCommand { filename: None }));
+                                        let files_for_restart = files.clone();
+                                        let current_file_for_restart = current_file.clone();
+                                        let source_code_for_restart = source_code.clone();
+                                        schedule_preview_restart(
+                                            run_command.clone(),
+                                            move || {
+                                                files_for_restart.set(Rc::new(new_files));
+                                                current_file_for_restart.set(filename);
+                                                source_code_for_restart
+                                                    .set(Rc::new(Cow::from(code)));
+                                            },
+                                            RunCommand { filename: None },
+                                        );
 
                                         // Update selection (by ID)
                                         selected_custom_example.set(Some(id.clone()));

@@ -104,6 +104,12 @@ enum Commands {
         #[command(subcommand)]
         action: MetricsAction,
     },
+
+    /// Run non-browser verification helpers
+    Verify {
+        #[command(subcommand)]
+        action: VerifyAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -175,6 +181,20 @@ enum MetricsAction {
         /// Cargo target dir to reuse for the focused metrics build/test
         #[arg(long)]
         target_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum VerifyAction {
+    /// Check whether the official 7GUIs examples lower for the Wasm engine
+    WasmLowering {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+
+        /// Exit nonzero if any official 7GUIs example fails to lower
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -618,6 +638,17 @@ fn main() -> Result<()> {
             } => {
                 if let Err(e) =
                     commands::backend_metrics::run_cells_backend_metrics(json, check, target_dir)
+                {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        },
+
+        Commands::Verify { action } => match action {
+            VerifyAction::WasmLowering { json, check } => {
+                if let Err(e) =
+                    commands::verify_wasm_lowering::run_verify_wasm_lowering(json, check)
                 {
                     eprintln!("{e}");
                     std::process::exit(1);
@@ -1253,14 +1284,14 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
         ExecAction::Persistence {
             enable,
             disable,
-            status,
+            status: _status,
         } => {
             if enable {
                 let response =
                     send_command_to_server(port, WsCommand::SetPersistence { enabled: true })
                         .await?;
                 match response {
-                    WsResponse::Success { data } => {
+                    WsResponse::Success { data: _data } => {
                         println!("Persistence: enabled");
                     }
                     _ => print_response(response),
@@ -1270,7 +1301,7 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                     send_command_to_server(port, WsCommand::SetPersistence { enabled: false })
                         .await?;
                 match response {
-                    WsResponse::Success { data } => {
+                    WsResponse::Success { data: _data } => {
                         println!("Persistence: disabled");
                     }
                     _ => print_response(response),
@@ -1528,90 +1559,98 @@ fn find_element_by_text(
     text: &str,
     exact: bool,
 ) -> Option<ElementBounds> {
-    // Try to find a matching element in the JSON structure
-    // The GetPreviewElements returns a nested structure with text and bounds
-    find_element_by_text_recursive(data, text, exact)
-}
+    fn match_priority(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        text: &str,
+        exact: bool,
+    ) -> Option<u8> {
+        let direct_text = obj.get("directText").and_then(|t| t.as_str());
+        let full_text = obj.get("fullText").and_then(|t| t.as_str());
+        let legacy_text = obj.get("text").and_then(|t| t.as_str());
 
-fn find_element_by_text_recursive(
-    value: &serde_json::Value,
-    text: &str,
-    exact: bool,
-) -> Option<ElementBounds> {
-    match value {
-        serde_json::Value::Object(obj) => {
-            // Check if this element has matching text
-            // GetPreviewElements returns 'directText' (direct child text nodes) and 'fullText' (all text content)
-            let has_match = {
-                // Try 'directText' field first (more precise match)
-                if let Some(elem_text) = obj.get("directText").and_then(|t| t.as_str()) {
-                    if exact {
-                        elem_text.trim() == text
-                    } else {
-                        elem_text.contains(text)
-                    }
-                // Then try 'fullText' field
-                } else if let Some(elem_text) = obj.get("fullText").and_then(|t| t.as_str()) {
-                    if exact {
-                        elem_text.trim() == text
-                    } else {
-                        elem_text.contains(text)
-                    }
-                // Legacy: Try 'text' field
-                } else if let Some(elem_text) = obj.get("text").and_then(|t| t.as_str()) {
-                    if exact {
-                        elem_text.trim() == text
-                    } else {
-                        elem_text.contains(text)
-                    }
-                } else {
-                    false
-                }
-            };
-
-            if has_match {
-                // Try to extract bounds
-                if let (Some(x), Some(y), Some(width), Some(height)) = (
-                    obj.get("x").and_then(|v| v.as_f64()),
-                    obj.get("y").and_then(|v| v.as_f64()),
-                    obj.get("width").and_then(|v| v.as_f64()),
-                    obj.get("height").and_then(|v| v.as_f64()),
-                ) {
-                    return Some(ElementBounds {
-                        x: x as i32,
-                        y: y as i32,
-                        width: width as i32,
-                        height: height as i32,
-                    });
-                }
+        let matches = |candidate: &str| {
+            if exact {
+                candidate.trim() == text
+            } else {
+                candidate.contains(text)
             }
+        };
 
-            // Search in children
-            if let Some(children) = obj.get("children") {
-                if let Some(result) = find_element_by_text_recursive(children, text, exact) {
-                    return Some(result);
-                }
-            }
-
-            // Search in other object values
-            for (key, val) in obj {
-                if key != "text" && key != "children" {
-                    if let Some(result) = find_element_by_text_recursive(val, text, exact) {
-                        return Some(result);
-                    }
-                }
-            }
+        if direct_text.is_some_and(matches) {
+            Some(0)
+        } else if full_text.is_some_and(matches) {
+            Some(1)
+        } else if legacy_text.is_some_and(matches) {
+            Some(2)
+        } else {
+            None
         }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                if let Some(result) = find_element_by_text_recursive(item, text, exact) {
-                    return Some(result);
-                }
-            }
-        }
-        _ => {}
     }
-    None
+
+    fn candidate_bounds(
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<ElementBounds> {
+        let (Some(x), Some(y), Some(width), Some(height)) = (
+            obj.get("x").and_then(|v| v.as_f64()),
+            obj.get("y").and_then(|v| v.as_f64()),
+            obj.get("width").and_then(|v| v.as_f64()),
+            obj.get("height").and_then(|v| v.as_f64()),
+        ) else {
+            return None;
+        };
+
+        Some(ElementBounds {
+            x: x as i32,
+            y: y as i32,
+            width: width as i32,
+            height: height as i32,
+        })
+    }
+
+    fn collect_recursive(
+        value: &serde_json::Value,
+        text: &str,
+        exact: bool,
+        candidates: &mut Vec<(u8, i64, ElementBounds)>,
+    ) {
+        match value {
+            serde_json::Value::Object(obj) => {
+                if let Some(priority) = match_priority(obj, text, exact) {
+                    if let Some(bounds) = candidate_bounds(obj) {
+                        let area = i64::from(bounds.width.max(0)) * i64::from(bounds.height.max(0));
+                        candidates.push((priority, area, bounds));
+                    }
+                }
+
+                if let Some(children) = obj.get("children") {
+                    collect_recursive(children, text, exact, candidates);
+                }
+
+                for (key, val) in obj {
+                    if key != "text" && key != "children" {
+                        collect_recursive(val, text, exact, candidates);
+                    }
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    collect_recursive(item, text, exact, candidates);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut candidates = Vec::new();
+    collect_recursive(data, text, exact, &mut candidates);
+    candidates
+        .into_iter()
+        .min_by(|(priority_a, area_a, _), (priority_b, area_b, _)| {
+            priority_a
+                .cmp(priority_b)
+                .then_with(|| area_a.cmp(area_b))
+        })
+        .map(|(_, _, bounds)| bounds)
 }
 
 fn print_response(response: WsResponse) {

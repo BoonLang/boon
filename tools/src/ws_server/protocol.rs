@@ -83,6 +83,9 @@ pub enum Command {
     /// Double-click at absolute screen coordinates
     DoubleClickAt { x: i32, y: i32 },
 
+    /// Double-click a Cells example cell by row/column using in-page DOM lookup
+    DoubleClickCellsCell { row: u32, column: u32 },
+
     /// Clear saved states (reset localStorage for Boon playground)
     ClearStates,
 
@@ -368,7 +371,7 @@ pub enum Response {
         /// Engine names surfaced in normal user-facing selection UX
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_available_engines: Option<Vec<String>>,
-        /// Preferred compiled Wasm-family engine, if any
+        /// Preferred compiled Wasm engine, if any
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preferred_wasm_engine: Option<String>,
     },

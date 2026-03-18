@@ -159,13 +159,13 @@ run_engine_tests() {
     echo "  ── 3. Checkbox Toggle ──"
 
     # Check first item
-    bt click-checkbox 0 >/dev/null 2>&1 || true
+    bt click-checkbox 1 >/dev/null 2>&1 || true
     sleep 2
     preview=$(bt preview)
     check_contains "$preview" "1 item" "Counter decrements after checking first item"
 
     # Uncheck first item
-    bt click-checkbox 0 >/dev/null 2>&1 || true
+    bt click-checkbox 1 >/dev/null 2>&1 || true
     sleep 2
     preview=$(bt preview)
     check_contains "$preview" "2 item" "Counter back to 2 after unchecking"
@@ -177,7 +177,7 @@ run_engine_tests() {
     echo "  ── 4. Filter Views ──"
 
     # Check first item to create mixed state
-    bt click-checkbox 0 >/dev/null 2>&1 || true
+    bt click-checkbox 1 >/dev/null 2>&1 || true
     sleep 1
 
     # Active filter
@@ -202,7 +202,7 @@ run_engine_tests() {
     check_contains "$preview" "Clean room" "All filter shows 'Clean room'"
 
     # Uncheck to restore
-    bt click-checkbox 0 >/dev/null 2>&1 || true
+    bt click-checkbox 1 >/dev/null 2>&1 || true
     sleep 1
 
     # ──────────────────────────────────
@@ -212,7 +212,7 @@ run_engine_tests() {
     echo "  ── 5. Clear Completed ──"
 
     # Check first item
-    bt click-checkbox 0 >/dev/null 2>&1 || true
+    bt click-checkbox 1 >/dev/null 2>&1 || true
     sleep 1
     preview=$(bt preview)
     check_contains "$preview" "Clear completed" "'Clear completed' button appears"

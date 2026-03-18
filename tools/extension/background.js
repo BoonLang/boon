@@ -8,6 +8,7 @@ const DEFAULT_WS_PORT = DEFAULT_PLAYGROUND_PORT + WS_PORT_OFFSET; // 9224
 
 let ws = null;
 let reconnectTimer = null;
+let wsHeartbeatTimer = null;
 let contentPort = null;
 let pendingRequests = new Map();
 
@@ -30,6 +31,13 @@ function isPlaygroundUrl(url) {
 
 function deriveWsPort(playgroundPort) {
   return playgroundPort + WS_PORT_OFFSET;
+}
+
+function withOperationTimeout(promise, label, timeoutMs = 5000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timeout`)), timeoutMs))
+  ]);
 }
 
 // Get WS URL: check storage override, then derive from playground port, then default
@@ -223,14 +231,17 @@ async function cdpDoubleClickAt(tabId, x, y) {
   await attachDebugger(tabId);
 
   // Get scroll offset to convert page coords to viewport coords for CDP events
-  const scrollOffset = await cdpEvaluate(tabId, `({ scrollX: window.scrollX, scrollY: window.scrollY })`);
+  const scrollOffset = await executeInTab(tabId, () => ({
+    scrollX: window.scrollX,
+    scrollY: window.scrollY
+  }));
+  if (scrollOffset?.type === 'error') {
+    throw new Error(scrollOffset.message || 'Failed to read scroll offset');
+  }
   const viewportX = x - (scrollOffset?.scrollX || 0);
   const viewportY = y - (scrollOffset?.scrollY || 0);
 
-  const result = await cdpEvaluate(tabId, `
-    (function() {
-      const x = ${JSON.stringify(viewportX)};
-      const y = ${JSON.stringify(viewportY)};
+  const result = await executeInTab(tabId, (x, y) => {
       const target = document.elementFromPoint(x, y);
       if (!target) {
         return { ok: false, error: 'No element at target coordinates' };
@@ -277,14 +288,189 @@ async function cdpDoubleClickAt(tabId, x, y) {
         right: rect.right,
         bottom: rect.bottom
       };
-    })()
-  `);
+    },
+    viewportX,
+    viewportY
+  );
+  if (result?.type === 'error') {
+    throw new Error(result.message || 'DOM double-click dispatch failed');
+  }
 
   if (!result?.ok) {
     throw new Error(result?.error || 'DOM double-click dispatch failed');
   }
 
   console.log(`[Boon] DOM dblclick at page (${x}, ${y}) -> viewport (${viewportX}, ${viewportY})`);
+}
+
+function locateCellsCellElement(preview, row, column) {
+  const rowKey = String(row - 1).padStart(4, '0');
+  const columnKey = String(column - 1).padStart(4, '0');
+  const targetPath = `all_row_cells.${rowKey}.cells.${columnKey}.display_element`;
+  const semanticCandidates = [
+    targetPath,
+    `all_row_cells.${rowKey}.items.0001.items.${columnKey}.element`,
+    `all_row_cells.${rowKey}.items.0001.element`
+  ];
+  for (const path of semanticCandidates) {
+    const semanticTarget =
+      preview.querySelector(`[data-boon-link-path="${path}"]`) ||
+      preview.querySelector(`[data-boon-port-double-click="${path}.event.double_click"]`);
+    if (semanticTarget) {
+      if (!path.endsWith('.items.0001.element')) {
+        return semanticTarget;
+      }
+      const rowRect = semanticTarget.getBoundingClientRect();
+      const labels = Array.from(semanticTarget.querySelectorAll('label'))
+        .map((el) => {
+          const rect = el.getBoundingClientRect();
+          return {
+            el,
+            text: (el.innerText || '').trim(),
+            x: rect.left,
+            width: rect.width,
+            height: rect.height,
+            centerY: rect.top + rect.height / 2
+          };
+        })
+        .filter((el) =>
+          el.width > 0 &&
+          el.height > 0 &&
+          Math.abs(el.centerY - (rowRect.top + rowRect.height / 2)) <= 4.0
+        )
+        .sort((a, b) => a.x - b.x);
+      if (labels.length >= column) {
+        return labels[column - 1].el;
+      }
+      return semanticTarget;
+    }
+  }
+
+  const rowRootPath = `all_row_cells.${rowKey}.element`;
+  const rowRoot =
+    preview.querySelector(`[data-boon-link-path="${rowRootPath}"]`) ||
+    preview.querySelector(`[data-boon-port-double-click="${rowRootPath}.event.double_click"]`);
+  if (rowRoot) {
+    const rowRect = rowRoot.getBoundingClientRect();
+    const labels = Array.from(rowRoot.querySelectorAll('label'))
+      .map((el) => {
+        const rect = el.getBoundingClientRect();
+        return {
+          el,
+          x: rect.left,
+          width: rect.width,
+          height: rect.height,
+          centerY: rect.top + rect.height / 2
+        };
+      })
+      .filter((el) =>
+        el.width > 0 &&
+        el.height > 0 &&
+        Math.abs(el.centerY - (rowRect.top + rowRect.height / 2)) <= 4.0
+      )
+      .sort((a, b) => a.x - b.x);
+    if (labels.length > column) {
+      return labels[column].el;
+    }
+  }
+
+  const directText = (el) => Array.from(el.childNodes)
+    .filter((node) => node.nodeType === Node.TEXT_NODE)
+    .map((node) => node.textContent || '')
+    .join('')
+    .trim();
+
+  const elements = Array.from(preview.querySelectorAll('*'))
+    .map((el) => {
+      const rect = el.getBoundingClientRect();
+      return {
+        el,
+        directText: directText(el),
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height,
+        right: rect.right,
+        centerY: rect.top + rect.height / 2,
+        fullText: (el.innerText || '').trim()
+      };
+    })
+    .filter((el) => el.width > 0 && el.height > 0);
+
+  const targetRow = String(row);
+  const rowMatches = elements
+    .filter((el) => el.directText === targetRow && el.width <= 60 && el.x < 1200)
+    .sort((a, b) => (a.y - b.y) || (a.x - b.x));
+
+  for (const rowLabel of rowMatches) {
+    const cellMatches = elements
+      .filter((el) =>
+        el.x >= rowLabel.right - 0.5 &&
+        Math.abs(el.centerY - rowLabel.centerY) <= 3.0
+      )
+      .sort((a, b) => (a.x - b.x) || (a.y - b.y));
+
+    const deduped = [];
+    for (const candidate of cellMatches) {
+      const prev = deduped[deduped.length - 1];
+      const duplicate = prev &&
+        Math.abs(prev.x - candidate.x) <= 1.0 &&
+        Math.abs(prev.y - candidate.y) <= 1.0 &&
+        prev.directText === candidate.directText;
+      if (!duplicate) {
+        deduped.push(candidate);
+      }
+    }
+
+    const filtered = deduped.filter((candidate) =>
+      candidate.width <= 120 &&
+      candidate.height <= 80 &&
+      (candidate.directText.length > 0 || candidate.fullText.length <= 8)
+    );
+    const ranked = filtered.length >= column ? filtered : deduped;
+
+    if (ranked.length >= column) {
+      return ranked[column - 1].el;
+    }
+  }
+
+  return null;
+}
+
+function dispatchSyntheticDoubleClick(target, clientX, clientY) {
+  if (typeof target.focus === 'function') {
+    try { target.focus(); } catch (_) {}
+  }
+
+  const makeMouseEvent = (type, detail) => new MouseEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: window,
+    clientX,
+    clientY,
+    screenX: clientX,
+    screenY: clientY,
+    button: 0,
+    buttons: type === 'mouseup' || type === 'click' || type === 'dblclick' ? 0 : 1,
+    detail
+  });
+
+  const sequence = [
+    ['mousedown', 1],
+    ['mouseup', 1],
+    ['click', 1],
+    ['mousedown', 2],
+    ['mouseup', 2],
+    ['click', 2],
+    ['dblclick', 2]
+  ];
+
+  for (const [type, detail] of sequence) {
+    target.dispatchEvent(makeMouseEvent(type, detail));
+  }
+
+  return true;
 }
 
 // Hover at coordinates using trusted CDP mouse movement only.
@@ -342,6 +528,135 @@ async function cdpClickSelector(tabId, selector) {
 async function cdpTypeTextCharByChar(tabId, text) {
   await attachDebugger(tabId);
 
+  const insertedViaPreviewInput = await chrome.debugger.sendCommand(
+    { tabId },
+    'Runtime.evaluate',
+    {
+      expression: `(function() {
+        const preview = document.querySelector('[data-boon-panel="preview"]');
+        if (!preview) return false;
+        const inputs = Array.from(preview.querySelectorAll('input, textarea'));
+        const isTextControl = (element) =>
+          element instanceof HTMLInputElement ||
+          element instanceof HTMLTextAreaElement;
+        const remembered = window.__boonLastPreviewTextInput;
+        const rememberedNodeId =
+          window.__boonLastPreviewTextInputNodeId ||
+          remembered?.getAttribute?.('data-boon-node-id') ||
+          null;
+        const rememberedIndex =
+          typeof window.__boonLastPreviewTextInputIndex === 'number'
+            ? window.__boonLastPreviewTextInputIndex
+            : null;
+        const rememberedSelectionStart =
+          typeof window.__boonLastPreviewTextSelectionStart === 'number'
+            ? window.__boonLastPreviewTextSelectionStart
+            : null;
+        const rememberedSelectionEnd =
+          typeof window.__boonLastPreviewTextSelectionEnd === 'number'
+            ? window.__boonLastPreviewTextSelectionEnd
+            : null;
+        let restoredFromRemembered = false;
+        let focused =
+          rememberedNodeId
+            ? preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]')
+            : null;
+        if (isTextControl(focused)) {
+          restoredFromRemembered = true;
+        }
+        if ((!isTextControl(focused) || focused === document.body) && rememberedIndex != null) {
+          focused = inputs[rememberedIndex] || focused;
+          restoredFromRemembered = isTextControl(focused);
+        }
+        if ((!isTextControl(focused) || focused === document.body) && remembered && remembered.isConnected && preview.contains(remembered)) {
+          focused = remembered;
+          restoredFromRemembered = true;
+        }
+        if ((!isTextControl(focused) || focused === document.body)) {
+          focused = document.activeElement;
+          restoredFromRemembered = false;
+        }
+        if ((!isTextControl(focused) || focused === document.body)) {
+          const previewFocused = preview.querySelector(':focus');
+          focused = isTextControl(previewFocused)
+            ? previewFocused
+            : preview.querySelector('[data-boon-focused="true"]')
+              || preview.querySelector('[focused="true"]')
+              || preview.querySelector('[autofocus]');
+        }
+        if (!isTextControl(focused)) return false;
+
+        if (document.activeElement !== focused && typeof focused.focus === 'function') {
+          focused.focus();
+        }
+
+        window.__boonLastPreviewTextInput = focused;
+        window.__boonLastPreviewTextInputNodeId =
+          focused.getAttribute('data-boon-node-id');
+        window.__boonLastPreviewTextInputIndex = inputs.indexOf(focused);
+
+        const insertedText = ${JSON.stringify(text)};
+        const fallbackStart =
+          rememberedSelectionStart != null
+            ? rememberedSelectionStart
+            : focused.value.length;
+        const fallbackEnd =
+          rememberedSelectionEnd != null
+            ? rememberedSelectionEnd
+            : fallbackStart;
+        const start = restoredFromRemembered
+          ? fallbackStart
+          : (focused.selectionStart ?? fallbackStart);
+        const end = restoredFromRemembered
+          ? fallbackEnd
+          : (focused.selectionEnd ?? start);
+        const nextValue =
+          focused.value.slice(0, start) +
+          insertedText +
+          focused.value.slice(end);
+        const nativeSetter =
+          Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set ||
+          Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+        if (nativeSetter) {
+          nativeSetter.call(focused, nextValue);
+        } else {
+          focused.value = nextValue;
+        }
+        const caret = start + insertedText.length;
+        if (focused.setSelectionRange) {
+          focused.setSelectionRange(caret, caret);
+        }
+        window.__boonLastPreviewTextSelectionStart = caret;
+        window.__boonLastPreviewTextSelectionEnd = caret;
+
+        focused.dispatchEvent(
+          new InputEvent('input', {
+            bubbles: true,
+            composed: true,
+            data: insertedText,
+            inputType: 'insertText'
+          })
+        );
+        const dispatchFact = window.__boonDispatchUiFact;
+        const dispatchEvent = window.__boonDispatchUiEvent;
+        const nodeId = focused.getAttribute('data-boon-node-id');
+        const inputPort = focused.getAttribute('data-boon-port-input');
+        if (typeof dispatchFact === 'function' && nodeId) {
+          dispatchFact(nodeId, 'DraftText', focused.value);
+        }
+        if (typeof dispatchEvent === 'function' && inputPort) {
+          dispatchEvent(inputPort, 'Input', focused.value);
+        }
+        return true;
+      })()`,
+      returnByValue: true
+    }
+  ).then(({ result }) => Boolean(result?.value)).catch(() => false);
+
+  if (insertedViaPreviewInput) {
+    return;
+  }
+
   for (const char of text) {
     // Prefer direct DOM input for focused editable elements in the preview.
     // CDP key events alone do not reliably trigger `input` handlers for the
@@ -352,8 +667,50 @@ async function cdpTypeTextCharByChar(tabId, text) {
       {
         expression: `(function() {
           const preview = document.querySelector('[data-boon-panel="preview"]');
-          let focused = document.activeElement;
-          if ((!focused || focused === document.body) && preview) {
+          const inputs = preview
+            ? Array.from(preview.querySelectorAll('input, textarea'))
+            : [];
+          const isTextControl = (element) =>
+            element instanceof HTMLInputElement ||
+            element instanceof HTMLTextAreaElement;
+          const remembered = window.__boonLastPreviewTextInput;
+          const rememberedNodeId =
+            window.__boonLastPreviewTextInputNodeId ||
+            remembered?.getAttribute?.('data-boon-node-id') ||
+            null;
+          const rememberedIndex =
+            typeof window.__boonLastPreviewTextInputIndex === 'number'
+              ? window.__boonLastPreviewTextInputIndex
+              : null;
+          const rememberedSelectionStart =
+            typeof window.__boonLastPreviewTextSelectionStart === 'number'
+              ? window.__boonLastPreviewTextSelectionStart
+              : null;
+          const rememberedSelectionEnd =
+            typeof window.__boonLastPreviewTextSelectionEnd === 'number'
+              ? window.__boonLastPreviewTextSelectionEnd
+              : null;
+          let restoredFromRemembered = false;
+          let focused =
+            preview && rememberedNodeId
+              ? preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]')
+              : null;
+          if (isTextControl(focused)) {
+            restoredFromRemembered = true;
+          }
+          if ((!isTextControl(focused) || focused === document.body) && preview && rememberedIndex != null) {
+            focused = inputs[rememberedIndex] || focused;
+            restoredFromRemembered = isTextControl(focused);
+          }
+          if ((!isTextControl(focused) || focused === document.body) && remembered && remembered.isConnected && preview?.contains(remembered)) {
+            focused = remembered;
+            restoredFromRemembered = true;
+          }
+          if ((!isTextControl(focused) || focused === document.body)) {
+            focused = document.activeElement;
+            restoredFromRemembered = false;
+          }
+          if ((!isTextControl(focused) || focused === document.body) && preview) {
             focused =
               preview.querySelector(':focus') ||
               preview.querySelector('[data-boon-focused="true"]') ||
@@ -363,24 +720,47 @@ async function cdpTypeTextCharByChar(tabId, text) {
           if (!focused) return false;
 
           const text = ${JSON.stringify(char)};
-          const isTextControl =
-            focused instanceof HTMLInputElement ||
-            focused instanceof HTMLTextAreaElement;
 
           if (isTextControl) {
             if (document.activeElement !== focused && typeof focused.focus === 'function') {
               focused.focus();
             }
-            const start = focused.selectionStart ?? focused.value.length;
-            const end = focused.selectionEnd ?? start;
-            focused.value =
+            window.__boonLastPreviewTextInput = focused;
+            window.__boonLastPreviewTextInputNodeId =
+              focused.getAttribute('data-boon-node-id');
+            window.__boonLastPreviewTextInputIndex = inputs.indexOf(focused);
+            const fallbackStart =
+              rememberedSelectionStart != null
+                ? rememberedSelectionStart
+                : focused.value.length;
+            const fallbackEnd =
+              rememberedSelectionEnd != null
+                ? rememberedSelectionEnd
+                : fallbackStart;
+            const start = restoredFromRemembered
+              ? fallbackStart
+              : (focused.selectionStart ?? fallbackStart);
+            const end = restoredFromRemembered
+              ? fallbackEnd
+              : (focused.selectionEnd ?? start);
+            const nextValue =
               focused.value.slice(0, start) +
               text +
               focused.value.slice(end);
+            const nativeSetter =
+              Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set ||
+              Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+            if (nativeSetter) {
+              nativeSetter.call(focused, nextValue);
+            } else {
+              focused.value = nextValue;
+            }
             const caret = start + text.length;
             if (focused.setSelectionRange) {
               focused.setSelectionRange(caret, caret);
             }
+            window.__boonLastPreviewTextSelectionStart = caret;
+            window.__boonLastPreviewTextSelectionEnd = caret;
             focused.dispatchEvent(
               new InputEvent('input', {
                 bubbles: true,
@@ -389,6 +769,16 @@ async function cdpTypeTextCharByChar(tabId, text) {
                 inputType: 'insertText'
               })
             );
+            const dispatchFact = window.__boonDispatchUiFact;
+            const dispatchEvent = window.__boonDispatchUiEvent;
+            const nodeId = focused.getAttribute('data-boon-node-id');
+            const inputPort = focused.getAttribute('data-boon-port-input');
+            if (typeof dispatchFact === 'function' && nodeId) {
+              dispatchFact(nodeId, 'DraftText', focused.value);
+            }
+            if (typeof dispatchEvent === 'function' && inputPort) {
+              dispatchEvent(inputPort, 'Input', focused.value);
+            }
             return true;
           }
 
@@ -396,6 +786,12 @@ async function cdpTypeTextCharByChar(tabId, text) {
             if (document.activeElement !== focused && typeof focused.focus === 'function') {
               focused.focus();
             }
+            window.__boonLastPreviewTextInput = focused;
+            window.__boonLastPreviewTextInputNodeId =
+              focused.getAttribute?.('data-boon-node-id') || null;
+            window.__boonLastPreviewTextInputIndex = inputs.indexOf(focused);
+            window.__boonLastPreviewTextSelectionStart = null;
+            window.__boonLastPreviewTextSelectionEnd = null;
             focused.textContent = (focused.textContent || '') + text;
             focused.dispatchEvent(
               new InputEvent('input', {
@@ -467,6 +863,185 @@ async function cdpTypeTextCharByChar(tabId, text) {
   }
 }
 
+async function handlePreviewSpecialKeyWithoutCdp(tabId, key) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: (requestedKey) => {
+        if (!['Enter', 'Escape', 'Backspace', 'Delete'].includes(requestedKey)) {
+          return false;
+        }
+
+        const preview = document.querySelector('[data-boon-panel="preview"]');
+        if (!preview) return false;
+
+        const inputs = Array.from(preview.querySelectorAll('input, textarea'));
+        const isTextControl = (element) =>
+          element instanceof HTMLInputElement ||
+          element instanceof HTMLTextAreaElement;
+        const remembered = window.__boonLastPreviewTextInput;
+        const rememberedNodeId =
+          window.__boonLastPreviewTextInputNodeId ||
+          remembered?.getAttribute?.('data-boon-node-id') ||
+          null;
+        const rememberedIndex =
+          typeof window.__boonLastPreviewTextInputIndex === 'number'
+            ? window.__boonLastPreviewTextInputIndex
+            : null;
+
+        let focused =
+          rememberedNodeId
+            ? preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]')
+            : null;
+        if ((!isTextControl(focused) || focused === document.body) && rememberedIndex != null) {
+          focused = inputs[rememberedIndex] || focused;
+        }
+        if ((!isTextControl(focused) || focused === document.body) && remembered && remembered.isConnected && preview.contains(remembered)) {
+          focused = remembered;
+        }
+        if ((!isTextControl(focused) || focused === document.body)) {
+          focused = document.activeElement;
+        }
+        if ((!isTextControl(focused) || focused === document.body)) {
+          const previewFocused = preview.querySelector(':focus');
+          focused = isTextControl(previewFocused)
+            ? previewFocused
+            : preview.querySelector('[data-boon-focused="true"]')
+              || preview.querySelector('[focused="true"]')
+              || preview.querySelector('[autofocus]');
+        }
+        if (!isTextControl(focused)) return false;
+
+        if (document.activeElement !== focused && typeof focused.focus === 'function') {
+          focused.focus();
+        }
+
+        window.__boonLastPreviewTextInput = focused;
+        window.__boonLastPreviewTextInputNodeId =
+          focused.getAttribute('data-boon-node-id');
+        window.__boonLastPreviewTextInputIndex = inputs.indexOf(focused);
+
+        const keyCodeMap = {
+          Enter: 13,
+          Escape: 27,
+          Backspace: 8,
+          Delete: 46
+        };
+        const codeMap = {
+          Enter: 'Enter',
+          Escape: 'Escape',
+          Backspace: 'Backspace',
+          Delete: 'Delete'
+        };
+        const keyCode = keyCodeMap[requestedKey] || 0;
+        const code = codeMap[requestedKey] || requestedKey;
+        const eventInit = {
+          key: requestedKey,
+          code,
+          keyCode,
+          which: keyCode,
+          bubbles: true,
+          composed: true,
+          cancelable: true
+        };
+
+        const applyInputMutation = (inputType, nextValue, selectionStart, selectionEnd, data) => {
+          const nativeSetter =
+            Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set ||
+            Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+          if (nativeSetter) {
+            nativeSetter.call(focused, nextValue);
+          } else {
+            focused.value = nextValue;
+          }
+          if (focused.setSelectionRange) {
+            focused.setSelectionRange(selectionStart, selectionEnd);
+          }
+          window.__boonLastPreviewTextSelectionStart = selectionStart;
+          window.__boonLastPreviewTextSelectionEnd = selectionEnd;
+          focused.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            composed: true,
+            data,
+            inputType
+          }));
+          const dispatchFact = window.__boonDispatchUiFact;
+          const dispatchEvent = window.__boonDispatchUiEvent;
+          const nodeId = focused.getAttribute('data-boon-node-id');
+          const inputPort = focused.getAttribute('data-boon-port-input');
+          if (typeof dispatchFact === 'function' && nodeId) {
+            dispatchFact(nodeId, 'DraftText', focused.value || '');
+          }
+          if (typeof dispatchEvent === 'function' && inputPort) {
+            dispatchEvent(inputPort, 'Input', focused.value || '');
+          }
+        };
+
+        const dispatchEvent = window.__boonDispatchUiEvent;
+        const keyDownPort = focused.getAttribute('data-boon-port-key-down');
+
+        if ((requestedKey === 'Enter' || requestedKey === 'Escape') && !keyDownPort) {
+          return false;
+        }
+
+        const dispatchedViaPort =
+          typeof dispatchEvent === 'function' && Boolean(keyDownPort);
+
+        if (!dispatchedViaPort) {
+          focused.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+        }
+        if (dispatchedViaPort) {
+          const payload = requestedKey + '\u001f' + (focused.value || '');
+          dispatchEvent(keyDownPort, 'KeyDown', payload);
+        }
+
+        if (requestedKey === 'Backspace' || requestedKey === 'Delete') {
+          const rawStart = focused.selectionStart ?? focused.value.length;
+          const rawEnd = focused.selectionEnd ?? rawStart;
+          let start = rawStart;
+          let end = rawEnd;
+          if (start === end) {
+            if (requestedKey === 'Backspace' && start > 0) {
+              start -= 1;
+            } else if (requestedKey === 'Delete' && end < focused.value.length) {
+              end += 1;
+            }
+          }
+          if (start !== end) {
+            const nextValue = focused.value.slice(0, start) + focused.value.slice(end);
+            applyInputMutation(
+              requestedKey === 'Backspace' ? 'deleteContentBackward' : 'deleteContentForward',
+              nextValue,
+              start,
+              start,
+              null
+            );
+          }
+        }
+
+        if (!dispatchedViaPort) {
+          focused.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+        }
+        return {
+          method: 'preview-no-cdp',
+          key: requestedKey,
+          nodeId: focused.getAttribute('data-boon-node-id'),
+          inputPort: focused.getAttribute('data-boon-port-input'),
+          keyDownPort,
+          value: focused.value || '',
+          dispatchedViaPort
+        };
+      },
+      args: [key]
+    });
+
+    return results?.[0]?.result || false;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Press special key (Enter, Tab, Escape, etc.) using CDP Input.dispatchKeyEvent
 // NOTE: This may not trigger JavaScript event listeners attached via web_sys
 async function cdpPressKey(tabId, key, modifiers = 0, retryCount = 0) {
@@ -477,6 +1052,186 @@ async function cdpPressKey(tabId, key, modifiers = 0, retryCount = 0) {
 
   try {
     await withTimeout(attachDebugger(tabId), 'attachDebugger');
+
+    const handledByPreviewInput = await chrome.debugger.sendCommand(
+      { tabId },
+      'Runtime.evaluate',
+      {
+        expression: `(function() {
+          if (!['Enter', 'Escape', 'Backspace', 'Delete'].includes(${JSON.stringify(key)})) {
+            return false;
+          }
+
+          const preview = document.querySelector('[data-boon-panel="preview"]');
+          if (!preview) return false;
+          const inputs = Array.from(preview.querySelectorAll('input, textarea'));
+          const isTextControl = (element) =>
+            element instanceof HTMLInputElement ||
+            element instanceof HTMLTextAreaElement;
+          const remembered = window.__boonLastPreviewTextInput;
+          const rememberedNodeId =
+            window.__boonLastPreviewTextInputNodeId ||
+            remembered?.getAttribute?.('data-boon-node-id') ||
+            null;
+          const rememberedIndex =
+            typeof window.__boonLastPreviewTextInputIndex === 'number'
+              ? window.__boonLastPreviewTextInputIndex
+              : null;
+
+          let focused =
+            rememberedNodeId
+              ? preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]')
+              : null;
+          if ((!isTextControl(focused) || focused === document.body) && rememberedIndex != null) {
+            focused = inputs[rememberedIndex] || focused;
+          }
+          if ((!isTextControl(focused) || focused === document.body) && remembered && remembered.isConnected && preview.contains(remembered)) {
+            focused = remembered;
+          }
+          if ((!isTextControl(focused) || focused === document.body)) {
+            focused = document.activeElement;
+          }
+          if ((!isTextControl(focused) || focused === document.body)) {
+            const previewFocused = preview.querySelector(':focus');
+            focused = isTextControl(previewFocused)
+              ? previewFocused
+              : preview.querySelector('[data-boon-focused="true"]')
+                || preview.querySelector('[focused="true"]')
+                || preview.querySelector('[autofocus]');
+          }
+          if (!isTextControl(focused)) return false;
+
+          if (document.activeElement !== focused && typeof focused.focus === 'function') {
+            focused.focus();
+          }
+
+          window.__boonLastPreviewTextInput = focused;
+          window.__boonLastPreviewTextInputNodeId =
+            focused.getAttribute('data-boon-node-id');
+          window.__boonLastPreviewTextInputIndex = inputs.indexOf(focused);
+
+          const key = ${JSON.stringify(key)};
+          const keyCodeMap = {
+            Enter: 13,
+            Escape: 27,
+            Backspace: 8,
+            Delete: 46
+          };
+          const codeMap = {
+            Enter: 'Enter',
+            Escape: 'Escape',
+            Backspace: 'Backspace',
+            Delete: 'Delete'
+          };
+          const keyCode = keyCodeMap[key] || 0;
+          const code = codeMap[key] || key;
+          const eventInit = {
+            key,
+            code,
+            keyCode,
+            which: keyCode,
+            bubbles: true,
+            composed: true,
+            cancelable: true
+          };
+
+          const applyInputMutation = (inputType, nextValue, selectionStart, selectionEnd, data) => {
+            const nativeSetter =
+              Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set ||
+              Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+            if (nativeSetter) {
+              nativeSetter.call(focused, nextValue);
+            } else {
+              focused.value = nextValue;
+            }
+            if (focused.setSelectionRange) {
+              focused.setSelectionRange(selectionStart, selectionEnd);
+            }
+            window.__boonLastPreviewTextSelectionStart = selectionStart;
+            window.__boonLastPreviewTextSelectionEnd = selectionEnd;
+            focused.dispatchEvent(new InputEvent('input', {
+              bubbles: true,
+              composed: true,
+              data,
+              inputType
+            }));
+            const dispatchFact = window.__boonDispatchUiFact;
+            const dispatchEvent = window.__boonDispatchUiEvent;
+            const nodeId = focused.getAttribute('data-boon-node-id');
+            const inputPort = focused.getAttribute('data-boon-port-input');
+            if (typeof dispatchFact === 'function' && nodeId) {
+              dispatchFact(nodeId, 'DraftText', focused.value || '');
+            }
+            if (typeof dispatchEvent === 'function' && inputPort) {
+              dispatchEvent(inputPort, 'Input', focused.value || '');
+            }
+          };
+
+          const dispatchEvent = window.__boonDispatchUiEvent;
+          const keyDownPort = focused.getAttribute('data-boon-port-key-down');
+
+          // Native CDP key delivery is required for bridge-owned inputs that do not expose
+          // Boon keydown ports on the focused DOM node.
+          if ((key === 'Enter' || key === 'Escape') && !keyDownPort) {
+            return false;
+          }
+
+          const dispatchedViaPort =
+            typeof dispatchEvent === 'function' && Boolean(keyDownPort);
+
+          if (!dispatchedViaPort) {
+            focused.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+          }
+          if (dispatchedViaPort) {
+            const payload = key + '\u001f' + (focused.value || '');
+            dispatchEvent(keyDownPort, 'KeyDown', payload);
+          }
+
+          if (key === 'Backspace' || key === 'Delete') {
+            const rawStart = focused.selectionStart ?? focused.value.length;
+            const rawEnd = focused.selectionEnd ?? rawStart;
+            let start = rawStart;
+            let end = rawEnd;
+            if (start === end) {
+              if (key === 'Backspace' && start > 0) {
+                start -= 1;
+              } else if (key === 'Delete' && end < focused.value.length) {
+                end += 1;
+              }
+            }
+            if (start !== end) {
+              const nextValue = focused.value.slice(0, start) + focused.value.slice(end);
+              applyInputMutation(
+                key === 'Backspace' ? 'deleteContentBackward' : 'deleteContentForward',
+                nextValue,
+                start,
+                start,
+                null
+              );
+            }
+          }
+
+          if (!dispatchedViaPort) {
+            focused.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+          }
+          return {
+            method: 'preview-input',
+            key,
+            nodeId: focused.getAttribute('data-boon-node-id'),
+            inputPort: focused.getAttribute('data-boon-port-input'),
+            changePort: focused.getAttribute('data-boon-port-change'),
+            keyDownPort,
+            value: focused.value || '',
+            dispatchedViaPort
+          };
+        })()`,
+        returnByValue: true
+      }
+    ).then(({ result }) => result?.value || false).catch(() => false);
+
+    if (handledByPreviewInput) {
+      return handledByPreviewInput;
+    }
 
     const keyMap = {
       'Enter': { key: 'Enter', code: 'Enter', keyCode: 13, windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
@@ -514,11 +1269,20 @@ async function cdpPressKey(tabId, key, modifiers = 0, retryCount = 0) {
       }
     }
 
-    const keyDownEvent = { type: 'keyDown', ...keyInfo, modifiers };
-    if (keyInfo.key === 'Enter') {
-      keyDownEvent.text = '\r';
-      keyDownEvent.unmodifiedText = '\r';
-    }
+    const specialKeys = new Set([
+      'Enter',
+      'Tab',
+      'Escape',
+      'Backspace',
+      'Delete',
+      'Home',
+      'End'
+    ]);
+    const keyDownEvent = {
+      type: specialKeys.has(keyInfo.key) ? 'rawKeyDown' : 'keyDown',
+      ...keyInfo,
+      modifiers
+    };
 
     await withTimeout(
       chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', keyDownEvent),
@@ -530,6 +1294,12 @@ async function cdpPressKey(tabId, key, modifiers = 0, retryCount = 0) {
       }),
       'Input.dispatchKeyEvent(keyUp)'
     );
+    return {
+      method: 'cdp',
+      key: keyInfo.key,
+      code: keyInfo.code,
+      modifiers
+    };
   } catch (e) {
     if (retryCount === 0 && (
       e.message?.includes('timeout') ||
@@ -589,8 +1359,12 @@ async function cdpEvaluate(tabId, expression, retryCount = 0) {
   await attachDebugger(tabId);
 
   try {
-    const { result, exceptionDetails } = await chrome.debugger.sendCommand(
-      { tabId }, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }
+    const { result, exceptionDetails } = await withOperationTimeout(
+      chrome.debugger.sendCommand(
+        { tabId }, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }
+      ),
+      'Runtime.evaluate',
+      10000
     );
 
     if (exceptionDetails) {
@@ -685,6 +1459,24 @@ function safeSend(message) {
   return false;
 }
 
+function stopWsHeartbeat() {
+  if (wsHeartbeatTimer) {
+    clearInterval(wsHeartbeatTimer);
+    wsHeartbeatTimer = null;
+  }
+}
+
+function startWsHeartbeat() {
+  stopWsHeartbeat();
+  wsHeartbeatTimer = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      stopWsHeartbeat();
+      return;
+    }
+    safeSend({ type: 'keepAlive' });
+  }, 5000);
+}
+
 // Connect to WebSocket server
 async function connect() {
   // Check both CONNECTING and OPEN states to avoid race conditions
@@ -713,10 +1505,12 @@ async function connect() {
     }
     // Identify as extension to the server
     safeSend({ clientType: 'extension' });
+    startWsHeartbeat();
   };
 
   ws.onclose = () => {
     console.log('[Boon] WebSocket connection closed');
+    stopWsHeartbeat();
     ws = null;
     scheduleReconnect();
   };
@@ -800,9 +1594,10 @@ async function handleCommand(id, command) {
       if (detectedPort && detectedPort !== activePlaygroundPort) {
         console.log(`[Boon] Detected playground port: ${detectedPort}, WS port: ${deriveWsPort(detectedPort)}`);
         await persistPlaygroundPort(detectedPort);
-        // Reconnect WS if port changed
-        if (ws) { ws.close(); ws = null; }
-        connect();
+        // Do not reconnect here. This command is already flowing over the
+        // current WebSocket, so closing it would self-abort the in-flight
+        // request and force the server to time out. The persisted port is
+        // enough for the next reconnect cycle to derive the right WS port.
       }
 
       console.log(`[Boon] Selected playground tab ${tab.id} (${tabs.length} tabs found)`);
@@ -845,6 +1640,242 @@ async function handleCommand(id, command) {
         // Use CDP for trusted double-click at coordinates
         await cdpDoubleClickAt(tab.id, command.x, command.y);
         return { type: 'success', data: { x: command.x, y: command.y, method: 'cdp' } };
+
+      case 'doubleClickCellsCell':
+        try {
+          const result = await executeInTab(tab.id, (row, column) => {
+            const preview = document.querySelector('[data-boon-panel="preview"]');
+            if (!preview) {
+              return { ok: false, error: 'preview root not found' };
+            }
+
+            const directText = (el) => Array.from(el.childNodes)
+              .filter((node) => node.nodeType === Node.TEXT_NODE)
+              .map((node) => node.textContent || '')
+              .join('')
+              .trim();
+
+            const locateCellsCellElement = (preview, row, column) => {
+              const rowKey = String(row - 1).padStart(4, '0');
+              const columnKey = String(column - 1).padStart(4, '0');
+              const targetPath = `all_row_cells.${rowKey}.cells.${columnKey}.display_element`;
+              const semanticCandidates = [
+                targetPath,
+                `all_row_cells.${rowKey}.items.0001.items.${columnKey}.element`,
+                `all_row_cells.${rowKey}.items.0001.element`
+              ];
+              for (const path of semanticCandidates) {
+                const semanticTarget =
+                  preview.querySelector(`[data-boon-link-path="${path}"]`) ||
+                  preview.querySelector(`[data-boon-port-double-click="${path}.event.double_click"]`);
+                if (semanticTarget) {
+                  if (!path.endsWith('.items.0001.element')) {
+                    return semanticTarget;
+                  }
+                  const rowRect = semanticTarget.getBoundingClientRect();
+                  const labels = Array.from(semanticTarget.querySelectorAll('label'))
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      return {
+                        el,
+                        x: rect.left,
+                        width: rect.width,
+                        height: rect.height,
+                        centerY: rect.top + rect.height / 2
+                      };
+                    })
+                    .filter((el) =>
+                      el.width > 0 &&
+                      el.height > 0 &&
+                      Math.abs(el.centerY - (rowRect.top + rowRect.height / 2)) <= 4.0
+                    )
+                    .sort((a, b) => a.x - b.x);
+                  if (labels.length >= column) {
+                    return labels[column - 1].el;
+                  }
+                  return semanticTarget;
+                }
+              }
+
+              const rowRootPath = `all_row_cells.${rowKey}.element`;
+              const rowRoot =
+                preview.querySelector(`[data-boon-link-path="${rowRootPath}"]`) ||
+                preview.querySelector(`[data-boon-port-double-click="${rowRootPath}.event.double_click"]`);
+              if (rowRoot) {
+                const rowRect = rowRoot.getBoundingClientRect();
+                const labels = Array.from(rowRoot.querySelectorAll('label'))
+                  .map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                      el,
+                      x: rect.left,
+                      width: rect.width,
+                      height: rect.height,
+                      centerY: rect.top + rect.height / 2
+                    };
+                  })
+                  .filter((el) =>
+                    el.width > 0 &&
+                    el.height > 0 &&
+                    Math.abs(el.centerY - (rowRect.top + rowRect.height / 2)) <= 4.0
+                  )
+                  .sort((a, b) => a.x - b.x);
+                if (labels.length > column) {
+                  return labels[column].el;
+                }
+              }
+
+              const elements = Array.from(preview.querySelectorAll('*'))
+                .map((el) => {
+                  const rect = el.getBoundingClientRect();
+                  return {
+                    el,
+                    directText: directText(el),
+                    x: rect.left,
+                    y: rect.top,
+                    width: rect.width,
+                    height: rect.height,
+                    right: rect.right,
+                    centerY: rect.top + rect.height / 2,
+                    fullText: (el.innerText || '').trim()
+                  };
+                })
+                .filter((el) => el.width > 0 && el.height > 0);
+
+              const rowMatches = elements
+                .filter((el) => el.directText === String(row) && el.width <= 60 && el.x < 1200)
+                .sort((a, b) => (a.y - b.y) || (a.x - b.x));
+
+              for (const rowLabel of rowMatches) {
+                const cellMatches = elements
+                  .filter((el) =>
+                    el.x >= rowLabel.right - 0.5 &&
+                    Math.abs(el.centerY - rowLabel.centerY) <= 3.0
+                  )
+                  .sort((a, b) => (a.x - b.x) || (a.y - b.y));
+
+                const deduped = [];
+                for (const candidate of cellMatches) {
+                  const prev = deduped[deduped.length - 1];
+                  const duplicate = prev &&
+                    Math.abs(prev.x - candidate.x) <= 1.0 &&
+                    Math.abs(prev.y - candidate.y) <= 1.0 &&
+                    prev.directText === candidate.directText;
+                  if (!duplicate) {
+                    deduped.push(candidate);
+                  }
+                }
+
+                const filtered = deduped.filter((candidate) =>
+                  candidate.width <= 120 &&
+                  candidate.height <= 80 &&
+                  (candidate.directText.length > 0 || candidate.fullText.length <= 8)
+                );
+                const ranked = filtered.length >= column ? filtered : deduped;
+
+                if (ranked.length >= column) {
+                  return ranked[column - 1].el;
+                }
+              }
+
+              return null;
+            };
+
+            const target = locateCellsCellElement(preview, row, column);
+            if (!target) {
+              return { ok: false, error: `cell (${row}, ${column}) not found` };
+            }
+
+            const rect = target.getBoundingClientRect();
+            const clientX = rect.left + rect.width / 2;
+            const clientY = rect.top + rect.height / 2;
+
+            if (typeof target.focus === 'function') {
+              try { target.focus(); } catch (_) {}
+            }
+
+            const makeMouseEvent = (type, detail) => new MouseEvent(type, {
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+              view: window,
+              clientX,
+              clientY,
+              screenX: clientX,
+              screenY: clientY,
+              button: 0,
+              buttons: type === 'mouseup' || type === 'click' || type === 'dblclick' ? 0 : 1,
+              detail
+            });
+
+            const sequence = [
+              ['mousedown', 1],
+              ['mouseup', 1],
+              ['click', 1],
+              ['mousedown', 2],
+              ['mouseup', 2],
+              ['click', 2],
+              ['dblclick', 2]
+            ];
+
+            for (const [type, detail] of sequence) {
+              target.dispatchEvent(makeMouseEvent(type, detail));
+            }
+
+            const expectedInputPath =
+              `all_row_cells.${String(row - 1).padStart(4, '0')}.cells.${String(column - 1).padStart(4, '0')}.editing_element.event.change`;
+            return new Promise((resolve) => {
+              const deadline = Date.now() + 1500;
+              const waitForInput = () => {
+                const input =
+                  preview.querySelector(`[data-boon-port-input="${expectedInputPath}"]`) ||
+                  Array.from(preview.querySelectorAll('input')).find((el) =>
+                    (el.getAttribute('data-boon-port-input') || '') === expectedInputPath
+                  );
+                if (input) {
+                  if (document.activeElement !== input && typeof input.focus === 'function') {
+                    try { input.focus(); } catch (_) {}
+                  }
+                  resolve({
+                    ok: true,
+                    tag: target.tagName,
+                    x: Math.round(clientX),
+                    y: Math.round(clientY),
+                    focusedTag: document.activeElement?.tagName || null,
+                    focusedValue: input.value || null
+                  });
+                  return;
+                }
+                if (Date.now() >= deadline) {
+                  resolve({
+                    ok: true,
+                    tag: target.tagName,
+                    x: Math.round(clientX),
+                    y: Math.round(clientY),
+                    focusedTag: document.activeElement?.tagName || null,
+                    focusedValue: null
+                  });
+                  return;
+                }
+                requestAnimationFrame(waitForInput);
+              };
+              waitForInput();
+            });
+          }, command.row, command.column);
+
+          if (result?.type === 'error') {
+            return { type: 'error', message: result.message || 'Cells dblclick failed' };
+          }
+          if (!result?.ok) {
+            return { type: 'error', message: result?.error || 'Cells dblclick failed' };
+          }
+          return {
+            type: 'success',
+            data: { row: command.row, column: command.column, method: 'in-page', ...result }
+          };
+        } catch (e) {
+          return { type: 'error', message: `Double-click cells cell failed: ${e.message}` };
+        }
 
       case 'type':
         // Use trusted keyboard-like CDP events only.
@@ -948,31 +1979,29 @@ async function handleCommand(id, command) {
         }
 
       case 'getPreviewText':
-        // Use CDP Runtime.evaluate
-        try {
-          const text = await cdpEvaluate(tab.id,
-            `document.querySelector('[data-boon-panel="preview"]')?.textContent || ''`);
-          return { type: 'previewText', text };
-        } catch (e) {
-          return { type: 'error', message: e.message };
+        {
+          const result = await executeInTab(tab.id, () =>
+            document.querySelector('[data-boon-panel="preview"]')?.textContent || ''
+          );
+          if (result && result.type === 'error') {
+            return { type: 'error', message: result.message || 'GetPreviewText failed' };
+          }
+          return { type: 'previewText', text: typeof result === 'string' ? result : '' };
         }
 
       case 'runAndCaptureInitial':
-        // ATOMIC: Run code and capture initial preview BEFORE any async events (timers) fire
-        // This is critical for testing initial state before timer-based updates
+        // ATOMIC: Run code and capture initial preview BEFORE any async events (timers) fire.
+        // Use page-world execution instead of CDP Runtime.evaluate; the first CDP eval after
+        // navigation has proven flaky for the initial suite example even when the page is ready.
         try {
-          const result = await cdpEvaluate(tab.id, `
-            (function() {
-              // Run the code synchronously
+          const result = await executeInTab(tab.id, () => {
+            try {
               if (typeof window.boonPlayground === 'undefined' || !window.boonPlayground.run) {
                 return { error: 'boonPlayground API not available' };
               }
 
-              // Trigger run - this compiles and renders synchronously
               window.boonPlayground.run();
 
-              // Immediately capture the preview BEFORE any setTimeout/timers fire
-              // JavaScript event loop guarantees sync code completes before async callbacks
               const preview = document.querySelector('[data-boon-panel="preview"]');
               const initialText = preview ? preview.textContent || '' : '';
 
@@ -981,8 +2010,10 @@ async function handleCommand(id, command) {
                 initialPreview: initialText,
                 timestamp: Date.now()
               };
-            })()
-          `);
+            } catch (e) {
+              return { error: e?.message || String(e) };
+            }
+          });
 
           if (result.error) {
             return { type: 'error', message: result.error };
@@ -1001,6 +2032,45 @@ async function handleCommand(id, command) {
               if (!preview) return { elements: [], error: 'Preview panel not found' };
 
               const allElements = preview.querySelectorAll('*');
+              const findClickablePoint = (el) => {
+                const rect = el.getBoundingClientRect();
+                const insetX = Math.min(8, Math.max(2, rect.width * 0.15));
+                const insetY = Math.min(8, Math.max(2, rect.height * 0.15));
+                const candidates = [
+                  [rect.left + rect.width / 2, rect.top + rect.height / 2, 'center'],
+                  [rect.left + insetX, rect.top + rect.height / 2, 'left-center'],
+                  [rect.right - insetX, rect.top + rect.height / 2, 'right-center'],
+                  [rect.left + rect.width / 2, rect.top + insetY, 'top-center'],
+                  [rect.left + rect.width / 2, rect.bottom - insetY, 'bottom-center'],
+                  [rect.left + insetX, rect.top + insetY, 'top-left'],
+                  [rect.right - insetX, rect.top + insetY, 'top-right'],
+                  [rect.left + insetX, rect.bottom - insetY, 'bottom-left'],
+                  [rect.right - insetX, rect.bottom - insetY, 'bottom-right'],
+                ];
+
+                for (const [x, y, label] of candidates) {
+                  const topElement = document.elementFromPoint(x, y);
+                  if (topElement && (el === topElement || el.contains(topElement))) {
+                    return { x, y, label };
+                  }
+                }
+
+                return null;
+              };
+
+              const firstVisibleAncestor = (el) => {
+                let current = el.parentElement;
+                while (current && current !== preview) {
+                  const rect = current.getBoundingClientRect();
+                  const style = window.getComputedStyle(current);
+                  if (rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden') {
+                    return { element: current, rect };
+                  }
+                  current = current.parentElement;
+                }
+                return null;
+              };
+
               const results = [];
 
               allElements.forEach((el) => {
@@ -1057,7 +2127,10 @@ async function handleCommand(id, command) {
       case 'clearStates':
         // Click the "Clear saved states" button using trusted pointer events.
         try {
-          const button = await cdpEvaluate(tab.id, `
+          let button = null;
+          try {
+            button = await withOperationTimeout(
+              cdpEvaluate(tab.id, `
             (function() {
               const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim().toLowerCase();
               const candidates = Array.from(document.querySelectorAll('button, [role="button"], [data-action="clear-states"]'));
@@ -1078,10 +2151,28 @@ async function handleCommand(id, command) {
                 y: Math.round(rect.y + rect.height / 2)
               };
             })()
-          `);
+          `),
+              'clearStates.findButton',
+              5000
+            );
+          } catch (e) {
+            console.log('[Boon] clearStates: button lookup timed out, falling back to direct storage clear:', e.message);
+          }
 
           if (button && button.found) {
-            await cdpClickAtViewport(tab.id, button.x, button.y);
+            try {
+              await withOperationTimeout(
+                cdpClickAtViewport(tab.id, button.x, button.y),
+                'clearStates.clickButton',
+                5000
+              );
+            } catch (e) {
+              console.log('[Boon] clearStates: button click timed out, falling back to direct storage clear:', e.message);
+              button = null;
+            }
+          }
+
+          if (button && button.found) {
             return {
               type: 'success',
               data: {
@@ -1093,22 +2184,29 @@ async function handleCommand(id, command) {
 
           // Fallback: if button not found, clear localStorage directly.
           // This is less user-like but keeps recovery behavior available.
-          const fallbackResult = await cdpEvaluate(tab.id, `
-              (function() {
-                const preserveKeys = ['boon-playground-engine-type'];
-                const preserved = {};
-                for (const key of preserveKeys) {
-                  const val = localStorage.getItem(key);
-                  if (val !== null) preserved[key] = val;
-                }
-                const keyCount = localStorage.length;
-                localStorage.clear();
-                for (const [key, val] of Object.entries(preserved)) {
-                  localStorage.setItem(key, val);
-                }
-                return { cleared: keyCount, preserved: Object.keys(preserved), warning: 'Button not found, timers may not be invalidated' };
-              })()
-            `);
+          const fallbackResults = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            world: 'MAIN',
+            func: () => {
+              const preserveKeys = ['boon-playground-engine-type'];
+              const preserved = {};
+              for (const key of preserveKeys) {
+                const val = localStorage.getItem(key);
+                if (val !== null) preserved[key] = val;
+              }
+              const keyCount = localStorage.length;
+              localStorage.clear();
+              for (const [key, val] of Object.entries(preserved)) {
+                localStorage.setItem(key, val);
+              }
+              return {
+                cleared: keyCount,
+                preserved: Object.keys(preserved),
+                warning: 'Fell back to direct storage clear'
+              };
+            }
+          });
+          const fallbackResult = fallbackResults?.[0]?.result || { cleared: 0, preserved: [] };
           return { type: 'success', data: { method: 'fallback-clear', ...fallbackResult } };
         } catch (e) {
           return { type: 'error', message: e.message };
@@ -1251,14 +2349,44 @@ async function handleCommand(id, command) {
                 }
               });
 
-              // Sort by vertical position (top to bottom), then horizontal (left to right) as tiebreaker
-              allCheckboxes.sort((a, b) => {
-                const rectA = a.getBoundingClientRect();
-                const rectB = b.getBoundingClientRect();
-                const dy = rectA.top - rectB.top;
-                if (Math.abs(dy) > 2) return dy;  // 2px threshold for "same row"
-                return rectA.left - rectB.left;
-              });
+              const findClickablePoint = (el) => {
+                const rect = el.getBoundingClientRect();
+                const insetX = Math.min(8, Math.max(2, rect.width * 0.15));
+                const insetY = Math.min(8, Math.max(2, rect.height * 0.15));
+                const candidates = [
+                  [rect.left + rect.width / 2, rect.top + rect.height / 2, 'center'],
+                  [rect.left + insetX, rect.top + rect.height / 2, 'left-center'],
+                  [rect.right - insetX, rect.top + rect.height / 2, 'right-center'],
+                  [rect.left + rect.width / 2, rect.top + insetY, 'top-center'],
+                  [rect.left + rect.width / 2, rect.bottom - insetY, 'bottom-center'],
+                  [rect.left + insetX, rect.top + insetY, 'top-left'],
+                  [rect.right - insetX, rect.top + insetY, 'top-right'],
+                  [rect.left + insetX, rect.bottom - insetY, 'bottom-left'],
+                  [rect.right - insetX, rect.bottom - insetY, 'bottom-right'],
+                ];
+
+                for (const [x, y, label] of candidates) {
+                  const topElement = document.elementFromPoint(x, y);
+                  if (topElement && (el === topElement || el.contains(topElement))) {
+                    return { x, y, label };
+                  }
+                }
+
+                return null;
+              };
+
+              const firstVisibleAncestor = (el) => {
+                let current = el.parentElement;
+                while (current && current !== preview) {
+                  const rect = current.getBoundingClientRect();
+                  const style = window.getComputedStyle(current);
+                  if (rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden') {
+                    return { element: current, rect };
+                  }
+                  current = current.parentElement;
+                }
+                return null;
+              };
 
               const results = [];
 
@@ -1278,17 +2406,49 @@ async function handleCommand(id, command) {
                   visibility: style.visibility
                 });
 
-                if (rect.width === 0 || rect.height === 0) return;
                 if (style.display === 'none' || style.visibility === 'hidden') return;
+
+                const clickPort = el.getAttribute('data-boon-port-click');
+                const zeroSized = rect.width === 0 || rect.height === 0;
+                const visibleAncestor = zeroSized ? firstVisibleAncestor(el) : null;
+
+                if (zeroSized && !clickPort && !visibleAncestor) return;
+
+                const usesVisibleAncestor = !!(zeroSized && visibleAncestor);
+                const hitTarget = usesVisibleAncestor ? visibleAncestor.element : el;
+                const hitRect = usesVisibleAncestor ? visibleAncestor.rect : rect;
+                const clickablePoint = hitRect.width > 0 && hitRect.height > 0
+                  ? findClickablePoint(hitTarget)
+                  : null;
 
                 results.push({
                   id: el.id,
-                  centerX: rect.x + rect.width / 2,
-                  centerY: rect.y + rect.height / 2,
-                  text: (el.textContent || '').trim().substring(0, 50),
-                  width: rect.width,
-                  height: rect.height
+                  queryIndex: i,
+                  proxyCheckbox: usesVisibleAncestor,
+                  centerX: hitRect.x + hitRect.width / 2,
+                  centerY: hitRect.y + hitRect.height / 2,
+                  clickX: clickablePoint ? clickablePoint.x : null,
+                  clickY: clickablePoint ? clickablePoint.y : null,
+                  clickPoint: clickablePoint ? clickablePoint.label : null,
+                  clickPort,
+                  text: ((el.textContent || '').trim() || (hitTarget.textContent || '').trim()).substring(0, 50),
+                  width: hitRect.width,
+                  height: hitRect.height,
+                  zeroSized
                 });
+              });
+
+              // Keep the visible toggle-all control first when it exists, then preserve
+              // visual top-to-bottom ordering for the remaining checkbox targets.
+              results.sort((a, b) => {
+                const aToggleAll = (a.text || '').trim() === '>';
+                const bToggleAll = (b.text || '').trim() === '>';
+                if (aToggleAll !== bToggleAll) {
+                  return aToggleAll ? -1 : 1;
+                }
+                const dy = a.centerY - b.centerY;
+                if (Math.abs(dy) > 2) return dy;
+                return a.centerX - b.centerX;
               });
 
               return { checkboxes: results, totalFound: allCheckboxes.length };
@@ -1306,16 +2466,129 @@ async function handleCommand(id, command) {
           }
           const checkbox = checkboxes[checkboxIndex];
 
-          // Click using real CDP mouse events at the checkbox center coordinates.
-          // getBoundingClientRect() returns viewport coordinates, which is what cdpClickAtViewport expects.
-          await cdpClickAtViewport(tab.id, checkbox.centerX, checkbox.centerY);
+          let clickX = checkbox.clickX ?? checkbox.centerX;
+          let clickY = checkbox.clickY ?? checkbox.centerY;
+          let method = 'cdp';
+
+          if (checkbox.zeroSized) {
+            const clickResult = await cdpEvaluate(tab.id, `
+              (function() {
+                const preview = document.querySelector('[data-boon-panel="preview"]');
+                if (!preview) return { ok: false, error: 'Preview panel not found' };
+
+                const roleCheckboxes = Array.from(preview.querySelectorAll('[role="checkbox"]'));
+                const idCheckboxes = Array.from(preview.querySelectorAll('[id^="cb-"]'));
+                const seen = new Set();
+                const allCheckboxes = [];
+
+                roleCheckboxes.forEach(el => {
+                  if (!seen.has(el)) {
+                    seen.add(el);
+                    allCheckboxes.push(el);
+                  }
+                });
+
+                idCheckboxes.forEach(el => {
+                  if (!seen.has(el)) {
+                    seen.add(el);
+                    allCheckboxes.push(el);
+                  }
+                });
+
+                const target = allCheckboxes[${JSON.stringify(checkbox.queryIndex)}];
+                if (!target) {
+                  return { ok: false, error: 'Checkbox target disappeared before click' };
+                }
+
+                target.click();
+                return { ok: true };
+              })()
+            `);
+            if (!clickResult?.ok) {
+              return {
+                type: 'error',
+                message: clickResult?.error || 'Zero-sized checkbox click failed'
+              };
+            }
+            method = 'dom-click';
+            return { type: 'success', data: {
+              index: checkboxIndex,
+              id: checkbox.id,
+              text: checkbox.text,
+              x: clickX,
+              y: clickY,
+              clickPoint: checkbox.clickPoint,
+              method,
+              width: checkbox.width,
+              height: checkbox.height
+            } };
+          }
+
+          if (checkbox.zeroSized && checkbox.clickPort) {
+            const dispatchResult = await cdpEvaluate(tab.id, `
+              (function() {
+                const dispatchEvent = window.__boonDispatchUiEvent;
+                if (typeof dispatchEvent !== 'function') {
+                  return { ok: false, error: 'window.__boonDispatchUiEvent is not available' };
+                }
+                dispatchEvent(${JSON.stringify(checkbox.clickPort)}, 'Click');
+                return { ok: true };
+              })()
+            `);
+            if (!dispatchResult?.ok) {
+              return {
+                type: 'error',
+                message: dispatchResult?.error || 'Checkbox click failed for zero-sized checkbox'
+              };
+            }
+            method = 'hook';
+            return { type: 'success', data: {
+              index: checkboxIndex,
+              id: checkbox.id,
+              text: checkbox.text,
+              x: clickX,
+              y: clickY,
+              clickPoint: checkbox.clickPoint,
+              method,
+              width: checkbox.width,
+              height: checkbox.height
+            } };
+          }
+
+          try {
+            await cdpClickAtViewport(tab.id, clickX, clickY);
+          } catch (cdpError) {
+            if (!checkbox.clickPort) {
+              return { type: 'error', message: `Checkbox click failed: ${cdpError.message}` };
+            }
+
+            const dispatchResult = await cdpEvaluate(tab.id, `
+              (function() {
+                const dispatchEvent = window.__boonDispatchUiEvent;
+                if (typeof dispatchEvent !== 'function') {
+                  return { ok: false, error: 'window.__boonDispatchUiEvent is not available' };
+                }
+                dispatchEvent(${JSON.stringify(checkbox.clickPort)}, 'Click');
+                return { ok: true };
+              })()
+            `);
+            if (!dispatchResult?.ok) {
+              return {
+                type: 'error',
+                message: dispatchResult?.error || `Checkbox click failed after CDP fallback: ${cdpError.message}`
+              };
+            }
+            method = 'hook';
+          }
 
           return { type: 'success', data: {
             index: checkboxIndex,
             id: checkbox.id,
             text: checkbox.text,
-            x: checkbox.centerX,
-            y: checkbox.centerY,
+            x: clickX,
+            y: clickY,
+            clickPoint: checkbox.clickPoint,
+            method,
             width: checkbox.width,
             height: checkbox.height
           } };
@@ -1334,8 +2607,8 @@ async function handleCommand(id, command) {
 
               const buttonIndex = ${command.index};
 
-              // First try: elements with role="button"
-              let buttons = Array.from(preview.querySelectorAll('[role="button"]'));
+              // First try: actual buttons plus elements with role="button"
+              let buttons = Array.from(preview.querySelectorAll('button, [role="button"]'));
 
               // Filter visible buttons
               buttons = buttons.filter(el => {
@@ -1353,7 +2626,7 @@ async function handleCommand(id, command) {
 
                 allElements.forEach((el) => {
                   // Skip if already in buttons array
-                  if (el.getAttribute('role') === 'button') return;
+                  if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') return;
 
                   const rect = el.getBoundingClientRect();
                   if (rect.width === 0 || rect.height === 0) return;
@@ -1437,6 +2710,44 @@ async function handleCommand(id, command) {
               let bestMatch = null;
               let bestMatchElement = null;
               let bestMatchSize = Infinity;
+              let bestMatchInteractive = false;
+              const interactiveSelector = 'button, [role="button"], a, input, select, textarea, [tabindex]';
+              const findClickablePoint = (el) => {
+                const rect = el.getBoundingClientRect();
+                const insetX = Math.min(8, Math.max(2, rect.width * 0.15));
+                const insetY = Math.min(8, Math.max(2, rect.height * 0.15));
+                const candidates = [
+                  [rect.left + rect.width / 2, rect.top + rect.height / 2],
+                  [rect.left + insetX, rect.top + rect.height / 2],
+                  [rect.right - insetX, rect.top + rect.height / 2],
+                  [rect.left + rect.width / 2, rect.top + insetY],
+                  [rect.left + rect.width / 2, rect.bottom - insetY],
+                  [rect.left + insetX, rect.top + insetY],
+                  [rect.right - insetX, rect.top + insetY],
+                  [rect.left + insetX, rect.bottom - insetY],
+                  [rect.right - insetX, rect.bottom - insetY],
+                ];
+
+                for (const [x, y] of candidates) {
+                  const topElement = document.elementFromPoint(x, y);
+                  if (topElement && (el === topElement || el.contains(topElement))) {
+                    return { x, y };
+                  }
+                }
+
+                return null;
+              };
+
+              const resolveClickableElement = (el) => {
+                let current = el;
+                while (current && current !== preview) {
+                  if (typeof current.matches === 'function' && current.matches(interactiveSelector)) {
+                    return current;
+                  }
+                  current = current.parentElement;
+                }
+                return el;
+              };
 
               allElements.forEach((el) => {
                 const rect = el.getBoundingClientRect();
@@ -1463,19 +2774,34 @@ async function handleCommand(id, command) {
                 }
 
                 if (matches) {
-                  // Prefer smaller elements (more specific match)
-                  const size = rect.width * rect.height;
-                  if (size < bestMatchSize) {
-                    bestMatchSize = size;
-                    bestMatchElement = el;
+                  const clickableElement = resolveClickableElement(el);
+                  const clickableRect = clickableElement.getBoundingClientRect();
+                  const clickablePoint = findClickablePoint(clickableElement);
+                  const clickableSize = clickableRect.width * clickableRect.height;
+                  const isInteractive = clickableElement !== el
+                    || (typeof clickableElement.matches === 'function'
+                      && clickableElement.matches(interactiveSelector));
+
+                  // Prefer interactive ancestors first; then prefer smaller targets.
+                  if (
+                    bestMatchElement === null
+                    || (isInteractive && !bestMatchInteractive)
+                    || (isInteractive === bestMatchInteractive && clickableSize < bestMatchSize)
+                  ) {
+                    bestMatchInteractive = isInteractive;
+                    bestMatchSize = clickableSize;
+                    bestMatchElement = clickableElement;
                     bestMatch = {
                       text: directText,
-                      x: Math.round(rect.x),
-                      y: Math.round(rect.y),
-                      width: Math.round(rect.width),
-                      height: Math.round(rect.height),
-                      centerX: Math.round(rect.x + rect.width / 2),
-                      centerY: Math.round(rect.y + rect.height / 2)
+                      x: Math.round(clickableRect.x),
+                      y: Math.round(clickableRect.y),
+                      width: Math.round(clickableRect.width),
+                      height: Math.round(clickableRect.height),
+                      centerX: Math.round(clickableRect.x + clickableRect.width / 2),
+                      centerY: Math.round(clickableRect.y + clickableRect.height / 2),
+                      clickX: clickablePoint ? Math.round(clickablePoint.x) : null,
+                      clickY: clickablePoint ? Math.round(clickablePoint.y) : null,
+                      clickPort: clickableElement.getAttribute('data-boon-port-click')
                     };
                   }
                 }
@@ -1494,10 +2820,32 @@ async function handleCommand(id, command) {
             return { type: 'error', message: result.error || 'Element not found' };
           }
 
-          // Click using real CDP mouse events at the element center coordinates
-          await cdpClickAtViewport(tab.id, result.element.centerX, result.element.centerY);
+          const clickX = result.element.clickX ?? result.element.centerX;
+          const clickY = result.element.clickY ?? result.element.centerY;
 
-          return { type: 'success', data: { text: result.element.text, x: result.element.centerX, y: result.element.centerY } };
+          try {
+            await cdpClickAtViewport(tab.id, clickX, clickY);
+          } catch (cdpError) {
+            if (!result.element.clickPort) {
+              return { type: 'error', message: `Click by text failed: ${cdpError.message}` };
+            }
+
+            const dispatchResult = await cdpEvaluate(tab.id, `
+              (function() {
+                const dispatchEvent = window.__boonDispatchUiEvent;
+                if (typeof dispatchEvent !== 'function') {
+                  return { ok: false, error: 'window.__boonDispatchUiEvent is not available' };
+                }
+                dispatchEvent(${JSON.stringify(result.element.clickPort)}, 'Click');
+                return { ok: true };
+              })()
+            `);
+            if (!dispatchResult?.ok) {
+              return { type: 'error', message: dispatchResult?.error || `Click by text failed after CDP fallback: ${cdpError.message}` };
+            }
+          }
+
+          return { type: 'success', data: { text: result.element.text, x: clickX, y: clickY } };
         } catch (e) {
           return { type: 'error', message: `Click by text failed: ${e.message}` };
         }
@@ -1624,13 +2972,39 @@ async function handleCommand(id, command) {
                 return { found: false, error: 'Target element not found after hover' };
               }
 
+              const findClickablePoint = (el) => {
+                const rect = el.getBoundingClientRect();
+                const insetX = Math.min(8, Math.max(2, rect.width * 0.15));
+                const insetY = Math.min(8, Math.max(2, rect.height * 0.15));
+                const candidates = [
+                  [rect.left + rect.width / 2, rect.top + rect.height / 2, 'center'],
+                  [rect.left + insetX, rect.top + rect.height / 2, 'left-center'],
+                  [rect.right - insetX, rect.top + rect.height / 2, 'right-center'],
+                  [rect.left + rect.width / 2, rect.top + insetY, 'top-center'],
+                  [rect.left + rect.width / 2, rect.bottom - insetY, 'bottom-center'],
+                  [rect.left + insetX, rect.top + insetY, 'top-left'],
+                  [rect.right - insetX, rect.top + insetY, 'top-right'],
+                  [rect.left + insetX, rect.bottom - insetY, 'bottom-left'],
+                  [rect.right - insetX, rect.bottom - insetY, 'bottom-right'],
+                ];
+
+                for (const [x, y, label] of candidates) {
+                  const topElement = document.elementFromPoint(x, y);
+                  if (topElement && (el === topElement || el.contains(topElement))) {
+                    return { x, y, label };
+                  }
+                }
+
+                return null;
+              };
+
               // Find the row container and look for the button
               let container = targetElement.parentElement;
               let foundButton = null;
               let maxDepth = 5;
 
               while (container && maxDepth > 0) {
-                const buttons = container.querySelectorAll('[role="button"]');
+                const buttons = container.querySelectorAll('button, [role="button"]');
                 for (const btn of buttons) {
                   let btnText = '';
                   for (const node of btn.childNodes) {
@@ -1667,8 +3041,9 @@ async function handleCommand(id, command) {
 
               // Return coordinates — click will be dispatched via real CDP mouse events
               const btnRect = foundButton.getBoundingClientRect();
-              const centerX = btnRect.x + btnRect.width / 2;
-              const centerY = btnRect.y + btnRect.height / 2;
+              const clickablePoint = findClickablePoint(foundButton);
+              const centerX = clickablePoint ? clickablePoint.x : btnRect.x + btnRect.width / 2;
+              const centerY = clickablePoint ? clickablePoint.y : btnRect.y + btnRect.height / 2;
 
               return {
                 found: true,
@@ -1676,6 +3051,8 @@ async function handleCommand(id, command) {
                 buttonText: buttonText,
                 centerX: Math.round(centerX),
                 centerY: Math.round(centerY),
+                clickPoint: clickablePoint ? clickablePoint.label : null,
+                clickPort: foundButton.getAttribute('data-boon-port-click'),
                 buttonRect: { x: btnRect.x, y: btnRect.y, w: btnRect.width, h: btnRect.height }
               };
             })()
@@ -1685,8 +3062,30 @@ async function handleCommand(id, command) {
             return { type: 'error', message: clickResult.error || 'Button not found after hover' };
           }
 
-          // Click using real CDP mouse events at the button center coordinates
-          await cdpClickAtViewport(tab.id, clickResult.centerX, clickResult.centerY);
+          if (clickResult.clickPoint) {
+            await cdpClickAtViewport(tab.id, clickResult.centerX, clickResult.centerY);
+          } else if (clickResult.clickPort) {
+            const dispatchResult = await cdpEvaluate(tab.id, `
+              (function() {
+                const dispatchEvent = window.__boonDispatchUiEvent;
+                if (typeof dispatchEvent !== 'function') {
+                  return { ok: false, error: 'window.__boonDispatchUiEvent is not available' };
+                }
+                dispatchEvent(${JSON.stringify(clickResult.clickPort)}, 'Click');
+                return { ok: true };
+              })()
+            `);
+            if (!dispatchResult?.ok) {
+              return { type: 'error', message: dispatchResult?.error || 'Button click dispatch failed' };
+            }
+            clickResult.method = 'hook';
+          } else {
+            return { type: 'error', message: `Button "${buttonText}" near "${searchText}" is obscured and has no click port fallback` };
+          }
+
+          if (!clickResult.method) {
+            clickResult.method = 'cdp';
+          }
 
           return { type: 'success', data: clickResult };
         } catch (e) {
@@ -1696,7 +3095,7 @@ async function handleCommand(id, command) {
       case 'focusInput':
         // Focus an input element in the preview panel by index
         try {
-          const result = await cdpEvaluate(tab.id, `
+          const focusInputProbe = async () => cdpEvaluate(tab.id, `
             (function() {
               const preview = document.querySelector('[data-boon-panel="preview"]');
               if (!preview) return { found: false, error: 'Preview panel not found' };
@@ -1704,11 +3103,13 @@ async function handleCommand(id, command) {
               const inputs = preview.querySelectorAll('input, textarea, [contenteditable="true"]');
               const inputIndex = ${command.index};
               if (inputIndex >= inputs.length) {
-                return { found: false, error: 'Input index ' + inputIndex + ' out of range (found ' + inputs.length + ' inputs)' };
+                return {
+                  found: false,
+                  error: 'Input index ' + inputIndex + ' out of range (found ' + inputs.length + ' inputs)'
+                };
               }
 
               const input = inputs[inputIndex];
-
               const rect = input.getBoundingClientRect();
               return {
                 found: true,
@@ -1720,6 +3121,19 @@ async function handleCommand(id, command) {
             })()
           `);
 
+          let result = null;
+          const deadline = Date.now() + 2500;
+          while (Date.now() < deadline) {
+            result = await focusInputProbe();
+            if (result && result.found) {
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+          if (!result) {
+            result = await focusInputProbe();
+          }
+
           if (!result.found) {
             return { type: 'error', message: result.error || 'Input not found' };
           }
@@ -1730,6 +3144,45 @@ async function handleCommand(id, command) {
           if (result.x > 0 || result.y > 0) {
             await cdpClickAtViewport(tab.id, result.x, result.y);
           }
+
+          await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return;
+              const inputs = preview.querySelectorAll('input, textarea, [contenteditable="true"]');
+              const input = inputs[${command.index}];
+              if (!input) return;
+
+              if (typeof input.focus === 'function') {
+                input.focus();
+              }
+
+              // Tests overwhelmingly use focus_input immediately before typing to
+              // replace the field contents, so normalize that by selecting the
+              // existing value after focus. This avoids stale-text append bugs
+              // across reruns without affecting explicit caret-manipulation flows.
+              if (typeof input.select === 'function') {
+                input.select();
+              } else if (typeof input.setSelectionRange === 'function') {
+                const value = input.value || '';
+                input.setSelectionRange(0, value.length);
+              }
+
+              window.__boonLastPreviewTextInput = input;
+              window.__boonLastPreviewTextInputNodeId =
+                input.getAttribute('data-boon-node-id');
+              window.__boonLastPreviewTextInputIndex =
+                Array.from(inputs).indexOf(input);
+              if (typeof input.selectionStart === 'number' && typeof input.selectionEnd === 'number') {
+                window.__boonLastPreviewTextSelectionStart = input.selectionStart;
+                window.__boonLastPreviewTextSelectionEnd = input.selectionEnd;
+              } else {
+                const value = input.value || '';
+                window.__boonLastPreviewTextSelectionStart = 0;
+                window.__boonLastPreviewTextSelectionEnd = value.length;
+              }
+            })()
+          `);
           return { type: 'success', data: result };
         } catch (e) {
           return { type: 'error', message: `Focus input failed: ${e.message}` };
@@ -1757,8 +3210,11 @@ async function handleCommand(id, command) {
       case 'pressKey':
         // Press a special key using trusted CDP keyboard events.
         try {
-          await cdpPressKey(tab.id, command.key);
-          return { type: 'success', data: { key: command.key, method: 'cdp' } };
+          const result = await cdpPressKey(tab.id, command.key);
+          return {
+            type: 'success',
+            data: result || { key: command.key, method: 'unknown' }
+          };
         } catch (e) {
           return { type: 'error', message: `Press key failed: ${e.message}` };
         }
@@ -1792,23 +3248,17 @@ async function handleCommand(id, command) {
         debuggerAttached.delete(tab.id);
         cdpConsoleMessages.delete(tab.id);
         await chrome.tabs.reload(tab.id);
-        // Wait for page to load and API to be ready
-        let attempts = 0;
-        while (attempts < 30) {
-          await new Promise(r => setTimeout(r, 500));
-          if (await checkApiReady(tab.id)) {
-            // Pre-attach debugger so subsequent commands work immediately
-            try {
-              await attachDebugger(tab.id);
-              console.log('[Boon] CDP: Pre-attached debugger after refresh');
-            } catch (e) {
-              console.log('[Boon] CDP: Could not pre-attach debugger:', e.message);
-            }
-            return { type: 'success', data: 'Page refreshed, API ready' };
+        if (await waitForApiReady(tab.id, 45000, 500)) {
+          // Pre-attach debugger so subsequent commands work immediately
+          try {
+            await attachDebugger(tab.id);
+            console.log('[Boon] CDP: Pre-attached debugger after refresh');
+          } catch (e) {
+            console.log('[Boon] CDP: Could not pre-attach debugger:', e.message);
           }
-          attempts++;
+          return { type: 'success', data: 'Page refreshed, API ready' };
         }
-        return { type: 'error', message: 'Page refreshed but API not ready after 15s' };
+        return { type: 'error', message: 'Page refreshed but API not ready after 45s' };
 
       case 'reload':
         // Hot reload: send response FIRST, then reload
@@ -1994,13 +3444,43 @@ async function handleCommand(id, command) {
                 return { found: false, error: 'No element found with text: ' + searchText };
               }
 
-              // Return coordinates — double-click will be dispatched via real CDP mouse events
               const rect = bestMatchElement.getBoundingClientRect();
               const centerX = rect.x + rect.width / 2;
               const centerY = rect.y + rect.height / 2;
 
+              if (typeof bestMatchElement.focus === 'function') {
+                try { bestMatchElement.focus(); } catch (_) {}
+              }
+
+              const makeMouseEvent = (type, detail) => new MouseEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                view: window,
+                clientX: centerX,
+                clientY: centerY,
+                screenX: centerX,
+                screenY: centerY,
+                button: 0,
+                buttons: type === 'mouseup' || type === 'click' || type === 'dblclick' ? 0 : 1,
+                detail
+              });
+
+              for (const [type, detail] of [
+                ['mousedown', 1],
+                ['mouseup', 1],
+                ['click', 1],
+                ['mousedown', 2],
+                ['mouseup', 2],
+                ['click', 2],
+                ['dblclick', 2]
+              ]) {
+                bestMatchElement.dispatchEvent(makeMouseEvent(type, detail));
+              }
+
               bestMatch.centerX = Math.round(centerX);
               bestMatch.centerY = Math.round(centerY);
+              bestMatch.tagName = bestMatchElement.tagName;
               return { found: true, element: bestMatch };
             })()
           `);
@@ -2009,14 +3489,7 @@ async function handleCommand(id, command) {
             return { type: 'error', message: result.error || 'Element not found' };
           }
 
-          // Double-click using real CDP mouse events at the element center coordinates.
-          // cdpDoubleClickAt expects page coordinates, so add scroll offset.
-          const scrollOffset = await cdpEvaluate(tab.id, `({ scrollX: window.scrollX, scrollY: window.scrollY })`);
-          const pageX = result.element.centerX + (scrollOffset?.scrollX || 0);
-          const pageY = result.element.centerY + (scrollOffset?.scrollY || 0);
-          await cdpDoubleClickAt(tab.id, pageX, pageY);
-
-          return { type: 'success', data: { text: result.element.text, x: result.element.centerX, y: result.element.centerY } };
+          return { type: 'success', data: { text: result.element.text, x: result.element.centerX, y: result.element.centerY, tagName: result.element.tagName, method: 'dom' } };
         } catch (e) {
           return { type: 'error', message: `Double-click by text failed: ${e.message}` };
         }
@@ -2178,9 +3651,14 @@ async function handleCommand(id, command) {
               // 1. aria-checked attribute (most reliable for role="checkbox")
               // 2. data-checked attribute
               // 3. checked property (for native checkboxes)
+              // 4. rendered content/icon fallback for custom Boon checkboxes
               const ariaChecked = checkbox.getAttribute('aria-checked');
               const dataChecked = checkbox.getAttribute('data-checked');
               const nativeChecked = checkbox.checked;
+              const iconTarget = checkbox.firstElementChild || checkbox;
+              const iconText = ((iconTarget && iconTarget.textContent) || checkbox.textContent || '').trim();
+              const iconStyle = iconTarget ? window.getComputedStyle(iconTarget) : null;
+              const backgroundImage = iconStyle ? iconStyle.backgroundImage || '' : '';
 
               let checked = false;
               if (ariaChecked !== null) {
@@ -2189,6 +3667,22 @@ async function handleCommand(id, command) {
                 checked = dataChecked === 'true';
               } else if (nativeChecked !== undefined) {
                 checked = !!nativeChecked;
+              } else if (iconText.includes('[X]') || iconText.includes('(checked)')) {
+                checked = true;
+              } else if (iconText.includes('[ ]') || iconText.includes('(unchecked)')) {
+                checked = false;
+              } else if (
+                backgroundImage.includes('%233EA390') ||
+                backgroundImage.includes('%2359A193') ||
+                backgroundImage.includes('3EA390') ||
+                backgroundImage.includes('59A193')
+              ) {
+                checked = true;
+              } else if (
+                backgroundImage.includes('%23949494') ||
+                backgroundImage.includes('949494')
+              ) {
+                checked = false;
               }
 
               return { found: true, checked };
@@ -2833,20 +4327,37 @@ async function executeInTab(tabId, func, ...args) {
 
 // Check if boonPlayground API is available
 async function checkApiReady(tabId) {
+  const timeoutMs = 3000;
   try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: 'MAIN',  // Run in page's main world to access window.boonPlayground
-      func: () => {
-        return typeof window.boonPlayground !== 'undefined' &&
-               typeof window.boonPlayground.isReady === 'function' &&
-               window.boonPlayground.isReady();
-      }
-    });
-    return results && results[0] && results[0].result === true;
+    const results = await Promise.race([
+      chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',  // Run in page's main world to access window.boonPlayground
+        func: () => {
+          return typeof window.boonPlayground !== 'undefined' &&
+                 typeof window.boonPlayground.isReady === 'function' &&
+                 window.boonPlayground.isReady();
+        }
+      }),
+      new Promise((resolve) => {
+        setTimeout(() => resolve(null), timeoutMs);
+      })
+    ]);
+    return !!(results && results[0] && results[0].result === true);
   } catch (e) {
     return false;
   }
+}
+
+async function waitForApiReady(tabId, timeoutMs = 45000, pollMs = 500) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await checkApiReady(tabId)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return false;
 }
 
 // Capture screenshot
@@ -3398,9 +4909,10 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
     if (port && port !== activePlaygroundPort) {
       console.log(`[Boon] Tab activated with playground port ${port}, WS port: ${deriveWsPort(port)}`);
       await persistPlaygroundPort(port);
-      // Reconnect WS if port changed
-      if (ws) { ws.close(); ws = null; }
-      connect();
+      // Do not reconnect here. Tab activation can happen while a command is
+      // already flowing over the current socket, and closing it here creates
+      // the same self-abort race we fixed in handleCommand().
+      // The persisted port is enough for the next natural reconnect cycle.
     }
   } catch (e) {
     // Tab may have been closed

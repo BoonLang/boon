@@ -15,6 +15,14 @@ The interactive app is in `playground/`: `frontend/` contains examples and the w
 - `./tools/scripts/verify_7guis_complete.sh --static-only`: run static 7GUIs verification.
 - `cd tools && just test-examples --filter cells --engine Actors`: run a targeted browser-driven example test.
 
+### Playground Dev Stack
+
+For normal playground development, prefer a single long-running `mzoon` process:
+
+- use `cd playground && makers mzoon start`
+- do not start separate duplicate frontend/backend runners when `mzoon` is sufficient
+- treat `mzoon` output as the primary place to watch frontend build results, backend build results, rebuilds, and running-instance logs
+
 ## Coding Style & Naming Conventions
 
 Use standard Rust formatting with `cargo fmt`. Follow existing Rust naming: `snake_case` for functions and modules, `CamelCase` for types, and descriptive names over abbreviations. Keep files ASCII unless the file already uses Unicode. Prefer small, explicit changes over broad rewrites.

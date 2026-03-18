@@ -85,8 +85,19 @@ fn create_persistent_profile() -> Result<PathBuf> {
     let repo_root = exe.parent().unwrap().parent().unwrap().parent().unwrap();
     let profile_dir = repo_root.join("tools").join(".chrome-profile");
     std::fs::create_dir_all(&profile_dir)?;
+    cleanup_stale_profile_locks(&profile_dir)?;
     log::info!("Using profile at: {}", profile_dir.display());
     Ok(profile_dir)
+}
+
+fn cleanup_stale_profile_locks(profile_dir: &std::path::Path) -> Result<()> {
+    for name in ["SingletonLock", "SingletonCookie", "SingletonSocket"] {
+        let path = profile_dir.join(name);
+        if path.exists() || path.is_symlink() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(())
 }
 
 /// Return PIDs of Chromium processes using Boon's persistent automation profile.
@@ -173,30 +184,31 @@ pub fn launch_browser(opts: LaunchOptions) -> Result<Child> {
     println!("Extension path: {}", extension_path.display());
     println!("User data dir: {}", user_data_dir.display());
 
-    let mut cmd = Command::new(&browser);
+    let mut browser_args: Vec<String> = vec![
+        format!("--load-extension={}", extension_path.display()),
+        format!("--user-data-dir={}", user_data_dir.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-default-apps".to_string(),
+        "--disable-popup-blocking".to_string(),
+        "--disable-translate".to_string(),
+        "--disable-sync".to_string(),
+        "--disable-session-crashed-bubble".to_string(),
+        "--hide-crash-restore-bubble".to_string(),
+        "--disable-background-timer-throttling".to_string(),
+        "--disable-backgrounding-occluded-windows".to_string(),
+        "--disable-renderer-backgrounding".to_string(),
+    ];
 
-    // Core flags for automation
-    cmd.args([
-        &format!("--load-extension={}", extension_path.display()),
-        &format!("--user-data-dir={}", user_data_dir.display()),
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-default-apps",
-        "--disable-popup-blocking",
-        "--disable-translate",
-        "--disable-sync",
-        // Disable session restore to prevent multiple tabs from previous sessions
-        "--disable-session-crashed-bubble",
-        "--hide-crash-restore-bubble",
-        // Disable background throttling so extension stays responsive
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
-    ]);
+    if !opts.headless && cfg!(target_os = "linux") && std::env::var_os("DISPLAY").is_some() {
+        // The desktop Chromium sessions on this machine are stable on X11, while
+        // detached launches can disappear immediately under the default auto mode.
+        browser_args.push("--ozone-platform=x11".to_string());
+    }
 
     if opts.headless {
         // Use new headless mode that supports extensions
-        cmd.arg("--headless=new");
+        browser_args.push("--headless=new".to_string());
     }
 
     // Open the playground URL with safe defaults to avoid loading a heavy example
@@ -208,10 +220,23 @@ pub fn launch_browser(opts: LaunchOptions) -> Result<Child> {
         .map(engine_query_value)
         .unwrap_or("actors");
     let initial_example = opts.initial_example.as_deref().unwrap_or("counter");
-    cmd.arg(&format!(
+    browser_args.push(format!(
         "http://localhost:{}/?engine={}&example={}",
         opts.playground_port, initial_engine, initial_example
     ));
+
+    let mut cmd = if cfg!(target_os = "linux") && opts.keep_open && !opts.headless {
+        // Detach the desktop browser from the launcher process group. Without this,
+        // Chromium can be torn down as soon as the CLI command exits even though the
+        // launch itself reported success.
+        let mut detached = Command::new("setsid");
+        detached.arg("-f");
+        detached.arg(&browser);
+        detached
+    } else {
+        Command::new(&browser)
+    };
+    cmd.args(&browser_args);
 
     // Suppress browser output unless in debug mode
     if std::env::var("RUST_LOG").is_err() {

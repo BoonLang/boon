@@ -281,15 +281,24 @@ dependencies = [
  "boon-renderer-zoon",
  "boon-scene",
  "chumsky",
- "futures-channel",
  "getrandom 0.3.4",
+ "serde",
+ "serde_json_any_key",
+ "ulid",
+ "zoon",
+]
+
+[[package]]
+name = "boon-engine-wasm"
+version = "0.1.0"
+dependencies = [
+ "boon",
+ "boon-renderer-zoon",
+ "boon-scene",
  "js-sys",
- "pin-project",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
- "serde_json_any_key",
- "smallvec",
  "ulid",
  "wasm-bindgen",
  "wasm-encoder 0.225.0",
@@ -329,6 +338,7 @@ dependencies = [
  "anyhow",
  "base64 0.21.7",
  "boon",
+ "boon-engine-wasm",
  "clap",
  "env_logger",
  "futures-util",
@@ -945,7 +955,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2dff15bf788c671c1934e366d07e30c1814a8ef514e1af724a602e8a2fbe1b10"
 dependencies = [
  "futures-core",
- "futures-sink",
 ]
 
 [[package]]

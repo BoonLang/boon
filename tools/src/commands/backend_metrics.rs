@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use boon::platform::browser::{
+use boon_engine_wasm::{
     cells_backend_metrics_snapshot, CellsBackendComparison, CellsBackendMetricsReport,
 };
 use std::path::PathBuf;
