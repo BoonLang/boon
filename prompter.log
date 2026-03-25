@@ -34606,3 +34606,24 @@
 2026-03-25T13:04:29.638050666+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(1495), supervisor_status=Completed
 2026-03-25T13:09:41.878685701+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(204), supervisor_status=Completed
 2026-03-25T16:03:16.604960796+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(10197), supervisor_status=Completed
+2026-03-25T16:31:22.392087686+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(1559), supervisor_status=Completed
+2026-03-25T16:59:47.593734529+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(1575), supervisor_status=Completed
+2026-03-25T17:29:14.390339543+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(1440), supervisor_status=Completed
+2026-03-25T18:32:54.297012705+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(3721), supervisor_status=Completed
+2026-03-25T18:37:00.236638375+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(106), supervisor_status=Completed
+2026-03-25T19:00:39.892721159+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(1393), supervisor_status=Completed
+2026-03-25T19:39:08.725044886+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(2234), supervisor_status=Completed
+2026-03-25T19:42:24.425803492+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(69), supervisor_status=Completed
+2026-03-25T19:42:46.342596025+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(10), supervisor_status=Completed
+2026-03-25T19:43:42.969603747+00:00 INFO prompter::web::routes: SSE: Broadcasting supervisor state, kick_count=0
+2026-03-25T19:44:08.336029671+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(54), supervisor_status=Completed
+2026-03-25T19:46:14.287168564+00:00 INFO prompter::web::routes: SSE: Broadcasting supervisor state, kick_count=0
+2026-03-25T19:46:14.294216798+00:00 INFO prompter::supervisor: Supervisor: Captured 104 protected files
+2026-03-25T19:46:14.294284615+00:00 INFO prompter::supervisor: Supervisor: Started with prompt, sent initial prompt
+2026-03-25T19:46:14.294300574+00:00 INFO prompter::supervisor: Supervisor: Claude stopped working, starting kick timer (10 sec)
+2026-03-25T19:46:14.294327361+00:00 INFO prompter::web::routes: SSE: Broadcasting supervisor state, kick_count=0
+2026-03-25T19:46:14.602440846+00:00 WARN prompter::state::shared: Working time RESET: gap_secs=Some(65), supervisor_status=WaitingToKick
+2026-03-25T19:46:14.603610197+00:00 INFO prompter::supervisor: Supervisor: Claude started working, cancelled kick timer
+2026-03-25T19:46:14.603749406+00:00 INFO prompter::web::routes: SSE: Broadcasting supervisor state, kick_count=0
+2026-03-25T19:46:17.890554694+00:00 INFO prompter::supervisor: Supervisor: Paused
+2026-03-25T19:46:17.890681200+00:00 INFO prompter::web::routes: SSE: Broadcasting supervisor state, kick_count=0
