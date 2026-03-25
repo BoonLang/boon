@@ -365,10 +365,12 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                     let ready = ready.clone();
                     let root_cell = root_cell.clone();
                     let retained = retained.clone();
-                    let _scene_lights = render_root
+                    let scene_lights = render_root
                         .scene
                         .as_ref()
                         .and_then(|scene| scene.lights.clone());
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = &scene_lights;
                     let scene_geometry = render_root
                         .scene
                         .as_ref()

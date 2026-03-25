@@ -1,0 +1,27 @@
+# Independent hover-state buttons example
+
+[test]
+category = "interactive"
+description = "Each button shows its outline only while hovered"
+
+[output]
+text = "Hover each button - only hovered one should show borderButton AButton BButton C"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+[[sequence]]
+description = "Hover Button A"
+actions = [["hover_text", "Button A"], ["assert_button_has_outline", "Button A"]]
+expect = "Hover each button - only hovered one should show borderButton AButton BButton C"
+
+[[sequence]]
+description = "Hover Button B"
+actions = [["hover_text", "Button B"], ["assert_button_has_outline", "Button B"]]
+expect = "Hover each button - only hovered one should show borderButton AButton BButton C"
+
+[[sequence]]
+description = "Hover Button C"
+actions = [["hover_text", "Button C"], ["assert_button_has_outline", "Button C"]]
+expect = "Hover each button - only hovered one should show borderButton AButton BButton C"

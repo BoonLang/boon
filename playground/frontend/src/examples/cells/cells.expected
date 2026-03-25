@@ -4,14 +4,14 @@
 category = "interactive"
 description = "7GUIs Task 7: spreadsheet with formulas and change propagation"
 [timing]
-timeout = 90000
-poll_interval = 500
-initial_delay = 20000
+timeout = 15000
+poll_interval = 100
+initial_delay = 200
 
 # SPEC: Grid renders with default formulas
 [[sequence]]
 description = "Default A1=5 visible"
-actions = [["wait", 25000], ["assert_cells_cell_text", 1, 1, "5"]]
+actions = [["assert_cells_cell_text", 1, 1, "5"]]
 
 [[sequence]]
 description = "Default A2=10 visible"
@@ -28,9 +28,7 @@ actions = [["assert_cells_cell_text", 1, 3, "30"]]
 [[sequence]]
 description = "Double-click A1 enters edit mode with current value"
 actions = [
-  ["wait", 15000],
   ["dblclick_cells_cell", 1, 1],
-  ["wait", 200],
   ["assert_focused"],
   ["assert_focused_input_value", "5"],
 ]
@@ -41,7 +39,6 @@ actions = [
   ["set_focused_input_value", "7"],
   ["assert_focused_input_value", "7"],
   ["key", "Enter"],
-  ["wait", 200],
   ["assert_not_focused"],
   ["assert_cells_cell_text", 1, 1, "7"],
   ["assert_cells_cell_text", 1, 2, "17"],
@@ -52,13 +49,11 @@ actions = [
 description = "Escape cancels in-progress edit"
 actions = [
   ["dblclick_cells_cell", 1, 1],
-  ["wait", 200],
   ["assert_focused"],
   ["assert_focused_input_value", "7"],
   ["set_focused_input_value", "9"],
   ["assert_focused_input_value", "9"],
   ["key", "Escape"],
-  ["wait", 200],
   ["assert_not_focused"],
   ["assert_cells_cell_text", 1, 1, "7"],
   ["assert_cells_cell_text", 1, 2, "17"],
@@ -69,11 +64,9 @@ actions = [
 description = "Blur exits edit mode without corrupting committed values"
 actions = [
   ["dblclick_cells_cell", 1, 1],
-  ["wait", 200],
   ["assert_focused"],
   ["set_focused_input_value", "8"],
   ["click_text", "Cells"],
-  ["wait", 200],
   ["assert_not_focused"],
   ["assert_cells_cell_text", 1, 1, "7"],
   ["assert_cells_cell_text", 1, 2, "17"],
@@ -81,8 +74,52 @@ actions = [
 ]
 
 [[sequence]]
+description = "Repeated reopen and commit recomputes dependent cells"
+actions = [
+  ["dblclick_cells_cell", 1, 1],
+  ["assert_focused"],
+  ["assert_focused_input_value", "7"],
+  ["set_focused_input_value", "11"],
+  ["assert_focused_input_value", "11"],
+  ["key", "Enter"],
+  ["assert_not_focused"],
+  ["assert_cells_cell_text", 1, 1, "11"],
+  ["assert_cells_cell_text", 1, 2, "21"],
+  ["assert_cells_cell_text", 1, 3, "36"],
+]
+
+[[sequence]]
+description = "Repeated reopen escape keeps committed dependency values"
+actions = [
+  ["dblclick_cells_cell", 1, 1],
+  ["assert_focused"],
+  ["assert_focused_input_value", "11"],
+  ["set_focused_input_value", "12"],
+  ["assert_focused_input_value", "12"],
+  ["key", "Escape"],
+  ["assert_not_focused"],
+  ["assert_cells_cell_text", 1, 1, "11"],
+  ["assert_cells_cell_text", 1, 2, "21"],
+  ["assert_cells_cell_text", 1, 3, "36"],
+]
+
+[[sequence]]
+description = "Editing A2 recomputes the dependent closure"
+actions = [
+  ["dblclick_cells_cell", 2, 1],
+  ["assert_focused"],
+  ["assert_focused_input_value", "10"],
+  ["set_focused_input_value", "20"],
+  ["assert_focused_input_value", "20"],
+  ["key", "Enter"],
+  ["assert_not_focused"],
+  ["assert_cells_cell_text", 2, 1, "20"],
+  ["assert_cells_cell_text", 1, 2, "31"],
+  ["assert_cells_cell_text", 1, 3, "46"],
+]
+
+[[sequence]]
 description = "Official row 100 becomes visible"
 actions = [
-  ["wait", 45000],
   ["assert_cells_row_visible", 100],
 ]

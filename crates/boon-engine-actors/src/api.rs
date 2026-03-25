@@ -4,7 +4,9 @@ use std::sync::Arc;
 use zoon::Timer;
 use zoon::futures_channel::mpsc;
 use zoon::futures_util::{
-    FutureExt, SinkExt, future::join_all, pin_mut, select,
+    FutureExt, SinkExt,
+    future::join_all,
+    pin_mut, select,
     stream::{self, LocalBoxStream, Stream, StreamExt},
 };
 use zoon::{Closure, JsCast, JsValue, SendWrapper, UnwrapThrowExt, history, window};
@@ -2136,7 +2138,8 @@ pub fn function_timer_interval(
     .filter_map(future::ready);
 
     let (tick_sender, tick_receiver) = mpsc::channel::<Value>(16);
-    let driver_loop_holder: Arc<std::sync::OnceLock<ActorLoop>> = Arc::new(std::sync::OnceLock::new());
+    let driver_loop_holder: Arc<std::sync::OnceLock<ActorLoop>> =
+        Arc::new(std::sync::OnceLock::new());
     let driver_loop_holder_for_stream = driver_loop_holder.clone();
 
     let driver = ActorLoop::new(async move {
@@ -2589,15 +2592,13 @@ pub fn function_list_is_empty(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
-    let list_stream = list_actor
-        .stream()
-        .filter_map(move |value| {
-            let result = match &value {
-                Value::List(list, _) => Some(list.clone()),
-                _ => None,
-            };
-            future::ready(result)
-        });
+    let list_stream = list_actor.stream().filter_map(move |value| {
+        let result = match &value {
+            Value::List(list, _) => Some(list.clone()),
+            _ => None,
+        };
+        future::ready(result)
+    });
     switch_map(list_stream, move |list| {
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
@@ -2642,15 +2643,13 @@ pub fn function_list_count(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
-    let list_stream = list_actor
-        .stream()
-        .filter_map(move |value| {
-            let result = match &value {
-                Value::List(list, _) => Some(list.clone()),
-                _ => None,
-            };
-            future::ready(result)
-        });
+    let list_stream = list_actor.stream().filter_map(move |value| {
+        let result = match &value {
+            Value::List(list, _) => Some(list.clone()),
+            _ => None,
+        };
+        future::ready(result)
+    });
     switch_map(list_stream, move |list| {
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
@@ -2694,15 +2693,13 @@ pub fn function_list_is_not_empty(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
-    let list_stream = list_actor
-        .stream()
-        .filter_map(move |value| {
-            let result = match &value {
-                Value::List(list, _) => Some(list.clone()),
-                _ => None,
-            };
-            future::ready(result)
-        });
+    let list_stream = list_actor.stream().filter_map(move |value| {
+        let result = match &value {
+            Value::List(list, _) => Some(list.clone()),
+            _ => None,
+        };
+        future::ready(result)
+    });
     switch_map(list_stream, move |list| {
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
@@ -3173,9 +3170,7 @@ pub fn function_list_latest(
     let list_actor = arguments[0].clone();
 
     let items_stream = switch_map(
-        list_actor
-        .stream()
-        .filter_map(|value| {
+        list_actor.stream().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
@@ -5276,9 +5271,11 @@ pub fn function_list_get(
                     Some(actor) => {
                         let actor_for_initial = actor.clone();
                         Box::pin(
-                            stream::once(async move { actor_for_initial.current_value().await.ok() })
-                                .filter_map(future::ready)
-                                .chain(actor.stream_from_now()),
+                            stream::once(
+                                async move { actor_for_initial.current_value().await.ok() },
+                            )
+                            .filter_map(future::ready)
+                            .chain(actor.stream_from_now()),
                         )
                     }
                     None => Box::pin(stream::once(future::ready(Tag::new_value(
@@ -5460,23 +5457,25 @@ pub fn function_list_sum(
                             ValueIdempotencyKey::new(),
                             initial_sum,
                         )))
-                        .chain(stream::select_all(streams)
-                        .scan(values, move |values, (i, value)| {
-                            if let Value::Number(n, _) = &value {
-                                values[i] = n.number();
-                            }
-                            let sum: f64 = values.iter().sum();
-                            future::ready(Some(Number::new_value(
-                                ConstructInfo::new(
-                                    function_call_id.with_child_id(0),
-                                    None,
-                                    "List/sum result",
-                                ),
-                                construct_context.clone(),
-                                ValueIdempotencyKey::new(),
-                                sum,
-                            )))
-                        }))
+                        .chain(stream::select_all(streams).scan(
+                            values,
+                            move |values, (i, value)| {
+                                if let Value::Number(n, _) = &value {
+                                    values[i] = n.number();
+                                }
+                                let sum: f64 = values.iter().sum();
+                                future::ready(Some(Number::new_value(
+                                    ConstructInfo::new(
+                                        function_call_id.with_child_id(0),
+                                        None,
+                                        "List/sum result",
+                                    ),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    sum,
+                                )))
+                            },
+                        ))
                     })
                     .right_stream()
                 })

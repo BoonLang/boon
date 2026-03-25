@@ -1,0 +1,55 @@
+# Checkbox toggling survives filter arm switching
+
+[test]
+category = "interactive"
+description = "Mapped checkbox state survives switching All/Active views"
+skip_engines = ["Actors", "DD", "Wasm"]
+
+[output]
+text = "Filter: AllAllActiveItem A (ALL) - checked: falseItem B (ALL) - checked: falseTest: Click Active, All, then checkbox 3x"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+[[sequence]]
+description = "Switch to Active view"
+actions = [
+  ["click_button", 1],
+  ["assert_contains", "Filter: Active"],
+  ["assert_checkbox_count", 2],
+  ["assert_checkbox_unchecked", 0],
+]
+
+[[sequence]]
+description = "Switch back to All view"
+actions = [
+  ["click_button", 0],
+  ["assert_contains", "Filter: All"],
+  ["assert_checkbox_count", 2],
+  ["assert_checkbox_unchecked", 0],
+]
+
+[[sequence]]
+description = "First checkbox click checks item"
+actions = [
+  ["click_checkbox", 0],
+  ["assert_checkbox_checked", 0],
+  ["assert_contains", "Item A (ALL) - checked: true"],
+]
+
+[[sequence]]
+description = "Second checkbox click unchecks item"
+actions = [
+  ["click_checkbox", 0],
+  ["assert_checkbox_unchecked", 0],
+  ["assert_contains", "Item A (ALL) - checked: false"],
+]
+
+[[sequence]]
+description = "Third checkbox click checks item again"
+actions = [
+  ["click_checkbox", 0],
+  ["assert_checkbox_checked", 0],
+  ["assert_contains", "Item A (ALL) - checked: true"],
+]

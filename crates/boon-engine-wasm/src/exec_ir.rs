@@ -234,7 +234,12 @@ fn object_list_item_matches_filter(
                     .map(String::as_str)
                     .unwrap_or_default(),
             };
-            actual.starts_with(text_values.get(binding).map(String::as_str).unwrap_or_default())
+            actual.starts_with(
+                text_values
+                    .get(binding)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            )
         }
         ObjectListFilter::ItemIdEqualsScalarBinding { binding } => scalar_values
             .get(binding)
@@ -250,12 +255,16 @@ fn scalar_operand_value(runtime: &RuntimeModel, operand: &DerivedScalarOperand) 
         DerivedScalarOperand::TextBindingNumber(_) => 0,
         DerivedScalarOperand::TextListCount { binding, filter } => match runtime {
             RuntimeModel::State(model) => match filter {
-                None => model.text_lists.get(binding).map_or(0, |items| items.len() as i64),
+                None => model
+                    .text_lists
+                    .get(binding)
+                    .map_or(0, |items| items.len() as i64),
                 Some(filter) => model
                     .text_lists
                     .get(binding)
                     .map(|items| {
-                        items.iter()
+                        items
+                            .iter()
                             .filter(|value| text_list_matches_filter(value, filter))
                             .count() as i64
                     })
@@ -265,12 +274,16 @@ fn scalar_operand_value(runtime: &RuntimeModel, operand: &DerivedScalarOperand) 
         },
         DerivedScalarOperand::ObjectListCount { binding, filter } => match runtime {
             RuntimeModel::State(model) => match filter {
-                None => model.object_lists.get(binding).map_or(0, |items| items.len() as i64),
+                None => model
+                    .object_lists
+                    .get(binding)
+                    .map_or(0, |items| items.len() as i64),
                 Some(filter) => model
                     .object_lists
                     .get(binding)
                     .map(|items| {
-                        items.iter()
+                        items
+                            .iter()
                             .filter(|item| {
                                 object_list_item_matches_filter(
                                     item,
@@ -290,15 +303,9 @@ fn scalar_operand_value(runtime: &RuntimeModel, operand: &DerivedScalarOperand) 
             let left = scalar_operand_value(runtime, left);
             let right = scalar_operand_value(runtime, right);
             match op {
-                crate::semantic_ir::DerivedArithmeticOp::Add => {
-                    left + right
-                }
-                crate::semantic_ir::DerivedArithmeticOp::Subtract => {
-                    left - right
-                }
-                crate::semantic_ir::DerivedArithmeticOp::Multiply => {
-                    left * right
-                }
+                crate::semantic_ir::DerivedArithmeticOp::Add => left + right,
+                crate::semantic_ir::DerivedArithmeticOp::Subtract => left - right,
+                crate::semantic_ir::DerivedArithmeticOp::Multiply => left * right,
                 crate::semantic_ir::DerivedArithmeticOp::Divide => {
                     if right == 0 {
                         0

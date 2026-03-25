@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Once;
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -32,6 +33,21 @@ use boon_engine_dd::{
 #[cfg(feature = "engine-wasm")]
 use boon_engine_wasm::{clear_wasm_persisted_states, run_wasm};
 
+#[cfg(feature = "engine-actors-lite")]
+use boon_engine_actors_lite::{
+    actors_lite_public_exposure_enabled, is_public_playground_example, run_actors_lite,
+};
+
+#[cfg(not(feature = "engine-actors-lite"))]
+fn is_public_playground_example(_name: &str) -> bool {
+    false
+}
+
+#[cfg(not(feature = "engine-actors-lite"))]
+fn actors_lite_public_exposure_enabled() -> bool {
+    false
+}
+
 #[cfg(not(feature = "engine-wasm"))]
 fn preferred_wasm_engine() -> Option<EngineType> {
     None
@@ -45,6 +61,9 @@ fn preferred_wasm_engine() -> Option<EngineType> {
 fn is_engine_available(engine: EngineType) -> bool {
     match engine {
         EngineType::Actors => cfg!(feature = "engine-actors"),
+        EngineType::ActorsLite => {
+            cfg!(feature = "engine-actors-lite") && actors_lite_public_exposure_enabled()
+        }
         EngineType::DifferentialDataflow => cfg!(feature = "engine-dd"),
         EngineType::Wasm => cfg!(feature = "engine-wasm"),
     }
@@ -54,6 +73,10 @@ fn available_engines() -> Vec<EngineType> {
     let mut engines = Vec::new();
     #[cfg(feature = "engine-actors")]
     engines.push(EngineType::Actors);
+    #[cfg(feature = "engine-actors-lite")]
+    if actors_lite_public_exposure_enabled() {
+        engines.push(EngineType::ActorsLite);
+    }
     #[cfg(feature = "engine-dd")]
     engines.push(EngineType::DifferentialDataflow);
     #[cfg(feature = "engine-wasm")]
@@ -83,7 +106,7 @@ fn resolve_engine_for_current_build(engine: EngineType) -> Option<EngineType> {
 
     match engine {
         EngineType::Wasm => preferred_wasm_engine(),
-        EngineType::Actors | EngineType::DifferentialDataflow => None,
+        EngineType::Actors | EngineType::ActorsLite | EngineType::DifferentialDataflow => None,
     }
 }
 
@@ -105,6 +128,10 @@ fn clear_all_compiled_engine_persisted_states() {
 
     #[cfg(feature = "engine-wasm")]
     clear_wasm_persisted_states();
+}
+
+fn engine_supports_persistence(engine: EngineType) -> bool {
+    !matches!(engine, EngineType::ActorsLite)
 }
 
 mod code_editor;
@@ -153,7 +180,7 @@ fn clear_prefixed_storage_keys(prefixes: &[&str]) {
 }
 
 // Number of main examples (rest are debug examples)
-const MAIN_EXAMPLES_COUNT: usize = 11;
+const MAIN_EXAMPLES_COUNT: usize = 25;
 
 const DEFAULT_PANEL_SPLIT_RATIO: f64 = 0.5;
 const MIN_PANEL_RATIO: f64 = 0.1;
@@ -216,6 +243,7 @@ fn autorun_enabled_from_url() -> bool {
 fn engine_query_value(engine: EngineType) -> &'static str {
     match engine {
         EngineType::Actors => "actors",
+        EngineType::ActorsLite => "actorslite",
         EngineType::DifferentialDataflow => "dd",
         EngineType::Wasm => "wasm",
     }
@@ -315,6 +343,7 @@ fn get_engine_from_url() -> Option<EngineType> {
     let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
     match params.get("engine").as_deref() {
         Some("actors") => Some(EngineType::Actors),
+        Some("actorslite") => Some(EngineType::ActorsLite),
         Some("dd") => Some(EngineType::DifferentialDataflow),
         Some("wasm") => Some(EngineType::Wasm),
         _ => None,
@@ -328,6 +357,7 @@ fn load_engine_from_storage() -> Option<EngineType> {
         .ok()?;
     match stored.as_str() {
         "Actors" => Some(EngineType::Actors),
+        "ActorsLite" => Some(EngineType::ActorsLite),
         "DD" => Some(EngineType::DifferentialDataflow),
         "Wasm" => Some(EngineType::Wasm),
         _ => None,
@@ -545,42 +575,127 @@ static EXAMPLE_DATAS: [ExampleData; MAIN_EXAMPLES_COUNT] = [
     make_example_data!("interval"),
     make_example_data!("interval_hold"),
     make_example_data!("counter"),
+    make_example_data!("complex_counter"),
     make_example_data!("counter_hold"),
     make_example_data!("fibonacci"),
     make_example_data!("layers"),
     make_example_data!("shopping_list"),
     make_example_data!("pages"),
     make_example_data!("todo_mvc"),
+    make_example_data!("list_retain_reactive"),
+    make_example_data!("list_map_external_dep"),
+    make_example_data!("list_map_block"),
+    make_example_data!("list_retain_count"),
+    make_example_data!("list_object_state"),
+    make_example_data!("list_retain_remove"),
+    make_example_data!("filter_checkbox_bug"),
+    make_example_data!("checkbox_test"),
+    make_example_data!("chained_list_remove_bug"),
+    make_example_data!("while_function_call"),
+    make_example_data!("button_hover_test"),
+    make_example_data!("button_hover_to_click_test"),
+    make_example_data!("switch_hold_test"),
     // Debug examples (commented out — use custom examples for ad-hoc testing)
     // make_example_data!("list_retain_count"),
     // make_example_data!("list_map_block"),
     // make_example_data!("list_object_state"),
     // make_example_data!("list_retain_reactive"),
     // make_example_data!("list_retain_remove"),
-    // make_example_data!("while_function_call"),
     // make_example_data!("list_map_external_dep"),
     // make_example_data!("text_interpolation_update"),
-    // make_example_data!("button_hover_test"),
-    // make_example_data!("button_hover_to_click_test"),
-    // make_example_data!("switch_hold_test"),
-    // make_example_data!("filter_checkbox_bug"),
     // make_example_data!("chained_list_remove_bug"),
 ];
 
 // 7GUIs benchmark examples (shown in "Other" expandable section)
 // Added incrementally as each task is implemented.
-static OTHER_EXAMPLE_DATAS: [ExampleData; 6] = [
+static OTHER_EXAMPLE_DATAS: [ExampleData; 12] = [
     make_example_data!("temperature_converter"),
     make_example_data!("crud"),
     make_example_data!("timer"),
     make_example_data!("flight_booker"),
     make_example_data!("circle_drawer"),
     make_example_data!("cells"),
+    make_example_data!("cells_dynamic"),
+    make_example_data!("latest"),
+    make_example_data!("text_interpolation_update"),
+    make_example_data!("then"),
+    make_example_data!("when"),
+    make_example_data!("while"),
 ];
 
 #[derive(Clone, Copy)]
 struct RunCommand {
     filename: Option<&'static str>,
+}
+
+fn example_name_from_filename(filename: &str) -> &str {
+    filename.trim_end_matches(".bn")
+}
+
+fn is_example_visible_in_engine(engine: EngineType, example_name: &str) -> bool {
+    match engine {
+        EngineType::ActorsLite => is_public_playground_example(example_name),
+        _ => true,
+    }
+}
+
+fn is_single_file_example_visible_in_engine(engine: EngineType, example: ExampleData) -> bool {
+    is_example_visible_in_engine(engine, example_name_from_filename(example.filename))
+}
+
+fn is_multi_file_example_visible_in_engine(engine: EngineType, example: &MultiFileExampleData) -> bool {
+    is_example_visible_in_engine(engine, example.name)
+}
+
+fn first_visible_single_file_example(engine: EngineType) -> ExampleData {
+    EXAMPLE_DATAS
+        .iter()
+        .chain(OTHER_EXAMPLE_DATAS.iter())
+        .copied()
+        .find(|example| is_single_file_example_visible_in_engine(engine, *example))
+        .unwrap_or(EXAMPLE_DATAS[0])
+}
+
+fn current_single_file_example(
+    files: &BTreeMap<String, String>,
+    current_file: &str,
+) -> Option<ExampleData> {
+    if files.len() != 1 {
+        return None;
+    }
+    find_example_by_name(example_name_from_filename(current_file))
+}
+
+fn current_multi_file_example(
+    files: &BTreeMap<String, String>,
+    current_file: &str,
+) -> Option<&'static MultiFileExampleData> {
+    MULTI_FILE_EXAMPLES
+        .iter()
+        .chain(OTHER_MULTI_FILE_EXAMPLES.iter())
+        .find(|example| {
+            current_file == example.entry_file
+                && files.len() == example.files.len()
+                && example
+                    .files
+                    .iter()
+                    .all(|(name, _)| files.contains_key(*name))
+        })
+}
+
+fn reset_to_single_file_example(
+    files: &mut BTreeMap<String, String>,
+    current_file: &mut String,
+    current_content: &mut String,
+    example: ExampleData,
+) {
+    files.clear();
+    files.insert(
+        example.filename.to_string(),
+        example.source_code.to_string(),
+    );
+    *current_file = example.filename.to_string();
+    *current_content = example.source_code.to_string();
 }
 
 fn schedule_preview_restart<F>(
@@ -609,7 +724,29 @@ struct ActorsPreviewKeepalive {
 }
 
 fn main() {
+    install_browser_panic_hook();
     start_app("app", Playground::new);
+}
+
+fn install_browser_panic_hook() {
+    static ONCE: Once = Once::new();
+
+    ONCE.call_once(|| {
+        std::panic::set_hook(Box::new(|panic_info| {
+            use boon::zoon::{js_sys, wasm_bindgen::JsValue};
+
+            let message = panic_info.to_string();
+            eprintln!("[boon panic] {message}");
+
+            if let Some(window) = web_sys::window() {
+                let _ = js_sys::Reflect::set(
+                    &window,
+                    &JsValue::from_str("__boonLastRustPanic"),
+                    &JsValue::from_str(&message),
+                );
+            }
+        }));
+    });
 }
 
 const DEFAULT_FILE_NAME: &str = "main.bn";
@@ -682,7 +819,7 @@ impl Playground {
 
         // Load URL-selected examples before local storage so shareable example links
         // are deterministic and do not silently reopen stale editor state.
-        let (files, current_file, current_content) =
+        let (mut files, mut current_file, mut current_content) =
             if let Some((_, name, code)) = custom_example_from_url {
                 // Load custom example from URL
                 let filename = format!("{}.bn", name);
@@ -749,6 +886,31 @@ impl Playground {
                     example_data.source_code.to_string(),
                 )
             };
+
+        let engine_type_value = get_engine_from_url()
+            .or_else(load_engine_from_storage)
+            .and_then(resolve_engine_for_current_build)
+            .unwrap_or_else(default_engine);
+
+        if current_single_file_example(&files, &current_file)
+            .is_some_and(|example| !is_single_file_example_visible_in_engine(engine_type_value, example))
+        {
+            reset_to_single_file_example(
+                &mut files,
+                &mut current_file,
+                &mut current_content,
+                first_visible_single_file_example(engine_type_value),
+            );
+        } else if current_multi_file_example(&files, &current_file)
+            .is_some_and(|example| !is_multi_file_example_visible_in_engine(engine_type_value, example))
+        {
+            reset_to_single_file_example(
+                &mut files,
+                &mut current_file,
+                &mut current_content,
+                first_visible_single_file_example(engine_type_value),
+            );
+        }
 
         let files = Mutable::new(Rc::new(files));
         let current_file = Mutable::new(current_file);
@@ -863,10 +1025,6 @@ impl Playground {
 
         // Load engine type: URL param > localStorage > default
         // Validate that loaded engine is actually available in this build
-        let engine_type_value = get_engine_from_url()
-            .or_else(load_engine_from_storage)
-            .and_then(resolve_engine_for_current_build)
-            .unwrap_or_else(default_engine);
         let engine_type = Mutable::new(engine_type_value);
 
         let _store_engine_type_task = Rc::new(Task::start_droppable({
@@ -1027,6 +1185,14 @@ impl Playground {
                     js_sys::Reflect::set(&api, &"setCurrentFile".into(), set_current_file.as_ref()).ok();
                     set_current_file.forget();
 
+                    // getCurrentFile() - get current selected file name
+                    let current_file_for_get = current_file.clone();
+                    let get_current_file = Closure::wrap(Box::new(move || -> String {
+                        current_file_for_get.lock_ref().clone()
+                    }) as Box<dyn Fn() -> String>);
+                    js_sys::Reflect::set(&api, &"getCurrentFile".into(), get_current_file.as_ref()).ok();
+                    get_current_file.forget();
+
                     // getCode() - get current editor content
                     let source_code_for_get = source_code.clone();
                     let get_code = Closure::wrap(Box::new(move || -> String {
@@ -1040,6 +1206,8 @@ impl Playground {
                     let run_fn = Closure::wrap(Box::new(move || {
                         let run_command_inner = run_command_for_run.clone();
                         Task::start(async move {
+                            run_command_inner.set(None);
+                            Timer::sleep(1).await;
                             run_command_inner.set(Some(RunCommand { filename: None }));
                         });
                     }) as Box<dyn Fn()>);
@@ -1199,6 +1367,7 @@ impl Playground {
 
                     // setEngine(engine) - set engine type and trigger re-run
                     let engine_type_for_set = engine_type.clone();
+                    let persistence_enabled_for_engine = persistence_enabled.clone();
                     let run_command_for_engine = run_command.clone();
                     let set_engine = Closure::wrap(Box::new(move |engine_str: String| -> JsValue {
                         let result = js_sys::Object::new();
@@ -1213,10 +1382,11 @@ impl Playground {
                         // Parse engine string
                         let new_engine = match engine_str.as_str() {
                             "Actors" => EngineType::Actors,
+                            "ActorsLite" => EngineType::ActorsLite,
                             "DD" => EngineType::DifferentialDataflow,
                             "Wasm" => EngineType::Wasm,
                             _ => {
-                                js_sys::Reflect::set(&result, &"error".into(), &format!("Invalid engine '{}'. Use 'Actors', 'DD', or 'Wasm'", engine_str).into()).ok();
+                                js_sys::Reflect::set(&result, &"error".into(), &format!("Invalid engine '{}'. Use 'Actors', 'ActorsLite', 'DD', or 'Wasm'", engine_str).into()).ok();
                                 return result.into();
                             }
                         };
@@ -1237,6 +1407,9 @@ impl Playground {
 
                         // Set the engine
                         engine_type_for_set.set(new_engine);
+                        if !engine_supports_persistence(new_engine) {
+                            persistence_enabled_for_engine.set(false);
+                        }
                         set_engine_in_url(new_engine);
 
                         schedule_preview_restart(
@@ -1371,7 +1544,12 @@ impl Playground {
 
                     // setPersistence(enabled) - enable/disable localStorage persistence
                     let persistence_enabled_for_set = persistence_enabled.clone();
+                    let engine_type_for_persistence = engine_type.clone();
                     let set_persistence = Closure::wrap(Box::new(move |enabled: bool| -> bool {
+                        if enabled && !engine_supports_persistence(engine_type_for_persistence.get()) {
+                            persistence_enabled_for_set.set(false);
+                            return false;
+                        }
                         persistence_enabled_for_set.set(enabled);
                         enabled
                     }) as Box<dyn Fn(bool) -> bool>);
@@ -1537,43 +1715,55 @@ impl Playground {
         Column::new()
             .s(Width::fill())
             .s(Gap::new().y(8))
-            .item(
-                // Main row: [logo] [examples...] [todo_mvc_physical] [+] [Other ▸]
-                Row::new()
-                    .s(Width::fill())
-                    .s(Align::new().center_y())
-                    .s(Gap::new().x(10).y(6))
-                    .multiline()
-                    .item(self.header_title())
-                    .items(
-                        EXAMPLE_DATAS
-                            .iter()
-                            .map(|&example_data| self.example_button(example_data)),
-                    )
-                    .items(
-                        MULTI_FILE_EXAMPLES
-                            .iter()
-                            .map(|example| self.multi_file_example_button(example)),
-                    )
-                    .item(self.add_custom_example_button())
-                    .item(self.other_section_toggle()),
-            )
+            .item_signal(self.engine_type.signal().map({
+                let this = self.clone();
+                move |engine| Some(this.example_tabs_row(engine))
+            }))
             .item_signal(
                 // "Other" expandable section: 7GUIs examples + custom examples
-                self.debug_collapsed.signal().map({
+                map_ref! {
+                    let collapsed = self.debug_collapsed.signal(),
+                    let engine = self.engine_type.signal() =>
+                    (*collapsed, *engine)
+                }
+                .map({
                     let this = self.clone();
-                    move |collapsed| {
+                    move |(collapsed, engine)| {
                         if collapsed {
                             None
                         } else {
-                            Some(this.other_section_content())
+                            Some(this.other_section_content(engine))
                         }
                     }
                 }),
             )
     }
 
-    fn other_section_content(&self) -> impl Element + use<> {
+    fn example_tabs_row(&self, engine: EngineType) -> impl Element + use<> {
+        Row::new()
+            .s(Width::fill())
+            .s(Align::new().center_y())
+            .s(Gap::new().x(10).y(6))
+            .multiline()
+            .item(self.header_title())
+            .items(
+                EXAMPLE_DATAS
+                    .iter()
+                    .copied()
+                    .filter(move |example| is_single_file_example_visible_in_engine(engine, *example))
+                    .map(|example_data| self.example_button(example_data)),
+            )
+            .items(
+                MULTI_FILE_EXAMPLES
+                    .iter()
+                    .filter(move |example| is_multi_file_example_visible_in_engine(engine, example))
+                    .map(|example| self.multi_file_example_button(example)),
+            )
+            .item(self.add_custom_example_button())
+            .item(self.other_section_toggle())
+    }
+
+    fn other_section_content(&self, engine: EngineType) -> impl Element + use<> {
         Row::new()
             .s(Width::fill())
             .s(Align::new().center_y())
@@ -1584,11 +1774,14 @@ impl Playground {
             .items(
                 OTHER_EXAMPLE_DATAS
                     .iter()
-                    .map(|&example_data| self.example_button(example_data)),
+                    .copied()
+                    .filter(move |example| is_single_file_example_visible_in_engine(engine, *example))
+                    .map(|example_data| self.example_button(example_data)),
             )
             .items(
                 OTHER_MULTI_FILE_EXAMPLES
                     .iter()
+                    .filter(move |example| is_multi_file_example_visible_in_engine(engine, example))
                     .map(|example| self.multi_file_example_button(example)),
             )
             // Custom examples row (only shown when custom examples exist)
@@ -1736,10 +1929,47 @@ impl Playground {
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press({
                 let engine_type = self.engine_type.clone();
+                let persistence_enabled = self.persistence_enabled.clone();
+                let files = self.files.clone();
+                let current_file = self.current_file.clone();
+                let source_code = self.source_code.clone();
                 let run_command = self.run_command.clone();
                 move || {
                     engine_type.set(engine);
-                    set_engine_in_url(engine);
+                    if !engine_supports_persistence(engine) {
+                        persistence_enabled.set(false);
+                    }
+                    let maybe_fallback = {
+                        let files_ref = files.lock_ref();
+                        let current_file_name = current_file.lock_ref().clone();
+                        if current_single_file_example(files_ref.as_ref(), &current_file_name)
+                            .is_some_and(|example| {
+                                !is_single_file_example_visible_in_engine(engine, example)
+                            })
+                            || current_multi_file_example(files_ref.as_ref(), &current_file_name)
+                                .is_some_and(|example| {
+                                    !is_multi_file_example_visible_in_engine(engine, example)
+                                })
+                        {
+                            Some(first_visible_single_file_example(engine))
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(example) = maybe_fallback {
+                        let mut next_files = BTreeMap::new();
+                        next_files.insert(
+                            example.filename.to_string(),
+                            example.source_code.to_string(),
+                        );
+                        files.set(Rc::new(next_files));
+                        current_file.set(example.filename.to_string());
+                        source_code.set_neq(Rc::new(Cow::from(example.source_code)));
+                        set_example_in_url(engine, example_name_from_filename(example.filename));
+                    } else {
+                        set_engine_in_url(engine);
+                    }
                     schedule_preview_restart(
                         run_command.clone(),
                         || {},
@@ -2238,12 +2468,23 @@ impl Playground {
         let persistence_enabled_for_bg = self.persistence_enabled.clone();
         let persistence_enabled_for_border = self.persistence_enabled.clone();
         let persistence_enabled_for_font = self.persistence_enabled.clone();
+        let engine_type_for_label = self.engine_type.clone();
+        let engine_type_for_bg = self.engine_type.clone();
+        let engine_type_for_border = self.engine_type.clone();
+        let engine_type_for_font = self.engine_type.clone();
+        let engine_type_for_press = self.engine_type.clone();
         Button::new()
             .s(Padding::new().x(12).y(7))
             .s(RoundedCorners::all(22))
-            .s(Borders::all_signal(
-                persistence_enabled_for_border.signal().map(|enabled| {
-                    if enabled {
+            .s(Borders::all_signal(map_ref! {
+                let enabled = persistence_enabled_for_border.signal(),
+                let engine = engine_type_for_border.signal() =>
+                {
+                    if !engine_supports_persistence(*engine) {
+                        Border::new()
+                            .color(color!("rgba(255, 210, 134, 0.35)"))
+                            .width(1)
+                    } else if *enabled {
                         Border::new()
                             .color(color!("rgba(134, 255, 134, 0.45)"))
                             .width(1)
@@ -2252,44 +2493,67 @@ impl Playground {
                             .color(color!("rgba(255, 255, 255, 0.2)"))
                             .width(1)
                     }
-                }),
-            ))
+                }
+            }))
             .s(Background::new().color_signal(map_ref! {
                 let enabled = persistence_enabled_for_bg.signal(),
+                let engine = engine_type_for_bg.signal(),
                 let hovered = hovered.signal() =>
                 {
-                    match (*enabled, *hovered) {
-                        (true, true) => color!("rgba(134, 255, 134, 0.15)"),
-                        (true, false) => color!("rgba(134, 255, 134, 0.08)"),
-                        (false, true) => color!("rgba(255, 255, 255, 0.08)"),
-                        (false, false) => color!("rgba(255, 255, 255, 0.04)"),
+                    if !engine_supports_persistence(*engine) {
+                        if *hovered {
+                            color!("rgba(255, 210, 134, 0.10)")
+                        } else {
+                            color!("rgba(255, 210, 134, 0.05)")
+                        }
+                    } else {
+                        match (*enabled, *hovered) {
+                            (true, true) => color!("rgba(134, 255, 134, 0.15)"),
+                            (true, false) => color!("rgba(134, 255, 134, 0.08)"),
+                            (false, true) => color!("rgba(255, 255, 255, 0.08)"),
+                            (false, false) => color!("rgba(255, 255, 255, 0.04)"),
+                        }
                     }
                 }
             }))
             .s(Font::new()
                 .size(13)
                 .weight(FontWeight::Medium)
-                .color_signal(persistence_enabled_for_font.signal().map(|enabled| {
-                    if enabled {
-                        color!("rgba(134, 255, 134, 0.95)")
-                    } else {
-                        color!("rgba(255, 255, 255, 0.6)")
+                .color_signal(map_ref! {
+                    let enabled = persistence_enabled_for_font.signal(),
+                    let engine = engine_type_for_font.signal() =>
+                    {
+                        if !engine_supports_persistence(*engine) {
+                            color!("rgba(255, 210, 134, 0.92)")
+                        } else if *enabled {
+                            color!("rgba(134, 255, 134, 0.95)")
+                        } else {
+                            color!("rgba(255, 255, 255, 0.6)")
+                        }
                     }
-                })))
+                }))
             .label(
                 El::new()
                     .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
-                    .child_signal(persistence_enabled_for_label.signal().map(|enabled| {
-                        if enabled {
-                            "Persistence: On"
-                        } else {
-                            "Persistence: Off"
+                    .child_signal(map_ref! {
+                        let enabled = persistence_enabled_for_label.signal(),
+                        let engine = engine_type_for_label.signal() =>
+                        {
+                            if !engine_supports_persistence(*engine) {
+                                "Persistence: Unsupported"
+                            } else if *enabled {
+                                "Persistence: On"
+                            } else {
+                                "Persistence: Off"
+                            }
                         }
-                    })),
+                    }),
             )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press(move || {
-                persistence_enabled.update(|enabled| !enabled);
+                if engine_supports_persistence(engine_type_for_press.get()) {
+                    persistence_enabled.update(|enabled| !enabled);
+                }
             })
     }
 
@@ -2858,6 +3122,23 @@ impl Playground {
         self.clear_actors_preview_keepalive();
 
         // Check which engine to use
+        #[cfg(feature = "engine-actors-lite")]
+        if matches!(engine_type, EngineType::ActorsLite) {
+            boon_engine_actors_lite::browser_debug::set_debug_marker(&format!(
+                "playground:example_runner:{}:{}",
+                filename,
+                source_code.len()
+            ));
+            drop(files);
+            if persistence_enabled {
+                return El::new()
+                    .s(Font::new().color(color!("LightCoral")))
+                    .child("ActorsLite: persistence is not supported in v1 yet")
+                    .unify();
+            }
+            return run_actors_lite(&source_code).unify();
+        }
+
         #[cfg(feature = "engine-wasm")]
         if matches!(engine_type, EngineType::Wasm) {
             let external_fns = parse_module_files(&files, filename);
@@ -3811,4 +4092,141 @@ fn force_size_toggle_button(force_size_expanded: Mutable<bool>) -> impl Element 
         .on_press(move || {
             force_size_expanded.set(true);
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actors_lite_persistence_is_capability_gated() {
+        assert!(!engine_supports_persistence(EngineType::ActorsLite));
+    }
+
+    #[test]
+    fn non_actors_lite_engines_keep_persistence_support() {
+        assert!(engine_supports_persistence(EngineType::Actors));
+        assert!(engine_supports_persistence(EngineType::DifferentialDataflow));
+        assert!(engine_supports_persistence(EngineType::Wasm));
+    }
+
+    #[test]
+    fn actors_lite_public_example_surface_matches_proven_examples() {
+        assert!(actors_lite_public_exposure_enabled());
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "minimal"));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "hello_world"));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "counter"));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "counter_hold"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "text_interpolation_update"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "button_hover_test"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "button_hover_to_click_test"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "switch_hold_test"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "filter_checkbox_bug"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "checkbox_test"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "chained_list_remove_bug"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "complex_counter"
+        ));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "fibonacci"));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "interval"));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "interval_hold"
+        ));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "then"));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "when"));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "while"));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "while_function_call"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "todo_mvc_physical"
+        ));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "todo_mvc"));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "cells"));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "cells_dynamic"));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "list_retain_reactive"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "list_map_external_dep"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "list_map_block"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "list_retain_count"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "list_object_state"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "list_retain_remove"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "temperature_converter"
+        ));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "flight_booker"
+        ));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "timer"));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "crud"));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "circle_drawer"
+        ));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "latest"));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "layers"));
+        assert!(is_example_visible_in_engine(EngineType::ActorsLite, "pages"));
+        assert!(is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "shopping_list"
+        ));
+        assert!(!is_example_visible_in_engine(
+            EngineType::ActorsLite,
+            "not_a_real_example"
+        ));
+    }
+
+    #[test]
+    fn actors_lite_engine_visibility_requires_phase4_acceptance_record() {
+        assert!(actors_lite_public_exposure_enabled());
+        assert!(is_engine_available(EngineType::ActorsLite));
+        assert!(available_engines().contains(&EngineType::ActorsLite));
+    }
 }

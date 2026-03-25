@@ -1,0 +1,44 @@
+# WHILE example - result keeps updating while the selected branch is active
+
+[test]
+category = "timer"
+description = "WHILE keeps recomputing after an operation has been selected"
+
+[output]
+match = "exact"
+text = "A: 0B: 0A + BA - B"
+
+[timing]
+timeout = 10000
+initial_delay = 200
+poll_interval = 200
+
+[[sequence]]
+description = "Wait until A=2 and B=10"
+actions = [["wait", 1100]]
+expect_match = "regex"
+expect = "^A: [1-9][0-9]*B: [1-9][0-9]*A \\+ BA - B-?[0-9]*$"
+
+[[sequence]]
+description = "Select Addition"
+actions = [["click_button", 0]]
+expect_match = "regex"
+expect = "^A: [1-9][0-9]*B: [1-9][0-9]*A \\+ BA - B-?[0-9]+$"
+
+[[sequence]]
+description = "Wait longer - WHILE recomputes live for Addition"
+actions = [["wait", 1000]]
+expect_match = "regex"
+expect = "^A: [1-9][0-9]*B: [1-9][0-9]*A \\+ BA - B-?[0-9]+$"
+
+[[sequence]]
+description = "Switch to Subtraction"
+actions = [["click_button", 1]]
+expect_match = "regex"
+expect = "^A: [1-9][0-9]*B: [1-9][0-9]*A \\+ BA - B-?[0-9]+$"
+
+[[sequence]]
+description = "Wait longer - WHILE recomputes live for Subtraction"
+actions = [["wait", 1000]]
+expect_match = "regex"
+expect = "^A: [1-9][0-9]*B: [1-9][0-9]*A \\+ BA - B-?[0-9]+$"

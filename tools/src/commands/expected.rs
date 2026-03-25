@@ -1,6 +1,16 @@
 //! Parser for .expected test specification files (TOML format)
 
 use anyhow::{Context, Result};
+use boon_engine_actors_lite::cells_acceptance::{
+    CellsAcceptanceAction, CellsAcceptanceSequence, cells_dynamic_acceptance_sequences,
+    cells_static_acceptance_sequences,
+};
+use boon_engine_actors_lite::counter_acceptance::{
+    CounterAcceptanceAction, CounterAcceptanceSequence, counter_acceptance_sequences,
+};
+use boon_engine_actors_lite::todo_acceptance::{
+    TodoAcceptanceAction, TodoAcceptanceSequence, todo_edit_save_acceptance_sequences,
+};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -68,7 +78,7 @@ pub struct OutputSpec {
     pub pattern: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MatchMode {
     #[default]
@@ -369,6 +379,33 @@ impl Action {
                             index: index as u32,
                         })
                     }
+                    "assert_input_not_typeable" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_input_not_typeable requires index (0-indexed)")?;
+                        Ok(ParsedAction::AssertInputNotTypeable {
+                            index: index as u32,
+                        })
+                    }
+                    "assert_button_disabled" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_button_disabled requires index (0-indexed)")?;
+                        Ok(ParsedAction::AssertButtonDisabled {
+                            index: index as u32,
+                        })
+                    }
+                    "assert_button_enabled" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_button_enabled requires index (0-indexed)")?;
+                        Ok(ParsedAction::AssertButtonEnabled {
+                            index: index as u32,
+                        })
+                    }
                     "assert_button_count" => {
                         let expected_count = arr
                             .get(1)
@@ -555,7 +592,7 @@ impl Action {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedAction {
     Click {
         selector: String,
@@ -640,6 +677,15 @@ pub enum ParsedAction {
     AssertInputTypeable {
         index: u32,
     }, // Assert input is actually typeable (not disabled/readonly/hidden)
+    AssertInputNotTypeable {
+        index: u32,
+    }, // Assert input is disabled/readonly/hidden and cannot be typed into
+    AssertButtonDisabled {
+        index: u32,
+    }, // Assert button is disabled
+    AssertButtonEnabled {
+        index: u32,
+    }, // Assert button is enabled
     AssertButtonCount {
         expected: u32,
     }, // Assert number of visible buttons in preview
@@ -695,6 +741,218 @@ pub enum ParsedAction {
         index: u32,
         value: String,
     }, // Select dropdown option by value
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedInteractionSequence {
+    pub description: Option<String>,
+    pub actions: Vec<ParsedAction>,
+    pub expect: Option<String>,
+    pub expect_match: MatchMode,
+}
+
+pub fn parsed_action_from_cells_acceptance_action(action: &CellsAcceptanceAction) -> ParsedAction {
+    match action {
+        CellsAcceptanceAction::AssertCellsCellText {
+            row,
+            column,
+            expected,
+        } => ParsedAction::AssertCellsCellText {
+            row: *row,
+            column: *column,
+            expected: (*expected).to_string(),
+        },
+        CellsAcceptanceAction::DblClickCellsCell { row, column } => ParsedAction::DblClickCellsCell {
+            row: *row,
+            column: *column,
+        },
+        CellsAcceptanceAction::AssertFocused => ParsedAction::AssertFocused { input_index: None },
+        CellsAcceptanceAction::AssertFocusedInputValue { expected } => {
+            ParsedAction::AssertFocusedInputValue {
+                expected: (*expected).to_string(),
+            }
+        }
+        CellsAcceptanceAction::SetFocusedInputValue { value } => {
+            ParsedAction::SetFocusedInputValue {
+                value: (*value).to_string(),
+            }
+        }
+        CellsAcceptanceAction::Key { key } => ParsedAction::Key {
+            key: (*key).to_string(),
+        },
+        CellsAcceptanceAction::AssertNotFocused => {
+            ParsedAction::AssertNotFocused { input_index: None }
+        }
+        CellsAcceptanceAction::ClickText { text } => ParsedAction::ClickText {
+            text: (*text).to_string(),
+        },
+        CellsAcceptanceAction::AssertCellsRowVisible { row } => {
+            ParsedAction::AssertCellsRowVisible { row: *row }
+        }
+    }
+}
+
+pub fn parsed_action_from_counter_acceptance_action(
+    action: &CounterAcceptanceAction,
+) -> ParsedAction {
+    match action {
+        CounterAcceptanceAction::ClickButton { index } => ParsedAction::ClickButton { index: *index },
+    }
+}
+
+pub fn parsed_action_from_todo_acceptance_action(action: &TodoAcceptanceAction) -> ParsedAction {
+    match action {
+        TodoAcceptanceAction::DblClickText { text } => ParsedAction::DblClickText {
+            text: (*text).to_string(),
+        },
+        TodoAcceptanceAction::AssertFocused { index } => ParsedAction::AssertFocused {
+            input_index: Some(*index),
+        },
+        TodoAcceptanceAction::AssertInputTypeable { index } => {
+            ParsedAction::AssertInputTypeable { index: *index }
+        }
+        TodoAcceptanceAction::TypeText { text } => ParsedAction::TypeText {
+            text: (*text).to_string(),
+        },
+        TodoAcceptanceAction::FocusInput { index } => ParsedAction::FocusInput { index: *index },
+        TodoAcceptanceAction::Key { key } => ParsedAction::Key {
+            key: (*key).to_string(),
+        },
+    }
+}
+
+fn parsed_interaction_sequence_from_cells_acceptance_sequence(
+    sequence: CellsAcceptanceSequence,
+) -> ParsedInteractionSequence {
+    ParsedInteractionSequence {
+        description: Some(sequence.description.to_string()),
+        actions: sequence
+            .actions
+            .iter()
+            .map(parsed_action_from_cells_acceptance_action)
+            .collect(),
+        expect: None,
+        expect_match: MatchMode::default(),
+    }
+}
+
+fn parsed_interaction_sequence_from_counter_acceptance_sequence(
+    sequence: CounterAcceptanceSequence,
+) -> ParsedInteractionSequence {
+    ParsedInteractionSequence {
+        description: Some(sequence.description.to_string()),
+        actions: sequence
+            .actions
+            .iter()
+            .map(parsed_action_from_counter_acceptance_action)
+            .collect(),
+        expect: Some(sequence.expect.to_string()),
+        expect_match: MatchMode::default(),
+    }
+}
+
+fn parsed_interaction_sequence_from_todo_acceptance_sequence(
+    sequence: TodoAcceptanceSequence,
+) -> ParsedInteractionSequence {
+    ParsedInteractionSequence {
+        description: Some(sequence.description.to_string()),
+        actions: sequence
+            .actions
+            .iter()
+            .map(parsed_action_from_todo_acceptance_action)
+            .collect(),
+        expect: Some(sequence.expect.to_string()),
+        expect_match: MatchMode::default(),
+    }
+}
+
+pub fn parse_interaction_sequences(
+    sequences: &[InteractionSequence],
+) -> Result<Vec<ParsedInteractionSequence>> {
+    sequences
+        .iter()
+        .map(|sequence| {
+            let actions = sequence
+                .actions
+                .iter()
+                .map(Action::parse)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ParsedInteractionSequence {
+                description: sequence.description.clone(),
+                actions,
+                expect: sequence.expect.clone(),
+                expect_match: sequence.expect_match.clone(),
+            })
+        })
+        .collect()
+}
+
+pub fn shared_example_parsed_sequences(
+    example_name: &str,
+) -> Option<Vec<ParsedInteractionSequence>> {
+    let sequences = match example_name {
+        "counter" => {
+            return Some(
+                counter_acceptance_sequences()
+                    .into_iter()
+                    .map(parsed_interaction_sequence_from_counter_acceptance_sequence)
+                    .collect(),
+            );
+        }
+        "cells" => cells_static_acceptance_sequences(),
+        "cells_dynamic" => cells_dynamic_acceptance_sequences(),
+        _ => return None,
+    };
+    Some(
+        sequences
+            .into_iter()
+            .map(parsed_interaction_sequence_from_cells_acceptance_sequence)
+            .collect(),
+    )
+}
+
+fn contains_sequence_window(
+    actual: &[ParsedInteractionSequence],
+    expected: &[ParsedInteractionSequence],
+) -> bool {
+    if expected.is_empty() {
+        return true;
+    }
+
+    actual
+        .windows(expected.len())
+        .any(|window| window.iter().zip(expected.iter()).all(|(left, right)| left == right))
+}
+
+pub fn validate_required_shared_sequences(
+    example_name: &str,
+    parsed_sequences: &[ParsedInteractionSequence],
+) -> Result<()> {
+    match example_name {
+        "todo_mvc" => {
+            let expected = todo_edit_save_acceptance_sequences()
+                .into_iter()
+                .map(parsed_interaction_sequence_from_todo_acceptance_sequence)
+                .collect::<Vec<_>>();
+            if !contains_sequence_window(parsed_sequences, &expected) {
+                anyhow::bail!(
+                    "todo_mvc expected sequences drifted from shared edit-save acceptance trace"
+                );
+            }
+        }
+        "counter" => {
+            let expected = counter_acceptance_sequences()
+                .into_iter()
+                .map(parsed_interaction_sequence_from_counter_acceptance_sequence)
+                .collect::<Vec<_>>();
+            if parsed_sequences != expected {
+                anyhow::bail!("counter expected sequences drifted from shared burst-click trace");
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -810,6 +1068,41 @@ pub fn matches_inline(text: &str, expected: &str, mode: &MatchMode) -> Result<bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn assert_expected_file_matches_shared_cells_sequences(
+        path: &str,
+        shared: &[CellsAcceptanceSequence],
+    ) {
+        let spec = ExpectedSpec::from_file(&PathBuf::from(path)).expect("expected file parses");
+        assert_eq!(
+            spec.sequence.len(),
+            shared.len(),
+            "sequence count mismatch for {path}"
+        );
+
+        for (index, (actual, expected)) in spec.sequence.iter().zip(shared.iter()).enumerate() {
+            assert_eq!(
+                actual.description.as_deref(),
+                Some(expected.description),
+                "description mismatch in {path} sequence {index}"
+            );
+            let parsed_actions = actual
+                .actions
+                .iter()
+                .map(|action| action.parse().expect("action parses"))
+                .collect::<Vec<_>>();
+            let expected_actions = expected
+                .actions
+                .iter()
+                .map(parsed_action_from_cells_acceptance_action)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                parsed_actions, expected_actions,
+                "actions mismatch in {path} sequence {index}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_minimal() {
@@ -866,5 +1159,52 @@ expect = "1"
             Some("Click increment".to_string())
         );
         assert_eq!(spec.sequence[0].expect, Some("1".to_string()));
+    }
+
+    #[test]
+    fn counter_expected_matches_shared_acceptance_sequences() {
+        let spec = ExpectedSpec::from_file(&PathBuf::from(
+            "/home/martinkavik/repos/boon/playground/frontend/src/examples/counter/counter.expected",
+        ))
+        .expect("expected file parses");
+        let actual = parse_interaction_sequences(&spec.sequence).expect("sequence parses");
+        let expected = counter_acceptance_sequences()
+            .into_iter()
+            .map(parsed_interaction_sequence_from_counter_acceptance_sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn cells_expected_matches_shared_acceptance_sequences() {
+        assert_expected_file_matches_shared_cells_sequences(
+            "/home/martinkavik/repos/boon/playground/frontend/src/examples/cells/cells.expected",
+            &cells_static_acceptance_sequences(),
+        );
+    }
+
+    #[test]
+    fn cells_dynamic_expected_matches_shared_acceptance_sequences() {
+        assert_expected_file_matches_shared_cells_sequences(
+            "/home/martinkavik/repos/boon/playground/frontend/src/examples/cells_dynamic/cells_dynamic.expected",
+            &cells_dynamic_acceptance_sequences(),
+        );
+    }
+
+    #[test]
+    fn todo_mvc_expected_contains_shared_edit_save_acceptance_sequences() {
+        let spec = ExpectedSpec::from_file(&PathBuf::from(
+            "/home/martinkavik/repos/boon/playground/frontend/src/examples/todo_mvc/todo_mvc.expected",
+        ))
+        .expect("expected file parses");
+        let actual = parse_interaction_sequences(&spec.sequence).expect("sequence parses");
+        let expected = todo_edit_save_acceptance_sequences()
+            .into_iter()
+            .map(parsed_interaction_sequence_from_todo_acceptance_sequence)
+            .collect::<Vec<_>>();
+        assert!(
+            contains_sequence_window(&actual, &expected),
+            "todo_mvc shared edit-save acceptance trace should appear in expected file",
+        );
     }
 }

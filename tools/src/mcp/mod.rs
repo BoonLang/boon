@@ -662,14 +662,14 @@ fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "boon_set_engine".to_string(),
-            description: "Set the Boon engine and trigger re-run. Use 'Actors' for the actor-based reactive engine, 'DD' for the Differential Dataflow engine, or 'Wasm' for the WebAssembly backend.".to_string(),
+            description: "Set the Boon engine and trigger re-run. Use 'Actors' for the actor-based reactive engine, 'ActorsLite' for the virtual-actor runtime, 'DD' for the Differential Dataflow engine, or 'Wasm' for the WebAssembly backend.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "engine": {
                         "type": "string",
-                        "enum": ["Actors", "DD", "Wasm"],
-                        "description": "Engine to use: 'Actors' (actor-based reactive), 'DD' (Differential Dataflow), or 'Wasm' (WebAssembly backend)"
+                        "enum": ["Actors", "ActorsLite", "DD", "Wasm"],
+                        "description": "Engine to use: 'Actors' (actor-based reactive), 'ActorsLite' (virtual actors + retained bridge), 'DD' (Differential Dataflow), or 'Wasm' (WebAssembly backend)"
                     }
                 },
                 "required": ["engine"]
@@ -1173,9 +1173,13 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
                 .ok_or("engine parameter required")?
                 .to_string();
             // Validate engine value
-            if engine != "Actors" && engine != "DD" && engine != "Wasm" {
+            if engine != "Actors"
+                && engine != "ActorsLite"
+                && engine != "DD"
+                && engine != "Wasm"
+            {
                 return Err(format!(
-                    "Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'",
+                    "Invalid engine '{}'. Must be 'Actors', 'ActorsLite', 'DD', or 'Wasm'",
                     engine
                 ));
             }
@@ -1477,6 +1481,8 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
                 Ok("Element found but no styles returned".to_string())
             }
         }
+
+        Response::ActorsLiteDebug { value } => Ok(value.unwrap_or_default()),
 
         Response::Error { message } => Err(message),
     }

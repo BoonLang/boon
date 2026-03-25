@@ -1,0 +1,60 @@
+[test]
+category = "interactive"
+description = "TodoMVC physical: add items, toggle/filter, clear completed, and switch theme mode"
+
+[output]
+text = "Professional"
+
+[timing]
+timeout = 15000
+poll_interval = 200
+
+[[sequence]]
+description = "Input starts focused"
+actions = [["assert_focused", 0]]
+expect = "Dark mode"
+
+[[sequence]]
+description = "Input is typeable"
+actions = [["assert_input_typeable", 0]]
+expect = "Dark mode"
+
+[[sequence]]
+description = "Add first todo"
+actions = [["type", "Buy groceries"], ["key", "Enter"]]
+expect = "1 item left"
+
+[[sequence]]
+description = "Add second todo"
+actions = [["type", "Clean room"], ["key", "Enter"]]
+expect = "2 items left"
+
+[[sequence]]
+description = "Complete first todo"
+actions = [["click_checkbox", 1]]
+expect = "1 item left"
+
+[[sequence]]
+description = "Active filter hides completed todo"
+actions = [["click_text", "Active"], ["assert_not_contains", "Buy groceries"]]
+expect = "Clean room"
+
+[[sequence]]
+description = "Return to all todos"
+actions = [["click_text", "All"]]
+expect = "Buy groceries"
+
+[[sequence]]
+description = "Clear completed removes the checked todo"
+actions = [["click_text", "Clear completed"], ["assert_not_contains", "Buy groceries"]]
+expect = "1 item left"
+
+[[sequence]]
+description = "Toggle dark mode button label"
+actions = [["click_text", "Dark mode"]]
+expect = "Light mode"
+
+[[sequence]]
+description = "Switch to Glass theme"
+actions = [["click_text", "Glass"], ["assert_button_has_outline", "Glass"]]
+expect = "Light mode"

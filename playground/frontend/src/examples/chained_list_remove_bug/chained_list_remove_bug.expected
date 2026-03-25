@@ -1,0 +1,65 @@
+# Chained list remove behavior stays stable across append and remove
+
+[test]
+category = "interactive"
+description = "Completed items do not reappear after clear + append + remove"
+skip_engines = ["Actors", "DD", "Wasm"]
+
+[output]
+text = "Chained List/remove Bug Test"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+[[sequence]]
+description = "Complete Item A"
+actions = [
+  ["click_checkbox", 0],
+  ["assert_contains", "Active: 1, Completed: 1"],
+]
+
+[[sequence]]
+description = "Clear completed removes Item A"
+actions = [
+  ["click_text", "Clear completed"],
+  ["assert_not_contains", "Item A (id=0)"],
+  ["assert_contains", "Item B (id=1)"],
+  ["assert_contains", "Active: 1, Completed: 0"],
+]
+
+[[sequence]]
+description = "Add one new item"
+actions = [
+  ["click_text", "Add Item"],
+  ["assert_contains", "New Item (id=2)"],
+  ["assert_contains", "Active: 2, Completed: 0"],
+]
+
+[[sequence]]
+description = "Removing the new item does not resurrect Item A"
+actions = [
+  ["click_button_near_text", "New Item (id=2)", "X"],
+  ["assert_not_contains", "New Item (id=2)"],
+  ["assert_not_contains", "Item A (id=0)"],
+  ["assert_contains", "Item B (id=1)"],
+  ["assert_contains", "Active: 1, Completed: 0"],
+]
+
+[[sequence]]
+description = "Cleared dynamic items also stay removed after later add/remove"
+actions = [
+  ["click_text", "Add Item"],
+  ["assert_contains", "New Item (id=3)"],
+  ["click_checkbox", 1],
+  ["assert_contains", "Active: 1, Completed: 1"],
+  ["click_text", "Clear completed"],
+  ["assert_not_contains", "New Item (id=3)"],
+  ["click_text", "Add Item"],
+  ["assert_contains", "New Item (id=4)"],
+  ["click_button_near_text", "New Item (id=4)", "X"],
+  ["assert_not_contains", "New Item (id=4)"],
+  ["assert_not_contains", "New Item (id=3)"],
+  ["assert_contains", "Item B (id=1)"],
+  ["assert_contains", "Active: 1, Completed: 0"],
+]

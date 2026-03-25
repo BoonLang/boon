@@ -1,0 +1,23 @@
+# Reactive list retain example - toggle filter updates retained mapped labels
+
+[test]
+category = "interactive"
+description = "Reactive List/retain toggles visible mapped items"
+skip_engines = ["Actors", "DD", "Wasm"]
+
+[output]
+text = "Toggle filtershow_even: FalseFiltered count: 6123456"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+[[sequence]]
+description = "Toggle on even-only filtering"
+actions = [["click_button", 0]]
+expect = "Toggle filtershow_even: TrueFiltered count: 3246"
+
+[[sequence]]
+description = "Toggle back to all values"
+actions = [["click_button", 0]]
+expect = "Toggle filtershow_even: FalseFiltered count: 6123456"

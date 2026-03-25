@@ -259,10 +259,9 @@ fn parse_and_lower(
         .map_err(|error| format!("augment_linked_text_input_runtime: {error}"))?;
     augment_top_level_bool_item_runtime(&mut context)
         .map_err(|error| format!("augment_top_level_bool_item_runtime: {error}"))?;
-    augment_dependent_object_list_updates_from_item_bindings(&mut context)
-        .map_err(|error| {
-            format!("augment_dependent_object_list_updates_from_item_bindings: {error}")
-        })?;
+    augment_dependent_object_list_updates_from_item_bindings(&mut context).map_err(|error| {
+        format!("augment_dependent_object_list_updates_from_item_bindings: {error}")
+    })?;
     seed_missing_scalar_initial_values(&mut context)
         .map_err(|error| format!("seed_missing_scalar_initial_values: {error}"))?;
 
@@ -327,8 +326,11 @@ fn synthetic_document_root_timer_expression<'a>(
     if !matches!(&trigger_then.node, StaticExpression::Then { .. }) {
         return None;
     }
-    matches!(timer_interval_millis_for_expression(trigger_source), Ok(Some(_)))
-        .then_some(trigger_source.as_ref())
+    matches!(
+        timer_interval_millis_for_expression(trigger_source),
+        Ok(Some(_))
+    )
+    .then_some(trigger_source.as_ref())
 }
 
 fn detect_timer_bindings(
@@ -603,8 +605,9 @@ fn lower_document_root<'a>(
             if path_matches(path, &["Document", "new"])
                 || path_matches(path, &["Scene", "new"]) =>
         {
-            let root = find_named_argument(arguments, "root")
-                .ok_or_else(|| "Document/new and Scene/new require a `root` argument".to_string())?;
+            let root = find_named_argument(arguments, "root").ok_or_else(|| {
+                "Document/new and Scene/new require a `root` argument".to_string()
+            })?;
             lower_ui_node(root, context, stack, locals, passed, current_binding)
         }
         StaticExpression::Pipe { from, to } => {
@@ -812,7 +815,8 @@ fn lower_ui_node<'a>(
         StaticExpression::TextLiteral { parts, .. } => {
             lower_text_node(parts, context, stack, locals, passed)
         }
-        StaticExpression::FunctionCall { path, arguments } if path_matches_element(path, "label") =>
+        StaticExpression::FunctionCall { path, arguments }
+            if path_matches_element(path, "label") =>
         {
             lower_label(arguments, context, stack, locals, passed, current_binding)
         }
@@ -826,7 +830,8 @@ fn lower_ui_node<'a>(
         {
             lower_container(arguments, context, stack, locals, passed, current_binding)
         }
-        StaticExpression::FunctionCall { path, arguments } if path_matches_element(path, "stack") =>
+        StaticExpression::FunctionCall { path, arguments }
+            if path_matches_element(path, "stack") =>
         {
             lower_stack(arguments, context, stack, locals, passed, current_binding)
         }
@@ -840,16 +845,17 @@ fn lower_ui_node<'a>(
         {
             lower_text_input(arguments, context, stack, locals, passed, current_binding)
         }
-        StaticExpression::FunctionCall { path, arguments } if path_matches_element(path, "select") =>
+        StaticExpression::FunctionCall { path, arguments }
+            if path_matches_element(path, "select") =>
         {
             lower_select(arguments, context, stack, locals, passed, current_binding)
         }
-        StaticExpression::FunctionCall { path, arguments } if path_matches_element(path, "slider") =>
+        StaticExpression::FunctionCall { path, arguments }
+            if path_matches_element(path, "slider") =>
         {
             lower_slider(arguments, context, stack, locals, passed, current_binding)
         }
-        StaticExpression::FunctionCall { path, arguments } if path_matches_element(path, "svg") =>
-        {
+        StaticExpression::FunctionCall { path, arguments } if path_matches_element(path, "svg") => {
             lower_svg(arguments, context, stack, locals, passed, current_binding)
         }
         StaticExpression::FunctionCall { path, arguments }
@@ -867,11 +873,14 @@ fn lower_ui_node<'a>(
         {
             lower_paragraph(arguments, context, stack, locals, passed, current_binding)
         }
-        StaticExpression::FunctionCall { path, arguments } if path_matches_element(path, "link") =>
+        StaticExpression::FunctionCall { path, arguments }
+            if path_matches_element(path, "link") =>
         {
             lower_link(arguments, context, stack, locals, passed, current_binding)
         }
-        StaticExpression::FunctionCall { path, arguments } if path_matches_element(path, "text") => {
+        StaticExpression::FunctionCall { path, arguments }
+            if path_matches_element(path, "text") =>
+        {
             lower_text(arguments, context, stack, locals, passed, current_binding)
         }
         StaticExpression::FunctionCall { path, arguments }
@@ -1473,9 +1482,7 @@ fn identity_bool_pipe_source<'a>(
     }
 }
 
-fn preserves_input_value_pipe(
-    expression: &StaticSpannedExpression,
-) -> bool {
+fn preserves_input_value_pipe(expression: &StaticSpannedExpression) -> bool {
     let StaticExpression::FunctionCall { path, .. } = &expression.node else {
         return false;
     };
@@ -1592,7 +1599,11 @@ fn list_quantifier_scalar_compare_operands(
             filter,
         };
         return Ok(Some(match quantifier {
-            "any" => (filtered, IntCompareOp::Greater, DerivedScalarOperand::Literal(0)),
+            "any" => (
+                filtered,
+                IntCompareOp::Greater,
+                DerivedScalarOperand::Literal(0),
+            ),
             "every" => (
                 filtered,
                 IntCompareOp::Equal,
@@ -1619,7 +1630,11 @@ fn list_quantifier_scalar_compare_operands(
             filter,
         };
         return Ok(Some(match quantifier {
-            "any" => (filtered, IntCompareOp::Greater, DerivedScalarOperand::Literal(0)),
+            "any" => (
+                filtered,
+                IntCompareOp::Greater,
+                DerivedScalarOperand::Literal(0),
+            ),
             "every" => (
                 filtered,
                 IntCompareOp::Equal,
@@ -3561,15 +3576,13 @@ fn static_dimension_css<'a>(
         return Ok(Some(format!("{}px", trim_number(number))));
     }
     let expression = resolve_alias(expression, context, locals, passed, stack)?;
-    Ok(
-        matches!(
-            &expression.node,
-            StaticExpression::Literal(static_expression::Literal::Tag(tag))
-                | StaticExpression::Literal(static_expression::Literal::Text(tag))
-                    if tag.as_str().eq_ignore_ascii_case("Fill")
-        )
-        .then_some("100%".to_string()),
+    Ok(matches!(
+        &expression.node,
+        StaticExpression::Literal(static_expression::Literal::Tag(tag))
+            | StaticExpression::Literal(static_expression::Literal::Text(tag))
+                if tag.as_str().eq_ignore_ascii_case("Fill")
     )
+    .then_some("100%".to_string()))
 }
 
 fn static_padding_style_parts<'a>(
@@ -4299,8 +4312,7 @@ fn lower_list_items<'a>(
     if let Some(dynamic) = lower_dynamic_list_items(expression, context, stack, locals, passed)? {
         return Ok(dynamic);
     }
-    if let Some(branch) =
-        lower_conditional_list_items(expression, context, stack, locals, passed)?
+    if let Some(branch) = lower_conditional_list_items(expression, context, stack, locals, passed)?
     {
         return Ok(branch);
     }
@@ -4446,7 +4458,8 @@ fn lower_conditional_list_items<'a>(
         stack,
         locals,
         passed,
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
     Ok(Some(vec![branch]))
@@ -5332,13 +5345,7 @@ fn initial_object_field_scalar_value_in_context<'a>(
     passed: &mut PassedScopes,
 ) -> Result<Option<i64>, String> {
     initial_object_field_scalar_value_after_steps(
-        expression,
-        field_name,
-        0,
-        context,
-        stack,
-        locals,
-        passed,
+        expression, field_name, 0, context, stack, locals, passed,
     )
 }
 
@@ -5383,11 +5390,7 @@ fn initial_object_field_scalar_value_after_steps<'a>(
                         let skip_count = find_named_argument(arguments, "count")
                             .map(|argument| {
                                 initial_scalar_value_in_context(
-                                    argument,
-                                    context,
-                                    stack,
-                                    locals,
-                                    passed,
+                                    argument, context, stack, locals, passed,
                                 )?
                                 .ok_or_else(|| {
                                     "Stream/skip requires an initial integer `count`".to_string()
@@ -5407,14 +5410,9 @@ fn initial_object_field_scalar_value_after_steps<'a>(
                         current = from;
                         continue;
                     }
-                    let Some(mut state) = evaluate_scalar_object_state(
-                        from,
-                        None,
-                        context,
-                        stack,
-                        locals,
-                        passed,
-                    )? else {
+                    let Some(mut state) =
+                        evaluate_scalar_object_state(from, None, context, stack, locals, passed)?
+                    else {
                         return Ok(None);
                     };
                     for _ in 0..total_steps {
@@ -5426,7 +5424,8 @@ fn initial_object_field_scalar_value_after_steps<'a>(
                             stack,
                             locals,
                             passed,
-                        )? else {
+                        )?
+                        else {
                             return Ok(None);
                         };
                         state = next_state;
@@ -5464,7 +5463,8 @@ fn evaluate_scalar_object_state<'a>(
                     stack,
                     locals,
                     passed,
-                )? else {
+                )?
+                else {
                     return Ok(None);
                 };
                 values.insert(name.to_string(), value);
@@ -5517,9 +5517,14 @@ fn evaluate_scalar_expression_with_state_scope<'a>(
     passed: &mut PassedScopes,
 ) -> Result<Option<i64>, String> {
     if let Some((state_name, state_values)) = state_scope {
-        if let Some(value) =
-            state_scope_scalar_value(expression, state_name, state_values, context, locals, passed)?
-        {
+        if let Some(value) = state_scope_scalar_value(
+            expression,
+            state_name,
+            state_values,
+            context,
+            locals,
+            passed,
+        )? {
             return Ok(Some(value));
         }
     }
@@ -5529,53 +5534,92 @@ fn evaluate_scalar_expression_with_state_scope<'a>(
         StaticExpression::ArithmeticOperator(static_expression::ArithmeticOperator::Add {
             operand_a,
             operand_b,
-        }) => Ok(
-            evaluate_scalar_expression_with_state_scope(
-                operand_a, state_scope, context, stack, locals, passed,
-            )?
-            .zip(evaluate_scalar_expression_with_state_scope(
-                operand_b, state_scope, context, stack, locals, passed,
-            )?)
-            .map(|(a, b)| a + b),
-        ),
+        }) => Ok(evaluate_scalar_expression_with_state_scope(
+            operand_a,
+            state_scope,
+            context,
+            stack,
+            locals,
+            passed,
+        )?
+        .zip(evaluate_scalar_expression_with_state_scope(
+            operand_b,
+            state_scope,
+            context,
+            stack,
+            locals,
+            passed,
+        )?)
+        .map(|(a, b)| a + b)),
         StaticExpression::ArithmeticOperator(static_expression::ArithmeticOperator::Subtract {
             operand_a,
             operand_b,
-        }) => Ok(
-            evaluate_scalar_expression_with_state_scope(
-                operand_a, state_scope, context, stack, locals, passed,
-            )?
-            .zip(evaluate_scalar_expression_with_state_scope(
-                operand_b, state_scope, context, stack, locals, passed,
-            )?)
-            .map(|(a, b)| a - b),
-        ),
+        }) => Ok(evaluate_scalar_expression_with_state_scope(
+            operand_a,
+            state_scope,
+            context,
+            stack,
+            locals,
+            passed,
+        )?
+        .zip(evaluate_scalar_expression_with_state_scope(
+            operand_b,
+            state_scope,
+            context,
+            stack,
+            locals,
+            passed,
+        )?)
+        .map(|(a, b)| a - b)),
         StaticExpression::ArithmeticOperator(static_expression::ArithmeticOperator::Multiply {
             operand_a,
             operand_b,
-        }) => Ok(
-            evaluate_scalar_expression_with_state_scope(
-                operand_a, state_scope, context, stack, locals, passed,
-            )?
-            .zip(evaluate_scalar_expression_with_state_scope(
-                operand_b, state_scope, context, stack, locals, passed,
-            )?)
-            .map(|(a, b)| a * b),
-        ),
+        }) => Ok(evaluate_scalar_expression_with_state_scope(
+            operand_a,
+            state_scope,
+            context,
+            stack,
+            locals,
+            passed,
+        )?
+        .zip(evaluate_scalar_expression_with_state_scope(
+            operand_b,
+            state_scope,
+            context,
+            stack,
+            locals,
+            passed,
+        )?)
+        .map(|(a, b)| a * b)),
         StaticExpression::ArithmeticOperator(static_expression::ArithmeticOperator::Divide {
             operand_a,
             operand_b,
-        }) => Ok(
-            evaluate_scalar_expression_with_state_scope(
-                operand_a, state_scope, context, stack, locals, passed,
-            )?
-            .zip(evaluate_scalar_expression_with_state_scope(
-                operand_b, state_scope, context, stack, locals, passed,
-            )?)
-            .and_then(|(a, b)| (b != 0).then_some(a / b)),
-        ),
+        }) => Ok(evaluate_scalar_expression_with_state_scope(
+            operand_a,
+            state_scope,
+            context,
+            stack,
+            locals,
+            passed,
+        )?
+        .zip(evaluate_scalar_expression_with_state_scope(
+            operand_b,
+            state_scope,
+            context,
+            stack,
+            locals,
+            passed,
+        )?)
+        .and_then(|(a, b)| (b != 0).then_some(a / b))),
         StaticExpression::Pipe { from, to } if preserves_input_value_pipe(to) => {
-            evaluate_scalar_expression_with_state_scope(from, state_scope, context, stack, locals, passed)
+            evaluate_scalar_expression_with_state_scope(
+                from,
+                state_scope,
+                context,
+                stack,
+                locals,
+                passed,
+            )
         }
         _ => initial_scalar_value_in_context(expression, context, stack, locals, passed),
     }
@@ -5591,14 +5635,18 @@ fn state_scope_scalar_value(
 ) -> Result<Option<i64>, String> {
     match &expression.node {
         StaticExpression::Alias(static_expression::Alias::WithoutPassed { parts, .. }) => {
-            if parts.first().is_some_and(|part| part.as_str() == state_name) {
+            if parts
+                .first()
+                .is_some_and(|part| part.as_str() == state_name)
+            {
                 if parts.len() == 2 {
                     return Ok(state_values.get(parts[1].as_str()).copied());
                 }
                 return Ok(None);
             }
             if parts.len() == 1 {
-                if let Some(local_expression) = lookup_local_binding_expr(parts[0].as_str(), locals) {
+                if let Some(local_expression) = lookup_local_binding_expr(parts[0].as_str(), locals)
+                {
                     return state_scope_scalar_value(
                         local_expression,
                         state_name,
@@ -5612,8 +5660,9 @@ fn state_scope_scalar_value(
             Ok(None)
         }
         StaticExpression::PostfixFieldAccess { expr, field } => {
-            if let StaticExpression::Alias(static_expression::Alias::WithoutPassed { parts, .. }) =
-                &expr.node
+            if let StaticExpression::Alias(static_expression::Alias::WithoutPassed {
+                parts, ..
+            }) = &expr.node
             {
                 if parts.len() == 1 && parts[0].as_str() == state_name {
                     return Ok(state_values.get(field.as_str()).copied());
@@ -5650,7 +5699,9 @@ fn initial_list_count_value<'a>(
                 .map(|items| match &list_ref.filter {
                     Some(filter) => items
                         .iter()
-                        .filter(|item| initial_object_list_item_matches_filter(item, filter, context))
+                        .filter(|item| {
+                            initial_object_list_item_matches_filter(item, filter, context)
+                        })
                         .count(),
                     None => items.len(),
                 })
@@ -5663,7 +5714,9 @@ fn initial_list_count_value<'a>(
                 .list_plan
                 .initial_values
                 .get(&list_ref.binding)
-                .map(|values| filtered_runtime_text_list_values(values, list_ref.filter.as_ref()).len())
+                .map(|values| {
+                    filtered_runtime_text_list_values(values, list_ref.filter.as_ref()).len()
+                })
                 .unwrap_or_default() as i64,
         ));
     }
@@ -6126,11 +6179,12 @@ fn initial_derived_scalar_operand_value(
             .initial_values
             .get(binding)
             .map(|items| {
-                items.iter()
+                items
+                    .iter()
                     .filter(|item| {
-                        filter
-                            .as_ref()
-                            .is_none_or(|filter| initial_object_list_item_matches_filter(item, filter, context))
+                        filter.as_ref().is_none_or(|filter| {
+                            initial_object_list_item_matches_filter(item, filter, context)
+                        })
                     })
                     .count() as i64
             })
@@ -6740,7 +6794,8 @@ fn initial_when_value_matches_tag<'a>(
     {
         return Ok(true);
     }
-    if let Some((binding, value)) = resolve_scalar_reference(expression, context, locals, passed, stack)?
+    if let Some((binding, value)) =
+        resolve_scalar_reference(expression, context, locals, passed, stack)?
     {
         let source_expression = context.path_bindings.get(&binding).copied();
         if let Some(expected_value) =
@@ -6810,7 +6865,8 @@ fn bool_binding_path(
     if let Some(binding) = element_local_binding_path(expression) {
         return Ok(Some(binding));
     }
-    if let Ok(path) = canonical_expression_path(expression, context, locals, passed, &mut Vec::new())
+    if let Ok(path) =
+        canonical_expression_path(expression, context, locals, passed, &mut Vec::new())
     {
         if scalar_binding_has_runtime_state(&path, context) {
             return Ok(Some(path));
@@ -7040,14 +7096,16 @@ fn runtime_object_list_filter(
     let StaticExpression::Pipe { from, to } = &expression.node else {
         return Ok(None);
     };
-    let resolved_from = resolve_alias(from, context, locals, &mut passed.clone(), &mut Vec::new())
-        .unwrap_or(from);
-    let selector_binding = canonical_expression_path(from, context, locals, passed, &mut Vec::new())
-        .ok()
-        .or_else(|| {
-            canonical_expression_path(resolved_from, context, locals, passed, &mut Vec::new()).ok()
-        })
-        .filter(|binding| context.scalar_plan.initial_values.contains_key(binding));
+    let resolved_from =
+        resolve_alias(from, context, locals, &mut passed.clone(), &mut Vec::new()).unwrap_or(from);
+    let selector_binding =
+        canonical_expression_path(from, context, locals, passed, &mut Vec::new())
+            .ok()
+            .or_else(|| {
+                canonical_expression_path(resolved_from, context, locals, passed, &mut Vec::new())
+                    .ok()
+            })
+            .filter(|binding| context.scalar_plan.initial_values.contains_key(binding));
     if let (Some(binding), StaticExpression::While { arms }) = (selector_binding, &to.node) {
         if selected_completed_filter_arms(arms, item_name) {
             return Ok(Some(ObjectListFilter::SelectedCompletedByScalar {
@@ -8158,14 +8216,16 @@ fn runtime_object_list_ref(
             }
         }
     }
-    if let Some(binding) = runtime_object_list_binding_path(expression, context, locals, passed, stack)?
+    if let Some(binding) =
+        runtime_object_list_binding_path(expression, context, locals, passed, stack)?
     {
         return Ok(Some(RuntimeObjectListRef {
             binding,
             filter: None,
         }));
     }
-    if let Some(binding) = runtime_object_list_binding_path(resolved, context, locals, passed, stack)?
+    if let Some(binding) =
+        runtime_object_list_binding_path(resolved, context, locals, passed, stack)?
     {
         return Ok(Some(RuntimeObjectListRef {
             binding,
@@ -8189,7 +8249,8 @@ fn runtime_text_list_ref(
                 continue;
             };
             if path_matches(path, &["List", "retain"]) {
-                let Some(binding) = runtime_list_binding_path(from, context, locals, passed, stack)?
+                let Some(binding) =
+                    runtime_list_binding_path(from, context, locals, passed, stack)?
                 else {
                     continue;
                 };
@@ -8306,10 +8367,12 @@ fn infer_tag<'a>(
     locals: &mut LocalScopes<'a>,
     passed: &mut PassedScopes,
 ) -> Result<String, String> {
-    Ok(resolve_element_object(element, context, stack, locals, passed)?
-        .and_then(|object| find_object_field(object, "tag"))
-        .and_then(extract_tag_name)
-        .map_or_else(|| default_tag.to_string(), |tag| tag.to_lowercase()))
+    Ok(
+        resolve_element_object(element, context, stack, locals, passed)?
+            .and_then(|object| find_object_field(object, "tag"))
+            .and_then(extract_tag_name)
+            .map_or_else(|| default_tag.to_string(), |tag| tag.to_lowercase()),
+    )
 }
 
 fn collect_common_properties<'a>(
@@ -8343,14 +8406,8 @@ fn collect_event_bindings<'a>(
     let Some(event_object) = find_object_field(object, "event").and_then(resolve_object) else {
         return Ok(Vec::new());
     };
-    let source_binding = event_binding_source_path(
-        element,
-        current_binding,
-        context,
-        locals,
-        passed,
-        stack,
-    );
+    let source_binding =
+        event_binding_source_path(element, current_binding, context, locals, passed, stack);
 
     Ok(event_object
         .variables
@@ -8380,30 +8437,32 @@ fn event_binding_source_path(
     _stack: &mut Vec<String>,
 ) -> Option<String> {
     element
-        .and_then(|element| {
-            match &element.node {
-                StaticExpression::Alias(static_expression::Alias::WithoutPassed { parts, .. })
-                    if parts.len() == 1 =>
-                {
-                    let name = parts[0].as_str();
-                    lookup_local_object_base(name, locals)
-                        .map(|base| format!("{base}.{name}"))
-                        .or_else(|| {
-                            canonical_expression_path(
-                                element,
-                                context,
-                                locals,
-                                passed,
-                                &mut Vec::new(),
-                            )
+        .and_then(|element| match &element.node {
+            StaticExpression::Alias(static_expression::Alias::WithoutPassed { parts, .. })
+                if parts.len() == 1 =>
+            {
+                let name = parts[0].as_str();
+                lookup_local_object_base(name, locals)
+                    .map(|base| format!("{base}.{name}"))
+                    .or_else(|| {
+                        canonical_expression_path(element, context, locals, passed, &mut Vec::new())
                             .ok()
-                        })
-                        .or_else(|| alias_binding_name(element).ok().flatten().map(ToString::to_string))
-                }
-                _ => canonical_expression_path(element, context, locals, passed, &mut Vec::new())
-                    .ok()
-                    .or_else(|| alias_binding_name(element).ok().flatten().map(ToString::to_string)),
+                    })
+                    .or_else(|| {
+                        alias_binding_name(element)
+                            .ok()
+                            .flatten()
+                            .map(ToString::to_string)
+                    })
             }
+            _ => canonical_expression_path(element, context, locals, passed, &mut Vec::new())
+                .ok()
+                .or_else(|| {
+                    alias_binding_name(element)
+                        .ok()
+                        .flatten()
+                        .map(ToString::to_string)
+                }),
         })
         .or_else(|| current_binding.map(ToString::to_string))
 }
@@ -11386,9 +11445,11 @@ fn augment_hold_alias_runtime(context: &mut LowerContext<'_>) -> Result<(), Stri
         let Some(expression) = context.path_bindings.get(&binding_name).copied() else {
             continue;
         };
-        if let Some((initial_value, source_binding)) =
-            hold_alias_scalar_spec_for_expression(expression, &context.path_bindings, &binding_name)?
-        {
+        if let Some((initial_value, source_binding)) = hold_alias_scalar_spec_for_expression(
+            expression,
+            &context.path_bindings,
+            &binding_name,
+        )? {
             context
                 .scalar_plan
                 .initial_values
@@ -11425,69 +11486,103 @@ fn augment_object_alias_field_runtime(context: &mut LowerContext<'_>) -> Result<
         .initial_values
         .keys()
         .cloned()
-        .chain(context.scalar_plan.event_updates.values().flat_map(|updates| {
-            updates.iter().map(|update| match update {
-                ScalarUpdate::Set { binding, .. }
-                | ScalarUpdate::SetFromPayloadNumber { binding }
-                | ScalarUpdate::SetFiltered { binding, .. }
-                | ScalarUpdate::Add { binding, .. }
-                | ScalarUpdate::AddTenths { binding, .. }
-                | ScalarUpdate::ToggleBool { binding } => binding.clone(),
-            })
-        }))
-        .chain(context.object_list_plan.item_actions.values().flat_map(|actions| {
-            actions.iter().flat_map(|action| match &action.action {
-                ObjectItemActionKind::UpdateBindings { scalar_updates, .. } => scalar_updates
-                    .iter()
-                    .map(|update| match update {
-                        ItemScalarUpdate::SetStatic { binding, .. }
-                        | ItemScalarUpdate::SetFromField { binding, .. } => binding.clone(),
+        .chain(
+            context
+                .scalar_plan
+                .event_updates
+                .values()
+                .flat_map(|updates| {
+                    updates.iter().map(|update| match update {
+                        ScalarUpdate::Set { binding, .. }
+                        | ScalarUpdate::SetFromPayloadNumber { binding }
+                        | ScalarUpdate::SetFiltered { binding, .. }
+                        | ScalarUpdate::Add { binding, .. }
+                        | ScalarUpdate::AddTenths { binding, .. }
+                        | ScalarUpdate::ToggleBool { binding } => binding.clone(),
                     })
-                    .collect::<Vec<_>>(),
-                _ => Vec::new(),
-            })
-        }))
+                }),
+        )
+        .chain(
+            context
+                .object_list_plan
+                .item_actions
+                .values()
+                .flat_map(|actions| {
+                    actions.iter().flat_map(|action| match &action.action {
+                        ObjectItemActionKind::UpdateBindings { scalar_updates, .. } => {
+                            scalar_updates
+                                .iter()
+                                .map(|update| match update {
+                                    ItemScalarUpdate::SetStatic { binding, .. }
+                                    | ItemScalarUpdate::SetFromField { binding, .. } => {
+                                        binding.clone()
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                        _ => Vec::new(),
+                    })
+                }),
+        )
         .collect::<BTreeSet<_>>();
     let text_sources = context
         .text_plan
         .initial_values
         .keys()
         .cloned()
-        .chain(context.text_plan.event_updates.values().flat_map(|updates| {
-            updates.iter().map(|update| match update {
-                TextUpdate::SetStatic { binding, .. }
-                | TextUpdate::SetComputed { binding, .. }
-                | TextUpdate::SetComputedBranch { binding, .. }
-                | TextUpdate::SetFromInput { binding, .. }
-                | TextUpdate::SetFromPayload { binding }
-                | TextUpdate::SetFromValueSource { binding, .. } => binding.clone(),
-            })
-        }))
-        .chain(context.object_list_plan.item_actions.values().flat_map(|actions| {
-            actions.iter().flat_map(|action| match &action.action {
-                ObjectItemActionKind::UpdateBindings { text_updates, .. } => text_updates
-                    .iter()
-                    .map(|update| match update {
-                        ItemTextUpdate::SetStatic { binding, .. }
-                        | ItemTextUpdate::SetFromField { binding, .. }
-                        | ItemTextUpdate::SetFromPayload { binding }
-                        | ItemTextUpdate::SetFromValueSource { binding, .. }
-                        | ItemTextUpdate::SetFromInputSource { binding, .. } => binding.clone(),
+        .chain(
+            context
+                .text_plan
+                .event_updates
+                .values()
+                .flat_map(|updates| {
+                    updates.iter().map(|update| match update {
+                        TextUpdate::SetStatic { binding, .. }
+                        | TextUpdate::SetComputed { binding, .. }
+                        | TextUpdate::SetComputedBranch { binding, .. }
+                        | TextUpdate::SetFromInput { binding, .. }
+                        | TextUpdate::SetFromPayload { binding }
+                        | TextUpdate::SetFromValueSource { binding, .. } => binding.clone(),
                     })
-                    .collect::<Vec<_>>(),
-                _ => Vec::new(),
-            })
-        }))
+                }),
+        )
+        .chain(
+            context
+                .object_list_plan
+                .item_actions
+                .values()
+                .flat_map(|actions| {
+                    actions.iter().flat_map(|action| match &action.action {
+                        ObjectItemActionKind::UpdateBindings { text_updates, .. } => text_updates
+                            .iter()
+                            .map(|update| match update {
+                                ItemTextUpdate::SetStatic { binding, .. }
+                                | ItemTextUpdate::SetFromField { binding, .. }
+                                | ItemTextUpdate::SetFromPayload { binding }
+                                | ItemTextUpdate::SetFromValueSource { binding, .. }
+                                | ItemTextUpdate::SetFromInputSource { binding, .. } => {
+                                    binding.clone()
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    })
+                }),
+        )
         .collect::<BTreeSet<_>>();
 
     for binding_name in binding_names {
         let Some(expression) = context.bindings.get(&binding_name).copied() else {
             continue;
         };
-        let Some(source_base) =
-            canonical_expression_path(expression, context, &Vec::new(), &Vec::new(), &mut Vec::new())
-                .ok()
-        else {
+        let Some(source_base) = canonical_expression_path(
+            expression,
+            context,
+            &Vec::new(),
+            &Vec::new(),
+            &mut Vec::new(),
+        )
+        .ok() else {
             continue;
         };
         if source_base == binding_name {
@@ -11565,7 +11660,11 @@ fn augment_document_link_forwarder_item_runtime(
         &mut item_actions,
     )?;
     for (binding, actions) in item_actions {
-        let entry = context.object_list_plan.item_actions.entry(binding).or_default();
+        let entry = context
+            .object_list_plan
+            .item_actions
+            .entry(binding)
+            .or_default();
         for action in actions {
             if !entry.contains(&action) {
                 entry.push(action);
@@ -11886,10 +11985,9 @@ fn expression_may_contain_link_setter_syntax(
                 || expression_may_contain_link_setter_syntax(to, context)
         }
         StaticExpression::Block { variables, output } => {
-            variables
-                .iter()
-                .any(|variable| expression_may_contain_link_setter_syntax(&variable.node.value, context))
-                || expression_may_contain_link_setter_syntax(output, context)
+            variables.iter().any(|variable| {
+                expression_may_contain_link_setter_syntax(&variable.node.value, context)
+            }) || expression_may_contain_link_setter_syntax(output, context)
         }
         StaticExpression::FunctionCall { path, arguments } => {
             resolved_function_name_for_path(path, context).is_some()
@@ -11899,10 +11997,9 @@ fn expression_may_contain_link_setter_syntax(
                     })
                 })
         }
-        StaticExpression::Object(object) => object
-            .variables
-            .iter()
-            .any(|variable| expression_may_contain_link_setter_syntax(&variable.node.value, context)),
+        StaticExpression::Object(object) => object.variables.iter().any(|variable| {
+            expression_may_contain_link_setter_syntax(&variable.node.value, context)
+        }),
         StaticExpression::List { items } | StaticExpression::Latest { inputs: items } => items
             .iter()
             .any(|item| expression_may_contain_link_setter_syntax(item, context)),
@@ -11969,7 +12066,9 @@ fn infer_object_literal_field_kinds(
         StaticExpression::Then { body } => body.as_ref(),
         StaticExpression::When { arms } => arms
             .iter()
-            .find_map(|arm| (!matches!(arm.pattern, static_expression::Pattern::WildCard)).then_some(&arm.body))
+            .find_map(|arm| {
+                (!matches!(arm.pattern, static_expression::Pattern::WildCard)).then_some(&arm.body)
+            })
             .unwrap_or_else(|| arms.first().map(|arm| &arm.body).unwrap_or(expression)),
         _ => expression,
     };
@@ -11988,7 +12087,12 @@ fn infer_object_literal_field_kinds(
                 name.to_string(),
                 LocalBinding {
                     expr: Some(&variable.node.value),
-                    object_base: infer_argument_object_base(&variable.node.value, context, locals, passed),
+                    object_base: infer_argument_object_base(
+                        &variable.node.value,
+                        context,
+                        locals,
+                        passed,
+                    ),
                 },
             ))
         })
@@ -11998,9 +12102,13 @@ fn infer_object_literal_field_kinds(
         if variable.node.name.is_empty() {
             continue;
         }
-        if let Some(kind) =
-            infer_object_field_kind(&variable.node.value, context, &mut Vec::new(), &mut scoped_locals, &mut passed.clone())?
-        {
+        if let Some(kind) = infer_object_field_kind(
+            &variable.node.value,
+            context,
+            &mut Vec::new(),
+            &mut scoped_locals,
+            &mut passed.clone(),
+        )? {
             kinds.insert(variable.node.name.as_str().to_string(), kind);
         }
     }
@@ -12024,7 +12132,9 @@ fn infer_link_target_kind(
                 selected = Some(&arm.body);
                 break;
             }
-            selected.or_else(|| arms.first().map(|arm| &arm.body)).unwrap_or(expression)
+            selected
+                .or_else(|| arms.first().map(|arm| &arm.body))
+                .unwrap_or(expression)
         }
         _ => expression,
     };
@@ -12258,8 +12368,7 @@ fn collect_linked_text_input_plans<'a>(
             }
         }
         StaticExpression::FunctionCall { path, arguments }
-            if path_matches_element(path, "container")
-                || path_matches_element(path, "block") =>
+            if path_matches_element(path, "container") || path_matches_element(path, "block") =>
         {
             if let Some(child) = find_named_argument(arguments, "child") {
                 collect_linked_text_input_plans(
@@ -12551,7 +12660,13 @@ fn detect_dependent_bound_object_list_updates<'a>(
         let StaticExpression::Then { body } = &trigger_then.node else {
             return Ok(None);
         };
-        collect_bound_object_append_updates(body, path_bindings, functions, binding_path, &mut updates)?;
+        collect_bound_object_append_updates(
+            body,
+            path_bindings,
+            functions,
+            binding_path,
+            &mut updates,
+        )?;
     }
 
     Ok((!updates.is_empty()).then_some(updates))
@@ -12574,11 +12689,29 @@ fn collect_bound_object_append_updates<'a>(
 
     match &expression.node {
         StaticExpression::Pipe { from, to } => {
-            collect_bound_object_append_updates(from, path_bindings, functions, binding_path, updates)?;
-            collect_bound_object_append_updates(to, path_bindings, functions, binding_path, updates)?;
+            collect_bound_object_append_updates(
+                from,
+                path_bindings,
+                functions,
+                binding_path,
+                updates,
+            )?;
+            collect_bound_object_append_updates(
+                to,
+                path_bindings,
+                functions,
+                binding_path,
+                updates,
+            )?;
         }
         StaticExpression::Then { body } => {
-            collect_bound_object_append_updates(body, path_bindings, functions, binding_path, updates)?;
+            collect_bound_object_append_updates(
+                body,
+                path_bindings,
+                functions,
+                binding_path,
+                updates,
+            )?;
         }
         StaticExpression::Block { variables, output } => {
             for variable in variables {
@@ -12590,7 +12723,13 @@ fn collect_bound_object_append_updates<'a>(
                     updates,
                 )?;
             }
-            collect_bound_object_append_updates(output, path_bindings, functions, binding_path, updates)?;
+            collect_bound_object_append_updates(
+                output,
+                path_bindings,
+                functions,
+                binding_path,
+                updates,
+            )?;
         }
         StaticExpression::When { arms } | StaticExpression::While { arms } => {
             for arm in arms {
@@ -14467,8 +14606,7 @@ fn detect_object_list_pipeline<'a>(
                         path_bindings,
                         binding_path,
                         functions,
-                    )?
-                    {
+                    )? {
                         append_item_actions = actions;
                         append_global_actions = globals;
                     }
@@ -14553,13 +14691,12 @@ fn detect_append_item_runtime_specs<'a>(
     binding_path: &str,
     functions: &BTreeMap<String, FunctionSpec<'a>>,
 ) -> Result<Option<(Vec<ObjectItemActionSpec>, PendingGlobalObjectUpdates)>, String> {
-    let resolved_expression = if let Some(path) =
-        canonical_reference_path(expression, path_bindings, binding_path)?
-    {
-        path_bindings.get(&path).copied().unwrap_or(expression)
-    } else {
-        expression
-    };
+    let resolved_expression =
+        if let Some(path) = canonical_reference_path(expression, path_bindings, binding_path)? {
+            path_bindings.get(&path).copied().unwrap_or(expression)
+        } else {
+            expression
+        };
     let candidate = match &resolved_expression.node {
         StaticExpression::Pipe { to, .. } => match &to.node {
             StaticExpression::Then { body } => body.as_ref(),
@@ -15757,8 +15894,7 @@ fn detect_dynamic_object_retain_bulk_remove_update(
     path_bindings: &BTreeMap<String, &StaticSpannedExpression>,
     binding_path: &str,
 ) -> Result<Option<((String, String), ObjectListUpdate)>, String> {
-    let Some(filter) =
-        retain_keep_false_filter(body, item_name, path_bindings, binding_path)?
+    let Some(filter) = retain_keep_false_filter(body, item_name, path_bindings, binding_path)?
     else {
         return Ok(None);
     };
@@ -15794,8 +15930,7 @@ fn retain_keep_false_filter(
     if let StaticExpression::Alias(static_expression::Alias::WithoutPassed { parts, .. }) =
         &from.node
     {
-        if parts.len() == 2 && parts[0].as_str() == item_name && parts[1].as_str() == "completed"
-        {
+        if parts.len() == 2 && parts[0].as_str() == item_name && parts[1].as_str() == "completed" {
             return Ok(Some(ObjectListFilter::BoolFieldEquals {
                 field: "completed".to_string(),
                 value: true,
@@ -16370,7 +16505,8 @@ fn latest_value_spec_for_expression(
     let mut event_values = Vec::new();
     let mut dynamic_values = BTreeMap::new();
     for input in inputs {
-        if let Some(value) = extract_scalar_literal_value_with_dynamic_tags(input, &mut dynamic_values)?
+        if let Some(value) =
+            extract_scalar_literal_value_with_dynamic_tags(input, &mut dynamic_values)?
         {
             static_emissions.push(value);
             continue;
@@ -17451,12 +17587,9 @@ fn event_only_counter_events_for_expression(
     binding_path: &str,
     timer_bindings: &BTreeMap<String, u32>,
 ) -> Result<Option<Vec<EventDeltaSpec>>, String> {
-    if let Some(events) = skip_wrapped_hold_counter_events(
-        expression,
-        path_bindings,
-        binding_path,
-        timer_bindings,
-    )? {
+    if let Some(events) =
+        skip_wrapped_hold_counter_events(expression, path_bindings, binding_path, timer_bindings)?
+    {
         return Ok(Some(events));
     }
     direct_timer_sum_counter_events(expression, path_bindings, binding_path)
@@ -17523,7 +17656,10 @@ fn direct_timer_sum_counter_events(
     } else if timer_interval_millis_for_expression(trigger_source)?.is_some()
         && path_bindings.contains_key(SYNTHETIC_DOCUMENT_ROOT_TIMER_BINDING)
     {
-        Some((SYNTHETIC_DOCUMENT_ROOT_TIMER_BINDING.to_string(), "tick".to_string()))
+        Some((
+            SYNTHETIC_DOCUMENT_ROOT_TIMER_BINDING.to_string(),
+            "tick".to_string(),
+        ))
     } else {
         None
     };
@@ -18840,43 +18976,40 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        LocalBinding, LowerContext, PassedScope, RuntimeObjectListRef, StaticExpression,
+        LocalBinding, LowerContext, PassedScope, RuntimeObjectListRef,
+        SYNTHETIC_DOCUMENT_ROOT_BINDING, SYNTHETIC_DOCUMENT_ROOT_TIMER_BINDING, StaticExpression,
         StaticSpannedExpression, active_object_scope,
-        augment_dependent_object_list_updates_from_item_bindings, canonical_expression_path,
+        augment_dependent_object_list_updates_from_item_bindings,
         augment_document_link_forwarder_item_runtime, augment_hold_alias_runtime,
         augment_linked_text_input_runtime, augment_object_alias_field_runtime,
         augment_top_level_bool_item_runtime, augment_top_level_object_field_runtime,
-        bool_ui_branch_arms, conditional_alias_arm, describe_expression_detailed,
-        detect_item_event_source, detect_list_plan, detect_object_list_plan, detect_scalar_plan,
-        detect_static_object_list_plan, detect_text_plan, detect_timer_bindings,
-        eager_block_scope, find_document_expression, find_named_argument,
-        find_object_field, find_positional_parameter_name, flatten_binding_paths,
-        infer_argument_object_base,
-        initial_scalar_value_in_context, invocation_marker, latest_value_spec_for_expression,
-        linked_text_input_plan, lower_bool_condition_from_nodes, lower_dynamic_list_items,
-        lower_scalar_value_when_node, lower_text_value, lower_to_semantic, lower_ui_node,
+        bool_ui_branch_arms, canonical_expression_path, conditional_alias_arm,
+        describe_expression_detailed, detect_item_event_source, detect_list_plan,
+        detect_object_list_plan, detect_scalar_plan, detect_static_object_list_plan,
+        detect_text_plan, detect_timer_bindings, eager_block_scope, find_document_expression,
+        find_named_argument, find_object_field, find_positional_parameter_name,
+        flatten_binding_paths, infer_argument_object_base, initial_scalar_value_in_context,
+        invocation_marker, latest_value_spec_for_expression, linked_text_input_plan,
+        lower_bool_condition_from_nodes, lower_dynamic_list_items, lower_scalar_value_when_node,
+        lower_text_value, lower_to_semantic, lower_ui_node,
         object_derived_scalar_operand_in_context, parse_static_expressions,
-        path_matches,
-        passed_scope_for_expression, resolve_alias, resolve_scalar_reference,
-        resolve_static_object_runtime_expression,
-        select_when_arm_body,
+        passed_scope_for_expression, path_matches, resolve_alias, resolve_scalar_reference,
+        resolve_static_object_runtime_expression, runtime_object_list_binding_path,
+        runtime_object_list_filter, runtime_object_list_ref, runtime_text_binding_path,
         scalar_binding_has_runtime_state, scalar_branch_all_values_for_source,
-        scalar_branch_pattern_value_for_source,
-        seed_missing_scalar_initial_values,
-        scalar_compare_branch_operands,
+        scalar_branch_pattern_value_for_source, scalar_compare_branch_operands,
+        seed_missing_scalar_initial_values, select_when_arm_body,
         synthetic_document_root_expression, synthetic_document_root_timer_expression,
-        runtime_object_list_binding_path, runtime_object_list_filter, runtime_object_list_ref,
-        runtime_text_binding_path, top_level_bindings, top_level_functions,
-        trigger_specs_for_runtime_binding, try_lower_to_semantic, with_invoked_function_scope,
-        SYNTHETIC_DOCUMENT_ROOT_BINDING, SYNTHETIC_DOCUMENT_ROOT_TIMER_BINDING,
+        top_level_bindings, top_level_functions, trigger_specs_for_runtime_binding,
+        try_lower_to_semantic, with_invoked_function_scope,
     };
-    use boon::parser::static_expression::Comparator as StaticComparator;
     use crate::semantic_ir::{
         DerivedScalarOperand, IntCompareOp, ItemScalarUpdate, ObjectDerivedScalarOperand,
         ObjectItemActionKind, ObjectListFilter, ObjectListUpdate, RuntimeModel, ScalarUpdate,
         SemanticAction, SemanticInputValue, SemanticNode, SemanticTextPart, TextListFilter,
         TextUpdate,
     };
+    use boon::parser::static_expression::Comparator as StaticComparator;
 
     #[test]
     fn lower_to_semantic_lowers_hello_world_document() {
@@ -18917,9 +19050,7 @@ mod tests {
         let examples = [
             (
                 "counter",
-                include_str!(
-                    "../../../playground/frontend/src/examples/counter/counter.bn"
-                ),
+                include_str!("../../../playground/frontend/src/examples/counter/counter.bn"),
             ),
             (
                 "temperature_converter",
@@ -18962,8 +19093,7 @@ mod tests {
 
     #[test]
     fn timer_progress_percent_has_initial_scalar_value() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/timer/timer.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/timer/timer.bn");
         let expressions = parse_static_expressions(source).expect("timer should parse");
         let bindings = top_level_bindings(&expressions);
         let functions = top_level_functions(&expressions, None);
@@ -19050,8 +19180,7 @@ mod tests {
 
     #[test]
     fn timer_duration_row_pass_object_resolves_store_binding() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/timer/timer.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/timer/timer.bn");
         let expressions = parse_static_expressions(source).expect("timer should parse");
         let bindings = top_level_bindings(&expressions);
         let functions = top_level_functions(&expressions, None);
@@ -19151,8 +19280,7 @@ mod tests {
 
     #[test]
     fn timer_gauge_row_lowering_restores_outer_pass_scope() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/timer/timer.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/timer/timer.bn");
         let expressions = parse_static_expressions(source).expect("timer should parse");
         let bindings = top_level_bindings(&expressions);
         let functions = top_level_functions(&expressions, None);
@@ -21421,8 +21549,7 @@ document: Document/new(root: Element/button(
             panic!("expected button root");
         };
         assert!(fact_bindings.iter().any(|binding| {
-            binding.kind
-                == crate::semantic_ir::SemanticFactKind::Focused
+            binding.kind == crate::semantic_ir::SemanticFactKind::Focused
                 && binding.binding == "__element__.focused"
         }));
     }
@@ -21466,7 +21593,10 @@ document: Document/new(root: Element/button(
         )
         .expect("panel_footer should lower in the real todo_mvc_physical context");
 
-        assert!(semantic_tree_contains_object_list_count_branch(&node, "store.todos"));
+        assert!(semantic_tree_contains_object_list_count_branch(
+            &node,
+            "store.todos"
+        ));
     }
 
     #[test]
@@ -21524,9 +21654,7 @@ document: Document/new(root: Element/button(
     #[test]
     fn todo_mvc_physical_store_todos_exposes_checkbox_item_action() {
         let program = try_lower_to_semantic(
-            include_str!(
-                "../../../playground/frontend/src/examples/todo_mvc_physical/RUN.bn"
-            ),
+            include_str!("../../../playground/frontend/src/examples/todo_mvc_physical/RUN.bn"),
             None,
             false,
         )
@@ -21734,7 +21862,10 @@ document: Document/new(root: Element/button(
         )
         .expect("panel_footer third item should lower in the real todo_mvc_physical context");
 
-        assert!(semantic_tree_contains_object_list_count_branch(&node, "store.todos"));
+        assert!(semantic_tree_contains_object_list_count_branch(
+            &node,
+            "store.todos"
+        ));
     }
 
     #[test]
@@ -21773,7 +21904,10 @@ document: Document/new(root: Element/button(
         )
         .expect("panel_footer third item child should lower in the real todo_mvc_physical context");
 
-        assert!(semantic_tree_contains_object_list_count_branch(&node, "store.todos"));
+        assert!(semantic_tree_contains_object_list_count_branch(
+            &node,
+            "store.todos"
+        ));
     }
 
     #[test]
@@ -21816,10 +21950,7 @@ document: Document/new(root: Element/button(
                 let (truthy, falsy) = bool_ui_branch_arms(arms)
                     .expect("bool_ui_branch_arms should inspect")
                     .expect("third child should be a bool branch");
-                assert!(matches!(
-                    truthy.node,
-                    StaticExpression::Pipe { .. }
-                ));
+                assert!(matches!(truthy.node, StaticExpression::Pipe { .. }));
                 assert!(matches!(
                     falsy.node,
                     StaticExpression::Literal(boon::parser::static_expression::Literal::Tag(_))
@@ -21835,15 +21966,12 @@ document: Document/new(root: Element/button(
                 .expect("binding inspection should succeed");
                 assert_eq!(binding.as_deref(), Some("store.todos"));
 
-                let compare = scalar_compare_branch_operands(
-                    from,
-                    context,
-                    locals,
-                    passed,
-                    stack,
-                )
-                .expect("scalar compare inspection should succeed");
-                assert!(compare.is_some(), "List/any condition should lower to a compare");
+                let compare = scalar_compare_branch_operands(from, context, locals, passed, stack)
+                    .expect("scalar compare inspection should succeed");
+                assert!(
+                    compare.is_some(),
+                    "List/any condition should lower to a compare"
+                );
                 Ok(())
             },
         )
@@ -21854,7 +21982,10 @@ document: Document/new(root: Element/button(
     fn todo_mvc_physical_theme_mode_detects_runtime_scalar_toggle() {
         let context = todo_mvc_physical_test_context();
 
-        assert_eq!(context.scalar_plan.initial_values.get("theme_options.mode"), Some(&1));
+        assert_eq!(
+            context.scalar_plan.initial_values.get("theme_options.mode"),
+            Some(&1)
+        );
         assert!(
             context
                 .scalar_plan
@@ -22180,9 +22311,7 @@ document: Document/new(root: Element/button(
     #[test]
     fn try_lower_to_semantic_todo_mvc_physical_real_file_smoke() {
         if let Err(error) = try_lower_to_semantic(
-            include_str!(
-                "../../../playground/frontend/src/examples/todo_mvc_physical/RUN.bn"
-            ),
+            include_str!("../../../playground/frontend/src/examples/todo_mvc_physical/RUN.bn"),
             None,
             false,
         ) {
@@ -22214,7 +22343,10 @@ document: Document/new(root:
             false,
         );
 
-        assert!(matches!(program.root, SemanticNode::ScalarCompareBranch { .. }));
+        assert!(matches!(
+            program.root,
+            SemanticNode::ScalarCompareBranch { .. }
+        ));
     }
 
     #[test]
@@ -22243,7 +22375,10 @@ scene: Scene/new(root: footer(PASS: [store: store]))
             false,
         );
 
-        assert!(matches!(program.root, SemanticNode::ScalarCompareBranch { .. }));
+        assert!(matches!(
+            program.root,
+            SemanticNode::ScalarCompareBranch { .. }
+        ));
     }
 
     #[test]
@@ -22300,7 +22435,10 @@ scene: Scene/new(root: footer(PASS: [store: store]))
             false,
         );
 
-        assert!(semantic_tree_contains_object_list_count_branch(&program.root, "store.todos"));
+        assert!(semantic_tree_contains_object_list_count_branch(
+            &program.root,
+            "store.todos"
+        ));
     }
 
     #[test]
@@ -22392,7 +22530,10 @@ scene: Scene/new(root: panel(PASS: [store: store]))
             false,
         );
 
-        assert!(semantic_tree_contains_object_list_count_branch(&program.root, "store.todos"));
+        assert!(semantic_tree_contains_object_list_count_branch(
+            &program.root,
+            "store.todos"
+        ));
     }
 
     #[test]
@@ -22697,7 +22838,9 @@ document: Document/new(root:
             context
                 .scalar_mirrors
                 .get("event_ports.edit_committed.column")
-                .is_some_and(|targets| targets.iter().any(|target| target == "edit_committed.column")),
+                .is_some_and(|targets| targets
+                    .iter()
+                    .any(|target| target == "edit_committed.column")),
             "expected scalar mirror event_ports.edit_committed.column -> edit_committed.column, got {:?}",
             context.scalar_mirrors
         );
@@ -22705,7 +22848,9 @@ document: Document/new(root:
             context
                 .text_mirrors
                 .get("event_ports.edit_committed.text")
-                .is_some_and(|targets| targets.iter().any(|target| target == "edit_committed.text")),
+                .is_some_and(|targets| targets
+                    .iter()
+                    .any(|target| target == "edit_committed.text")),
             "expected text mirror event_ports.edit_committed.text -> edit_committed.text, got {:?}",
             context.text_mirrors
         );
@@ -22766,11 +22911,13 @@ document: Document/new(root:
                 timer_expression,
             );
         }
-        let timer_bindings = detect_timer_bindings(&path_bindings).expect("timer bindings should build");
-        let mut scalar_plan =
-            detect_scalar_plan(&path_bindings, &functions, &timer_bindings).expect("scalar plan should build");
-        let static_object_lists = detect_static_object_list_plan(&path_bindings, &functions, &mut scalar_plan)
-            .expect("static object list plan should build");
+        let timer_bindings =
+            detect_timer_bindings(&path_bindings).expect("timer bindings should build");
+        let mut scalar_plan = detect_scalar_plan(&path_bindings, &functions, &timer_bindings)
+            .expect("scalar plan should build");
+        let static_object_lists =
+            detect_static_object_list_plan(&path_bindings, &functions, &mut scalar_plan)
+                .expect("static object list plan should build");
         let text_plan = detect_text_plan(&path_bindings).expect("text plan should build");
         let object_list_plan =
             detect_object_list_plan(&path_bindings, &functions, &scalar_plan, &text_plan)
@@ -22882,7 +23029,10 @@ document: Document/new(root:
         .expect("column comparator should inspect");
 
         assert!(
-            matches!(lowered, Some(SemanticNode::ObjectScalarCompareBranch { .. })),
+            matches!(
+                lowered,
+                Some(SemanticNode::ObjectScalarCompareBranch { .. })
+            ),
             "expected column comparator to lower as object scalar compare branch, got {lowered:?}"
         );
     }
@@ -22921,15 +23071,8 @@ document: Document/new(root:
         }
         locals.push(scope);
 
-        let lowered = lower_ui_node(
-            output,
-            &context,
-            &mut Vec::new(),
-            &mut locals,
-            passed,
-            None,
-        )
-        .expect("make_cell_element output should lower");
+        let lowered = lower_ui_node(output, &context, &mut Vec::new(), &mut locals, passed, None)
+            .expect("make_cell_element output should lower");
 
         assert!(
             semantic_tree_contains_cells_editing_compare(&lowered),
@@ -23194,8 +23337,7 @@ document: Document/new(root:
     }
 
     fn crud_test_context() -> LowerContext<'static> {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/crud/crud.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/crud/crud.bn");
         let expressions: &'static [StaticSpannedExpression] = Box::leak(
             parse_static_expressions(source)
                 .expect("crud source should parse")
@@ -23245,8 +23387,7 @@ document: Document/new(root:
 
     #[test]
     fn crud_initial_new_person_item_resolves_as_runtime_object() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/crud/crud.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/crud/crud.bn");
         let expressions: &'static [StaticSpannedExpression] = Box::leak(
             parse_static_expressions(source)
                 .expect("crud source should parse")
@@ -23266,7 +23407,9 @@ document: Document/new(root:
         let StaticExpression::List { items } = &source_expr.node else {
             panic!("store.people source should be a list");
         };
-        let first_item = items.first().expect("store.people should have an initial item");
+        let first_item = items
+            .first()
+            .expect("store.people should have an initial item");
         assert!(
             resolve_static_object_runtime_expression(first_item, &functions)
                 .expect("new_person should inspect")
@@ -23278,8 +23421,7 @@ document: Document/new(root:
 
     #[test]
     fn crud_append_new_person_body_resolves_as_runtime_object() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/crud/crud.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/crud/crud.bn");
         let expressions: &'static [StaticSpannedExpression] = Box::leak(
             parse_static_expressions(source)
                 .expect("crud source should parse")
@@ -23375,30 +23517,27 @@ document: Document/new(root:
         );
         let mapper_name = find_positional_parameter_name(map_arguments)
             .expect("selected_id List/map should define item parameter");
-        let mut locals = vec![store_object
-            .variables
-            .iter()
-            .filter_map(|variable| {
-                let name = variable.node.name.as_str();
-                (!name.is_empty()).then_some((
-                    name.to_string(),
-                    LocalBinding {
-                        expr: Some(&variable.node.value),
-                        object_base: Some(format!("store.{name}")),
-                    },
-                ))
-            })
-            .collect::<BTreeMap<_, _>>()];
+        let mut locals = vec![
+            store_object
+                .variables
+                .iter()
+                .filter_map(|variable| {
+                    let name = variable.node.name.as_str();
+                    (!name.is_empty()).then_some((
+                        name.to_string(),
+                        LocalBinding {
+                            expr: Some(&variable.node.value),
+                            object_base: Some(format!("store.{name}")),
+                        },
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>(),
+        ];
         let mut passed = Vec::new();
-        let list_ref = runtime_object_list_ref(
-            map_source,
-            &context,
-            &locals,
-            &passed,
-            &mut Vec::new(),
-        )
-        .expect("selected_id map source should inspect")
-        .expect("selected_id map source should resolve to a runtime object list");
+        let list_ref =
+            runtime_object_list_ref(map_source, &context, &locals, &passed, &mut Vec::new())
+                .expect("selected_id map source should inspect")
+                .expect("selected_id map source should resolve to a runtime object list");
         assert_eq!(list_ref.binding, "store.people");
         locals.push(BTreeMap::from([(
             mapper_name.to_string(),
@@ -23425,8 +23564,7 @@ document: Document/new(root:
     }
 
     fn todo_mvc_test_context() -> LowerContext<'static> {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
         let expressions: &'static [StaticSpannedExpression] = Box::leak(
             parse_static_expressions(source)
                 .expect("todo_mvc source should parse")
@@ -23475,9 +23613,8 @@ document: Document/new(root:
     }
 
     fn todo_mvc_physical_test_context() -> LowerContext<'static> {
-        let source = include_str!(
-            "../../../playground/frontend/src/examples/todo_mvc_physical/RUN.bn"
-        );
+        let source =
+            include_str!("../../../playground/frontend/src/examples/todo_mvc_physical/RUN.bn");
         let external_functions = todo_mvc_physical_external_functions();
         let expressions: &'static [StaticSpannedExpression] = Box::leak(
             parse_static_expressions(source)
@@ -23816,9 +23953,14 @@ document: Document/new(root:
         let direct_path =
             canonical_expression_path(retain_from, &context, &locals, &passed, &mut Vec::new());
         let mut passed_clone = passed.clone();
-        let resolved_retain_from =
-            resolve_alias(retain_from, &context, &locals, &mut passed_clone, &mut Vec::new())
-                .expect("retain source should resolve");
+        let resolved_retain_from = resolve_alias(
+            retain_from,
+            &context,
+            &locals,
+            &mut passed_clone,
+            &mut Vec::new(),
+        )
+        .expect("retain source should resolve");
         let resolved_path = canonical_expression_path(
             resolved_retain_from,
             &context,
@@ -23832,7 +23974,11 @@ document: Document/new(root:
             "retain_from={} direct_path={direct_path:?} resolved={} resolved_path={resolved_path:?} object_lists={:?}",
             describe_expression_detailed(retain_from),
             describe_expression_detailed(resolved_retain_from),
-            context.object_list_plan.initial_values.keys().collect::<Vec<_>>(),
+            context
+                .object_list_plan
+                .initial_values
+                .keys()
+                .collect::<Vec<_>>(),
         );
 
         let StaticExpression::FunctionCall {
@@ -24557,9 +24703,7 @@ document: Document/new(root:
             SemanticNode::ObjectList { template, .. } => {
                 semantic_tree_contains_cells_editing_compare(template)
             }
-            SemanticNode::Keyed { node, .. } => {
-                semantic_tree_contains_cells_editing_compare(node)
-            }
+            SemanticNode::Keyed { node, .. } => semantic_tree_contains_cells_editing_compare(node),
             _ => false,
         }
     }

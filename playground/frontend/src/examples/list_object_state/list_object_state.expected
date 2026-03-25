@@ -1,0 +1,28 @@
+# Object state inside mapped list items stays independent
+
+[test]
+category = "interactive"
+description = "Mapped object counters keep independent HOLD state"
+skip_engines = ["Actors", "DD", "Wasm"]
+
+[output]
+text = "Click each button - counts should be independentClick meCount: 0Click meCount: 0Click meCount: 0"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+[[sequence]]
+description = "Click first counter once"
+actions = [["click_button", 0]]
+expect = "Click each button - counts should be independentClick meCount: 1Click meCount: 0Click meCount: 0"
+
+[[sequence]]
+description = "Click second counter twice"
+actions = [["click_button", 1], ["click_button", 1]]
+expect = "Click each button - counts should be independentClick meCount: 1Click meCount: 2Click meCount: 0"
+
+[[sequence]]
+description = "Click third counter once"
+actions = [["click_button", 2]]
+expect = "Click each button - counts should be independentClick meCount: 1Click meCount: 2Click meCount: 1"

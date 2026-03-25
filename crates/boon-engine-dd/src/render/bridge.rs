@@ -3612,7 +3612,8 @@ impl RetainedNode {
                         }
                     }
                     if restoring_persisted_text.get()
-                        && (new_text == dom_value || (!new_text.is_empty() && new_text == input_el.value()))
+                        && (new_text == dom_value
+                            || (!new_text.is_empty() && new_text == input_el.value()))
                     {
                         restoring_persisted_text.set(false);
                     }
@@ -3665,14 +3666,19 @@ impl RetainedNode {
                         .unwrap_or_else(|| link_path.to_string());
 
                     if let Some(input_el) = dom_element.borrow().as_ref() {
-                        let new_value_num =
-                            fields.get("value").and_then(|v| v.as_number()).unwrap_or(0.0);
-                        let new_min =
-                            fields.get("min").and_then(|v| v.as_number()).unwrap_or(0.0);
-                        let new_max =
-                            fields.get("max").and_then(|v| v.as_number()).unwrap_or(100.0);
-                        let new_step =
-                            fields.get("step").and_then(|v| v.as_number()).unwrap_or(1.0);
+                        let new_value_num = fields
+                            .get("value")
+                            .and_then(|v| v.as_number())
+                            .unwrap_or(0.0);
+                        let new_min = fields.get("min").and_then(|v| v.as_number()).unwrap_or(0.0);
+                        let new_max = fields
+                            .get("max")
+                            .and_then(|v| v.as_number())
+                            .unwrap_or(100.0);
+                        let new_step = fields
+                            .get("step")
+                            .and_then(|v| v.as_number())
+                            .unwrap_or(1.0);
 
                         let value_str = format!("{}", new_value_num);
                         if input_el.value() != value_str {

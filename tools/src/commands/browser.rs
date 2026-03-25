@@ -157,6 +157,7 @@ impl Default for LaunchOptions {
 fn engine_query_value(engine: &str) -> &str {
     match engine {
         "Actors" => "actors",
+        "ActorsLite" => "actorslite",
         "DD" => "dd",
         "Wasm" => "wasm",
         other => other,

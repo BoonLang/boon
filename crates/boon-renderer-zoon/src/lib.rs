@@ -163,6 +163,7 @@ impl RenderInteractionHandlers {
 thread_local! {
     static AUTOMATION_HANDLERS: RefCell<RenderInteractionHandlers> = RefCell::new(RenderInteractionHandlers::default());
     static AUTOMATION_HOOKS_INSTALLED: RefCell<bool> = const { RefCell::new(false) };
+    static ACTIVE_TIMER_INTERVALS: RefCell<HashMap<String, i32>> = RefCell::new(HashMap::new());
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -185,6 +186,22 @@ impl FakeRenderState {
     #[must_use]
     pub fn root(&self) -> Option<&RenderRoot> {
         self.root.as_ref()
+    }
+
+    #[must_use]
+    pub fn property_value(&self, id: NodeId, name: &str) -> Option<&str> {
+        self.properties
+            .get(&id)
+            .and_then(|properties| properties.get(name))
+            .and_then(|value| value.as_deref())
+    }
+
+    #[must_use]
+    pub fn style_value(&self, id: NodeId, name: &str) -> Option<&str> {
+        self.styles
+            .get(&id)
+            .and_then(|styles| styles.get(name))
+            .and_then(|value| value.as_deref())
     }
 
     fn properties_for(&self, id: NodeId) -> impl Iterator<Item = (&String, &Option<String>)> {
@@ -439,7 +456,9 @@ pub fn render_snapshot_root_with_handlers(
     install_automation_hooks(handlers.clone());
     let active_text_input = active_text_input_state();
     match root {
-        RenderRoot::UiTree(node) => render_ui_node(node, state, handlers, active_text_input.as_ref()),
+        RenderRoot::UiTree(node) => {
+            render_ui_node(node, state, handlers, active_text_input.as_ref())
+        }
         RenderRoot::SceneGraph(node) => render_scene_node(node),
     }
 }
@@ -584,6 +603,7 @@ fn render_ui_node(
             let node_id_value = node.id;
             let node_id = node.id.0.to_string();
             let mut should_focus_after_insert = false;
+            let mut should_select_after_insert = false;
             let restore_selection_after_insert = if tag == "input" {
                 active_text_input
                     .filter(|input| input.node_id == node_id)
@@ -638,6 +658,10 @@ fn render_ui_node(
                 if let Some(value) = value {
                     if tag == "input" && name == "autofocus" && value == "true" {
                         should_focus_after_insert = true;
+                        should_select_after_insert = true;
+                    }
+                    if tag == "input" && name == "focused" && value == "true" {
+                        should_focus_after_insert = true;
                     }
                     if tag == "input" && name == "value" {
                         input_value_after_insert = Some(value.clone());
@@ -669,7 +693,9 @@ fn render_ui_node(
             }
             if let Some(checked) = state.checked_value_for(node_id_value) {
                 let checked = if checked { "true" } else { "false" };
-                el = el.attr("aria-checked", checked).attr("data-checked", checked);
+                el = el
+                    .attr("aria-checked", checked)
+                    .attr("data-checked", checked);
             }
             if tag == "select" {
                 let selected_value = state.selected_value_for(node_id_value).cloned();
@@ -685,10 +711,9 @@ fn render_ui_node(
                 el = el.attr(event_port_attr_name(&kind), &port.0.to_string());
                 el = attach_ui_handler(el, handlers.clone(), node_id_value, port, kind);
             }
-            if should_focus_after_insert
-                || restore_selection_after_insert.is_some()
-                || input_value_after_insert.is_some()
-            {
+            let should_restore_focus =
+                should_focus_after_insert || restore_selection_after_insert.is_some();
+            if input_value_after_insert.is_some() || should_restore_focus {
                 let restore_selection_after_insert = restore_selection_after_insert;
                 let input_value_after_insert = input_value_after_insert;
                 el = el.after_insert(move |element| {
@@ -696,53 +721,60 @@ fn render_ui_node(
                         if let Some(value) = input_value_after_insert.as_deref() {
                             input.set_value(value);
                         }
-                        let _ = input.focus();
-                        if should_focus_after_insert {
-                            let _ = input.select();
-                        } else if let Some((start, end)) = restore_selection_after_insert {
-                            if let (Some(start), Some(end)) = (start, end) {
-                                let _ = input.set_selection_range(start, end);
+                        if should_restore_focus {
+                            let _ = input.focus();
+                            if should_select_after_insert {
+                                let _ = input.select();
+                            } else if let Some((start, end)) = restore_selection_after_insert {
+                                if let (Some(start), Some(end)) = (start, end) {
+                                    let _ = input.set_selection_range(start, end);
+                                }
                             }
                         }
-                    } else if let Some(html) = element.dyn_ref::<web_sys::HtmlElement>() {
-                        let _ = html.focus();
+                    } else if should_restore_focus {
+                        if let Some(html) = element.dyn_ref::<web_sys::HtmlElement>() {
+                            let _ = html.focus();
+                        }
                     }
-                    if let Some(window) = web_sys::window() {
-                        let delayed_element = element.clone();
-                        let restore_selection_after_insert = restore_selection_after_insert;
-                        let input_value_after_insert = input_value_after_insert.clone();
-                        for delay_ms in [0, 50] {
-                            let delayed_element = delayed_element.clone();
+                    if should_restore_focus {
+                        if let Some(window) = web_sys::window() {
+                            let delayed_element = element.clone();
                             let restore_selection_after_insert = restore_selection_after_insert;
                             let input_value_after_insert = input_value_after_insert.clone();
-                            let callback = wasm_bindgen::closure::Closure::once(move || {
-                                if let Some(input) =
-                                    delayed_element.dyn_ref::<web_sys::HtmlInputElement>()
-                                {
-                                    if let Some(value) = input_value_after_insert.as_deref() {
-                                        input.set_value(value);
-                                    }
-                                    let _ = input.focus();
-                                    if should_focus_after_insert {
-                                        let _ = input.select();
-                                    } else if let Some((start, end)) =
-                                        restore_selection_after_insert
+                            for delay_ms in [0, 50] {
+                                let delayed_element = delayed_element.clone();
+                                let restore_selection_after_insert = restore_selection_after_insert;
+                                let input_value_after_insert = input_value_after_insert.clone();
+                                let callback = wasm_bindgen::closure::Closure::once(move || {
+                                    if let Some(input) =
+                                        delayed_element.dyn_ref::<web_sys::HtmlInputElement>()
                                     {
-                                        if let (Some(start), Some(end)) = (start, end) {
-                                            let _ = input.set_selection_range(start, end);
+                                        if let Some(value) = input_value_after_insert.as_deref() {
+                                            input.set_value(value);
                                         }
+                                        let _ = input.focus();
+                                        if should_select_after_insert {
+                                            let _ = input.select();
+                                        } else if let Some((start, end)) =
+                                            restore_selection_after_insert
+                                        {
+                                            if let (Some(start), Some(end)) = (start, end) {
+                                                let _ = input.set_selection_range(start, end);
+                                            }
+                                        }
+                                    } else if let Some(html) =
+                                        delayed_element.dyn_ref::<web_sys::HtmlElement>()
+                                    {
+                                        let _ = html.focus();
                                     }
-                                } else if let Some(html) =
-                                    delayed_element.dyn_ref::<web_sys::HtmlElement>()
-                                {
-                                    let _ = html.focus();
-                                }
-                            });
-                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                                callback.as_ref().unchecked_ref(),
-                                delay_ms,
-                            );
-                            callback.forget();
+                                });
+                                let _ = window
+                                    .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                        callback.as_ref().unchecked_ref(),
+                                        delay_ms,
+                                    );
+                                callback.forget();
+                            }
                         }
                     }
                 });
@@ -872,7 +904,10 @@ fn attach_ui_handler(
             });
         }),
         UiEventKind::Custom(name) => {
-            if let Some(interval_ms) = name.strip_prefix("timer:").and_then(|value| value.parse::<i32>().ok()) {
+            if let Some(interval_ms) = name
+                .strip_prefix("timer:")
+                .and_then(|value| value.parse::<i32>().ok())
+            {
                 raw_el.after_insert(move |element| {
                     let Some(window) = web_sys::window() else {
                         return;
@@ -880,6 +915,13 @@ fn attach_ui_handler(
                     let handlers = handlers.clone();
                     let element = element.clone();
                     let kind_name = name.clone();
+                    let port_key = port.0.to_string();
+                    let port_key_for_callback = port_key.clone();
+                    ACTIVE_TIMER_INTERVALS.with(|timers| {
+                        if let Some(existing_id) = timers.borrow_mut().remove(&port_key) {
+                            window.clear_interval_with_handle(existing_id);
+                        }
+                    });
                     let interval_id = Rc::new(RefCell::new(None::<i32>));
                     let interval_id_for_callback = interval_id.clone();
                     let callback = Closure::<dyn FnMut()>::wrap(Box::new(move || {
@@ -888,6 +930,12 @@ fn attach_ui_handler(
                                 if let Some(window) = web_sys::window() {
                                     window.clear_interval_with_handle(id);
                                 }
+                                ACTIVE_TIMER_INTERVALS.with(|timers| {
+                                    let mut timers = timers.borrow_mut();
+                                    if timers.get(&port_key_for_callback).copied() == Some(id) {
+                                        timers.remove(&port_key_for_callback);
+                                    }
+                                });
                             }
                             return;
                         }
@@ -897,12 +945,13 @@ fn attach_ui_handler(
                             payload: None,
                         });
                     }));
-                    if let Ok(id) = window
-                        .set_interval_with_callback_and_timeout_and_arguments_0(
-                            callback.as_ref().unchecked_ref(),
-                            interval_ms,
-                        )
-                    {
+                    if let Ok(id) = window.set_interval_with_callback_and_timeout_and_arguments_0(
+                        callback.as_ref().unchecked_ref(),
+                        interval_ms,
+                    ) {
+                        ACTIVE_TIMER_INTERVALS.with(|timers| {
+                            timers.borrow_mut().insert(port_key.clone(), id);
+                        });
                         *interval_id.borrow_mut() = Some(id);
                         callback.forget();
                     }

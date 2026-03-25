@@ -11,7 +11,10 @@ use crate::ws_server::{
     self, send_command_to_server, Command as WsCommand, Response as WsResponse,
 };
 
-use super::expected::{matches_inline, ExpectedSpec, MatchMode, ParsedAction};
+use super::expected::{
+    ExpectedSpec, MatchMode, ParsedAction, matches_inline, parse_interaction_sequences,
+    shared_example_parsed_sequences, validate_required_shared_sequences,
+};
 
 /// Options for test-examples command
 pub struct TestOptions {
@@ -62,6 +65,8 @@ pub struct StepResult {
 #[derive(Debug)]
 pub struct DiscoveredExample {
     pub name: String,
+    pub select_name: String,
+    pub editor_filename: String,
     #[allow(dead_code)]
     pub bn_path: PathBuf,
     pub expected_path: PathBuf,
@@ -70,6 +75,7 @@ pub struct DiscoveredExample {
 fn engine_query_value(engine: &str) -> Option<&'static str> {
     match engine {
         "Actors" => Some("actors"),
+        "ActorsLite" => Some("actorslite"),
         "DD" => Some("dd"),
         "Wasm" => Some("wasm"),
         _ => None,
@@ -93,8 +99,316 @@ fn post_refresh_delay_ms(initial_delay_ms: u64) -> u64 {
     std::cmp::max(initial_delay_ms, 500)
 }
 
+async fn send_command_with_timeout(
+    port: u16,
+    command: WsCommand,
+    timeout: Duration,
+) -> Result<WsResponse> {
+    match tokio::time::timeout(timeout, send_command_to_server(port, command)).await {
+        Ok(response) => response,
+        Err(_) => anyhow::bail!("Extension response timeout"),
+    }
+}
+
+async fn get_preview_text_via_eval(port: u16) -> Result<Option<String>> {
+    let response = send_command_with_timeout(
+        port,
+        WsCommand::EvalJs {
+            expression: r#"(function() {
+                const preview = document.querySelector('[data-boon-panel="preview"]');
+                if (!preview) return null;
+                const limit = 8192;
+                const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT);
+                let text = '';
+                let node = walker.nextNode();
+                while (node) {
+                    text += node.textContent || '';
+                    if (text.length >= limit) {
+                        text = text.substring(0, limit);
+                        break;
+                    }
+                    node = walker.nextNode();
+                }
+                return text;
+            })()"#
+                .to_string(),
+        },
+        Duration::from_secs(2),
+    )
+    .await?;
+
+    match response {
+        WsResponse::Success {
+            data: Some(serde_json::Value::String(text)),
+        } => Ok(Some(text)),
+        WsResponse::Success {
+            data: Some(serde_json::Value::Null) | None,
+        } => Ok(None),
+        WsResponse::Error { message } => anyhow::bail!("Eval preview text failed: {}", message),
+        _ => Ok(None),
+    }
+}
+
+async fn get_preview_text(port: u16) -> Result<Option<String>> {
+    for attempt in 0..3 {
+        let direct = send_command_with_timeout(port, WsCommand::GetPreviewText, Duration::from_secs(2)).await;
+        match direct {
+            Ok(WsResponse::PreviewText { text }) => return Ok(Some(text)),
+            Ok(WsResponse::Error { message }) => {
+                if !message.to_ascii_lowercase().contains("timeout") {
+                    anyhow::bail!("GetPreviewText failed: {}", message);
+                }
+            }
+            Ok(_) => return Ok(None),
+            Err(error) => {
+                if !error.to_string().to_ascii_lowercase().contains("timeout") {
+                    return Err(error);
+                }
+            }
+        }
+
+        if let Ok(Some(text)) = get_preview_text_via_eval(port).await {
+            return Ok(Some(text));
+        }
+
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    Ok(None)
+}
+
+async fn wait_for_non_retry_preview_text(
+    port: u16,
+    timeout: Duration,
+) -> Result<Option<String>> {
+    let start = Instant::now();
+    let mut last_preview = None;
+
+    while start.elapsed() <= timeout {
+        let preview = get_preview_text(port).await?;
+        if !preview_needs_retry(preview.as_deref()) {
+            return Ok(preview);
+        }
+        if preview.is_some() {
+            last_preview = preview;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Ok(last_preview)
+}
+
+async fn get_actors_lite_debug(port: u16) -> Result<Option<String>> {
+    let response = send_command_with_timeout(
+        port,
+        WsCommand::GetActorsLiteDebug,
+        Duration::from_secs(3),
+    )
+    .await?;
+
+    match response {
+        WsResponse::ActorsLiteDebug { value } => Ok(value),
+        WsResponse::Error { message } => anyhow::bail!("GetActorsLiteDebug failed: {}", message),
+        _ => Ok(None),
+    }
+}
+
+fn preview_needs_retry(preview: Option<&str>) -> bool {
+    match preview.map(str::trim) {
+        None => true,
+        Some("") => true,
+        Some("Run to see preview") => true,
+        _ => false,
+    }
+}
+
+async fn clear_preview_input_memory(port: u16) -> Result<()> {
+    let expression = r#"(function() {
+        window.__boonLastPreviewTextInput = null;
+        window.__boonLastPreviewTextInputNodeId = null;
+        window.__boonLastPreviewTextInputIndex = null;
+        window.__boonPreferredTextInputIndex = null;
+        window.__boonLastPreviewTextSelectionStart = null;
+        window.__boonLastPreviewTextSelectionEnd = null;
+        return true;
+    })()"#
+    .to_string();
+
+    for attempt in 0..3 {
+        let response = send_command_with_timeout(
+            port,
+            WsCommand::EvalJs {
+                expression: expression.clone(),
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+
+        match response {
+            Ok(WsResponse::Error { message }) => {
+                if !message.to_ascii_lowercase().contains("timeout") {
+                    anyhow::bail!("Clear preview input memory failed: {}", message);
+                }
+            }
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                if !error.to_string().to_ascii_lowercase().contains("timeout") {
+                    return Err(error);
+                }
+            }
+        }
+
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    println!("[boon-tools] warning: clear preview input memory timed out; continuing");
+    Ok(())
+}
+
+async fn inject_example_code(port: u16, filename: &str, path: &Path) -> Result<()> {
+    let code = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("Failed to read example '{}': {}", path.display(), error))?;
+    wait_for_playground_api_ready(port, Duration::from_secs(10)).await?;
+
+    for attempt in 0..2 {
+        let response = send_command_to_server(
+            port,
+            WsCommand::InjectCode {
+                code: code.clone(),
+                filename: Some(filename.to_string()),
+            },
+        )
+        .await?;
+        if let WsResponse::Error { message } = response {
+            let lower = message.to_ascii_lowercase();
+            let api_not_ready = lower.contains("boonplayground api not available")
+                || lower.contains("cannot read properties of undefined")
+                || lower.contains("setcurrentfile");
+            if api_not_ready && attempt == 0 {
+                wait_for_playground_api_ready(port, Duration::from_secs(10)).await?;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            anyhow::bail!("InjectCode failed for '{}': {}", filename, message);
+        }
+        wait_for_editor_contents(port, filename, &code, Duration::from_secs(10)).await?;
+        return Ok(());
+    }
+
+    anyhow::bail!("InjectCode failed for '{}' after retry", filename)
+}
+
+async fn trigger_run_then_capture(port: u16, _engine: Option<&str>) -> Result<Option<String>> {
+    let response = if _engine == Some("ActorsLite") {
+        send_command_to_server(
+            port,
+            WsCommand::EvalJs {
+                expression: r#"(function() {
+                    if (window.boonPlayground && typeof window.boonPlayground.run === 'function') {
+                        window.boonPlayground.run();
+                        return { ok: true, path: 'playground-api' };
+                    }
+                    return { ok: false, reason: 'window.boonPlayground.run unavailable' };
+                })()"#
+                    .to_string(),
+            },
+        )
+        .await?
+    } else {
+        send_command_to_server(port, WsCommand::TriggerRun).await?
+    };
+    if let WsResponse::Error { message } = response {
+        let lower = message.to_ascii_lowercase();
+        if _engine == Some("ActorsLite")
+            && (lower.contains("timeout") || lower.contains("runtime.evaluate"))
+        {
+            return match run_and_capture_initial(port).await {
+                Ok(initial_preview) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    wait_for_preview_to_settle(port).await;
+                    let settled_preview = get_preview_text(port).await?;
+                    if preview_needs_retry(settled_preview.as_deref()) {
+                        Ok(initial_preview)
+                    } else {
+                        Ok(settled_preview)
+                    }
+                }
+                Err(error) => {
+                    let fallback_lower = error.to_string().to_ascii_lowercase();
+                    if fallback_lower.contains("timeout") {
+                        Ok(None)
+                    } else {
+                        Err(error)
+                    }
+                }
+            };
+        }
+        anyhow::bail!("TriggerRun failed: {}", message);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_preview_to_settle(port).await;
+    get_preview_text(port).await
+}
+
+async fn trigger_run_then_capture_immediate(
+    port: u16,
+    engine: Option<&str>,
+) -> Result<Option<String>> {
+    let response = if engine == Some("ActorsLite") {
+        send_command_to_server(
+            port,
+            WsCommand::EvalJs {
+                expression: r#"(function() {
+                    if (window.boonPlayground && typeof window.boonPlayground.run === 'function') {
+                        window.boonPlayground.run();
+                        return { ok: true, path: 'playground-api' };
+                    }
+                    return { ok: false, reason: 'window.boonPlayground.run unavailable' };
+                })()"#
+                    .to_string(),
+            },
+        )
+        .await?
+    } else {
+        send_command_to_server(port, WsCommand::TriggerRun).await?
+    };
+    if let WsResponse::Error { message } = response {
+        anyhow::bail!("TriggerRun failed: {}", message);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_non_retry_preview_text(port, Duration::from_millis(250)).await
+}
+
+async fn trigger_run_until_preview_ready(
+    port: u16,
+    engine: Option<&str>,
+    max_attempts: usize,
+) -> Result<Option<String>> {
+    let attempts = max_attempts.max(1);
+    let mut preview = None;
+
+    for attempt in 0..attempts {
+        preview = trigger_run_then_capture(port, engine).await?;
+        if !preview_needs_retry(preview.as_deref()) {
+            break;
+        }
+
+        if attempt + 1 < attempts {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    Ok(preview)
+}
+
 async fn run_and_capture_initial(port: u16) -> Result<Option<String>> {
-    let response = send_command_to_server(port, WsCommand::RunAndCaptureInitial).await?;
+    let response =
+        send_command_with_timeout(port, WsCommand::RunAndCaptureInitial, Duration::from_secs(10))
+            .await?;
     match response {
         WsResponse::RunAndCaptureInitial {
             success,
@@ -106,7 +420,12 @@ async fn run_and_capture_initial(port: u16) -> Result<Option<String>> {
             }
             if initial_preview == "Run to see preview" {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                let retry = send_command_to_server(port, WsCommand::RunAndCaptureInitial).await?;
+                let retry = send_command_with_timeout(
+                    port,
+                    WsCommand::RunAndCaptureInitial,
+                    Duration::from_secs(10),
+                )
+                .await?;
                 match retry {
                     WsResponse::RunAndCaptureInitial {
                         success,
@@ -139,12 +458,165 @@ async fn wait_for_initial_interaction_settle(port: u16) {
     tokio::time::sleep(Duration::from_millis(150)).await;
 }
 
+async fn wait_for_playground_api_ready(port: u16, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if matches!(get_connection_status(port).await, ConnectionStatus::Ready) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!(
+        "Playground API not ready after waiting {} ms",
+        timeout.as_millis()
+    );
+}
+
+async fn wait_for_current_file(port: u16, expected_filename: &str, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    let expected_json = serde_json::to_string(expected_filename)?;
+    while start.elapsed() < timeout {
+        let response = send_command_to_server(
+            port,
+            WsCommand::EvalJs {
+                expression: format!(
+                    r#"(function() {{
+                        if (!window.boonPlayground || typeof window.boonPlayground.getCurrentFile !== 'function') {{
+                            return {{ ready: false, currentFile: null }};
+                        }}
+                        return {{
+                            ready: true,
+                            currentFile: window.boonPlayground.getCurrentFile(),
+                            codeLength: (typeof window.boonPlayground.getCode === 'function'
+                                ? window.boonPlayground.getCode().length
+                                : null)
+                        }};
+                    }})()"#
+                ),
+            },
+        )
+        .await?;
+
+        let value = match response {
+            WsResponse::Success {
+                data: Some(serde_json::Value::Object(value)),
+            } => serde_json::Value::Object(value),
+            WsResponse::Success {
+                data: Some(serde_json::Value::String(json)),
+            } => serde_json::from_str(&json)?,
+            WsResponse::Error { message } => {
+                if message.to_ascii_lowercase().contains("timeout") {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                anyhow::bail!("EvalJs current-file probe failed: {}", message)
+            }
+            _ => serde_json::Value::Null,
+        };
+
+        let current_file = value.get("currentFile").and_then(|v| v.as_str());
+        let code_length = value.get("codeLength").and_then(|v| v.as_u64());
+        let has_code = code_length.map(|len| len > 0).unwrap_or(true);
+        if current_file == Some(expected_filename) && has_code {
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    anyhow::bail!(
+        "Current file did not become {} within {} ms",
+        expected_json,
+        timeout.as_millis()
+    );
+}
+
+async fn wait_for_editor_contents(
+    port: u16,
+    expected_filename: &str,
+    expected_code: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let start = Instant::now();
+    let expected_filename_json = serde_json::to_string(expected_filename)?;
+    let expected_code_json = serde_json::to_string(expected_code)?;
+
+    while start.elapsed() < timeout {
+        let response = send_command_to_server(
+            port,
+            WsCommand::EvalJs {
+                expression: format!(
+                    r#"(function() {{
+                        if (!window.boonPlayground ||
+                            typeof window.boonPlayground.getCurrentFile !== 'function' ||
+                            typeof window.boonPlayground.getCode !== 'function') {{
+                            return {{ ready: false, matches: false }};
+                        }}
+                        const currentFile = window.boonPlayground.getCurrentFile();
+                        const code = window.boonPlayground.getCode();
+                        return {{
+                            ready: true,
+                            currentFile,
+                            codeLength: code.length,
+                            matches: currentFile === {expected_filename_json} && code === {expected_code_json}
+                        }};
+                    }})()"#
+                ),
+            },
+        )
+        .await?;
+
+        let value = match response {
+            WsResponse::Success {
+                data: Some(serde_json::Value::Object(value)),
+            } => serde_json::Value::Object(value),
+            WsResponse::Success {
+                data: Some(serde_json::Value::String(json)),
+            } => serde_json::from_str(&json)?,
+            WsResponse::Error { message } => {
+                if message.to_ascii_lowercase().contains("timeout") {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                anyhow::bail!("EvalJs editor-content probe failed: {}", message);
+            }
+            _ => serde_json::Value::Null,
+        };
+
+        if value
+            .get("matches")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    anyhow::bail!(
+        "Editor contents did not become {} within {} ms",
+        expected_filename_json,
+        timeout.as_millis()
+    );
+}
+
 async fn refresh_to_example(
     port: u16,
     example_name: &str,
+    select_name: &str,
+    editor_filename: &str,
+    example_path: &Path,
     engine: Option<&str>,
     min_delay_ms: u64,
+    capture_stable_initial_preview: bool,
 ) -> Result<Option<String>> {
+    if engine == Some("ActorsLite") {
+        println!(
+            "[ActorsLite harness] prepare example '{}' with ready-first bootstrap",
+            example_name
+        );
+    }
     let response = send_command_to_server(
         port,
         WsCommand::NavigateTo {
@@ -164,24 +636,220 @@ async fn refresh_to_example(
 
     tokio::time::sleep(Duration::from_millis(min_delay_ms)).await;
 
+    clear_preview_input_memory(port).await?;
+
     let response = send_command_to_server(port, WsCommand::ClearStates).await?;
     if let WsResponse::Error { message } = response {
         anyhow::bail!("ClearStates failed: {}", message);
     }
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let response = send_command_to_server(port, WsCommand::Refresh).await?;
+    if engine == Some("ActorsLite") {
+        println!(
+            "[ActorsLite harness] skip redundant refresh after ClearStates for '{}'",
+            example_name
+        );
+        tokio::time::sleep(Duration::from_millis(min_delay_ms.min(250))).await;
+        wait_for_playground_api_ready(port, Duration::from_secs(10)).await?;
+    } else {
+        let response = send_command_to_server(port, WsCommand::Refresh).await?;
+        if let WsResponse::Error { message } = response {
+            anyhow::bail!("Refresh after ClearStates failed: {}", message);
+        }
+
+        tokio::time::sleep(Duration::from_millis(min_delay_ms)).await;
+        wait_for_playground_api_ready(port, Duration::from_secs(10)).await?;
+    }
+    clear_preview_input_memory(port).await?;
+
+    let response = send_command_to_server(
+        port,
+        WsCommand::SelectExample {
+            name: select_name.to_string(),
+        },
+    )
+    .await?;
     if let WsResponse::Error { message } = response {
-        anyhow::bail!("Refresh after ClearStates failed: {}", message);
+        anyhow::bail!("SelectExample failed for '{}': {}", select_name, message);
+    }
+    wait_for_current_file(port, editor_filename, Duration::from_secs(10)).await?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    if engine == Some("ActorsLite") {
+        inject_example_code(port, editor_filename, example_path).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    if wait_for_current_file(port, editor_filename, Duration::from_secs(10))
+        .await
+        .is_ok()
+    {
+        tokio::time::sleep(Duration::from_millis(min_delay_ms.max(300))).await;
+
+        if engine == Some("ActorsLite") {
+            println!(
+                "[ActorsLite harness] run initial preview for '{}' via TriggerRun + {} capture",
+                example_name,
+                if capture_stable_initial_preview {
+                    "settled"
+                } else {
+                    "immediate"
+                }
+            );
+            let initial_preview = if capture_stable_initial_preview {
+                trigger_run_until_preview_ready(port, engine, 3).await?
+            } else {
+                trigger_run_then_capture_immediate(port, engine).await?
+            };
+            let summary = initial_preview
+                .as_deref()
+                .map(|text| truncate_for_error(text, 80))
+                .unwrap_or_else(|| "<none>".to_string());
+            println!(
+                "[ActorsLite harness] initial preview for '{}' => {}",
+                example_name, summary
+            );
+            if capture_stable_initial_preview && preview_needs_retry(initial_preview.as_deref()) {
+                match get_actors_lite_debug(port).await {
+                    Ok(Some(debug)) => {
+                        println!(
+                            "[ActorsLite harness] actors-lite debug for '{}' => {}",
+                            example_name, debug
+                        );
+                    }
+                    Ok(None) => {
+                        println!(
+                            "[ActorsLite harness] actors-lite debug for '{}' => <none>",
+                            example_name
+                        );
+                    }
+                    Err(error) => {
+                        println!(
+                            "[ActorsLite harness] actors-lite debug for '{}' failed: {}",
+                            example_name, error
+                        );
+                    }
+                }
+            }
+            if capture_stable_initial_preview {
+                wait_for_initial_interaction_settle(port).await;
+            }
+            return Ok(initial_preview);
+        }
+
+        let initial_preview = get_preview_text(port).await?;
+        if preview_needs_retry(initial_preview.as_deref()) {
+            return trigger_run_then_capture(port, engine).await;
+        }
+        return Ok(initial_preview);
     }
 
-    tokio::time::sleep(Duration::from_millis(min_delay_ms)).await;
+    let reset_example = if example_name == "minimal" {
+        "hello_world.bn"
+    } else {
+        "minimal.bn"
+    };
+    let response = send_command_to_server(
+        port,
+        WsCommand::SelectExample {
+            name: reset_example.to_string(),
+        },
+    )
+    .await?;
+    if let WsResponse::Error { message } = response {
+        anyhow::bail!("Reset SelectExample failed: {}", message);
+    }
+    wait_for_current_file(port, reset_example, Duration::from_secs(10)).await?;
+
+    let response = send_command_to_server(
+        port,
+        WsCommand::SelectExample {
+            name: select_name.to_string(),
+        },
+    )
+    .await?;
+    if let WsResponse::Error { message } = response {
+        anyhow::bail!("SelectExample after refresh failed: {}", message);
+    }
+    wait_for_current_file(port, editor_filename, Duration::from_secs(10)).await?;
+    if engine == Some("ActorsLite") {
+        inject_example_code(port, editor_filename, example_path).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        wait_for_current_file(port, editor_filename, Duration::from_secs(10)).await?;
+    }
+    tokio::time::sleep(Duration::from_millis(min_delay_ms.max(300))).await;
+
+    if engine == Some("ActorsLite") {
+        println!(
+            "[ActorsLite harness] run initial preview for '{}' via TriggerRun + {} capture",
+            example_name,
+            if capture_stable_initial_preview {
+                "settled"
+            } else {
+                "immediate"
+            }
+        );
+        let initial_preview = if capture_stable_initial_preview {
+            trigger_run_until_preview_ready(port, engine, 3).await?
+        } else {
+            trigger_run_then_capture_immediate(port, engine).await?
+        };
+        let summary = initial_preview
+            .as_deref()
+            .map(|text| truncate_for_error(text, 80))
+            .unwrap_or_else(|| "<none>".to_string());
+        println!(
+            "[ActorsLite harness] initial preview for '{}' => {}",
+            example_name, summary
+        );
+        if capture_stable_initial_preview && preview_needs_retry(initial_preview.as_deref()) {
+            match get_actors_lite_debug(port).await {
+                Ok(Some(debug)) => {
+                    println!(
+                        "[ActorsLite harness] actors-lite debug for '{}' => {}",
+                        example_name, debug
+                    );
+                }
+                Ok(None) => {
+                    println!(
+                        "[ActorsLite harness] actors-lite debug for '{}' => <none>",
+                        example_name
+                    );
+                }
+                Err(error) => {
+                    println!(
+                        "[ActorsLite harness] actors-lite debug for '{}' failed: {}",
+                        example_name, error
+                    );
+                }
+            }
+        }
+        if capture_stable_initial_preview {
+            wait_for_initial_interaction_settle(port).await;
+        }
+        return Ok(initial_preview);
+    }
     match run_and_capture_initial(port).await {
         Ok(initial_preview) => {
+            if engine == Some("ActorsLite") {
+                let summary = initial_preview
+                    .as_deref()
+                    .map(|text| truncate_for_error(text, 80))
+                    .unwrap_or_else(|| "<none>".to_string());
+                println!(
+                    "[ActorsLite harness] initial preview for '{}' => {}",
+                    example_name, summary
+                );
+            }
             wait_for_initial_interaction_settle(port).await;
             Ok(initial_preview)
         }
         Err(error) => {
+            if engine == Some("ActorsLite") {
+                println!(
+                    "[ActorsLite harness] initial preview for '{}' failed: {}",
+                    example_name, error
+                );
+            }
             let is_timeout = error
                 .to_string()
                 .to_ascii_lowercase()
@@ -189,11 +857,20 @@ async fn refresh_to_example(
             if !is_timeout {
                 return Err(error);
             }
-
-            tokio::time::sleep(Duration::from_millis(750)).await;
-            let initial_preview = run_and_capture_initial(port).await?;
-            wait_for_initial_interaction_settle(port).await;
-            Ok(initial_preview)
+            if engine == Some("ActorsLite") {
+                println!(
+                    "[ActorsLite harness] falling back to TriggerRun + settled preview capture for '{}'",
+                    example_name
+                );
+                let initial_preview = trigger_run_then_capture(port, engine).await?;
+                wait_for_initial_interaction_settle(port).await;
+                Ok(initial_preview)
+            } else {
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                let initial_preview = run_and_capture_initial(port).await?;
+                wait_for_initial_interaction_settle(port).await;
+                Ok(initial_preview)
+            }
         }
     }
 }
@@ -209,7 +886,6 @@ pub fn discover_examples(examples_dir: &Path) -> Result<Vec<DiscoveredExample>> 
     {
         let path = entry.path();
         if path.extension().map(|e| e == "expected").unwrap_or(false) {
-            // Found an .expected file, look for matching .bn
             let stem = path.file_stem().unwrap().to_str().unwrap();
             let bn_path = path.with_extension("bn");
 
@@ -217,7 +893,25 @@ pub fn discover_examples(examples_dir: &Path) -> Result<Vec<DiscoveredExample>> 
                 let name = stem.to_string();
                 examples.push(DiscoveredExample {
                     name,
+                    select_name: stem.to_string(),
+                    editor_filename: format!("{stem}.bn"),
                     bn_path,
+                    expected_path: path.to_path_buf(),
+                });
+                continue;
+            }
+
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            let run_path = parent.join("RUN.bn");
+            if run_path.exists() {
+                let name = stem.to_string();
+                examples.push(DiscoveredExample {
+                    name,
+                    select_name: stem.to_string(),
+                    editor_filename: "RUN.bn".to_string(),
+                    bn_path: run_path,
                     expected_path: path.to_path_buf(),
                 });
             }
@@ -417,6 +1111,56 @@ async fn get_connection_status(port: u16) -> ConnectionStatus {
     }
 }
 
+async fn get_server_status(port: u16) -> Option<ServerStatus> {
+    check_server_connection(port).await.ok()
+}
+
+fn setup_launch_engine(initial_engine: Option<&str>) -> &'static str {
+    match initial_engine {
+        Some("ActorsLite") => "Actors",
+        Some("Actors") => "Actors",
+        Some("DD") => "DD",
+        Some("Wasm") => "Wasm",
+        Some(_) | None => "Actors",
+    }
+}
+
+async fn relaunch_clean_automation_browser(
+    port: u16,
+    playground_port: u16,
+    initial_engine: Option<&str>,
+) -> Result<()> {
+    println!("[ActorsLite harness] relaunching automation browser from a clean visible page");
+    let _ = browser::kill_browser_instances();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let opts = browser::LaunchOptions {
+        playground_port,
+        ws_port: port,
+        headless: false,
+        keep_open: true,
+        browser_path: None,
+        initial_engine: Some(setup_launch_engine(initial_engine).to_string()),
+        initial_example: Some("counter".to_string()),
+    };
+
+    let child = browser::launch_browser(opts)?;
+    println!(
+        "[ActorsLite harness] relaunched Chromium (PID: {}) for clean ready state",
+        child.id()
+    );
+    browser::wait_for_extension_connection(port, Duration::from_secs(30)).await?;
+
+    if let Some(server_status) = get_server_status(port).await {
+        println!(
+            "[ActorsLite harness] post-relaunch url={:?} api_ready={}",
+            server_status.page_url, server_status.api_ready
+        );
+    }
+
+    Ok(())
+}
+
 /// Result of setup - tracks what we started so we can clean up
 pub struct SetupState {
     /// Did we start mzoon ourselves? If so, we should kill it when done.
@@ -506,7 +1250,7 @@ async fn ensure_browser_connection(
             headless: false,
             keep_open: true, // Don't block waiting
             browser_path: None,
-            initial_engine: Some(initial_engine.unwrap_or("Actors").to_string()),
+            initial_engine: Some(setup_launch_engine(initial_engine).to_string()),
             initial_example: Some("counter".to_string()),
         };
 
@@ -551,11 +1295,12 @@ async fn ensure_browser_connection(
     if !matches!(final_status, ConnectionStatus::Ready) {
         // Wait for the playground WASM to load
         let initial_wait = Duration::from_secs(15);
-        let max_retries = 3;
+        let max_retries = 6;
+        let mut actors_lite_stuck_retries = 0u8;
 
         println!("Waiting for playground API to be ready...");
 
-        for retry in 0..max_retries {
+        'readiness: for retry in 0..max_retries {
             let start = Instant::now();
 
             // Wait with status updates
@@ -581,7 +1326,32 @@ async fn ensure_browser_connection(
                         max_retries
                     );
 
-                    // Send refresh command through WebSocket
+                    if initial_engine == Some("ActorsLite") {
+                        if let Some(server_status) = get_server_status(port).await {
+                            println!(
+                                "[ActorsLite harness] retry reset url={:?} api_ready={}",
+                                server_status.page_url, server_status.api_ready
+                            );
+                            let page_is_stuck = !server_status.api_ready
+                                && server_status
+                                    .page_url
+                                    .as_deref()
+                                    .is_some_and(|url| url.contains("engine=actorslite"));
+                            if page_is_stuck {
+                                actors_lite_stuck_retries =
+                                    actors_lite_stuck_retries.saturating_add(1);
+                                if actors_lite_stuck_retries >= 2 {
+                                    println!(
+                                        "[ActorsLite harness] repeated stuck ActorsLite route detected, fast-tracking clean relaunch"
+                                    );
+                                    break 'readiness;
+                                }
+                            } else {
+                                actors_lite_stuck_retries = 0;
+                            }
+                        }
+                    }
+
                     let _ = send_command_to_server(port, WsCommand::Refresh).await;
 
                     // Wait a bit for refresh to complete
@@ -597,6 +1367,53 @@ async fn ensure_browser_connection(
         if matches!(get_connection_status(port).await, ConnectionStatus::Ready) {
             println!("Playground API ready!");
             return Ok(setup);
+        }
+
+        if initial_engine == Some("ActorsLite") {
+            println!(
+                "[ActorsLite harness] API still not ready after {} retries, attempting one clean browser relaunch",
+                max_retries
+            );
+
+            match relaunch_clean_automation_browser(port, playground_port, initial_engine).await {
+                Ok(()) => {
+                    let recovery_wait = Duration::from_secs(15);
+                    let recovery_retries = 3;
+
+                    for retry in 0..recovery_retries {
+                        let start = Instant::now();
+                        while start.elapsed() < recovery_wait {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            if matches!(get_connection_status(port).await, ConnectionStatus::Ready)
+                            {
+                                println!("Playground API ready after clean relaunch!");
+                                return Ok(setup);
+                            }
+                        }
+
+                        if retry < recovery_retries - 1
+                            && matches!(
+                                get_connection_status(port).await,
+                                ConnectionStatus::ExtensionConnectedNotReady
+                            )
+                        {
+                            println!(
+                                "[ActorsLite harness] post-relaunch API still not ready, refreshing page (attempt {}/{})...",
+                                retry + 1,
+                                recovery_retries
+                            );
+                            let _ = send_command_to_server(port, WsCommand::Refresh).await;
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
+                    }
+                }
+                Err(error) => {
+                    println!(
+                        "[ActorsLite harness] clean relaunch failed after readiness retries: {}",
+                        error
+                    );
+                }
+            }
         }
 
         anyhow::bail!(
@@ -697,7 +1514,18 @@ async fn run_tests_inner(opts: &TestOptions) -> Result<Vec<TestResult>> {
         // Refresh to a lightweight example before switching engines so the next engine
         // does not inherit heavy in-memory state from the currently loaded page.
         if !already_on_requested_engine {
-            let _ = refresh_to_example(opts.port, "counter", None, 1500).await?;
+            let counter_path = find_examples_dir()?.join("counter").join("counter.bn");
+            let _ = refresh_to_example(
+                opts.port,
+                "counter",
+                "counter",
+                "counter.bn",
+                &counter_path,
+                None,
+                1500,
+                true,
+            )
+            .await?;
 
             if effective_engine != *engine {
                 println!(
@@ -751,7 +1579,8 @@ async fn run_tests_inner(opts: &TestOptions) -> Result<Vec<TestResult>> {
 
     // Apply filter
     if let Some(ref filter) = opts.filter {
-        examples.retain(|e| e.name.contains(filter));
+        let prefer_exact = examples.iter().any(|example| example.name == *filter);
+        examples.retain(|example| example_name_matches_filter(&example.name, filter, prefer_exact));
         if examples.is_empty() {
             println!("No examples match filter '{}'", filter);
             return Ok(vec![]);
@@ -832,6 +1661,10 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
 
     // Parse expected spec
     let spec = ExpectedSpec::from_file(&example.expected_path)?;
+    let parsed_sequences = parse_interaction_sequences(&spec.sequence)?;
+    validate_required_shared_sequences(&example.name, &parsed_sequences)?;
+    let sequences =
+        shared_example_parsed_sequences(&example.name).unwrap_or(parsed_sequences);
     let is_timer_category = matches!(spec.test.category.as_deref(), Some("timer"));
     let persistence_enabled = !opts.skip_persistence && !spec.persistence.is_empty();
 
@@ -890,11 +1723,24 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
     } else {
         post_refresh_delay_ms(spec.timing.initial_delay)
     };
+    if opts.engine.as_deref() == Some("ActorsLite") {
+        println!(
+            "[ActorsLite harness] start example '{}' (initial_delay={}ms, refresh_delay={}ms, sequences={})",
+            example.name,
+            spec.timing.initial_delay,
+            refresh_delay,
+            sequences.len()
+        );
+    }
     let initial_preview = match refresh_to_example(
         opts.port,
         &example.name,
+        &example.select_name,
+        &example.editor_filename,
+        &example.bn_path,
         opts.engine.as_deref(),
         refresh_delay,
+        !is_timer_category,
     )
     .await
     {
@@ -1063,34 +1909,56 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
     let mut all_passed = initial_passed || !spec.sequence.is_empty();
     let mut preferred_input_index = None;
 
-    for seq in &spec.sequence {
+    for seq in &sequences {
+        if opts.engine.as_deref() == Some("ActorsLite") {
+            println!(
+                "[ActorsLite harness] sequence '{}' for '{}'",
+                seq.description
+                    .as_deref()
+                    .unwrap_or("<unnamed sequence>"),
+                example.name
+            );
+        }
         let mut last_action = None;
         // Execute actions
-        for action in &seq.actions {
-            let parsed = action.parse()?;
+        for parsed in &seq.actions {
             if opts.verbose {
                 println!("  -> {:?}", parsed);
             }
             last_action = Some(parsed.clone());
             if let Err(e) =
-                execute_action(opts.port, &parsed, &mut preferred_input_index, opts.verbose).await
+                execute_action(
+                    opts.port,
+                    opts.engine.as_deref(),
+                    parsed,
+                    &mut preferred_input_index,
+                    opts.verbose,
+                )
+                .await
             {
+                let mut error_text = e.to_string();
+                if opts.engine.as_deref() == Some("ActorsLite") {
+                    if let Ok(Some(debug)) = get_actors_lite_debug(opts.port).await {
+                        println!("[ActorsLite harness] debug on failure => {}", debug);
+                        error_text = format!("{error_text}\nActorsLite debug: {debug}");
+                    }
+                }
                 // Action failed (including assertions) - record as test failure
                 steps.push(StepResult {
-                    description: seq
-                        .description
-                        .clone()
-                        .unwrap_or_else(|| format!("{:?}", parsed)),
-                    passed: false,
-                    actual: Some(e.to_string()),
-                    expected: None,
+                        description: seq
+                            .description
+                            .clone()
+                            .unwrap_or_else(|| format!("{:?}", parsed)),
+                        passed: false,
+                        actual: Some(error_text.clone()),
+                        expected: None,
                 });
                 return Ok(TestResult {
                     name: example.name.clone(),
                     passed: false,
                     skipped: None,
                     duration: start.elapsed(),
-                    error: Some(e.to_string()),
+                    error: Some(error_text),
                     actual_output: None,
                     expected_output: None,
                     steps,
@@ -1239,6 +2107,7 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
                 }
                 if let Err(e) = execute_action(
                     opts.port,
+                    opts.engine.as_deref(),
                     &parsed,
                     &mut preferred_input_index,
                     opts.verbose,
@@ -1364,22 +2233,7 @@ async fn wait_for_output(
         }
 
         // Get current preview
-        let response = send_command_to_server(port, WsCommand::GetPreviewText)
-            .await
-            .map_err(|e| WaitError::Other(e))?;
-
-        let preview = match response {
-            WsResponse::PreviewText { text } => text,
-            WsResponse::Error { message } => {
-                return Err(WaitError::Other(anyhow::anyhow!(
-                    "GetPreview failed: {}",
-                    message
-                )));
-            }
-            _ => {
-                return Err(WaitError::Other(anyhow::anyhow!("Unexpected response")));
-            }
-        };
+        let preview = get_preview(port).await.map_err(WaitError::Other)?;
 
         // Check match
         let matches = output_spec
@@ -1389,17 +2243,12 @@ async fn wait_for_output(
         if matches {
             // Stability check - wait and verify again
             tokio::time::sleep(interval).await;
-            let response = send_command_to_server(port, WsCommand::GetPreviewText)
-                .await
+            let text = get_preview(port).await.map_err(WaitError::Other)?;
+            let still_matches = output_spec
+                .matches(&text)
                 .map_err(|e| WaitError::Other(e))?;
-
-            if let WsResponse::PreviewText { text } = response {
-                let still_matches = output_spec
-                    .matches(&text)
-                    .map_err(|e| WaitError::Other(e))?;
-                if still_matches {
-                    return Ok(text);
-                }
+            if still_matches {
+                return Ok(text);
             }
         }
 
@@ -1433,38 +2282,18 @@ async fn wait_for_inline_output(
             });
         }
 
-        let response = send_command_to_server(port, WsCommand::GetPreviewText)
-            .await
-            .map_err(|e| WaitError::Other(e))?;
-
-        let preview = match response {
-            WsResponse::PreviewText { text } => text,
-            WsResponse::Error { message } => {
-                return Err(WaitError::Other(anyhow::anyhow!(
-                    "GetPreview failed: {}",
-                    message
-                )));
-            }
-            _ => {
-                return Err(WaitError::Other(anyhow::anyhow!("Unexpected response")));
-            }
-        };
+        let preview = get_preview(port).await.map_err(WaitError::Other)?;
 
         let matches = matches_inline(&preview, expected, mode).map_err(|e| WaitError::Other(e))?;
 
         if matches {
             // Stability check
             tokio::time::sleep(interval).await;
-            let response = send_command_to_server(port, WsCommand::GetPreviewText)
-                .await
-                .map_err(|e| WaitError::Other(e))?;
-
-            if let WsResponse::PreviewText { text } = response {
-                let still_matches =
-                    matches_inline(&text, expected, mode).map_err(|e| WaitError::Other(e))?;
-                if still_matches {
-                    return Ok(text);
-                }
+            let text = get_preview(port).await.map_err(WaitError::Other)?;
+            let still_matches =
+                matches_inline(&text, expected, mode).map_err(|e| WaitError::Other(e))?;
+            if still_matches {
+                return Ok(text);
             }
         }
 
@@ -1518,10 +2347,16 @@ async fn set_focused_input_value(port: u16, value: &str, verbose: bool) -> Resul
     let focus_js = r#"(function() {
             const preview = document.querySelector('[data-boon-panel="preview"]');
             if (!preview) return 'ERROR: preview root not found';
-            const inputs = Array.from(preview.querySelectorAll('input, textarea'));
-            const collectInputs = () => Array.from(
-                preview.querySelectorAll('input, textarea')
-            ).map((element) => ({
+            const isTextInput = (element) =>
+                element
+                && element !== document.body
+                && (
+                    element.tagName === 'TEXTAREA'
+                    || (element.tagName === 'INPUT'
+                        && !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+                );
+            const inputs = Array.from(preview.querySelectorAll('input, textarea')).filter(isTextInput);
+            const collectInputs = () => inputs.map((element) => ({
                 nodeId: element.getAttribute('data-boon-node-id'),
                 inputPort: element.getAttribute('data-boon-port-input'),
                 keyDownPort: element.getAttribute('data-boon-port-key-down'),
@@ -1532,10 +2367,6 @@ async fn set_focused_input_value(port: u16, value: &str, verbose: bool) -> Resul
                 value: element.value || '',
                 connected: element.isConnected,
             }));
-            const isTextInput = (element) =>
-                element
-                && element !== document.body
-                && (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA');
             const remembered = window.__boonLastPreviewTextInput;
             const rememberedNodeId =
                 window.__boonLastPreviewTextInputNodeId ||
@@ -1549,13 +2380,22 @@ async fn set_focused_input_value(port: u16, value: &str, verbose: bool) -> Resul
                 typeof window.__boonPreferredTextInputIndex === 'number'
                     ? window.__boonPreferredTextInputIndex
                     : null;
-            let input = preferredIndex != null
-                ? inputs[preferredIndex] || null
-                : null;
-            if (!isTextInput(input)) {
-                input = rememberedNodeId
-                ? preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]')
-                : null;
+            const focusedCandidate = (() => {
+                const previewFocused = preview.querySelector(':focus');
+                if (isTextInput(previewFocused)) return previewFocused;
+                if (isTextInput(document.activeElement) && preview.contains(document.activeElement)) {
+                    return document.activeElement;
+                }
+                return preview.querySelector('[data-boon-focused="true"]')
+                    || preview.querySelector('[focused="true"]')
+                    || preview.querySelector('input[autofocus], textarea[autofocus]');
+            })();
+            let input = isTextInput(focusedCandidate) ? focusedCandidate : null;
+            if (!isTextInput(input) && preferredIndex != null) {
+                input = inputs[preferredIndex] || null;
+            }
+            if (!isTextInput(input) && rememberedNodeId) {
+                input = preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]');
             }
             if (!isTextInput(input) && rememberedIndex != null) {
                 input = inputs[rememberedIndex] || input;
@@ -1563,15 +2403,7 @@ async fn set_focused_input_value(port: u16, value: &str, verbose: bool) -> Resul
             if (!isTextInput(input)) {
                 input = isTextInput(remembered) && remembered.isConnected && preview.contains(remembered)
                     ? remembered
-                    : document.activeElement;
-            }
-            if (!isTextInput(input)) {
-                const previewFocused = preview.querySelector(':focus');
-                input = isTextInput(previewFocused)
-                    ? previewFocused
-                    : preview.querySelector('[data-boon-focused="true"]')
-                        || preview.querySelector('[focused="true"]')
-                        || preview.querySelector('input[autofocus], textarea[autofocus]');
+                    : null;
             }
             if (!input || input === document.body) return 'ERROR: no focused element';
             if (input.tagName !== 'INPUT' && input.tagName !== 'TEXTAREA') {
@@ -1672,21 +2504,27 @@ async fn focused_preview_input_via_eval(port: u16) -> Result<(Option<String>, Op
                     && element !== document.body
                     && (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA');
                 const remembered = window.__boonLastPreviewTextInput;
-                let focused = isTextInput(remembered) && remembered.isConnected && preview.contains(remembered)
-                    ? remembered
-                    : document.activeElement;
-                if (!isTextInput(focused)) {
-                    const previewFocused = preview.querySelector(':focus');
-                    focused = isTextInput(previewFocused)
-                        ? previewFocused
+                const previewFocused = preview.querySelector(':focus');
+                let focused = isTextInput(previewFocused)
+                    ? previewFocused
+                    : (isTextInput(document.activeElement) && preview.contains(document.activeElement)
+                        ? document.activeElement
                         : preview.querySelector('[data-boon-focused="true"]')
                             || preview.querySelector('[focused="true"]')
-                            || preview.querySelector('input[autofocus], textarea[autofocus]');
+                            || preview.querySelector('input[autofocus], textarea[autofocus]'));
+                if (!isTextInput(focused)) {
+                    focused = isTextInput(remembered) && remembered.isConnected && preview.contains(remembered)
+                        ? remembered
+                        : null;
                 }
                 if (!isTextInput(focused)) {
                     return { tagName: focused?.tagName ?? null, inputIndex: null };
                 }
-                const inputs = Array.from(preview.querySelectorAll('input, textarea, [contenteditable="true"]'));
+                const inputs = Array.from(preview.querySelectorAll('input, textarea, [contenteditable="true"]')).filter((element) =>
+                    element.matches?.('textarea, [contenteditable="true"]')
+                    || (element.matches?.('input')
+                        && !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+                );
                 const index = inputs.findIndex((input) => input === focused);
                 return {
                     tagName: focused.tagName || null,
@@ -1732,6 +2570,195 @@ async fn focused_preview_input_via_eval(port: u16) -> Result<(Option<String>, Op
     }
 }
 
+async fn focused_preview_debug_via_eval(port: u16) -> Result<String> {
+    let response = send_command_to_server(
+        port,
+        WsCommand::EvalJs {
+            expression: r#"(function() {
+                const preview = document.querySelector('[data-boon-panel="preview"]');
+                if (!preview) return { error: 'preview root not found' };
+                const isTextInput = (element) =>
+                    element
+                    && element !== document.body
+                    && (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA');
+                const describe = (element) => element ? {
+                    tag: element.tagName || null,
+                    type: element.type || null,
+                    value: element.value || '',
+                    nodeId: element.getAttribute?.('data-boon-node-id') || null,
+                    focusedAttr: element.getAttribute?.('focused') || null,
+                    boonFocused: element.getAttribute?.('data-boon-focused') || null,
+                    autofocus: element.getAttribute?.('autofocus') || null,
+                    connected: !!element.isConnected,
+                    active: element === document.activeElement,
+                } : null;
+                const inputs = Array.from(preview.querySelectorAll('input, textarea, [contenteditable=\"true\"]')).filter((element) =>
+                    element.matches?.('textarea, [contenteditable=\"true\"]')
+                    || (element.matches?.('input')
+                        && !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+                );
+                return {
+                    activeElement: describe(document.activeElement),
+                    previewFocus: describe(preview.querySelector(':focus')),
+                    remembered: describe(window.__boonLastPreviewTextInput),
+                    textInputs: inputs.map((element, index) => ({
+                        index,
+                        ...describe(element),
+                    })),
+                };
+            })()"#
+                .to_string(),
+        },
+    )
+    .await?;
+
+    match response {
+        WsResponse::Success { data: Some(value) } => Ok(value.to_string()),
+        WsResponse::Success { data: None } => Ok("null".to_string()),
+        WsResponse::Error { message } => anyhow::bail!("Focused preview debug eval failed: {}", message),
+        _ => anyhow::bail!("Unexpected response for focused preview debug eval"),
+    }
+}
+
+async fn preview_text_input_properties_via_eval(
+    port: u16,
+    index: u32,
+) -> Result<(bool, Option<String>, Option<String>)> {
+    let response = send_command_to_server(
+        port,
+        WsCommand::EvalJs {
+            expression: format!(
+                r#"(function() {{
+                    const preview = document.querySelector('[data-boon-panel="preview"]');
+                    if (!preview) return {{ found: false, placeholder: null, value: null }};
+                    const inputs = Array.from(
+                        preview.querySelectorAll('input, textarea, [contenteditable="true"]')
+                    ).filter((element) =>
+                        element.matches?.('textarea, [contenteditable="true"]')
+                        || (element.matches?.('input')
+                            && !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+                    );
+                    const input = inputs[{index}];
+                    if (!input) {{
+                        return {{ found: false, placeholder: null, value: null }};
+                    }}
+                    return {{
+                        found: true,
+                        placeholder: input.placeholder || input.getAttribute('placeholder') || null,
+                        value: input.value ?? input.textContent ?? ''
+                    }};
+                }})()"#,
+                index = index,
+            ),
+        },
+    )
+    .await?;
+
+    match response {
+        WsResponse::Success {
+            data: Some(serde_json::Value::Object(value)),
+        } => Ok((
+            value.get("found").and_then(|v| v.as_bool()).unwrap_or(false),
+            value.get("placeholder")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            value.get("value")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        )),
+        WsResponse::Success {
+            data: Some(serde_json::Value::String(json)),
+        } => {
+            let value: serde_json::Value = serde_json::from_str(&json)?;
+            Ok((
+                value.get("found").and_then(|v| v.as_bool()).unwrap_or(false),
+                value.get("placeholder")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                value.get("value")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            ))
+        }
+        WsResponse::Error { message } => anyhow::bail!("Preview input eval failed: {}", message),
+        _ => Ok((false, None, None)),
+    }
+}
+
+async fn preview_button_disabled_via_eval(port: u16, index: u32) -> Result<(bool, bool, String)> {
+    let response = send_command_to_server(
+        port,
+        WsCommand::EvalJs {
+            expression: format!(
+                r#"(function() {{
+                    const preview = document.querySelector('[data-boon-panel="preview"]');
+                    if (!preview) return {{ found: false, disabled: false, text: '' }};
+                    const isCheckboxInput = (el) =>
+                        el
+                        && el.tagName === 'INPUT'
+                        && ((el.getAttribute('type') || '').toLowerCase() === 'checkbox');
+                    const isVisible = (el) => {{
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width === 0 || rect.height === 0) return false;
+                        const style = window.getComputedStyle(el);
+                        return style.display !== 'none' && style.visibility !== 'hidden';
+                    }};
+                    const buttons = Array.from(
+                        preview.querySelectorAll('button, [role="button"], [data-boon-port-click]')
+                    ).filter((element) => !isCheckboxInput(element) && isVisible(element));
+                    const button = buttons[{index}];
+                    if (!button) {{
+                        return {{ found: false, disabled: false, text: '' }};
+                    }}
+                    return {{
+                        found: true,
+                        disabled: !!button.disabled || button.getAttribute('aria-disabled') === 'true',
+                        text: (button.textContent || '').trim()
+                    }};
+                }})()"#,
+                index = index,
+            ),
+        },
+    )
+    .await?;
+
+    match response {
+        WsResponse::Success {
+            data: Some(serde_json::Value::Object(value)),
+        } => Ok((
+            value.get("found").and_then(|v| v.as_bool()).unwrap_or(false),
+            value
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            value
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        )),
+        WsResponse::Success {
+            data: Some(serde_json::Value::String(json)),
+        } => {
+            let value: serde_json::Value = serde_json::from_str(&json)?;
+            Ok((
+                value.get("found").and_then(|v| v.as_bool()).unwrap_or(false),
+                value
+                    .get("disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                value
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            ))
+        }
+        WsResponse::Error { message } => anyhow::bail!("Preview button eval failed: {}", message),
+        _ => Ok((false, false, String::new())),
+    }
+}
+
 async fn wait_for_focused_text_input_suffix(port: u16, expected_suffix: &str) -> Result<()> {
     if expected_suffix.is_empty() {
         return Ok(());
@@ -1746,16 +2773,19 @@ async fn wait_for_focused_text_input_suffix(port: u16, expected_suffix: &str) ->
             && element !== document.body
             && (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA');
         const remembered = window.__boonLastPreviewTextInput;
-        let focused = isTextInput(remembered) && remembered.isConnected && preview.contains(remembered)
-            ? remembered
-            : document.activeElement;
-        if (!isTextInput(focused)) {
-            const previewFocused = preview.querySelector(':focus');
-            focused = isTextInput(previewFocused)
-                ? previewFocused
+        const previewFocused = preview.querySelector(':focus');
+        let focused = isTextInput(previewFocused)
+            ? previewFocused
+            : (isTextInput(document.activeElement) && preview.contains(document.activeElement)
+                ? document.activeElement
                 : preview.querySelector('[data-boon-focused="true"]')
                     || preview.querySelector('[focused="true"]')
-                    || null;
+                    || preview.querySelector('input[autofocus], textarea[autofocus]')
+                    || null);
+        if (!isTextInput(focused)) {
+            focused = isTextInput(remembered) && remembered.isConnected && preview.contains(remembered)
+                ? remembered
+                : null;
         }
         if (!isTextInput(focused)) {
             return { found: false, value: null };
@@ -1789,8 +2819,6 @@ async fn wait_for_focused_text_input_suffix(port: u16, expected_suffix: &str) ->
                     if value.ends_with(expected_suffix) {
                         return Ok(());
                     }
-                } else if !saw_input {
-                    return Ok(());
                 }
             }
             WsResponse::Error { .. } => return Ok(()),
@@ -1805,16 +2833,599 @@ async fn wait_for_focused_text_input_suffix(port: u16, expected_suffix: &str) ->
                     last_value
                 );
             }
-            return Ok(());
+            anyhow::bail!(
+                "No focused preview text input was available while waiting for typed suffix {:?}",
+                expected_suffix
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn dispatch_preview_special_key_via_eval(port: u16, key: &str) -> Result<bool> {
+    if !matches!(key, "Enter" | "Escape") {
+        return Ok(false);
+    }
+
+    let response = send_command_to_server(
+        port,
+        WsCommand::EvalJs {
+            expression: format!(
+                r#"(function() {{
+                    const preview = document.querySelector('[data-boon-panel="preview"]');
+                    if (!preview) return {{ dispatched: false }};
+                    const isTextInput = (element) =>
+                        element
+                        && element !== document.body
+                        && (
+                            element.tagName === 'TEXTAREA'
+                            || (element.tagName === 'INPUT'
+                                && !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+                        );
+                    const remembered = window.__boonLastPreviewTextInput;
+                    const rememberedNodeId =
+                        window.__boonLastPreviewTextInputNodeId ||
+                        remembered?.getAttribute?.('data-boon-node-id') ||
+                        null;
+                    const previewFocused = preview.querySelector(':focus');
+                    let focused = isTextInput(previewFocused)
+                        ? previewFocused
+                        : (isTextInput(document.activeElement) && preview.contains(document.activeElement)
+                            ? document.activeElement
+                            : preview.querySelector('[data-boon-focused="true"]')
+                                || preview.querySelector('[focused="true"]')
+                                || preview.querySelector('input[autofocus], textarea[autofocus]')
+                                || null);
+                    if (!isTextInput(focused) && rememberedNodeId) {{
+                        focused = preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]');
+                    }}
+                    if (!isTextInput(focused)) {{
+                        focused = isTextInput(remembered) && remembered.isConnected && preview.contains(remembered)
+                            ? remembered
+                            : null;
+                    }}
+                    if (!isTextInput(focused)) return {{ dispatched: false }};
+                    const keyDownPort = focused.getAttribute('data-boon-port-key-down');
+                    const dispatchEvent = window.__boonDispatchUiEvent;
+                    if (!keyDownPort || typeof dispatchEvent !== 'function') {{
+                        return {{ dispatched: false }};
+                    }}
+                    window.__boonLastPreviewTextInput = focused;
+                    window.__boonLastPreviewTextInputNodeId =
+                        focused.getAttribute('data-boon-node-id');
+                    const inputs = Array.from(
+                        preview.querySelectorAll('input, textarea, [contenteditable="true"]')
+                    ).filter((element) =>
+                        element.matches?.('textarea, [contenteditable="true"]')
+                        || (element.matches?.('input')
+                            && !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+                    );
+                    window.__boonLastPreviewTextInputIndex = inputs.indexOf(focused);
+                    const payload = {key_json} + '\u001f' + (focused.value || '');
+                    dispatchEvent(keyDownPort, 'KeyDown', payload);
+                    return {{
+                        dispatched: true,
+                        nodeId: focused.getAttribute('data-boon-node-id'),
+                        keyDownPort
+                    }};
+                }})()"#,
+                key_json = serde_json::to_string(key)?,
+            ),
+        },
+    )
+    .await?;
+
+    match response {
+        WsResponse::Success {
+            data: Some(serde_json::Value::Object(value)),
+        } => Ok(value
+            .get("dispatched")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)),
+        WsResponse::Success {
+            data: Some(serde_json::Value::String(json)),
+        } => {
+            let value: serde_json::Value = serde_json::from_str(&json)?;
+            Ok(value
+                .get("dispatched")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false))
+        }
+        WsResponse::Error { message } => anyhow::bail!("Preview special key eval failed: {}", message),
+        _ => Ok(false),
+    }
+}
+
+async fn type_preview_text_via_eval(port: u16, text: &str) -> Result<bool> {
+    let response = send_command_to_server(
+        port,
+        WsCommand::EvalJs {
+            expression: format!(
+                r#"(function() {{
+                    const preview = document.querySelector('[data-boon-panel="preview"]');
+                    if (!preview) return {{ dispatched: false }};
+                    const isTextInput = (element) =>
+                        element
+                        && element !== document.body
+                        && (
+                            element.tagName === 'TEXTAREA'
+                            || (element.tagName === 'INPUT'
+                                && !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+                        );
+                    const inputs = Array.from(
+                        preview.querySelectorAll('input, textarea, [contenteditable="true"]')
+                    ).filter((element) =>
+                        element.matches?.('textarea, [contenteditable="true"]')
+                        || (element.matches?.('input')
+                            && !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+                    );
+                    const remembered = window.__boonLastPreviewTextInput;
+                    const rememberedNodeId =
+                        window.__boonLastPreviewTextInputNodeId ||
+                        remembered?.getAttribute?.('data-boon-node-id') ||
+                        null;
+                    const rememberedIndex =
+                        typeof window.__boonLastPreviewTextInputIndex === 'number'
+                            ? window.__boonLastPreviewTextInputIndex
+                            : null;
+                    const previewFocused = preview.querySelector(':focus');
+                    const hintedFocused =
+                        preview.querySelector('[data-boon-focused="true"]')
+                        || preview.querySelector('[focused="true"]')
+                        || preview.querySelector('input[autofocus], textarea[autofocus]')
+                        || null;
+                    let focused = isTextInput(hintedFocused)
+                        ? hintedFocused
+                        : (isTextInput(previewFocused)
+                            ? previewFocused
+                            : (isTextInput(document.activeElement) && preview.contains(document.activeElement)
+                                ? document.activeElement
+                                : null));
+                    if (!isTextInput(focused) && rememberedNodeId) {{
+                        focused = preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]');
+                    }}
+                    if (!isTextInput(focused) && rememberedIndex != null) {{
+                        focused = inputs[rememberedIndex] || focused;
+                    }}
+                    if (!isTextInput(focused)) {{
+                        focused = isTextInput(remembered) && remembered.isConnected && preview.contains(remembered)
+                            ? remembered
+                            : null;
+                    }}
+                    if (!isTextInput(focused)) return {{ dispatched: false }};
+                    if (document.activeElement !== focused && typeof focused.focus === 'function') {{
+                        focused.focus();
+                    }}
+                    const start0 =
+                        typeof focused.selectionStart === 'number'
+                            ? focused.selectionStart
+                            : focused.value.length;
+                    const end0 =
+                        typeof focused.selectionEnd === 'number'
+                            ? focused.selectionEnd
+                            : start0;
+                    let start = start0;
+                    let end = end0;
+                    if (
+                        focused === hintedFocused
+                        && focused.value
+                        && start === 0
+                        && end === 0
+                    ) {{
+                        start = focused.value.length;
+                        end = start;
+                    }}
+                    const insertedText = {text_json};
+                    if (
+                        focused.value
+                        && start === 0
+                        && end === focused.value.length
+                        && typeof insertedText === 'string'
+                        && /^\\s/.test(insertedText)
+                    ) {{
+                        start = focused.value.length;
+                        end = start;
+                    }}
+                    const nextValue =
+                        focused.value.slice(0, start) +
+                        insertedText +
+                        focused.value.slice(end);
+                    const nativeSetter =
+                        Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set ||
+                        Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                    if (nativeSetter) {{
+                        nativeSetter.call(focused, nextValue);
+                    }} else {{
+                        focused.value = nextValue;
+                    }}
+                    const caret = start + insertedText.length;
+                    if (typeof focused.setSelectionRange === 'function') {{
+                        focused.setSelectionRange(caret, caret);
+                    }}
+                    window.__boonLastPreviewTextInput = focused;
+                    window.__boonLastPreviewTextInputNodeId =
+                        focused.getAttribute('data-boon-node-id');
+                    window.__boonLastPreviewTextInputIndex = inputs.indexOf(focused);
+                    window.__boonLastPreviewTextSelectionStart = caret;
+                    window.__boonLastPreviewTextSelectionEnd = caret;
+                    focused.dispatchEvent(new InputEvent('input', {{
+                        bubbles: true,
+                        composed: true,
+                        data: insertedText,
+                        inputType: 'insertText'
+                    }}));
+                    const dispatchFact = window.__boonDispatchUiFact;
+                    const dispatchEvent = window.__boonDispatchUiEvent;
+                    const nodeId = focused.getAttribute('data-boon-node-id');
+                    const inputPort = focused.getAttribute('data-boon-port-input');
+                    if (typeof dispatchFact === 'function' && nodeId) {{
+                        dispatchFact(nodeId, 'DraftText', focused.value || '');
+                    }}
+                    if (typeof dispatchEvent === 'function' && inputPort) {{
+                        dispatchEvent(inputPort, 'Input', focused.value || '');
+                    }}
+                    return {{
+                        dispatched: true,
+                        value: focused.value || '',
+                        nodeId,
+                        inputPort
+                    }};
+                }})()"#,
+                text_json = serde_json::to_string(text)?,
+            ),
+        },
+    )
+    .await?;
+
+    match response {
+        WsResponse::Success {
+            data: Some(serde_json::Value::Object(value)),
+        } => Ok(value
+            .get("dispatched")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)),
+        WsResponse::Success {
+            data: Some(serde_json::Value::String(json)),
+        } => {
+            let value: serde_json::Value = serde_json::from_str(&json)?;
+            Ok(value
+                .get("dispatched")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false))
+        }
+        WsResponse::Error { message } => anyhow::bail!("Preview type text eval failed: {}", message),
+        _ => Ok(false),
+    }
+}
+
+async fn append_preview_text_via_eval(port: u16, text: &str) -> Result<bool> {
+    let response = send_command_to_server(
+        port,
+        WsCommand::EvalJs {
+            expression: format!(
+                r#"(function() {{
+                    const preview = document.querySelector('[data-boon-panel="preview"]');
+                    if (!preview) return {{ dispatched: false }};
+                    const isTextInput = (element) =>
+                        element
+                        && element !== document.body
+                        && (
+                            element.tagName === 'TEXTAREA'
+                            || (element.tagName === 'INPUT'
+                                && !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+                        );
+                    const remembered = window.__boonLastPreviewTextInput;
+                    const previewFocused = preview.querySelector(':focus');
+                    let focused = isTextInput(previewFocused)
+                        ? previewFocused
+                        : (isTextInput(document.activeElement) && preview.contains(document.activeElement)
+                            ? document.activeElement
+                            : preview.querySelector('[data-boon-focused="true"]')
+                                || preview.querySelector('[focused="true"]')
+                                || preview.querySelector('input[autofocus], textarea[autofocus]'));
+                    if (!isTextInput(focused)) {{
+                        focused = isTextInput(remembered) && remembered.isConnected && preview.contains(remembered)
+                            ? remembered
+                            : null;
+                    }}
+                    if (!isTextInput(focused) || !focused.value) return {{ dispatched: false }};
+                    const insertedText = {text_json};
+                    const nextValue = (focused.value || '') + insertedText;
+                    const nativeSetter =
+                        Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set ||
+                        Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                    if (nativeSetter) {{
+                        nativeSetter.call(focused, nextValue);
+                    }} else {{
+                        focused.value = nextValue;
+                    }}
+                    const caret = nextValue.length;
+                    if (typeof focused.setSelectionRange === 'function') {{
+                        focused.setSelectionRange(caret, caret);
+                    }}
+                    window.__boonLastPreviewTextInput = focused;
+                    window.__boonLastPreviewTextInputNodeId =
+                        focused.getAttribute('data-boon-node-id');
+                    window.__boonLastPreviewTextSelectionStart = caret;
+                    window.__boonLastPreviewTextSelectionEnd = caret;
+                    focused.dispatchEvent(new InputEvent('input', {{
+                        bubbles: true,
+                        composed: true,
+                        data: insertedText,
+                        inputType: 'insertText'
+                    }}));
+                    const dispatchFact = window.__boonDispatchUiFact;
+                    const dispatchEvent = window.__boonDispatchUiEvent;
+                    const nodeId = focused.getAttribute('data-boon-node-id');
+                    const inputPort = focused.getAttribute('data-boon-port-input');
+                    if (typeof dispatchFact === 'function' && nodeId) {{
+                        dispatchFact(nodeId, 'DraftText', focused.value || '');
+                    }}
+                    if (typeof dispatchEvent === 'function' && inputPort) {{
+                        dispatchEvent(inputPort, 'Input', focused.value || '');
+                    }}
+                    return {{ dispatched: true, value: focused.value || '' }};
+                }})()"#,
+                text_json = serde_json::to_string(text)?,
+            ),
+        },
+    )
+    .await?;
+
+    match response {
+        WsResponse::Success {
+            data: Some(serde_json::Value::Object(value)),
+        } => Ok(value
+            .get("dispatched")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)),
+        WsResponse::Success {
+            data: Some(serde_json::Value::String(json)),
+        } => {
+            let value: serde_json::Value = serde_json::from_str(&json)?;
+            Ok(value
+                .get("dispatched")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false))
+        }
+        WsResponse::Error { message } => anyhow::bail!("Preview append text eval failed: {}", message),
+        _ => Ok(false),
+    }
+}
+
+async fn click_button_near_text_via_eval(
+    port: u16,
+    text: &str,
+    button_text: &str,
+) -> Result<bool> {
+    let response = send_command_to_server(
+        port,
+        WsCommand::EvalJs {
+            expression: format!(
+                r#"(function() {{
+                    const preview = document.querySelector('[data-boon-panel="preview"]');
+                    if (!preview) return {{ clicked: false, reason: 'preview root not found' }};
+
+                    const visible = (el) => {{
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0
+                            && rect.height > 0
+                            && style.display !== 'none'
+                            && style.visibility !== 'hidden';
+                    }};
+
+                    const directTextOf = (el) =>
+                        Array.from(el.childNodes)
+                            .filter((node) => node.nodeType === Node.TEXT_NODE)
+                            .map((node) => node.textContent || '')
+                            .join('')
+                            .trim();
+
+                    const matchesText = (candidate) => {{
+                        const direct = directTextOf(candidate);
+                        const full = (candidate.textContent || '').trim();
+                        return direct === {text_json}
+                            || direct.includes({text_json})
+                            || full === {text_json}
+                            || full.includes({text_json});
+                    }};
+
+                    const candidates = Array.from(preview.querySelectorAll('*'))
+                        .filter((el) => visible(el) && matchesText(el));
+                    if (candidates.length === 0) {{
+                        return {{ clicked: false, reason: 'target text not found' }};
+                    }}
+
+                    candidates.sort((a, b) => {{
+                        const ar = a.getBoundingClientRect();
+                        const br = b.getBoundingClientRect();
+                        return (ar.width * ar.height) - (br.width * br.height);
+                    }});
+
+                    let target = candidates[0];
+                    let container = target;
+                    const buttonMatches = (button) => {{
+                        const direct = directTextOf(button);
+                        const full = (button.textContent || '').trim();
+                        return direct === {button_json}
+                            || full === {button_json}
+                            || direct.includes({button_json})
+                            || full.includes({button_json});
+                    }};
+                    for (let depth = 0; depth < 5 && container; depth += 1) {{
+                        const buttons = Array.from(
+                            container.querySelectorAll('button, [role="button"]')
+                        ).filter((el) => visible(el));
+                        const match = buttons.find((button) => buttonMatches(button));
+                        if (match) {{
+                            const port = match.getAttribute('data-boon-port-click');
+                            const dispatchEvent = window.__boonDispatchUiEvent;
+                            if (port && typeof dispatchEvent === 'function') {{
+                                dispatchEvent(port, 'Click');
+                            }} else if (typeof match.click === 'function') {{
+                                match.click();
+                            }} else {{
+                                match.dispatchEvent(new MouseEvent('click', {{ bubbles: true, composed: true }}));
+                            }}
+                            return {{ clicked: true }};
+                        }}
+                        container = container.parentElement;
+                    }}
+
+                    const visibleMatches = Array.from(
+                        preview.querySelectorAll('button, [role="button"]')
+                    ).filter((button) => visible(button) && buttonMatches(button));
+                    if (visibleMatches.length > 0) {{
+                        const targetRect = target.getBoundingClientRect();
+                        visibleMatches.sort((a, b) => {{
+                            const ar = a.getBoundingClientRect();
+                            const br = b.getBoundingClientRect();
+                            const ax = ar.left + (ar.width / 2);
+                            const ay = ar.top + (ar.height / 2);
+                            const bx = br.left + (br.width / 2);
+                            const by = br.top + (br.height / 2);
+                            const tx = targetRect.left + (targetRect.width / 2);
+                            const ty = targetRect.top + (targetRect.height / 2);
+                            const ad = Math.hypot(ax - tx, ay - ty);
+                            const bd = Math.hypot(bx - tx, by - ty);
+                            return ad - bd;
+                        }});
+                        const match = visibleMatches[0];
+                        const port = match.getAttribute('data-boon-port-click');
+                        const dispatchEvent = window.__boonDispatchUiEvent;
+                        if (port && typeof dispatchEvent === 'function') {{
+                            dispatchEvent(port, 'Click');
+                        }} else if (typeof match.click === 'function') {{
+                            match.click();
+                        }} else {{
+                            match.dispatchEvent(new MouseEvent('click', {{ bubbles: true, composed: true }}));
+                        }}
+                        return {{ clicked: true }};
+                    }}
+
+                    return {{ clicked: false, reason: 'button not found near target' }};
+                }})()"#,
+                text_json = serde_json::to_string(text)?,
+                button_json = serde_json::to_string(button_text)?,
+            ),
+        },
+    )
+    .await?;
+
+    match response {
+        WsResponse::Success {
+            data: Some(serde_json::Value::Object(value)),
+        } => Ok(value
+            .get("clicked")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)),
+        WsResponse::Success {
+            data: Some(serde_json::Value::String(json)),
+        } => {
+            let value: serde_json::Value = serde_json::from_str(&json)?;
+            Ok(value
+                .get("clicked")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false))
+        }
+        WsResponse::Error { message } => anyhow::bail!("Click button near text eval failed: {}", message),
+        _ => Ok(false),
+    }
+}
+
+async fn click_button_by_index_via_eval(port: u16, index: u32) -> Result<bool> {
+    let response = send_command_to_server(
+        port,
+        WsCommand::EvalJs {
+            expression: format!(
+                r#"(function() {{
+                    const preview = document.querySelector('[data-boon-panel="preview"]');
+                    if (!preview) return {{ clicked: false, reason: 'preview root not found' }};
+
+                    const isCheckboxInput = (el) =>
+                        el
+                        && el.tagName === 'INPUT'
+                        && ((el.getAttribute('type') || '').toLowerCase() === 'checkbox');
+                    const isVisible = (el) => {{
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0
+                            && rect.height > 0
+                            && style.display !== 'none'
+                            && style.visibility !== 'hidden';
+                    }};
+
+                    const buttons = Array.from(
+                        preview.querySelectorAll('button, [role="button"], [data-boon-port-click]')
+                    ).filter((element) => !isCheckboxInput(element) && isVisible(element));
+                    const button = buttons[{index}];
+                    if (!button) {{
+                        return {{ clicked: false, reason: 'button index out of range' }};
+                    }}
+
+                    const port = button.getAttribute('data-boon-port-click');
+                    const dispatchEvent = window.__boonDispatchUiEvent;
+                    if (port && typeof dispatchEvent === 'function') {{
+                        dispatchEvent(port, 'Click');
+                        return {{ clicked: true, mode: 'port' }};
+                    }}
+
+                    if (typeof button.click === 'function') {{
+                        button.click();
+                        return {{ clicked: true, mode: 'native' }};
+                    }}
+
+                    button.dispatchEvent(new MouseEvent('click', {{ bubbles: true, composed: true }}));
+                    return {{ clicked: true, mode: 'mouse' }};
+                }})()"#,
+                index = index,
+            ),
+        },
+    )
+    .await?;
+
+    match response {
+        WsResponse::Success {
+            data: Some(serde_json::Value::Object(value)),
+        } => Ok(value
+            .get("clicked")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)),
+        WsResponse::Success {
+            data: Some(serde_json::Value::String(json)),
+        } => {
+            let value: serde_json::Value = serde_json::from_str(&json)?;
+            Ok(value
+                .get("clicked")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false))
+        }
+        WsResponse::Error { message } => anyhow::bail!("Click button eval failed: {}", message),
+        _ => Ok(false),
     }
 }
 
 async fn get_current_focused_input_index(port: u16) -> Result<Option<u32>> {
     let response = send_command_to_server(port, WsCommand::GetFocusedElement).await?;
     match response {
-        WsResponse::FocusedElement { input_index, .. } => Ok(input_index),
+        WsResponse::FocusedElement {
+            tag_name,
+            input_index,
+            ..
+        } => {
+            let (fallback_tag_name, fallback_input_index) =
+                focused_preview_input_via_eval(port).await?;
+            if fallback_tag_name.is_some() {
+                Ok(fallback_input_index)
+            } else if tag_name.is_some() {
+                Ok(input_index)
+            } else {
+                Ok(None)
+            }
+        }
         WsResponse::Error { message } => anyhow::bail!("Get focused element failed: {}", message),
         _ => Ok(None),
     }
@@ -1826,7 +3437,11 @@ async fn set_input_value_by_index(port: u16, index: u32, value: &str) -> Result<
         r#"(function() {{
             const preview = document.querySelector('[data-boon-panel="preview"]');
             if (!preview) return 'ERROR: preview root not found';
-            const inputs = Array.from(preview.querySelectorAll('input, textarea'));
+            const inputs = Array.from(preview.querySelectorAll('input, textarea')).filter((element) =>
+                element.tagName === 'TEXTAREA'
+                || (element.tagName === 'INPUT'
+                    && !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+            );
             const input = inputs[{index}];
             if (!input) return 'ERROR: input index {index} not found (have ' + inputs.length + ')';
             if (typeof input.focus === 'function') {{
@@ -1937,6 +3552,13 @@ async fn wait_for_preview_to_settle(port: u16) {
             Err(_) => return,
         };
 
+        if preview_needs_retry(Some(snapshot.0.as_str())) {
+            stable_reads = 0;
+            last_snapshot = Some(snapshot);
+            tokio::time::sleep(poll_interval).await;
+            continue;
+        }
+
         if last_snapshot.as_ref() == Some(&snapshot) {
             stable_reads += 1;
             if stable_reads >= 2 {
@@ -2003,6 +3625,7 @@ async fn wait_for_preview_change_then_settle(
 /// Execute a parsed action
 async fn execute_action(
     port: u16,
+    engine: Option<&str>,
     action: &ParsedAction,
     preferred_input_index: &mut Option<u32>,
     verbose: bool,
@@ -2052,15 +3675,30 @@ async fn execute_action(
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         ParsedAction::Key { key } => {
-            let response =
-                send_command_to_server(port, WsCommand::PressKey { key: key.clone() }).await?;
-            if verbose {
-                println!("[press-key] {:?}", response);
+            let before_snapshot = get_preview_stability_snapshot(port).await.ok();
+            let mut handled_in_preview = false;
+            if matches!(key.as_str(), "Enter" | "Escape") {
+                handled_in_preview = dispatch_preview_special_key_via_eval(port, key).await?;
             }
-            if let WsResponse::Error { message } = response {
-                anyhow::bail!("Key press failed: {}", message);
+            if !handled_in_preview {
+                let response =
+                    send_command_to_server(port, WsCommand::PressKey { key: key.clone() }).await?;
+                if verbose {
+                    println!("[press-key] {:?}", response);
+                }
+                if let WsResponse::Error { message } = response {
+                    anyhow::bail!("Key press failed: {}", message);
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
+            if matches!(key.as_str(), "Enter" | "Escape" | "Backspace" | "Delete") {
+                let changed = wait_for_preview_change_then_settle(port, before_snapshot.clone()).await;
+                if !changed {
+                    wait_for_preview_to_settle(port).await;
+                }
+            } else {
+                wait_for_preview_to_settle(port).await;
+            }
         }
         ParsedAction::FocusInput { index } => {
             let response =
@@ -2088,31 +3726,117 @@ async fn execute_action(
                 Result::<()>::Ok(())
             };
 
-            send_type_text(port, text.clone()).await?;
-            if let Err(first_err) = wait_for_focused_text_input_suffix(port, text).await {
-                let retry_index = match *preferred_input_index {
-                    Some(index) => Some(index),
-                    None => get_current_focused_input_index(port).await?,
-                };
-                if let Some(index) = retry_index {
-                    *preferred_input_index = Some(index);
-                    let response =
-                        send_command_to_server(port, WsCommand::FocusInput { index }).await?;
-                    if let WsResponse::Error { message } = response {
-                        anyhow::bail!(
-                            "Type text failed after retry focus attempt: {}; focus retry failed: {}",
-                            first_err,
-                            message
-                        );
+            if engine == Some("ActorsLite") {
+                if text.starts_with(char::is_whitespace) {
+                    let handled_in_preview = append_preview_text_via_eval(port, text).await?
+                        || type_preview_text_via_eval(port, text).await?;
+                    if !handled_in_preview {
+                        send_type_text(port, text.clone()).await?;
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    send_type_text(port, text.clone()).await?;
-                    wait_for_focused_text_input_suffix(port, text).await?;
                 } else {
-                    return Err(first_err);
+                    let target_index = (*preferred_input_index)
+                        .or(get_current_focused_input_index(port).await?)
+                        .or(Some(0));
+                    if let Some(index) = target_index {
+                        *preferred_input_index = Some(index);
+                        let response =
+                            send_command_to_server(port, WsCommand::FocusInput { index }).await?;
+                        if let WsResponse::Error { message } = response {
+                            if index != 0 {
+                                let fallback_index = 0;
+                                *preferred_input_index = Some(fallback_index);
+                                let fallback_response = send_command_to_server(
+                                    port,
+                                    WsCommand::FocusInput {
+                                        index: fallback_index,
+                                    },
+                                )
+                                .await?;
+                                if let WsResponse::Error {
+                                    message: fallback_message,
+                                } = fallback_response
+                                {
+                                    anyhow::bail!(
+                                        "Type text failed: focus retry before typing failed at index {}: {}; fallback focus {} failed: {}",
+                                        index,
+                                        message,
+                                        fallback_index,
+                                        fallback_message
+                                    );
+                                }
+                            } else {
+                                anyhow::bail!(
+                                    "Type text failed: focus retry before typing failed: {}",
+                                    message
+                                );
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    send_type_text(port, text.clone()).await?;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                wait_for_preview_to_settle(port).await;
+            } else {
+                let handled_in_preview = if text.starts_with(char::is_whitespace) {
+                    append_preview_text_via_eval(port, text).await?
+                        || type_preview_text_via_eval(port, text).await?
+                } else {
+                    type_preview_text_via_eval(port, text).await?
+                };
+                if !handled_in_preview {
+                    send_type_text(port, text.clone()).await?;
+                }
+                if let Err(first_err) = wait_for_focused_text_input_suffix(port, text).await {
+                    let focused_index = get_current_focused_input_index(port).await?;
+                    let retry_index = focused_index
+                        .or(*preferred_input_index)
+                        .or(Some(0));
+                    if let Some(index) = retry_index {
+                        *preferred_input_index = Some(index);
+                        let response =
+                            send_command_to_server(port, WsCommand::FocusInput { index }).await?;
+                        if let WsResponse::Error { message } = response {
+                            if index != 0 {
+                                let fallback_index = 0;
+                                *preferred_input_index = Some(fallback_index);
+                                let fallback_response = send_command_to_server(
+                                    port,
+                                    WsCommand::FocusInput {
+                                        index: fallback_index,
+                                    },
+                                )
+                                .await?;
+                                if let WsResponse::Error {
+                                    message: fallback_message,
+                                } = fallback_response
+                                {
+                                    anyhow::bail!(
+                                        "Type text failed after retry focus attempt: {}; focus retry failed at index {}: {}; fallback focus {} failed: {}",
+                                        first_err,
+                                        index,
+                                        message,
+                                        fallback_index,
+                                        fallback_message
+                                    );
+                                }
+                            } else {
+                                anyhow::bail!(
+                                    "Type text failed after retry focus attempt: {}; focus retry failed: {}",
+                                    first_err,
+                                    message
+                                );
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        send_type_text(port, text.clone()).await?;
+                        wait_for_focused_text_input_suffix(port, text).await?;
+                    } else {
+                        return Err(first_err);
+                    }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
         }
         ParsedAction::ClickText { text } => {
             let before_snapshot = get_preview_stability_snapshot(port).await.ok();
@@ -2145,11 +3869,32 @@ async fn execute_action(
             let before_snapshot = get_preview_stability_snapshot(port).await.ok();
             let response =
                 send_command_to_server(port, WsCommand::ClickButton { index: *index }).await?;
-            if let WsResponse::Error { message } = response {
-                anyhow::bail!("Click button failed: {}", message);
+            let primary_error = if let WsResponse::Error { message } = response {
+                Some(message)
+            } else {
+                None
+            };
+
+            let changed = if primary_error.is_none() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                wait_for_preview_change_then_settle(port, before_snapshot.clone()).await
+            } else {
+                false
+            };
+
+            if primary_error.is_some() || !changed {
+                if !click_button_by_index_via_eval(port, *index).await? {
+                    if let Some(message) = primary_error {
+                        anyhow::bail!(
+                            "Click button failed: {}; eval fallback failed",
+                            message
+                        );
+                    }
+                    anyhow::bail!("Click button failed: no preview change and eval fallback failed");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = wait_for_preview_change_then_settle(port, before_snapshot).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = wait_for_preview_change_then_settle(port, before_snapshot).await;
         }
         ParsedAction::ClickButtonNearText { text, button_text } => {
             let before_snapshot = get_preview_stability_snapshot(port).await.ok();
@@ -2162,7 +3907,10 @@ async fn execute_action(
             )
             .await?;
             if let WsResponse::Error { message } = response {
-                anyhow::bail!("Click button near text failed: {}", message);
+                let label = button_text.as_deref().unwrap_or("×");
+                if !click_button_near_text_via_eval(port, text, label).await? {
+                    anyhow::bail!("Click button near text failed: {}", message);
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = wait_for_preview_change_then_settle(port, before_snapshot).await;
@@ -2279,7 +4027,7 @@ async fn execute_action(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         ParsedAction::DblClickCellsCell { row, column } => {
-            let dispatch_response = send_command_to_server(
+            let direct_response = send_command_to_server(
                 port,
                 WsCommand::DoubleClickCellsCell {
                     row: *row,
@@ -2287,8 +4035,46 @@ async fn execute_action(
                 },
             )
             .await?;
-            if let WsResponse::Error { message } = dispatch_response {
-                anyhow::bail!("Double-click cells cell failed: {}", message);
+            match direct_response {
+                WsResponse::Error { .. } => {}
+                _ => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    return Ok(());
+                }
+            }
+
+            let lookup_deadline = Instant::now() + Duration::from_secs(10);
+            let (x, y) = loop {
+                let response = send_command_to_server(port, WsCommand::GetPreviewElements).await?;
+                match response {
+                    WsResponse::PreviewElements { data } => match locate_cells_cell(&data, *row, *column) {
+                        Ok(lookup) => {
+                            let x = (lookup.cell.x + (lookup.cell.width / 2.0)).round() as i32;
+                            let y = (lookup.cell.y + (lookup.cell.height / 2.0)).round() as i32;
+                            break (x, y);
+                        }
+                        Err(error) => {
+                            let retryable =
+                                error.contains("row label") || error.contains("cell (");
+                            if retryable && Instant::now() < lookup_deadline {
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                continue;
+                            }
+                            anyhow::bail!("Double-click cells cell failed: {}", error);
+                        }
+                    },
+                    WsResponse::Error { message } => {
+                        anyhow::bail!("Double-click cells cell failed: {}", message);
+                    }
+                    _ => anyhow::bail!("Unexpected response for GetPreviewElements"),
+                }
+            };
+            for _ in 0..2 {
+                let response = send_command_to_server(port, WsCommand::ClickAt { x, y }).await?;
+                if let WsResponse::Error { message } = response {
+                    anyhow::bail!("Double-click cells cell failed: {}", message);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -2415,7 +4201,10 @@ async fn execute_action(
                             anyhow::bail!("Assert cells row visible failed: JS returned no data");
                         };
                         if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
-                            if error.contains("row label") && Instant::now() < lookup_deadline {
+                            if (error.contains("row label")
+                                || error.contains("preview root not found"))
+                                && Instant::now() < lookup_deadline
+                            {
                                 tokio::time::sleep(Duration::from_millis(200)).await;
                                 continue;
                             }
@@ -2478,6 +4267,7 @@ async fn execute_action(
             }
         }
         ParsedAction::AssertFocused { input_index } => {
+            let _ = wait_for_non_retry_preview_text(port, Duration::from_millis(1500)).await?;
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let response = send_command_to_server(port, WsCommand::GetFocusedElement).await?;
@@ -2489,7 +4279,12 @@ async fn execute_action(
                     } => {
                         let mut last_tag_name = tag_name.clone();
                         let mut last_input_index = actual_index;
-                        if input_index.is_some() && actual_index.is_none() {
+                        if actual_index.is_none()
+                            || last_tag_name.is_none()
+                            || input_index.is_some_and(|expected_idx| {
+                                actual_index != Some(expected_idx)
+                            })
+                        {
                             let (fallback_tag_name, fallback_input_index) =
                                 focused_preview_input_via_eval(port).await?;
                             if fallback_tag_name.is_some() {
@@ -2504,14 +4299,21 @@ async fn execute_action(
                             break;
                         }
                         if Instant::now() >= deadline {
+                            let debug = focused_preview_debug_via_eval(port)
+                                .await
+                                .unwrap_or_else(|error| format!("debug failed: {error}"));
                             if last_tag_name.is_none() {
-                                anyhow::bail!("Assert focused failed: no element is focused");
+                                anyhow::bail!(
+                                    "Assert focused failed: no element is focused\nFocus debug: {}",
+                                    debug
+                                );
                             }
                             if let Some(expected_idx) = input_index {
                                 anyhow::bail!(
-                                    "Assert focused failed: expected input index {}, got {:?}",
+                                    "Assert focused failed: expected input index {}, got {:?}\nFocus debug: {}",
                                     expected_idx,
-                                    last_input_index
+                                    last_input_index,
+                                    debug
                                 );
                             }
                             break;
@@ -2526,6 +4328,7 @@ async fn execute_action(
             }
         }
         ParsedAction::AssertFocusedInputValue { expected } => {
+            let _ = wait_for_non_retry_preview_text(port, Duration::from_millis(1500)).await?;
             let response = send_command_to_server(port, WsCommand::EvalJs {
                 expression: r#"(function() {
                     const preview = document.querySelector('[data-boon-panel="preview"]');
@@ -2535,16 +4338,18 @@ async fn execute_action(
                         && element !== document.body
                         && (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA');
                     const remembered = window.__boonLastPreviewTextInput;
-                    let focused = isTextInput(remembered) && remembered.isConnected && preview.contains(remembered)
-                        ? remembered
-                        : document.activeElement;
-                    if (!isTextInput(focused)) {
-                        const previewFocused = preview.querySelector(':focus');
-                        focused = isTextInput(previewFocused)
-                            ? previewFocused
+                    const previewFocused = preview.querySelector(':focus');
+                    let focused = isTextInput(previewFocused)
+                        ? previewFocused
+                        : (isTextInput(document.activeElement) && preview.contains(document.activeElement)
+                            ? document.activeElement
                             : preview.querySelector('[data-boon-focused="true"]')
                                 || preview.querySelector('[focused="true"]')
-                                || preview.querySelector('input[autofocus], textarea[autofocus]');
+                                || preview.querySelector('input[autofocus], textarea[autofocus]'));
+                    if (!isTextInput(focused)) {
+                        focused = isTextInput(remembered) && remembered.isConnected && preview.contains(remembered)
+                            ? remembered
+                            : null;
                     }
                     if (!focused || focused === document.body) {
                         return { error: 'no element is focused' };
@@ -2582,29 +4387,17 @@ async fn execute_action(
             }
         }
         ParsedAction::AssertInputPlaceholder { index, expected } => {
-            let response =
-                send_command_to_server(port, WsCommand::GetInputProperties { index: *index })
-                    .await?;
-            match response {
-                WsResponse::InputProperties {
-                    found, placeholder, ..
-                } => {
-                    if !found {
-                        anyhow::bail!("Assert input placeholder failed: input {} not found", index);
-                    }
-                    let actual = placeholder.unwrap_or_default();
-                    if !actual.contains(expected) {
-                        anyhow::bail!(
-                            "Assert input placeholder failed: expected '{}' in placeholder, got '{}'",
-                            expected,
-                            actual
-                        );
-                    }
-                }
-                WsResponse::Error { message } => {
-                    anyhow::bail!("Assert input placeholder failed: {}", message);
-                }
-                _ => anyhow::bail!("Unexpected response for GetInputProperties"),
+            let (found, placeholder, _) = preview_text_input_properties_via_eval(port, *index).await?;
+            if !found {
+                anyhow::bail!("Assert input placeholder failed: input {} not found", index);
+            }
+            let actual = placeholder.unwrap_or_default();
+            if !actual.contains(expected) {
+                anyhow::bail!(
+                    "Assert input placeholder failed: expected '{}' in placeholder, got '{}'",
+                    expected,
+                    actual
+                );
             }
         }
         ParsedAction::AssertUrl { pattern } => {
@@ -2660,6 +4453,55 @@ async fn execute_action(
                 _ => anyhow::bail!("Unexpected response for VerifyInputTypeable"),
             }
         }
+        ParsedAction::AssertInputNotTypeable { index } => {
+            let response =
+                send_command_to_server(port, WsCommand::VerifyInputTypeable { index: *index })
+                    .await?;
+            match response {
+                WsResponse::InputTypeableStatus {
+                    typeable, reason, ..
+                } => {
+                    if typeable {
+                        anyhow::bail!("Input {} is unexpectedly typeable", index);
+                    }
+                    if let Some(reason) = reason {
+                        if reason.is_empty() {
+                            return Ok(());
+                        }
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert input not typeable failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for VerifyInputTypeable"),
+            }
+        }
+        ParsedAction::AssertButtonDisabled { index } => {
+            let (found, disabled, text) = preview_button_disabled_via_eval(port, *index).await?;
+            if !found {
+                anyhow::bail!("Assert button disabled failed: button {} not found", index);
+            }
+            if !disabled {
+                anyhow::bail!(
+                    "Assert button disabled failed: button {} ('{}') is enabled",
+                    index,
+                    text
+                );
+            }
+        }
+        ParsedAction::AssertButtonEnabled { index } => {
+            let (found, disabled, text) = preview_button_disabled_via_eval(port, *index).await?;
+            if !found {
+                anyhow::bail!("Assert button enabled failed: button {} not found", index);
+            }
+            if disabled {
+                anyhow::bail!(
+                    "Assert button enabled failed: button {} ('{}') is disabled",
+                    index,
+                    text
+                );
+            }
+        }
         ParsedAction::AssertButtonCount { expected } => {
             // IMPORTANT: Clear hover state before counting buttons.
             // Delete buttons (×) in TodoMVC only appear on hover.
@@ -2700,11 +4542,19 @@ async fn execute_action(
   if (!preview) return { error: 'Preview panel not found' };
 
   const roleCheckboxes = Array.from(preview.querySelectorAll('[role="checkbox"]'));
+  const nativeCheckboxes = Array.from(preview.querySelectorAll('input[type="checkbox"]'));
   const idCheckboxes = Array.from(preview.querySelectorAll('[id^="cb-"]'));
   const seen = new Set();
   const allCheckboxes = [];
 
   roleCheckboxes.forEach((el) => {
+    if (!seen.has(el)) {
+      seen.add(el);
+      allCheckboxes.push(el);
+    }
+  });
+
+  nativeCheckboxes.forEach((el) => {
     if (!seen.has(el)) {
       seen.add(el);
       allCheckboxes.push(el);
@@ -2752,41 +4602,39 @@ async fn execute_action(
         }
         ParsedAction::AssertNotContains { text } => {
             // Get preview text and verify it does NOT contain the specified text
-            let response = send_command_to_server(port, WsCommand::GetPreviewText).await?;
-            match response {
-                WsResponse::PreviewText { text: preview } => {
-                    if preview.contains(text) {
-                        anyhow::bail!(
-                            "Assert not contains failed: preview should NOT contain '{}' but it does.\nPreview: {}",
-                            text,
-                            truncate_for_error(&preview, 200)
-                        );
-                    }
-                }
-                WsResponse::Error { message } => {
-                    anyhow::bail!("Assert not contains failed: {}", message);
-                }
-                _ => anyhow::bail!("Unexpected response for GetPreviewText"),
+            let preview = get_preview(port).await?;
+            if preview.contains(text) {
+                anyhow::bail!(
+                    "Assert not contains failed: preview should NOT contain '{}' but it does.\nPreview: {}",
+                    text,
+                    truncate_for_error(&preview, 200)
+                );
             }
         }
         ParsedAction::AssertNotFocused { input_index } => {
+            let _ = wait_for_non_retry_preview_text(port, Duration::from_millis(1500)).await?;
             let response = send_command_to_server(port, WsCommand::GetFocusedElement).await?;
             match response {
                 WsResponse::FocusedElement {
+                    tag_name,
                     input_index: actual_index,
                     ..
                 } => {
+                    let (fallback_tag_name, fallback_input_index) =
+                        focused_preview_input_via_eval(port).await?;
+                    let resolved_tag_name = fallback_tag_name.or(tag_name);
+                    let resolved_input_index = fallback_input_index.or(actual_index);
                     if let Some(expected_index) = input_index {
-                        if actual_index == Some(*expected_index) {
+                        if resolved_input_index == Some(*expected_index) {
                             anyhow::bail!(
                                 "Assert not focused failed: expected input {} to NOT be focused, but it is",
                                 expected_index
                             );
                         }
-                    } else if actual_index.is_some() {
+                    } else if resolved_tag_name.is_some() {
                         anyhow::bail!(
                             "Assert not focused failed: expected no focused input, got {:?}",
-                            actual_index
+                            resolved_input_index
                         );
                     }
                 }
@@ -2874,46 +4722,28 @@ async fn execute_action(
         }
         ParsedAction::AssertInputEmpty { index } => {
             // Verify that the input value is empty (cleared after action)
-            let response =
-                send_command_to_server(port, WsCommand::GetInputProperties { index: *index })
-                    .await?;
-            match response {
-                WsResponse::InputProperties { found, value, .. } => {
-                    if !found {
-                        anyhow::bail!("Assert input empty failed: input {} not found", index);
-                    }
-                    let actual_value = value.unwrap_or_default();
-                    if !actual_value.is_empty() {
-                        anyhow::bail!(
-                            "Assert input empty failed: expected input {} to be empty, but got '{}'",
-                            index,
-                            actual_value
-                        );
-                    }
-                }
-                WsResponse::Error { message } => {
-                    anyhow::bail!("Assert input empty failed: {}", message);
-                }
-                _ => anyhow::bail!("Unexpected response for GetInputProperties"),
+            let (found, _, value) = preview_text_input_properties_via_eval(port, *index).await?;
+            if !found {
+                anyhow::bail!("Assert input empty failed: input {} not found", index);
+            }
+            let actual_value = value.unwrap_or_default();
+            if !actual_value.is_empty() {
+                anyhow::bail!(
+                    "Assert input empty failed: expected input {} to be empty, but got '{}'",
+                    index,
+                    actual_value
+                );
             }
         }
         ParsedAction::AssertContains { text } => {
             // Verify that the preview contains the specified text
-            let response = send_command_to_server(port, WsCommand::GetPreviewText).await?;
-            match response {
-                WsResponse::PreviewText { text: preview } => {
-                    if !preview.contains(text) {
-                        anyhow::bail!(
-                            "Assert contains failed: preview should contain '{}' but it doesn't.\nPreview: {}",
-                            text,
-                            truncate_for_error(&preview, 200)
-                        );
-                    }
-                }
-                WsResponse::Error { message } => {
-                    anyhow::bail!("Assert contains failed: {}", message);
-                }
-                _ => anyhow::bail!("Unexpected response for GetPreviewText"),
+            let preview = get_preview(port).await?;
+            if !preview.contains(text) {
+                anyhow::bail!(
+                    "Assert contains failed: preview should contain '{}' but it doesn't.\nPreview: {}",
+                    text,
+                    truncate_for_error(&preview, 200)
+                );
             }
         }
         ParsedAction::AssertCheckboxClickable { index } => {
@@ -2981,28 +4811,18 @@ async fn execute_action(
             let deadline = Instant::now() + Duration::from_secs(5);
 
             loop {
-                let response =
-                    send_command_to_server(port, WsCommand::GetInputProperties { index: *index })
-                        .await?;
-                let last_error = match response {
-                    WsResponse::InputProperties { found, value, .. } => {
-                        if !found {
-                            format!("Assert input value failed: input {} not found", index)
-                        } else {
-                            let actual = value.unwrap_or_default();
-                            if actual == *expected {
-                                break;
-                            }
-                            format!(
-                                "Assert input value failed: expected '{}' in input {}, got '{}'",
-                                expected, index, actual
-                            )
-                        }
+                let (found, _, value) = preview_text_input_properties_via_eval(port, *index).await?;
+                let last_error = if !found {
+                    format!("Assert input value failed: input {} not found", index)
+                } else {
+                    let actual = value.unwrap_or_default();
+                    if actual == *expected {
+                        break;
                     }
-                    WsResponse::Error { message } => {
-                        format!("Assert input value failed: {}", message)
-                    }
-                    _ => "Unexpected response for GetInputProperties".to_string(),
+                    format!(
+                        "Assert input value failed: expected '{}' in input {}, got '{}'",
+                        expected, index, actual
+                    )
                 };
 
                 if Instant::now() >= deadline {
@@ -3182,6 +5002,7 @@ fn count_delete_buttons_recursive(value: &serde_json::Value, count: &mut u32) {
 #[derive(Clone, Debug)]
 struct PreviewElementInfo {
     direct_text: String,
+    link_path: Option<String>,
     x: f64,
     y: f64,
     width: f64,
@@ -3222,6 +5043,10 @@ fn preview_element_infos(data: &serde_json::Value) -> Vec<PreviewElementInfo> {
             let obj = value.as_object()?;
             Some(PreviewElementInfo {
                 direct_text: obj.get("directText")?.as_str()?.trim().to_string(),
+                link_path: obj
+                    .get("linkPath")
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned),
                 x: obj.get("x")?.as_f64()?,
                 y: obj.get("y")?.as_f64()?,
                 width: obj.get("width")?.as_f64()?,
@@ -3381,19 +5206,53 @@ async fn click_preview_text_element(port: u16, text: &str, exact: bool) -> Resul
             const wanted = {text_json};
             const exact = {exact_json};
             const matches = (candidate) => exact ? candidate.trim() === wanted : candidate.includes(wanted);
+            const directText = (el) => {{
+                let text = '';
+                for (const node of el.childNodes) {{
+                    if (node.nodeType === Node.TEXT_NODE) {{
+                        text += node.textContent || '';
+                    }}
+                }}
+                return text.trim();
+            }};
+            const tagScore = (tag) => {{
+                switch (tag) {{
+                    case 'BUTTON': return 0;
+                    case 'A': return 1;
+                    case 'LABEL': return 2;
+                    case 'SPAN': return 3;
+                    case 'DIV': return 4;
+                    case 'P': return 5;
+                    default: return 6;
+                }}
+            }};
 
             const candidates = Array.from(preview.querySelectorAll('*'))
                 .map((el) => {{
                     const text = (el.innerText || el.textContent || '').trim();
+                    const direct = directText(el);
                     const rect = el.getBoundingClientRect();
                     if (!text || rect.width === 0 || rect.height === 0) return null;
                     const style = window.getComputedStyle(el);
                     if (style.display === 'none' || style.visibility === 'hidden') return null;
-                    if (!matches(text)) return null;
-                    return {{ el, text, area: rect.width * rect.height }};
+                    const directMatch = direct && matches(direct);
+                    const textMatch = matches(text);
+                    if (!directMatch && !textMatch) return null;
+                    return {{
+                        el,
+                        text,
+                        direct,
+                        area: rect.width * rect.height,
+                        directMatch,
+                        tagScore: tagScore(el.tagName),
+                    }};
                 }})
                 .filter(Boolean)
-                .sort((a, b) => a.area - b.area);
+                .sort((a, b) =>
+                    Number(b.directMatch) - Number(a.directMatch) ||
+                    a.tagScore - b.tagScore ||
+                    a.area - b.area
+                );
 
             const best = candidates[0];
             if (!best) return {{ found: false }};
@@ -3415,6 +5274,7 @@ async fn click_preview_text_element(port: u16, text: &str, exact: bool) -> Resul
                 found: true,
                 tag: best.el.tagName,
                 text: best.text,
+                direct: best.direct,
             }};
         }})()"#,
         text_json = serde_json::to_string(text)?,
@@ -3445,6 +5305,24 @@ fn locate_cells_cell(
     target_column: u32,
 ) -> Result<CellsLookup, String> {
     let elements = preview_element_infos(data);
+    let target_path = format!(
+        "all_row_cells.{:04}.cells.{:04}.display_element",
+        target_row.saturating_sub(1),
+        target_column.saturating_sub(1)
+    );
+    if let Some(cell) = elements
+        .iter()
+        .find(|element| element.link_path.as_deref() == Some(target_path.as_str()))
+        .cloned()
+    {
+        return Ok(CellsLookup {
+            cell,
+            row_match_count: 1,
+            viable_row_count: 1,
+            first_row_cells: vec![target_path],
+        });
+    }
+
     let mut row_matches: Vec<_> = elements
         .iter()
         .filter(|element| {
@@ -3648,12 +5526,9 @@ async fn save_screenshot(port: u16, path: &str) -> Result<()> {
 }
 
 async fn get_preview(port: u16) -> Result<String> {
-    let response = send_command_to_server(port, WsCommand::GetPreviewText).await?;
-    match response {
-        WsResponse::PreviewText { text } => Ok(text),
-        WsResponse::Error { message } => anyhow::bail!("{}", message),
-        _ => anyhow::bail!("Unexpected response"),
-    }
+    Ok(wait_for_non_retry_preview_text(port, Duration::from_millis(1500))
+        .await?
+        .unwrap_or_default())
 }
 
 async fn get_console(port: u16) -> Result<Vec<String>> {
@@ -3672,6 +5547,7 @@ async fn get_console(port: u16) -> Result<Vec<String>> {
 struct ServerStatus {
     connected: bool,
     api_ready: bool,
+    page_url: Option<String>,
 }
 
 /// Check if WebSocket server is running and browser extension is connected
@@ -3681,10 +5557,12 @@ async fn check_server_connection(port: u16) -> Result<ServerStatus> {
         WsResponse::Status {
             connected,
             api_ready,
+            page_url,
             ..
         } => Ok(ServerStatus {
             connected,
             api_ready,
+            page_url,
         }),
         WsResponse::Error { message } => {
             anyhow::bail!("Status check failed: {}", message)
@@ -3734,7 +5612,8 @@ async fn run_smoke_inner(opts: &SmokeOptions) -> Result<Vec<TestResult>> {
     let mut examples: Vec<&str> = BUILTIN_EXAMPLES.to_vec();
 
     if let Some(ref filter) = opts.filter {
-        examples.retain(|name| name.contains(filter.as_str()));
+        let prefer_exact = examples.contains(&filter.as_str());
+        examples.retain(|name| example_name_matches_filter(name, filter, prefer_exact));
         if examples.is_empty() {
             println!("No built-in examples match filter '{}'", filter);
             return Ok(vec![]);
@@ -3818,6 +5697,14 @@ async fn run_smoke_inner(opts: &SmokeOptions) -> Result<Vec<TestResult>> {
     println!("{}/{} passed", passed, results.len());
 
     Ok(results)
+}
+
+fn example_name_matches_filter(name: &str, filter: &str, prefer_exact: bool) -> bool {
+    if prefer_exact {
+        name == filter
+    } else {
+        name.contains(filter)
+    }
 }
 
 /// Find examples directory relative to cwd or tools directory

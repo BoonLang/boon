@@ -15,8 +15,8 @@ use super::engine::{
     BRIDGE_TEXT_CHANGE_CAPACITY, ConstructContext, ConstructInfo, ConstructInfoComplete,
     ConstructType, LOG_DEBUG, ListChange, NamedChannel, Number as EngineNumber, Object, ScopeId,
     Tag as EngineTag, TaggedObject, Text as EngineText, TimestampedEvent, TypedStream, Value,
-    ValueIdempotencyKey, ValueMetadata, Variable, create_actor, create_constant_actor,
-    inc_metric, switch_map,
+    ValueIdempotencyKey, ValueMetadata, Variable, create_actor, create_constant_actor, inc_metric,
+    switch_map,
 };
 
 // --- Cached ConstructInfoComplete for hot bridge paths ---
@@ -951,15 +951,12 @@ fn actor_current_or_future_stream(actor: ActorHandle) -> LocalBoxStream<'static,
     let initial = stream::once(async move { actor_for_initial.value().await.ok() })
         .filter_map(|value| async move { value });
     stream::select(initial, actor.stream_from_now())
-        .scan(
-            None::<(ValueIdempotencyKey, u64)>,
-            |last_seen, value| {
-                let current = (value.idempotency_key(), value.lamport_time());
-                let should_emit = last_seen.as_ref() != Some(&current);
-                *last_seen = Some(current);
-                future::ready(Some(if should_emit { Some(value) } else { None }))
-            },
-        )
+        .scan(None::<(ValueIdempotencyKey, u64)>, |last_seen, value| {
+            let current = (value.idempotency_key(), value.lamport_time());
+            let should_emit = last_seen.as_ref() != Some(&current);
+            *last_seen = Some(current);
+            future::ready(Some(if should_emit { Some(value) } else { None }))
+        })
         .filter_map(future::ready)
         .boxed_local()
 }
@@ -4028,40 +4025,42 @@ fn element_text_input(
             construct_context.clone(),
             ValueIdempotencyKey::new(),
             lamport_time,
-            [Variable::new_arc(
-                ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
-                construct_context.clone(),
-                "key",
-                create_constant_actor(
-                    ConstructInfo::new(
-                        "text_input::key_down_event::key_actor",
-                        None,
-                        "key_down key actor",
+            [
+                Variable::new_arc(
+                    ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
+                    construct_context.clone(),
+                    "key",
+                    create_constant_actor(
+                        ConstructInfo::new(
+                            "text_input::key_down_event::key_actor",
+                            None,
+                            "key_down key actor",
+                        ),
+                        parser::PersistenceId::new(),
+                        tag_value,
+                        scope_id,
                     ),
-                    parser::PersistenceId::new(),
-                    tag_value,
-                    scope_id,
+                    parser::PersistenceId::default(),
+                    parser::Scope::Root,
                 ),
-                parser::PersistenceId::default(),
-                parser::Scope::Root,
-            ),
-            Variable::new_arc(
-                ConstructInfo::new("text_input::key_down_event::text", None, "key_down text"),
-                construct_context.clone(),
-                "text",
-                create_constant_actor(
-                    ConstructInfo::new(
-                        "text_input::key_down_event::text_actor",
-                        None,
-                        "key_down text actor",
+                Variable::new_arc(
+                    ConstructInfo::new("text_input::key_down_event::text", None, "key_down text"),
+                    construct_context.clone(),
+                    "text",
+                    create_constant_actor(
+                        ConstructInfo::new(
+                            "text_input::key_down_event::text_actor",
+                            None,
+                            "key_down text actor",
+                        ),
+                        parser::PersistenceId::new(),
+                        text_value,
+                        scope_id,
                     ),
-                    parser::PersistenceId::new(),
-                    text_value,
-                    scope_id,
+                    parser::PersistenceId::default(),
+                    parser::Scope::Root,
                 ),
-                parser::PersistenceId::default(),
-                parser::Scope::Root,
-            )],
+            ],
         )
     }
 
@@ -4516,10 +4515,13 @@ fn element_text_input(
 
     // Update the mutable when the stream emits
     // CRITICAL: Use switch_map (not flat_map) because focus variable stream is infinite.
-    let focus_stream = switch_map(variable_current_or_future_stream(settings_variable), |value| {
-        let focus_variable = value.expect_object().expect_variable("focus");
-        variable_current_or_future_stream(focus_variable)
-    })
+    let focus_stream = switch_map(
+        variable_current_or_future_stream(settings_variable),
+        |value| {
+            let focus_variable = value.expect_object().expect_variable("focus");
+            variable_current_or_future_stream(focus_variable)
+        },
+    )
     .filter_map(|value| {
         future::ready(match value {
             Value::Tag(tag, _) => Some(tag.tag() == "True"),
@@ -5746,8 +5748,7 @@ fn element_label(
 
     // Set up hovered link
     // Chain with pending() to prevent stream termination causing busy-polling in select!
-    let hovered_stream = element_variable
-        .clone();
+    let hovered_stream = element_variable.clone();
     let hovered_stream = variable_current_or_future_stream(hovered_stream)
         .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
         .map(|variable| variable.expect_link_value_sender())

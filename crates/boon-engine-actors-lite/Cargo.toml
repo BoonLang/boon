@@ -1,0 +1,16 @@
+[package]
+name = "boon-engine-actors-lite"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/BoonLang/boon"
+authors = ["Martin Kavík <martin@kavik.cz>"]
+description = "ActorsLite browser engine for Boon"
+categories = ["Compilers"]
+license = "UPL-1.0"
+
+[dependencies]
+boon = { path = "../boon" }
+boon-renderer-zoon = { path = "../boon-renderer-zoon" }
+boon-scene = { path = "../boon-scene" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,13 @@
+# BLOCK + WHEN inside List/map emits the same visible row as direct WHEN for Mode=All
+
+[test]
+category = "interactive"
+description = "List/map block variant renders both rows for the initial All mode"
+skip_engines = ["Actors", "DD", "Wasm"]
+
+[output]
+text = "Mode: All1234512345"
+
+[timing]
+timeout = 5000
+poll_interval = 200

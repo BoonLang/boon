@@ -1,0 +1,32 @@
+# Complex counter example - decrement and increment buttons update one display
+
+[test]
+category = "interactive"
+description = "Complex counter handles both decrement and increment"
+
+[output]
+text = "-0+"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+[[sequence]]
+description = "Click increment button"
+actions = [["click_button", 1]]
+expect = "-1+"
+
+[[sequence]]
+description = "Click increment again"
+actions = [["click_button", 1]]
+expect = "-2+"
+
+[[sequence]]
+description = "Click decrement button"
+actions = [["click_button", 0]]
+expect = "-1+"
+
+[[sequence]]
+description = "Return to zero"
+actions = [["click_button", 0]]
+expect = "-0+"

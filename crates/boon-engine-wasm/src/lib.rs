@@ -1027,7 +1027,9 @@ impl WasmPreview {
                         "data-boon-wasm-last-error",
                         "dispatch_events_failed_for_double_click",
                     );
-                    wasm_browser_log("[wasm-preview] dispatch_events failed for double_click batch");
+                    wasm_browser_log(
+                        "[wasm-preview] dispatch_events failed for double_click batch",
+                    );
                 }
                 if trace_text_event {
                     wasm_browser_log("[wasm-preview] dispatch_events failed for text batch");
@@ -1364,8 +1366,7 @@ mod tests {
 
     #[test]
     fn preview_pipeline_todo_mvc_real_file_renders_input_without_error() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
         let semantic = lower::lower_to_semantic(source, None, false);
         let exec = exec_ir::ExecProgram::from_semantic(&semantic);
         let preview =
@@ -1384,8 +1385,7 @@ mod tests {
 
     #[test]
     fn preview_pipeline_cells_fact_rerender_then_keydown_commits_value() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
         let semantic = lower::lower_to_semantic(source, None, false);
         let exec = exec_ir::ExecProgram::from_semantic(&semantic);
         let preview =
@@ -1710,8 +1710,7 @@ mod tests {
 
     #[test]
     fn preview_handler_cells_fact_rerender_then_keydown_without_input_keeps_original_value() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
         let semantic = lower::lower_to_semantic(source, None, false);
         let exec = exec_ir::ExecProgram::from_semantic(&semantic);
         let preview =
@@ -1793,8 +1792,7 @@ mod tests {
 
     #[test]
     fn preview_handler_cells_fact_input_then_keydown_commits_value() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
         let semantic = lower::lower_to_semantic(source, None, false);
         let exec = exec_ir::ExecProgram::from_semantic(&semantic);
         let preview =
@@ -1905,8 +1903,7 @@ mod tests {
 
     #[test]
     fn preview_handler_cells_input_event_updates_edit_changed_text() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
         let semantic = lower::lower_to_semantic(source, None, false);
         let exec = exec_ir::ExecProgram::from_semantic(&semantic);
         let preview =
@@ -1956,8 +1953,7 @@ mod tests {
 
     #[test]
     fn preview_handler_cells_edit_input_keeps_single_input_and_keydown_port_after_input() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
         let semantic = lower::lower_to_semantic(source, None, false);
         let exec = exec_ir::ExecProgram::from_semantic(&semantic);
         let preview =
@@ -2042,8 +2038,7 @@ mod tests {
 
     #[test]
     fn preview_pipeline_cells_commit_uses_incremental_batch_and_preserves_grid_ports() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
         let semantic = lower::lower_to_semantic(source, None, false);
         let exec = exec_ir::ExecProgram::from_semantic(&semantic);
         let preview =
@@ -2141,8 +2136,7 @@ mod tests {
 
     #[test]
     fn preview_pipeline_cells_commit_restores_same_edited_cell_identity() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
         let semantic = lower::lower_to_semantic(source, None, false);
         let exec = exec_ir::ExecProgram::from_semantic(&semantic);
         let preview =
@@ -2219,8 +2213,7 @@ mod tests {
 
     #[test]
     fn preview_pipeline_cells_cancel_restores_same_edited_cell_identity() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
         let semantic = lower::lower_to_semantic(source, None, false);
         let exec = exec_ir::ExecProgram::from_semantic(&semantic);
         let preview =
@@ -2297,8 +2290,7 @@ mod tests {
 
     #[test]
     fn preview_pipeline_cells_blur_restores_same_edited_cell_identity() {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
         let semantic = lower::lower_to_semantic(source, None, false);
         let exec = exec_ir::ExecProgram::from_semantic(&semantic);
         let preview =

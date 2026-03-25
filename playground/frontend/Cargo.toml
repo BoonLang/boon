@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 boon = { path = "../../crates/boon" }
 boon-engine-actors = { path = "../../crates/boon-engine-actors", optional = true }
+boon-engine-actors-lite = { path = "../../crates/boon-engine-actors-lite", optional = true }
 boon-engine-dd = { path = "../../crates/boon-engine-dd", optional = true }
 boon-engine-wasm = { path = "../../crates/boon-engine-wasm", optional = true }
 ulid = { version = "1.2.0", features = ["serde"] }
@@ -17,7 +18,8 @@ default = ["engine-all"]
 
 # Engine feature gates
 engine-actors = ["dep:boon-engine-actors"]
+engine-actors-lite = ["dep:boon-engine-actors-lite"]
 engine-dd = ["dep:boon-engine-dd"]
 engine-wasm = ["dep:boon-engine-wasm"]
 engine-both = ["engine-actors", "engine-dd"]
-engine-all = ["engine-actors", "engine-dd", "engine-wasm"]
+engine-all = ["engine-actors", "engine-actors-lite", "engine-dd", "engine-wasm"]

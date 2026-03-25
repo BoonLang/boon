@@ -384,15 +384,13 @@ impl DdWorkerHandle {
                     ("text", Value::text(text)),
                 ]),
             ),
-            Event::TextChange { link_path, text } => {
-                (
-                    link_path,
-                    Value::object([
-                        ("text", Value::text(text.clone())),
-                        ("value", Value::text(text)),
-                    ]),
-                )
-            }
+            Event::TextChange { link_path, text } => (
+                link_path,
+                Value::object([
+                    ("text", Value::text(text.clone())),
+                    ("value", Value::text(text)),
+                ]),
+            ),
             Event::NumberChange { link_path, value } => {
                 (link_path, Value::object([("value", Value::number(value))]))
             }
@@ -970,8 +968,7 @@ document: Document/new(root:
             .collect::<Vec<_>>()
             .join(" | ");
         assert!(
-            diff_text.contains("remove:0000")
-                && diff_text.contains("remove:0002"),
+            diff_text.contains("remove:0000") && diff_text.contains("remove:0002"),
             "expected filter input change to remove the non-matching keyed rows, got diffs: {diff_text}"
         );
     }
@@ -1072,11 +1069,14 @@ document: Document/new(root:
 
     #[test]
     fn shopping_list_enter_adds_item() {
-        let source = read_example("../../playground/frontend/src/examples/shopping_list/shopping_list.bn");
+        let source =
+            read_example("../../playground/frontend/src/examples/shopping_list/shopping_list.bn");
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("shopping_list should compile");
         let handle = match program {
-            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Dataflow { graph } => {
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
             CompiledProgram::Static { .. } => panic!("shopping_list should compile to dataflow"),
         };
 
@@ -1103,7 +1103,9 @@ document: Document/new(root:
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("todo_mvc should compile");
         let handle = match program {
-            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Dataflow { graph } => {
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
             CompiledProgram::Static { .. } => panic!("todo_mvc should compile to dataflow"),
         };
 
@@ -1123,7 +1125,9 @@ document: Document/new(root:
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("todo_mvc should compile");
         let handle = match program {
-            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Dataflow { graph } => {
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
             CompiledProgram::Static { .. } => panic!("todo_mvc should compile to dataflow"),
         };
 
@@ -1204,7 +1208,9 @@ document: Document/new(root:
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("todo_mvc should compile");
         let handle = match program {
-            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Dataflow { graph } => {
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
             CompiledProgram::Static { .. } => panic!("todo_mvc should compile to dataflow"),
         };
 
@@ -1237,7 +1243,9 @@ document: Document/new(root:
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("todo_mvc should compile");
         let handle = match program {
-            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Dataflow { graph } => {
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
             CompiledProgram::Static { .. } => panic!("todo_mvc should compile to dataflow"),
         };
 
@@ -1341,7 +1349,9 @@ document: Document/new(root:
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("timer should compile");
         let handle = match program {
-            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Dataflow { graph } => {
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
             CompiledProgram::Static { .. } => panic!("timer should compile to dataflow"),
         };
 
@@ -1372,7 +1382,9 @@ document: Document/new(root:
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("timer should compile");
         let handle = match program {
-            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Dataflow { graph } => {
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
             CompiledProgram::Static { .. } => panic!("timer should compile to dataflow"),
         };
 
@@ -1475,13 +1487,11 @@ document: Document/new(root:
                 .to_string(),
         });
         handle.inject_dd_event(Event::TextChange {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.change"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.change".to_string(),
             text: "7".to_string(),
         });
         handle.inject_dd_event(Event::KeyDown {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down".to_string(),
             key: "Enter".to_string(),
             text: "7".to_string(),
         });
@@ -1505,7 +1515,9 @@ document: Document/new(root:
         let program = compile(&source, None, &std::collections::HashMap::new(), None)
             .expect("cells should compile");
         let handle = match program {
-            CompiledProgram::Dataflow { graph } => DdWorkerHandle::new_from_graph(graph, |_value| {}),
+            CompiledProgram::Dataflow { graph } => {
+                DdWorkerHandle::new_from_graph(graph, |_value| {})
+            }
             CompiledProgram::Static { .. } => panic!("cells should compile to dataflow"),
         };
 
@@ -1514,30 +1526,25 @@ document: Document/new(root:
                 .to_string(),
         });
         handle.inject_dd_event(Event::KeyDown {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down".to_string(),
             key: "Backspace".to_string(),
             text: "5".to_string(),
         });
         handle.inject_dd_event(Event::TextChange {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.change"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.change".to_string(),
             text: "".to_string(),
         });
         handle.inject_dd_event(Event::TextChange {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.change"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.change".to_string(),
             text: "7".to_string(),
         });
         handle.inject_dd_event(Event::KeyDown {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down".to_string(),
             key: "Enter".to_string(),
             text: "7".to_string(),
         });
         handle.inject_dd_event(Event::Blur {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.blur"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.blur".to_string(),
         });
 
         let output_text = handle.current_output().to_display_string();
@@ -1570,8 +1577,7 @@ document: Document/new(root:
                 .to_string(),
         });
         handle.inject_dd_event(Event::KeyDown {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down".to_string(),
             key: "Backspace".to_string(),
             text: "".to_string(),
         });
@@ -1601,13 +1607,11 @@ document: Document/new(root:
                 .to_string(),
         });
         handle.inject_dd_event(Event::TextChange {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.change"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.change".to_string(),
             text: "7".to_string(),
         });
         handle.inject_dd_event(Event::KeyDown {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down".to_string(),
             key: "Enter".to_string(),
             text: "7".to_string(),
         });
@@ -1642,13 +1646,11 @@ document: Document/new(root:
                 .to_string(),
         });
         handle.inject_dd_event(Event::TextChange {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.change"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.change".to_string(),
             text: "7".to_string(),
         });
         handle.inject_dd_event(Event::KeyDown {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down".to_string(),
             key: "Enter".to_string(),
             text: "7".to_string(),
         });
@@ -1657,13 +1659,11 @@ document: Document/new(root:
                 .to_string(),
         });
         handle.inject_dd_event(Event::TextChange {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.change"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.change".to_string(),
             text: "9".to_string(),
         });
         handle.inject_dd_event(Event::KeyDown {
-            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down"
-                .to_string(),
+            link_path: "all_row_cells.0000.cells.0000.editing_element.event.key_down".to_string(),
             key: "Escape".to_string(),
             text: "9".to_string(),
         });
@@ -1697,11 +1697,9 @@ document: Document/new(root:
             .collect();
 
         assert!(
-            paths
-                .iter()
-                .any(|path| {
-                    path == "all_row_cells.0000.cells.0000.display_element.event.double_click"
-                }),
+            paths.iter().any(|path| {
+                path == "all_row_cells.0000.cells.0000.display_element.event.double_click"
+            }),
             "expected concrete A1 double-click input path; got inputs: {paths:?}"
         );
     }

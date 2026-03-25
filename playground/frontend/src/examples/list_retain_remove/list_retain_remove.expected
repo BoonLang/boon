@@ -1,0 +1,30 @@
+# List/retain source append behavior stays stable through the shared append-list path
+
+[test]
+category = "interactive"
+description = "List/retain remove example appends trimmed items from the focused input"
+skip_engines = ["Actors", "DD", "Wasm"]
+
+[output]
+text = "Add items with EnterCount: 3- Apple- Banana- Cherry"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+[[sequence]]
+description = "Input is present and focused with the expected placeholder"
+actions = [
+  ["assert_input_placeholder", 0, "Type and press Enter"],
+  ["assert_focused"],
+]
+
+[[sequence]]
+description = "Typing a trimmed item and pressing Enter appends it and clears the input"
+actions = [
+  ["type", "Orange"],
+  ["key", "Enter"],
+  ["assert_contains", "Count: 4"],
+  ["assert_contains", "- Orange"],
+  ["assert_input_empty", 0],
+]

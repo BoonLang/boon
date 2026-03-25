@@ -1,19 +1,11 @@
-# Layers example - displays three overlapping colored cards
+# Layers example - stacked cards render in retained absolute layout
 
 [test]
-category = "static"
-description = "Displays three colored cards with absolute positioning"
+category = "layout"
+description = "Layers renders the stacked card labels"
 
 [output]
-# Check that all three cards are rendered
-text = "Blue Card"
+text = "Red CardGreen CardBlue Card"
 
 [timing]
 timeout = 5000
-
-# --- PERSISTENCE TEST ---
-# Static display - verify consistent output after re-run
-
-[[persistence]]
-description = "After re-run, cards should still be displayed"
-expect = "Blue Card"

@@ -182,6 +182,33 @@ enum MetricsAction {
         #[arg(long)]
         target_dir: Option<PathBuf>,
     },
+
+    /// Measure current ActorsLite preview metrics and budget gates
+    ActorsLite {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+
+        /// Exit nonzero if the current ActorsLite budget gate fails
+        #[arg(long)]
+        check: bool,
+
+        /// Also require the pinned benchmark environment constraints to pass
+        #[arg(long)]
+        pinned_env: bool,
+
+        /// Assert that the playground and extension session is warmed
+        #[arg(long)]
+        warmed_session: bool,
+
+        /// Assert that only a single visible browser tab is active
+        #[arg(long)]
+        single_visible_tab: bool,
+
+        /// Assert that DevTools is closed during measurement
+        #[arg(long)]
+        no_devtools: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -195,6 +222,33 @@ enum VerifyAction {
         /// Exit nonzero if any official 7GUIs example fails to lower
         #[arg(long)]
         check: bool,
+    },
+
+    /// Run the ActorsLite milestone browser traces plus metrics gate
+    ActorsLite {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+
+        /// Exit nonzero if any milestone trace or budget gate fails
+        #[arg(long)]
+        check: bool,
+
+        /// Also require the pinned benchmark environment constraints to pass
+        #[arg(long)]
+        pinned_env: bool,
+
+        /// Assert that the playground and extension session is warmed
+        #[arg(long)]
+        warmed_session: bool,
+
+        /// Assert that only a single visible browser tab is active
+        #[arg(long)]
+        single_visible_tab: bool,
+
+        /// Assert that DevTools is closed during verification
+        #[arg(long)]
+        no_devtools: bool,
     },
 }
 
@@ -427,7 +481,7 @@ enum ExecAction {
         #[arg(long)]
         no_launch: bool,
 
-        /// Engine to test against: Actors, DD, or Wasm
+        /// Engine to test against: Actors, ActorsLite, DD, or Wasm
         #[arg(long)]
         engine: Option<String>,
 
@@ -466,7 +520,7 @@ enum ExecAction {
 
     /// Set the engine and trigger re-run
     SetEngine {
-        /// Engine to use: "Actors", "DD", or "Wasm"
+        /// Engine to use: "Actors", "ActorsLite", "DD", or "Wasm"
         engine: String,
     },
 
@@ -643,6 +697,26 @@ fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
+            MetricsAction::ActorsLite {
+                json,
+                check,
+                pinned_env,
+                warmed_session,
+                single_visible_tab,
+                no_devtools,
+            } => {
+                if let Err(e) = commands::backend_metrics::run_actors_lite_metrics(
+                    json,
+                    check,
+                    pinned_env,
+                    warmed_session,
+                    single_visible_tab,
+                    no_devtools,
+                ) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
         },
 
         Commands::Verify { action } => match action {
@@ -650,6 +724,27 @@ fn main() -> Result<()> {
                 if let Err(e) =
                     commands::verify_wasm_lowering::run_verify_wasm_lowering(json, check)
                 {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+            VerifyAction::ActorsLite {
+                json,
+                check,
+                pinned_env,
+                warmed_session,
+                single_visible_tab,
+                no_devtools,
+            } => {
+                let rt = tokio::runtime::Runtime::new()?;
+                if let Err(e) = rt.block_on(commands::verify_actors_lite::run_verify_actors_lite(
+                    json,
+                    check,
+                    pinned_env,
+                    warmed_session,
+                    single_visible_tab,
+                    no_devtools,
+                )) {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }
@@ -1155,9 +1250,9 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
 
             // Validate engine if provided
             if let Some(ref eng) = engine {
-                if eng != "Actors" && eng != "DD" && eng != "Wasm" {
+                if eng != "Actors" && eng != "ActorsLite" && eng != "DD" && eng != "Wasm" {
                     anyhow::bail!(
-                        "Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'",
+                        "Invalid engine '{}'. Must be 'Actors', 'ActorsLite', 'DD', or 'Wasm'",
                         eng
                     );
                 }
@@ -1331,7 +1426,7 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             // Validate engine value
             if !commands::is_valid_engine_name(&engine) {
                 anyhow::bail!(
-                    "Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'",
+                    "Invalid engine '{}'. Must be 'Actors', 'ActorsLite', 'DD', or 'Wasm'",
                     engine
                 );
             }

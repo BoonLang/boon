@@ -1,0 +1,32 @@
+# HOLD across switched WHILE branches example
+
+[test]
+category = "interactive"
+description = "Item click counts persist while toggling between WHILE branches"
+
+[output]
+text = "Showing: Item AToggle ViewItem A clicks: 0Click Item AClick Item BTest: Click button, toggle view, click again. Counts should increment correctly."
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+[[sequence]]
+description = "Click Item A"
+actions = [["click_button", 1]]
+expect = "Showing: Item AToggle ViewItem A clicks: 1Click Item AClick Item BTest: Click button, toggle view, click again. Counts should increment correctly."
+
+[[sequence]]
+description = "Toggle to Item B"
+actions = [["click_button", 0]]
+expect = "Showing: Item BToggle ViewItem B clicks: 0Click Item AClick Item BTest: Click button, toggle view, click again. Counts should increment correctly."
+
+[[sequence]]
+description = "Click Item B"
+actions = [["click_button", 2]]
+expect = "Showing: Item BToggle ViewItem B clicks: 1Click Item AClick Item BTest: Click button, toggle view, click again. Counts should increment correctly."
+
+[[sequence]]
+description = "Toggle back to Item A and preserve its count"
+actions = [["click_button", 0]]
+expect = "Showing: Item AToggle ViewItem A clicks: 1Click Item AClick Item BTest: Click button, toggle view, click again. Counts should increment correctly."

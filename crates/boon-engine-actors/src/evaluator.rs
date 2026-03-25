@@ -12,8 +12,8 @@ use zoon::futures_util::future;
 use zoon::futures_util::stream::{self, LocalBoxStream};
 use zoon::{SinkExt, Stream, StreamExt, Task, TaskHandle, mpsc};
 
-use crate::api;
 use super::engine::*;
+use crate::api;
 use boon::parser::{
     Persistence, PersistenceId, PersistenceStatus, Scope, SourceCode, Span, Spanned, Token, lexer,
     parser, resolve_persistence, resolve_references, span_at, static_expression,
@@ -2819,17 +2819,17 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                     scope_id,
                 );
                 let prev_actor_for_visible_initial = prev_actor.clone();
-                let visible_forwarding = connect_forwarding(
-                    wrapper_sender,
-                    prev_actor.clone(),
-                    async move { prev_actor_for_visible_initial.current_value().await.ok() },
-                );
+                let visible_forwarding =
+                    connect_forwarding(wrapper_sender, prev_actor.clone(), async move {
+                        prev_actor_for_visible_initial.current_value().await.ok()
+                    });
 
                 let alias_for_stream = alias.node.clone();
                 let ctx_for_stream = new_ctx.clone();
                 let prev_actor_for_link_initial = prev_actor.clone();
                 let prev_actor_for_link_updates = prev_actor.clone();
-                let subscription_scope_for_stream = new_ctx.actor_context.subscription_scope.clone();
+                let subscription_scope_for_stream =
+                    new_ctx.actor_context.subscription_scope.clone();
                 let link_forwarding = ActorLoop::new(async move {
                     let Some(link_sender) =
                         get_link_sender_from_alias(alias_for_stream, ctx_for_stream).await
@@ -3123,8 +3123,9 @@ fn evaluate_alias_immediate(
 ) -> Result<ActorHandle, String> {
     type BoxedFuture = Pin<Box<dyn std::future::Future<Output = ActorHandle>>>;
 
-    let (root_value_actor, root_should_use_subscription_time): (BoxedFuture, bool) =
-        match alias.clone() {
+    let (root_value_actor, root_should_use_subscription_time): (BoxedFuture, bool) = match alias
+        .clone()
+    {
         static_expression::Alias::WithPassed { extra_parts: _ } => {
             match &ctx.actor_context.passed {
                 Some(passed) => {
@@ -3246,7 +3247,8 @@ async fn freeze_snapshot_root_actor(
     let snapshot_value = if let Some((emission_idempotency_key, emission_lamport_time)) =
         actor_context.snapshot_emission_identity
     {
-        actor.current_value_before_emission(emission_idempotency_key, emission_lamport_time)
+        actor
+            .current_value_before_emission(emission_idempotency_key, emission_lamport_time)
             .await
     } else {
         actor.current_value().await
@@ -3279,7 +3281,8 @@ async fn snapshot_current_value(
     if let Some((emission_idempotency_key, emission_lamport_time)) =
         actor_context.snapshot_emission_identity
     {
-        actor.current_value_before_emission(emission_idempotency_key, emission_lamport_time)
+        actor
+            .current_value_before_emission(emission_idempotency_key, emission_lamport_time)
             .await
     } else {
         actor.current_value().await
@@ -3658,9 +3661,7 @@ enum BranchConditionEmissionDedupKey {
     Number(u64, ValueIdempotencyKey, u64),
 }
 
-fn branch_condition_emission_identity(
-    value: &Value,
-) -> (ValueIdempotencyKey, u64) {
+fn branch_condition_emission_identity(value: &Value) -> (ValueIdempotencyKey, u64) {
     (value.idempotency_key(), value.lamport_time())
 }
 
@@ -3677,15 +3678,15 @@ fn branch_condition_dedup_key(value: &Value) -> Option<BranchConditionDedupKey> 
     match value {
         Value::Text(text, _) => Some(BranchConditionDedupKey::Text(text.text().to_string())),
         Value::Tag(tag, _) => Some(BranchConditionDedupKey::Tag(tag.tag().to_string())),
-        Value::Number(number, _) => Some(BranchConditionDedupKey::Number(number.number().to_bits())),
+        Value::Number(number, _) => {
+            Some(BranchConditionDedupKey::Number(number.number().to_bits()))
+        }
         Value::Flushed(inner, _) => branch_condition_dedup_key(inner),
         Value::Object(_, _) | Value::TaggedObject(_, _) | Value::List(_, _) => None,
     }
 }
 
-fn branch_condition_emission_dedup_key(
-    value: &Value,
-) -> Option<BranchConditionEmissionDedupKey> {
+fn branch_condition_emission_dedup_key(value: &Value) -> Option<BranchConditionEmissionDedupKey> {
     let (idempotency_key, lamport_time) = branch_condition_emission_identity(value);
     match value {
         Value::Text(text, _) => Some(BranchConditionEmissionDedupKey::Text(
@@ -3868,36 +3869,36 @@ fn build_when_actor(
                             parameters.insert(name, bound_actor);
                         }
 
-                        let frozen_passed =
-                            if let Some(passed_actor) = actor_context_clone.passed.clone() {
-                                if let Ok(current_value) =
-                                    snapshot_current_value(&passed_actor, &actor_context_clone).await
-                                {
-                                    let frozen_value = materialize_snapshot_value(
-                                        current_value,
-                                        construct_context_clone.clone(),
-                                        actor_context_clone.clone(),
-                                    )
-                                    .await;
-                                    Some(create_constant_actor(
-                                        ConstructInfo::new(
-                                            "frozen passed",
-                                            None,
-                                            "frozen passed value for WHEN snapshot body",
-                                        ),
-                                        PersistenceId::new(),
-                                        frozen_value,
-                                        actor_context_clone.scope_id(),
-                                    ))
-                                } else {
-                                    Some(passed_actor)
-                                }
+                        let frozen_passed = if let Some(passed_actor) =
+                            actor_context_clone.passed.clone()
+                        {
+                            if let Ok(current_value) =
+                                snapshot_current_value(&passed_actor, &actor_context_clone).await
+                            {
+                                let frozen_value = materialize_snapshot_value(
+                                    current_value,
+                                    construct_context_clone.clone(),
+                                    actor_context_clone.clone(),
+                                )
+                                .await;
+                                Some(create_constant_actor(
+                                    ConstructInfo::new(
+                                        "frozen passed",
+                                        None,
+                                        "frozen passed value for WHEN snapshot body",
+                                    ),
+                                    PersistenceId::new(),
+                                    frozen_value,
+                                    actor_context_clone.scope_id(),
+                                ))
+                            } else {
+                                Some(passed_actor)
+                            }
                         } else {
                             None
                         };
 
-                        let mut frozen_object_locals: HashMap<Span, ActorHandle> =
-                            HashMap::new();
+                        let mut frozen_object_locals: HashMap<Span, ActorHandle> = HashMap::new();
                         for (span, actor) in actor_context_clone.object_locals.iter() {
                             if let Ok(current_value) =
                                 snapshot_current_value(actor, &actor_context_clone).await
@@ -3993,8 +3994,7 @@ fn build_when_actor(
                                     // matched-arm stream. Keeping the arm live here can recursively
                                     // spawn work while a one-shot `.value()` caller is still waiting.
                                     let result_actor_keepalive = result_actor.clone();
-                                    let construct_context_for_map =
-                                        construct_context_clone.clone();
+                                    let construct_context_for_map = construct_context_clone.clone();
                                     let actor_context_for_map = new_actor_context.clone();
                                     stream::once(async move { result_actor.value().await })
                                         .filter_map(move |value| {
@@ -4040,8 +4040,7 @@ fn build_when_actor(
                                     //
                                     // Snapshot semantics for event-style WHENs are still preserved by
                                     // freezing parameters / PASSED above at match time.
-                                    let construct_context_for_map =
-                                        construct_context_clone.clone();
+                                    let construct_context_for_map = construct_context_clone.clone();
                                     let actor_context_for_map = new_actor_context.clone();
                                     result_actor
                                         .stream()
@@ -4092,11 +4091,7 @@ fn build_when_actor(
                                         .boxed_local()
                                 };
                                 return stream::unfold(
-                                    (
-                                        body_stream,
-                                        Some(scope_guard),
-                                        arm_registry_scope,
-                                    ),
+                                    (body_stream, Some(scope_guard), arm_registry_scope),
                                     |(mut s, guard, reg_scope)| async move {
                                         s.next().await.map(|v| (v, (s, guard, reg_scope)))
                                     },
@@ -4143,21 +4138,22 @@ fn build_when_actor(
     // duplicate scalar inputs here; complex values still pass through unchanged.
     let seeded_condition_stream = current_or_future_stream(piped.clone());
 
-    let deduped_condition_stream = seeded_condition_stream.scan(
-        None::<BranchConditionEmissionDedupKey>,
-        move |last_key, value| {
-            let current_key = branch_condition_emission_dedup_key(&value);
-            let should_emit = current_key.as_ref() != last_key.as_ref();
-            *last_key = current_key;
-            future::ready(Some(if should_emit { Some(value) } else { None }))
-        },
-    )
-    .filter_map(future::ready);
+    let deduped_condition_stream = seeded_condition_stream
+        .scan(
+            None::<BranchConditionEmissionDedupKey>,
+            move |last_key, value| {
+                let current_key = branch_condition_emission_dedup_key(&value);
+                let should_emit = current_key.as_ref() != last_key.as_ref();
+                *last_key = current_key;
+                future::ready(Some(if should_emit { Some(value) } else { None }))
+            },
+        )
+        .filter_map(future::ready);
 
-    let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(switch_map(
-        deduped_condition_stream,
-        move |value| stream::once(eval_body(value)).flatten(),
-    ));
+    let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> =
+        Box::pin(switch_map(deduped_condition_stream, move |value| {
+            stream::once(eval_body(value)).flatten()
+        }));
 
     let scope_id = ctx.actor_context.scope_id();
     Ok(create_actor(
@@ -4218,16 +4214,14 @@ fn build_while_actor(
     // scalar conditions here; complex values still pass through unchanged.
     let seeded_condition_stream = current_or_future_stream(piped.clone());
 
-    let deduped_condition_stream = seeded_condition_stream.scan(
-        None::<BranchConditionDedupKey>,
-        move |last_key, value| {
+    let deduped_condition_stream = seeded_condition_stream
+        .scan(None::<BranchConditionDedupKey>, move |last_key, value| {
             let current_key = branch_condition_dedup_key(&value);
             let should_emit = current_key.as_ref() != last_key.as_ref();
             *last_key = current_key;
             future::ready(Some(if should_emit { Some(value) } else { None }))
-        },
-    )
-    .filter_map(future::ready);
+        })
+        .filter_map(future::ready);
 
     let stream = switch_map(deduped_condition_stream, move |value| {
         let actor_context_clone = Arc::clone(&actor_context_for_while);
@@ -4335,8 +4329,7 @@ fn build_while_actor(
                     // UI events and drive reopen loops on examples like Cells.
                     scope: {
                         use boon::parser::Scope;
-                        let scope_id =
-                            format!("while_arm_{}_{}", arm_idx, source_lamport_time);
+                        let scope_id = format!("while_arm_{}_{}", arm_idx, source_lamport_time);
                         match &actor_context_clone.scope {
                             Scope::Root => Scope::Nested(scope_id),
                             Scope::Nested(existing) => {
@@ -4356,10 +4349,7 @@ fn build_while_actor(
                     // earlier incarnations of the same arm. Parameter/global references opt
                     // out in evaluate_alias_immediate, but object-local roots keep this filter.
                     subscription_time: Some(source_lamport_time),
-                    snapshot_emission_identity: Some((
-                        source_idempotency_key,
-                        source_lamport_time,
-                    )),
+                    snapshot_emission_identity: Some((source_idempotency_key, source_lamport_time)),
                     // Use the arm's registry scope (if available) so actors are owned by this arm
                     registry_scope_id: arm_registry_scope
                         .as_ref()
@@ -4391,8 +4381,7 @@ fn build_while_actor(
                                 let construct_context_for_map = construct_context_for_map.clone();
                                 let actor_context_for_map = actor_context_for_map.clone();
                                 async move {
-                                    let emission_idempotency_key =
-                                        result_value.idempotency_key();
+                                    let emission_idempotency_key = result_value.idempotency_key();
                                     let emission_lamport_time = result_value.lamport_time();
                                     if should_materialize {
                                         result_value = materialize_value(
@@ -4427,11 +4416,8 @@ fn build_while_actor(
                                     let structurally_equal = if same_emission {
                                         false
                                     } else if let Some(previous) = last_value.as_ref() {
-                                        crate::engine::values_equal_async(
-                                            previous,
-                                            &result_value,
-                                        )
-                                        .await
+                                        crate::engine::values_equal_async(previous, &result_value)
+                                            .await
                                     } else {
                                         false
                                     };
@@ -4564,8 +4550,7 @@ fn build_field_access_actor(
     // Mapped helper calls often receive a fully-constructed object before any live
     // updates occur; using stream() alone can miss that initial object and blank the
     // whole derived subtree.
-    let mut value_stream: LocalBoxStream<'static, Value> =
-        current_or_future_stream(piped.clone());
+    let mut value_stream: LocalBoxStream<'static, Value> = current_or_future_stream(piped.clone());
 
     // Chain switch_map for EACH field - THE KEY FIX!
     // When ANY field emits a new value, downstream switch_maps automatically
@@ -4963,10 +4948,7 @@ fn build_hold_actor(
                     // Subsequent source values reset HOLD state.
                     let value = source_subscription.next().await?;
                     if let Ok(current_value) = output_clone.current_value().await {
-                        if crate::engine::values_equal(
-                            &current_value,
-                            &value,
-                        ) {
+                        if crate::engine::values_equal(&current_value, &value) {
                             return Some((
                                 value,
                                 HoldResetInputState::ForwardingSource {
@@ -5007,10 +4989,7 @@ fn build_hold_actor(
             let storage = storage_for_state_save.clone();
             async move {
                 if let Ok(current_value) = output_actor.current_value().await {
-                    if crate::engine::values_equal(
-                        &current_value,
-                        &new_value,
-                    ) {
+                    if crate::engine::values_equal(&current_value, &new_value) {
                         return None;
                     }
                 }
@@ -5184,10 +5163,7 @@ fn build_stateless_hold_actor(
                 } => {
                     let value = source_subscription.next().await?;
                     if let Ok(current_value) = output_clone.current_value().await {
-                        if crate::engine::values_equal(
-                            &current_value,
-                            &value,
-                        ) {
+                        if crate::engine::values_equal(&current_value, &value) {
                             return Some((
                                 value,
                                 HoldResetInputState::ForwardingSource {
@@ -5219,10 +5195,7 @@ fn build_stateless_hold_actor(
             let storage = storage_for_body_save.clone();
             async move {
                 if let Ok(current_value) = output_actor.current_value().await {
-                    if crate::engine::values_equal(
-                        &current_value,
-                        &new_value,
-                    ) {
+                    if crate::engine::values_equal(&current_value, &new_value) {
                         return None;
                     }
                 }
@@ -6512,13 +6485,9 @@ fn expression_references_parameter_with_bindings(
             alias_references_parameter(&alias.node, parameter, bindings)
         }
         Expression::FunctionCall { arguments, .. } => arguments.iter().any(|argument| {
-            argument
-                .node
-                .value
-                .as_ref()
-                .is_some_and(|value| {
-                    expression_references_parameter_with_bindings(value, parameter, bindings)
-                })
+            argument.node.value.as_ref().is_some_and(|value| {
+                expression_references_parameter_with_bindings(value, parameter, bindings)
+            })
         }),
         Expression::List { items } => items
             .iter()
@@ -6534,9 +6503,7 @@ fn expression_references_parameter_with_bindings(
                 || expression_references_parameter_with_bindings(&entry.value, parameter, bindings)
         }),
         Expression::Function {
-            parameters,
-            body,
-            ..
+            parameters, body, ..
         } => {
             let initial_len = bindings.len();
             bindings.extend(parameters.iter().map(|param| param.node.to_string()));
@@ -6612,9 +6579,7 @@ fn expression_references_parameter_with_bindings(
                 operand_b,
             } => {
                 expression_references_parameter_with_bindings(operand_a, parameter, bindings)
-                    || expression_references_parameter_with_bindings(
-                        operand_b, parameter, bindings,
-                    )
+                    || expression_references_parameter_with_bindings(operand_b, parameter, bindings)
             }
         },
         Expression::ArithmeticOperator(operator) => match operator {
@@ -6638,9 +6603,7 @@ fn expression_references_parameter_with_bindings(
                 operand_b,
             } => {
                 expression_references_parameter_with_bindings(operand_a, parameter, bindings)
-                    || expression_references_parameter_with_bindings(
-                        operand_b, parameter, bindings,
-                    )
+                    || expression_references_parameter_with_bindings(operand_b, parameter, bindings)
             }
         },
         Expression::TextLiteral { parts, .. } => parts.iter().any(|part| match part {
@@ -6681,7 +6644,8 @@ fn variables_reference_parameter(
 ) -> bool {
     let initial_len = bindings.len();
     for variable in variables {
-        if expression_references_parameter_with_bindings(&variable.node.value, parameter, bindings) {
+        if expression_references_parameter_with_bindings(&variable.node.value, parameter, bindings)
+        {
             bindings.truncate(initial_len);
             return true;
         }
@@ -6699,9 +6663,7 @@ fn alias_references_parameter(
     match alias {
         static_expression::Alias::WithoutPassed { parts, .. } => {
             !bindings.iter().any(|binding| binding == parameter)
-                && parts
-                    .first()
-                    .is_some_and(|part| part.as_str() == parameter)
+                && parts.first().is_some_and(|part| part.as_str() == parameter)
         }
         static_expression::Alias::WithPassed { .. } => false,
     }
@@ -7021,10 +6983,8 @@ fn call_function(
                 // actors like `cell_formula(...)` as arguments; without retaining them
                 // here, the wrapper can freeze at the initial value once those temporaries
                 // get dropped.
-                let result_stream =
-                    current_or_future_stream(result_actor.clone()).scan(arg_actors, |_arg_actors, value| async move {
-                        Some(value)
-                    });
+                let result_stream = current_or_future_stream(result_actor.clone())
+                    .scan(arg_actors, |_arg_actors, value| async move { Some(value) });
                 let wrapper: ActorHandle = create_actor(
                     ConstructInfo::new(
                         format!("PersistenceId: {persistence_id}"),
@@ -9122,15 +9082,15 @@ fn spawn_recorded_calls_storage_actor(
 #[cfg(test)]
 mod tests {
     use super::{FunctionRegistry, ModuleLoader, evaluate_with_registry, flatten_pipe_chain};
+    use crate::engine::{
+        ActorContext, ConstructContext, ConstructId, Object, ScopeDestroyGuard, Value, Variable,
+        VirtualFilesystem,
+    };
     use boon::parser::{
         SourceCode, Spanned, Token, lexer, parser, resolve_references, span_at, static_expression,
     };
     use boon::platform::browser::kernel::{
         KernelValue, LatestCandidate, TickId, TickSeq, select_latest,
-    };
-    use crate::engine::{
-        ActorContext, ConstructContext, ConstructId, Object, ScopeDestroyGuard, Value, Variable,
-        VirtualFilesystem,
     };
     use chumsky::Parser as ChumskyParser;
     use chumsky::input::Input as ChumskyInput;
@@ -9243,24 +9203,26 @@ pressed: increment_button.event.press |> THEN { TEXT { pressed } }
         (source_code, static_ast)
     }
 
-    fn evaluate_program(
-        source: &str,
-    ) -> (
-        Arc<Object>,
-        ConstructContext,
-        ScopeDestroyGuard,
-    ) {
+    fn evaluate_program(source: &str) -> (Arc<Object>, ConstructContext, ScopeDestroyGuard) {
         let (source_code, expressions) = parse_static_program(source);
-        let (root_object, construct_context, _function_registry, _module_loader, _references, _links, _pass_throughs, scope_guard) =
-            evaluate_with_registry(
-                source_code,
-                expressions,
-                "",
-                VirtualFilesystem::new(),
-                FunctionRegistry::new(),
-                ModuleLoader::default(),
-            )
-            .expect("program should evaluate");
+        let (
+            root_object,
+            construct_context,
+            _function_registry,
+            _module_loader,
+            _references,
+            _links,
+            _pass_throughs,
+            scope_guard,
+        ) = evaluate_with_registry(
+            source_code,
+            expressions,
+            "",
+            VirtualFilesystem::new(),
+            FunctionRegistry::new(),
+            ModuleLoader::default(),
+        )
+        .expect("program should evaluate");
         (root_object, construct_context, scope_guard)
     }
 
@@ -9393,7 +9355,6 @@ count: 0 |> HOLD state {
 }
 "#
     }
-
 
     fn nested_cells_map_source(with_link: bool) -> String {
         let mapped_element = if with_link {
@@ -10009,7 +9970,8 @@ all_completed: completed_todos_count == 4
 
     #[test]
     fn list_append_from_link_event_snapshots_object_fields() {
-        let (root_object, construct_context, _scope_guard) = evaluate_program(append_from_link_source());
+        let (root_object, construct_context, _scope_guard) =
+            evaluate_program(append_from_link_source());
         let edit_committed = root_object.expect_variable("edit_committed");
         let overrides = root_object.expect_variable("overrides");
         let sender = edit_committed.expect_link_value_sender();
@@ -10178,7 +10140,11 @@ all_completed: completed_todos_count == 4
                 panic!("elements should evaluate to a list");
             };
             let snapshot = list.snapshot().await;
-            assert_eq!(snapshot.len(), 2, "expected two mapped linked cell elements");
+            assert_eq!(
+                snapshot.len(),
+                2,
+                "expected two mapped linked cell elements"
+            );
 
             for (_pid, item_actor) in snapshot {
                 let item_value = item_actor
@@ -10229,7 +10195,8 @@ all_completed: completed_todos_count == 4
     }
 
     #[test]
-    fn nested_cells_map_helper_when_while_with_text_input_inactive_branch_produces_label_elements() {
+    fn nested_cells_map_helper_when_while_with_text_input_inactive_branch_produces_label_elements()
+    {
         let source = nested_cells_map_helper_when_while_text_input_source();
         let (root_object, _construct_context, _scope_guard) = evaluate_program(&source);
         let elements = root_object.expect_variable("elements");
@@ -10455,7 +10422,9 @@ all_completed: completed_todos_count == 4
                 let Value::Object(element_obj, _) = element_value else {
                     panic!("linked element field should be an object");
                 };
-                let event = element_obj.variable("event").expect("element should have event");
+                let event = element_obj
+                    .variable("event")
+                    .expect("element should have event");
                 let event_value = event
                     .value_actor()
                     .current_value()
@@ -10475,7 +10444,8 @@ all_completed: completed_todos_count == 4
             let _initial = first_mapped_item(&elements).await;
             let cell_obj = first_cell(&cells).await;
 
-            let display_sender = nested_link_sender(cell_obj.clone(), "display", "double_click").await;
+            let display_sender =
+                nested_link_sender(cell_obj.clone(), "display", "double_click").await;
             send_link_signal(
                 construct_context.clone(),
                 display_sender,
@@ -10927,8 +10897,7 @@ all_completed: completed_todos_count == 4
     #[test]
     #[ignore = "requires browser-side actors runtime; host lib tests still touch js-sys statics"]
     fn crud_mapped_row_press_updates_selected_id() {
-        let source =
-            read_example_source("../../playground/frontend/src/examples/crud/crud.bn");
+        let source = read_example_source("../../playground/frontend/src/examples/crud/crud.bn");
         let (root_object, construct_context, _scope_guard) = evaluate_program(&source);
         let document = root_object.expect_variable("document");
         let store = root_object.expect_variable("store");
@@ -11290,11 +11259,10 @@ all_completed: completed_todos_count == 4
                     .await;
 
                 let initial_snapshot = list.snapshot().await;
-                let current_items: Vec<crate::engine::ActorHandle> =
-                    initial_snapshot
-                        .iter()
-                        .map(|(_id, item_actor)| item_actor.clone())
-                        .collect();
+                let current_items: Vec<crate::engine::ActorHandle> = initial_snapshot
+                    .iter()
+                    .map(|(_id, item_actor)| item_actor.clone())
+                    .collect();
                 let initial_mapped_json = items_to_json(current_items.clone()).await;
 
                 send_edit_committed(construct_context, sender, 1.0, 1.0, "7").await;
@@ -11358,37 +11326,37 @@ all_completed: completed_todos_count == 4
                 panic!("todos should evaluate to a list");
             };
 
-            let items_to_json =
-                |items: Vec<crate::engine::ActorHandle>| async move {
-                    let mut values = Vec::new();
-                    for item_actor in items {
-                        let value = item_actor
+            let items_to_json = |items: Vec<crate::engine::ActorHandle>| async move {
+                let mut values = Vec::new();
+                for item_actor in items {
+                    let value = item_actor
+                        .current_value()
+                        .await
+                        .expect("todo item should have current value");
+                    let Value::Object(todo_obj, _) = value else {
+                        panic!("todo item should be an object");
+                    };
+                    let completed = todo_obj
+                        .variable("completed")
+                        .expect("todo item should have completed");
+                    values.push(
+                        completed
+                            .value_actor()
                             .current_value()
                             .await
-                            .expect("todo item should have current value");
-                        let Value::Object(todo_obj, _) = value else {
-                            panic!("todo item should be an object");
-                        };
-                        let completed = todo_obj
-                            .variable("completed")
-                            .expect("todo item should have completed");
-                        values.push(
-                            completed
-                                .value_actor()
-                                .current_value()
-                                .await
-                                .expect("completed should have current value")
-                                .to_json()
-                                .await,
-                        );
-                    }
-                    serde_json::Value::Array(values)
-                };
+                            .expect("completed should have current value")
+                            .to_json()
+                            .await,
+                    );
+                }
+                serde_json::Value::Array(values)
+            };
 
             let snapshot = list.snapshot().await;
-            let current_items: Vec<
-                crate::engine::ActorHandle,
-            > = snapshot.into_iter().map(|(_id, item_actor)| item_actor).collect();
+            let current_items: Vec<crate::engine::ActorHandle> = snapshot
+                .into_iter()
+                .map(|(_id, item_actor)| item_actor)
+                .collect();
             let initial_json = items_to_json(current_items.clone()).await;
 
             send_link_signal(
@@ -11414,5 +11382,4 @@ all_completed: completed_todos_count == 4
         assert_eq!(initial_json, json!([false, false, false, true]));
         assert_eq!(updated_json, json!([true, true, true, true]));
     }
-
 }

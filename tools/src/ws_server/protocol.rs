@@ -37,6 +37,9 @@ pub enum Command {
     /// Get preview panel text content
     GetPreviewText,
 
+    /// Get persisted ActorsLite browser debug breadcrumb
+    GetActorsLiteDebug,
+
     /// Check if extension is connected and ready
     Ping,
 
@@ -201,7 +204,7 @@ pub enum Command {
 
     /// Set the engine type and trigger re-run
     SetEngine {
-        /// Engine name: "Actors", "DD", or "Wasm"
+        /// Engine name: "Actors", "ActorsLite", "DD", or "Wasm"
         engine: String,
     },
 
@@ -256,6 +259,12 @@ pub enum Response {
 
     /// Preview text
     PreviewText { text: String },
+
+    /// ActorsLite debug breadcrumb
+    ActorsLiteDebug {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+    },
 
     /// Pong response
     Pong,
@@ -358,7 +367,7 @@ pub enum Response {
 
     /// Engine info response
     EngineInfo {
-        /// Current engine: "Actors", "DD", or "Wasm"
+        /// Current engine: "Actors", "ActorsLite", "DD", or "Wasm"
         engine: String,
         /// Human-facing label for the current engine
         #[serde(default, skip_serializing_if = "Option::is_none")]

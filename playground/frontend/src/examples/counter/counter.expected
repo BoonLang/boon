@@ -21,21 +21,30 @@ description = "Click again"
 actions = [["click_button", 0]]
 expect = "2+"
 
+[[sequence]]
+description = "Burst click three more times"
+actions = [
+    ["click_button", 0],
+    ["click_button", 0],
+    ["click_button", 0]
+]
+expect = "5+"
+
 # --- PERSISTENCE TEST ---
 # After re-run (simulating page reload), state should be preserved
 
 [[persistence]]
-description = "After re-run, counter should still be 2 (persisted)"
-expect = "2+"
+description = "After re-run, counter should still be 5 (persisted)"
+expect = "5+"
 
 # --- CLEAR STATES TEST ---
 # Verify that "Clear saved states" button resets counter
 # This is placed in a persistence section so it runs after the main persistence test
 
 [[persistence]]
-description = "Click increment to get to 3"
+description = "Click increment to get to 6"
 actions = [["click_button", 0]]
-expect = "3+"
+expect = "6+"
 
 [[persistence]]
 description = "Clear states and re-run - counter should reset to 0"

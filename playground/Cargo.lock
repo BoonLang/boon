@@ -440,6 +440,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon-engine-actors-lite"
+version = "0.1.0"
+dependencies = [
+ "boon",
+ "boon-renderer-zoon",
+ "boon-scene",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "boon-engine-dd"
 version = "0.1.0"
 dependencies = [
@@ -950,6 +961,7 @@ version = "0.1.0"
 dependencies = [
  "boon",
  "boon-engine-actors",
+ "boon-engine-actors-lite",
  "boon-engine-dd",
  "boon-engine-wasm",
  "ulid",

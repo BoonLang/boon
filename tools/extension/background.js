@@ -222,85 +222,34 @@ async function cdpClickAt(tabId, x, y) {
   console.log(`[Boon] CDP: Real click at page (${x}, ${y}) -> viewport (${viewportX}, ${viewportY})`);
 }
 
-// Double-click at coordinates.
-// Chromium's CDP clickCount-based sequence does not reliably produce a DOM
-// `dblclick` for the Zoon label cells used by the playground, even though the
-// hit target is correct. Dispatch the DOM double-click sequence directly on the
-// resolved element instead.
+// Double-click at coordinates using real CDP mouse events.
+// This keeps the extension responsive even when the page does heavy rerender
+// work in response to the interaction.
 async function cdpDoubleClickAt(tabId, x, y) {
   await attachDebugger(tabId);
 
   // Get scroll offset to convert page coords to viewport coords for CDP events
-  const scrollOffset = await executeInTab(tabId, () => ({
-    scrollX: window.scrollX,
-    scrollY: window.scrollY
-  }));
-  if (scrollOffset?.type === 'error') {
-    throw new Error(scrollOffset.message || 'Failed to read scroll offset');
-  }
+  const scrollOffset = await cdpEvaluate(tabId, `({ scrollX: window.scrollX, scrollY: window.scrollY })`);
   const viewportX = x - (scrollOffset?.scrollX || 0);
   const viewportY = y - (scrollOffset?.scrollY || 0);
 
-  const result = await executeInTab(tabId, (x, y) => {
-      const target = document.elementFromPoint(x, y);
-      if (!target) {
-        return { ok: false, error: 'No element at target coordinates' };
-      }
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved', x: viewportX, y: viewportY, button: 'none'
+  });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed', x: viewportX, y: viewportY, button: 'left', clickCount: 1
+  });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x: viewportX, y: viewportY, button: 'left', clickCount: 1
+  });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed', x: viewportX, y: viewportY, button: 'left', clickCount: 2
+  });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x: viewportX, y: viewportY, button: 'left', clickCount: 2
+  });
 
-      if (typeof target.focus === 'function') {
-        try { target.focus(); } catch (_) {}
-      }
-
-      const makeMouseEvent = (type, detail) => new MouseEvent(type, {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        view: window,
-        clientX: x,
-        clientY: y,
-        screenX: x,
-        screenY: y,
-        button: 0,
-        buttons: type === 'mouseup' || type === 'click' || type === 'dblclick' ? 0 : 1,
-        detail
-      });
-
-      const sequence = [
-        ['mousedown', 1],
-        ['mouseup', 1],
-        ['click', 1],
-        ['mousedown', 2],
-        ['mouseup', 2],
-        ['click', 2],
-        ['dblclick', 2]
-      ];
-
-      for (const [type, detail] of sequence) {
-        target.dispatchEvent(makeMouseEvent(type, detail));
-      }
-
-      const rect = target.getBoundingClientRect();
-      return {
-        ok: true,
-        tag: target.tagName,
-        left: rect.left,
-        top: rect.top,
-        right: rect.right,
-        bottom: rect.bottom
-      };
-    },
-    viewportX,
-    viewportY
-  );
-  if (result?.type === 'error') {
-    throw new Error(result.message || 'DOM double-click dispatch failed');
-  }
-
-  if (!result?.ok) {
-    throw new Error(result?.error || 'DOM double-click dispatch failed');
-  }
-
-  console.log(`[Boon] DOM dblclick at page (${x}, ${y}) -> viewport (${viewportX}, ${viewportY})`);
+  console.log(`[Boon] CDP dblclick at page (${x}, ${y}) -> viewport (${viewportX}, ${viewportY})`);
 }
 
 function locateCellsCellElement(preview, row, column) {
@@ -535,10 +484,10 @@ async function cdpTypeTextCharByChar(tabId, text) {
       expression: `(function() {
         const preview = document.querySelector('[data-boon-panel="preview"]');
         if (!preview) return false;
-        const inputs = Array.from(preview.querySelectorAll('input, textarea'));
         const isTextControl = (element) =>
-          element instanceof HTMLInputElement ||
+          (element instanceof HTMLInputElement && !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase())) ||
           element instanceof HTMLTextAreaElement;
+        const inputs = Array.from(preview.querySelectorAll('input, textarea')).filter(isTextControl);
         const remembered = window.__boonLastPreviewTextInput;
         const rememberedNodeId =
           window.__boonLastPreviewTextInputNodeId ||
@@ -557,12 +506,22 @@ async function cdpTypeTextCharByChar(tabId, text) {
             ? window.__boonLastPreviewTextSelectionEnd
             : null;
         let restoredFromRemembered = false;
-        let focused =
-          rememberedNodeId
-            ? preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]')
-            : null;
-        if (isTextControl(focused)) {
-          restoredFromRemembered = true;
+        const hintedFocused =
+          preview.querySelector('[data-boon-focused="true"]') ||
+          preview.querySelector('[focused="true"]') ||
+          preview.querySelector('input[autofocus], textarea[autofocus]') ||
+          null;
+        const previewFocused = preview.querySelector(':focus');
+        let focused = isTextControl(hintedFocused)
+          ? hintedFocused
+          : (isTextControl(previewFocused)
+              ? previewFocused
+              : (isTextControl(document.activeElement) && preview.contains(document.activeElement)
+                  ? document.activeElement
+                  : null));
+        if ((!isTextControl(focused) || focused === document.body) && rememberedNodeId) {
+          focused = preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]');
+          restoredFromRemembered = isTextControl(focused);
         }
         if ((!isTextControl(focused) || focused === document.body) && rememberedIndex != null) {
           focused = inputs[rememberedIndex] || focused;
@@ -570,19 +529,7 @@ async function cdpTypeTextCharByChar(tabId, text) {
         }
         if ((!isTextControl(focused) || focused === document.body) && remembered && remembered.isConnected && preview.contains(remembered)) {
           focused = remembered;
-          restoredFromRemembered = true;
-        }
-        if ((!isTextControl(focused) || focused === document.body)) {
-          focused = document.activeElement;
-          restoredFromRemembered = false;
-        }
-        if ((!isTextControl(focused) || focused === document.body)) {
-          const previewFocused = preview.querySelector(':focus');
-          focused = isTextControl(previewFocused)
-            ? previewFocused
-            : preview.querySelector('[data-boon-focused="true"]')
-              || preview.querySelector('[focused="true"]')
-              || preview.querySelector('[autofocus]');
+          restoredFromRemembered = isTextControl(focused);
         }
         if (!isTextControl(focused)) return false;
 
@@ -604,12 +551,20 @@ async function cdpTypeTextCharByChar(tabId, text) {
           rememberedSelectionEnd != null
             ? rememberedSelectionEnd
             : fallbackStart;
-        const start = restoredFromRemembered
+        let start = restoredFromRemembered
           ? fallbackStart
           : (focused.selectionStart ?? fallbackStart);
-        const end = restoredFromRemembered
+        let end = restoredFromRemembered
           ? fallbackEnd
           : (focused.selectionEnd ?? start);
+        if (!restoredFromRemembered
+            && focused === hintedFocused
+            && focused.value
+            && start === 0
+            && end === 0) {
+          start = focused.value.length;
+          end = start;
+        }
         const nextValue =
           focused.value.slice(0, start) +
           insertedText +
@@ -667,12 +622,13 @@ async function cdpTypeTextCharByChar(tabId, text) {
       {
         expression: `(function() {
           const preview = document.querySelector('[data-boon-panel="preview"]');
-          const inputs = preview
-            ? Array.from(preview.querySelectorAll('input, textarea'))
-            : [];
           const isTextControl = (element) =>
-            element instanceof HTMLInputElement ||
-            element instanceof HTMLTextAreaElement;
+            element instanceof HTMLTextAreaElement ||
+            (element instanceof HTMLInputElement &&
+              !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()));
+          const inputs = preview
+            ? Array.from(preview.querySelectorAll('input, textarea')).filter(isTextControl)
+            : [];
           const remembered = window.__boonLastPreviewTextInput;
           const rememberedNodeId =
             window.__boonLastPreviewTextInputNodeId ||
@@ -691,12 +647,23 @@ async function cdpTypeTextCharByChar(tabId, text) {
               ? window.__boonLastPreviewTextSelectionEnd
               : null;
           let restoredFromRemembered = false;
-          let focused =
-            preview && rememberedNodeId
-              ? preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]')
-              : null;
-          if (isTextControl(focused)) {
-            restoredFromRemembered = true;
+          const hintedFocused = preview
+            ? (preview.querySelector('[data-boon-focused="true"]')
+              || preview.querySelector('[focused="true"]')
+              || preview.querySelector('input[autofocus], textarea[autofocus]')
+              || null)
+            : null;
+          const previewFocused = preview ? preview.querySelector(':focus') : null;
+          let focused = isTextControl(hintedFocused)
+            ? hintedFocused
+            : (isTextControl(previewFocused)
+                ? previewFocused
+                : (isTextControl(document.activeElement) && preview?.contains(document.activeElement)
+                    ? document.activeElement
+                    : null));
+          if ((!isTextControl(focused) || focused === document.body) && preview && rememberedNodeId) {
+            focused = preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]');
+            restoredFromRemembered = isTextControl(focused);
           }
           if ((!isTextControl(focused) || focused === document.body) && preview && rememberedIndex != null) {
             focused = inputs[rememberedIndex] || focused;
@@ -704,24 +671,13 @@ async function cdpTypeTextCharByChar(tabId, text) {
           }
           if ((!isTextControl(focused) || focused === document.body) && remembered && remembered.isConnected && preview?.contains(remembered)) {
             focused = remembered;
-            restoredFromRemembered = true;
-          }
-          if ((!isTextControl(focused) || focused === document.body)) {
-            focused = document.activeElement;
-            restoredFromRemembered = false;
-          }
-          if ((!isTextControl(focused) || focused === document.body) && preview) {
-            focused =
-              preview.querySelector(':focus') ||
-              preview.querySelector('[data-boon-focused="true"]') ||
-              preview.querySelector('[focused="true"]') ||
-              preview.querySelector('[autofocus]');
+            restoredFromRemembered = isTextControl(focused);
           }
           if (!focused) return false;
 
           const text = ${JSON.stringify(char)};
 
-          if (isTextControl) {
+          if (isTextControl(focused)) {
             if (document.activeElement !== focused && typeof focused.focus === 'function') {
               focused.focus();
             }
@@ -737,12 +693,20 @@ async function cdpTypeTextCharByChar(tabId, text) {
               rememberedSelectionEnd != null
                 ? rememberedSelectionEnd
                 : fallbackStart;
-            const start = restoredFromRemembered
+            let start = restoredFromRemembered
               ? fallbackStart
               : (focused.selectionStart ?? fallbackStart);
-            const end = restoredFromRemembered
+            let end = restoredFromRemembered
               ? fallbackEnd
               : (focused.selectionEnd ?? start);
+            if (!restoredFromRemembered
+                && focused === hintedFocused
+                && focused.value
+                && start === 0
+                && end === 0) {
+              start = focused.value.length;
+              end = start;
+            }
             const nextValue =
               focused.value.slice(0, start) +
               text +
@@ -876,10 +840,11 @@ async function handlePreviewSpecialKeyWithoutCdp(tabId, key) {
         const preview = document.querySelector('[data-boon-panel="preview"]');
         if (!preview) return false;
 
-        const inputs = Array.from(preview.querySelectorAll('input, textarea'));
         const isTextControl = (element) =>
-          element instanceof HTMLInputElement ||
-          element instanceof HTMLTextAreaElement;
+          element instanceof HTMLTextAreaElement ||
+          (element instanceof HTMLInputElement &&
+            !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()));
+        const inputs = Array.from(preview.querySelectorAll('input, textarea')).filter(isTextControl);
         const remembered = window.__boonLastPreviewTextInput;
         const rememberedNodeId =
           window.__boonLastPreviewTextInputNodeId ||
@@ -890,10 +855,21 @@ async function handlePreviewSpecialKeyWithoutCdp(tabId, key) {
             ? window.__boonLastPreviewTextInputIndex
             : null;
 
-        let focused =
-          rememberedNodeId
-            ? preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]')
-            : null;
+        let focused = document.activeElement;
+        if ((!isTextControl(focused) || focused === document.body)) {
+          const previewFocused = preview.querySelector(':focus');
+          focused = isTextControl(previewFocused)
+            ? previewFocused
+            : preview.querySelector('[data-boon-focused="true"]')
+              || preview.querySelector('[focused="true"]')
+              || null;
+        }
+        if ((!isTextControl(focused) || focused === document.body)) {
+          focused =
+            rememberedNodeId
+              ? preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]')
+              : null;
+        }
         if ((!isTextControl(focused) || focused === document.body) && rememberedIndex != null) {
           focused = inputs[rememberedIndex] || focused;
         }
@@ -901,15 +877,7 @@ async function handlePreviewSpecialKeyWithoutCdp(tabId, key) {
           focused = remembered;
         }
         if ((!isTextControl(focused) || focused === document.body)) {
-          focused = document.activeElement;
-        }
-        if ((!isTextControl(focused) || focused === document.body)) {
-          const previewFocused = preview.querySelector(':focus');
-          focused = isTextControl(previewFocused)
-            ? previewFocused
-            : preview.querySelector('[data-boon-focused="true"]')
-              || preview.querySelector('[focused="true"]')
-              || preview.querySelector('[autofocus]');
+          focused = preview.querySelector('[autofocus]');
         }
         if (!isTextControl(focused)) return false;
 
@@ -1064,10 +1032,11 @@ async function cdpPressKey(tabId, key, modifiers = 0, retryCount = 0) {
 
           const preview = document.querySelector('[data-boon-panel="preview"]');
           if (!preview) return false;
-          const inputs = Array.from(preview.querySelectorAll('input, textarea'));
           const isTextControl = (element) =>
-            element instanceof HTMLInputElement ||
-            element instanceof HTMLTextAreaElement;
+            element instanceof HTMLTextAreaElement ||
+            (element instanceof HTMLInputElement &&
+              !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()));
+          const inputs = Array.from(preview.querySelectorAll('input, textarea')).filter(isTextControl);
           const remembered = window.__boonLastPreviewTextInput;
           const rememberedNodeId =
             window.__boonLastPreviewTextInputNodeId ||
@@ -1079,9 +1048,19 @@ async function cdpPressKey(tabId, key, modifiers = 0, retryCount = 0) {
               : null;
 
           let focused =
-            rememberedNodeId
-              ? preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]')
-              : null;
+            preview.querySelector('[data-boon-focused="true"]') ||
+            preview.querySelector('[focused="true"]') ||
+            null;
+          if ((!isTextControl(focused) || focused === document.body)) {
+            const previewFocused = preview.querySelector(':focus');
+            focused = isTextControl(previewFocused) ? previewFocused : document.activeElement;
+          }
+          if ((!isTextControl(focused) || focused === document.body)) {
+            focused =
+              rememberedNodeId
+                ? preview.querySelector('[data-boon-node-id="' + rememberedNodeId + '"]')
+                : null;
+          }
           if ((!isTextControl(focused) || focused === document.body) && rememberedIndex != null) {
             focused = inputs[rememberedIndex] || focused;
           }
@@ -1089,15 +1068,7 @@ async function cdpPressKey(tabId, key, modifiers = 0, retryCount = 0) {
             focused = remembered;
           }
           if ((!isTextControl(focused) || focused === document.body)) {
-            focused = document.activeElement;
-          }
-          if ((!isTextControl(focused) || focused === document.body)) {
-            const previewFocused = preview.querySelector(':focus');
-            focused = isTextControl(previewFocused)
-              ? previewFocused
-              : preview.querySelector('[data-boon-focused="true"]')
-                || preview.querySelector('[focused="true"]')
-                || preview.querySelector('[autofocus]');
+            focused = preview.querySelector('[autofocus]');
           }
           if (!isTextControl(focused)) return false;
 
@@ -1643,235 +1614,80 @@ async function handleCommand(id, command) {
 
       case 'doubleClickCellsCell':
         try {
-          const result = await executeInTab(tab.id, (row, column) => {
-            const preview = document.querySelector('[data-boon-panel="preview"]');
-            if (!preview) {
-              return { ok: false, error: 'preview root not found' };
-            }
-
-            const directText = (el) => Array.from(el.childNodes)
-              .filter((node) => node.nodeType === Node.TEXT_NODE)
-              .map((node) => node.textContent || '')
-              .join('')
-              .trim();
-
-            const locateCellsCellElement = (preview, row, column) => {
-              const rowKey = String(row - 1).padStart(4, '0');
-              const columnKey = String(column - 1).padStart(4, '0');
-              const targetPath = `all_row_cells.${rowKey}.cells.${columnKey}.display_element`;
-              const semanticCandidates = [
-                targetPath,
-                `all_row_cells.${rowKey}.items.0001.items.${columnKey}.element`,
-                `all_row_cells.${rowKey}.items.0001.element`
-              ];
-              for (const path of semanticCandidates) {
-                const semanticTarget =
-                  preview.querySelector(`[data-boon-link-path="${path}"]`) ||
-                  preview.querySelector(`[data-boon-port-double-click="${path}.event.double_click"]`);
-                if (semanticTarget) {
-                  if (!path.endsWith('.items.0001.element')) {
-                    return semanticTarget;
-                  }
-                  const rowRect = semanticTarget.getBoundingClientRect();
-                  const labels = Array.from(semanticTarget.querySelectorAll('label'))
-                    .map((el) => {
-                      const rect = el.getBoundingClientRect();
-                      return {
-                        el,
-                        x: rect.left,
-                        width: rect.width,
-                        height: rect.height,
-                        centerY: rect.top + rect.height / 2
-                      };
-                    })
-                    .filter((el) =>
-                      el.width > 0 &&
-                      el.height > 0 &&
-                      Math.abs(el.centerY - (rowRect.top + rowRect.height / 2)) <= 4.0
-                    )
-                    .sort((a, b) => a.x - b.x);
-                  if (labels.length >= column) {
-                    return labels[column - 1].el;
-                  }
-                  return semanticTarget;
+          const rowKey = String(command.row - 1).padStart(4, '0');
+          const columnKey = String(command.column - 1).padStart(4, '0');
+          const targetPath = `all_row_cells.${rowKey}.cells.${columnKey}.display_element`;
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const targetPath = ${JSON.stringify(targetPath)};
+              const selector =
+                '[data-boon-panel="preview"] [data-boon-link-path="' + targetPath + '"], ' +
+                '[data-boon-panel="preview"] [data-boon-port-double-click="' + targetPath + '.event.double_click"]';
+              const target = document.querySelector(selector);
+              if (!target) {
+                return { found: false };
+              }
+              if (typeof target.scrollIntoView === 'function') {
+                try {
+                  target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+                } catch (_) {
+                  target.scrollIntoView({ block: 'center', inline: 'center' });
                 }
               }
-
-              const rowRootPath = `all_row_cells.${rowKey}.element`;
-              const rowRoot =
-                preview.querySelector(`[data-boon-link-path="${rowRootPath}"]`) ||
-                preview.querySelector(`[data-boon-port-double-click="${rowRootPath}.event.double_click"]`);
-              if (rowRoot) {
-                const rowRect = rowRoot.getBoundingClientRect();
-                const labels = Array.from(rowRoot.querySelectorAll('label'))
-                  .map((el) => {
-                    const rect = el.getBoundingClientRect();
-                    return {
-                      el,
-                      x: rect.left,
-                      width: rect.width,
-                      height: rect.height,
-                      centerY: rect.top + rect.height / 2
-                    };
-                  })
-                  .filter((el) =>
-                    el.width > 0 &&
-                    el.height > 0 &&
-                    Math.abs(el.centerY - (rowRect.top + rowRect.height / 2)) <= 4.0
-                  )
-                  .sort((a, b) => a.x - b.x);
-                if (labels.length > column) {
-                  return labels[column].el;
-                }
+              const rect = target.getBoundingClientRect();
+              const centerX = rect.left + rect.width / 2;
+              const centerY = rect.top + rect.height / 2;
+              const makeMouseEvent = (type, detail) => new MouseEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                view: window,
+                clientX: centerX,
+                clientY: centerY,
+                screenX: centerX,
+                screenY: centerY,
+                button: 0,
+                buttons: type === 'mouseup' || type === 'click' || type === 'dblclick' ? 0 : 1,
+                detail
+              });
+              if (typeof target.focus === 'function') {
+                try { target.focus(); } catch (_) {}
               }
-
-              const elements = Array.from(preview.querySelectorAll('*'))
-                .map((el) => {
-                  const rect = el.getBoundingClientRect();
-                  return {
-                    el,
-                    directText: directText(el),
-                    x: rect.left,
-                    y: rect.top,
-                    width: rect.width,
-                    height: rect.height,
-                    right: rect.right,
-                    centerY: rect.top + rect.height / 2,
-                    fullText: (el.innerText || '').trim()
-                  };
-                })
-                .filter((el) => el.width > 0 && el.height > 0);
-
-              const rowMatches = elements
-                .filter((el) => el.directText === String(row) && el.width <= 60 && el.x < 1200)
-                .sort((a, b) => (a.y - b.y) || (a.x - b.x));
-
-              for (const rowLabel of rowMatches) {
-                const cellMatches = elements
-                  .filter((el) =>
-                    el.x >= rowLabel.right - 0.5 &&
-                    Math.abs(el.centerY - rowLabel.centerY) <= 3.0
-                  )
-                  .sort((a, b) => (a.x - b.x) || (a.y - b.y));
-
-                const deduped = [];
-                for (const candidate of cellMatches) {
-                  const prev = deduped[deduped.length - 1];
-                  const duplicate = prev &&
-                    Math.abs(prev.x - candidate.x) <= 1.0 &&
-                    Math.abs(prev.y - candidate.y) <= 1.0 &&
-                    prev.directText === candidate.directText;
-                  if (!duplicate) {
-                    deduped.push(candidate);
-                  }
-                }
-
-                const filtered = deduped.filter((candidate) =>
-                  candidate.width <= 120 &&
-                  candidate.height <= 80 &&
-                  (candidate.directText.length > 0 || candidate.fullText.length <= 8)
-                );
-                const ranked = filtered.length >= column ? filtered : deduped;
-
-                if (ranked.length >= column) {
-                  return ranked[column - 1].el;
-                }
+              for (const [type, detail] of [
+                ['mousedown', 1],
+                ['mouseup', 1],
+                ['click', 1],
+                ['mousedown', 2],
+                ['mouseup', 2],
+                ['click', 2],
+                ['dblclick', 2]
+              ]) {
+                target.dispatchEvent(makeMouseEvent(type, detail));
               }
-
-              return null;
-            };
-
-            const target = locateCellsCellElement(preview, row, column);
-            if (!target) {
-              return { ok: false, error: `cell (${row}, ${column}) not found` };
-            }
-
-            const rect = target.getBoundingClientRect();
-            const clientX = rect.left + rect.width / 2;
-            const clientY = rect.top + rect.height / 2;
-
-            if (typeof target.focus === 'function') {
-              try { target.focus(); } catch (_) {}
-            }
-
-            const makeMouseEvent = (type, detail) => new MouseEvent(type, {
-              bubbles: true,
-              cancelable: true,
-              composed: true,
-              view: window,
-              clientX,
-              clientY,
-              screenX: clientX,
-              screenY: clientY,
-              button: 0,
-              buttons: type === 'mouseup' || type === 'click' || type === 'dblclick' ? 0 : 1,
-              detail
-            });
-
-            const sequence = [
-              ['mousedown', 1],
-              ['mouseup', 1],
-              ['click', 1],
-              ['mousedown', 2],
-              ['mouseup', 2],
-              ['click', 2],
-              ['dblclick', 2]
-            ];
-
-            for (const [type, detail] of sequence) {
-              target.dispatchEvent(makeMouseEvent(type, detail));
-            }
-
-            const expectedInputPath =
-              `all_row_cells.${String(row - 1).padStart(4, '0')}.cells.${String(column - 1).padStart(4, '0')}.editing_element.event.change`;
-            return new Promise((resolve) => {
-              const deadline = Date.now() + 1500;
-              const waitForInput = () => {
-                const input =
-                  preview.querySelector(`[data-boon-port-input="${expectedInputPath}"]`) ||
-                  Array.from(preview.querySelectorAll('input')).find((el) =>
-                    (el.getAttribute('data-boon-port-input') || '') === expectedInputPath
-                  );
-                if (input) {
-                  if (document.activeElement !== input && typeof input.focus === 'function') {
-                    try { input.focus(); } catch (_) {}
-                  }
-                  resolve({
-                    ok: true,
-                    tag: target.tagName,
-                    x: Math.round(clientX),
-                    y: Math.round(clientY),
-                    focusedTag: document.activeElement?.tagName || null,
-                    focusedValue: input.value || null
-                  });
-                  return;
-                }
-                if (Date.now() >= deadline) {
-                  resolve({
-                    ok: true,
-                    tag: target.tagName,
-                    x: Math.round(clientX),
-                    y: Math.round(clientY),
-                    focusedTag: document.activeElement?.tagName || null,
-                    focusedValue: null
-                  });
-                  return;
-                }
-                requestAnimationFrame(waitForInput);
+              return {
+                found: true,
+                x: Math.round(centerX),
+                y: Math.round(centerY),
+                tagName: target.tagName
               };
-              waitForInput();
-            });
-          }, command.row, command.column);
-
-          if (result?.type === 'error') {
-            return { type: 'error', message: result.message || 'Cells dblclick failed' };
-          }
-          if (!result?.ok) {
-            return { type: 'error', message: result?.error || 'Cells dblclick failed' };
+            })()
+          `);
+          if (!result || !result.found) {
+            return {
+              type: 'error',
+              message: `Cells dblclick target not found for row ${command.row}, column ${command.column}`
+            };
           }
           return {
             type: 'success',
-            data: { row: command.row, column: command.column, method: 'in-page', ...result }
+            data: {
+              row: command.row,
+              column: command.column,
+              method: 'dom-cells-double-click',
+              x: result.x,
+              y: result.y,
+              tagName: result.tagName || null
+            }
           };
         } catch (e) {
           return { type: 'error', message: `Double-click cells cell failed: ${e.message}` };
@@ -1951,6 +1767,10 @@ async function handleCommand(id, command) {
         // Use CDP Runtime.evaluate (still CDP, minimal JS injection)
         // If filename is provided, set it first so code is saved under the correct name
         try {
+          const ready = await waitForApiReady(tab.id, 10000, 200);
+          if (!ready) {
+            return { type: 'error', message: 'boonPlayground API not available before InjectCode' };
+          }
           if (command.filename) {
             await cdpEvaluate(tab.id, `window.boonPlayground.setCurrentFile(${JSON.stringify(command.filename)})`);
           }
@@ -1963,7 +1783,24 @@ async function handleCommand(id, command) {
       case 'triggerRun':
         // Use CDP Runtime.evaluate for playground API
         try {
-          await cdpEvaluate(tab.id, 'window.boonPlayground.run()');
+          await cdpEvaluate(tab.id, `
+            (function() {
+              if (window.boonPlayground && typeof window.boonPlayground.run === 'function') {
+                window.boonPlayground.run();
+                return { path: 'playground-api' };
+              }
+              const buttons = Array.from(document.querySelectorAll('[role="button"], button'));
+              const runButton = buttons.find((button) => {
+                const text = button.textContent || '';
+                return text.includes('Run') && text.includes('Shift + Enter');
+              });
+              if (!runButton) {
+                throw new Error('Playground run API and run button are both unavailable');
+              }
+              runButton.click();
+              return { path: 'run-button-fallback' };
+            })()
+          `);
           return { type: 'success', data: null };
         } catch (e) {
           return { type: 'error', message: e.message };
@@ -1987,6 +1824,25 @@ async function handleCommand(id, command) {
             return { type: 'error', message: result.message || 'GetPreviewText failed' };
           }
           return { type: 'previewText', text: typeof result === 'string' ? result : '' };
+        }
+
+      case 'getActorsLiteDebug':
+        {
+          const result = await executeInTab(tab.id, () => {
+            const debug = window.__boonActorsLiteDebug;
+            if (!debug) return null;
+            if (Array.isArray(debug.history)) {
+              return debug.history.join(' | ');
+            }
+            if (typeof debug.last === 'string') {
+              return debug.last;
+            }
+            return null;
+          });
+          if (result && result.type === 'error') {
+            return { type: 'error', message: result.message || 'GetActorsLiteDebug failed' };
+          }
+          return { type: 'actorsLiteDebug', value: typeof result === 'string' ? result : null };
         }
 
       case 'runAndCaptureInitial':
@@ -2112,7 +1968,9 @@ async function handleCommand(id, command) {
                   centerY: Math.round(rect.y + rect.height / 2),
                   directText,
                   fullText,
-                  className: el.className || ''
+                  className: el.className || '',
+                  linkPath: el.getAttribute('data-boon-link-path'),
+                  nodeId: el.getAttribute('data-boon-node-id')
                 });
               });
 
@@ -2235,6 +2093,10 @@ async function handleCommand(id, command) {
       case 'selectExample':
         // Call the WASM-exported selectExample(name) which does the same as clicking the example tab
         try {
+          const ready = await waitForApiReady(tab.id, 10000, 200);
+          if (!ready) {
+            return { type: 'error', message: 'boonPlayground API not available before SelectExample' };
+          }
           const exampleName = command.name.replace('.bn', '');
           const found = await cdpEvaluate(tab.id, `window.boonPlayground.selectExample(${JSON.stringify(exampleName)})`);
           if (!found) {
@@ -2327,8 +2189,10 @@ async function handleCommand(id, command) {
 
               // Find checkboxes by multiple methods:
               // 1. Standard role="checkbox"
-              // 2. Boon's cb-* ID convention (bridge_v2.rs assigns id="cb-{slot_index}")
+              // 2. Native checkbox inputs
+              // 3. Boon's cb-* ID convention (bridge_v2.rs assigns id="cb-{slot_index}")
               const roleCheckboxes = Array.from(preview.querySelectorAll('[role="checkbox"]'));
+              const nativeCheckboxes = Array.from(preview.querySelectorAll('input[type="checkbox"]'));
               const idCheckboxes = Array.from(preview.querySelectorAll('[id^="cb-"]'));
 
               // Merge and dedupe (prefer elements found by both methods)
@@ -2339,6 +2203,13 @@ async function handleCommand(id, command) {
               roleCheckboxes.forEach(el => {
                 seen.add(el);
                 allCheckboxes.push(el);
+              });
+
+              nativeCheckboxes.forEach(el => {
+                if (!seen.has(el)) {
+                  seen.add(el);
+                  allCheckboxes.push(el);
+                }
               });
 
               // Then add id-based checkboxes not already found
@@ -2391,7 +2262,7 @@ async function handleCommand(id, command) {
               const results = [];
 
               // Log all found checkboxes for debugging
-              console.log('[Boon Debug] Found', allCheckboxes.length, 'checkboxes (role:', roleCheckboxes.length, ', id:', idCheckboxes.length, ')');
+              console.log('[Boon Debug] Found', allCheckboxes.length, 'checkboxes (role:', roleCheckboxes.length, ', native:', nativeCheckboxes.length, ', id:', idCheckboxes.length, ')');
 
               allCheckboxes.forEach((el, i) => {
                 const rect = el.getBoundingClientRect();
@@ -2477,11 +2348,19 @@ async function handleCommand(id, command) {
                 if (!preview) return { ok: false, error: 'Preview panel not found' };
 
                 const roleCheckboxes = Array.from(preview.querySelectorAll('[role="checkbox"]'));
+                const nativeCheckboxes = Array.from(preview.querySelectorAll('input[type="checkbox"]'));
                 const idCheckboxes = Array.from(preview.querySelectorAll('[id^="cb-"]'));
                 const seen = new Set();
                 const allCheckboxes = [];
 
                 roleCheckboxes.forEach(el => {
+                  if (!seen.has(el)) {
+                    seen.add(el);
+                    allCheckboxes.push(el);
+                  }
+                });
+
+                nativeCheckboxes.forEach(el => {
                   if (!seen.has(el)) {
                     seen.add(el);
                     allCheckboxes.push(el);
@@ -2606,18 +2485,22 @@ async function handleCommand(id, command) {
               if (!preview) return { error: 'Preview panel not found' };
 
               const buttonIndex = ${command.index};
-
-              // First try: actual buttons plus elements with role="button"
-              let buttons = Array.from(preview.querySelectorAll('button, [role="button"]'));
-
-              // Filter visible buttons
-              buttons = buttons.filter(el => {
+              const isCheckboxInput = (el) =>
+                el &&
+                el.tagName === 'INPUT' &&
+                ((el.getAttribute('type') || '').toLowerCase() === 'checkbox');
+              const isVisible = (el) => {
                 const rect = el.getBoundingClientRect();
                 if (rect.width === 0 || rect.height === 0) return false;
                 const style = window.getComputedStyle(el);
                 if (style.display === 'none' || style.visibility === 'hidden') return false;
                 return true;
-              });
+              };
+
+              // First try: actual buttons, ARIA buttons, and retained click nodes.
+              const candidateSelector = 'button, [role="button"], [data-boon-port-click]';
+              let buttons = Array.from(preview.querySelectorAll(candidateSelector))
+                .filter(el => !isCheckboxInput(el) && isVisible(el));
 
               // If not enough role="button" elements, fall back to heuristics
               if (buttons.length <= buttonIndex) {
@@ -2628,11 +2511,9 @@ async function handleCommand(id, command) {
                   // Skip if already in buttons array
                   if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') return;
 
+                  if (isCheckboxInput(el) || !isVisible(el)) return;
                   const rect = el.getBoundingClientRect();
-                  if (rect.width === 0 || rect.height === 0) return;
-
                   const style = window.getComputedStyle(el);
-                  if (style.display === 'none' || style.visibility === 'hidden') return;
 
                   let directText = '';
                   for (const node of el.childNodes) {
@@ -2661,6 +2542,7 @@ async function handleCommand(id, command) {
               const button = buttons[buttonIndex];
               const rect = button.getBoundingClientRect();
               const text = (button.textContent || '').trim().substring(0, 50);
+              const port = button.getAttribute('data-boon-port-click');
 
               const centerX = rect.x + rect.width / 2;
               const centerY = rect.y + rect.height / 2;
@@ -2670,6 +2552,7 @@ async function handleCommand(id, command) {
                 success: true,
                 index: buttonIndex,
                 text: text,
+                port: port,
                 rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
                 role: button.getAttribute('role'),
                 centerX: centerX,
@@ -2682,10 +2565,24 @@ async function handleCommand(id, command) {
             return { type: 'error', message: clickResult.error };
           }
 
+          if (clickResult.port) {
+            await cdpEvaluate(tab.id, `
+              (function() {
+                const dispatchEvent = window.__boonDispatchUiEvent;
+                if (typeof dispatchEvent !== 'function') {
+                  throw new Error('retained port dispatcher unavailable');
+                }
+                dispatchEvent(${JSON.stringify(clickResult.port)}, 'Click');
+                return { ok: true, mode: 'port' };
+              })()
+            `);
+            return { type: 'success', data: { ...clickResult, dispatchMode: 'port' } };
+          }
+
           // Click using real CDP mouse events at the button center coordinates
           await cdpClickAtViewport(tab.id, clickResult.centerX, clickResult.centerY);
 
-          return { type: 'success', data: clickResult };
+          return { type: 'success', data: { ...clickResult, dispatchMode: 'cdp-click' } };
         } catch (e) {
           return { type: 'error', message: `Click button failed: ${e.message}` };
         }
@@ -2823,29 +2720,83 @@ async function handleCommand(id, command) {
           const clickX = result.element.clickX ?? result.element.centerX;
           const clickY = result.element.clickY ?? result.element.centerY;
 
-          try {
-            await cdpClickAtViewport(tab.id, clickX, clickY);
-          } catch (cdpError) {
-            if (!result.element.clickPort) {
-              return { type: 'error', message: `Click by text failed: ${cdpError.message}` };
-            }
-
+          if (result.element.clickPort) {
             const dispatchResult = await cdpEvaluate(tab.id, `
               (function() {
                 const dispatchEvent = window.__boonDispatchUiEvent;
                 if (typeof dispatchEvent !== 'function') {
                   return { ok: false, error: 'window.__boonDispatchUiEvent is not available' };
                 }
+                const target = document.querySelector(
+                  '[data-boon-port-click="${result.element.clickPort}"]'
+                );
+                const active = document.activeElement;
+                const isEditable = (el) => el && (
+                  el.matches?.('input, textarea, [contenteditable="true"]')
+                );
+                const blurEditable = (el) => {
+                  if (!isEditable(el)) return;
+                  const blurPort = el.getAttribute?.('data-boon-port-blur');
+                  if (blurPort && typeof dispatchEvent === 'function') {
+                    dispatchEvent(blurPort, 'Blur');
+                    return;
+                  }
+                  if (typeof el.blur === 'function') {
+                    try { el.blur(); } catch (_) {}
+                  }
+                };
+                if (
+                  isEditable(active)
+                  && active !== target
+                  && !(target && typeof target.contains === 'function' && target.contains(active))
+                ) {
+                  blurEditable(active);
+                }
                 dispatchEvent(${JSON.stringify(result.element.clickPort)}, 'Click');
                 return { ok: true };
               })()
             `);
-            if (!dispatchResult?.ok) {
-              return { type: 'error', message: dispatchResult?.error || `Click by text failed after CDP fallback: ${cdpError.message}` };
+            if (dispatchResult?.ok) {
+              return {
+                type: 'success',
+                data: {
+                  text: result.element.text,
+                  x: clickX,
+                  y: clickY,
+                  method: 'preview-port'
+                }
+              };
             }
           }
 
-          return { type: 'success', data: { text: result.element.text, x: clickX, y: clickY } };
+          try {
+            await cdpEvaluate(tab.id, `
+              (function() {
+                const dispatchEvent = window.__boonDispatchUiEvent;
+                const active = document.activeElement;
+                const isEditable = (el) => el && (
+                  el.matches?.('input, textarea, [contenteditable="true"]')
+                );
+                if (isEditable(active)) {
+                  const blurPort = active.getAttribute?.('data-boon-port-blur');
+                  if (blurPort && typeof dispatchEvent === 'function') {
+                    dispatchEvent(blurPort, 'Blur');
+                  } else if (typeof active.blur === 'function') {
+                    try { active.blur(); } catch (_) {}
+                  }
+                }
+                return { ok: true };
+              })()
+            `);
+            await cdpClickAtViewport(tab.id, clickX, clickY);
+          } catch (cdpError) {
+            return { type: 'error', message: `Click by text failed: ${cdpError.message}` };
+          }
+
+          return {
+            type: 'success',
+            data: { text: result.element.text, x: clickX, y: clickY, method: 'cdp' }
+          };
         } catch (e) {
           return { type: 'error', message: `Click by text failed: ${e.message}` };
         }
@@ -2884,7 +2835,7 @@ async function handleCommand(id, command) {
                 }
                 directText = directText.trim();
 
-                if (directText === searchText) {
+                if (directText === searchText || directText.includes(searchText)) {
                   const size = rect.width * rect.height;
                   if (size < smallestSize) {
                     smallestSize = size;
@@ -2959,7 +2910,7 @@ async function handleCommand(id, command) {
                 }
                 directText = directText.trim();
 
-                if (directText === searchText) {
+                if (directText === searchText || directText.includes(searchText)) {
                   const size = rect.width * rect.height;
                   if (size < smallestSize) {
                     smallestSize = size;
@@ -3100,7 +3051,13 @@ async function handleCommand(id, command) {
               const preview = document.querySelector('[data-boon-panel="preview"]');
               if (!preview) return { found: false, error: 'Preview panel not found' };
 
-              const inputs = preview.querySelectorAll('input, textarea, [contenteditable="true"]');
+              const isTextEditable = (element) =>
+                element.matches?.('textarea, [contenteditable="true"]') ||
+                (element.matches?.('input') &&
+                  !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()));
+              const inputs = Array.from(
+                preview.querySelectorAll('input, textarea, [contenteditable="true"]')
+              ).filter(isTextEditable);
               const inputIndex = ${command.index};
               if (inputIndex >= inputs.length) {
                 return {
@@ -3149,7 +3106,13 @@ async function handleCommand(id, command) {
             (function() {
               const preview = document.querySelector('[data-boon-panel="preview"]');
               if (!preview) return;
-              const inputs = preview.querySelectorAll('input, textarea, [contenteditable="true"]');
+              const isTextEditable = (element) =>
+                element.matches?.('textarea, [contenteditable="true"]') ||
+                (element.matches?.('input') &&
+                  !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()));
+              const inputs = Array.from(
+                preview.querySelectorAll('input, textarea, [contenteditable="true"]')
+              ).filter(isTextEditable);
               const input = inputs[${command.index}];
               if (!input) return;
 
@@ -3210,7 +3173,9 @@ async function handleCommand(id, command) {
       case 'pressKey':
         // Press a special key using trusted CDP keyboard events.
         try {
-          const result = await cdpPressKey(tab.id, command.key);
+          const result =
+            (await handlePreviewSpecialKeyWithoutCdp(tab.id, command.key)) ||
+            (await cdpPressKey(tab.id, command.key));
           return {
             type: 'success',
             data: result || { key: command.key, method: 'unknown' }
@@ -3303,7 +3268,13 @@ async function handleCommand(id, command) {
 
               // Debug logging
               const boonFocused = preview ? preview.querySelector('[data-boon-focused="true"]') : null;
-              const inputs = preview ? preview.querySelectorAll('input') : [];
+              const inputs = preview
+                ? Array.from(preview.querySelectorAll('input, textarea, [contenteditable="true"]')).filter((element) =>
+                    element.matches?.('textarea, [contenteditable="true"]') ||
+                    (element.matches?.('input') &&
+                      !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+                  )
+                : [];
               console.log('[getFocusedElement] activeElement:', focused?.tagName, 'boonFocused:', boonFocused?.tagName, 'inputs:', inputs.length);
               if (inputs.length > 0) {
                 console.log('[getFocusedElement] input attrs:', Array.from(inputs[0].attributes).map(a => a.name + '=' + a.value).join(', '));
@@ -3337,7 +3308,13 @@ async function handleCommand(id, command) {
               // Find the input index within the preview pane
               let input_index = null;
               if (preview && (focused.tagName === 'INPUT' || focused.tagName === 'TEXTAREA')) {
-                const inputs = preview.querySelectorAll('input, textarea, [contenteditable="true"]');
+                const inputs = Array.from(
+                  preview.querySelectorAll('input, textarea, [contenteditable="true"]')
+                ).filter((element) =>
+                  element.matches?.('textarea, [contenteditable="true"]') ||
+                  (element.matches?.('input') &&
+                    !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+                );
                 for (let i = 0; i < inputs.length; i++) {
                   if (inputs[i] === focused) {
                     input_index = i;
@@ -3362,7 +3339,13 @@ async function handleCommand(id, command) {
               const preview = document.querySelector('[data-boon-panel="preview"]');
               if (!preview) return { found: false, error: 'Preview panel not found' };
 
-              const inputs = preview.querySelectorAll('input, textarea, [contenteditable="true"]');
+              const inputs = Array.from(
+                preview.querySelectorAll('input, textarea, [contenteditable="true"]')
+              ).filter((element) =>
+                element.matches?.('textarea, [contenteditable="true"]') ||
+                (element.matches?.('input') &&
+                  !['checkbox', 'radio', 'button', 'submit', 'reset', 'hidden'].includes((element.type || '').toLowerCase()))
+              );
               const index = ${command.index};
 
               if (index >= inputs.length) {
@@ -3617,6 +3600,7 @@ async function handleCommand(id, command) {
 
               // Find checkboxes using same logic as clickCheckbox
               const roleCheckboxes = Array.from(preview.querySelectorAll('[role="checkbox"]'));
+              const nativeCheckboxes = Array.from(preview.querySelectorAll('input[type="checkbox"]'));
               const idCheckboxes = Array.from(preview.querySelectorAll('[id^="cb-"]'));
               const seen = new Set();
               const allCheckboxes = [];
@@ -3624,6 +3608,13 @@ async function handleCommand(id, command) {
               roleCheckboxes.forEach(el => {
                 seen.add(el);
                 allCheckboxes.push(el);
+              });
+
+              nativeCheckboxes.forEach(el => {
+                if (!seen.has(el)) {
+                  seen.add(el);
+                  allCheckboxes.push(el);
+                }
               });
 
               idCheckboxes.forEach(el => {
@@ -3815,7 +3806,7 @@ async function handleCommand(id, command) {
               if (!preview) return { found: false, error: 'Preview panel not found' };
 
               // Find the toggle all checkbox - it's the first checkbox (index 0) containing the ❯ chevron
-              const checkboxes = preview.querySelectorAll('[role="checkbox"]');
+              const checkboxes = preview.querySelectorAll('[role="checkbox"], input[type="checkbox"], [id^="cb-"]');
               if (checkboxes.length === 0) {
                 return { found: false, error: 'No checkboxes found' };
               }
@@ -3915,12 +3906,14 @@ async function handleCommand(id, command) {
 
               // Find checkboxes using same method as clickCheckbox
               const roleCheckboxes = Array.from(preview.querySelectorAll('[role="checkbox"]'));
+              const nativeCheckboxes = Array.from(preview.querySelectorAll('input[type="checkbox"]'));
               const idCheckboxes = Array.from(preview.querySelectorAll('[id^="cb-"]'));
 
               // Merge and dedupe
               const seen = new Set();
               const allCheckboxes = [];
               roleCheckboxes.forEach(el => { seen.add(el); allCheckboxes.push(el); });
+              nativeCheckboxes.forEach(el => { if (!seen.has(el)) { seen.add(el); allCheckboxes.push(el); } });
               idCheckboxes.forEach(el => { if (!seen.has(el)) { seen.add(el); allCheckboxes.push(el); } });
 
               // Sort by vertical position for consistent ordering
@@ -4134,8 +4127,8 @@ async function handleCommand(id, command) {
         // Set the engine type and trigger re-run
         try {
           const engineToSet = command.engine;
-          if (engineToSet !== 'Actors' && engineToSet !== 'DD' && engineToSet !== 'Wasm') {
-            return { type: 'error', message: `Invalid engine '${engineToSet}'. Must be 'Actors', 'DD', or 'Wasm'` };
+          if (engineToSet !== 'Actors' && engineToSet !== 'ActorsLite' && engineToSet !== 'DD' && engineToSet !== 'Wasm') {
+            return { type: 'error', message: `Invalid engine '${engineToSet}'. Must be 'Actors', 'ActorsLite', 'DD', or 'Wasm'` };
           }
           const result = await cdpEvaluate(tab.id, `
             (function() {
@@ -4309,12 +4302,16 @@ async function handleCommand(id, command) {
 // Execute function in tab context (MAIN world to access page's window object)
 async function executeInTab(tabId, func, ...args) {
   try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: 'MAIN',  // Run in page's main world to access window.boonPlayground
-      func: func,
-      args: args
-    });
+    const results = await withOperationTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',  // Run in page's main world to access window.boonPlayground
+        func: func,
+        args: args
+      }),
+      'executeScript',
+      10000
+    );
 
     if (results && results[0]) {
       return results[0].result;

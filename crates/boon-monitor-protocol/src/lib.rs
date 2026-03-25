@@ -9,6 +9,7 @@ pub struct MonitorEnvelope {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MonitorSource {
     Actors,
+    ActorsLite,
     Dd,
     Wasm,
     Renderer(String),

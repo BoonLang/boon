@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub enum EngineType {
     /// Actor-based reactive streams engine (push-based, fine-grained subscriptions)
     Actors,
+    /// Virtual-actor runtime with renderer-agnostic retained bridge
+    ActorsLite,
     /// Differential Dataflow engine (pull-based, incremental computation)
     DifferentialDataflow,
     /// Compiled WASM engine with renderer-agnostic diff output
@@ -18,6 +20,7 @@ impl EngineType {
     pub fn short_name(&self) -> &'static str {
         match self {
             Self::Actors => "Actors",
+            Self::ActorsLite => "ActorsLite",
             Self::DifferentialDataflow => "DD",
             Self::Wasm => "Wasm",
         }
@@ -27,6 +30,7 @@ impl EngineType {
     pub fn picker_label(&self) -> &'static str {
         match self {
             Self::Actors => "Actors",
+            Self::ActorsLite => "ActorsLite",
             Self::DifferentialDataflow => "DD",
             Self::Wasm => "Wasm",
         }
@@ -36,6 +40,7 @@ impl EngineType {
     pub fn full_name(&self) -> &'static str {
         match self {
             Self::Actors => "Actor-based reactive streams",
+            Self::ActorsLite => "Virtual actors with retained bridge",
             Self::DifferentialDataflow => "Differential Dataflow",
             Self::Wasm => "Compiled WASM",
         }
@@ -45,6 +50,7 @@ impl EngineType {
     pub fn description(&self) -> &'static str {
         match self {
             Self::Actors => "Reactive actor subscriptions (mixed push/pull)",
+            Self::ActorsLite => "Virtual-actor runtime with retained/keyed host bridge",
             Self::DifferentialDataflow => {
                 "Incremental computation based on the Differential Dataflow library"
             }

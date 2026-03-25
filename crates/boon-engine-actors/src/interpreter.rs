@@ -11,16 +11,16 @@ use zoon::{UnwrapThrowExt, WebStorage, eprintln, local_storage, println, serde_j
 /// Set to false to disable verbose source code and AST logging in console
 const LOG_SOURCE_AND_AST: bool = false;
 
-use boon::parser::{
-    Expression, Input, ParseError, Parser, SourceCode, Spanned, Token, lexer, parser,
-    reset_expression_depth, resolve_persistence, resolve_references, span_at, static_expression,
-};
 use crate::{
     engine::{
         ConstructContext, LinkConnector, Object, PassThroughConnector, ReferenceConnector,
         ScopeDestroyGuard, VirtualFilesystem,
     },
     evaluator::{FunctionRegistry, ModuleLoader, evaluate_with_registry},
+};
+use boon::parser::{
+    Expression, Input, ParseError, Parser, SourceCode, Spanned, Token, lexer, parser,
+    reset_expression_depth, resolve_persistence, resolve_references, span_at, static_expression,
 };
 
 /// Run a Boon program and return the result.

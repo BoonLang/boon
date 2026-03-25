@@ -1,0 +1,31 @@
+# List retain/count updates when items are appended through the focused input
+
+[test]
+category = "interactive"
+description = "List/retain count tracks appended items from text input"
+skip_engines = ["Actors", "DD", "Wasm"]
+
+[output]
+text = "All count: 1Retain count: 1Initial"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+[[sequence]]
+description = "Input is present and focused with the expected placeholder"
+actions = [
+  ["assert_input_placeholder", 0, "Type and press Enter"],
+  ["assert_focused"],
+]
+
+[[sequence]]
+description = "Typing and pressing Enter appends one item and updates both counts"
+actions = [
+  ["type", "Apple"],
+  ["key", "Enter"],
+  ["assert_contains", "All count: 2"],
+  ["assert_contains", "Retain count: 2"],
+  ["assert_contains", "Initial"],
+  ["assert_contains", "Apple"],
+]

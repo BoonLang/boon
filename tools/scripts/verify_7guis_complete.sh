@@ -33,9 +33,22 @@ ok()   { PASS=$((PASS+1)); echo "  [PASS] $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 skip() { SKIP=$((SKIP+1)); echo "  [SKIP] $1"; }
 
+live_examples_for_engine() {
+    case "$1" in
+        Wasm)
+            echo "$EXAMPLES"
+            ;;
+        ActorsLite)
+            echo "temperature_converter flight_booker timer crud circle_drawer cells"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
 EXAMPLES="temperature_converter flight_booker timer crud circle_drawer cells"
-# The single-engine cutover plan's browser-first gate is Wasm-only.
-LIVE_ENGINES="Wasm"
+LIVE_ENGINES="Wasm ActorsLite"
 
 # ── Section 1: Build boon-tools ──
 echo "=== 7GUIs Verification ==="
@@ -286,7 +299,12 @@ else
         for engine in $LIVE_ENGINES; do
             echo ""
             echo "  --- $engine engine ---"
+            ENGINE_EXAMPLES="$(live_examples_for_engine "$engine")"
             for ex in $EXAMPLES; do
+                if ! echo " $ENGINE_EXAMPLES " | grep -q " $ex "; then
+                    skip "$engine/$ex (not yet in live parity set)"
+                    continue
+                fi
                 OUTPUT=$("$BT" exec test-examples --engine "$engine" --filter "$ex" --no-launch 2>&1) || true
 
                 if echo "$OUTPUT" | grep -q "\[SKIP\]"; then

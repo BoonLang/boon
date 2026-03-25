@@ -42,6 +42,18 @@ description = "Return date has a date value"
 actions = [["assert_input_value", 1, "2026-03-03"]]
 expect = "Flight Booker"
 
+# SPEC: In one-way mode, return date is disabled
+[[sequence]]
+description = "Return date is disabled for one-way flight"
+actions = [["assert_input_not_typeable", 1]]
+expect = "Flight Booker"
+
+# SPEC: Initial one-way booking is enabled
+[[sequence]]
+description = "Book button starts enabled for valid one-way flight"
+actions = [["assert_button_enabled", 0]]
+expect = "Flight Booker"
+
 # SPEC: Book valid one-way flight -> confirmation message
 [[sequence]]
 description = "Book one-way flight"
@@ -53,6 +65,24 @@ expect_match = "contains"
 [[sequence]]
 description = "Switch to return flight"
 actions = [["select_option", 0, "return"]]
+expect = "Flight Booker"
+
+# SPEC: In return mode, return date becomes editable
+[[sequence]]
+description = "Return date becomes editable for return flight"
+actions = [["assert_input_typeable", 1]]
+expect = "Flight Booker"
+
+# SPEC: Invalid return date disables booking
+[[sequence]]
+description = "Invalid return date disables Book button"
+actions = [["set_input_value", 1, "2026-03-02"], ["assert_button_disabled", 0]]
+expect = "Flight Booker"
+
+# SPEC: Valid return date re-enables booking
+[[sequence]]
+description = "Valid return date re-enables Book button"
+actions = [["set_input_value", 1, "2026-03-03"], ["assert_button_enabled", 0]]
 expect = "Flight Booker"
 
 # SPEC: Book return flight -> shows both dates

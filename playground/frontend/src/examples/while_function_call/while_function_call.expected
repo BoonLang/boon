@@ -1,0 +1,22 @@
+# WHILE function-call branch example
+
+[test]
+category = "interactive"
+description = "WHILE branch toggles between hidden text and function-rendered greeting"
+
+[output]
+text = "Toggle (show: False)Hidden"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+[[sequence]]
+description = "Toggle on to render greeting from function call"
+actions = [["click_button", 0]]
+expect = "Toggle (show: True)Hello, World!"
+
+[[sequence]]
+description = "Toggle off again"
+actions = [["click_button", 0]]
+expect = "Toggle (show: False)Hidden"

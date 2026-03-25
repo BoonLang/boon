@@ -1,0 +1,35 @@
+# Reactive list map example - mapped items respond to external filter state
+
+[test]
+category = "interactive"
+description = "Reactive List/map updates when external filter state changes"
+skip_engines = ["Actors", "DD", "Wasm"]
+
+[output]
+text = "show_filtered: FalseToggle filterExpected: When True, show Apple and Cherry. When False, show all.AppleBananaCherryDate"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+[[sequence]]
+description = "Toggle on filtered mode"
+actions = [
+  ["click_button", 0],
+  ["assert_contains", "show_filtered: True"],
+  ["assert_contains", "Apple"],
+  ["assert_contains", "Cherry"],
+  ["assert_not_contains", "Banana"],
+  ["assert_not_contains", "Date"],
+]
+
+[[sequence]]
+description = "Toggle back to showing all items"
+actions = [
+  ["click_button", 0],
+  ["assert_contains", "show_filtered: False"],
+  ["assert_contains", "Apple"],
+  ["assert_contains", "Banana"],
+  ["assert_contains", "Cherry"],
+  ["assert_contains", "Date"],
+]

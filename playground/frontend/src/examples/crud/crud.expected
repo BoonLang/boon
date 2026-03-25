@@ -55,7 +55,7 @@ expect = "CRUD"
 # SPEC: Filter by surname prefix
 [[sequence]]
 description = "Filter by M -> only Mustermann"
-actions = [["focus_input", 0], ["type", "M"]]
+actions = [["set_input_value", 0, "M"]]
 expect = "Mustermann"
 expect_match = "contains"
 
@@ -74,12 +74,12 @@ expect_match = "contains"
 # SPEC: Create new person
 [[sequence]]
 description = "Type name for new person"
-actions = [["focus_input", 1], ["type", "John"]]
+actions = [["set_input_value", 1, "John"]]
 expect = "CRUD"
 
 [[sequence]]
 description = "Type surname for new person"
-actions = [["focus_input", 2], ["type", "Doe"]]
+actions = [["set_input_value", 2, "Doe"]]
 expect = "CRUD"
 
 [[sequence]]
@@ -95,15 +95,37 @@ actions = [["click_text", "Tansen"]]
 expect = "► Tansen"
 expect_match = "contains"
 
+# SPEC: Update selected person from the form inputs
+[[sequence]]
+description = "Set updated name for selected person"
+actions = [["set_input_value", 1, "Rita"]]
+expect = "CRUD"
+
+[[sequence]]
+description = "Set updated surname for selected person"
+actions = [["set_input_value", 2, "Tester"]]
+expect = "CRUD"
+
+[[sequence]]
+description = "Click Update to rename selected person"
+actions = [["click_text", "Update"]]
+expect = "► Tester, Rita"
+expect_match = "contains"
+
+[[sequence]]
+description = "Updated person should no longer show old name"
+actions = [["assert_not_contains", "Tansen"]]
+expect = "Tester"
+
 # SPEC: Delete selected person
 [[sequence]]
-description = "Click Delete to remove Tansen"
+description = "Click Delete to remove updated person"
 actions = [["click_text", "Delete"]]
 expect = "CRUD"
 
 [[sequence]]
-description = "Tansen should be gone"
-actions = [["assert_not_contains", "Tansen"]]
+description = "Updated person should be gone"
+actions = [["assert_not_contains", "Tester"]]
 expect = "Emil"
 
 # SPEC: Other people still there after delete

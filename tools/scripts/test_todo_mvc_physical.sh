@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TodoMVC Physical — Cross-Engine Test Suite
 #
-# Tests todo_mvc_physical on all 3 engines: Actors, DD, WASM.
+# Tests todo_mvc_physical on the currently supported engines: Actors, ActorsLite, DD, Wasm.
 # Covers: add items, checkbox toggle, filters, clear completed,
 # theme switching, dark/light mode, counter text.
 #
@@ -11,7 +11,7 @@
 #   - Browser with extension connected
 #
 # Usage: ./test_todo_mvc_physical.sh [--engine ENGINE] [--port PORT]
-#   --engine   Test only one engine: Actors, DD, Wasm (default: all)
+#   --engine   Test only one engine: Actors, ActorsLite, DD, Wasm (default: all)
 #   --port     WebSocket port (default: 9224)
 #
 # Exit code 0 = all tests pass, non-zero = failures.
@@ -309,7 +309,7 @@ ENGINES_TO_TEST=()
 if [ -n "$ENGINE_FILTER" ]; then
     ENGINES_TO_TEST+=("$ENGINE_FILTER")
 else
-    ENGINES_TO_TEST+=("Actors" "DD" "Wasm")
+    ENGINES_TO_TEST+=("Actors" "ActorsLite" "DD" "Wasm")
 fi
 
 for engine in "${ENGINES_TO_TEST[@]}"; do

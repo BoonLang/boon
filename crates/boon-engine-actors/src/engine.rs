@@ -53,12 +53,10 @@ fn list_instance_key(list: &Arc<List>) -> usize {
 #[cfg(feature = "actors-metrics")]
 macro_rules! inc_metric {
     ($counter:ident) => {
-        $crate::engine::metrics::$counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        $crate::engine::metrics::$counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     };
     ($counter:ident, $amount:expr) => {
-        $crate::engine::metrics::$counter
-            .fetch_add($amount, std::sync::atomic::Ordering::Relaxed);
+        $crate::engine::metrics::$counter.fetch_add($amount, std::sync::atomic::Ordering::Relaxed);
     };
 }
 
@@ -3564,52 +3562,52 @@ impl LatestCombinator {
             .scan(
                 (State::default(), vec![None::<Value>; input_count]),
                 move |(state, latest_values), (new_state, index, value)| {
-                if let Some(new_state) = new_state {
-                    *state = new_state;
-                }
-                let idempotency_key = value.idempotency_key();
-                let lamport_time = value.lamport_time();
-                let skip_value = state
-                    .input_emission_keys
-                    .get(&index)
-                    .is_some_and(|(previous_idempotency_key, previous_lamport_time)| {
-                        *previous_idempotency_key == idempotency_key
-                            && *previous_lamport_time == lamport_time
-                            && latest_values[index]
-                                .as_ref()
-                                .is_some_and(|previous| values_equal(previous, &value))
-                    });
-                state
-                    .input_emission_keys
-                    .insert(index, (idempotency_key, lamport_time));
-                if skip_value {
-                    return future::ready(Some(None));
-                }
+                    if let Some(new_state) = new_state {
+                        *state = new_state;
+                    }
+                    let idempotency_key = value.idempotency_key();
+                    let lamport_time = value.lamport_time();
+                    let skip_value = state.input_emission_keys.get(&index).is_some_and(
+                        |(previous_idempotency_key, previous_lamport_time)| {
+                            *previous_idempotency_key == idempotency_key
+                                && *previous_lamport_time == lamport_time
+                                && latest_values[index]
+                                    .as_ref()
+                                    .is_some_and(|previous| values_equal(previous, &value))
+                        },
+                    );
+                    state
+                        .input_emission_keys
+                        .insert(index, (idempotency_key, lamport_time));
+                    if skip_value {
+                        return future::ready(Some(None));
+                    }
 
-                if latest_values[index]
-                    .as_ref()
-                    .is_some_and(|previous| previous.lamport_time() > value.lamport_time())
-                {
-                    return future::ready(Some(None));
-                }
-                latest_values[index] = Some(value);
+                    if latest_values[index]
+                        .as_ref()
+                        .is_some_and(|previous| previous.lamport_time() > value.lamport_time())
+                    {
+                        return future::ready(Some(None));
+                    }
+                    latest_values[index] = Some(value);
 
-                let selected = latest_values
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(input_index, current)| {
-                        current.as_ref().map(|current| (input_index, current))
-                    })
-                    .max_by(|(lhs_idx, lhs), (rhs_idx, rhs)| {
-                        lhs.lamport_time()
-                            .cmp(&rhs.lamport_time())
-                            .then_with(|| rhs_idx.cmp(lhs_idx))
-                    })
-                    .map(|(_, selected)| selected.clone());
+                    let selected = latest_values
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(input_index, current)| {
+                            current.as_ref().map(|current| (input_index, current))
+                        })
+                        .max_by(|(lhs_idx, lhs), (rhs_idx, rhs)| {
+                            lhs.lamport_time()
+                                .cmp(&rhs.lamport_time())
+                                .then_with(|| rhs_idx.cmp(lhs_idx))
+                        })
+                        .map(|(_, selected)| selected.clone());
 
-                storage.save_state(persistent_id, &*state);
-                future::ready(Some(selected))
-            })
+                    storage.save_state(persistent_id, &*state);
+                    future::ready(Some(selected))
+                },
+            )
             .filter_map(future::ready);
 
         // Subscription-based streams are infinite (subscriptions never terminate first)
@@ -4211,17 +4209,14 @@ impl ValueHistory {
         emission_idempotency_key: ValueIdempotencyKey,
         emission_lamport_time: u64,
     ) -> Option<Value> {
-        self.values
-            .iter()
-            .rev()
-            .find_map(|(_, value)| {
-                let metadata = value.metadata();
-                let is_same_emission = metadata.idempotency_key == emission_idempotency_key
-                    && metadata.lamport_time == emission_lamport_time;
-                let is_before = metadata.lamport_time < emission_lamport_time
-                    || (metadata.lamport_time == emission_lamport_time && !is_same_emission);
-                is_before.then(|| value.clone())
-            })
+        self.values.iter().rev().find_map(|(_, value)| {
+            let metadata = value.metadata();
+            let is_same_emission = metadata.idempotency_key == emission_idempotency_key
+                && metadata.lamport_time == emission_lamport_time;
+            let is_before = metadata.lamport_time < emission_lamport_time
+                || (metadata.lamport_time == emission_lamport_time && !is_same_emission);
+            is_before.then(|| value.clone())
+        })
     }
 }
 
@@ -4411,7 +4406,9 @@ impl ActorRegistry {
         // scope ids and later recursive destroys can explode in time/memory.
         if let Some(parent_id) = parent {
             if let Some(parent_scope) = self.get_scope_mut(parent_id) {
-                parent_scope.children.retain(|child_id| *child_id != scope_id);
+                parent_scope
+                    .children
+                    .retain(|child_id| *child_id != scope_id);
             }
         }
 
@@ -6101,7 +6098,8 @@ pub async fn materialize_snapshot_value(
         if let Some((emission_idempotency_key, emission_lamport_time)) =
             actor_context.snapshot_emission_identity
         {
-            actor.current_value_before_emission(emission_idempotency_key, emission_lamport_time)
+            actor
+                .current_value_before_emission(emission_idempotency_key, emission_lamport_time)
                 .await
         } else {
             actor.current_value().await
@@ -6113,8 +6111,9 @@ pub async fn materialize_snapshot_value(
         Value::Object(object, metadata) => {
             let mut materialized_vars: Vec<Arc<Variable>> = Vec::new();
             for variable in object.variables() {
-                let value_actor =
-                    if let Ok(var_value) = snapshot_actor_value(&variable.value_actor(), &actor_context).await {
+                let value_actor = if let Ok(var_value) =
+                    snapshot_actor_value(&variable.value_actor(), &actor_context).await
+                {
                     let materialized = Box::pin(materialize_snapshot_value(
                         var_value,
                         construct_context.clone(),
@@ -6166,8 +6165,9 @@ pub async fn materialize_snapshot_value(
         Value::TaggedObject(tagged_object, metadata) => {
             let mut materialized_vars: Vec<Arc<Variable>> = Vec::new();
             for variable in tagged_object.variables() {
-                let value_actor =
-                    if let Ok(var_value) = snapshot_actor_value(&variable.value_actor(), &actor_context).await {
+                let value_actor = if let Ok(var_value) =
+                    snapshot_actor_value(&variable.value_actor(), &actor_context).await
+                {
                     let materialized = Box::pin(materialize_snapshot_value(
                         var_value,
                         construct_context.clone(),
@@ -6261,15 +6261,17 @@ pub async fn materialize_snapshot_value(
             Value::List(new_list, metadata)
         }
         Value::Flushed(inner, metadata) => {
-            let materialized_inner =
-                Box::pin(materialize_snapshot_value(*inner, construct_context, actor_context))
-                    .await;
+            let materialized_inner = Box::pin(materialize_snapshot_value(
+                *inner,
+                construct_context,
+                actor_context,
+            ))
+            .await;
             Value::Flushed(Box::new(materialized_inner), metadata)
         }
         other => other,
     }
 }
-
 
 // --- Object ---
 
@@ -8680,8 +8682,7 @@ impl ListBindingFunction {
                 pred.clone()
                     .stream_from_now()
                     .map(move |v| {
-                        let is_true =
-                            matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
+                        let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
                         (pid.clone(), is_true)
                     })
                     .scan(None::<bool>, |last_bool, (pid, is_true)| {
@@ -8700,7 +8701,9 @@ impl ListBindingFunction {
             None
         } else {
             Some(Box::pin(coalesce(stream::select_all(pred_streams)))
-                as Pin<Box<dyn Stream<Item = Vec<(parser::PersistenceId, bool)>>>>)
+                as Pin<
+                    Box<dyn Stream<Item = Vec<(parser::PersistenceId, bool)>>>,
+                >)
         };
 
         let filtered: Vec<_> = items
@@ -9286,7 +9289,10 @@ impl ListBindingFunction {
                     persistence_id: parser::PersistenceId,
                 ) -> LocalBoxStream<'static, parser::PersistenceId> {
                     let when_actor_for_initial = when_actor.clone();
-                    let initial = stream::once(async move { when_actor_for_initial.current_value().await.ok() })
+                    let initial =
+                        stream::once(
+                            async move { when_actor_for_initial.current_value().await.ok() },
+                        )
                         .filter_map(future::ready);
                     stream::select(initial, when_actor.stream_from_now())
                         .map(move |_| persistence_id.clone())
@@ -10110,10 +10116,9 @@ impl ListBindingFunction {
                 let original_pid = item_actor.persistence_id();
                 let scope_id = new_actor_context.scope_id();
                 let result_actor_for_initial = result_actor.clone();
-                let seeded_result_stream = stream::once(async move {
-                    result_actor_for_initial.value().await.ok()
-                })
-                .filter_map(|value| async move { value });
+                let seeded_result_stream =
+                    stream::once(async move { result_actor_for_initial.value().await.ok() })
+                        .filter_map(|value| async move { value });
                 create_actor(
                     ConstructInfo::new(
                         ConstructId::new("List/map mapped item"),
@@ -10181,8 +10186,13 @@ impl ListBindingFunction {
                         current_length
                     );
                 }
-                let transformed_item =
-                    Self::transform_item(item, insert_index, config, construct_context, actor_context);
+                let transformed_item = Self::transform_item(
+                    item,
+                    insert_index,
+                    config,
+                    construct_context,
+                    actor_context,
+                );
                 (
                     ListChange::InsertAt {
                         index: insert_index,
@@ -10204,8 +10214,13 @@ impl ListBindingFunction {
                         current_length
                     );
                 }
-                let transformed_item =
-                    Self::transform_item(item, update_index, config, construct_context, actor_context);
+                let transformed_item = Self::transform_item(
+                    item,
+                    update_index,
+                    config,
+                    construct_context,
+                    actor_context,
+                );
                 (
                     ListChange::UpdateAt {
                         index: update_index,
@@ -10555,11 +10570,10 @@ impl ListBindingFunction {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_actor_forwarding, create_constant_actor, create_registry_scope,
-        list_item_scope_id, values_equal_async, ActorContext, ConstructContext, ConstructStorage,
-        ConstructInfo, LatestCombinator, List, ListChange, ScopeDestroyGuard, TaggedObject, Text,
-        Value, Variable,
-        ValueIdempotencyKey, VirtualFilesystem,
+        ActorContext, ConstructContext, ConstructInfo, ConstructStorage, LatestCombinator, List,
+        ListChange, ScopeDestroyGuard, TaggedObject, Text, Value, ValueIdempotencyKey, Variable,
+        VirtualFilesystem, create_actor_forwarding, create_constant_actor, create_registry_scope,
+        list_item_scope_id, values_equal_async,
     };
     use boon::parser::PersistenceId;
     use std::future::Future;

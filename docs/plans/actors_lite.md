@@ -599,6 +599,18 @@ Only after Phase 4:
 
 - add public engine enum, picker, CLI, ws, and MCP exposure
 - broaden example coverage
+- make the full playground example catalog work under `ActorsLite`, not just the milestone subset:
+  - every example shown in the playground UI for `ActorsLite` must either run correctly or be intentionally hidden from the `ActorsLite` example surface until implemented
+  - shipped `ActorsLite` playground examples must not fall back to subset-marker / unsupported-source errors such as:
+    - missing top-level `store`
+    - missing source-marker strings used by the current subset detectors
+    - other temporary “subset requires …” gating failures
+  - the long-term target is lowering/runtime support, not brittle source-marker admission checks
+- replace temporary subset-marker gating for shipped examples with real lowering/runtime support or explicit engine gating at the UI/catalog layer
+- bring bridge-applied visual parity up to the level of the supported examples:
+  - host/bridge style application must preserve meaningful styling, spacing, and layout instead of rendering examples as mostly unstyled text flows
+  - supported examples in the playground UI must render with the intended structural layout, not merely with correct text content
+  - style/layout parity belongs in the retained/keyed bridge + renderer integration, not as example-specific hacks
 - then consider later work such as:
   - persistence
   - mailbox storage optimization
@@ -661,6 +673,13 @@ Initial required examples under `ActorsLite`:
 - one nearby `cells` variant using different shape parameters or nearby nested-list structure
 
 For Phase 2 through Phase 4, these examples are green only in the non-persistence sense unless `ActorsLite` persistence is explicitly implemented and enabled.
+
+Phase 5 broader-parity acceptance:
+
+- every example exposed in the playground UI when `ActorsLite` is selected opens successfully without unsupported-source/subset-marker errors
+- examples that are still not implemented are not exposed as runnable `ActorsLite` examples until support lands
+- the example catalog used by the playground UI is aligned with the real `ActorsLite` support set instead of relying on stale source-marker heuristics
+- supported playground examples retain meaningful bridge-applied styling and layout, rather than degrading to bare/unlaid-out text with only semantic content preserved
 
 ### Performance acceptance
 

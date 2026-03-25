@@ -1,0 +1,33 @@
+# Mapped checkbox state stays independent per item
+
+[test]
+category = "interactive"
+description = "Mapped checkboxes do not share state between siblings"
+skip_engines = ["Actors", "DD", "Wasm"]
+
+[output]
+text = "Item A(unchecked)Item B(unchecked)"
+
+[timing]
+timeout = 5000
+poll_interval = 200
+
+[[sequence]]
+description = "First checkbox checks only first item"
+actions = [
+  ["click_checkbox", 0],
+  ["assert_checkbox_checked", 0],
+  ["assert_checkbox_unchecked", 1],
+  ["assert_contains", "Item A(checked)"],
+  ["assert_contains", "Item B(unchecked)"],
+]
+
+[[sequence]]
+description = "Second checkbox checks only second item"
+actions = [
+  ["click_checkbox", 1],
+  ["assert_checkbox_checked", 0],
+  ["assert_checkbox_checked", 1],
+  ["assert_contains", "Item A(checked)"],
+  ["assert_contains", "Item B(checked)"],
+]

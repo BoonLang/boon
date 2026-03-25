@@ -751,8 +751,12 @@ impl WasmRuntime {
                             changed |= self.set_scalar_value(&binding, value);
                         }
                         ScalarUpdate::Add { binding, delta } => {
-                            let next =
-                                self.scalar_values.get(&binding).copied().unwrap_or_default() + delta;
+                            let next = self
+                                .scalar_values
+                                .get(&binding)
+                                .copied()
+                                .unwrap_or_default()
+                                + delta;
                             changed |= self.set_scalar_value(&binding, next);
                         }
                         ScalarUpdate::AddTenths {
@@ -777,7 +781,11 @@ impl WasmRuntime {
                             }
                         }
                         ScalarUpdate::ToggleBool { binding } => {
-                            let next = if self.scalar_values.get(&binding).copied().unwrap_or_default()
+                            let next = if self
+                                .scalar_values
+                                .get(&binding)
+                                .copied()
+                                .unwrap_or_default()
                                 == 0
                             {
                                 1
@@ -858,17 +866,16 @@ impl WasmRuntime {
                                 event_keydown_text(event)
                                     .map(ToString::to_string)
                                     .or_else(|| {
-                                        self.input_texts
-                                            .get(&source_binding)
-                                            .cloned()
-                                            .or_else(|| {
+                                        self.input_texts.get(&source_binding).cloned().or_else(
+                                            || {
                                                 self.active_input_bindings
                                                     .get(&event.target)
                                                     .and_then(|binding| {
                                                         self.input_texts.get(binding)
                                                     })
                                                     .cloned()
-                                            })
+                                            },
+                                        )
                                     })
                                     .unwrap_or_default()
                             } else {
@@ -1616,12 +1623,14 @@ impl WasmRuntime {
             DerivedScalarOperand::TextBindingNumber(binding) => {
                 self.text_binding_number_value(binding).unwrap_or_default()
             }
-            DerivedScalarOperand::TextListCount { binding, filter } => self
-                .filtered_text_list_values(binding, filter.as_ref())
-                .len() as i64,
-            DerivedScalarOperand::ObjectListCount { binding, filter } => self
-                .filtered_object_list_items(binding, filter.as_ref())
-                .len() as i64,
+            DerivedScalarOperand::TextListCount { binding, filter } => {
+                self.filtered_text_list_values(binding, filter.as_ref())
+                    .len() as i64
+            }
+            DerivedScalarOperand::ObjectListCount { binding, filter } => {
+                self.filtered_object_list_items(binding, filter.as_ref())
+                    .len() as i64
+            }
             DerivedScalarOperand::Literal(value) => *value,
             DerivedScalarOperand::Arithmetic { op, left, right } => {
                 let left = self.derived_scalar_operand_value(left);
@@ -1894,9 +1903,10 @@ impl WasmRuntime {
                     .iter()
                     .map(|binding| {
                         let action = binding.action.clone().or_else(|| {
-                            let suffix = binding.source_binding.as_deref().map(|source| {
-                                source.strip_prefix("__item__.").unwrap_or(source)
-                            });
+                            let suffix = binding
+                                .source_binding
+                                .as_deref()
+                                .map(|source| source.strip_prefix("__item__.").unwrap_or(source));
                             let matched = item_actions
                                 .iter()
                                 .filter(|spec| {
@@ -2139,9 +2149,8 @@ impl WasmRuntime {
                                                         value,
                                                     } => TextUpdate::SetStatic {
                                                         binding: binding.clone(),
-                                                        value: self.render_object_input_value(
-                                                            item, value,
-                                                        ),
+                                                        value: self
+                                                            .render_object_input_value(item, value),
                                                         payload_filter: payload_filter.clone(),
                                                     },
                                                 })
@@ -2862,7 +2871,9 @@ fn collect_all_object_list_item_action_summaries(node: &SemanticNode) -> Vec<ser
 
 fn collect_object_list_bindings(node: &SemanticNode) -> Vec<String> {
     match node {
-        SemanticNode::ObjectList { binding, template, .. } => {
+        SemanticNode::ObjectList {
+            binding, template, ..
+        } => {
             let mut output = vec![binding.clone()];
             output.extend(collect_object_list_bindings(template));
             output
@@ -2961,10 +2972,9 @@ fn collect_branch_summaries(node: &SemanticNode) -> Vec<String> {
             output
         }
         SemanticNode::ObjectList { template, .. } => collect_branch_summaries(template),
-        SemanticNode::Element { children, .. } | SemanticNode::Fragment(children) => children
-            .iter()
-            .flat_map(collect_branch_summaries)
-            .collect(),
+        SemanticNode::Element { children, .. } | SemanticNode::Fragment(children) => {
+            children.iter().flat_map(collect_branch_summaries).collect()
+        }
         SemanticNode::Keyed { node, .. } => collect_branch_summaries(node),
         SemanticNode::Text(_)
         | SemanticNode::TextTemplate { .. }
@@ -3162,8 +3172,7 @@ fn merge_style_fragments(
             object_lists,
             current_element_scope,
             item,
-        )
-        {
+        ) {
             merge_style_property(properties, &style);
         }
     }
@@ -3259,10 +3268,20 @@ fn style_scalar_compare_matches(
     object_lists: &BTreeMap<String, Vec<ObjectListItem>>,
     current_element_scope: Option<&str>,
 ) -> bool {
-    let left =
-        style_scalar_operand_value(left, scalar_values, text_lists, object_lists, current_element_scope);
-    let right =
-        style_scalar_operand_value(right, scalar_values, text_lists, object_lists, current_element_scope);
+    let left = style_scalar_operand_value(
+        left,
+        scalar_values,
+        text_lists,
+        object_lists,
+        current_element_scope,
+    );
+    let right = style_scalar_operand_value(
+        right,
+        scalar_values,
+        text_lists,
+        object_lists,
+        current_element_scope,
+    );
     match op {
         IntCompareOp::Equal => left == right,
         IntCompareOp::NotEqual => left != right,
@@ -3290,7 +3309,8 @@ fn style_scalar_operand_value(
         DerivedScalarOperand::TextListCount { binding, filter } => text_lists
             .get(binding)
             .map(|items| {
-                items.iter()
+                items
+                    .iter()
                     .filter(|value| {
                         filter
                             .as_ref()
@@ -3302,18 +3322,17 @@ fn style_scalar_operand_value(
         DerivedScalarOperand::ObjectListCount { binding, filter } => object_lists
             .get(binding)
             .map(|items| {
-                items.iter()
+                items
+                    .iter()
                     .filter(|item| {
-                        filter
-                            .as_ref()
-                            .is_none_or(|filter| {
-                                object_list_item_matches_filter(
-                                    item,
-                                    filter,
-                                    scalar_values,
-                                    &BTreeMap::new(),
-                                )
-                            })
+                        filter.as_ref().is_none_or(|filter| {
+                            object_list_item_matches_filter(
+                                item,
+                                filter,
+                                scalar_values,
+                                &BTreeMap::new(),
+                            )
+                        })
                     })
                     .count() as i64
             })
@@ -3346,31 +3365,27 @@ fn style_scalar_operand_value(
                 }
             }
         }
-        DerivedScalarOperand::Min { left, right } => {
-            style_scalar_operand_value(
-                left,
-                scalar_values,
-                text_lists,
-                object_lists,
-                current_element_scope,
-            )
-            .min(style_scalar_operand_value(
-                right,
-                scalar_values,
-                text_lists,
-                object_lists,
-                current_element_scope,
-            ))
-        }
-        DerivedScalarOperand::Round { source } => {
-            style_scalar_operand_value(
-                source,
-                scalar_values,
-                text_lists,
-                object_lists,
-                current_element_scope,
-            )
-        }
+        DerivedScalarOperand::Min { left, right } => style_scalar_operand_value(
+            left,
+            scalar_values,
+            text_lists,
+            object_lists,
+            current_element_scope,
+        )
+        .min(style_scalar_operand_value(
+            right,
+            scalar_values,
+            text_lists,
+            object_lists,
+            current_element_scope,
+        )),
+        DerivedScalarOperand::Round { source } => style_scalar_operand_value(
+            source,
+            scalar_values,
+            text_lists,
+            object_lists,
+            current_element_scope,
+        ),
     }
 }
 
@@ -3587,9 +3602,7 @@ mod tests {
     use serde::Serialize;
 
     use super::{KEYDOWN_TEXT_SEPARATOR, WasmRuntime, bootstrap_runtime};
-    use crate::abi::{
-        encode_render_diff_batch, encode_ui_event_batch, encode_ui_fact_batch,
-    };
+    use crate::abi::{encode_render_diff_batch, encode_ui_event_batch, encode_ui_fact_batch};
     use crate::exec_ir::ExecProgram;
     use crate::lower::lower_to_semantic;
     use crate::semantic_ir::{
@@ -4286,8 +4299,7 @@ mod tests {
     const CELLS_26X100_COMMIT_MAX_DOUBLE_CLICK_ATTACHES: usize = 4;
 
     fn wasm_pro_pipeline_metrics_for_cells() -> WasmInternalPipelineMetrics {
-        let source =
-            include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
+        let source = include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
 
         let lower_started = Instant::now();
         let semantic = lower_to_semantic(source, None, false);
@@ -8604,9 +8616,7 @@ document: Document/new(root: Element/stripe(
     #[test]
     fn todo_mvc_physical_runtime_checkbox_toggle_decrements_counter() {
         let semantic = lower_to_semantic(
-            include_str!(
-                "../../../playground/frontend/src/examples/todo_mvc_physical/RUN.bn"
-            ),
+            include_str!("../../../playground/frontend/src/examples/todo_mvc_physical/RUN.bn"),
             None,
             false,
         );
@@ -8682,8 +8692,7 @@ document: Document/new(root: Element/stripe(
         let add_second_batch = runtime
             .decode_commands(add_second_descriptor)
             .expect("second physical add batch should decode");
-        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) =
-            &add_second_batch.ops[0]
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &add_second_batch.ops[0]
         else {
             panic!("expected ReplaceRoot(UiTree)");
         };
@@ -8711,8 +8720,9 @@ document: Document/new(root: Element/stripe(
             .expect("first physical todo row should be present");
         let groceries_toggle = find_first_tag(groceries_row, "button")
             .expect("physical todo row should render a checkbox button");
-        let groceries_toggle_port = find_port(&add_second_batch, groceries_toggle.id, UiEventKind::Click)
-            .expect("physical todo checkbox should expose Click");
+        let groceries_toggle_port =
+            find_port(&add_second_batch, groceries_toggle.id, UiEventKind::Click)
+                .expect("physical todo checkbox should expose Click");
 
         let toggle_descriptor = runtime
             .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
@@ -8742,9 +8752,7 @@ document: Document/new(root: Element/stripe(
     #[test]
     fn todo_mvc_physical_runtime_active_filter_click_updates_selected_filter() {
         let semantic = lower_to_semantic(
-            include_str!(
-                "../../../playground/frontend/src/examples/todo_mvc_physical/RUN.bn"
-            ),
+            include_str!("../../../playground/frontend/src/examples/todo_mvc_physical/RUN.bn"),
             None,
             false,
         );
@@ -8818,8 +8826,7 @@ document: Document/new(root: Element/stripe(
         let add_second_batch = runtime
             .decode_commands(add_second_descriptor)
             .expect("second physical add batch should decode");
-        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) =
-            &add_second_batch.ops[0]
+        let boon_scene::RenderOp::ReplaceRoot(RenderRoot::UiTree(root)) = &add_second_batch.ops[0]
         else {
             panic!("expected ReplaceRoot(UiTree)");
         };
@@ -8828,8 +8835,9 @@ document: Document/new(root: Element/stripe(
             .expect("first physical todo row should be present");
         let groceries_toggle = find_first_tag(groceries_row, "button")
             .expect("physical todo row should render a checkbox button");
-        let groceries_toggle_port = find_port(&add_second_batch, groceries_toggle.id, UiEventKind::Click)
-            .expect("physical todo checkbox should expose Click");
+        let groceries_toggle_port =
+            find_port(&add_second_batch, groceries_toggle.id, UiEventKind::Click)
+                .expect("physical todo checkbox should expose Click");
         let toggle_descriptor = runtime
             .dispatch_events(&encode_ui_event_batch(&UiEventBatch {
                 events: vec![UiEvent {

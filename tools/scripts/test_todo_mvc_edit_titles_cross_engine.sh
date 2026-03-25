@@ -105,6 +105,7 @@ test_engine() {
 }
 
 echo "=== TodoMVC Cross-Engine Edit Title Test ==="
+echo "ActorsLite is intentionally excluded here until persistence is implemented."
 
 reset_project_cache
 

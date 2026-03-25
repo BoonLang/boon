@@ -1,0 +1,38 @@
+# THEN example - result updates only when the button is pressed
+
+[test]
+category = "timer"
+description = "THEN captures the current timer values only on click"
+
+[output]
+match = "exact"
+text = "A: 0B: 0A + B"
+
+[timing]
+timeout = 8000
+initial_delay = 200
+poll_interval = 200
+
+[[sequence]]
+description = "Wait until A=2 and B=10"
+actions = [["wait", 1100]]
+expect_match = "regex"
+expect = "^A: [1-9][0-9]*B: [1-9][0-9]*A \\+ B$"
+
+[[sequence]]
+description = "Click add to capture the current sum"
+actions = [["click_button", 0]]
+expect_match = "regex"
+expect = "^A: [1-9][0-9]*B: [1-9][0-9]*A \\+ B-?[0-9]+$"
+
+[[sequence]]
+description = "Wait longer - inputs change but captured result stays stable"
+actions = [["wait", 1000]]
+expect_match = "regex"
+expect = "^A: [1-9][0-9]*B: [1-9][0-9]*A \\+ B-?[0-9]+$"
+
+[[sequence]]
+description = "Click add again to capture the new sum"
+actions = [["click_button", 0]]
+expect_match = "regex"
+expect = "^A: [1-9][0-9]*B: [1-9][0-9]*A \\+ B-?[0-9]+$"
