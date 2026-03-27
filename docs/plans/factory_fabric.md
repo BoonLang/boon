@@ -86,6 +86,7 @@ This plan assumes the repo shape that currently exists:
 - the corresponding `.expected` files already exist, and some newer examples are currently engine-skipped rather than duplicated per engine
 - the repo already uses `.expected` files and `boon-tools exec test-examples` as the normative scripted example harness
 - tool, browser-launch, MCP, and ws-server surfaces currently enumerate engine names explicitly rather than discovering them dynamically
+- the latest landed repo work also established a concrete engine experiment pattern via `crates/boon-engine-actors-lite` plus `tools/src/commands/verify_actors_lite.rs` and `tools/src/commands/backend_metrics.rs`
 
 Because GitHub code search is not always accessible anonymously, implementation instructions below intentionally include `rg`-based discovery commands for integration points.
 
@@ -95,6 +96,7 @@ Because GitHub code search is not always accessible anonymously, implementation 
 - The first dev hook belongs in `playground/frontend/src/main.rs` and related frontend feature flags, not in a backend boot path.
 - Prefer a renderer boundary that reuses `boon-scene` / `boon-renderer-zoon` contracts or a thin adapter to them. Do not invent a second long-lived DOM/Zoon patch protocol unless the shared contracts are proven insufficient.
 - Reuse the existing milestone examples and `.expected` files. Do not fork `counter`, `todo_mvc`, `cells`, or `cells_dynamic` into Fabric-specific copies.
+- Borrow the current `ActorsLite` verify/metrics/acceptance structure where it helps, but do **not** copy its source-classifying preview architecture.
 - Avoid adding a new engine-specific automation protocol surface like `GetFactoryFabricDebug`. If extra debugging is needed, prefer a generic engine-debug hook or page-level debug snapshot surface that other engines could also use.
 
 ## Design idea in one paragraph
@@ -603,12 +605,9 @@ The exact enum may differ, but the separation between pure operators, stateful b
 `HostViewIR` is passive retained structure.
 It is **not** a second reactive engine.
 
-In this repo, the first implementation should either:
-
-- lower `HostViewIR` into `boon_scene::RenderDiffBatch`, or
-- keep `HostViewIR` internal but adapt it through one thin layer that targets `boon-renderer-zoon`
-
-It should **not** become a second bespoke public rendering protocol if the shared crates already cover the needed retained diff/event surface.
+In this repo, the first implementation should lower `HostViewIR` into `boon_scene::RenderDiffBatch`.
+`HostViewIR` remains internal to the engine crate, and `boon-renderer-zoon` stays the renderer-side consumer of that shared diff/event contract.
+Do **not** introduce a second bespoke public rendering protocol for v1.
 
 It should model:
 
@@ -1171,14 +1170,8 @@ Lower to `WhileMachine` / `SwitchGate`.
 
 ## 43. `LATEST`
 
-If all inputs are local bus values, `LATEST` can often be compiled into pure arbitration logic in a conveyor segment.
-
-If it mixes dynamic event-like sources that need explicit task handling, lower it to a small `LatestMachine`.
-
-Start simple:
-
-- allow a tiny `LatestMachine` in v1 if that reduces implementation risk
-- optimize into conveyor arbitration later when the semantics are stable
+For v1, lower `LATEST` through a small `LatestMachine` even when some cases could be fused into conveyors.
+Only optimize specific `LATEST` shapes into conveyor arbitration after semantics and tests are stable.
 
 ## 44. `LINK`
 
@@ -1340,7 +1333,7 @@ are green and performant.
 
 # Part IX — Implementation plan
 
-## 49. Suggested crate layout
+## 49. Crate layout
 
 Create:
 
@@ -1378,7 +1371,7 @@ crates/boon-engine-factory-fabric/
     perf_smoke.rs
 ```
 
-Suggested public browser-facing API from the crate:
+Required public browser-facing API for v1:
 
 ```rust
 pub fn run_factory_fabric(source: &str) -> impl Element;
@@ -1387,7 +1380,7 @@ pub fn factory_fabric_metrics_snapshot() -> Result<FactoryFabricMetricsReport, S
 pub fn factory_fabric_debug_snapshot() -> Option<DebugSnapshot>;
 ```
 
-Suggested internal runtime-facing API:
+Required internal runtime-facing API shape for v1:
 
 ```rust
 pub struct FactoryFabricRunner { ... }
@@ -1426,11 +1419,13 @@ No production code yet.
 2. add minimal `Cargo.toml` and `lib.rs`
 3. verify the workspace picks it up automatically because root workspace uses `crates/*`
 4. add `boon-engine-factory-fabric` as an optional dependency in `playground/frontend/Cargo.toml`
-5. add a dedicated frontend feature such as `engine-factory-fabric`
-6. add it to the normal playground build surface instead of introducing hidden-only selection logic
+5. add the exact frontend feature name `engine-factory-fabric`
+6. add it to `engine-all` / the normal playground build surface instead of introducing hidden-only selection logic
 7. extend `EngineType`, the playground picker, and frontend query/storage mappings early so the experimental engine is selectable in the normal UI
-8. update the tool/browser/ws/MCP engine enumerations in the same integration pass so the exposed engine name stays consistent everywhere
-9. add placeholder `boon-tools verify factory-fabric` and `boon-tools metrics factory-fabric` entrypoints early so the experimental engine has a stable repo-level command surface
+8. when the exposed experimental engine cannot lower or run the selected program, render an explicit FactoryFabric error in the preview; never silently fall back to another engine
+9. update the tool/browser/ws/MCP engine enumerations in the same integration pass so the exposed engine name stays consistent everywhere:
+   `tools/src/main.rs`, `tools/src/commands/mod.rs`, `tools/src/commands/test_examples.rs`, `tools/src/commands/browser.rs`, `tools/extension/background.js`, `tools/src/mcp/mod.rs`, and `tools/src/ws_server/protocol.rs`
+10. add concrete `boon-tools verify factory-fabric` and `boon-tools metrics factory-fabric` entrypoints early so the experimental engine has a stable repo-level command surface
 
 ### Useful discovery commands
 
@@ -1512,10 +1507,14 @@ These commands should be part of the implementation checklist so a simpler agent
 
 - minimal HostViewIR
 - retained node graph
-- one explicit renderer boundary decision for v1:
-  - `HostViewIR -> boon_scene::RenderDiffBatch`, or
-  - `HostViewIR -> thin boon-renderer-zoon adapter`
-- generic quiescence/debug hook exposed through the page or a generic engine-debug tool path so the harness can wait for "host batch drained + retained diff flushed"
+- fixed renderer boundary for v1:
+  `HostViewIR -> boon_scene::RenderDiffBatch`
+  with `boon-renderer-zoon` consuming that shared diff/event contract
+- fixed generic page-level status/debug transport:
+  `window.boonPlayground.getEngineStatus()`
+  and
+  `window.boonPlayground.getEngineDebug()`
+- generic tool-side wrappers must expose `GetEngineStatus` / `GetEngineDebug` by the time phase 5 browser verification starts, and the page API contract remains the source of truth
 - event registration for `press`
 - text sink binding
 - `Document/new`, `Element/button`, `Element/stripe`, label/text sink plumbing sufficient for `counter`
@@ -1583,15 +1582,13 @@ After the experimental engine is already exposed in the playground:
 4. remove temporary integration shortcuts only when they are genuinely blocking progress or correctness
 5. revisit whether the engine should remain a fifth long-lived engine after milestone evidence exists
 
-### Engine naming recommendation
+### Engine naming
 
 - enum variant: `FactoryFabric`
-- picker label: `Fabric (Exp)` or `FactoryFabric`
+- picker label: `Fabric (Exp)`
 - full name: `FactoryFabric`
 - query value: `factoryfabric`
 - crate name: `boon-engine-factory-fabric`
-
-If terse labels are preferred, `Fabric` is also acceptable, but the experimental status should be visible somewhere in the UI copy.
 
 ---
 
@@ -1607,6 +1604,16 @@ The existing `.expected` harness remains the primary browser reliability check, 
 
 Quantitative budgets should **not** live inside `.expected` files.
 Use `boon-tools metrics factory-fabric --check` for performance/churn gates.
+
+The latest repo change already established this shape for `ActorsLite`.
+`FactoryFabric` should mirror that verification layering instead of inventing a second incompatible experiment flow.
+
+Exact `verify factory-fabric` scope by phase:
+
+1. first usable version: engine-selection smoke plus `counter.expected` with `--skip-persistence`
+2. after TodoMVC support lands: add `todo_mvc.expected`
+3. after Cells support lands: add `cells.expected` and `cells_dynamic.expected`
+4. only after phase 7: make `boon-tools metrics factory-fabric --check` a required part of `verify factory-fabric --check`
 
 Required harness files:
 
@@ -1627,6 +1634,15 @@ as the normative scripted interaction runner.
 
 Do not copy the current `ActorsLite`-specific harness branches blindly.
 Prefer to generalize engine selection, readiness, and debug snapshot fetching where possible so `FactoryFabric` does not multiply special-case automation paths.
+
+Also add crate-local acceptance tests for the milestone examples, similar in role to the current `ActorsLite` acceptance modules, so there is a fast pre-browser gate for `counter`, `todo_mvc`, and `cells`.
+
+Experimental exposure contract:
+
+- `FactoryFabric` stays visible in the picker and query-string routing even while incomplete
+- unsupported programs must fail explicitly in preview output with a FactoryFabric-specific lower/runtime error
+- the engine must never silently fall back to `Actors`, `ActorsLite`, `DD`, or `Wasm`
+- `.expected` files and `verify factory-fabric` should cover only the examples the engine explicitly supports in that phase
 
 ## 60. Capability-gated persistence during milestone phase
 
@@ -1668,11 +1684,14 @@ Add:
 
 The file already exists in the repo. Extend and keep it as a peer acceptance file rather than creating a second FactoryFabric-specific expectation unless the generic file structure proves insufficient.
 
-### Missing hooks the plan must budget for
+### Required hooks
 
-- a generic engine-debug snapshot path that tools can query without adding a Fabric-only ws command
-- a quiescence/idle signal so the harness can wait for engine drain + retained flush instead of stacking blind delays
-- churn/identity counters if retained-node churn, dirty-closure size, or mapped-scope reuse are part of acceptance
+- a generic page-level status API:
+  `window.boonPlayground.getEngineStatus() -> { engine, quiescent, last_flush_id, supported }`
+- a generic page-level debug API:
+  `window.boonPlayground.getEngineDebug() -> DebugSnapshot | null`
+- generic tool-side wrappers must expose those through `GetEngineStatus` / `GetEngineDebug` once phase 5 browser verification starts
+- churn/identity counters must live in `DebugSnapshot` once retained-node churn, dirty-closure size, or mapped-scope reuse become acceptance criteria
 
 ## 62. Kernel differential tests
 
@@ -1804,12 +1823,34 @@ Recommended debug surfaces:
 
 ## 69. Debug snapshot API
 
+Add an engine crate debug snapshot structure plus one page-level status object.
+
+Page-level status contract:
+
+```rust
+pub struct EngineStatus {
+    pub engine: &'static str,
+    pub supported: bool,
+    pub quiescent: bool,
+    pub last_flush_id: u64,
+}
+```
+
+Expose it through:
+
+- `window.boonPlayground.getEngineStatus()`
+- `window.boonPlayground.getEngineDebug()`
+
+The page API is the source of truth.
+Extension/ws/CLI wrappers should expose matching generic commands `GetEngineStatus` and `GetEngineDebug` by the time phase 5 browser verification starts, and they should just forward this contract.
+
 Add a debug snapshot structure from the engine crate:
 
 ```rust
 pub struct DebugSnapshot {
     pub tick: FabricTick,
     pub quiescent: bool,
+    pub last_flush_id: u64,
     pub ready_regions: Vec<RegionId>,
     pub regions: Vec<RegionDebugState>,
     pub dirty_sinks: Vec<SinkPortId>,
@@ -1817,6 +1858,7 @@ pub struct DebugSnapshot {
     pub retained_node_creations: usize,
     pub retained_node_deletions: usize,
     pub recreated_mapped_scopes: usize,
+    pub dirty_closure_size: usize,
 }
 ```
 
@@ -1980,6 +2022,7 @@ rg "pub enum EngineType" crates playground tools
 rg "short_name\(|picker_label\(|full_name\(|description\(" crates playground tools
 rg "engine-actors|engine-actors-lite|engine-dd|engine-wasm|engine-all" playground/frontend/Cargo.toml playground/frontend/src/main.rs
 rg "availableEngines|preferredWasmEngine|boon_set_engine|Invalid engine" playground tools
+rg "verify_actors_lite|run_actors_lite_metrics|skip_engines|engines|GetActorsLiteDebug" tools crates
 rg "Document/new|Element/button|Element/text_input|Reference\[element" playground/frontend/src/examples
 rg -o 'Element/[A-Za-z_]+' playground/frontend/src/examples/{counter,todo_mvc,cells,cells_dynamic} -g '*.bn' | sort -u
 rg -n 'Hidden\[|NoElement|NoOutline|Reference\[element|Oklch\[|SansSerif|Fill|Center|Column|Row' playground/frontend/src/examples/{counter,todo_mvc,cells,cells_dynamic} -g '*.bn'
