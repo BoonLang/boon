@@ -1,5 +1,6 @@
 use crate::cells_lower::{LoweredCellsFormula, parse_lowered_cells_formula};
 use crate::cells_runtime::{CellsFormulaState, CellsSheetState};
+use crate::clock::MonotonicInstant;
 use crate::edit_session::{EditSession, EditSessionStateExt, apply_edit_session_key_down};
 use crate::interactive_preview::{InteractivePreview, render_interactive_preview};
 use crate::ir::{FunctionInstanceId, MirrorCellId, RetainedNodeKey, SourcePortId, ViewSiteId};
@@ -18,7 +19,7 @@ use boon_scene::{
     UiNodeKind,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct CellsProgram {
@@ -1033,7 +1034,7 @@ fn recreated_mapped_scope_count(
 pub fn cells_metrics_snapshot() -> Result<CellsMetricsReport, String> {
     let source = include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
 
-    let startup_started = Instant::now();
+    let startup_started = MonotonicInstant::now();
     let mut preview = CellsPreview::new(source)?;
     let _ = preview.preview_text();
     let cold_mount_to_stable_first_paint_millis = startup_started.elapsed().as_secs_f64() * 1000.0;
@@ -1063,7 +1064,7 @@ pub fn cells_metrics_snapshot() -> Result<CellsMetricsReport, String> {
             }
         };
 
-        let started = Instant::now();
+        let started = MonotonicInstant::now();
         assert!(preview.apply_event(
             CellsUiAction::CellDoubleClick { row, column },
             UiEventKind::DoubleClick,

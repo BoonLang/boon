@@ -209,6 +209,17 @@ enum MetricsAction {
         #[arg(long)]
         no_devtools: bool,
     },
+
+    /// Report current FactoryFabric metrics surface and budget-gate readiness
+    FactoryFabric {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+
+        /// Exit nonzero if the current FactoryFabric budget gate fails
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -249,6 +260,17 @@ enum VerifyAction {
         /// Assert that DevTools is closed during verification
         #[arg(long)]
         no_devtools: bool,
+    },
+
+    /// Run the FactoryFabric milestone browser traces for the currently supported subset
+    FactoryFabric {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+
+        /// Exit nonzero if any milestone trace fails
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -481,7 +503,7 @@ enum ExecAction {
         #[arg(long)]
         no_launch: bool,
 
-        /// Engine to test against: Actors, ActorsLite, DD, or Wasm
+        /// Engine to test against: Actors, ActorsLite, FactoryFabric, DD, or Wasm
         #[arg(long)]
         engine: Option<String>,
 
@@ -518,9 +540,15 @@ enum ExecAction {
     /// Get the currently selected engine and the normal user-facing engine list
     GetEngine,
 
+    /// Get the generic runtime status snapshot from the page API
+    GetEngineStatus,
+
+    /// Get the generic runtime debug snapshot from the page API
+    GetEngineDebug,
+
     /// Set the engine and trigger re-run
     SetEngine {
-        /// Engine to use: "Actors", "ActorsLite", "DD", or "Wasm"
+        /// Engine to use: "Actors", "ActorsLite", "FactoryFabric", "DD", or "Wasm"
         engine: String,
     },
 
@@ -717,6 +745,12 @@ fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
+            MetricsAction::FactoryFabric { json, check } => {
+                if let Err(e) = commands::backend_metrics::run_factory_fabric_metrics(json, check) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
         },
 
         Commands::Verify { action } => match action {
@@ -745,6 +779,17 @@ fn main() -> Result<()> {
                     single_visible_tab,
                     no_devtools,
                 )) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+            VerifyAction::FactoryFabric { json, check } => {
+                let rt = tokio::runtime::Runtime::new()?;
+                if let Err(e) =
+                    rt.block_on(commands::verify_factory_fabric::run_verify_factory_fabric(
+                        json, check,
+                    ))
+                {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }
@@ -1250,9 +1295,14 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
 
             // Validate engine if provided
             if let Some(ref eng) = engine {
-                if eng != "Actors" && eng != "ActorsLite" && eng != "DD" && eng != "Wasm" {
+                if eng != "Actors"
+                    && eng != "ActorsLite"
+                    && eng != "FactoryFabric"
+                    && eng != "DD"
+                    && eng != "Wasm"
+                {
                     anyhow::bail!(
-                        "Invalid engine '{}'. Must be 'Actors', 'ActorsLite', 'DD', or 'Wasm'",
+                        "Invalid engine '{}'. Must be 'Actors', 'ActorsLite', 'FactoryFabric', 'DD', or 'Wasm'",
                         eng
                     );
                 }
@@ -1376,6 +1426,29 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             }
         }
 
+        ExecAction::GetEngineStatus => {
+            let response = send_command_to_server(port, WsCommand::GetEngineStatus).await?;
+            match response {
+                WsResponse::EngineStatus { status } => {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                }
+                _ => print_response(response),
+            }
+        }
+
+        ExecAction::GetEngineDebug => {
+            let response = send_command_to_server(port, WsCommand::GetEngineDebug).await?;
+            match response {
+                WsResponse::EngineDebug { debug } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&debug.unwrap_or(serde_json::Value::Null))?
+                    );
+                }
+                _ => print_response(response),
+            }
+        }
+
         ExecAction::Persistence {
             enable,
             disable,
@@ -1426,7 +1499,7 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
             // Validate engine value
             if !commands::is_valid_engine_name(&engine) {
                 anyhow::bail!(
-                    "Invalid engine '{}'. Must be 'Actors', 'ActorsLite', 'DD', or 'Wasm'",
+                    "Invalid engine '{}'. Must be 'Actors', 'ActorsLite', 'FactoryFabric', 'DD', or 'Wasm'",
                     engine
                 );
             }

@@ -427,7 +427,12 @@ async function cdpHoverAt(tabId, x, y) {
   await attachDebugger(tabId);
 
   // Get scroll offset to convert page coords to viewport coords
-  const scrollOffset = await cdpEvaluate(tabId, `({ scrollX: window.scrollX, scrollY: window.scrollY })`);
+  const scrollResults = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: () => ({ scrollX: window.scrollX, scrollY: window.scrollY })
+  });
+  const scrollOffset = scrollResults?.[0]?.result || { scrollX: 0, scrollY: 0 };
   const viewportX = x - (scrollOffset?.scrollX || 0);
   const viewportY = y - (scrollOffset?.scrollY || 0);
 
@@ -437,6 +442,42 @@ async function cdpHoverAt(tabId, x, y) {
   });
 
   console.log(`[Boon] CDP: Trusted hover at (${x}, ${y})`);
+}
+
+async function dispatchDomHoverAtPoint(tabId, clientX, clientY) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: (clientX, clientY) => {
+      const target = document.elementFromPoint(clientX, clientY);
+      if (!target) {
+        return { found: false, error: 'No element at hover point' };
+      }
+      const makeMouseEvent = (type) => new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window,
+        clientX,
+        clientY,
+        screenX: clientX,
+        screenY: clientY,
+        button: 0,
+        buttons: 0,
+        detail: 0
+      });
+      for (const type of ['mouseover', 'mouseenter', 'mousemove']) {
+        target.dispatchEvent(makeMouseEvent(type));
+      }
+      return {
+        found: true,
+        tagName: target.tagName,
+        text: (target.textContent || '').trim()
+      };
+    },
+    args: [clientX, clientY]
+  });
+  return results?.[0]?.result || { found: false, error: 'hover dispatch failed' };
 }
 
 // Get element bounding box via CDP
@@ -559,9 +600,10 @@ async function cdpTypeTextCharByChar(tabId, text) {
           : (focused.selectionEnd ?? start);
         if (!restoredFromRemembered
             && focused === hintedFocused
+            && !focused.hasAttribute('autofocus')
             && focused.value
             && start === 0
-            && end === 0) {
+            && (end === 0 || end === focused.value.length)) {
           start = focused.value.length;
           end = start;
         }
@@ -701,9 +743,10 @@ async function cdpTypeTextCharByChar(tabId, text) {
               : (focused.selectionEnd ?? start);
             if (!restoredFromRemembered
                 && focused === hintedFocused
+                && !focused.hasAttribute('autofocus')
                 && focused.value
                 && start === 0
-                && end === 0) {
+                && (end === 0 || end === focused.value.length)) {
               start = focused.value.length;
               end = start;
             }
@@ -1845,6 +1888,46 @@ async function handleCommand(id, command) {
           return { type: 'actorsLiteDebug', value: typeof result === 'string' ? result : null };
         }
 
+      case 'getEngineStatus':
+        {
+          const result = await executeInTab(tab.id, () => {
+            if (typeof window.boonPlayground === 'undefined') {
+              return { error: 'boonPlayground not available' };
+            }
+            if (typeof window.boonPlayground.getEngineStatus !== 'function') {
+              return { error: 'getEngineStatus API not available' };
+            }
+            return window.boonPlayground.getEngineStatus();
+          });
+          if (result && result.type === 'error') {
+            return { type: 'error', message: result.message || 'GetEngineStatus failed' };
+          }
+          if (result && result.error) {
+            return { type: 'error', message: result.error };
+          }
+          return { type: 'engineStatus', status: result || null };
+        }
+
+      case 'getEngineDebug':
+        {
+          const result = await executeInTab(tab.id, () => {
+            if (typeof window.boonPlayground === 'undefined') {
+              return { error: 'boonPlayground not available' };
+            }
+            if (typeof window.boonPlayground.getEngineDebug !== 'function') {
+              return { error: 'getEngineDebug API not available' };
+            }
+            return window.boonPlayground.getEngineDebug();
+          });
+          if (result && result.type === 'error') {
+            return { type: 'error', message: result.message || 'GetEngineDebug failed' };
+          }
+          if (result && result.error) {
+            return { type: 'error', message: result.error };
+          }
+          return { type: 'engineDebug', debug: result ?? null };
+        }
+
       case 'runAndCaptureInitial':
         // ATOMIC: Run code and capture initial preview BEFORE any async events (timers) fire.
         // Use page-world execution instead of CDP Runtime.evaluate; the first CDP eval after
@@ -2341,6 +2424,41 @@ async function handleCommand(id, command) {
           let clickY = checkbox.clickY ?? checkbox.centerY;
           let method = 'cdp';
 
+          // Prefer the retained click-port path when available. For engines that render
+          // controlled checkboxes, native browser clicks can fire extra focus/input
+          // behavior before the engine applies its own checked state, which is both
+          // less deterministic and can wedge experimental runtimes mid-trace.
+          if (checkbox.clickPort) {
+            const dispatchResult = await cdpEvaluate(tab.id, `
+              (function() {
+                const dispatchEvent = window.__boonDispatchUiEvent;
+                if (typeof dispatchEvent !== 'function') {
+                  return { ok: false, error: 'window.__boonDispatchUiEvent is not available' };
+                }
+                dispatchEvent(${JSON.stringify(checkbox.clickPort)}, 'Click');
+                return { ok: true };
+              })()
+            `);
+            if (!dispatchResult?.ok) {
+              return {
+                type: 'error',
+                message: dispatchResult?.error || 'Checkbox click dispatch failed'
+              };
+            }
+            method = 'hook';
+            return { type: 'success', data: {
+              index: checkboxIndex,
+              id: checkbox.id,
+              text: checkbox.text,
+              x: clickX,
+              y: clickY,
+              clickPoint: checkbox.clickPoint,
+              method,
+              width: checkbox.width,
+              height: checkbox.height
+            } };
+          }
+
           if (checkbox.zeroSized) {
             const clickResult = await cdpEvaluate(tab.id, `
               (function() {
@@ -2403,61 +2521,10 @@ async function handleCommand(id, command) {
             } };
           }
 
-          if (checkbox.zeroSized && checkbox.clickPort) {
-            const dispatchResult = await cdpEvaluate(tab.id, `
-              (function() {
-                const dispatchEvent = window.__boonDispatchUiEvent;
-                if (typeof dispatchEvent !== 'function') {
-                  return { ok: false, error: 'window.__boonDispatchUiEvent is not available' };
-                }
-                dispatchEvent(${JSON.stringify(checkbox.clickPort)}, 'Click');
-                return { ok: true };
-              })()
-            `);
-            if (!dispatchResult?.ok) {
-              return {
-                type: 'error',
-                message: dispatchResult?.error || 'Checkbox click failed for zero-sized checkbox'
-              };
-            }
-            method = 'hook';
-            return { type: 'success', data: {
-              index: checkboxIndex,
-              id: checkbox.id,
-              text: checkbox.text,
-              x: clickX,
-              y: clickY,
-              clickPoint: checkbox.clickPoint,
-              method,
-              width: checkbox.width,
-              height: checkbox.height
-            } };
-          }
-
           try {
             await cdpClickAtViewport(tab.id, clickX, clickY);
           } catch (cdpError) {
-            if (!checkbox.clickPort) {
-              return { type: 'error', message: `Checkbox click failed: ${cdpError.message}` };
-            }
-
-            const dispatchResult = await cdpEvaluate(tab.id, `
-              (function() {
-                const dispatchEvent = window.__boonDispatchUiEvent;
-                if (typeof dispatchEvent !== 'function') {
-                  return { ok: false, error: 'window.__boonDispatchUiEvent is not available' };
-                }
-                dispatchEvent(${JSON.stringify(checkbox.clickPort)}, 'Click');
-                return { ok: true };
-              })()
-            `);
-            if (!dispatchResult?.ok) {
-              return {
-                type: 'error',
-                message: dispatchResult?.error || `Checkbox click failed after CDP fallback: ${cdpError.message}`
-              };
-            }
-            method = 'hook';
+            return { type: 'error', message: `Checkbox click failed: ${cdpError.message}` };
           }
 
           return { type: 'success', data: {
@@ -2739,7 +2806,6 @@ async function handleCommand(id, command) {
                   const blurPort = el.getAttribute?.('data-boon-port-blur');
                   if (blurPort && typeof dispatchEvent === 'function') {
                     dispatchEvent(blurPort, 'Blur');
-                    return;
                   }
                   if (typeof el.blur === 'function') {
                     try { el.blur(); } catch (_) {}
@@ -2781,7 +2847,8 @@ async function handleCommand(id, command) {
                   const blurPort = active.getAttribute?.('data-boon-port-blur');
                   if (blurPort && typeof dispatchEvent === 'function') {
                     dispatchEvent(blurPort, 'Blur');
-                  } else if (typeof active.blur === 'function') {
+                  }
+                  if (typeof active.blur === 'function') {
                     try { active.blur(); } catch (_) {}
                   }
                 }
@@ -3484,10 +3551,10 @@ async function handleCommand(id, command) {
           const searchText = command.text;
           const exact = command.exact || false;
 
-          const result = await cdpEvaluate(tab.id, `
-            (function() {
-              const searchText = ${JSON.stringify(searchText)};
-              const exact = ${exact};
+          const results = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            world: 'MAIN',
+            func: (searchText, exact) => {
               const preview = document.querySelector('[data-boon-panel="preview"]');
               if (!preview) return { found: false, error: 'Preview panel not found' };
 
@@ -3511,15 +3578,14 @@ async function handleCommand(id, command) {
                 }
                 directText = directText.trim();
 
-                let matches = exact ? directText === searchText : directText.includes(searchText);
+                const matches = exact ? directText === searchText : directText.includes(searchText);
+                if (!matches) return;
 
-                if (matches) {
-                  const size = rect.width * rect.height;
-                  if (size < bestMatchSize) {
-                    bestMatchSize = size;
-                    bestMatchElement = el;
-                    bestMatch = { text: directText };
-                  }
+                const size = rect.width * rect.height;
+                if (size < bestMatchSize) {
+                  bestMatchSize = size;
+                  bestMatchElement = el;
+                  bestMatch = { text: directText };
                 }
               });
 
@@ -3527,14 +3593,15 @@ async function handleCommand(id, command) {
                 return { found: false, error: 'No element found with text: ' + searchText };
               }
 
-              // Scroll into view, then get viewport coordinates for CDP hover
               bestMatchElement.scrollIntoView({ block: 'center', behavior: 'instant' });
               const rect = bestMatchElement.getBoundingClientRect();
               bestMatch.centerX = Math.round(rect.x + rect.width / 2);
               bestMatch.centerY = Math.round(rect.y + rect.height / 2);
               return { found: true, element: bestMatch };
-            })()
-          `);
+            },
+            args: [searchText, exact],
+          });
+          const result = results?.[0]?.result || { found: false, error: 'hover lookup failed' };
 
           if (!result.found) {
             return { type: 'error', message: result.error || 'Element not found' };
@@ -3544,6 +3611,7 @@ async function handleCommand(id, command) {
           // Small delay after scroll for layout to settle
           await new Promise(r => setTimeout(r, 50));
           await cdpHoverAt(tab.id, element.centerX, element.centerY);
+          await dispatchDomHoverAtPoint(tab.id, element.centerX, element.centerY);
           return { type: 'success', data: { text: element.text, x: element.centerX, y: element.centerY } };
         } catch (e) {
           return { type: 'error', message: `Hover by text failed: ${e.message}` };
@@ -3694,15 +3762,25 @@ async function handleCommand(id, command) {
               if (!preview) return { found: false, hasOutline: false, error: 'Preview panel not found' };
 
               const buttonText = ${JSON.stringify(command.text)};
-
-              // Find buttons (button tags and role="button" elements)
-              const allButtons = Array.from(preview.querySelectorAll('button, [role="button"]'));
-
-              // Find button with matching text
-              const button = allButtons.find(btn => {
-                const text = btn.textContent.trim();
-                return text === buttonText;
+              const allElements = Array.from(preview.querySelectorAll('*'));
+              const matchingElement = allElements.find((el) => {
+                const directText = Array.from(el.childNodes)
+                  .filter((node) => node.nodeType === Node.TEXT_NODE)
+                  .map((node) => node.textContent || '')
+                  .join('')
+                  .trim();
+                if (directText === buttonText) {
+                  return true;
+                }
+                const textContent = (el.textContent || '').trim();
+                return textContent === buttonText;
               });
+
+              const button = matchingElement
+                ? (matchingElement.matches('button, [role="button"]')
+                    ? matchingElement
+                    : matchingElement.closest('button, [role="button"]'))
+                : null;
 
               if (!button) {
                 return { found: false, hasOutline: false, error: 'Button with text "' + buttonText + '" not found' };
@@ -4127,8 +4205,8 @@ async function handleCommand(id, command) {
         // Set the engine type and trigger re-run
         try {
           const engineToSet = command.engine;
-          if (engineToSet !== 'Actors' && engineToSet !== 'ActorsLite' && engineToSet !== 'DD' && engineToSet !== 'Wasm') {
-            return { type: 'error', message: `Invalid engine '${engineToSet}'. Must be 'Actors', 'ActorsLite', 'DD', or 'Wasm'` };
+          if (engineToSet !== 'Actors' && engineToSet !== 'ActorsLite' && engineToSet !== 'FactoryFabric' && engineToSet !== 'DD' && engineToSet !== 'Wasm') {
+            return { type: 'error', message: `Invalid engine '${engineToSet}'. Must be 'Actors', 'ActorsLite', 'FactoryFabric', 'DD', or 'Wasm'` };
           }
           const result = await cdpEvaluate(tab.id, `
             (function() {

@@ -1,4 +1,5 @@
 use crate::bridge::{HostInput, HostSnapshot};
+use crate::clock::MonotonicInstant;
 use crate::filtered_list_view::filtered_list_with_filter;
 use crate::ids::ActorId;
 use crate::interactive_preview::{InteractivePreview, render_interactive_preview};
@@ -22,8 +23,6 @@ use boon_scene::{
     NodeId, RenderOp, RenderRoot, UiEventBatch, UiEventKind, UiFactBatch, UiFactKind, UiNode,
 };
 use std::collections::BTreeMap;
-use std::time::Instant;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Filter {
     All,
@@ -86,7 +85,7 @@ pub(crate) enum TodoUiAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FactTarget {
     MainInput,
-    TodoTitle(u64),
+    TodoItemRow(u64),
     TodoEditInput(u64),
 }
 
@@ -305,7 +304,7 @@ impl TodoPreview {
             (FactTarget::MainInput, kind) => {
                 self.apply_text_input_fact(TextInputTarget::MainInput, kind)
             }
-            (FactTarget::TodoTitle(todo_id), UiFactKind::Hovered(hovered)) => {
+            (FactTarget::TodoItemRow(todo_id), UiFactKind::Hovered(hovered)) => {
                 self.apply_hover_fact(todo_id, hovered)
             }
             (FactTarget::TodoEditInput(todo_id), kind) => {
@@ -771,7 +770,7 @@ impl TodoPreview {
         match target {
             TextInputTarget::MainInput => {
                 let inputs = self.todo_runtime_inputs(true);
-                self.dispatch_text_input_inputs_and_observe(
+                let changed = self.dispatch_text_input_inputs_and_observe(
                     target,
                     current_text.clone(),
                     inputs,
@@ -784,7 +783,12 @@ impl TodoPreview {
                     )),
                     Self::todo_list_projection,
                     true,
-                )
+                );
+                if changed {
+                    let _ =
+                        self.apply_text_input_port_value(TextInputTarget::MainInput, String::new());
+                }
+                changed
             }
             TextInputTarget::EditInput(todo_id) => {
                 let inputs = self.todo_runtime_inputs(false);
@@ -937,14 +941,18 @@ impl TodoPreview {
             content_children.push(self.render_list(ops, &visible_todos));
             content_children.push(self.render_panel_footer(ops, active_count, completed_count));
         }
-        content_children.push(self.render_footer_texts());
+        content_children.push(self.render_footer_texts(ops));
 
         let content = self.element_node(ViewSiteId(201), "div", None, content_children);
-        self.element_node(ViewSiteId(200), "div", None, vec![content])
+        apply_todo_root_styles(ops, content.id);
+        let shell = self.element_node(ViewSiteId(200), "div", None, vec![content]);
+        apply_todo_shell_styles(ops, shell.id);
+        shell
     }
 
     fn render_header(&mut self) -> UiNode {
-        self.element_node(ViewSiteId(202), "h1", Some("todos".to_string()), Vec::new())
+        let node = self.element_node(ViewSiteId(202), "h1", Some("todos".to_string()), Vec::new());
+        node
     }
 
     fn render_input_row(&mut self, ops: &mut Vec<RenderOp>, all_completed: bool) -> UiNode {
@@ -955,11 +963,17 @@ impl TodoPreview {
         children.push(self.render_main_input(ops));
 
         let row = self.element_node(ViewSiteId(203), "div", None, children);
+        apply_todo_input_row_styles(ops, row.id);
         if self.main_input_focused() {
             ops.push(RenderOp::SetStyle {
                 id: row.id,
                 name: "outline".to_string(),
-                value: Some("1px solid rgb(200, 120, 120)".to_string()),
+                value: Some("1px solid rgba(199, 92, 92, 0.9)".to_string()),
+            });
+            ops.push(RenderOp::SetStyle {
+                id: row.id,
+                name: "box-shadow".to_string(),
+                value: Some("0 0 0 3px rgba(199, 92, 92, 0.14)".to_string()),
             });
         }
         row
@@ -984,6 +998,7 @@ impl TodoPreview {
             name: "aria-label".to_string(),
             value: Some("Toggle all".to_string()),
         });
+        apply_todo_checkbox_styles(ops, node.id);
         node
     }
 
@@ -1010,19 +1025,13 @@ impl TodoPreview {
             id: node.id,
             value: self.main_input_draft(),
         });
+        apply_todo_main_input_styles(ops, node.id);
         self.ui.bind_fact_target(node.id, FactTarget::MainInput);
         self.attach_port(
             ops,
             node.id,
             TodoProgram::MAIN_INPUT_CHANGE_PORT,
             UiEventKind::Input,
-            TodoUiAction::MainInputChange,
-        );
-        self.attach_port(
-            ops,
-            node.id,
-            TodoProgram::MAIN_INPUT_CHANGE_PORT,
-            UiEventKind::Change,
             TodoUiAction::MainInputChange,
         );
         self.attach_port(
@@ -1058,7 +1067,9 @@ impl TodoPreview {
             .iter()
             .map(|todo| self.render_todo_item(ops, todo))
             .collect::<Vec<_>>();
-        self.element_node(ViewSiteId(206), "div", None, children)
+        let node = self.element_node(ViewSiteId(206), "div", None, children);
+        apply_todo_list_styles(ops, node.id);
+        node
     }
 
     fn render_todo_item(
@@ -1075,7 +1086,11 @@ impl TodoPreview {
         if self.hovered_todo_id() == Some(todo.id) {
             children.push(self.render_todo_delete_button(ops, todo));
         }
-        self.element_node_with_item(ViewSiteId(300), "div", None, todo.id, children)
+        let node = self.element_node_with_item(ViewSiteId(300), "div", None, todo.id, children);
+        apply_todo_item_row_styles(ops, node.id);
+        self.ui
+            .bind_fact_target(node.id, FactTarget::TodoItemRow(todo.id));
+        node
     }
 
     fn render_todo_checkbox(
@@ -1092,6 +1107,7 @@ impl TodoPreview {
             todo_checkbox_port(todo.id),
             TodoUiAction::TodoCheckbox(todo.id),
         );
+        apply_todo_checkbox_styles(ops, node.id);
         node
     }
 
@@ -1113,9 +1129,13 @@ impl TodoPreview {
                 name: "text-decoration".to_string(),
                 value: Some("line-through".to_string()),
             });
+            ops.push(RenderOp::SetStyle {
+                id: node.id,
+                name: "color".to_string(),
+                value: Some("rgba(148, 163, 184, 0.9)".to_string()),
+            });
         }
-        self.ui
-            .bind_fact_target(node.id, FactTarget::TodoTitle(todo.id));
+        apply_todo_title_styles(ops, node.id);
         self.attach_port(
             ops,
             node.id,
@@ -1153,8 +1173,9 @@ impl TodoPreview {
         ops.push(RenderOp::SetStyle {
             id: node.id,
             name: "outline".to_string(),
-            value: Some("1px solid rgb(80, 120, 220)".to_string()),
+            value: Some("1px solid rgba(80, 120, 220, 0.9)".to_string()),
         });
+        apply_todo_edit_input_styles(ops, node.id);
         self.ui
             .bind_fact_target(node.id, FactTarget::TodoEditInput(todo_id));
         self.attach_port(
@@ -1214,6 +1235,7 @@ impl TodoPreview {
             UiEventKind::Click,
             TodoUiAction::TodoDelete(todo.id),
         );
+        apply_todo_delete_button_styles(ops, node.id);
         node
     }
 
@@ -1262,6 +1284,7 @@ impl TodoPreview {
                 Some("Clear completed".to_string()),
                 Vec::new(),
             );
+            apply_todo_clear_button_styles(ops, clear.id);
             self.attach_port(
                 ops,
                 clear.id,
@@ -1271,7 +1294,9 @@ impl TodoPreview {
             );
             children.push(clear);
         }
-        self.element_node(ViewSiteId(212), "footer", None, children)
+        let node = self.element_node(ViewSiteId(212), "footer", None, children);
+        apply_todo_footer_styles(ops, node.id);
+        node
     }
 
     fn render_filter_button(
@@ -1284,18 +1309,29 @@ impl TodoPreview {
         action: TodoUiAction,
     ) -> UiNode {
         let node = self.element_node(view_site, "button", Some(label.to_string()), Vec::new());
+        apply_todo_filter_button_styles(ops, node.id, self.selected_filter() == filter);
         if self.selected_filter() == filter {
             ops.push(RenderOp::SetStyle {
                 id: node.id,
                 name: "outline".to_string(),
                 value: Some("2px solid rgb(120, 80, 80)".to_string()),
             });
+            ops.push(RenderOp::SetStyle {
+                id: node.id,
+                name: "outline-offset".to_string(),
+                value: Some("1px".to_string()),
+            });
+            ops.push(RenderOp::SetStyle {
+                id: node.id,
+                name: "border-color".to_string(),
+                value: Some("rgba(199, 92, 92, 0.7)".to_string()),
+            });
         }
         self.attach_port(ops, node.id, port, UiEventKind::Click, action);
         node
     }
 
-    fn render_footer_texts(&mut self) -> UiNode {
+    fn render_footer_texts(&mut self, ops: &mut Vec<RenderOp>) -> UiNode {
         let help = self.element_node(
             ViewSiteId(214),
             "p",
@@ -1314,7 +1350,12 @@ impl TodoPreview {
             Some("Part of TodoMVC".to_string()),
             Vec::new(),
         );
-        self.element_node(ViewSiteId(213), "div", None, vec![help, created_by, author])
+        let help_id = help.id;
+        let created_by_id = created_by.id;
+        let author_id = author.id;
+        let node = self.element_node(ViewSiteId(213), "div", None, vec![help, created_by, author]);
+        apply_todo_footer_texts_styles(node.id, help_id, created_by_id, author_id, ops);
+        node
     }
 
     fn configure_checkbox(
@@ -1413,7 +1454,7 @@ pub(crate) fn todo_metrics_capture()
 -> Result<(InteractionMetricsReport, RuntimeTelemetrySnapshot), String> {
     let source = include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
 
-    let startup_started = Instant::now();
+    let startup_started = MonotonicInstant::now();
     let mut preview = TodoPreview::new(source)?;
     let _ = preview.preview_text();
     let startup_millis = startup_started.elapsed().as_secs_f64() * 1000.0;
@@ -1421,7 +1462,7 @@ pub(crate) fn todo_metrics_capture()
     let mut add_samples = Vec::new();
     for index in 0..24 {
         let title = format!("Bench todo {index}");
-        let started = Instant::now();
+        let started = MonotonicInstant::now();
         let changed =
             preview.apply_fact(FactTarget::MainInput, UiFactKind::DraftText(title.clone()));
         let committed = preview.apply_event(
@@ -1441,7 +1482,7 @@ pub(crate) fn todo_metrics_capture()
             .first()
             .map(|todo| todo.id)
             .expect("todo exists");
-        let started = Instant::now();
+        let started = MonotonicInstant::now();
         assert!(preview.apply_event(
             TodoUiAction::TodoCheckbox(first_id),
             UiEventKind::Click,
@@ -1462,7 +1503,7 @@ pub(crate) fn todo_metrics_capture()
             Filter::Active => TodoUiAction::FilterActive,
             Filter::Completed => TodoUiAction::FilterCompleted,
         };
-        let started = Instant::now();
+        let started = MonotonicInstant::now();
         assert!(preview.apply_event(action, UiEventKind::Click, None));
         let _ = preview.preview_text();
         filter_samples.push(started.elapsed());
@@ -1476,7 +1517,7 @@ pub(crate) fn todo_metrics_capture()
             .map(|todo| todo.id)
             .expect("todo exists");
         let title = format!("Edited todo {index}");
-        let started = Instant::now();
+        let started = MonotonicInstant::now();
         assert!(preview.apply_event(
             TodoUiAction::TodoTitleDoubleClick(todo_id),
             UiEventKind::DoubleClick,
@@ -1530,7 +1571,7 @@ fn todo_edit_key_down_port(todo_id: u64) -> SourcePortId {
 fn todo_fact_cell(target: &FactTarget) -> MirrorCellId {
     match target {
         FactTarget::MainInput => MirrorCellId(1),
-        FactTarget::TodoTitle(todo_id) => MirrorCellId(1_000 + *todo_id as u32),
+        FactTarget::TodoItemRow(todo_id) => MirrorCellId(1_000 + *todo_id as u32),
         FactTarget::TodoEditInput(todo_id) => MirrorCellId(2_000 + *todo_id as u32),
     }
 }
@@ -1538,9 +1579,167 @@ fn todo_fact_cell(target: &FactTarget) -> MirrorCellId {
 fn todo_fact_target(cell: MirrorCellId) -> Option<FactTarget> {
     match cell.0 {
         1 => Some(FactTarget::MainInput),
-        1_000..=1_999 => Some(FactTarget::TodoTitle((cell.0 - 1_000) as u64)),
+        1_000..=1_999 => Some(FactTarget::TodoItemRow((cell.0 - 1_000) as u64)),
         2_000..=2_999 => Some(FactTarget::TodoEditInput((cell.0 - 2_000) as u64)),
         _ => None,
+    }
+}
+
+fn set_style(ops: &mut Vec<RenderOp>, id: NodeId, name: &str, value: &str) {
+    ops.push(RenderOp::SetStyle {
+        id,
+        name: name.to_string(),
+        value: Some(value.to_string()),
+    });
+}
+
+fn apply_todo_shell_styles(ops: &mut Vec<RenderOp>, id: NodeId) {
+    set_style(ops, id, "display", "flex");
+    set_style(ops, id, "justify-content", "center");
+    set_style(ops, id, "width", "100%");
+}
+
+fn apply_todo_root_styles(ops: &mut Vec<RenderOp>, id: NodeId) {
+    set_style(ops, id, "display", "flex");
+    set_style(ops, id, "flex-direction", "column");
+    set_style(ops, id, "gap", "16px");
+    set_style(ops, id, "width", "100%");
+    set_style(ops, id, "max-width", "560px");
+    set_style(ops, id, "padding", "24px 20px 32px");
+    set_style(ops, id, "box-sizing", "border-box");
+}
+
+fn apply_todo_input_row_styles(ops: &mut Vec<RenderOp>, id: NodeId) {
+    set_style(ops, id, "display", "flex");
+    set_style(ops, id, "align-items", "center");
+    set_style(ops, id, "gap", "12px");
+    set_style(ops, id, "padding", "0 12px");
+    set_style(ops, id, "min-height", "56px");
+    set_style(ops, id, "background", "rgba(255, 255, 255, 0.96)");
+    set_style(ops, id, "border", "1px solid rgba(148, 163, 184, 0.35)");
+    set_style(ops, id, "border-radius", "14px");
+    set_style(ops, id, "box-shadow", "0 18px 38px rgba(15, 23, 42, 0.12)");
+}
+
+fn apply_todo_main_input_styles(ops: &mut Vec<RenderOp>, id: NodeId) {
+    set_style(ops, id, "flex", "1 1 auto");
+    set_style(ops, id, "min-width", "0");
+    set_style(ops, id, "padding", "14px 0");
+    set_style(ops, id, "border", "0");
+    set_style(ops, id, "background", "transparent");
+    set_style(ops, id, "font-size", "30px");
+    set_style(ops, id, "line-height", "1.2");
+    set_style(ops, id, "color", "rgb(15, 23, 42)");
+    set_style(ops, id, "outline", "none");
+}
+
+fn apply_todo_list_styles(ops: &mut Vec<RenderOp>, id: NodeId) {
+    set_style(ops, id, "display", "flex");
+    set_style(ops, id, "flex-direction", "column");
+    set_style(ops, id, "background", "rgba(255, 255, 255, 0.96)");
+    set_style(ops, id, "border", "1px solid rgba(148, 163, 184, 0.3)");
+    set_style(ops, id, "border-radius", "14px");
+    set_style(ops, id, "overflow", "hidden");
+    set_style(ops, id, "box-shadow", "0 14px 30px rgba(15, 23, 42, 0.1)");
+}
+
+fn apply_todo_item_row_styles(ops: &mut Vec<RenderOp>, id: NodeId) {
+    set_style(ops, id, "display", "flex");
+    set_style(ops, id, "align-items", "center");
+    set_style(ops, id, "gap", "12px");
+    set_style(ops, id, "min-height", "54px");
+    set_style(ops, id, "padding", "0 12px");
+    set_style(ops, id, "border-top", "1px solid rgba(226, 232, 240, 0.9)");
+}
+
+fn apply_todo_checkbox_styles(ops: &mut Vec<RenderOp>, id: NodeId) {
+    set_style(ops, id, "width", "18px");
+    set_style(ops, id, "height", "18px");
+    set_style(ops, id, "margin", "0");
+    set_style(ops, id, "flex", "0 0 auto");
+}
+
+fn apply_todo_title_styles(ops: &mut Vec<RenderOp>, id: NodeId) {
+    set_style(ops, id, "flex", "1 1 auto");
+    set_style(ops, id, "min-width", "0");
+    set_style(ops, id, "font-size", "26px");
+    set_style(ops, id, "line-height", "1.25");
+    set_style(ops, id, "color", "rgb(15, 23, 42)");
+    set_style(ops, id, "overflow-wrap", "anywhere");
+}
+
+fn apply_todo_edit_input_styles(ops: &mut Vec<RenderOp>, id: NodeId) {
+    set_style(ops, id, "flex", "1 1 auto");
+    set_style(ops, id, "min-width", "0");
+    set_style(ops, id, "padding", "10px 12px");
+    set_style(ops, id, "font-size", "24px");
+    set_style(ops, id, "line-height", "1.25");
+    set_style(ops, id, "border", "1px solid rgba(148, 163, 184, 0.55)");
+    set_style(ops, id, "border-radius", "10px");
+    set_style(ops, id, "background", "rgba(255, 255, 255, 0.98)");
+    set_style(ops, id, "box-sizing", "border-box");
+}
+
+fn apply_todo_delete_button_styles(ops: &mut Vec<RenderOp>, id: NodeId) {
+    set_style(ops, id, "margin-left", "auto");
+    set_style(ops, id, "padding", "0 6px");
+    set_style(ops, id, "border", "0");
+    set_style(ops, id, "background", "transparent");
+    set_style(ops, id, "color", "rgb(199, 92, 92)");
+    set_style(ops, id, "font-size", "28px");
+    set_style(ops, id, "line-height", "1");
+    set_style(ops, id, "cursor", "pointer");
+}
+
+fn apply_todo_footer_styles(ops: &mut Vec<RenderOp>, id: NodeId) {
+    set_style(ops, id, "display", "flex");
+    set_style(ops, id, "align-items", "center");
+    set_style(ops, id, "gap", "10px");
+    set_style(ops, id, "flex-wrap", "wrap");
+    set_style(ops, id, "padding", "14px 16px");
+    set_style(ops, id, "background", "rgba(255, 255, 255, 0.92)");
+    set_style(ops, id, "border", "1px solid rgba(148, 163, 184, 0.25)");
+    set_style(ops, id, "border-radius", "12px");
+}
+
+fn apply_todo_filter_button_styles(ops: &mut Vec<RenderOp>, id: NodeId, selected: bool) {
+    set_style(ops, id, "padding", "4px 10px");
+    set_style(ops, id, "border", "1px solid rgba(148, 163, 184, 0.25)");
+    set_style(ops, id, "border-radius", "999px");
+    set_style(ops, id, "background", "transparent");
+    set_style(ops, id, "color", "rgb(51, 65, 85)");
+    set_style(ops, id, "cursor", "pointer");
+    if selected {
+        set_style(ops, id, "background", "rgba(199, 92, 92, 0.08)");
+    }
+}
+
+fn apply_todo_clear_button_styles(ops: &mut Vec<RenderOp>, id: NodeId) {
+    set_style(ops, id, "margin-left", "auto");
+    set_style(ops, id, "padding", "4px 0");
+    set_style(ops, id, "border", "0");
+    set_style(ops, id, "background", "transparent");
+    set_style(ops, id, "color", "rgb(71, 85, 105)");
+    set_style(ops, id, "cursor", "pointer");
+}
+
+fn apply_todo_footer_texts_styles(
+    root_id: NodeId,
+    help_id: NodeId,
+    created_by_id: NodeId,
+    author_id: NodeId,
+    ops: &mut Vec<RenderOp>,
+) {
+    set_style(ops, root_id, "display", "flex");
+    set_style(ops, root_id, "flex-direction", "column");
+    set_style(ops, root_id, "align-items", "center");
+    set_style(ops, root_id, "gap", "6px");
+    set_style(ops, root_id, "padding", "6px 0 0");
+    for node_id in [help_id, created_by_id, author_id] {
+        set_style(ops, node_id, "margin", "0");
+        set_style(ops, node_id, "color", "rgba(226, 232, 240, 0.88)");
+        set_style(ops, node_id, "font-size", "14px");
+        set_style(ops, node_id, "line-height", "1.35");
     }
 }
 
@@ -1720,7 +1919,7 @@ mod tests {
     fn todo_preview_hover_reveals_delete_button() {
         let source = include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
         let mut preview = TodoPreview::new(source).expect("todo preview");
-        preview.apply_fact(FactTarget::TodoTitle(1), UiFactKind::Hovered(true));
+        preview.apply_fact(FactTarget::TodoItemRow(1), UiFactKind::Hovered(true));
         assert!(preview.preview_text().contains("×"));
     }
 
@@ -1728,7 +1927,7 @@ mod tests {
     fn todo_preview_double_click_clears_hovered_delete_button() {
         let source = include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
         let mut preview = TodoPreview::new(source).expect("todo preview");
-        preview.apply_fact(FactTarget::TodoTitle(1), UiFactKind::Hovered(true));
+        preview.apply_fact(FactTarget::TodoItemRow(1), UiFactKind::Hovered(true));
         assert!(preview.preview_text().contains("×"));
 
         preview.apply_event(
@@ -2103,7 +2302,7 @@ mod tests {
                 8 if !oracle.todos.is_empty() => {
                     let index = rng.next_range(oracle.todos.len() as u32) as usize;
                     let todo_id = oracle.todos[index].id;
-                    preview.apply_fact(FactTarget::TodoTitle(todo_id), UiFactKind::Hovered(true));
+                    preview.apply_fact(FactTarget::TodoItemRow(todo_id), UiFactKind::Hovered(true));
                     preview.apply_event(
                         TodoUiAction::TodoDelete(todo_id),
                         UiEventKind::Click,

@@ -1,4 +1,5 @@
 use crate::bridge::HostSnapshot;
+use crate::clock::MonotonicInstant;
 use crate::host_view_preview::HostViewPreviewApp;
 use crate::ids::ActorId;
 use crate::ir_executor::IrExecutor;
@@ -9,14 +10,10 @@ use crate::runtime::ActorKind;
 use crate::runtime::RuntimeTelemetrySnapshot;
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
-use boon_renderer_zoon::{
-    FakeRenderState, RenderInteractionHandlers, render_snapshot_root_with_handlers,
-};
+use boon_renderer_zoon::{FakeRenderState, RenderInteractionHandlers, render_retained_snapshot_signal};
 use boon_scene::{RenderRoot, UiEventBatch, UiEventKind, UiFactBatch, UiNode};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Instant;
-
 pub struct CounterPreview {
     runtime: PreviewRuntime,
     button_actor: ActorId,
@@ -113,14 +110,14 @@ pub(crate) fn counter_metrics_capture()
 -> Result<(CounterMetricsReport, RuntimeTelemetrySnapshot), String> {
     let source = include_str!("../../../playground/frontend/src/examples/counter/counter.bn");
 
-    let startup_started = Instant::now();
+    let startup_started = MonotonicInstant::now();
     let mut preview = CounterPreview::new(source)?;
     let _ = preview.preview_text();
     let startup_millis = startup_started.elapsed().as_secs_f64() * 1000.0;
 
     let mut press_samples = Vec::new();
     for _ in 0..64 {
-        let started = Instant::now();
+        let started = MonotonicInstant::now();
         preview.click_increment();
         let _ = preview.preview_text();
         press_samples.push(started.elapsed());
@@ -141,29 +138,25 @@ pub fn counter_metrics_snapshot() -> Result<CounterMetricsReport, String> {
 
 pub fn render_counter_preview(preview: CounterPreview) -> impl Element {
     let preview = Rc::new(RefCell::new(preview));
-    let version = Mutable::new(0u64);
+    let snapshot = Mutable::new({
+        let (root, state) = preview.borrow_mut().render_snapshot();
+        (RenderRoot::UiTree(root), state)
+    });
 
     let handlers = RenderInteractionHandlers::new(
         {
             let preview = preview.clone();
-            let version = version.clone();
+            let snapshot = snapshot.clone();
             move |batch: UiEventBatch| {
                 preview.borrow_mut().dispatch_ui_events(batch);
-                version.update(|value| value + 1);
+                let (root, state) = preview.borrow_mut().render_snapshot();
+                snapshot.set((RenderRoot::UiTree(root), state));
             }
         },
         move |_facts: UiFactBatch| {},
     );
 
-    El::new().child_signal(version.signal().map({
-        let preview = preview.clone();
-        let handlers = handlers.clone();
-        move |_| {
-            let (root, state) = preview.borrow_mut().render_snapshot();
-            let root = RenderRoot::UiTree(root);
-            Some(render_snapshot_root_with_handlers(&root, &state, &handlers))
-        }
-    }))
+    render_retained_snapshot_signal(snapshot.signal_cloned(), handlers)
 }
 
 #[cfg(test)]

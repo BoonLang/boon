@@ -3205,7 +3205,7 @@ pub fn try_lower_temperature_converter(
                 source: NodeId(1812),
                 arms: vec![crate::ir::MatchArm {
                     matcher: KernelValue::Tag("NaN".to_string()),
-                    result: NodeId(1803),
+                    result: NodeId(1800),
                 }],
                 fallback: NodeId(1820),
             },
@@ -3267,7 +3267,7 @@ pub fn try_lower_temperature_converter(
                 source: NodeId(1823),
                 arms: vec![crate::ir::MatchArm {
                     matcher: KernelValue::Tag("NaN".to_string()),
-                    result: NodeId(1804),
+                    result: NodeId(1800),
                 }],
                 fallback: NodeId(1827),
             },

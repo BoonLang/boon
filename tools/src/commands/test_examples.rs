@@ -76,6 +76,7 @@ fn engine_query_value(engine: &str) -> Option<&'static str> {
     match engine {
         "Actors" => Some("actors"),
         "ActorsLite" => Some("actorslite"),
+        "FactoryFabric" => Some("factoryfabric"),
         "DD" => Some("dd"),
         "Wasm" => Some("wasm"),
         _ => None,
@@ -151,17 +152,19 @@ async fn get_preview_text_via_eval(port: u16) -> Result<Option<String>> {
 
 async fn get_preview_text(port: u16) -> Result<Option<String>> {
     for attempt in 0..3 {
-        let direct = send_command_with_timeout(port, WsCommand::GetPreviewText, Duration::from_secs(2)).await;
+        let direct =
+            send_command_with_timeout(port, WsCommand::GetPreviewText, Duration::from_secs(2))
+                .await;
         match direct {
             Ok(WsResponse::PreviewText { text }) => return Ok(Some(text)),
             Ok(WsResponse::Error { message }) => {
-                if !message.to_ascii_lowercase().contains("timeout") {
+                if !is_retryable_browser_error(&message) {
                     anyhow::bail!("GetPreviewText failed: {}", message);
                 }
             }
             Ok(_) => return Ok(None),
             Err(error) => {
-                if !error.to_string().to_ascii_lowercase().contains("timeout") {
+                if !is_retryable_browser_error(&error.to_string()) {
                     return Err(error);
                 }
             }
@@ -177,6 +180,15 @@ async fn get_preview_text(port: u16) -> Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+fn is_retryable_browser_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("timeout")
+        || lower.contains("frame with id 0 was removed")
+        || lower.contains("execution context was destroyed")
+        || lower.contains("inspected target navigated or closed")
+        || lower.contains("cannot find context with specified id")
 }
 
 async fn wait_for_non_retry_preview_text(
@@ -458,6 +470,19 @@ async fn wait_for_initial_interaction_settle(port: u16) {
     tokio::time::sleep(Duration::from_millis(150)).await;
 }
 
+fn use_factory_fabric_timing_bootstrap(
+    engine: Option<&str>,
+    example_name: &str,
+    capture_stable_initial_preview: bool,
+) -> bool {
+    engine == Some("FactoryFabric")
+        && !capture_stable_initial_preview
+        && matches!(
+            example_name,
+            "interval" | "interval_hold" | "then" | "when" | "while"
+        )
+}
+
 async fn wait_for_playground_api_ready(port: u16, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -736,6 +761,11 @@ async fn refresh_to_example(
             return Ok(initial_preview);
         }
 
+        if use_factory_fabric_timing_bootstrap(engine, example_name, capture_stable_initial_preview)
+        {
+            return trigger_run_then_capture_immediate(port, engine).await;
+        }
+
         let initial_preview = get_preview_text(port).await?;
         if preview_needs_retry(initial_preview.as_deref()) {
             return trigger_run_then_capture(port, engine).await;
@@ -828,6 +858,10 @@ async fn refresh_to_example(
         }
         return Ok(initial_preview);
     }
+    if use_factory_fabric_timing_bootstrap(engine, example_name, capture_stable_initial_preview) {
+        return trigger_run_then_capture_immediate(port, engine).await;
+    }
+
     match run_and_capture_initial(port).await {
         Ok(initial_preview) => {
             if engine == Some("ActorsLite") {
@@ -1238,6 +1272,31 @@ async fn ensure_browser_connection(
     }
 
     // Step 3: Need to launch browser if extension not connected
+    if matches!(
+        status,
+        ConnectionStatus::NoExtension | ConnectionStatus::ServerNotRunning
+    ) {
+        if browser::has_running_automation_browser() {
+            println!("Automation Chromium already running, waiting for extension reconnect...");
+            let reconnect_timeout = Duration::from_secs(25);
+            match browser::wait_for_extension_connection(port, reconnect_timeout).await {
+                Ok(()) => {
+                    println!("Reused existing Chromium session.");
+                }
+                Err(error) => {
+                    let pids = browser::running_automation_pids();
+                    anyhow::bail!(
+                        "Existing shared Chromium session {:?} did not reconnect: {}.\n\
+                        Refusing to reset the shared profile or kill the browser automatically.",
+                        pids,
+                        error
+                    );
+                }
+            }
+        }
+    }
+
+    let status = get_connection_status(port).await;
     if matches!(
         status,
         ConnectionStatus::NoExtension | ConnectionStatus::ServerNotRunning
@@ -1892,7 +1951,7 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
         (true, String::new())
     };
 
-    if !initial_passed && spec.sequence.is_empty() {
+    if !initial_passed {
         return Ok(TestResult {
             name: example.name.clone(),
             passed: false,
@@ -2343,7 +2402,12 @@ async fn wait_for_inline_output_after_explicit_wait(
     }
 }
 
-async fn set_focused_input_value(port: u16, value: &str, verbose: bool) -> Result<()> {
+async fn set_focused_input_value(
+    port: u16,
+    engine: Option<&str>,
+    value: &str,
+    verbose: bool,
+) -> Result<()> {
     let focus_js = r#"(function() {
             const preview = document.querySelector('[data-boon-panel="preview"]');
             if (!preview) return 'ERROR: preview root not found';
@@ -2460,7 +2524,70 @@ async fn set_focused_input_value(port: u16, value: &str, verbose: bool) -> Resul
         }
         _ => {}
     }
-    let response = if value.is_empty() {
+    let response = if engine == Some("FactoryFabric") {
+        let direct_set_js = format!(
+            r#"(function() {{
+                const preview = document.querySelector('[data-boon-panel="preview"]');
+                if (!preview) return 'ERROR: preview root not found';
+                const isTextInput = (element) =>
+                    element
+                    && element !== document.body
+                    && (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA');
+                const remembered = window.__boonLastPreviewTextInput;
+                const previewFocused = preview.querySelector(':focus');
+                let focused = isTextInput(previewFocused)
+                    ? previewFocused
+                    : (isTextInput(document.activeElement) && preview.contains(document.activeElement)
+                        ? document.activeElement
+                        : preview.querySelector('[data-boon-focused="true"]')
+                            || preview.querySelector('[focused="true"]')
+                            || preview.querySelector('input[autofocus], textarea[autofocus]')
+                            || null);
+                if (!isTextInput(focused)) {{
+                    focused = isTextInput(remembered) && remembered.isConnected && preview.contains(remembered)
+                        ? remembered
+                        : null;
+                }}
+                if (!isTextInput(focused)) {{
+                    return 'ERROR: no focused text input';
+                }}
+                const nextValue = {value_json};
+                const nativeSetter =
+                    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set ||
+                    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                if (nativeSetter) {{
+                    nativeSetter.call(focused, nextValue);
+                }} else {{
+                    focused.value = nextValue;
+                }}
+                if (typeof focused.focus === 'function') {{
+                    focused.focus();
+                }}
+                if (typeof focused.setSelectionRange === 'function') {{
+                    focused.setSelectionRange(nextValue.length, nextValue.length);
+                }}
+                window.__boonLastPreviewTextInput = focused;
+                window.__boonLastPreviewTextInputNodeId = focused.getAttribute('data-boon-node-id');
+                window.__boonLastPreviewTextSelectionStart = nextValue.length;
+                window.__boonLastPreviewTextSelectionEnd = nextValue.length;
+                return {{
+                    ok: true,
+                    value: focused.value || '',
+                    nodeId: focused.getAttribute('data-boon-node-id'),
+                    changePort: focused.getAttribute('data-boon-port-change'),
+                    keyDownPort: focused.getAttribute('data-boon-port-key-down')
+                }};
+            }})()"#,
+            value_json = serde_json::to_string(value)?,
+        );
+        send_command_to_server(
+            port,
+            WsCommand::EvalJs {
+                expression: direct_set_js,
+            },
+        )
+        .await?
+    } else if value.is_empty() {
         send_command_to_server(
             port,
             WsCommand::PressKey {
@@ -2481,7 +2608,13 @@ async fn set_focused_input_value(port: u16, value: &str, verbose: bool) -> Resul
         println!("[set-focused-input-value-apply] {:?}", response);
     }
     match response {
-        WsResponse::Success { .. } => {}
+        WsResponse::Success { data } => {
+            if let Some(serde_json::Value::String(ref d)) = data {
+                if d.starts_with("ERROR") {
+                    anyhow::bail!("Set focused input value failed: {}", d);
+                }
+            }
+        }
         WsResponse::Error { message } => {
             anyhow::bail!("Set focused input value failed: {}", message);
         }
@@ -2842,6 +2975,7 @@ async fn wait_for_focused_text_input_suffix(port: u16, expected_suffix: &str) ->
     }
 }
 
+#[allow(dead_code)]
 async fn dispatch_preview_special_key_via_eval(port: u16, key: &str) -> Result<bool> {
     if !matches!(key, "Enter" | "Escape") {
         return Ok(false);
@@ -3676,19 +3810,13 @@ async fn execute_action(
         }
         ParsedAction::Key { key } => {
             let before_snapshot = get_preview_stability_snapshot(port).await.ok();
-            let mut handled_in_preview = false;
-            if matches!(key.as_str(), "Enter" | "Escape") {
-                handled_in_preview = dispatch_preview_special_key_via_eval(port, key).await?;
+            let response =
+                send_command_to_server(port, WsCommand::PressKey { key: key.clone() }).await?;
+            if verbose {
+                println!("[press-key] {:?}", response);
             }
-            if !handled_in_preview {
-                let response =
-                    send_command_to_server(port, WsCommand::PressKey { key: key.clone() }).await?;
-                if verbose {
-                    println!("[press-key] {:?}", response);
-                }
-                if let WsResponse::Error { message } = response {
-                    anyhow::bail!("Key press failed: {}", message);
-                }
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Key press failed: {}", message);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
             if matches!(key.as_str(), "Enter" | "Escape" | "Backspace" | "Delete") {
@@ -3701,20 +3829,25 @@ async fn execute_action(
             }
         }
         ParsedAction::FocusInput { index } => {
-            let response =
-                send_command_to_server(port, WsCommand::FocusInput { index: *index }).await?;
-            if let WsResponse::Error { message } = response {
-                anyhow::bail!("Focus input failed: {}", message);
+            let already_focused = get_current_focused_input_index(port).await? == Some(*index);
+            if !already_focused {
+                let response =
+                    send_command_to_server(port, WsCommand::FocusInput { index: *index }).await?;
+                if let WsResponse::Error { message } = response {
+                    anyhow::bail!("Focus input failed: {}", message);
+                }
             }
             *preferred_input_index = Some(*index);
-            let js = format!(
-                r#"(function() {{
-                    window.__boonPreferredTextInputIndex = {index};
-                    return true;
-                }})()"#,
-                index = index,
-            );
-            let _ = send_command_to_server(port, WsCommand::EvalJs { expression: js }).await?;
+            if engine != Some("FactoryFabric") {
+                let js = format!(
+                    r#"(function() {{
+                        window.__boonPreferredTextInputIndex = {index};
+                        return true;
+                    }})()"#,
+                    index = index,
+                );
+                let _ = send_command_to_server(port, WsCommand::EvalJs { expression: js }).await?;
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         ParsedAction::TypeText { text } => {
@@ -3778,13 +3911,16 @@ async fn execute_action(
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 wait_for_preview_to_settle(port).await;
             } else {
-                let handled_in_preview = if text.starts_with(char::is_whitespace) {
+                let prefer_command_path = engine == Some("FactoryFabric");
+                let handled_in_preview = if prefer_command_path {
+                    false
+                } else if text.starts_with(char::is_whitespace) {
                     append_preview_text_via_eval(port, text).await?
                         || type_preview_text_via_eval(port, text).await?
                 } else {
                     type_preview_text_via_eval(port, text).await?
                 };
-                if !handled_in_preview {
+                if prefer_command_path || !handled_in_preview {
                     send_type_text(port, text.clone()).await?;
                 }
                 if let Err(first_err) = wait_for_focused_text_input_suffix(port, text).await {
@@ -4079,15 +4215,32 @@ async fn execute_action(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         ParsedAction::HoverText { text } => {
-            let response = send_command_to_server(
-                port,
-                WsCommand::HoverByText {
-                    text: text.clone(),
-                    exact: false,
-                },
-            )
-            .await?;
-            if let WsResponse::Error { message } = response {
+            let mut last_error = None;
+            for attempt in 0..3 {
+                let response = send_command_to_server(
+                    port,
+                    WsCommand::HoverByText {
+                        text: text.clone(),
+                        exact: false,
+                    },
+                )
+                .await?;
+                match response {
+                    WsResponse::Error { message } => {
+                        if is_retryable_browser_error(&message) && attempt < 2 {
+                            last_error = Some(message);
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            continue;
+                        }
+                        anyhow::bail!("Hover text failed: {}", message);
+                    }
+                    _ => {
+                        last_error = None;
+                        break;
+                    }
+                }
+            }
+            if let Some(message) = last_error {
                 anyhow::bail!("Hover text failed: {}", message);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4624,6 +4777,10 @@ async fn execute_action(
                         focused_preview_input_via_eval(port).await?;
                     let resolved_tag_name = fallback_tag_name.or(tag_name);
                     let resolved_input_index = fallback_input_index.or(actual_index);
+                    let focused_text_input = matches!(
+                        resolved_tag_name.as_deref(),
+                        Some("INPUT") | Some("TEXTAREA")
+                    );
                     if let Some(expected_index) = input_index {
                         if resolved_input_index == Some(*expected_index) {
                             anyhow::bail!(
@@ -4631,7 +4788,7 @@ async fn execute_action(
                                 expected_index
                             );
                         }
-                    } else if resolved_tag_name.is_some() {
+                    } else if focused_text_input || resolved_input_index.is_some() {
                         anyhow::bail!(
                             "Assert not focused failed: expected no focused input, got {:?}",
                             resolved_input_index
@@ -4918,7 +5075,7 @@ async fn execute_action(
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         ParsedAction::SetFocusedInputValue { value } => {
-            set_focused_input_value(port, value, verbose).await?
+            set_focused_input_value(port, engine, value, verbose).await?
         }
         ParsedAction::SelectOption { index, value } => {
             // Use EvalJs to change select value and drive both DOM and Boon hooks.

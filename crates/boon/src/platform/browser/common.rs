@@ -9,6 +9,8 @@ pub enum EngineType {
     Actors,
     /// Virtual-actor runtime with renderer-agnostic retained bridge
     ActorsLite,
+    /// Deterministic factory-style runtime experiment
+    FactoryFabric,
     /// Differential Dataflow engine (pull-based, incremental computation)
     DifferentialDataflow,
     /// Compiled WASM engine with renderer-agnostic diff output
@@ -21,6 +23,7 @@ impl EngineType {
         match self {
             Self::Actors => "Actors",
             Self::ActorsLite => "ActorsLite",
+            Self::FactoryFabric => "FactoryFabric",
             Self::DifferentialDataflow => "DD",
             Self::Wasm => "Wasm",
         }
@@ -31,6 +34,7 @@ impl EngineType {
         match self {
             Self::Actors => "Actors",
             Self::ActorsLite => "ActorsLite",
+            Self::FactoryFabric => "Fabric (Exp)",
             Self::DifferentialDataflow => "DD",
             Self::Wasm => "Wasm",
         }
@@ -41,6 +45,7 @@ impl EngineType {
         match self {
             Self::Actors => "Actor-based reactive streams",
             Self::ActorsLite => "Virtual actors with retained bridge",
+            Self::FactoryFabric => "FactoryFabric",
             Self::DifferentialDataflow => "Differential Dataflow",
             Self::Wasm => "Compiled WASM",
         }
@@ -51,6 +56,7 @@ impl EngineType {
         match self {
             Self::Actors => "Reactive actor subscriptions (mixed push/pull)",
             Self::ActorsLite => "Virtual-actor runtime with retained/keyed host bridge",
+            Self::FactoryFabric => "Deterministic factory-style runtime with retained diff bridge",
             Self::DifferentialDataflow => {
                 "Incremental computation based on the Differential Dataflow library"
             }

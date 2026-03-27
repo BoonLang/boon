@@ -2,6 +2,9 @@ use anyhow::{bail, Context, Result};
 use boon_engine_actors_lite::{
     ActorsLiteMetricsComparison, ActorsLiteMetricsReport, actors_lite_metrics_snapshot,
 };
+use boon_engine_factory_fabric::{
+    FactoryFabricMetricsComparison, FactoryFabricMetricsReport, factory_fabric_metrics_snapshot,
+};
 use boon_engine_wasm::{
     cells_backend_metrics_snapshot, CellsBackendComparison, CellsBackendMetricsReport,
 };
@@ -369,4 +372,88 @@ pub fn run_actors_lite_metrics_capture(
         .context("failed to compute ActorsLite metrics")?;
     let comparison = ActorsLiteMetricsComparison::from_report(&report);
     Ok((report, comparison))
+}
+
+pub fn run_factory_fabric_metrics(json: bool, check: bool) -> Result<()> {
+    let report: FactoryFabricMetricsReport = factory_fabric_metrics_snapshot()
+        .map_err(anyhow::Error::msg)
+        .context("failed to compute FactoryFabric metrics")?;
+    let comparison = FactoryFabricMetricsComparison::from_report(&report);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "report": &report,
+                "comparison": &comparison,
+            }))?
+        );
+    } else {
+        println!("FactoryFabric Metrics");
+        println!(
+            "  RuntimeCore: region creation p50 {:.3} ms, host batch p50 {:.3} ms, throughput {:.1} msg/s",
+            report.runtime_core.region_creation_latency.p50_ms,
+            report.runtime_core.host_batch_processing.p50_ms,
+            report.runtime_core.messages_per_second
+        );
+        println!(
+            "    cross-region wakes max: {}, bus writes max: {}, machine tasks max: {}, conveyor ops max: {}",
+            report.runtime_core.cross_region_wake_count_per_host_event_max,
+            report.runtime_core.bus_writes_per_host_event_max,
+            report.runtime_core.machine_task_count_per_host_event_max,
+            report.runtime_core.conveyor_ops_per_host_event_max
+        );
+        println!(
+            "  Counter: startup {:.3} ms, press-to-paint p50 {:.3} ms, p95 {:.3} ms",
+            report.counter.startup_millis,
+            report.counter.press_to_paint.p50_ms,
+            report.counter.press_to_paint.p95_ms
+        );
+        println!(
+            "  TodoMVC: startup {:.3} ms, add/toggle/filter/edit p50 {:.3}/{:.3}/{:.3}/{:.3} ms",
+            report.todo_mvc.startup_millis,
+            report.todo_mvc.add_to_paint.p50_ms,
+            report.todo_mvc.toggle_to_paint.p50_ms,
+            report.todo_mvc.filter_to_paint.p50_ms,
+            report.todo_mvc.edit_to_paint.p50_ms
+        );
+        println!(
+            "  Cells: cold mount {:.3} ms, steady-state edit p50 {:.3} ms, p95 {:.3} ms",
+            report.cells.cold_mount_to_stable_first_paint_millis,
+            report.cells.steady_state_single_cell_edit_to_paint.p50_ms,
+            report.cells.steady_state_single_cell_edit_to_paint.p95_ms
+        );
+        println!(
+            "    retained creates/deletes max: {}/{}, dirty count max: {}, function-instance reuse min: {:.3}, recreated mapped scopes max: {}",
+            report.cells.retained_node_creations_per_edit_max,
+            report.cells.retained_node_deletions_per_edit_max,
+            report.cells.dirty_sink_or_export_count_per_edit_max,
+            report.cells.function_instance_reuse_hit_rate_min,
+            report.cells.recreated_mapped_scope_count_max
+        );
+        println!(
+            "  Cells Dynamic: cold mount {:.3} ms, steady-state edit p50 {:.3} ms, p95 {:.3} ms",
+            report.cells_dynamic.cold_mount_to_stable_first_paint_millis,
+            report.cells_dynamic.steady_state_single_cell_edit_to_paint.p50_ms,
+            report.cells_dynamic.steady_state_single_cell_edit_to_paint.p95_ms
+        );
+        println!(
+            "    retained creates/deletes max: {}/{}, dirty count max: {}, function-instance reuse min: {:.3}, recreated mapped scopes max: {}",
+            report.cells_dynamic.retained_node_creations_per_edit_max,
+            report.cells_dynamic.retained_node_deletions_per_edit_max,
+            report.cells_dynamic.dirty_sink_or_export_count_per_edit_max,
+            report.cells_dynamic.function_instance_reuse_hit_rate_min,
+            report.cells_dynamic.recreated_mapped_scope_count_max
+        );
+        println!("  Supported examples: {}", report.supported_examples.join(", "));
+    }
+
+    if check && !comparison.all_pass() {
+        bail!(
+            "FactoryFabric budget gate failed:\n{}",
+            serde_json::to_string_pretty(&comparison)?
+        );
+    }
+
+    Ok(())
 }

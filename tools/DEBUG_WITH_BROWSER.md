@@ -304,9 +304,17 @@ And still uses executeScript for:
 ## Troubleshooting
 
 ### Extension Not Connecting
-1. Check if WebSocket server is running: `ps aux | grep boon-tools`
-2. Check Chrome extension page for errors: `chrome://extensions/`
-3. Reload extension and refresh playground page
+Check these in order before debugging extension code:
+1. Check that Chromium is actually running with the shared `tools/.chrome-profile`
+2. Check if the WebSocket server is running: `ps aux | grep boon-tools`
+3. Check whether the current example wedged the browser tab or playground page
+4. Check `chrome://extensions/` and verify Developer mode is still enabled
+5. Only then inspect extension errors, reload the extension, or debug `tools/extension/background.js`
+
+Important:
+- The shared browser profile is used for both manual and automation workflows
+- Do not reset, scrub, or recreate that shared profile as a recovery step
+- If Developer mode was turned off because the shared profile was disturbed, fix that first; the extension code is usually not the root cause
 
 ### Server Logs
 The WebSocket server prints connection status:
@@ -369,9 +377,9 @@ cd playground && makers kill && makers mzoon start
 | Error | Solution |
 |-------|----------|
 | "Another debugger is already attached" | `boon-tools exec detach` then retry |
-| "No extension connected" | Refresh browser tab at localhost:8083 |
+| "No extension connected" | First verify browser running, WebSocket server running, example not wedged, and Developer mode still enabled |
 | Extension stops responding | `boon-tools exec refresh` (NOT reload) |
-| Complete failure | Kill Chromium: `pkill -f boon-chromium`, then relaunch |
+| Complete failure | Re-check the four items above before touching extension code or restarting anything |
 
 ### Ideal single-browser workflow:
 

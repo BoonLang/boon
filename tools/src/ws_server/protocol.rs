@@ -40,6 +40,12 @@ pub enum Command {
     /// Get persisted ActorsLite browser debug breadcrumb
     GetActorsLiteDebug,
 
+    /// Get the generic engine runtime status from the page API
+    GetEngineStatus,
+
+    /// Get the generic engine runtime debug snapshot from the page API
+    GetEngineDebug,
+
     /// Check if extension is connected and ready
     Ping,
 
@@ -204,7 +210,7 @@ pub enum Command {
 
     /// Set the engine type and trigger re-run
     SetEngine {
-        /// Engine name: "Actors", "ActorsLite", "DD", or "Wasm"
+        /// Engine name: "Actors", "ActorsLite", "FactoryFabric", "DD", or "Wasm"
         engine: String,
     },
 
@@ -264,6 +270,15 @@ pub enum Response {
     ActorsLiteDebug {
         #[serde(skip_serializing_if = "Option::is_none")]
         value: Option<String>,
+    },
+
+    /// Generic engine status snapshot
+    EngineStatus { status: serde_json::Value },
+
+    /// Generic engine debug snapshot
+    EngineDebug {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        debug: Option<serde_json::Value>,
     },
 
     /// Pong response
@@ -367,7 +382,7 @@ pub enum Response {
 
     /// Engine info response
     EngineInfo {
-        /// Current engine: "Actors", "ActorsLite", "DD", or "Wasm"
+        /// Current engine: "Actors", "ActorsLite", "FactoryFabric", "DD", or "Wasm"
         engine: String,
         /// Human-facing label for the current engine
         #[serde(default, skip_serializing_if = "Option::is_none")]

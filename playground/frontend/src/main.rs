@@ -38,6 +38,9 @@ use boon_engine_actors_lite::{
     actors_lite_public_exposure_enabled, is_public_playground_example, run_actors_lite,
 };
 
+#[cfg(feature = "engine-factory-fabric")]
+use boon_engine_factory_fabric::run_factory_fabric;
+
 #[cfg(not(feature = "engine-actors-lite"))]
 fn is_public_playground_example(_name: &str) -> bool {
     false
@@ -64,6 +67,7 @@ fn is_engine_available(engine: EngineType) -> bool {
         EngineType::ActorsLite => {
             cfg!(feature = "engine-actors-lite") && actors_lite_public_exposure_enabled()
         }
+        EngineType::FactoryFabric => cfg!(feature = "engine-factory-fabric"),
         EngineType::DifferentialDataflow => cfg!(feature = "engine-dd"),
         EngineType::Wasm => cfg!(feature = "engine-wasm"),
     }
@@ -77,6 +81,8 @@ fn available_engines() -> Vec<EngineType> {
     if actors_lite_public_exposure_enabled() {
         engines.push(EngineType::ActorsLite);
     }
+    #[cfg(feature = "engine-factory-fabric")]
+    engines.push(EngineType::FactoryFabric);
     #[cfg(feature = "engine-dd")]
     engines.push(EngineType::DifferentialDataflow);
     #[cfg(feature = "engine-wasm")]
@@ -106,7 +112,10 @@ fn resolve_engine_for_current_build(engine: EngineType) -> Option<EngineType> {
 
     match engine {
         EngineType::Wasm => preferred_wasm_engine(),
-        EngineType::Actors | EngineType::ActorsLite | EngineType::DifferentialDataflow => None,
+        EngineType::Actors
+        | EngineType::ActorsLite
+        | EngineType::FactoryFabric
+        | EngineType::DifferentialDataflow => None,
     }
 }
 
@@ -131,7 +140,60 @@ fn clear_all_compiled_engine_persisted_states() {
 }
 
 fn engine_supports_persistence(engine: EngineType) -> bool {
-    !matches!(engine, EngineType::ActorsLite)
+    !matches!(engine, EngineType::ActorsLite | EngineType::FactoryFabric)
+}
+
+fn default_engine_status(engine: EngineType) -> JsValue {
+    let result = js_sys::Object::new();
+    js_sys::Reflect::set(&result, &"engine".into(), &engine.short_name().into()).ok();
+    js_sys::Reflect::set(&result, &"supported".into(), &true.into()).ok();
+    js_sys::Reflect::set(&result, &"quiescent".into(), &true.into()).ok();
+    js_sys::Reflect::set(&result, &"last_flush_id".into(), &0.into()).ok();
+    result.into()
+}
+
+fn set_page_engine_status_snapshot(engine: EngineType, supported: bool, last_flush_id: u64) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let result = js_sys::Object::new();
+    js_sys::Reflect::set(&result, &"engine".into(), &engine.short_name().into()).ok();
+    js_sys::Reflect::set(&result, &"supported".into(), &supported.into()).ok();
+    js_sys::Reflect::set(&result, &"quiescent".into(), &true.into()).ok();
+    js_sys::Reflect::set(
+        &result,
+        &"last_flush_id".into(),
+        &JsValue::from_f64(last_flush_id as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(&window, &"__boonEngineStatus".into(), &result).ok();
+}
+
+fn clear_page_engine_debug_snapshot() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    js_sys::Reflect::set(&window, &"__boonEngineDebug".into(), &JsValue::NULL).ok();
+}
+
+fn page_engine_status_snapshot(engine: EngineType) -> JsValue {
+    let Some(window) = web_sys::window() else {
+        return default_engine_status(engine);
+    };
+    js_sys::Reflect::get(&window, &"__boonEngineStatus".into())
+        .ok()
+        .filter(|value| !value.is_null() && !value.is_undefined())
+        .unwrap_or_else(|| default_engine_status(engine))
+}
+
+fn page_engine_debug_snapshot() -> JsValue {
+    let Some(window) = web_sys::window() else {
+        return JsValue::NULL;
+    };
+    js_sys::Reflect::get(&window, &"__boonEngineDebug".into())
+        .ok()
+        .filter(|value| !value.is_undefined())
+        .unwrap_or(JsValue::NULL)
 }
 
 mod code_editor;
@@ -144,6 +206,7 @@ static OLD_SOURCE_CODE_STORAGE_KEY: &str = "boon-playground-old-source-code";
 static OLD_SPAN_ID_PAIRS_STORAGE_KEY: &str = "boon-playground-span-id-pairs";
 static STATES_STORAGE_KEY: &str = "boon-playground-states";
 static PANEL_SPLIT_STORAGE_KEY: &str = "boon-playground-panel-split";
+static OTHER_COLLAPSED_STORAGE_KEY: &str = "boon-playground-other-collapsed";
 static DEBUG_COLLAPSED_STORAGE_KEY: &str = "boon-playground-debug-collapsed";
 static CUSTOM_EXAMPLES_STORAGE_KEY: &str = "boon-playground-custom-examples";
 static FORCED_PREVIEW_SIZE_STORAGE_KEY: &str = "boon-playground-forced-preview-size";
@@ -179,8 +242,8 @@ fn clear_prefixed_storage_keys(prefixes: &[&str]) {
     }
 }
 
-// Number of main examples (rest are debug examples)
-const MAIN_EXAMPLES_COUNT: usize = 25;
+const MAIN_EXAMPLES_COUNT: usize = 12;
+const DEBUG_EXAMPLES_COUNT: usize = 13;
 
 const DEFAULT_PANEL_SPLIT_RATIO: f64 = 0.5;
 const MIN_PANEL_RATIO: f64 = 0.1;
@@ -244,6 +307,7 @@ fn engine_query_value(engine: EngineType) -> &'static str {
     match engine {
         EngineType::Actors => "actors",
         EngineType::ActorsLite => "actorslite",
+        EngineType::FactoryFabric => "factoryfabric",
         EngineType::DifferentialDataflow => "dd",
         EngineType::Wasm => "wasm",
     }
@@ -344,6 +408,7 @@ fn get_engine_from_url() -> Option<EngineType> {
     match params.get("engine").as_deref() {
         Some("actors") => Some(EngineType::Actors),
         Some("actorslite") => Some(EngineType::ActorsLite),
+        Some("factoryfabric") => Some(EngineType::FactoryFabric),
         Some("dd") => Some(EngineType::DifferentialDataflow),
         Some("wasm") => Some(EngineType::Wasm),
         _ => None,
@@ -358,6 +423,7 @@ fn load_engine_from_storage() -> Option<EngineType> {
     match stored.as_str() {
         "Actors" => Some(EngineType::Actors),
         "ActorsLite" => Some(EngineType::ActorsLite),
+        "FactoryFabric" => Some(EngineType::FactoryFabric),
         "DD" => Some(EngineType::DifferentialDataflow),
         "Wasm" => Some(EngineType::Wasm),
         _ => None,
@@ -371,11 +437,8 @@ fn save_engine_to_storage(engine: EngineType) {
 
 /// Find example data by name (filename without .bn extension)
 fn find_example_by_name(name: &str) -> Option<ExampleData> {
-    EXAMPLE_DATAS
-        .iter()
-        .chain(OTHER_EXAMPLE_DATAS.iter())
+    single_file_examples_iter()
         .find(|e| e.filename.trim_end_matches(".bn") == name || e.filename == name)
-        .copied()
 }
 
 /// Multi-file example data (e.g., todo_mvc_physical with 8 files)
@@ -582,28 +645,6 @@ static EXAMPLE_DATAS: [ExampleData; MAIN_EXAMPLES_COUNT] = [
     make_example_data!("shopping_list"),
     make_example_data!("pages"),
     make_example_data!("todo_mvc"),
-    make_example_data!("list_retain_reactive"),
-    make_example_data!("list_map_external_dep"),
-    make_example_data!("list_map_block"),
-    make_example_data!("list_retain_count"),
-    make_example_data!("list_object_state"),
-    make_example_data!("list_retain_remove"),
-    make_example_data!("filter_checkbox_bug"),
-    make_example_data!("checkbox_test"),
-    make_example_data!("chained_list_remove_bug"),
-    make_example_data!("while_function_call"),
-    make_example_data!("button_hover_test"),
-    make_example_data!("button_hover_to_click_test"),
-    make_example_data!("switch_hold_test"),
-    // Debug examples (commented out — use custom examples for ad-hoc testing)
-    // make_example_data!("list_retain_count"),
-    // make_example_data!("list_map_block"),
-    // make_example_data!("list_object_state"),
-    // make_example_data!("list_retain_reactive"),
-    // make_example_data!("list_retain_remove"),
-    // make_example_data!("list_map_external_dep"),
-    // make_example_data!("text_interpolation_update"),
-    // make_example_data!("chained_list_remove_bug"),
 ];
 
 // 7GUIs benchmark examples (shown in "Other" expandable section)
@@ -621,6 +662,22 @@ static OTHER_EXAMPLE_DATAS: [ExampleData; 12] = [
     make_example_data!("then"),
     make_example_data!("when"),
     make_example_data!("while"),
+];
+
+static DEBUG_EXAMPLE_DATAS: [ExampleData; DEBUG_EXAMPLES_COUNT] = [
+    make_example_data!("list_retain_reactive"),
+    make_example_data!("list_map_external_dep"),
+    make_example_data!("list_map_block"),
+    make_example_data!("list_retain_count"),
+    make_example_data!("list_object_state"),
+    make_example_data!("list_retain_remove"),
+    make_example_data!("filter_checkbox_bug"),
+    make_example_data!("checkbox_test"),
+    make_example_data!("chained_list_remove_bug"),
+    make_example_data!("while_function_call"),
+    make_example_data!("button_hover_test"),
+    make_example_data!("button_hover_to_click_test"),
+    make_example_data!("switch_hold_test"),
 ];
 
 #[derive(Clone, Copy)]
@@ -647,11 +704,16 @@ fn is_multi_file_example_visible_in_engine(engine: EngineType, example: &MultiFi
     is_example_visible_in_engine(engine, example.name)
 }
 
-fn first_visible_single_file_example(engine: EngineType) -> ExampleData {
+fn single_file_examples_iter() -> impl Iterator<Item = ExampleData> {
     EXAMPLE_DATAS
         .iter()
         .chain(OTHER_EXAMPLE_DATAS.iter())
+        .chain(DEBUG_EXAMPLE_DATAS.iter())
         .copied()
+}
+
+fn first_visible_single_file_example(engine: EngineType) -> ExampleData {
+    single_file_examples_iter()
         .find(|example| is_single_file_example_visible_in_engine(engine, *example))
         .unwrap_or(EXAMPLE_DATAS[0])
 }
@@ -766,6 +828,8 @@ struct Playground {
     panel_split_ratio: Mutable<f64>,
     panel_container_width: Mutable<u32>,
     is_dragging_panel_split: Mutable<bool>,
+    /// Whether "Other" examples section is collapsed
+    other_collapsed: Mutable<bool>,
     /// Whether debug examples section is collapsed
     debug_collapsed: Mutable<bool>,
     /// Custom user examples (id, name, source_code) - Vec preserves insertion order, id is stable
@@ -787,6 +851,7 @@ struct Playground {
     _store_files_task: Rc<TaskHandle>,
     _store_current_file_task: Rc<TaskHandle>,
     _store_panel_split_task: Rc<TaskHandle>,
+    _store_other_collapsed_task: Rc<TaskHandle>,
     _store_debug_collapsed_task: Rc<TaskHandle>,
     _store_custom_examples_task: Rc<TaskHandle>,
     _store_forced_preview_size_task: Rc<TaskHandle>,
@@ -954,7 +1019,22 @@ impl Playground {
             }),
         ));
 
-        // Load debug collapsed state from storage (default: collapsed)
+        // Load expandable section state from storage (default: collapsed)
+        let other_collapsed_value = local_storage()
+            .get::<bool>(OTHER_COLLAPSED_STORAGE_KEY)
+            .and_then(Result::ok)
+            .unwrap_or(true);
+        let other_collapsed = Mutable::new(other_collapsed_value);
+
+        let _store_other_collapsed_task = Rc::new(Task::start_droppable(
+            other_collapsed.signal().for_each_sync(|collapsed| {
+                if let Err(error) = local_storage().insert(OTHER_COLLAPSED_STORAGE_KEY, &collapsed)
+                {
+                    eprintln!("Failed to store other collapsed state: {error:#?}");
+                }
+            }),
+        ));
+
         let debug_collapsed_value = local_storage()
             .get::<bool>(DEBUG_COLLAPSED_STORAGE_KEY)
             .and_then(Result::ok)
@@ -1085,6 +1165,7 @@ impl Playground {
             panel_split_ratio,
             panel_container_width: Mutable::new(0),
             is_dragging_panel_split: Mutable::new(false),
+            other_collapsed,
             debug_collapsed,
             custom_examples,
             selected_custom_example,
@@ -1094,6 +1175,7 @@ impl Playground {
             _store_files_task,
             _store_current_file_task,
             _store_panel_split_task,
+            _store_other_collapsed_task,
             _store_debug_collapsed_task,
             _store_custom_examples_task,
             _store_forced_preview_size_task,
@@ -1365,6 +1447,29 @@ impl Playground {
                     js_sys::Reflect::set(&api, &"getEngine".into(), get_engine.as_ref()).ok();
                     get_engine.forget();
 
+                    let engine_type_for_status = engine_type.clone();
+                    let get_engine_status = Closure::wrap(Box::new(move || -> JsValue {
+                        page_engine_status_snapshot(engine_type_for_status.get())
+                    }) as Box<dyn Fn() -> JsValue>);
+                    js_sys::Reflect::set(
+                        &api,
+                        &"getEngineStatus".into(),
+                        get_engine_status.as_ref(),
+                    )
+                    .ok();
+                    get_engine_status.forget();
+
+                    let get_engine_debug = Closure::wrap(Box::new(move || -> JsValue {
+                        page_engine_debug_snapshot()
+                    }) as Box<dyn Fn() -> JsValue>);
+                    js_sys::Reflect::set(
+                        &api,
+                        &"getEngineDebug".into(),
+                        get_engine_debug.as_ref(),
+                    )
+                    .ok();
+                    get_engine_debug.forget();
+
                     // setEngine(engine) - set engine type and trigger re-run
                     let engine_type_for_set = engine_type.clone();
                     let persistence_enabled_for_engine = persistence_enabled.clone();
@@ -1383,10 +1488,11 @@ impl Playground {
                         let new_engine = match engine_str.as_str() {
                             "Actors" => EngineType::Actors,
                             "ActorsLite" => EngineType::ActorsLite,
+                            "FactoryFabric" => EngineType::FactoryFabric,
                             "DD" => EngineType::DifferentialDataflow,
                             "Wasm" => EngineType::Wasm,
                             _ => {
-                                js_sys::Reflect::set(&result, &"error".into(), &format!("Invalid engine '{}'. Use 'Actors', 'ActorsLite', 'DD', or 'Wasm'", engine_str).into()).ok();
+                                js_sys::Reflect::set(&result, &"error".into(), &format!("Invalid engine '{}'. Use 'Actors', 'ActorsLite', 'FactoryFabric', 'DD', or 'Wasm'", engine_str).into()).ok();
                                 return result.into();
                             }
                         };
@@ -1410,6 +1516,8 @@ impl Playground {
                         if !engine_supports_persistence(new_engine) {
                             persistence_enabled_for_engine.set(false);
                         }
+                        set_page_engine_status_snapshot(new_engine, true, 0);
+                        clear_page_engine_debug_snapshot();
                         set_engine_in_url(new_engine);
 
                         schedule_preview_restart(
@@ -1722,7 +1830,7 @@ impl Playground {
             .item_signal(
                 // "Other" expandable section: 7GUIs examples + custom examples
                 map_ref! {
-                    let collapsed = self.debug_collapsed.signal(),
+                    let collapsed = self.other_collapsed.signal(),
                     let engine = self.engine_type.signal() =>
                     (*collapsed, *engine)
                 }
@@ -1733,6 +1841,23 @@ impl Playground {
                             None
                         } else {
                             Some(this.other_section_content(engine))
+                        }
+                    }
+                }),
+            )
+            .item_signal(
+                map_ref! {
+                    let collapsed = self.debug_collapsed.signal(),
+                    let engine = self.engine_type.signal() =>
+                    (*collapsed, *engine)
+                }
+                .map({
+                    let this = self.clone();
+                    move |(collapsed, engine)| {
+                        if collapsed {
+                            None
+                        } else {
+                            Some(this.debug_section_content(engine))
                         }
                     }
                 }),
@@ -1761,6 +1886,7 @@ impl Playground {
             )
             .item(self.add_custom_example_button())
             .item(self.other_section_toggle())
+            .item(self.debug_section_toggle())
     }
 
     fn other_section_content(&self, engine: EngineType) -> impl Element + use<> {
@@ -1831,11 +1957,62 @@ impl Playground {
                     .width(1),
             ))
             .s(Font::new().color(muted_text_color()))
-            .label_signal(self.debug_collapsed.signal().map(|collapsed| {
+            .label_signal(self.other_collapsed.signal().map(|collapsed| {
                 if collapsed {
                     "Other \u{25B8}"
                 } else {
                     "Other \u{25BE}"
+                }
+            }))
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+            .on_press({
+                let other_collapsed = self.other_collapsed.clone();
+                move || {
+                    other_collapsed.set(!other_collapsed.get());
+                }
+            })
+    }
+
+    fn debug_section_content(&self, engine: EngineType) -> impl Element + use<> {
+        Row::new()
+            .s(Width::fill())
+            .s(Align::new().center_y())
+            .s(Gap::new().x(10).y(6))
+            .s(Padding::new().left(10))
+            .multiline()
+            .items(
+                DEBUG_EXAMPLE_DATAS
+                    .iter()
+                    .copied()
+                    .filter(move |example| is_single_file_example_visible_in_engine(engine, *example))
+                    .map(|example_data| self.example_button(example_data)),
+            )
+    }
+
+    fn debug_section_toggle(&self) -> impl Element + use<> {
+        let hovered = Mutable::new(false);
+        Button::new()
+            .s(Padding::new().x(10).y(7))
+            .s(RoundedCorners::all(24))
+            .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
+            .s(Background::new().color_signal(hovered.signal().map(|h| {
+                if h {
+                    color!("rgba(60, 70, 100, 0.4)")
+                } else {
+                    color!("rgba(40, 50, 80, 0.3)")
+                }
+            })))
+            .s(Borders::all(
+                Border::new()
+                    .color(color!("rgba(88, 126, 194, 0.25)"))
+                    .width(1),
+            ))
+            .s(Font::new().color(muted_text_color()))
+            .label_signal(self.debug_collapsed.signal().map(|collapsed| {
+                if collapsed {
+                    "Debug \u{25B8}"
+                } else {
+                    "Debug \u{25BE}"
                 }
             }))
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
@@ -3117,6 +3294,8 @@ impl Playground {
         let source_code = self.source_code.lock_ref();
         let engine_type = self.engine_type.get();
         let persistence_enabled = self.persistence_enabled.get();
+        set_page_engine_status_snapshot(engine_type, true, 0);
+        clear_page_engine_debug_snapshot();
 
         #[cfg(feature = "engine-actors")]
         self.clear_actors_preview_keepalive();
@@ -3131,12 +3310,26 @@ impl Playground {
             ));
             drop(files);
             if persistence_enabled {
+                set_page_engine_status_snapshot(engine_type, false, 0);
                 return El::new()
                     .s(Font::new().color(color!("LightCoral")))
                     .child("ActorsLite: persistence is not supported in v1 yet")
                     .unify();
             }
             return run_actors_lite(&source_code).unify();
+        }
+
+        #[cfg(feature = "engine-factory-fabric")]
+        if matches!(engine_type, EngineType::FactoryFabric) {
+            drop(files);
+            if persistence_enabled {
+                set_page_engine_status_snapshot(engine_type, false, 0);
+                return El::new()
+                    .s(Font::new().color(color!("LightCoral")))
+                    .child("FactoryFabric: persistence is not supported in v1 yet")
+                    .unify();
+            }
+            return run_factory_fabric(example_name_from_filename(filename), &source_code).unify();
         }
 
         #[cfg(feature = "engine-wasm")]
@@ -4104,7 +4297,12 @@ mod tests {
     }
 
     #[test]
-    fn non_actors_lite_engines_keep_persistence_support() {
+    fn factory_fabric_persistence_is_capability_gated() {
+        assert!(!engine_supports_persistence(EngineType::FactoryFabric));
+    }
+
+    #[test]
+    fn other_engines_keep_persistence_support() {
         assert!(engine_supports_persistence(EngineType::Actors));
         assert!(engine_supports_persistence(EngineType::DifferentialDataflow));
         assert!(engine_supports_persistence(EngineType::Wasm));
@@ -4228,5 +4426,12 @@ mod tests {
         assert!(actors_lite_public_exposure_enabled());
         assert!(is_engine_available(EngineType::ActorsLite));
         assert!(available_engines().contains(&EngineType::ActorsLite));
+    }
+
+    #[test]
+    fn factory_fabric_is_available_in_default_engine_surface() {
+        assert!(is_engine_available(EngineType::FactoryFabric));
+        assert!(available_engines().contains(&EngineType::FactoryFabric));
+        assert_eq!(engine_query_value(EngineType::FactoryFabric), "factoryfabric");
     }
 }

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 boon = { path = "../crates/boon" }
 boon-engine-actors-lite = { path = "../crates/boon-engine-actors-lite" }
+boon-engine-factory-fabric = { path = "../crates/boon-engine-factory-fabric" }
 boon-engine-wasm = { path = "../crates/boon-engine-wasm" }
 # CLI
 clap = { version = "4", features = ["derive"] }

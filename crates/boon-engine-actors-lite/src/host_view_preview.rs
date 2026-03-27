@@ -542,7 +542,7 @@ impl HostViewPreviewRenderer {
                 ops.push(RenderOp::AttachEventPort {
                     id,
                     port: input_event_port,
-                    kind: boon_scene::UiEventKind::Input,
+                    kind: boon_scene::UiEventKind::Change,
                 });
                 ops.push(RenderOp::SetProperty {
                     id,
@@ -594,7 +594,7 @@ impl HostViewPreviewRenderer {
                 ops.push(RenderOp::AttachEventPort {
                     id,
                     port: input_event_port,
-                    kind: boon_scene::UiEventKind::Input,
+                    kind: boon_scene::UiEventKind::Change,
                 });
                 ops.push(RenderOp::SetProperty {
                     id,

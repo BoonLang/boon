@@ -245,6 +245,15 @@ makers verify-playground-interactive
 ./target/release/boon-tools exec test-examples --filter shopping_list
 ```
 
+Before debugging browser extension code for a browser-driven test failure, check these first:
+
+- the browser is actually started
+- the WebSocket server is running and reachable
+- the selected example has not frozen the page
+- the shared Chrome/Chromium profile still has Developer mode enabled in `chrome://extensions/`
+
+In this repo, those are more common causes than bugs in the extension code itself. Do not reset the shared browser profile as a routine recovery step.
+
 ### Test Categories
 
 - **Static**: Examples that display fixed output (minimal, hello_world, layers)

@@ -8,9 +8,7 @@ use crate::runtime::ActorKind;
 use crate::validated_form_runtime::ValidatedFormRuntime;
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
-use boon_renderer_zoon::{
-    FakeRenderState, RenderInteractionHandlers, render_snapshot_root_with_handlers,
-};
+use boon_renderer_zoon::{FakeRenderState, RenderInteractionHandlers, render_retained_snapshot_signal};
 use boon_scene::{RenderRoot, UiEventBatch, UiFactBatch, UiNode};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -48,14 +46,16 @@ impl TemperatureConverterPreview {
             [],
         );
 
-        Ok(Self {
+        let mut preview = Self {
             runtime,
             celsius_actor,
             fahrenheit_actor,
             program,
             executor,
             form,
-        })
+        };
+        preview.sync_inputs_from_sinks();
+        Ok(preview)
     }
 
     pub fn dispatch_ui_events(&mut self, batch: UiEventBatch) {
@@ -93,6 +93,7 @@ impl TemperatureConverterPreview {
         for (sink, value) in self.executor.sink_values() {
             self.form.set_sink_value(*sink, value.clone());
         }
+        self.sync_inputs_from_sinks();
     }
 
     #[must_use]
@@ -108,33 +109,55 @@ impl TemperatureConverterPreview {
     pub fn app(&self) -> &crate::host_view_preview::HostViewPreviewApp {
         self.form.app()
     }
+
+    fn sync_inputs_from_sinks(&mut self) {
+        let celsius = self
+            .form
+            .sink_value(self.program.celsius_input_sink)
+            .map(render_kernel_value)
+            .unwrap_or_default();
+        let fahrenheit = self
+            .form
+            .sink_value(self.program.fahrenheit_input_sink)
+            .map(render_kernel_value)
+            .unwrap_or_default();
+        let _ = self.form.set_input(0, celsius);
+        let _ = self.form.set_input(1, fahrenheit);
+    }
+}
+
+fn render_kernel_value(value: &KernelValue) -> String {
+    match value {
+        KernelValue::Number(number) if number.fract() == 0.0 => format!("{}", *number as i64),
+        KernelValue::Number(number) => number.to_string(),
+        KernelValue::Text(text) | KernelValue::Tag(text) => text.clone(),
+        KernelValue::Bool(value) => value.to_string(),
+        KernelValue::Skip => String::new(),
+        KernelValue::Object(_) | KernelValue::List(_) => format!("{value:?}"),
+    }
 }
 
 pub fn render_temperature_converter_preview(preview: TemperatureConverterPreview) -> impl Element {
     let preview = Rc::new(RefCell::new(preview));
-    let version = Mutable::new(0u64);
+    let snapshot = Mutable::new({
+        let (root, state) = preview.borrow_mut().render_snapshot();
+        (RenderRoot::UiTree(root), state)
+    });
 
     let handlers = RenderInteractionHandlers::new(
         {
             let preview = preview.clone();
-            let version = version.clone();
+            let snapshot = snapshot.clone();
             move |batch: UiEventBatch| {
                 preview.borrow_mut().dispatch_ui_events(batch);
-                version.update(|value| value + 1);
+                let (root, state) = preview.borrow_mut().render_snapshot();
+                snapshot.set((RenderRoot::UiTree(root), state));
             }
         },
         move |_facts: UiFactBatch| {},
     );
 
-    El::new().child_signal(version.signal().map({
-        let preview = preview.clone();
-        let handlers = handlers.clone();
-        move |_| {
-            let (root, state) = preview.borrow_mut().render_snapshot();
-            let root = RenderRoot::UiTree(root);
-            Some(render_snapshot_root_with_handlers(&root, &state, &handlers))
-        }
-    }))
+    render_retained_snapshot_signal(snapshot.signal_cloned(), handlers)
 }
 
 #[cfg(test)]
@@ -181,6 +204,54 @@ mod tests {
         assert_eq!(
             preview.form.sink_value(preview.program.celsius_input_sink),
             Some(&KernelValue::from(0.0))
+        );
+    }
+
+    #[test]
+    fn clearing_fahrenheit_clears_celsius_projection() {
+        let source = include_str!(
+            "../../../playground/frontend/src/examples/temperature_converter/temperature_converter.bn"
+        );
+        let mut preview =
+            TemperatureConverterPreview::new(source).expect("temperature_converter preview");
+        assert!(preview.preview_text().contains("Temperature Converter"));
+        let celsius_port = preview
+            .app()
+            .event_port_for_source(preview.program.celsius_change_port)
+            .expect("celsius port");
+        let fahrenheit_port = preview
+            .app()
+            .event_port_for_source(preview.program.fahrenheit_change_port)
+            .expect("fahrenheit port");
+
+        preview.dispatch_ui_events(UiEventBatch {
+            events: vec![UiEvent {
+                target: celsius_port,
+                kind: UiEventKind::Input,
+                payload: Some("100".to_string()),
+            }],
+        });
+        assert_eq!(
+            preview
+                .form
+                .sink_value(preview.program.fahrenheit_input_sink),
+            Some(&KernelValue::from(212.0))
+        );
+
+        preview.dispatch_ui_events(UiEventBatch {
+            events: vec![UiEvent {
+                target: fahrenheit_port,
+                kind: UiEventKind::Input,
+                payload: Some(String::new()),
+            }],
+        });
+        assert_eq!(
+            preview.form.sink_value(preview.program.celsius_input_sink),
+            Some(&KernelValue::from(String::new()))
+        );
+        assert_eq!(
+            preview.form.sink_value(preview.program.fahrenheit_input_sink),
+            Some(&KernelValue::from(String::new()))
         );
     }
 }

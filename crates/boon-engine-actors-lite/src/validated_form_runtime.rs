@@ -55,6 +55,10 @@ impl<const N: usize> ValidatedFormRuntime<N> {
         self.inputs.input(index)
     }
 
+    pub fn set_input(&mut self, index: usize, next: impl Into<String>) -> bool {
+        self.inputs.set_input(index, next)
+    }
+
     pub fn set_sink_value(&mut self, sink: SinkPortId, value: KernelValue) {
         self.app.set_sink_value(sink, value);
     }

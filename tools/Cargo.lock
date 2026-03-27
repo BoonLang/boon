@@ -300,6 +300,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon-engine-factory-fabric"
+version = "0.1.0"
+dependencies = [
+ "boon",
+ "boon-engine-actors-lite",
+ "boon-renderer-zoon",
+ "boon-scene",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "boon-engine-wasm"
 version = "0.1.0"
 dependencies = [
@@ -350,6 +362,7 @@ dependencies = [
  "base64 0.21.7",
  "boon",
  "boon-engine-actors-lite",
+ "boon-engine-factory-fabric",
  "boon-engine-wasm",
  "clap",
  "env_logger",

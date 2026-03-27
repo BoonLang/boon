@@ -21,6 +21,7 @@ pub mod cells_runtime;
 pub mod chained_list_remove_bug_preview;
 pub mod checkbox_test_preview;
 pub mod circle_drawer_preview;
+pub mod clock;
 pub mod complex_counter_preview;
 pub mod counter_acceptance;
 pub mod crud_preview;

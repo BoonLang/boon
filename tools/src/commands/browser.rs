@@ -85,19 +85,8 @@ fn create_persistent_profile() -> Result<PathBuf> {
     let repo_root = exe.parent().unwrap().parent().unwrap().parent().unwrap();
     let profile_dir = repo_root.join("tools").join(".chrome-profile");
     std::fs::create_dir_all(&profile_dir)?;
-    cleanup_stale_profile_locks(&profile_dir)?;
     log::info!("Using profile at: {}", profile_dir.display());
     Ok(profile_dir)
-}
-
-fn cleanup_stale_profile_locks(profile_dir: &std::path::Path) -> Result<()> {
-    for name in ["SingletonLock", "SingletonCookie", "SingletonSocket"] {
-        let path = profile_dir.join(name);
-        if path.exists() || path.is_symlink() {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-    Ok(())
 }
 
 /// Return PIDs of Chromium processes using Boon's persistent automation profile.
@@ -158,6 +147,7 @@ fn engine_query_value(engine: &str) -> &str {
     match engine {
         "Actors" => "actors",
         "ActorsLite" => "actorslite",
+        "FactoryFabric" => "factoryfabric",
         "DD" => "dd",
         "Wasm" => "wasm",
         other => other,

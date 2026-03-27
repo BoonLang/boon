@@ -1,18 +1,15 @@
 use crate::bridge::{HostInput, HostSnapshot};
 use crate::host_view_preview::HostViewPreviewApp;
 use crate::ids::ActorId;
+use crate::interactive_preview::{InteractivePreview, render_interactive_preview};
 use crate::ir_executor::IrExecutor;
 use crate::lower::{ComplexCounterProgram, try_lower_complex_counter};
 use crate::preview_runtime::PreviewRuntime;
 use crate::runtime::ActorKind;
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
-use boon_renderer_zoon::{
-    FakeRenderState, RenderInteractionHandlers, render_snapshot_root_with_handlers,
-};
+use boon_renderer_zoon::FakeRenderState;
 use boon_scene::{NodeId, RenderRoot, UiEventBatch, UiEventKind, UiFactBatch, UiFactKind, UiNode};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 pub struct ComplexCounterPreview {
     runtime: PreviewRuntime,
@@ -140,38 +137,27 @@ impl ComplexCounterPreview {
     }
 }
 
+impl InteractivePreview for ComplexCounterPreview {
+    fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool {
+        let before = self.preview_text();
+        ComplexCounterPreview::dispatch_ui_events(self, batch);
+        self.preview_text() != before
+    }
+
+    fn dispatch_ui_facts(&mut self, batch: UiFactBatch) -> bool {
+        let before = self.preview_text();
+        ComplexCounterPreview::dispatch_ui_facts(self, batch);
+        self.preview_text() != before
+    }
+
+    fn render_snapshot(&mut self) -> (RenderRoot, FakeRenderState) {
+        let (root, state) = ComplexCounterPreview::render_snapshot(self);
+        (RenderRoot::UiTree(root), state)
+    }
+}
+
 pub fn render_complex_counter_preview(preview: ComplexCounterPreview) -> impl Element {
-    let preview = Rc::new(RefCell::new(preview));
-    let version = Mutable::new(0u64);
-
-    let handlers = RenderInteractionHandlers::new(
-        {
-            let preview = preview.clone();
-            let version = version.clone();
-            move |batch: UiEventBatch| {
-                preview.borrow_mut().dispatch_ui_events(batch);
-                version.update(|value| value + 1);
-            }
-        },
-        {
-            let preview = preview.clone();
-            let version = version.clone();
-            move |batch: UiFactBatch| {
-                preview.borrow_mut().dispatch_ui_facts(batch);
-                version.update(|value| value + 1);
-            }
-        },
-    );
-
-    El::new().child_signal(version.signal().map({
-        let preview = preview.clone();
-        let handlers = handlers.clone();
-        move |_| {
-            let (root, state) = preview.borrow_mut().render_snapshot();
-            let root = RenderRoot::UiTree(root);
-            Some(render_snapshot_root_with_handlers(&root, &state, &handlers))
-        }
-    }))
+    render_interactive_preview(preview)
 }
 
 #[cfg(test)]

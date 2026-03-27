@@ -1,3 +1,4 @@
+use crate::clock::MonotonicInstant;
 use crate::ids::{ActorId, GenerationalId, ScopeId};
 use crate::ir::{IrProgram, MirrorCellId, NodeId, SinkPortId, SourcePortId};
 use crate::ir_executor::IrExecutor;
@@ -6,7 +7,7 @@ use boon::platform::browser::kernel::KernelValue;
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::marker::PhantomData;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorKind {
@@ -207,7 +208,7 @@ impl RuntimeCore {
     }
 
     pub fn alloc_actor(&mut self, kind: ActorKind, scope_id: ScopeId) -> ActorId {
-        let started = Instant::now();
+        let started = MonotonicInstant::now();
         let actor_id = self.actors.alloc(ActorSlot {
             kind,
             mailbox: VecDeque::new(),
@@ -230,7 +231,7 @@ impl RuntimeCore {
     }
 
     pub fn push_message(&mut self, actor_id: ActorId, msg: Msg) -> bool {
-        let started = Instant::now();
+        let started = MonotonicInstant::now();
         let Some(actor) = self.actors.get_mut(actor_id) else {
             return false;
         };

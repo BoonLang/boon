@@ -2,7 +2,7 @@ use crate::retained_ui_state::RetainedUiState;
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
 use boon_renderer_zoon::FakeRenderState;
-use boon_renderer_zoon::{RenderInteractionHandlers, render_snapshot_root_with_handlers};
+use boon_renderer_zoon::{RenderInteractionHandlers, render_retained_snapshot_signal};
 use boon_scene::{
     EventPortId, NodeId, RenderRoot, UiEventBatch, UiEventKind, UiFactBatch, UiFactKind, UiNode,
     UiNodeKind,
@@ -248,12 +248,13 @@ where
     Preview: InteractivePreview + 'static,
 {
     let preview = Rc::new(RefCell::new(preview));
-    let version = Mutable::new(0u64);
+    let snapshot = Mutable::new(preview.borrow_mut().render_snapshot());
     let rerender_pending = Rc::new(Cell::new(false));
 
     let schedule_rerender = {
-        let version = version.clone();
+        let snapshot = snapshot.clone();
         let rerender_pending = rerender_pending.clone();
+        let preview = preview.clone();
         move || {
             if rerender_pending.replace(true) {
                 return;
@@ -261,11 +262,12 @@ where
             #[cfg(target_arch = "wasm32")]
             {
                 if let Some(window) = web_sys::window() {
-                    let version = version.clone();
+                    let snapshot = snapshot.clone();
+                    let preview = preview.clone();
                     let rerender_pending = rerender_pending.clone();
                     let callback = Closure::once(move || {
                         rerender_pending.set(false);
-                        version.update(|value| value + 1);
+                        snapshot.set(preview.borrow_mut().render_snapshot());
                     });
                     let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
                         callback.as_ref().unchecked_ref(),
@@ -274,13 +276,13 @@ where
                     callback.forget();
                 } else {
                     rerender_pending.set(false);
-                    version.update(|value| value + 1);
+                    snapshot.set(preview.borrow_mut().render_snapshot());
                 }
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
                 rerender_pending.set(false);
-                version.update(|value| value + 1);
+                snapshot.set(preview.borrow_mut().render_snapshot());
             }
         }
     };
@@ -306,14 +308,7 @@ where
         },
     );
 
-    El::new().child_signal(version.signal().map({
-        let preview = preview.clone();
-        let handlers = handlers.clone();
-        move |_| {
-            let (root, state) = preview.borrow_mut().render_snapshot();
-            Some(render_snapshot_root_with_handlers(&root, &state, &handlers))
-        }
-    }))
+    render_retained_snapshot_signal(snapshot.signal_cloned(), handlers)
 }
 
 #[cfg(test)]

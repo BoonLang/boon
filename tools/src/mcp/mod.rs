@@ -662,14 +662,14 @@ fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "boon_set_engine".to_string(),
-            description: "Set the Boon engine and trigger re-run. Use 'Actors' for the actor-based reactive engine, 'ActorsLite' for the virtual-actor runtime, 'DD' for the Differential Dataflow engine, or 'Wasm' for the WebAssembly backend.".to_string(),
+            description: "Set the Boon engine and trigger re-run. Use 'Actors' for the actor-based reactive engine, 'ActorsLite' for the virtual-actor runtime, 'FactoryFabric' for the experimental factory-style runtime, 'DD' for the Differential Dataflow engine, or 'Wasm' for the WebAssembly backend.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "engine": {
                         "type": "string",
-                        "enum": ["Actors", "ActorsLite", "DD", "Wasm"],
-                        "description": "Engine to use: 'Actors' (actor-based reactive), 'ActorsLite' (virtual actors + retained bridge), 'DD' (Differential Dataflow), or 'Wasm' (WebAssembly backend)"
+                        "enum": ["Actors", "ActorsLite", "FactoryFabric", "DD", "Wasm"],
+                        "description": "Engine to use: 'Actors' (actor-based reactive), 'ActorsLite' (virtual actors + retained bridge), 'FactoryFabric' (experimental factory runtime), 'DD' (Differential Dataflow), or 'Wasm' (WebAssembly backend)"
                     }
                 },
                 "required": ["engine"]
@@ -1175,11 +1175,12 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
             // Validate engine value
             if engine != "Actors"
                 && engine != "ActorsLite"
+                && engine != "FactoryFabric"
                 && engine != "DD"
                 && engine != "Wasm"
             {
                 return Err(format!(
-                    "Invalid engine '{}'. Must be 'Actors', 'ActorsLite', 'DD', or 'Wasm'",
+                    "Invalid engine '{}'. Must be 'Actors', 'ActorsLite', 'FactoryFabric', 'DD', or 'Wasm'",
                     engine
                 ));
             }
@@ -1483,6 +1484,16 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
         }
 
         Response::ActorsLiteDebug { value } => Ok(value.unwrap_or_default()),
+
+        Response::EngineStatus { status } => Ok(
+            serde_json::to_string_pretty(&status)
+                .unwrap_or_else(|_| "{\"error\":\"failed to encode engine status\"}".to_string()),
+        ),
+
+        Response::EngineDebug { debug } => Ok(
+            serde_json::to_string_pretty(&debug.unwrap_or(serde_json::Value::Null))
+                .unwrap_or_else(|_| "{\"error\":\"failed to encode engine debug\"}".to_string()),
+        ),
 
         Response::Error { message } => Err(message),
     }
