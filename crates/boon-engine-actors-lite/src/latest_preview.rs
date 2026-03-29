@@ -1,10 +1,10 @@
-use crate::host_view_preview::HostViewPreviewApp;
-use crate::interactive_preview::{InteractivePreview, render_interactive_preview};
-use crate::lower::{LatestProgram, try_lower_latest};
+use crate::host_view_preview::{
+    HostViewPreviewApp, InteractiveHostViewModel, render_interactive_host_view,
+};
+use crate::lower::{LatestProgram, lower_program};
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
-use boon_renderer_zoon::FakeRenderState;
-use boon_scene::{RenderRoot, UiEventBatch, UiEventKind};
+use boon_scene::{UiEventBatch, UiEventKind};
 
 pub struct LatestPreview {
     program: LatestProgram,
@@ -14,19 +14,26 @@ pub struct LatestPreview {
 
 impl LatestPreview {
     pub fn new(source: &str) -> Result<Self, String> {
-        let program = try_lower_latest(source)?;
+        Ok(Self::from_program(
+            lower_program(source)?.into_latest_program()?,
+        ))
+    }
+
+    pub fn from_program(program: LatestProgram) -> Self {
         let mut app =
             HostViewPreviewApp::new(program.host_view.clone(), initial_sinks(&program, 3));
         app.set_sink_value(program.value_sink, KernelValue::from("3"));
-        Ok(Self {
+        app.set_sink_value(program.sum_sink, KernelValue::from("3"));
+        Self {
             program,
             current_value: 3,
             app,
-        })
+        }
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
     }
 
@@ -44,15 +51,17 @@ impl LatestPreview {
             self.program.value_sink,
             KernelValue::from(value.to_string()),
         );
-        self.app.set_sink_value(
-            self.program.sum_sink,
-            KernelValue::from(format!("Sum: {value}")),
-        );
+        self.app
+            .set_sink_value(self.program.sum_sink, KernelValue::from(value.to_string()));
         true
     }
 }
 
-impl InteractivePreview for LatestPreview {
+impl InteractiveHostViewModel for LatestPreview {
+    fn app_mut(&mut self) -> &mut HostViewPreviewApp {
+        &mut self.app
+    }
+
     fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool {
         let first = self
             .app
@@ -75,19 +84,10 @@ impl InteractivePreview for LatestPreview {
 
         false
     }
-
-    fn dispatch_ui_facts(&mut self, _batch: boon_scene::UiFactBatch) -> bool {
-        false
-    }
-
-    fn render_snapshot(&mut self) -> (RenderRoot, FakeRenderState) {
-        let (root, state) = self.app.render_snapshot();
-        (RenderRoot::UiTree(root), state)
-    }
 }
 
 pub fn render_latest_preview(preview: LatestPreview) -> impl Element {
-    render_interactive_preview(preview)
+    render_interactive_host_view(preview)
 }
 
 fn initial_sinks(
@@ -96,7 +96,7 @@ fn initial_sinks(
 ) -> std::collections::BTreeMap<crate::ir::SinkPortId, KernelValue> {
     std::collections::BTreeMap::from([
         (program.value_sink, KernelValue::from(value.to_string())),
-        (program.sum_sink, KernelValue::from(format!("Sum: {value}"))),
+        (program.sum_sink, KernelValue::from(value.to_string())),
     ])
 }
 

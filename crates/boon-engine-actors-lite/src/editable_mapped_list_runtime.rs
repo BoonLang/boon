@@ -76,7 +76,7 @@ impl<T, const INPUTS: usize, const ROWS: usize> EditableMappedListRuntime<T, INP
         self.items.update_selected(move |item| update(item))
     }
 
-    pub fn dispatch_input_events(
+    pub(crate) fn dispatch_input_events(
         &mut self,
         app: &HostViewPreviewApp,
         batch: &UiEventBatch,
@@ -84,7 +84,7 @@ impl<T, const INPUTS: usize, const ROWS: usize> EditableMappedListRuntime<T, INP
         self.inputs.dispatch_ui_events(app, batch)
     }
 
-    pub fn dispatch_row_clicks(
+    pub(crate) fn dispatch_row_clicks(
         &mut self,
         app: &HostViewPreviewApp,
         batch: UiEventBatch,
@@ -115,7 +115,7 @@ impl<T, const INPUTS: usize, const ROWS: usize> EditableMappedListRuntime<T, INP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{HostViewIr, HostViewKind, HostViewNode};
+    use crate::bridge::{HostButtonLabel, HostViewIr, HostViewKind, HostViewNode};
     use crate::host_view_preview::HostViewPreviewApp;
     use crate::ir::{FunctionInstanceId, RetainedNodeKey, SinkPortId, ViewSiteId};
     use boon::platform::browser::kernel::KernelValue;
@@ -144,6 +144,8 @@ mod tests {
                                 placeholder: "A".to_string(),
                                 change_port: input_ports[0],
                                 key_down_port: SourcePortId(20),
+                                blur_port: None,
+                                focus_port: None,
                                 focus_on_mount: false,
                                 disabled_sink: None,
                             },
@@ -160,6 +162,8 @@ mod tests {
                                 placeholder: "B".to_string(),
                                 change_port: input_ports[1],
                                 key_down_port: SourcePortId(21),
+                                blur_port: None,
+                                focus_port: None,
                                 focus_on_mount: false,
                                 disabled_sink: None,
                             },
@@ -172,7 +176,7 @@ mod tests {
                                 mapped_item_identity: Some(1),
                             },
                             kind: HostViewKind::Button {
-                                label: "Row 0".to_string(),
+                                label: HostButtonLabel::Static("Row 0".to_string()),
                                 press_port: row_ports[0],
                                 disabled_sink: None,
                             },
@@ -185,7 +189,7 @@ mod tests {
                                 mapped_item_identity: Some(2),
                             },
                             kind: HostViewKind::Button {
-                                label: "Row 1".to_string(),
+                                label: HostButtonLabel::Static("Row 1".to_string()),
                                 press_port: row_ports[1],
                                 disabled_sink: None,
                             },

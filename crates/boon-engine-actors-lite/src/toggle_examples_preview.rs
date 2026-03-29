@@ -32,7 +32,8 @@ impl WhileFunctionCallPreview {
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
     }
 
@@ -98,7 +99,8 @@ impl ButtonHoverToClickTestPreview {
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
     }
 
@@ -169,11 +171,6 @@ impl ButtonHoverTestPreview {
             hovered: [false; 3],
             app,
         })
-    }
-
-    #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
-        &self.app
     }
 
     #[must_use]
@@ -259,7 +256,8 @@ impl SwitchHoldTestPreview {
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
     }
 
@@ -336,14 +334,7 @@ fn while_function_call_sinks(
             program.toggle_label_sink,
             KernelValue::from(format!("Toggle (show: {})", bool_text(show_greeting))),
         ),
-        (
-            program.content_sink,
-            KernelValue::from(if show_greeting {
-                "Hello, World!"
-            } else {
-                "Hidden"
-            }),
-        ),
+        (program.content_sink, KernelValue::from(show_greeting)),
     ])
 }
 
@@ -406,6 +397,15 @@ fn switch_hold_test_sinks(
         ("Item B", click_counts[1], [true, false])
     };
     BTreeMap::from([
+        (program.show_item_a_sink, KernelValue::Bool(show_item_a)),
+        (
+            program.item_count_sinks[0],
+            KernelValue::from(click_counts[0] as f64),
+        ),
+        (
+            program.item_count_sinks[1],
+            KernelValue::from(click_counts[1] as f64),
+        ),
         (
             program.current_item_sink,
             KernelValue::from(format!("Showing: {item_name}")),
@@ -543,7 +543,7 @@ mod tests {
         let mut preview = SwitchHoldTestPreview::new(source).expect("switch_hold_test preview");
         assert_eq!(
             preview.preview_text(),
-            "Showing: Item AToggle ViewItem A clicks: 0Click Item AClick Item BTest: Click button, toggle view, click again. Counts should increment correctly."
+            "Showing: Item AToggle ViewItem A clicks: 0Click Item ATest: Click button, toggle view, click again. Counts should increment correctly."
         );
 
         let _ = preview.render_snapshot();
@@ -583,7 +583,7 @@ mod tests {
         });
         assert_eq!(
             preview.preview_text(),
-            "Showing: Item BToggle ViewItem B clicks: 1Click Item AClick Item BTest: Click button, toggle view, click again. Counts should increment correctly."
+            "Showing: Item BToggle ViewItem B clicks: 1Click Item BTest: Click button, toggle view, click again. Counts should increment correctly."
         );
         preview.dispatch_ui_events(UiEventBatch {
             events: vec![UiEvent {
@@ -594,7 +594,7 @@ mod tests {
         });
         assert_eq!(
             preview.preview_text(),
-            "Showing: Item AToggle ViewItem A clicks: 1Click Item AClick Item BTest: Click button, toggle view, click again. Counts should increment correctly."
+            "Showing: Item AToggle ViewItem A clicks: 1Click Item ATest: Click button, toggle view, click again. Counts should increment correctly."
         );
     }
 }

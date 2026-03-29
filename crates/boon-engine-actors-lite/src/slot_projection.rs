@@ -16,7 +16,7 @@ pub fn project_slot_values_into_map(
     }
 }
 
-pub fn project_slot_values_into_app(
+pub(crate) fn project_slot_values_into_app(
     app: &mut HostViewPreviewApp,
     sinks: &[SinkPortId],
     values: impl IntoIterator<Item = KernelValue>,

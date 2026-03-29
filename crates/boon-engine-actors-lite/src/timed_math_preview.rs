@@ -1,71 +1,45 @@
-use crate::host_view_preview::HostViewPreviewApp;
-use crate::interactive_preview::{InteractivePreview, render_interactive_preview};
-use crate::lower::{
-    ThenProgram, WhenProgram, WhileProgram, try_lower_then, try_lower_when, try_lower_while,
+use crate::bridge::HostInput;
+use crate::host_view_preview::{
+    HostViewPreviewApp, InteractiveHostViewModel, render_interactive_host_view,
 };
+use crate::ids::ActorId;
+use crate::ir::SinkPortId;
+use crate::ir_executor::IrExecutor;
+use crate::lower::{ThenProgram, WhenProgram, WhileProgram, lower_program};
+use crate::preview_runtime::PreviewRuntime;
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
-use boon_renderer_zoon::FakeRenderState;
-use boon_scene::{RenderRoot, UiEventBatch, UiEventKind};
-use std::collections::BTreeMap;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Operation {
-    Addition,
-    Subtraction,
-}
-
-impl Operation {
-    fn apply(self, input_a: i64, input_b: i64) -> i64 {
-        match self {
-            Self::Addition => input_a + input_b,
-            Self::Subtraction => input_a - input_b,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct TimedInputs {
-    tick_count: u64,
-    input_a: i64,
-    input_b: i64,
-}
-
-impl TimedInputs {
-    fn tick(&mut self) {
-        self.tick_count += 1;
-        self.input_a += 1;
-        if self.tick_count % 2 == 0 {
-            self.input_b += 10;
-        }
-    }
-}
+use boon_scene::{UiEvent, UiEventBatch, UiEventKind};
 
 pub struct ThenPreview {
     program: ThenProgram,
-    inputs: TimedInputs,
-    result: Option<i64>,
+    runtime: PreviewRuntime,
+    host_actor: ActorId,
+    executor: IrExecutor,
     app: HostViewPreviewApp,
 }
 
 impl ThenPreview {
     pub fn new(source: &str) -> Result<Self, String> {
-        let program = try_lower_then(source)?;
-        let inputs = TimedInputs::default();
-        let app = HostViewPreviewApp::new(
-            program.host_view.clone(),
-            then_sink_values(&program, inputs, None),
-        );
+        Self::from_program(lower_program(source)?.into_then_program()?)
+    }
+
+    pub fn from_program(program: ThenProgram) -> Result<Self, String> {
+        let mut runtime = PreviewRuntime::new();
+        let host_actor = runtime.alloc_actor();
+        let executor = IrExecutor::new(program.ir.clone())?;
+        let app = HostViewPreviewApp::new(program.host_view.clone(), executor.sink_values());
         Ok(Self {
             program,
-            inputs,
-            result: None,
+            runtime,
+            host_actor,
+            executor,
             app,
         })
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
     }
 
@@ -74,88 +48,86 @@ impl ThenPreview {
         self.app.preview_text()
     }
 
-    fn set_input_sinks(&mut self) {
-        self.app.set_sink_value(
-            self.program.input_a_sink,
-            KernelValue::from(format!("A: {}", self.inputs.input_a)),
-        );
-        self.app.set_sink_value(
-            self.program.input_b_sink,
-            KernelValue::from(format!("B: {}", self.inputs.input_b)),
+    fn refresh_sink_values(&mut self) {
+        sync_sink_values(
+            &mut self.app,
+            &self.executor,
+            &[
+                self.program.input_a_sink,
+                self.program.input_b_sink,
+                self.program.result_sink,
+            ],
         );
     }
 
-    fn set_result(&mut self, result: Option<i64>) -> bool {
-        if self.result == result {
+    fn apply_messages(&mut self, inputs: Vec<HostInput>) -> bool {
+        if inputs.is_empty() {
             return false;
         }
-        self.result = result;
-        self.app.set_sink_value(
-            self.program.result_sink,
-            KernelValue::from(result.map_or_else(String::new, |value| value.to_string())),
-        );
+        let Self {
+            runtime, executor, ..
+        } = self;
+        runtime.dispatch_inputs_batches(inputs.as_slice(), |messages| {
+            executor
+                .apply_pure_messages_owned(messages.drain(..))
+                .expect("then IR should execute");
+        });
+        self.refresh_sink_values();
         true
     }
 }
 
-impl InteractivePreview for ThenPreview {
+impl InteractiveHostViewModel for ThenPreview {
+    fn app_mut(&mut self) -> &mut HostViewPreviewApp {
+        &mut self.app
+    }
+
     fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool {
-        let tick_port = self.app.event_port_for_source(self.program.tick_port);
-        let addition_port = self
-            .app
-            .event_port_for_source(self.program.addition_press_port);
-        let mut changed = false;
-
-        for event in batch.events {
-            if Some(event.target) == tick_port && matches!(event.kind, UiEventKind::Custom(_)) {
-                self.inputs.tick();
-                self.set_input_sinks();
-                changed = true;
-            } else if Some(event.target) == addition_port && event.kind == UiEventKind::Click {
-                changed |= self.set_result(Some(self.inputs.input_a + self.inputs.input_b));
-            }
-        }
-
-        changed
-    }
-
-    fn dispatch_ui_facts(&mut self, _batch: boon_scene::UiFactBatch) -> bool {
-        false
-    }
-
-    fn render_snapshot(&mut self) -> (RenderRoot, FakeRenderState) {
-        let (root, state) = self.app.render_snapshot();
-        (RenderRoot::UiTree(root), state)
+        let ports = TimedMathPorts {
+            input_a_tick_port: self.program.input_a_tick_port,
+            input_b_tick_port: self.program.input_b_tick_port,
+            addition_press_port: Some(self.program.addition_press_port),
+            subtraction_press_port: None,
+        };
+        self.apply_messages(timed_math_inputs_from_events(
+            self.app(),
+            self.host_actor,
+            &self.runtime,
+            ports,
+            batch.events,
+        ))
     }
 }
 
 pub struct WhenPreview {
     program: WhenProgram,
-    inputs: TimedInputs,
-    operation: Option<Operation>,
-    result: Option<i64>,
+    runtime: PreviewRuntime,
+    host_actor: ActorId,
+    executor: IrExecutor,
     app: HostViewPreviewApp,
 }
 
 impl WhenPreview {
     pub fn new(source: &str) -> Result<Self, String> {
-        let program = try_lower_when(source)?;
-        let inputs = TimedInputs::default();
-        let app = HostViewPreviewApp::new(
-            program.host_view.clone(),
-            when_sink_values(&program, inputs, None),
-        );
+        Self::from_program(lower_program(source)?.into_when_program()?)
+    }
+
+    pub fn from_program(program: WhenProgram) -> Result<Self, String> {
+        let mut runtime = PreviewRuntime::new();
+        let host_actor = runtime.alloc_actor();
+        let executor = IrExecutor::new(program.ir.clone())?;
+        let app = HostViewPreviewApp::new(program.host_view.clone(), executor.sink_values());
         Ok(Self {
             program,
-            inputs,
-            operation: None,
-            result: None,
+            runtime,
+            host_actor,
+            executor,
             app,
         })
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
     }
 
@@ -164,100 +136,86 @@ impl WhenPreview {
         self.app.preview_text()
     }
 
-    fn set_input_sinks(&mut self) {
-        self.app.set_sink_value(
-            self.program.input_a_sink,
-            KernelValue::from(format!("A: {}", self.inputs.input_a)),
-        );
-        self.app.set_sink_value(
-            self.program.input_b_sink,
-            KernelValue::from(format!("B: {}", self.inputs.input_b)),
+    fn refresh_sink_values(&mut self) {
+        sync_sink_values(
+            &mut self.app,
+            &self.executor,
+            &[
+                self.program.input_a_sink,
+                self.program.input_b_sink,
+                self.program.result_sink,
+            ],
         );
     }
 
-    fn set_result(&mut self, result: Option<i64>) -> bool {
-        if self.result == result {
+    fn apply_messages(&mut self, inputs: Vec<HostInput>) -> bool {
+        if inputs.is_empty() {
             return false;
         }
-        self.result = result;
-        self.app.set_sink_value(
-            self.program.result_sink,
-            KernelValue::from(result.map_or_else(String::new, |value| value.to_string())),
-        );
+        let Self {
+            runtime, executor, ..
+        } = self;
+        runtime.dispatch_inputs_batches(inputs.as_slice(), |messages| {
+            executor
+                .apply_pure_messages_owned(messages.drain(..))
+                .expect("when IR should execute");
+        });
+        self.refresh_sink_values();
         true
-    }
-
-    fn select_operation(&mut self, operation: Operation) -> bool {
-        self.operation = Some(operation);
-        self.set_result(Some(
-            operation.apply(self.inputs.input_a, self.inputs.input_b),
-        ))
     }
 }
 
-impl InteractivePreview for WhenPreview {
+impl InteractiveHostViewModel for WhenPreview {
+    fn app_mut(&mut self) -> &mut HostViewPreviewApp {
+        &mut self.app
+    }
+
     fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool {
-        let tick_port = self.app.event_port_for_source(self.program.tick_port);
-        let addition_port = self
-            .app
-            .event_port_for_source(self.program.addition_press_port);
-        let subtraction_port = self
-            .app
-            .event_port_for_source(self.program.subtraction_press_port);
-        let mut changed = false;
-
-        for event in batch.events {
-            if Some(event.target) == tick_port && matches!(event.kind, UiEventKind::Custom(_)) {
-                self.inputs.tick();
-                self.set_input_sinks();
-                changed = true;
-            } else if Some(event.target) == addition_port && event.kind == UiEventKind::Click {
-                changed |= self.select_operation(Operation::Addition);
-            } else if Some(event.target) == subtraction_port && event.kind == UiEventKind::Click {
-                changed |= self.select_operation(Operation::Subtraction);
-            }
-        }
-
-        changed
-    }
-
-    fn dispatch_ui_facts(&mut self, _batch: boon_scene::UiFactBatch) -> bool {
-        false
-    }
-
-    fn render_snapshot(&mut self) -> (RenderRoot, FakeRenderState) {
-        let (root, state) = self.app.render_snapshot();
-        (RenderRoot::UiTree(root), state)
+        let ports = TimedMathPorts {
+            input_a_tick_port: self.program.input_a_tick_port,
+            input_b_tick_port: self.program.input_b_tick_port,
+            addition_press_port: Some(self.program.addition_press_port),
+            subtraction_press_port: Some(self.program.subtraction_press_port),
+        };
+        self.apply_messages(timed_math_inputs_from_events(
+            self.app(),
+            self.host_actor,
+            &self.runtime,
+            ports,
+            batch.events,
+        ))
     }
 }
 
 pub struct WhilePreview {
     program: WhileProgram,
-    inputs: TimedInputs,
-    operation: Option<Operation>,
-    result: Option<i64>,
+    runtime: PreviewRuntime,
+    host_actor: ActorId,
+    executor: IrExecutor,
     app: HostViewPreviewApp,
 }
 
 impl WhilePreview {
     pub fn new(source: &str) -> Result<Self, String> {
-        let program = try_lower_while(source)?;
-        let inputs = TimedInputs::default();
-        let app = HostViewPreviewApp::new(
-            program.host_view.clone(),
-            while_sink_values(&program, inputs, None),
-        );
+        Self::from_program(lower_program(source)?.into_while_program()?)
+    }
+
+    pub fn from_program(program: WhileProgram) -> Result<Self, String> {
+        let mut runtime = PreviewRuntime::new();
+        let host_actor = runtime.alloc_actor();
+        let executor = IrExecutor::new(program.ir.clone())?;
+        let app = HostViewPreviewApp::new(program.host_view.clone(), executor.sink_values());
         Ok(Self {
             program,
-            inputs,
-            operation: None,
-            result: None,
+            runtime,
+            host_actor,
+            executor,
             app,
         })
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
     }
 
@@ -266,155 +224,167 @@ impl WhilePreview {
         self.app.preview_text()
     }
 
-    fn set_input_sinks(&mut self) {
-        self.app.set_sink_value(
-            self.program.input_a_sink,
-            KernelValue::from(format!("A: {}", self.inputs.input_a)),
-        );
-        self.app.set_sink_value(
-            self.program.input_b_sink,
-            KernelValue::from(format!("B: {}", self.inputs.input_b)),
+    fn refresh_sink_values(&mut self) {
+        sync_sink_values(
+            &mut self.app,
+            &self.executor,
+            &[
+                self.program.input_a_sink,
+                self.program.input_b_sink,
+                self.program.result_sink,
+            ],
         );
     }
 
-    fn set_result(&mut self, result: Option<i64>) -> bool {
-        if self.result == result {
+    fn apply_messages(&mut self, inputs: Vec<HostInput>) -> bool {
+        if inputs.is_empty() {
             return false;
         }
-        self.result = result;
-        self.app.set_sink_value(
-            self.program.result_sink,
-            KernelValue::from(result.map_or_else(String::new, |value| value.to_string())),
-        );
+        let Self {
+            runtime, executor, ..
+        } = self;
+        runtime.dispatch_inputs_batches(inputs.as_slice(), |messages| {
+            executor
+                .apply_pure_messages_owned(messages.drain(..))
+                .expect("while IR should execute");
+        });
+        self.refresh_sink_values();
         true
-    }
-
-    fn recompute_result(&mut self) -> bool {
-        self.set_result(
-            self.operation
-                .map(|operation| operation.apply(self.inputs.input_a, self.inputs.input_b)),
-        )
     }
 }
 
-impl InteractivePreview for WhilePreview {
+impl InteractiveHostViewModel for WhilePreview {
+    fn app_mut(&mut self) -> &mut HostViewPreviewApp {
+        &mut self.app
+    }
+
     fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool {
-        let tick_port = self.app.event_port_for_source(self.program.tick_port);
-        let addition_port = self
-            .app
-            .event_port_for_source(self.program.addition_press_port);
-        let subtraction_port = self
-            .app
-            .event_port_for_source(self.program.subtraction_press_port);
-        let mut changed = false;
+        let ports = TimedMathPorts {
+            input_a_tick_port: self.program.input_a_tick_port,
+            input_b_tick_port: self.program.input_b_tick_port,
+            addition_press_port: Some(self.program.addition_press_port),
+            subtraction_press_port: Some(self.program.subtraction_press_port),
+        };
+        self.apply_messages(timed_math_inputs_from_events(
+            self.app(),
+            self.host_actor,
+            &self.runtime,
+            ports,
+            batch.events,
+        ))
+    }
+}
 
-        for event in batch.events {
-            if Some(event.target) == tick_port && matches!(event.kind, UiEventKind::Custom(_)) {
-                self.inputs.tick();
-                self.set_input_sinks();
-                changed = true;
-                changed |= self.recompute_result();
-            } else if Some(event.target) == addition_port && event.kind == UiEventKind::Click {
-                self.operation = Some(Operation::Addition);
-                changed |= self.recompute_result();
-            } else if Some(event.target) == subtraction_port && event.kind == UiEventKind::Click {
-                self.operation = Some(Operation::Subtraction);
-                changed |= self.recompute_result();
+#[derive(Clone, Copy)]
+struct TimedMathPorts {
+    input_a_tick_port: crate::ir::SourcePortId,
+    input_b_tick_port: crate::ir::SourcePortId,
+    addition_press_port: Option<crate::ir::SourcePortId>,
+    subtraction_press_port: Option<crate::ir::SourcePortId>,
+}
+
+fn timed_math_inputs_from_events(
+    app: &HostViewPreviewApp,
+    host_actor: ActorId,
+    runtime: &PreviewRuntime,
+    ports: TimedMathPorts,
+    events: Vec<UiEvent>,
+) -> Vec<HostInput> {
+    let input_a_tick = app.event_port_for_source(ports.input_a_tick_port);
+    let input_b_tick = app.event_port_for_source(ports.input_b_tick_port);
+    let addition = ports
+        .addition_press_port
+        .and_then(|port| app.event_port_for_source(port))
+        .map(|event_port| {
+            (
+                event_port,
+                ports.addition_press_port.expect("addition port"),
+            )
+        });
+    let subtraction = ports
+        .subtraction_press_port
+        .and_then(|port| app.event_port_for_source(port))
+        .map(|event_port| {
+            (
+                event_port,
+                ports.subtraction_press_port.expect("subtraction port"),
+            )
+        });
+
+    events
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            if Some(event.target) == input_a_tick && matches!(event.kind, UiEventKind::Custom(_)) {
+                return Some(HostInput::Pulse {
+                    actor: host_actor,
+                    port: ports.input_a_tick_port,
+                    value: KernelValue::from("tick"),
+                    seq: runtime.causal_seq(index as u32),
+                });
             }
-        }
+            if Some(event.target) == input_b_tick && matches!(event.kind, UiEventKind::Custom(_)) {
+                return Some(HostInput::Pulse {
+                    actor: host_actor,
+                    port: ports.input_b_tick_port,
+                    value: KernelValue::from("tick"),
+                    seq: runtime.causal_seq(index as u32),
+                });
+            }
+            if let Some((event_port, port)) = addition
+                && Some(event.target) == Some(event_port)
+                && event.kind == UiEventKind::Click
+            {
+                return Some(HostInput::Pulse {
+                    actor: host_actor,
+                    port,
+                    value: KernelValue::from("press"),
+                    seq: runtime.causal_seq(index as u32),
+                });
+            }
+            if let Some((event_port, port)) = subtraction
+                && Some(event.target) == Some(event_port)
+                && event.kind == UiEventKind::Click
+            {
+                return Some(HostInput::Pulse {
+                    actor: host_actor,
+                    port,
+                    value: KernelValue::from("press"),
+                    seq: runtime.causal_seq(index as u32),
+                });
+            }
+            None
+        })
+        .collect()
+}
 
-        changed
-    }
-
-    fn dispatch_ui_facts(&mut self, _batch: boon_scene::UiFactBatch) -> bool {
-        false
-    }
-
-    fn render_snapshot(&mut self) -> (RenderRoot, FakeRenderState) {
-        let (root, state) = self.app.render_snapshot();
-        (RenderRoot::UiTree(root), state)
+fn sync_sink_values(app: &mut HostViewPreviewApp, executor: &IrExecutor, sinks: &[SinkPortId]) {
+    for sink in sinks {
+        app.set_sink_value(
+            *sink,
+            executor
+                .sink_value(*sink)
+                .cloned()
+                .unwrap_or(KernelValue::Skip),
+        );
     }
 }
 
 pub fn render_then_preview(preview: ThenPreview) -> impl Element {
-    render_interactive_preview(preview)
+    render_interactive_host_view(preview)
 }
 
 pub fn render_when_preview(preview: WhenPreview) -> impl Element {
-    render_interactive_preview(preview)
+    render_interactive_host_view(preview)
 }
 
 pub fn render_while_preview(preview: WhilePreview) -> impl Element {
-    render_interactive_preview(preview)
-}
-
-fn then_sink_values(
-    program: &ThenProgram,
-    inputs: TimedInputs,
-    result: Option<i64>,
-) -> BTreeMap<crate::ir::SinkPortId, KernelValue> {
-    BTreeMap::from([
-        (
-            program.input_a_sink,
-            KernelValue::from(format!("A: {}", inputs.input_a)),
-        ),
-        (
-            program.input_b_sink,
-            KernelValue::from(format!("B: {}", inputs.input_b)),
-        ),
-        (
-            program.result_sink,
-            KernelValue::from(result.map_or_else(String::new, |value| value.to_string())),
-        ),
-    ])
-}
-
-fn when_sink_values(
-    program: &WhenProgram,
-    inputs: TimedInputs,
-    result: Option<i64>,
-) -> BTreeMap<crate::ir::SinkPortId, KernelValue> {
-    BTreeMap::from([
-        (
-            program.input_a_sink,
-            KernelValue::from(format!("A: {}", inputs.input_a)),
-        ),
-        (
-            program.input_b_sink,
-            KernelValue::from(format!("B: {}", inputs.input_b)),
-        ),
-        (
-            program.result_sink,
-            KernelValue::from(result.map_or_else(String::new, |value| value.to_string())),
-        ),
-    ])
-}
-
-fn while_sink_values(
-    program: &WhileProgram,
-    inputs: TimedInputs,
-    result: Option<i64>,
-) -> BTreeMap<crate::ir::SinkPortId, KernelValue> {
-    BTreeMap::from([
-        (
-            program.input_a_sink,
-            KernelValue::from(format!("A: {}", inputs.input_a)),
-        ),
-        (
-            program.input_b_sink,
-            KernelValue::from(format!("B: {}", inputs.input_b)),
-        ),
-        (
-            program.result_sink,
-            KernelValue::from(result.map_or_else(String::new, |value| value.to_string())),
-        ),
-    ])
+    render_interactive_host_view(preview)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_scene::UiEvent;
 
     fn click(target: boon_scene::EventPortId) -> UiEventBatch {
         UiEventBatch {
@@ -426,14 +396,39 @@ mod tests {
         }
     }
 
-    fn tick(target: boon_scene::EventPortId) -> UiEventBatch {
-        UiEventBatch {
-            events: vec![UiEvent {
-                target,
-                kind: UiEventKind::Custom("timer:500".to_string()),
-                payload: None,
-            }],
+    fn timer(target: boon_scene::EventPortId, interval_ms: u32) -> UiEvent {
+        UiEvent {
+            target,
+            kind: UiEventKind::Custom(format!("timer:{interval_ms}")),
+            payload: None,
         }
+    }
+
+    fn one_second_tick(
+        fast_target: boon_scene::EventPortId,
+        slow_target: boon_scene::EventPortId,
+    ) -> UiEventBatch {
+        UiEventBatch {
+            events: vec![
+                timer(fast_target, 500),
+                timer(fast_target, 500),
+                timer(slow_target, 1000),
+            ],
+        }
+    }
+
+    fn half_then_one_second_ticks(
+        fast_target: boon_scene::EventPortId,
+        slow_target: boon_scene::EventPortId,
+    ) -> [UiEventBatch; 2] {
+        [
+            UiEventBatch {
+                events: vec![timer(fast_target, 500)],
+            },
+            UiEventBatch {
+                events: vec![timer(fast_target, 500), timer(slow_target, 1000)],
+            },
+        ]
     }
 
     #[test]
@@ -443,24 +438,30 @@ mod tests {
         assert_eq!(preview.preview_text(), "A: 0B: 0A + B");
 
         let _ = preview.render_snapshot();
-        let tick_port = preview
+        let input_a_tick = preview
             .app()
-            .event_port_for_source(preview.program.tick_port)
-            .expect("tick");
+            .event_port_for_source(preview.program.input_a_tick_port)
+            .expect("input_a tick");
+        let input_b_tick = preview
+            .app()
+            .event_port_for_source(preview.program.input_b_tick_port)
+            .expect("input_b tick");
         let addition = preview
             .app()
             .event_port_for_source(preview.program.addition_press_port)
             .expect("addition");
 
-        preview.dispatch_ui_events(tick(tick_port));
-        preview.dispatch_ui_events(tick(tick_port));
+        for batch in half_then_one_second_ticks(input_a_tick, input_b_tick) {
+            preview.dispatch_ui_events(batch);
+        }
         assert_eq!(preview.preview_text(), "A: 2B: 10A + B");
 
         preview.dispatch_ui_events(click(addition));
         assert_eq!(preview.preview_text(), "A: 2B: 10A + B12");
 
-        preview.dispatch_ui_events(tick(tick_port));
-        preview.dispatch_ui_events(tick(tick_port));
+        for batch in half_then_one_second_ticks(input_a_tick, input_b_tick) {
+            preview.dispatch_ui_events(batch);
+        }
         assert_eq!(preview.preview_text(), "A: 4B: 20A + B12");
 
         preview.dispatch_ui_events(click(addition));
@@ -474,10 +475,14 @@ mod tests {
         assert_eq!(preview.preview_text(), "A: 0B: 0A + BA - B");
 
         let _ = preview.render_snapshot();
-        let tick_port = preview
+        let input_a_tick = preview
             .app()
-            .event_port_for_source(preview.program.tick_port)
-            .expect("tick");
+            .event_port_for_source(preview.program.input_a_tick_port)
+            .expect("input_a tick");
+        let input_b_tick = preview
+            .app()
+            .event_port_for_source(preview.program.input_b_tick_port)
+            .expect("input_b tick");
         let addition = preview
             .app()
             .event_port_for_source(preview.program.addition_press_port)
@@ -487,13 +492,15 @@ mod tests {
             .event_port_for_source(preview.program.subtraction_press_port)
             .expect("subtraction");
 
-        preview.dispatch_ui_events(tick(tick_port));
-        preview.dispatch_ui_events(tick(tick_port));
+        for batch in half_then_one_second_ticks(input_a_tick, input_b_tick) {
+            preview.dispatch_ui_events(batch);
+        }
         preview.dispatch_ui_events(click(addition));
         assert_eq!(preview.preview_text(), "A: 2B: 10A + BA - B12");
 
-        preview.dispatch_ui_events(tick(tick_port));
-        preview.dispatch_ui_events(tick(tick_port));
+        for batch in half_then_one_second_ticks(input_a_tick, input_b_tick) {
+            preview.dispatch_ui_events(batch);
+        }
         assert_eq!(preview.preview_text(), "A: 4B: 20A + BA - B12");
 
         preview.dispatch_ui_events(click(subtraction));
@@ -507,10 +514,14 @@ mod tests {
         assert_eq!(preview.preview_text(), "A: 0B: 0A + BA - B");
 
         let _ = preview.render_snapshot();
-        let tick_port = preview
+        let input_a_tick = preview
             .app()
-            .event_port_for_source(preview.program.tick_port)
-            .expect("tick");
+            .event_port_for_source(preview.program.input_a_tick_port)
+            .expect("input_a tick");
+        let input_b_tick = preview
+            .app()
+            .event_port_for_source(preview.program.input_b_tick_port)
+            .expect("input_b tick");
         let addition = preview
             .app()
             .event_port_for_source(preview.program.addition_press_port)
@@ -520,20 +531,19 @@ mod tests {
             .event_port_for_source(preview.program.subtraction_press_port)
             .expect("subtraction");
 
-        preview.dispatch_ui_events(tick(tick_port));
-        preview.dispatch_ui_events(tick(tick_port));
+        for batch in half_then_one_second_ticks(input_a_tick, input_b_tick) {
+            preview.dispatch_ui_events(batch);
+        }
         preview.dispatch_ui_events(click(addition));
         assert_eq!(preview.preview_text(), "A: 2B: 10A + BA - B12");
 
-        preview.dispatch_ui_events(tick(tick_port));
-        preview.dispatch_ui_events(tick(tick_port));
+        preview.dispatch_ui_events(one_second_tick(input_a_tick, input_b_tick));
         assert_eq!(preview.preview_text(), "A: 4B: 20A + BA - B24");
 
         preview.dispatch_ui_events(click(subtraction));
         assert_eq!(preview.preview_text(), "A: 4B: 20A + BA - B-16");
 
-        preview.dispatch_ui_events(tick(tick_port));
-        preview.dispatch_ui_events(tick(tick_port));
+        preview.dispatch_ui_events(one_second_tick(input_a_tick, input_b_tick));
         assert_eq!(preview.preview_text(), "A: 6B: 30A + BA - B-24");
     }
 }

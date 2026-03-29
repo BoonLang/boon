@@ -1,10 +1,9 @@
-use crate::bridge::{HostInput, HostSnapshot};
+use crate::bridge::HostInput;
 use crate::ids::ActorId;
 use crate::input_form_runtime::{FormInputBinding, FormInputEvent};
 use crate::ir_executor::IrExecutor;
 use crate::lower::{FlightBookerProgram, try_lower_flight_booker};
 use crate::preview_runtime::PreviewRuntime;
-use crate::runtime::ActorKind;
 use crate::validated_form_runtime::ValidatedFormRuntime;
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
@@ -30,14 +29,14 @@ impl FlightBookerPreview {
     pub fn new(source: &str) -> Result<Self, String> {
         let program = try_lower_flight_booker(source)?;
         let mut runtime = PreviewRuntime::new();
-        let flight_type_actor = runtime.alloc_actor(ActorKind::SourcePort);
-        let departure_actor = runtime.alloc_actor(ActorKind::SourcePort);
-        let return_actor = runtime.alloc_actor(ActorKind::SourcePort);
-        let book_actor = runtime.alloc_actor(ActorKind::SourcePort);
+        let flight_type_actor = runtime.alloc_actor();
+        let departure_actor = runtime.alloc_actor();
+        let return_actor = runtime.alloc_actor();
+        let book_actor = runtime.alloc_actor();
         let executor = IrExecutor::new(program.ir.clone())?;
         let form = ValidatedFormRuntime::new(
             program.host_view.clone(),
-            executor.sink_values().clone(),
+            executor.sink_values(),
             [
                 FormInputBinding {
                     change_port: program.flight_type_change_port,
@@ -112,12 +111,14 @@ impl FlightBookerPreview {
             return;
         }
 
-        let messages = self.runtime.dispatch_snapshot(HostSnapshot::new(inputs));
-        self.executor
-            .apply_messages(&messages)
-            .expect("flight booker IR should execute");
-        for (sink, value) in self.executor.sink_values() {
-            self.form.set_sink_value(*sink, value.clone());
+        let (runtime, executor, form) = (&mut self.runtime, &mut self.executor, &mut self.form);
+        runtime.dispatch_inputs_batches(inputs.as_slice(), |messages| {
+            executor
+                .apply_pure_messages_owned(messages.drain(..))
+                .expect("flight booker IR should execute");
+        });
+        for (sink, value) in executor.sink_values() {
+            form.set_sink_value(sink, value);
         }
     }
 
@@ -136,7 +137,8 @@ impl FlightBookerPreview {
     }
 
     #[must_use]
-    pub fn app(&self) -> &crate::host_view_preview::HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &crate::host_view_preview::HostViewPreviewApp {
         self.form.app()
     }
 }

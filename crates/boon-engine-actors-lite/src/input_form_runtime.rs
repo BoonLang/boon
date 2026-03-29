@@ -50,7 +50,7 @@ impl<const N: usize> InputFormRuntime<N> {
     }
 
     #[must_use]
-    pub fn dispatch_ui_events(
+    pub(crate) fn dispatch_ui_events(
         &mut self,
         app: &HostViewPreviewApp,
         batch: &UiEventBatch,
@@ -150,6 +150,8 @@ mod tests {
                                 placeholder: "A".to_string(),
                                 change_port: bindings[0].change_port,
                                 key_down_port: bindings[0].key_down_port.expect("key port"),
+                                blur_port: None,
+                                focus_port: None,
                                 focus_on_mount: false,
                                 disabled_sink: None,
                             },
@@ -166,6 +168,8 @@ mod tests {
                                 placeholder: "B".to_string(),
                                 change_port: bindings[1].change_port,
                                 key_down_port: bindings[1].key_down_port.expect("key port"),
+                                blur_port: None,
+                                focus_port: None,
                                 focus_on_mount: false,
                                 disabled_sink: None,
                             },

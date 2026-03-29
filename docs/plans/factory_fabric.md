@@ -2,8 +2,10 @@
 
 ## Status
 
+- Superseded as the forward-engine direction by `docs/plans/ACTORSLITE_STRICT_UNIFIED_ENGINE_PLAN.md` on 2026-03-30.
+- Use this document as donor/comparison context only unless the repo explicitly revives FactoryFabric as an experimental side path.
 - Proposed engine direction for Boon.
-- This document is the source-of-truth implementation plan for a candidate new engine named `FactoryFabric`.
+- This document is no longer the forward implementation source of truth.
 - Suggested new crate: `crates/boon-engine-factory-fabric`.
 - The repo currently already exposes four engines in the playground: `Actors`, `ActorsLite`, `DD`, and `Wasm`.
 - `FactoryFabric` is a fifth engine experiment.

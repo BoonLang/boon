@@ -49,6 +49,7 @@ impl<F: Copy> SelectedListFilter<F> {
     }
 }
 
+#[cfg(test)]
 impl SelectedListFilter<bool> {
     pub(crate) fn toggle(&mut self) -> bool {
         self.select(!self.current)

@@ -32,6 +32,7 @@ Codex must treat the following as hard constraints, not suggestions.
 - Do **not** add `Sheet/*` builtins or `if example == cells` fast paths.
 - Do **not** add fixed runtime assumptions such as 26 columns, 100 rows, or hardcoded A1/B1/C1 knowledge.
 - Do **not** add generated Boon source or source rewriting to make a specific example pass.
+- Do **not** add lowering helpers, configs, or semantic/view/persistence families whose shape is business-specific when the same concern can be expressed as a language-level lowering family.
 - Do **not** key list identity by render order or value equality when a stable item identity exists.
 - Do **not** keep example-name or source-marker checks in the final lowerer.
 
@@ -849,6 +850,7 @@ Do not start later phases while earlier phase exit criteria are red.
 5. Carry persistence metadata through lowering.
 6. Add lower-time diagnostics for unsupported constructs.
 7. Add lower tests using small purpose-built Boon snippets, not example-name detection.
+8. Audit the lowerer for business-specific items and replace them with lowerer-owned generic semantic/view/persistence families or explicit unsupported-construct diagnostics.
 
 ### Mandatory rule
 
@@ -858,6 +860,7 @@ Do **not** delete the old example-specific lowerers until the generic lowerer co
 
 - `counter`, `todo_mvc`, and minimal list/control examples lower through the generic pipeline;
 - no new `try_lower_*` functions are added;
+- existing business-specific lowering items have been audited, and new lowering work is blocked from introducing fresh business-specific helpers/configs/families;
 - unsupported features fail explicitly in the generic lowerer.
 
 ---
@@ -1139,6 +1142,7 @@ Before declaring completion, Codex must explicitly check and fix these repositor
 
 - replace example-specific lowering as the production path;
 - keep only generic lowering/runtime/bridge code;
+- audit remaining lowering helpers/configs/families for business-specific shape and either generalize or delete them;
 - remove static acceptance-green logic;
 - keep metrics and verification grounded in real execution.
 
@@ -1196,10 +1200,11 @@ Codex must work in this order:
 1. make the generic architecture real;
 2. make semantics correct;
 3. make persistence real;
-4. make milestone examples pass;
-5. make `cells` and `cells_dynamic` fast generically;
-6. remove temporary structures;
-7. cut over to one real engine.
+4. actively reject new business-specific lowering items, even if they look like a fast local path;
+5. make milestone examples pass;
+6. make `cells` and `cells_dynamic` fast generically;
+7. remove temporary structures;
+8. cut over to one real engine.
 
 Codex must not optimize for a green screenshot or one example at the cost of genericity.
 

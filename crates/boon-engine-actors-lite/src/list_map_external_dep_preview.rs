@@ -1,4 +1,4 @@
-use crate::bridge::{HostInput, HostSnapshot};
+use crate::bridge::HostInput;
 use crate::host_view_preview::HostViewPreviewApp;
 use crate::ids::ActorId;
 use crate::interactive_preview::{InteractivePreview, render_interactive_preview};
@@ -6,7 +6,6 @@ use crate::ir::SinkPortId;
 use crate::ir_executor::IrExecutor;
 use crate::lower::{ListMapExternalDepProgram, try_lower_list_map_external_dep};
 use crate::preview_runtime::PreviewRuntime;
-use crate::runtime::ActorKind;
 use crate::slot_projection::{project_slot_values_into_app, project_slot_values_into_map};
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
@@ -27,7 +26,7 @@ impl ListMapExternalDepPreview {
     pub fn new(source: &str) -> Result<Self, String> {
         let program = try_lower_list_map_external_dep(source)?;
         let mut runtime = PreviewRuntime::new();
-        let host_actor = runtime.alloc_actor(ActorKind::SourcePort);
+        let host_actor = runtime.alloc_actor();
         let executor = IrExecutor::new(program.ir.clone())?;
         let app = HostViewPreviewApp::new(
             program.host_view.clone(),
@@ -52,7 +51,8 @@ impl ListMapExternalDepPreview {
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
     }
 
@@ -107,10 +107,14 @@ impl ListMapExternalDepPreview {
         if inputs.is_empty() {
             return false;
         }
-        let messages = self.runtime.dispatch_snapshot(HostSnapshot::new(inputs));
-        self.executor
-            .apply_messages(&messages)
-            .expect("list_map_external_dep IR should execute");
+        let Self {
+            runtime, executor, ..
+        } = self;
+        runtime.dispatch_inputs_batches(inputs.as_slice(), |messages| {
+            executor
+                .apply_pure_messages_owned(messages.drain(..))
+                .expect("list_map_external_dep IR should execute");
+        });
         self.refresh_sink_values();
         true
     }

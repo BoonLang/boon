@@ -46,7 +46,11 @@ impl<const N: usize> MultiInputState<N> {
         true
     }
 
-    pub fn dispatch_ui_events(&mut self, app: &HostViewPreviewApp, batch: &UiEventBatch) -> bool {
+    pub(crate) fn dispatch_ui_events(
+        &mut self,
+        app: &HostViewPreviewApp,
+        batch: &UiEventBatch,
+    ) -> bool {
         let event_ports = self
             .input_ports()
             .iter()
@@ -111,6 +115,8 @@ mod tests {
                                 placeholder: "A".to_string(),
                                 change_port: input_ports[0],
                                 key_down_port: SourcePortId(20),
+                                blur_port: None,
+                                focus_port: None,
                                 focus_on_mount: false,
                                 disabled_sink: None,
                             },
@@ -127,6 +133,8 @@ mod tests {
                                 placeholder: "B".to_string(),
                                 change_port: input_ports[1],
                                 key_down_port: SourcePortId(21),
+                                blur_port: None,
+                                focus_port: None,
                                 focus_on_mount: false,
                                 disabled_sink: None,
                             },

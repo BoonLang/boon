@@ -19,7 +19,7 @@ impl<T, const N: usize> MappedItemStateRuntime<T, N> {
         }
     }
 
-    pub fn dispatch_ui_events(
+    pub(crate) fn dispatch_ui_events(
         &mut self,
         app: &HostViewPreviewApp,
         batch: UiEventBatch,
@@ -59,7 +59,7 @@ impl<T, const N: usize> MappedItemStateRuntime<T, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{HostViewIr, HostViewKind, HostViewNode};
+    use crate::bridge::{HostButtonLabel, HostViewIr, HostViewKind, HostViewNode};
     use crate::host_view_preview::HostViewPreviewApp;
     use crate::ir::{FunctionInstanceId, RetainedNodeKey, SinkPortId, ViewSiteId};
     use boon::platform::browser::kernel::KernelValue;
@@ -84,7 +84,7 @@ mod tests {
                                 mapped_item_identity: Some(1),
                             },
                             kind: HostViewKind::Button {
-                                label: "A".to_string(),
+                                label: HostButtonLabel::Static("A".to_string()),
                                 press_port: first_port,
                                 disabled_sink: None,
                             },
@@ -97,7 +97,7 @@ mod tests {
                                 mapped_item_identity: Some(2),
                             },
                             kind: HostViewKind::Button {
-                                label: "B".to_string(),
+                                label: HostButtonLabel::Static("B".to_string()),
                                 press_port: second_port,
                                 disabled_sink: None,
                             },

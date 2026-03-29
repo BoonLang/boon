@@ -1,10 +1,9 @@
-use crate::bridge::{HostInput, HostSnapshot};
+use crate::bridge::HostInput;
 use crate::ids::ActorId;
 use crate::input_form_runtime::{FormInputBinding, FormInputEvent};
 use crate::ir_executor::IrExecutor;
 use crate::lower::{TimerProgram, try_lower_timer};
 use crate::preview_runtime::PreviewRuntime;
-use crate::runtime::ActorKind;
 use crate::validated_form_runtime::ValidatedFormRuntime;
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
@@ -25,13 +24,13 @@ impl TimerPreview {
     pub fn new(source: &str) -> Result<Self, String> {
         let program = try_lower_timer(source)?;
         let mut runtime = PreviewRuntime::new();
-        let duration_actor = runtime.alloc_actor(ActorKind::SourcePort);
-        let reset_actor = runtime.alloc_actor(ActorKind::SourcePort);
-        let tick_actor = runtime.alloc_actor(ActorKind::SourcePort);
+        let duration_actor = runtime.alloc_actor();
+        let reset_actor = runtime.alloc_actor();
+        let tick_actor = runtime.alloc_actor();
         let executor = IrExecutor::new(program.ir.clone())?;
         let form = ValidatedFormRuntime::new(
             program.host_view.clone(),
-            executor.sink_values().clone(),
+            executor.sink_values(),
             [FormInputBinding {
                 change_port: program.duration_change_port,
                 key_down_port: None,
@@ -101,12 +100,14 @@ impl TimerPreview {
             return;
         }
 
-        let messages = self.runtime.dispatch_snapshot(HostSnapshot::new(inputs));
-        self.executor
-            .apply_messages(&messages)
-            .expect("timer IR should execute");
-        for (sink, value) in self.executor.sink_values() {
-            self.form.set_sink_value(*sink, value.clone());
+        let (runtime, executor, form) = (&mut self.runtime, &mut self.executor, &mut self.form);
+        runtime.dispatch_inputs_batches(inputs.as_slice(), |messages| {
+            executor
+                .apply_pure_messages_owned(messages.drain(..))
+                .expect("timer IR should execute");
+        });
+        for (sink, value) in executor.sink_values() {
+            form.set_sink_value(sink, value);
         }
     }
 
@@ -125,7 +126,8 @@ impl TimerPreview {
     }
 
     #[must_use]
-    pub fn app(&self) -> &crate::host_view_preview::HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &crate::host_view_preview::HostViewPreviewApp {
         self.form.app()
     }
 }

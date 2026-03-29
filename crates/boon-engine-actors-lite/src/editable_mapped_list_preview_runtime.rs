@@ -11,7 +11,7 @@ use boon_renderer_zoon::FakeRenderState;
 use boon_scene::{UiEventBatch, UiNode};
 use std::collections::BTreeMap;
 
-pub trait EditableMappedListProjection<T, const INPUTS: usize, const ROWS: usize> {
+pub(crate) trait EditableMappedListProjection<T, const INPUTS: usize, const ROWS: usize> {
     fn host_view(&self) -> &HostViewIr;
 
     fn initial_sink_values(
@@ -26,7 +26,7 @@ pub trait EditableMappedListProjection<T, const INPUTS: usize, const ROWS: usize
     );
 }
 
-pub struct EditableMappedListPreviewRuntime<
+pub(crate) struct EditableMappedListPreviewRuntime<
     T,
     P,
     const INPUTS: usize,
@@ -45,7 +45,7 @@ where
     P: EditableMappedListProjection<T, INPUTS, ROWS>,
 {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         projection: P,
         state: EditableMappedListRuntime<T, INPUTS, ROWS>,
         button_ports: [SourcePortId; BUTTONS],
@@ -61,7 +61,7 @@ where
         }
     }
 
-    pub fn dispatch_ui_events(
+    pub(crate) fn dispatch_ui_events(
         &mut self,
         batch: UiEventBatch,
         is_visible: impl Fn(&MappedListItem<T>) -> bool,
@@ -69,7 +69,7 @@ where
             &mut EditableMappedListRuntime<T, INPUTS, ROWS>,
             Vec<SourcePortId>,
         ) -> bool,
-    ) {
+    ) -> bool {
         let _ = self.render_root();
         let mut changed = self.state.dispatch_input_events(&self.app, &batch);
 
@@ -83,25 +83,22 @@ where
             self.projection
                 .refresh_sink_values(&mut self.app, &self.state);
         }
-    }
-
-    pub fn refresh(&mut self) {
-        self.projection
-            .refresh_sink_values(&mut self.app, &self.state);
+        changed
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
     }
 
-    #[must_use]
-    pub fn state(&self) -> &EditableMappedListRuntime<T, INPUTS, ROWS> {
-        &self.state
+    pub(crate) fn app_mut(&mut self) -> &mut HostViewPreviewApp {
+        &mut self.app
     }
 
-    pub fn state_mut(&mut self) -> &mut EditableMappedListRuntime<T, INPUTS, ROWS> {
-        &mut self.state
+    #[must_use]
+    pub(crate) fn state(&self) -> &EditableMappedListRuntime<T, INPUTS, ROWS> {
+        &self.state
     }
 
     #[must_use]
@@ -109,7 +106,7 @@ where
         self.app.render_root()
     }
 
-    pub fn render_snapshot(&mut self) -> (UiNode, FakeRenderState) {
+    pub(crate) fn render_snapshot(&mut self) -> (UiNode, FakeRenderState) {
         self.app.render_snapshot()
     }
 
@@ -119,7 +116,7 @@ where
     }
 }
 
-pub fn render_editable_mapped_list_preview<
+pub(crate) fn render_editable_mapped_list_preview<
     T: 'static,
     P: EditableMappedListProjection<T, INPUTS, ROWS> + 'static,
     const INPUTS: usize,

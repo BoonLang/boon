@@ -1,11 +1,10 @@
-use crate::bridge::{HostInput, HostSnapshot};
+use crate::bridge::HostInput;
 use crate::host_view_preview::HostViewPreviewApp;
 use crate::ids::ActorId;
 use crate::interactive_preview::{InteractivePreview, render_interactive_preview};
 use crate::ir_executor::IrExecutor;
 use crate::lower::{ComplexCounterProgram, try_lower_complex_counter};
 use crate::preview_runtime::PreviewRuntime;
-use crate::runtime::ActorKind;
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
 use boon_renderer_zoon::FakeRenderState;
@@ -24,11 +23,11 @@ impl ComplexCounterPreview {
     pub fn new(source: &str) -> Result<Self, String> {
         let program = try_lower_complex_counter(source)?;
         let mut runtime = PreviewRuntime::new();
-        let decrement_actor = runtime.alloc_actor(ActorKind::SourcePort);
-        let increment_actor = runtime.alloc_actor(ActorKind::SourcePort);
+        let decrement_actor = runtime.alloc_actor();
+        let increment_actor = runtime.alloc_actor();
         let executor = IrExecutor::new(program.ir.clone())?;
 
-        let sink_values = executor.sink_values().clone();
+        let sink_values = executor.sink_values();
         let app = HostViewPreviewApp::new(program.host_view.clone(), sink_values);
 
         Ok(Self {
@@ -42,21 +41,37 @@ impl ComplexCounterPreview {
     }
 
     pub fn click_decrement(&mut self) {
-        let messages = self.runtime.dispatch_pulse(
-            self.decrement_actor,
-            self.program.decrement_port,
+        let Self {
+            runtime,
+            decrement_actor,
+            program,
+            executor,
+            app,
+            ..
+        } = self;
+        runtime.dispatch_pulse_batches(
+            *decrement_actor,
+            program.decrement_port,
             KernelValue::from("press"),
+            |messages| Self::apply_runtime_messages(executor, app, messages),
         );
-        self.apply_runtime_messages(messages);
     }
 
     pub fn click_increment(&mut self) {
-        let messages = self.runtime.dispatch_pulse(
-            self.increment_actor,
-            self.program.increment_port,
+        let Self {
+            runtime,
+            increment_actor,
+            program,
+            executor,
+            app,
+            ..
+        } = self;
+        runtime.dispatch_pulse_batches(
+            *increment_actor,
+            program.increment_port,
             KernelValue::from("press"),
+            |messages| Self::apply_runtime_messages(executor, app, messages),
         );
-        self.apply_runtime_messages(messages);
     }
 
     pub fn dispatch_ui_events(&mut self, batch: UiEventBatch) {
@@ -101,8 +116,15 @@ impl ComplexCounterPreview {
         if inputs.is_empty() {
             return;
         }
-        let messages = self.runtime.dispatch_snapshot(HostSnapshot::new(inputs));
-        self.apply_runtime_messages(messages);
+        let Self {
+            runtime,
+            executor,
+            app,
+            ..
+        } = self;
+        runtime.dispatch_inputs_batches(inputs.as_slice(), |messages| {
+            Self::apply_runtime_messages(executor, app, messages)
+        });
     }
 
     #[must_use]
@@ -127,12 +149,16 @@ impl ComplexCounterPreview {
         Some((decrement.id, increment.id))
     }
 
-    fn apply_runtime_messages(&mut self, messages: Vec<(ActorId, crate::runtime::Msg)>) {
-        self.executor
-            .apply_messages(&messages)
+    fn apply_runtime_messages(
+        executor: &mut IrExecutor,
+        app: &mut HostViewPreviewApp,
+        messages: &mut Vec<crate::runtime::Msg>,
+    ) {
+        executor
+            .apply_pure_messages_owned(messages.drain(..))
             .expect("complex counter IR should execute");
-        for (sink, value) in self.executor.sink_values() {
-            self.app.set_sink_value(*sink, value.clone());
+        for (sink, value) in executor.sink_values() {
+            app.set_sink_value(sink, value);
         }
     }
 }

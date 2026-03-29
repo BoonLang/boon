@@ -40,7 +40,8 @@ pub(crate) fn dispatch_text_filtered_ui_events<
         &mut EditableMappedListRuntime<T, INPUTS, ROWS>,
         Vec<SourcePortId>,
     ) -> bool,
-) where
+) -> bool
+where
     P: TextFilteredEditableMappedListProjection<T, INPUTS, ROWS>,
 {
     let filter_text = runtime.state().input(P::FILTER_INPUT_INDEX).to_string();
@@ -48,5 +49,5 @@ pub(crate) fn dispatch_text_filtered_ui_events<
         batch,
         move |item| P::item_matches_filter(&filter_text, item),
         on_button_clicks,
-    );
+    )
 }

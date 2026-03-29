@@ -1,16 +1,17 @@
-use crate::bridge::HostSnapshot;
+use crate::bridge::HostInput;
 use crate::clock::MonotonicInstant;
 use crate::host_view_preview::HostViewPreviewApp;
 use crate::ids::ActorId;
 use crate::ir_executor::IrExecutor;
-use crate::lower::{CounterProgram, try_lower_counter};
+use crate::lower::{CounterProgram, lower_program};
 use crate::metrics::{CounterMetricsReport, LatencySummary};
 use crate::preview_runtime::PreviewRuntime;
-use crate::runtime::ActorKind;
 use crate::runtime::RuntimeTelemetrySnapshot;
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
-use boon_renderer_zoon::{FakeRenderState, RenderInteractionHandlers, render_retained_snapshot_signal};
+use boon_renderer_zoon::{
+    FakeRenderState, RenderInteractionHandlers, render_retained_snapshot_signal,
+};
 use boon_scene::{RenderRoot, UiEventBatch, UiEventKind, UiFactBatch, UiNode};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -24,12 +25,15 @@ pub struct CounterPreview {
 
 impl CounterPreview {
     pub fn new(source: &str) -> Result<Self, String> {
-        let program = try_lower_counter(source)?;
+        Self::from_program(lower_program(source)?.into_counter_program()?)
+    }
+
+    pub fn from_program(program: CounterProgram) -> Result<Self, String> {
         let mut runtime = PreviewRuntime::new();
-        let button_actor = runtime.alloc_actor(ActorKind::SourcePort);
+        let button_actor = runtime.alloc_actor();
         let executor = IrExecutor::new(program.ir.clone())?;
 
-        let sink_values = executor.sink_values().clone();
+        let sink_values = executor.sink_values();
         let app = HostViewPreviewApp::new(program.host_view.clone(), sink_values);
 
         Ok(Self {
@@ -41,23 +45,32 @@ impl CounterPreview {
         })
     }
 
-    #[must_use]
-    pub fn root_scope_id(&self) -> crate::ids::ScopeId {
-        self.runtime.root_scope_id()
-    }
-
     pub fn click_increment(&mut self) {
-        let messages = self.runtime.dispatch_pulse(
-            self.button_actor,
-            self.program.press_port,
+        let Self {
+            runtime,
+            button_actor,
+            program,
+            executor,
+            app,
+        } = self;
+        runtime.dispatch_pulse_batches(
+            *button_actor,
+            program.press_port,
             KernelValue::from("press"),
+            |messages| Self::apply_runtime_messages(executor, app, messages),
         );
-        self.apply_runtime_messages(messages);
     }
 
-    pub fn dispatch_snapshot(&mut self, snapshot: HostSnapshot) {
-        let messages = self.runtime.dispatch_snapshot(snapshot);
-        self.apply_runtime_messages(messages);
+    pub fn dispatch_inputs(&mut self, inputs: &[HostInput]) {
+        let Self {
+            runtime,
+            executor,
+            app,
+            ..
+        } = self;
+        runtime.dispatch_inputs_batches(inputs, |messages| {
+            Self::apply_runtime_messages(executor, app, messages)
+        });
     }
 
     pub fn dispatch_ui_events(&mut self, batch: UiEventBatch) {
@@ -91,17 +104,21 @@ impl CounterPreview {
         self.app.preview_text()
     }
 
-    fn apply_runtime_messages(&mut self, messages: Vec<(ActorId, crate::runtime::Msg)>) {
-        self.executor
-            .apply_messages(&messages)
+    fn apply_runtime_messages(
+        executor: &mut IrExecutor,
+        app: &mut HostViewPreviewApp,
+        messages: &mut Vec<crate::runtime::Msg>,
+    ) {
+        executor
+            .apply_pure_messages_owned(messages.drain(..))
             .expect("counter IR should execute");
-        for (sink, value) in self.executor.sink_values() {
-            self.app.set_sink_value(*sink, value.clone());
+        for (sink, value) in executor.sink_values() {
+            app.set_sink_value(sink, value);
         }
     }
 
     #[must_use]
-    pub fn runtime_telemetry_snapshot(&self) -> RuntimeTelemetrySnapshot {
+    pub(crate) fn runtime_telemetry_snapshot(&self) -> RuntimeTelemetrySnapshot {
         self.runtime.telemetry_snapshot()
     }
 }
@@ -214,7 +231,7 @@ mod tests {
         let mut preview = CounterPreview::new(source).expect("counter preview");
         let actor = preview.button_actor;
         let port = preview.program.press_port;
-        preview.dispatch_snapshot(HostSnapshot::new(vec![
+        preview.dispatch_inputs(&[
             HostInput::Pulse {
                 actor,
                 port,
@@ -233,7 +250,7 @@ mod tests {
                 value: KernelValue::from("press"),
                 seq: CausalSeq::new(1, 2),
             },
-        ]));
+        ]);
         assert_eq!(preview.preview_text(), "3+");
     }
 
@@ -258,7 +275,7 @@ mod tests {
                 });
             }
             expected += batch_len as i64;
-            preview.dispatch_snapshot(HostSnapshot::new(inputs));
+            preview.dispatch_inputs(inputs.as_slice());
             assert_eq!(preview.preview_text(), format!("{expected}+"));
         }
     }

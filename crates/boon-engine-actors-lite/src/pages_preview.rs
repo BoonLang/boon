@@ -33,7 +33,8 @@ impl PagesPreview {
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
     }
 
@@ -125,6 +126,15 @@ fn sink_values_for_route(
     };
 
     BTreeMap::from([
+        (
+            program.current_page_sink,
+            match normalized.as_str() {
+                HOME_ROUTE => KernelValue::Tag("Home".to_string()),
+                ABOUT_ROUTE => KernelValue::Tag("About".to_string()),
+                CONTACT_ROUTE => KernelValue::Tag("Contact".to_string()),
+                _ => KernelValue::Tag("NotFound".to_string()),
+            },
+        ),
         (program.title_sink, KernelValue::from(title)),
         (program.description_sink, KernelValue::from(description)),
         (

@@ -1,18 +1,5 @@
 use crate::acceptance::actors_lite_public_exposure_enabled;
-use crate::cells_preview::try_lower_cells_program;
-use crate::lower::{
-    try_lower_button_hover_test, try_lower_button_hover_to_click_test,
-    try_lower_chained_list_remove_bug, try_lower_checkbox_test, try_lower_circle_drawer,
-    try_lower_complex_counter, try_lower_counter, try_lower_crud, try_lower_fibonacci,
-    try_lower_filter_checkbox_bug, try_lower_flight_booker, try_lower_interval,
-    try_lower_interval_hold, try_lower_latest, try_lower_layers, try_lower_list_map_block,
-    try_lower_list_map_external_dep, try_lower_list_object_state, try_lower_list_retain_count,
-    try_lower_list_retain_reactive, try_lower_list_retain_remove, try_lower_pages,
-    try_lower_shopping_list, try_lower_static_document, try_lower_switch_hold_test,
-    try_lower_temperature_converter, try_lower_text_interpolation_update, try_lower_then,
-    try_lower_timer, try_lower_todo_mvc, try_lower_todo_mvc_physical, try_lower_when,
-    try_lower_while, try_lower_while_function_call,
-};
+use crate::lower::{LoweredProgram, lower_program};
 
 pub const SUPPORTED_PLAYGROUND_EXAMPLES: &[&str] = &[
     "minimal",
@@ -35,7 +22,6 @@ pub const SUPPORTED_PLAYGROUND_EXAMPLES: &[&str] = &[
     "button_hover_to_click_test",
     "switch_hold_test",
     "shopping_list",
-    "todo_mvc_physical",
     "todo_mvc",
     "list_retain_reactive",
     "list_map_external_dep",
@@ -78,7 +64,6 @@ pub const PUBLIC_PLAYGROUND_EXAMPLES: &[&str] = &[
     "when",
     "while",
     "while_function_call",
-    "todo_mvc_physical",
     "todo_mvc",
     "cells",
     "cells_dynamic",
@@ -142,7 +127,6 @@ pub enum ActorsLiteSourceKind {
     TemperatureConverter,
     FlightBooker,
     Timer,
-    TodoMvcPhysical,
     TodoMvc,
     Cells,
     StaticDocument,
@@ -151,214 +135,70 @@ pub enum ActorsLiteSourceKind {
 pub fn classify_source(source: &str) -> Result<ActorsLiteSourceKind, Vec<String>> {
     let mut errors = Vec::new();
 
-    if try_lower_todo_mvc_physical(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::TodoMvcPhysical);
-    } else if let Err(error) = try_lower_todo_mvc_physical(source) {
-        errors.push(format!("todo_mvc_physical: {error}"));
-    }
-
-    if try_lower_todo_mvc(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::TodoMvc);
-    } else if let Err(error) = try_lower_todo_mvc(source) {
-        errors.push(format!("todo_mvc: {error}"));
-    }
-
-    if try_lower_cells_program(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::Cells);
-    } else if let Err(error) = try_lower_cells_program(source) {
-        errors.push(format!("cells: {error}"));
-    }
-
-    if try_lower_complex_counter(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::ComplexCounter);
-    } else if let Err(error) = try_lower_complex_counter(source) {
-        errors.push(format!("complex_counter: {error}"));
-    }
-
-    if try_lower_interval(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::Interval);
-    } else if let Err(error) = try_lower_interval(source) {
-        errors.push(format!("interval: {error}"));
-    }
-
-    if try_lower_interval_hold(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::IntervalHold);
-    } else if let Err(error) = try_lower_interval_hold(source) {
-        errors.push(format!("interval_hold: {error}"));
-    }
-
-    if try_lower_fibonacci(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::Fibonacci);
-    } else if let Err(error) = try_lower_fibonacci(source) {
-        errors.push(format!("fibonacci: {error}"));
-    }
-
-    if try_lower_layers(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::Layers);
-    } else if let Err(error) = try_lower_layers(source) {
-        errors.push(format!("layers: {error}"));
-    }
-
-    if try_lower_pages(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::Pages);
-    } else if let Err(error) = try_lower_pages(source) {
-        errors.push(format!("pages: {error}"));
-    }
-
-    if try_lower_latest(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::Latest);
-    } else if let Err(error) = try_lower_latest(source) {
-        errors.push(format!("latest: {error}"));
-    }
-
-    if try_lower_text_interpolation_update(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::TextInterpolationUpdate);
-    } else if let Err(error) = try_lower_text_interpolation_update(source) {
-        errors.push(format!("text_interpolation_update: {error}"));
-    }
-
-    if try_lower_then(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::Then);
-    } else if let Err(error) = try_lower_then(source) {
-        errors.push(format!("then: {error}"));
-    }
-
-    if try_lower_when(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::When);
-    } else if let Err(error) = try_lower_when(source) {
-        errors.push(format!("when: {error}"));
-    }
-
-    if try_lower_while(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::While);
-    } else if let Err(error) = try_lower_while(source) {
-        errors.push(format!("while: {error}"));
-    }
-
-    if try_lower_while_function_call(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::WhileFunctionCall);
-    } else if let Err(error) = try_lower_while_function_call(source) {
-        errors.push(format!("while_function_call: {error}"));
-    }
-
-    if try_lower_button_hover_test(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::ButtonHoverTest);
-    } else if let Err(error) = try_lower_button_hover_test(source) {
-        errors.push(format!("button_hover_test: {error}"));
-    }
-
-    if try_lower_button_hover_to_click_test(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::ButtonHoverToClickTest);
-    } else if let Err(error) = try_lower_button_hover_to_click_test(source) {
-        errors.push(format!("button_hover_to_click_test: {error}"));
-    }
-
-    if try_lower_switch_hold_test(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::SwitchHoldTest);
-    } else if let Err(error) = try_lower_switch_hold_test(source) {
-        errors.push(format!("switch_hold_test: {error}"));
-    }
-
-    if try_lower_list_retain_reactive(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::ListRetainReactive);
-    } else if let Err(error) = try_lower_list_retain_reactive(source) {
-        errors.push(format!("list_retain_reactive: {error}"));
-    }
-
-    if try_lower_list_map_external_dep(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::ListMapExternalDep);
-    } else if let Err(error) = try_lower_list_map_external_dep(source) {
-        errors.push(format!("list_map_external_dep: {error}"));
-    }
-
-    if try_lower_list_map_block(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::ListMapBlock);
-    } else if let Err(error) = try_lower_list_map_block(source) {
-        errors.push(format!("list_map_block: {error}"));
-    }
-
-    if try_lower_list_retain_count(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::ListRetainCount);
-    } else if let Err(error) = try_lower_list_retain_count(source) {
-        errors.push(format!("list_retain_count: {error}"));
-    }
-
-    if try_lower_list_object_state(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::ListObjectState);
-    } else if let Err(error) = try_lower_list_object_state(source) {
-        errors.push(format!("list_object_state: {error}"));
-    }
-
-    if try_lower_list_retain_remove(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::ListRetainRemove);
-    } else if let Err(error) = try_lower_list_retain_remove(source) {
-        errors.push(format!("list_retain_remove: {error}"));
-    }
-
-    if try_lower_shopping_list(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::ShoppingList);
-    } else if let Err(error) = try_lower_shopping_list(source) {
-        errors.push(format!("shopping_list: {error}"));
-    }
-
-    if try_lower_filter_checkbox_bug(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::FilterCheckboxBug);
-    } else if let Err(error) = try_lower_filter_checkbox_bug(source) {
-        errors.push(format!("filter_checkbox_bug: {error}"));
-    }
-
-    if try_lower_checkbox_test(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::CheckboxTest);
-    } else if let Err(error) = try_lower_checkbox_test(source) {
-        errors.push(format!("checkbox_test: {error}"));
-    }
-
-    if try_lower_chained_list_remove_bug(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::ChainedListRemoveBug);
-    } else if let Err(error) = try_lower_chained_list_remove_bug(source) {
-        errors.push(format!("chained_list_remove_bug: {error}"));
-    }
-
-    if try_lower_circle_drawer(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::CircleDrawer);
-    } else if let Err(error) = try_lower_circle_drawer(source) {
-        errors.push(format!("circle_drawer: {error}"));
-    }
-
-    if try_lower_crud(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::Crud);
-    } else if let Err(error) = try_lower_crud(source) {
-        errors.push(format!("crud: {error}"));
-    }
-
-    if try_lower_temperature_converter(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::TemperatureConverter);
-    } else if let Err(error) = try_lower_temperature_converter(source) {
-        errors.push(format!("temperature_converter: {error}"));
-    }
-
-    if try_lower_flight_booker(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::FlightBooker);
-    } else if let Err(error) = try_lower_flight_booker(source) {
-        errors.push(format!("flight_booker: {error}"));
-    }
-
-    if try_lower_timer(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::Timer);
-    } else if let Err(error) = try_lower_timer(source) {
-        errors.push(format!("timer: {error}"));
-    }
-
-    if try_lower_counter(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::Counter);
-    } else if let Err(error) = try_lower_counter(source) {
-        errors.push(format!("counter: {error}"));
-    }
-
-    if try_lower_static_document(source).is_ok() {
-        return Ok(ActorsLiteSourceKind::StaticDocument);
-    } else if let Err(error) = try_lower_static_document(source) {
-        errors.push(format!("static: {error}"));
+    match lower_program(source) {
+        Ok(LoweredProgram::Counter(_)) => return Ok(ActorsLiteSourceKind::Counter),
+        Ok(LoweredProgram::ComplexCounter(_)) => return Ok(ActorsLiteSourceKind::ComplexCounter),
+        Ok(LoweredProgram::TodoMvc(_)) => return Ok(ActorsLiteSourceKind::TodoMvc),
+        Ok(LoweredProgram::Interval(_)) => return Ok(ActorsLiteSourceKind::Interval),
+        Ok(LoweredProgram::IntervalHold(_)) => return Ok(ActorsLiteSourceKind::IntervalHold),
+        Ok(LoweredProgram::Fibonacci(_)) => return Ok(ActorsLiteSourceKind::Fibonacci),
+        Ok(LoweredProgram::Layers(_)) => return Ok(ActorsLiteSourceKind::Layers),
+        Ok(LoweredProgram::Pages(_)) => return Ok(ActorsLiteSourceKind::Pages),
+        Ok(LoweredProgram::Latest(_)) => return Ok(ActorsLiteSourceKind::Latest),
+        Ok(LoweredProgram::TextInterpolationUpdate(_)) => {
+            return Ok(ActorsLiteSourceKind::TextInterpolationUpdate);
+        }
+        Ok(LoweredProgram::ButtonHoverToClickTest(_)) => {
+            return Ok(ActorsLiteSourceKind::ButtonHoverToClickTest);
+        }
+        Ok(LoweredProgram::ButtonHoverTest(_)) => {
+            return Ok(ActorsLiteSourceKind::ButtonHoverTest);
+        }
+        Ok(LoweredProgram::FilterCheckboxBug(_)) => {
+            return Ok(ActorsLiteSourceKind::FilterCheckboxBug);
+        }
+        Ok(LoweredProgram::CheckboxTest(_)) => {
+            return Ok(ActorsLiteSourceKind::CheckboxTest);
+        }
+        Ok(LoweredProgram::TemperatureConverter(_)) => {
+            return Ok(ActorsLiteSourceKind::TemperatureConverter);
+        }
+        Ok(LoweredProgram::FlightBooker(_)) => {
+            return Ok(ActorsLiteSourceKind::FlightBooker);
+        }
+        Ok(LoweredProgram::Timer(_)) => return Ok(ActorsLiteSourceKind::Timer),
+        Ok(LoweredProgram::ListMapExternalDep(_)) => {
+            return Ok(ActorsLiteSourceKind::ListMapExternalDep);
+        }
+        Ok(LoweredProgram::ListMapBlock(_)) => return Ok(ActorsLiteSourceKind::ListMapBlock),
+        Ok(LoweredProgram::ListRetainCount(_)) => {
+            return Ok(ActorsLiteSourceKind::ListRetainCount);
+        }
+        Ok(LoweredProgram::ListObjectState(_)) => return Ok(ActorsLiteSourceKind::ListObjectState),
+        Ok(LoweredProgram::ChainedListRemoveBug(_)) => {
+            return Ok(ActorsLiteSourceKind::ChainedListRemoveBug);
+        }
+        Ok(LoweredProgram::Crud(_)) => return Ok(ActorsLiteSourceKind::Crud),
+        Ok(LoweredProgram::ListRetainRemove(_)) => {
+            return Ok(ActorsLiteSourceKind::ListRetainRemove);
+        }
+        Ok(LoweredProgram::ShoppingList(_)) => return Ok(ActorsLiteSourceKind::ShoppingList),
+        Ok(LoweredProgram::ListRetainReactive(_)) => {
+            return Ok(ActorsLiteSourceKind::ListRetainReactive);
+        }
+        Ok(LoweredProgram::Then(_)) => return Ok(ActorsLiteSourceKind::Then),
+        Ok(LoweredProgram::When(_)) => return Ok(ActorsLiteSourceKind::When),
+        Ok(LoweredProgram::While(_)) => return Ok(ActorsLiteSourceKind::While),
+        Ok(LoweredProgram::WhileFunctionCall(_)) => {
+            return Ok(ActorsLiteSourceKind::WhileFunctionCall);
+        }
+        Ok(LoweredProgram::SwitchHoldTest(_)) => {
+            return Ok(ActorsLiteSourceKind::SwitchHoldTest);
+        }
+        Ok(LoweredProgram::CircleDrawer(_)) => return Ok(ActorsLiteSourceKind::CircleDrawer),
+        Ok(LoweredProgram::Cells(_)) => return Ok(ActorsLiteSourceKind::Cells),
+        Ok(LoweredProgram::StaticDocument(_)) => return Ok(ActorsLiteSourceKind::StaticDocument),
+        Err(error) => errors.push(format!("generic: {error}")),
     }
 
     Err(errors)
@@ -385,8 +225,6 @@ mod tests {
     fn classifies_supported_examples_explicitly() {
         let counter = include_str!("../../../playground/frontend/src/examples/counter/counter.bn");
         let todo = include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
-        let todo_physical =
-            include_str!("../../../playground/frontend/src/examples/todo_mvc_physical/RUN.bn");
         let cells = include_str!("../../../playground/frontend/src/examples/cells/cells.bn");
         let cells_dynamic = include_str!(
             "../../../playground/frontend/src/examples/cells_dynamic/cells_dynamic.bn"
@@ -566,10 +404,6 @@ mod tests {
             Ok(ActorsLiteSourceKind::FlightBooker)
         );
         assert_eq!(classify_source(timer), Ok(ActorsLiteSourceKind::Timer));
-        assert_eq!(
-            classify_source(todo_physical),
-            Ok(ActorsLiteSourceKind::TodoMvcPhysical)
-        );
         assert_eq!(classify_source(todo), Ok(ActorsLiteSourceKind::TodoMvc));
         assert_eq!(classify_source(cells), Ok(ActorsLiteSourceKind::Cells));
         assert_eq!(
@@ -597,81 +431,107 @@ mod tests {
     fn unsupported_source_returns_classifier_errors() {
         let unsupported = "FUNCTION unsupported() { True }";
         let errors = classify_source(unsupported).expect_err("unsupported source should fail");
-        assert!(errors.iter().any(|error| error.starts_with("counter:")));
+        assert!(errors.iter().any(|error| error.starts_with("generic:")));
         assert!(
             errors
                 .iter()
-                .any(|error| error.starts_with("todo_mvc_physical:"))
-        );
-        assert!(errors.iter().any(|error| error.starts_with("todo_mvc:")));
-        assert!(errors.iter().any(|error| error.starts_with("cells:")));
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.starts_with("complex_counter:"))
+                .any(|error| error.contains("single_action_accumulator_document:"))
         );
         assert!(
             errors
                 .iter()
-                .any(|error| error.starts_with("list_retain_reactive:"))
+                .any(|error| error.contains("editable_filterable_list_document:"))
         );
         assert!(
             errors
                 .iter()
-                .any(|error| error.starts_with("list_map_external_dep:"))
+                .any(|error| error.contains("persistent_indexed_text_grid_document:"))
         );
         assert!(
             errors
                 .iter()
-                .any(|error| error.starts_with("list_map_block:"))
+                .any(|error| error.contains("dual_action_accumulator_document:"))
         );
         assert!(
             errors
                 .iter()
-                .any(|error| error.starts_with("list_retain_count:"))
+                .any(|error| error.contains("retained_toggle_filter_list_document:"))
         );
         assert!(
             errors
                 .iter()
-                .any(|error| error.starts_with("list_object_state:"))
+                .any(|error| error.contains("external_mode_mapped_items_document:"))
         );
         assert!(
             errors
                 .iter()
-                .any(|error| error.starts_with("list_retain_remove:"))
+                .any(|error| error.contains("dual_mapped_label_stripes_document:"))
         );
         assert!(
             errors
                 .iter()
-                .any(|error| error.starts_with("shopping_list:"))
+                .any(|error| error.contains("counted_filtered_append_list_document:"))
         );
         assert!(
             errors
                 .iter()
-                .any(|error| error.starts_with("filter_checkbox_bug:"))
+                .any(|error| error.contains("independent_object_counters_document:"))
         );
         assert!(
             errors
                 .iter()
-                .any(|error| error.starts_with("checkbox_test:"))
+                .any(|error| error.contains("removable_append_list_document:"))
         );
         assert!(
             errors
                 .iter()
-                .any(|error| error.starts_with("chained_list_remove_bug:"))
-        );
-        assert!(errors.iter().any(|error| error.starts_with("crud:")));
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.starts_with("temperature_converter:"))
+                .any(|error| error.contains("clearable_append_list_document:"))
         );
         assert!(
             errors
                 .iter()
-                .any(|error| error.starts_with("flight_booker:"))
+                .any(|error| error.contains("filterable_checkbox_list_document:"))
         );
-        assert!(errors.iter().any(|error| error.starts_with("static:")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("independent_checkbox_list_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("removable_checkbox_list_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("canvas_history_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("selectable_record_column_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("bidirectional_conversion_form_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("selectable_dual_date_form_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("resettable_timed_progress_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("static_document_display:"))
+        );
     }
 
     #[test]
@@ -698,7 +558,6 @@ mod tests {
         assert!(PUBLIC_PLAYGROUND_EXAMPLES.contains(&"when"));
         assert!(PUBLIC_PLAYGROUND_EXAMPLES.contains(&"while"));
         assert!(PUBLIC_PLAYGROUND_EXAMPLES.contains(&"while_function_call"));
-        assert!(PUBLIC_PLAYGROUND_EXAMPLES.contains(&"todo_mvc_physical"));
         assert!(PUBLIC_PLAYGROUND_EXAMPLES.contains(&"list_retain_reactive"));
         assert!(PUBLIC_PLAYGROUND_EXAMPLES.contains(&"list_map_external_dep"));
         assert!(PUBLIC_PLAYGROUND_EXAMPLES.contains(&"list_map_block"));
@@ -730,6 +589,7 @@ mod tests {
     fn public_playground_examples_require_phase4_acceptance_record() {
         assert!(actors_lite_public_exposure_enabled());
         assert!(is_public_playground_example("counter"));
+        assert!(!is_public_playground_example("todo_mvc_physical"));
         assert!(!is_public_playground_example("not_a_real_example"));
     }
 }

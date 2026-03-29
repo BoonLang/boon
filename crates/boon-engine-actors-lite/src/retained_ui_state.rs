@@ -6,13 +6,13 @@ use boon_scene::{
 use std::collections::BTreeMap;
 
 #[derive(Debug, Default)]
-pub struct RetainedUiState {
+pub(crate) struct RetainedUiState {
     retained_nodes: BTreeMap<RetainedNodeKey, NodeId>,
     event_ports: BTreeMap<SourcePortId, EventPortId>,
 }
 
 impl RetainedUiState {
-    pub fn element_node(
+    pub(crate) fn element_node(
         &mut self,
         retained_key: RetainedNodeKey,
         tag: &str,
@@ -34,7 +34,7 @@ impl RetainedUiState {
         }
     }
 
-    pub fn attach_port(
+    pub(crate) fn attach_port(
         &mut self,
         ops: &mut Vec<RenderOp>,
         node_id: NodeId,
@@ -53,7 +53,7 @@ impl RetainedUiState {
         event_port
     }
 
-    pub fn finalize_render(
+    pub(crate) fn finalize_render(
         &self,
         root: UiNode,
         ops: Vec<RenderOp>,
@@ -63,11 +63,6 @@ impl RetainedUiState {
             .apply_batch(&RenderDiffBatch { ops })
             .expect("retained ui render ops should apply");
         (RenderRoot::UiTree(root), state)
-    }
-
-    #[must_use]
-    pub fn retained_nodes(&self) -> &BTreeMap<RetainedNodeKey, NodeId> {
-        &self.retained_nodes
     }
 }
 

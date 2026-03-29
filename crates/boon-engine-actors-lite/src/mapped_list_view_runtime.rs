@@ -158,7 +158,7 @@ impl<T> MappedListViewRuntime<T> {
         );
     }
 
-    pub fn project_visible_into_app(
+    pub(crate) fn project_visible_into_app(
         &self,
         app: &mut HostViewPreviewApp,
         sinks: &[SinkPortId],

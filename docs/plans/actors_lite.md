@@ -2,8 +2,10 @@
 
 ## Status
 
+- Superseded for implementation by `docs/plans/ACTORSLITE_STRICT_UNIFIED_ENGINE_PLAN.md` on 2026-03-30.
+- Use this document as historical/supporting context only while migrating off the milestone-only path.
 - Proposed new engine direction as of 2026-03-25.
-- This document is the source-of-truth plan for a new fourth engine, `ActorsLite`.
+- This document is no longer the implementation source of truth.
 - `ActorsLite` is a new crate, `boon-engine-actors-lite`.
 - It is hidden and dev-only first. Public engine selection comes only after the milestone examples are green.
 

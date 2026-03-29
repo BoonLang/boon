@@ -49,7 +49,7 @@ impl<F: Copy + PartialEq> SelectedFilterClickRuntime<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{HostViewIr, HostViewKind, HostViewNode};
+    use crate::bridge::{HostButtonLabel, HostViewIr, HostViewKind, HostViewNode};
     use crate::host_view_preview::HostViewPreviewApp;
     use crate::ir::{FunctionInstanceId, RetainedNodeKey, ViewSiteId};
     use boon_scene::{UiEvent, UiEventKind};
@@ -73,7 +73,7 @@ mod tests {
                                 mapped_item_identity: Some(1),
                             },
                             kind: HostViewKind::Button {
-                                label: "A".to_string(),
+                                label: HostButtonLabel::Static("A".to_string()),
                                 press_port: first_port,
                                 disabled_sink: None,
                             },
@@ -86,7 +86,7 @@ mod tests {
                                 mapped_item_identity: Some(2),
                             },
                             kind: HostViewKind::Button {
-                                label: "B".to_string(),
+                                label: HostButtonLabel::Static("B".to_string()),
                                 press_port: second_port,
                                 disabled_sink: None,
                             },

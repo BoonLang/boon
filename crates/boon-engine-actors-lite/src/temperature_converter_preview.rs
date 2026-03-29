@@ -1,14 +1,15 @@
-use crate::bridge::{HostInput, HostSnapshot};
+use crate::bridge::HostInput;
 use crate::ids::ActorId;
 use crate::input_form_runtime::{FormInputBinding, FormInputEvent};
 use crate::ir_executor::IrExecutor;
 use crate::lower::{TemperatureConverterProgram, try_lower_temperature_converter};
 use crate::preview_runtime::PreviewRuntime;
-use crate::runtime::ActorKind;
 use crate::validated_form_runtime::ValidatedFormRuntime;
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
-use boon_renderer_zoon::{FakeRenderState, RenderInteractionHandlers, render_retained_snapshot_signal};
+use boon_renderer_zoon::{
+    FakeRenderState, RenderInteractionHandlers, render_retained_snapshot_signal,
+};
 use boon_scene::{RenderRoot, UiEventBatch, UiFactBatch, UiNode};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -26,8 +27,8 @@ impl TemperatureConverterPreview {
     pub fn new(source: &str) -> Result<Self, String> {
         let program = try_lower_temperature_converter(source)?;
         let mut runtime = PreviewRuntime::new();
-        let celsius_actor = runtime.alloc_actor(ActorKind::SourcePort);
-        let fahrenheit_actor = runtime.alloc_actor(ActorKind::SourcePort);
+        let celsius_actor = runtime.alloc_actor();
+        let fahrenheit_actor = runtime.alloc_actor();
         let executor = IrExecutor::new(program.ir.clone())?;
         let bindings = [
             FormInputBinding {
@@ -41,7 +42,7 @@ impl TemperatureConverterPreview {
         ];
         let form = ValidatedFormRuntime::new(
             program.host_view.clone(),
-            executor.sink_values().clone(),
+            executor.sink_values(),
             bindings,
             [],
         );
@@ -86,12 +87,16 @@ impl TemperatureConverterPreview {
             return;
         }
 
-        let messages = self.runtime.dispatch_snapshot(HostSnapshot::new(inputs));
-        self.executor
-            .apply_messages(&messages)
-            .expect("temperature converter IR should execute");
-        for (sink, value) in self.executor.sink_values() {
-            self.form.set_sink_value(*sink, value.clone());
+        {
+            let (runtime, executor, form) = (&mut self.runtime, &mut self.executor, &mut self.form);
+            runtime.dispatch_inputs_batches(inputs.as_slice(), |messages| {
+                executor
+                    .apply_pure_messages_owned(messages.drain(..))
+                    .expect("temperature converter IR should execute");
+            });
+            for (sink, value) in executor.sink_values() {
+                form.set_sink_value(sink, value);
+            }
         }
         self.sync_inputs_from_sinks();
     }
@@ -106,7 +111,8 @@ impl TemperatureConverterPreview {
     }
 
     #[must_use]
-    pub fn app(&self) -> &crate::host_view_preview::HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &crate::host_view_preview::HostViewPreviewApp {
         self.form.app()
     }
 
@@ -250,7 +256,9 @@ mod tests {
             Some(&KernelValue::from(String::new()))
         );
         assert_eq!(
-            preview.form.sink_value(preview.program.fahrenheit_input_sink),
+            preview
+                .form
+                .sink_value(preview.program.fahrenheit_input_sink),
             Some(&KernelValue::from(String::new()))
         );
     }

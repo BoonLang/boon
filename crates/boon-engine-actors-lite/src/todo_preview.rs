@@ -1,16 +1,18 @@
-use crate::bridge::{HostInput, HostSnapshot};
+use crate::bridge::HostInput;
 use crate::clock::MonotonicInstant;
 use crate::filtered_list_view::filtered_list_with_filter;
+use crate::host_view_preview::{
+    HostViewPreviewApp, InteractiveHostViewModel, render_interactive_host_view,
+};
 use crate::ids::ActorId;
-use crate::interactive_preview::{InteractivePreview, render_interactive_preview};
+use crate::interactive_preview::InteractivePreview;
 use crate::ir::{
     FunctionInstanceId, MirrorCellId, RetainedNodeKey, SinkPortId, SourcePortId, ViewSiteId,
 };
 use crate::ir_executor::IrExecutor;
-use crate::lower::{TodoProgram, try_lower_todo_mvc};
+use crate::lower::{TodoProgram, lower_program};
 use crate::metrics::{InteractionMetricsReport, LatencySummary};
 use crate::preview_runtime::PreviewRuntime;
-use crate::runtime::ActorKind;
 use crate::runtime::RuntimeTelemetrySnapshot;
 use crate::runtime_backed_domain::RuntimeBackedDomain;
 use crate::runtime_backed_preview::RuntimeBackedPreviewState;
@@ -23,6 +25,7 @@ use boon_scene::{
     NodeId, RenderOp, RenderRoot, UiEventBatch, UiEventKind, UiFactBatch, UiFactKind, UiNode,
 };
 use std::collections::BTreeMap;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Filter {
     All,
@@ -95,6 +98,7 @@ pub struct TodoPreview {
     ui_state_actor: ActorId,
     ui_state_executor: IrExecutor,
     todos: TargetedListRuntime<TodoItem>,
+    app: HostViewPreviewApp,
     ui: RuntimeBackedPreviewState<TodoUiAction, FactTarget>,
 }
 
@@ -146,13 +150,38 @@ impl RuntimeBackedDomain for TodoPreview {
     }
 }
 
+impl InteractiveHostViewModel for TodoPreview {
+    fn app_mut(&mut self) -> &mut HostViewPreviewApp {
+        &mut self.app
+    }
+
+    fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool {
+        self.dispatch_host_ui_events(batch)
+    }
+
+    fn dispatch_ui_facts(&mut self, batch: UiFactBatch) -> bool {
+        self.dispatch_host_ui_facts(batch)
+    }
+
+    fn render_snapshot(&mut self) -> (RenderRoot, FakeRenderState) {
+        self.refresh_host_view();
+        let (root, state) = self.app.render_snapshot();
+        (RenderRoot::UiTree(root), state)
+    }
+}
+
 impl TodoPreview {
     pub fn new(source: &str) -> Result<Self, String> {
-        let program = try_lower_todo_mvc(source)?;
+        Self::from_program(lower_program(source)?.into_todo_program()?)
+    }
+
+    pub fn from_program(program: TodoProgram) -> Result<Self, String> {
         let mut ui_state_runtime = PreviewRuntime::new();
-        let ui_state_actor = ui_state_runtime.alloc_actor(ActorKind::SourcePort);
+        let ui_state_actor = ui_state_runtime.alloc_actor();
         let ui_state_executor = IrExecutor::new(program.ir.clone())?;
-        Ok(Self {
+        let host_view = program.host_view.clone();
+        let host_view_sink_values = program.host_view_sink_values(&ui_state_executor.sink_values());
+        let mut preview = Self {
             program,
             ui_state_runtime,
             ui_state_actor,
@@ -176,26 +205,160 @@ impl TodoPreview {
                 ],
                 3,
             ),
+            app: HostViewPreviewApp::new(host_view, host_view_sink_values),
             ui: RuntimeBackedPreviewState::default(),
-        })
+        };
+        preview.refresh_host_view();
+        Ok(preview)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
+        &self.app
     }
 
     #[must_use]
     pub fn preview_text(&mut self) -> String {
-        RuntimeBackedDomain::preview_text(self)
+        self.refresh_host_view();
+        self.app.preview_text()
     }
 
     pub fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool {
-        RuntimeBackedDomain::dispatch_ui_events(self, batch)
+        self.dispatch_host_ui_events(batch)
     }
 
     #[must_use]
-    pub fn runtime_telemetry_snapshot(&self) -> RuntimeTelemetrySnapshot {
+    pub(crate) fn runtime_telemetry_snapshot(&self) -> RuntimeTelemetrySnapshot {
         self.ui_state_runtime.telemetry_snapshot()
     }
 
     pub fn dispatch_ui_facts(&mut self, batch: UiFactBatch) -> bool {
-        RuntimeBackedDomain::dispatch_ui_facts(self, batch)
+        self.dispatch_host_ui_facts(batch)
+    }
+
+    fn refresh_host_view(&mut self) {
+        let sink_values = self
+            .program
+            .host_view_sink_values(&self.ui_state_executor.sink_values());
+        let host_view = self
+            .program
+            .materialize_host_view(&sink_values)
+            .expect("todo host-view template should materialize");
+        self.app.set_host_view(host_view);
+        for (sink, value) in sink_values {
+            self.app.set_sink_value(sink, value);
+        }
+    }
+
+    fn dispatch_host_ui_events(&mut self, batch: UiEventBatch) -> bool {
+        let mut changed = false;
+        for event in batch.events {
+            let Some(binding) = self.app.event_binding_for_port(event.target) else {
+                continue;
+            };
+            changed |= match (binding.source_port, binding.mapped_item_identity) {
+                (TodoProgram::MAIN_INPUT_CHANGE_PORT, None)
+                | (TodoProgram::MAIN_INPUT_KEY_DOWN_PORT, None)
+                | (TodoProgram::MAIN_INPUT_BLUR_PORT, None)
+                | (TodoProgram::MAIN_INPUT_FOCUS_PORT, None) => self.apply_text_input_event(
+                    TextInputTarget::MainInput,
+                    event.kind,
+                    event.payload.as_deref(),
+                ),
+                (TodoProgram::FILTER_ALL_PORT, None)
+                | (TodoProgram::FILTER_ACTIVE_PORT, None)
+                | (TodoProgram::FILTER_COMPLETED_PORT, None)
+                    if event.kind == UiEventKind::Click =>
+                {
+                    self.apply_filter_click(binding.source_port)
+                }
+                (TodoProgram::TOGGLE_ALL_PORT, None) if event.kind == UiEventKind::Click => {
+                    self.apply_todo_list_action(TodoProgram::TOGGLE_ALL_PORT, PortPayload::Click)
+                }
+                (TodoProgram::CLEAR_COMPLETED_PORT, None) if event.kind == UiEventKind::Click => {
+                    self.apply_todo_list_action(
+                        TodoProgram::CLEAR_COMPLETED_PORT,
+                        PortPayload::Click,
+                    )
+                }
+                (TodoProgram::TODO_TOGGLE_PORT, Some(todo_id))
+                    if event.kind == UiEventKind::Click =>
+                {
+                    self.apply_todo_list_action(
+                        TodoProgram::TODO_TOGGLE_PORT,
+                        PortPayload::TargetId(todo_id),
+                    )
+                }
+                (TodoProgram::TODO_BEGIN_EDIT_PORT, Some(todo_id))
+                    if event.kind == UiEventKind::DoubleClick =>
+                {
+                    self.begin_edit_for(todo_id)
+                }
+                (TodoProgram::TODO_DELETE_PORT, Some(todo_id))
+                    if event.kind == UiEventKind::Click =>
+                {
+                    self.apply_todo_list_action(
+                        TodoProgram::TODO_DELETE_PORT,
+                        PortPayload::TargetId(todo_id),
+                    )
+                }
+                (TodoProgram::TODO_EDIT_CHANGE_PORT, Some(todo_id))
+                | (TodoProgram::TODO_EDIT_COMMIT_PORT, Some(todo_id))
+                | (TodoProgram::TODO_EDIT_BLUR_PORT, Some(todo_id))
+                | (TodoProgram::TODO_EDIT_FOCUS_PORT, Some(todo_id)) => self
+                    .apply_text_input_event(
+                        TextInputTarget::EditInput(todo_id),
+                        event.kind,
+                        event.payload.as_deref(),
+                    ),
+                _ => false,
+            };
+        }
+        if changed {
+            self.refresh_host_view();
+        }
+        changed
+    }
+
+    fn dispatch_host_ui_facts(&mut self, batch: UiFactBatch) -> bool {
+        let mut changed = false;
+        for fact in batch.facts {
+            let Some(key) = self.app.retained_key_for_node(fact.id) else {
+                continue;
+            };
+            changed |= match (key.view_site.0, key.mapped_item_identity, fact.kind) {
+                (205, None, kind) => self.apply_fact(FactTarget::MainInput, kind),
+                (300, Some(todo_id), UiFactKind::Hovered(hovered)) => self.apply_fact(
+                    FactTarget::TodoItemRow(todo_id),
+                    UiFactKind::Hovered(hovered),
+                ),
+                (303, Some(todo_id), kind) => {
+                    self.apply_fact(FactTarget::TodoEditInput(todo_id), kind)
+                }
+                _ => false,
+            };
+        }
+        if changed {
+            self.refresh_host_view();
+        }
+        changed
+    }
+
+    fn begin_edit_for(&mut self, todo_id: u64) -> bool {
+        let Some(title) = self
+            .todos
+            .find(todo_id)
+            .map(|todo| todo.value.title.clone())
+        else {
+            return false;
+        };
+        self.apply_edit_session_action(
+            TodoProgram::TODO_BEGIN_EDIT_PORT,
+            PortPayload::IdTitle {
+                target_id: todo_id,
+                title,
+            },
+        )
     }
 
     fn apply_event(
@@ -447,9 +610,12 @@ impl TodoPreview {
         }
     }
 
-    fn apply_ui_state_messages(&mut self, messages: Vec<(ActorId, crate::runtime::Msg)>) {
-        self.ui_state_executor
-            .apply_messages(&messages)
+    fn apply_ui_state_messages(
+        ui_state_executor: &mut IrExecutor,
+        messages: &mut Vec<crate::runtime::Msg>,
+    ) {
+        ui_state_executor
+            .apply_pure_messages_owned(messages.drain(..))
             .expect("todo ui-state IR should execute");
     }
 
@@ -664,22 +830,6 @@ impl TodoPreview {
         ))
     }
 
-    fn todo_list_kernel_value(&self) -> KernelValue {
-        let items = self
-            .todos
-            .items()
-            .iter()
-            .map(|todo| {
-                Self::kernel_object([
-                    ("id", KernelValue::from(todo.id as f64)),
-                    ("title", KernelValue::from(todo.value.title.clone())),
-                    ("completed", KernelValue::from(todo.value.completed)),
-                ])
-            })
-            .collect();
-        KernelValue::List(items)
-    }
-
     fn next_todo_id(&self) -> u64 {
         self.todos.next_id()
     }
@@ -742,16 +892,7 @@ impl TodoPreview {
                 .map(|(id, title, completed)| (id, TodoItem { title, completed })),
             next_id,
         );
-        self.sync_todo_list_mirrors();
         true
-    }
-
-    fn sync_todo_list_mirrors(&mut self) {
-        let inputs = self.todo_runtime_inputs(true);
-        let messages = self
-            .ui_state_runtime
-            .dispatch_snapshot(HostSnapshot::new(inputs));
-        self.apply_ui_state_messages(messages);
     }
 
     fn apply_port_action<T: PartialEq>(
@@ -839,12 +980,7 @@ impl TodoPreview {
     }
 
     fn todo_runtime_inputs(&mut self, include_next_todo_id: bool) -> Vec<HostInput> {
-        let mut inputs = vec![HostInput::Mirror {
-            actor: self.ui_state_actor,
-            cell: TodoProgram::TODOS_LIST_CELL,
-            value: self.todo_list_kernel_value(),
-            seq: self.ui_state_runtime.causal_seq(0),
-        }];
+        let mut inputs = Vec::new();
         if include_next_todo_id {
             inputs.push(HostInput::Mirror {
                 actor: self.ui_state_actor,
@@ -871,10 +1007,14 @@ impl TodoPreview {
         sync_todos: bool,
     ) -> bool {
         let before = observe(self);
-        let messages = self
-            .ui_state_runtime
-            .dispatch_snapshot(HostSnapshot::new(inputs));
-        self.apply_ui_state_messages(messages);
+        let Self {
+            ui_state_runtime,
+            ui_state_executor,
+            ..
+        } = self;
+        ui_state_runtime.dispatch_inputs_batches(inputs.as_slice(), |messages| {
+            Self::apply_ui_state_messages(ui_state_executor, messages);
+        });
         if sync_todos {
             let synced = self.sync_todos_from_runtime();
             synced || before != observe(self)
@@ -1744,13 +1884,14 @@ fn apply_todo_footer_texts_styles(
 }
 
 pub fn render_todo_preview(preview: TodoPreview) -> impl Element {
-    render_interactive_preview(preview)
+    render_interactive_host_view(preview)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::todo_acceptance::{TodoAcceptanceAction, todo_edit_save_acceptance_sequences};
+    use boon_scene::UiEvent;
 
     #[derive(Clone)]
     struct TraceRng(u64);
@@ -1847,15 +1988,37 @@ mod tests {
     }
 
     fn seed_buy_milk_only(preview: &mut TodoPreview) {
-        preview.todos = TargetedListRuntime::new(
-            [(
-                3,
-                TodoItem {
-                    title: "Buy milk".to_string(),
-                    completed: false,
-                },
-            )],
-            4,
+        preview.apply_fact(
+            FactTarget::MainInput,
+            UiFactKind::DraftText("Buy milk".to_string()),
+        );
+        preview.apply_event(
+            TodoUiAction::MainInputKeyDown,
+            UiEventKind::KeyDown,
+            Some(&format!("Enter{KEYDOWN_TEXT_SEPARATOR}Buy milk")),
+        );
+        let buy_groceries_id = todo_id_by_title(preview, "Buy groceries");
+        preview.apply_event(
+            TodoUiAction::TodoDelete(buy_groceries_id),
+            UiEventKind::Click,
+            None,
+        );
+        assert_eq!(
+            preview.runtime_todos(),
+            Some(vec![
+                (2, "Clean room".to_string(), false),
+                (3, "Buy milk".to_string(), false),
+            ])
+        );
+        let clean_room_id = todo_id_by_title(preview, "Clean room");
+        preview.apply_event(
+            TodoUiAction::TodoDelete(clean_room_id),
+            UiEventKind::Click,
+            None,
+        );
+        assert_eq!(
+            preview.runtime_todos(),
+            Some(vec![(3, "Buy milk".to_string(), false)])
         );
     }
     #[test]
@@ -1866,6 +2029,51 @@ mod tests {
         assert!(text.contains("2 items left"));
         assert!(text.contains("Buy groceries"));
         assert!(text.contains("Clean room"));
+    }
+
+    #[test]
+    fn todo_preview_shared_host_view_dispatches_main_input_and_mapped_row_events() {
+        let source = include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
+        let mut preview = TodoPreview::new(source).expect("todo preview");
+        let _ = preview.preview_text();
+
+        let change_port = preview
+            .app
+            .event_port_for_source(TodoProgram::MAIN_INPUT_CHANGE_PORT)
+            .expect("main input change port");
+        let key_down_port = preview
+            .app
+            .event_port_for_source(TodoProgram::MAIN_INPUT_KEY_DOWN_PORT)
+            .expect("main input keydown port");
+
+        assert!(preview.dispatch_ui_events(UiEventBatch {
+            events: vec![
+                UiEvent {
+                    target: change_port,
+                    kind: UiEventKind::Input,
+                    payload: Some("Host shell todo".to_string()),
+                },
+                UiEvent {
+                    target: key_down_port,
+                    kind: UiEventKind::KeyDown,
+                    payload: Some(format!("Enter{KEYDOWN_TEXT_SEPARATOR}Host shell todo")),
+                },
+            ],
+        }));
+        assert!(preview.preview_text().contains("Host shell todo"));
+
+        let edit_port = preview
+            .app
+            .event_port_for_mapped_source(TodoProgram::TODO_BEGIN_EDIT_PORT, 1)
+            .expect("mapped double-click port");
+        assert!(preview.dispatch_ui_events(UiEventBatch {
+            events: vec![UiEvent {
+                target: edit_port,
+                kind: UiEventKind::DoubleClick,
+                payload: None,
+            }],
+        }));
+        assert_eq!(preview.edit_target_id(), Some(1));
     }
 
     #[test]
@@ -2057,6 +2265,51 @@ mod tests {
     }
 
     #[test]
+    fn todo_preview_escape_then_active_filter_keeps_uncancelled_rows_visible() {
+        let source = include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
+        let mut preview = TodoPreview::new(source).expect("todo preview");
+
+        preview.apply_event(
+            TodoUiAction::TodoTitleDoubleClick(2),
+            UiEventKind::DoubleClick,
+            None,
+        );
+        preview.apply_fact(
+            FactTarget::TodoEditInput(2),
+            UiFactKind::DraftText("discard-2".to_string()),
+        );
+        preview.apply_event(
+            TodoUiAction::TodoEditKeyDown(2),
+            UiEventKind::KeyDown,
+            Some("Escape"),
+        );
+        preview.apply_event(TodoUiAction::FilterActive, UiEventKind::Click, None);
+
+        assert_eq!(preview.selected_filter(), Filter::Active);
+        assert_eq!(
+            preview.runtime_todos(),
+            Some(vec![
+                (1, "Buy groceries".to_string(), false),
+                (2, "Clean room".to_string(), false),
+            ])
+        );
+        assert_eq!(preview.edit_target_id(), None);
+        assert_eq!(preview.edit_draft(), "");
+        assert!(!preview.edit_focus_hint());
+        assert!(!preview.edit_focused());
+
+        let text = preview.preview_text();
+        assert!(
+            text.contains("Buy groceries"),
+            "expected Buy groceries after escape+filter, got: {text}"
+        );
+        assert!(
+            text.contains("Clean room"),
+            "expected Clean room after escape+filter, got: {text}"
+        );
+    }
+
+    #[test]
     fn todo_preview_edit_save_uses_latest_draft_across_batches() {
         let source = include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
         let mut preview = TodoPreview::new(source).expect("todo preview");
@@ -2096,6 +2349,13 @@ mod tests {
                 match action {
                     TodoAcceptanceAction::DblClickText { text } => {
                         let todo_id = todo_id_by_title(&preview, text);
+                        assert_eq!(
+                            preview.runtime_todos(),
+                            Some(vec![(todo_id, "Buy milk".to_string(), false)]),
+                            "{}",
+                            sequence.description
+                        );
+                        assert_eq!(preview.active_count(), 1, "{}", sequence.description);
                         preview.apply_event(
                             TodoUiAction::TodoTitleDoubleClick(todo_id),
                             UiEventKind::DoubleClick,
@@ -2104,6 +2364,19 @@ mod tests {
                         preview.apply_fact(
                             FactTarget::TodoEditInput(todo_id),
                             UiFactKind::Focused(true),
+                        );
+                        assert_eq!(
+                            preview.runtime_todos(),
+                            Some(vec![(todo_id, "Buy milk".to_string(), false)]),
+                            "{}",
+                            sequence.description
+                        );
+                        assert_eq!(preview.active_count(), 1, "{}", sequence.description);
+                        assert_eq!(
+                            preview.edit_target_id(),
+                            Some(todo_id),
+                            "{}",
+                            sequence.description
                         );
                     }
                     TodoAcceptanceAction::AssertFocused { index } => {

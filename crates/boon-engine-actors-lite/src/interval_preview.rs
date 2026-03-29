@@ -3,7 +3,6 @@ use crate::ids::ActorId;
 use crate::ir_executor::IrExecutor;
 use crate::lower::{IntervalProgram, try_lower_interval, try_lower_interval_hold};
 use crate::preview_runtime::PreviewRuntime;
-use crate::runtime::ActorKind;
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
 use boon_renderer_zoon::FakeRenderState;
@@ -21,10 +20,9 @@ impl IntervalPreview {
     pub fn new(source: &str) -> Result<Self, String> {
         let program = try_lower_interval(source).or_else(|_| try_lower_interval_hold(source))?;
         let mut runtime = PreviewRuntime::new();
-        let tick_actor = runtime.alloc_actor(ActorKind::SourcePort);
+        let tick_actor = runtime.alloc_actor();
         let executor = IrExecutor::new(program.ir.clone())?;
-        let app =
-            HostViewPreviewApp::new(program.host_view.clone(), executor.sink_values().clone());
+        let app = HostViewPreviewApp::new(program.host_view.clone(), executor.sink_values());
 
         Ok(Self {
             runtime,
@@ -49,16 +47,25 @@ impl IntervalPreview {
             return;
         }
 
-        let messages = self.runtime.dispatch_pulse(
-            self.tick_actor,
-            self.program.tick_port,
+        let Self {
+            runtime,
+            tick_actor,
+            program,
+            executor,
+            app,
+        } = self;
+        runtime.dispatch_pulse_batches(
+            *tick_actor,
+            program.tick_port,
             KernelValue::from("tick"),
+            |messages| {
+                executor
+                    .apply_pure_messages_owned(messages.drain(..))
+                    .expect("interval IR should execute");
+            },
         );
-        self.executor
-            .apply_messages(&messages)
-            .expect("interval IR should execute");
-        for (sink, value) in self.executor.sink_values() {
-            self.app.set_sink_value(*sink, value.clone());
+        for (sink, value) in executor.sink_values() {
+            app.set_sink_value(sink, value);
         }
     }
 
@@ -77,7 +84,8 @@ impl IntervalPreview {
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
     }
 }

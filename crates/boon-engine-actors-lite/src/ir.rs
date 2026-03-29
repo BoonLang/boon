@@ -1,4 +1,4 @@
-use crate::ids::ScopeId;
+use boon::parser::PersistenceId;
 use boon::platform::browser::kernel::{ExprId, KernelValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -26,14 +26,6 @@ pub struct ViewSiteId(pub u32);
 pub struct FunctionInstanceId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FunctionInstanceKey {
-    pub function: FunctionId,
-    pub call_site: CallSiteId,
-    pub parent_scope: ScopeId,
-    pub mapped_item_identity: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RetainedNodeKey {
     pub view_site: ViewSiteId,
     pub function_instance: Option<FunctionInstanceId>,
@@ -45,6 +37,29 @@ pub struct IrNode {
     pub id: NodeId,
     pub source_expr: Option<ExprId>,
     pub kind: IrNodeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistKind {
+    Hold,
+    ListStore,
+    FutureDurableCell,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistPolicy {
+    None,
+    Durable {
+        root_key: PersistenceId,
+        local_slot: u32,
+        persist_kind: PersistKind,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrNodePersistence {
+    pub node: NodeId,
+    pub policy: PersistPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +74,18 @@ pub struct IrFunctionTemplate {
 pub struct IrProgram {
     pub nodes: Vec<IrNode>,
     pub functions: Vec<IrFunctionTemplate>,
+    pub persistence: Vec<IrNodePersistence>,
+}
+
+impl IrProgram {
+    #[must_use]
+    pub fn persist_policy(&self, node: NodeId) -> PersistPolicy {
+        self.persistence
+            .iter()
+            .find(|entry| entry.node == node)
+            .map(|entry| entry.policy)
+            .unwrap_or(PersistPolicy::None)
+    }
 }
 
 impl From<Vec<IrNode>> for IrProgram {
@@ -66,6 +93,7 @@ impl From<Vec<IrNode>> for IrProgram {
         Self {
             nodes,
             functions: Vec::new(),
+            persistence: Vec::new(),
         }
     }
 }

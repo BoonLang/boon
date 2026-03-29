@@ -3,7 +3,7 @@ use crate::ids::ActorId;
 use crate::input_form_runtime::{FormInputBinding, FormInputEvent, InputFormRuntime};
 use crate::ir::SourcePortId;
 use crate::preview_runtime::PreviewRuntime;
-use crate::runtime::{ActorKind, Msg};
+use crate::runtime::Msg;
 use crate::text_input::decode_key_down_payload;
 use boon::platform::browser::kernel::KernelValue;
 use boon_scene::{UiEventBatch, UiEventKind};
@@ -36,10 +36,8 @@ impl AppendListRuntime {
     #[must_use]
     pub fn new(config: AppendListConfig, initial_items: Vec<String>) -> Self {
         let mut runtime = PreviewRuntime::new();
-        let input_actor = runtime.alloc_actor(ActorKind::SourcePort);
-        let clear_actor = config
-            .clear_press_port
-            .map(|_| runtime.alloc_actor(ActorKind::SourcePort));
+        let input_actor = runtime.alloc_actor();
+        let clear_actor = config.clear_press_port.map(|_| runtime.alloc_actor());
         Self {
             runtime,
             input_actor,
@@ -53,7 +51,11 @@ impl AppendListRuntime {
         }
     }
 
-    pub fn dispatch_ui_events(&mut self, app: &HostViewPreviewApp, batch: UiEventBatch) -> bool {
+    pub(crate) fn dispatch_ui_events(
+        &mut self,
+        app: &HostViewPreviewApp,
+        batch: UiEventBatch,
+    ) -> bool {
         let clear_port = self
             .config
             .clear_press_port
@@ -113,9 +115,9 @@ impl AppendListRuntime {
         &self.items
     }
 
-    fn apply_runtime_messages(&mut self, messages: Vec<(ActorId, Msg)>) -> bool {
+    fn apply_runtime_messages(&mut self, messages: Vec<Msg>) -> bool {
         let mut changed = false;
-        for (_actor_id, message) in messages {
+        for message in messages {
             match message {
                 Msg::SourcePulse { port, value, .. } if port == self.config.input_change_port => {
                     let next = match value {
@@ -173,7 +175,7 @@ impl AppendListRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{HostViewIr, HostViewKind, HostViewNode};
+    use crate::bridge::{HostButtonLabel, HostViewIr, HostViewKind, HostViewNode};
     use crate::host_view_preview::HostViewPreviewApp;
     use crate::ir::{FunctionInstanceId, RetainedNodeKey, SinkPortId, ViewSiteId};
     use boon_scene::{UiEvent, UiNode};
@@ -192,6 +194,8 @@ mod tests {
                     placeholder: "x".to_string(),
                     change_port: config.input_change_port,
                     key_down_port: config.input_key_down_port,
+                    blur_port: None,
+                    focus_port: None,
                     focus_on_mount: true,
                     disabled_sink: None,
                 },
@@ -274,6 +278,8 @@ mod tests {
                                 placeholder: "x".to_string(),
                                 change_port: config.input_change_port,
                                 key_down_port: config.input_key_down_port,
+                                blur_port: None,
+                                focus_port: None,
                                 focus_on_mount: true,
                                 disabled_sink: None,
                             },
@@ -286,7 +292,7 @@ mod tests {
                                 mapped_item_identity: None,
                             },
                             kind: HostViewKind::Button {
-                                label: "Clear".to_string(),
+                                label: HostButtonLabel::Static("Clear".to_string()),
                                 press_port: config.clear_press_port.unwrap(),
                                 disabled_sink: None,
                             },

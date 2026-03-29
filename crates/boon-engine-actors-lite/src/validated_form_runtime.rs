@@ -69,8 +69,13 @@ impl<const N: usize> ValidatedFormRuntime<N> {
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
+    }
+
+    #[must_use]
+    pub(crate) fn app_mut(&mut self) -> &mut HostViewPreviewApp {
+        &mut self.app
     }
 
     #[must_use]

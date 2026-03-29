@@ -129,7 +129,8 @@ impl CrudPreview {
     }
 
     #[must_use]
-    pub fn app(&self) -> &crate::host_view_preview::HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &crate::host_view_preview::HostViewPreviewApp {
         self.runtime.app()
     }
 }
@@ -267,9 +268,9 @@ fn refresh_sink_values_into(
 pub fn render_crud_preview(preview: CrudPreview) -> impl Element {
     let program = preview.program.clone();
     render_editable_mapped_list_preview(preview.runtime, move |preview, batch| {
-        dispatch_text_filtered_ui_events(preview, batch, |people, clicked| {
+        let _ = dispatch_text_filtered_ui_events(preview, batch, |people, clicked| {
             apply_button_clicks(&program, people, clicked)
-        })
+        });
     })
 }
 

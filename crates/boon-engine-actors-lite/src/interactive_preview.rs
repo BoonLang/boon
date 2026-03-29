@@ -14,7 +14,7 @@ use std::rc::Rc;
 use wasm_bindgen::{JsCast, closure::Closure};
 
 #[derive(Debug)]
-pub struct InteractivePreviewState<Action, FactTarget> {
+pub(crate) struct InteractivePreviewState<Action, FactTarget> {
     retained_ui: RetainedUiState,
     event_bindings: HashMap<EventPortId, (crate::ir::SourcePortId, Action)>,
     fact_targets: HashMap<NodeId, FactTarget>,
@@ -35,13 +35,13 @@ where
     Action: Clone,
     FactTarget: Clone,
 {
-    pub fn clear_bindings(&mut self) {
+    pub(crate) fn clear_bindings(&mut self) {
         self.event_bindings.clear();
         self.fact_targets.clear();
     }
 
     #[must_use]
-    pub fn finalize_render(
+    pub(crate) fn finalize_render(
         &self,
         root: UiNode,
         ops: Vec<boon_scene::RenderOp>,
@@ -49,11 +49,11 @@ where
         self.retained_ui.finalize_render(root, ops)
     }
 
-    pub fn bind_fact_target(&mut self, node_id: NodeId, target: FactTarget) {
+    pub(crate) fn bind_fact_target(&mut self, node_id: NodeId, target: FactTarget) {
         self.fact_targets.insert(node_id, target);
     }
 
-    pub fn attach_port(
+    pub(crate) fn attach_port(
         &mut self,
         ops: &mut Vec<boon_scene::RenderOp>,
         node_id: NodeId,
@@ -69,7 +69,17 @@ where
     }
 
     #[must_use]
-    pub fn element_node(
+    pub(crate) fn source_port_for_event_port(
+        &self,
+        event_port: EventPortId,
+    ) -> Option<crate::ir::SourcePortId> {
+        self.event_bindings
+            .get(&event_port)
+            .map(|(source_port, _action)| *source_port)
+    }
+
+    #[must_use]
+    pub(crate) fn element_node(
         &mut self,
         retained_key: crate::ir::RetainedNodeKey,
         tag: &str,
@@ -81,31 +91,7 @@ where
     }
 
     #[must_use]
-    pub fn retained_nodes(
-        &self,
-    ) -> &std::collections::BTreeMap<crate::ir::RetainedNodeKey, NodeId> {
-        self.retained_ui.retained_nodes()
-    }
-
-    #[must_use]
-    pub fn resolve_ui_events(
-        &self,
-        batch: UiEventBatch,
-    ) -> Vec<(crate::ir::SourcePortId, Action, UiEventKind, Option<String>)> {
-        batch
-            .events
-            .into_iter()
-            .filter_map(|event| {
-                self.event_bindings
-                    .get(&event.target)
-                    .cloned()
-                    .map(|(source_port, action)| (source_port, action, event.kind, event.payload))
-            })
-            .collect()
-    }
-
-    #[must_use]
-    pub fn action_for_port(&self, source_port: crate::ir::SourcePortId) -> Option<Action> {
+    pub(crate) fn action_for_port(&self, source_port: crate::ir::SourcePortId) -> Option<Action> {
         self.event_bindings.values().find_map(|(port, action)| {
             if *port == source_port {
                 Some(action.clone())
@@ -116,22 +102,13 @@ where
     }
 
     #[must_use]
-    pub fn resolve_ui_facts(&self, batch: UiFactBatch) -> Vec<(FactTarget, UiFactKind)> {
-        batch
-            .facts
-            .into_iter()
-            .filter_map(|fact| {
-                self.fact_targets
-                    .get(&fact.id)
-                    .cloned()
-                    .map(|target| (target, fact.kind))
-            })
-            .collect()
+    pub(crate) fn fact_target_for_node(&self, node_id: NodeId) -> Option<FactTarget> {
+        self.fact_targets.get(&node_id).cloned()
     }
 }
 
 #[must_use]
-pub fn preview_text_from_root(root: &RenderRoot) -> String {
+pub(crate) fn preview_text_from_root(root: &RenderRoot) -> String {
     fn collect(node: &UiNode, out: &mut String) {
         match &node.kind {
             UiNodeKind::Element { text, .. } => {
@@ -156,7 +133,7 @@ pub fn preview_text_from_root(root: &RenderRoot) -> String {
 const UI_EVENT_SEPARATOR: char = '\u{1E}';
 
 #[must_use]
-pub fn encode_ui_event(kind: UiEventKind, payload: Option<&str>) -> KernelValue {
+pub(crate) fn encode_ui_event(kind: UiEventKind, payload: Option<&str>) -> KernelValue {
     let kind = match kind {
         UiEventKind::Click => "click",
         UiEventKind::DoubleClick => "double_click",
@@ -179,7 +156,7 @@ pub fn encode_ui_event(kind: UiEventKind, payload: Option<&str>) -> KernelValue 
 }
 
 #[must_use]
-pub fn decode_ui_event(value: &KernelValue) -> Option<(UiEventKind, Option<String>)> {
+pub(crate) fn decode_ui_event(value: &KernelValue) -> Option<(UiEventKind, Option<String>)> {
     let text = match value {
         KernelValue::Text(text) | KernelValue::Tag(text) => text.as_str(),
         _ => return None,
@@ -207,7 +184,7 @@ pub fn decode_ui_event(value: &KernelValue) -> Option<(UiEventKind, Option<Strin
 }
 
 #[must_use]
-pub fn encode_ui_fact(kind: &UiFactKind) -> Option<KernelValue> {
+pub(crate) fn encode_ui_fact(kind: &UiFactKind) -> Option<KernelValue> {
     match kind {
         UiFactKind::DraftText(text) => Some(KernelValue::from(format!(
             "draft{UI_EVENT_SEPARATOR}{text}"
@@ -223,7 +200,7 @@ pub fn encode_ui_fact(kind: &UiFactKind) -> Option<KernelValue> {
 }
 
 #[must_use]
-pub fn decode_ui_fact(value: &KernelValue) -> Option<UiFactKind> {
+pub(crate) fn decode_ui_fact(value: &KernelValue) -> Option<UiFactKind> {
     let text = match value {
         KernelValue::Text(text) | KernelValue::Tag(text) => text.as_str(),
         _ => return None,
@@ -237,13 +214,13 @@ pub fn decode_ui_fact(value: &KernelValue) -> Option<UiFactKind> {
     }
 }
 
-pub trait InteractivePreview {
+pub(crate) trait InteractivePreview {
     fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool;
     fn dispatch_ui_facts(&mut self, batch: UiFactBatch) -> bool;
     fn render_snapshot(&mut self) -> (RenderRoot, FakeRenderState);
 }
 
-pub fn render_interactive_preview<Preview>(preview: Preview) -> impl Element
+pub(crate) fn render_interactive_preview<Preview>(preview: Preview) -> impl Element
 where
     Preview: InteractivePreview + 'static,
 {

@@ -1,5 +1,5 @@
 use crate::host_view_preview::{HostViewPreviewApp, render_static_host_view};
-use crate::lower::{StaticProgram, try_lower_static_document};
+use crate::lower::{StaticProgram, lower_program};
 use boon::zoon::*;
 
 #[derive(Debug)]
@@ -9,13 +9,19 @@ pub struct StaticPreview {
 
 impl StaticPreview {
     pub fn new(source: &str) -> Result<Self, String> {
+        Ok(Self::from_program(
+            lower_program(source)?.into_static_program()?,
+        ))
+    }
+
+    pub fn from_program(program: StaticProgram) -> Self {
         let StaticProgram {
             host_view,
             sink_values,
-        } = try_lower_static_document(source)?;
-        Ok(Self {
+        } = program;
+        Self {
             app: HostViewPreviewApp::new(host_view, sink_values),
-        })
+        }
     }
 
     #[must_use]

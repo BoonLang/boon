@@ -1,9 +1,8 @@
-use crate::bridge::{HostInput, HostSnapshot};
+use crate::bridge::HostInput;
 use crate::ids::ActorId;
 use crate::ir_executor::IrExecutor;
 use crate::lower::{CircleDrawerProgram, try_lower_circle_drawer};
 use crate::preview_runtime::PreviewRuntime;
-use crate::runtime::ActorKind;
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
 use boon_renderer_zoon::FakeRenderState;
@@ -23,12 +22,12 @@ impl CircleDrawerPreview {
     pub fn new(source: &str) -> Result<Self, String> {
         let program = try_lower_circle_drawer(source)?;
         let mut runtime = PreviewRuntime::new();
-        let canvas_actor = runtime.alloc_actor(ActorKind::SourcePort);
-        let undo_actor = runtime.alloc_actor(ActorKind::SourcePort);
+        let canvas_actor = runtime.alloc_actor();
+        let undo_actor = runtime.alloc_actor();
         let executor = IrExecutor::new(program.ir.clone())?;
         let app = crate::host_view_preview::HostViewPreviewApp::new(
             program.host_view.clone(),
-            executor.sink_values().clone(),
+            executor.sink_values(),
         );
         Ok(Self {
             runtime,
@@ -72,12 +71,14 @@ impl CircleDrawerPreview {
             return;
         }
 
-        let messages = self.runtime.dispatch_snapshot(HostSnapshot::new(inputs));
-        self.executor
-            .apply_messages(&messages)
-            .expect("circle drawer IR should execute");
-        for (sink, value) in self.executor.sink_values() {
-            self.app.set_sink_value(*sink, value.clone());
+        let (runtime, executor, app) = (&mut self.runtime, &mut self.executor, &mut self.app);
+        runtime.dispatch_inputs_batches(inputs.as_slice(), |messages| {
+            executor
+                .apply_pure_messages_owned(messages.drain(..))
+                .expect("circle drawer IR should execute");
+        });
+        for (sink, value) in executor.sink_values() {
+            app.set_sink_value(sink, value);
         }
     }
 
@@ -96,7 +97,8 @@ impl CircleDrawerPreview {
     }
 
     #[must_use]
-    pub fn app(&self) -> &crate::host_view_preview::HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &crate::host_view_preview::HostViewPreviewApp {
         &self.app
     }
 }

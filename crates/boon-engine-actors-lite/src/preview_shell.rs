@@ -1,5 +1,7 @@
 use boon::zoon::*;
-use boon_renderer_zoon::{FakeRenderState, RenderInteractionHandlers, render_retained_snapshot_signal};
+use boon_renderer_zoon::{
+    FakeRenderState, RenderInteractionHandlers, render_retained_snapshot_signal,
+};
 use boon_scene::{RenderRoot, UiEventBatch, UiNode};
 use std::cell::RefCell;
 use std::rc::Rc;

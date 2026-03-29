@@ -2,7 +2,7 @@ use crate::host_view_preview::HostViewPreviewApp;
 use crate::ids::ActorId;
 use crate::ir::SourcePortId;
 use crate::preview_runtime::PreviewRuntime;
-use crate::runtime::{ActorKind, Msg};
+use crate::runtime::Msg;
 use boon::platform::browser::kernel::KernelValue;
 use boon_scene::{UiEventBatch, UiEventKind};
 use std::collections::BTreeMap;
@@ -19,7 +19,7 @@ impl MappedClickRuntime {
         let mut actors_by_port = BTreeMap::new();
 
         for source_port in source_ports {
-            actors_by_port.insert(source_port, runtime.alloc_actor(ActorKind::SourcePort));
+            actors_by_port.insert(source_port, runtime.alloc_actor());
         }
 
         Self {
@@ -29,7 +29,7 @@ impl MappedClickRuntime {
     }
 
     #[must_use]
-    pub fn dispatch_clicks(
+    pub(crate) fn dispatch_clicks(
         &mut self,
         app: &HostViewPreviewApp,
         batch: UiEventBatch,
@@ -54,20 +54,22 @@ impl MappedClickRuntime {
                 continue;
             };
             let actor = self.actors_by_port[&source_port];
-            let messages =
-                self.runtime
-                    .dispatch_pulse(actor, source_port, KernelValue::from("press"));
-            clicked.extend(Self::clicked_ports(messages));
+            self.runtime.dispatch_pulse_batches(
+                actor,
+                source_port,
+                KernelValue::from("press"),
+                |messages| clicked.extend(Self::clicked_ports(messages)),
+            );
         }
 
         clicked
     }
 
-    fn clicked_ports(messages: Vec<(ActorId, Msg)>) -> Vec<SourcePortId> {
+    fn clicked_ports(messages: &[Msg]) -> Vec<SourcePortId> {
         messages
-            .into_iter()
-            .filter_map(|(_actor_id, message)| match message {
-                Msg::SourcePulse { port, .. } => Some(port),
+            .iter()
+            .filter_map(|message| match message {
+                Msg::SourcePulse { port, .. } => Some(*port),
                 _ => None,
             })
             .collect()
@@ -77,7 +79,7 @@ impl MappedClickRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{HostViewIr, HostViewKind, HostViewNode};
+    use crate::bridge::{HostButtonLabel, HostViewIr, HostViewKind, HostViewNode};
     use crate::host_view_preview::HostViewPreviewApp;
     use crate::ir::{FunctionInstanceId, RetainedNodeKey, SinkPortId, ViewSiteId};
     use boon::platform::browser::kernel::KernelValue;
@@ -101,7 +103,7 @@ mod tests {
                                 mapped_item_identity: Some(1),
                             },
                             kind: HostViewKind::Button {
-                                label: "A".to_string(),
+                                label: HostButtonLabel::Static("A".to_string()),
                                 press_port: first_port,
                                 disabled_sink: None,
                             },

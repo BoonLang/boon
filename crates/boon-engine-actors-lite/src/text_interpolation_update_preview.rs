@@ -26,7 +26,8 @@ impl TextInterpolationUpdatePreview {
     }
 
     #[must_use]
-    pub fn app(&self) -> &HostViewPreviewApp {
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &HostViewPreviewApp {
         &self.app
     }
 
@@ -87,10 +88,7 @@ fn sinks_for_value(
             program.label_sink,
             KernelValue::from(format!("Label shows: {value_text}")),
         ),
-        (
-            program.while_sink,
-            KernelValue::from(format!("WHILE says: {value_text}")),
-        ),
+        (program.while_sink, KernelValue::from(value)),
     ])
 }
 

@@ -1,18 +1,35 @@
 use crate::bridge::{
-    HostCrossAlign, HostSelectOption, HostStripeDirection, HostViewIr, HostViewKind, HostViewNode,
-    HostWidth,
+    HostButtonLabel, HostCrossAlign, HostSelectOption, HostStripeDirection, HostTemplatedTextPart,
+    HostViewIr, HostViewKind, HostViewMatchArm, HostViewMatchValue, HostViewNode, HostWidth,
 };
+use crate::host_view_template::kernel_value_truthy;
+use crate::interactive_preview::{InteractivePreview, render_interactive_preview};
 use crate::ir::{RetainedNodeKey, SinkPortId, SourcePortId};
 use boon::platform::browser::kernel::KernelValue;
 use boon::zoon::*;
 use boon_renderer_zoon::{
     FakeRenderState, RenderInteractionHandlers, render_snapshot_root_with_handlers,
 };
-use boon_scene::{EventPortId, NodeId, RenderDiffBatch, RenderOp, RenderRoot, UiNode, UiNodeKind};
-use std::collections::BTreeMap;
+use boon_scene::{
+    EventPortId, NodeId, RenderDiffBatch, RenderOp, RenderRoot, UiEventBatch, UiEventKind,
+    UiFactBatch, UiNode, UiNodeKind,
+};
+use std::collections::{BTreeMap, HashMap};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostEventBinding {
+    pub source_port: SourcePortId,
+    pub mapped_item_identity: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct HostEventBindingKey {
+    source_port: SourcePortId,
+    mapped_item_identity: Option<u64>,
+}
 
 #[derive(Debug)]
-pub struct HostViewPreviewApp {
+pub(crate) struct HostViewPreviewApp {
     host_view: HostViewIr,
     sink_values: BTreeMap<SinkPortId, KernelValue>,
     renderer: HostViewPreviewRenderer,
@@ -20,7 +37,10 @@ pub struct HostViewPreviewApp {
 
 impl HostViewPreviewApp {
     #[must_use]
-    pub fn new(host_view: HostViewIr, sink_values: BTreeMap<SinkPortId, KernelValue>) -> Self {
+    pub(crate) fn new(
+        host_view: HostViewIr,
+        sink_values: BTreeMap<SinkPortId, KernelValue>,
+    ) -> Self {
         Self {
             host_view,
             sink_values,
@@ -29,60 +49,198 @@ impl HostViewPreviewApp {
     }
 
     #[must_use]
-    pub fn render_root(&mut self) -> UiNode {
+    pub(crate) fn render_root(&mut self) -> UiNode {
         self.render_snapshot().0
     }
 
     #[must_use]
-    pub fn render_snapshot(&mut self) -> (UiNode, FakeRenderState) {
+    pub(crate) fn render_snapshot(&mut self) -> (UiNode, FakeRenderState) {
         self.renderer
             .render_snapshot(&self.host_view, &self.sink_values)
     }
 
     #[must_use]
-    pub fn preview_text(&mut self) -> String {
+    pub(crate) fn preview_text(&mut self) -> String {
         preview_text(&self.render_root())
     }
 
     #[must_use]
-    pub fn sink_value(&self, sink: SinkPortId) -> Option<&KernelValue> {
+    pub(crate) fn sink_value(&self, sink: SinkPortId) -> Option<&KernelValue> {
         self.sink_values.get(&sink)
     }
 
-    pub fn set_sink_value(&mut self, sink: SinkPortId, value: KernelValue) {
+    pub(crate) fn set_sink_value(&mut self, sink: SinkPortId, value: KernelValue) {
         self.sink_values.insert(sink, value);
     }
 
+    pub(crate) fn set_host_view(&mut self, host_view: HostViewIr) {
+        self.host_view = host_view;
+    }
+
     #[must_use]
-    pub fn event_port_for_source(&self, source_port: SourcePortId) -> Option<EventPortId> {
+    pub(crate) fn event_port_for_source(&self, source_port: SourcePortId) -> Option<EventPortId> {
         self.renderer.event_port_for_source(source_port)
     }
 
-    pub fn into_parts(
-        self,
-    ) -> (
-        HostViewIr,
-        BTreeMap<SinkPortId, KernelValue>,
-        HostViewPreviewRenderer,
-    ) {
-        (self.host_view, self.sink_values, self.renderer)
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn event_port_for_mapped_source(
+        &self,
+        source_port: SourcePortId,
+        mapped_item_identity: u64,
+    ) -> Option<EventPortId> {
+        self.renderer
+            .event_port_for_mapped_source(source_port, mapped_item_identity)
     }
+
+    #[must_use]
+    pub(crate) fn event_binding_for_port(
+        &self,
+        event_port: EventPortId,
+    ) -> Option<HostEventBinding> {
+        self.renderer.event_binding_for_port(event_port)
+    }
+
+    #[must_use]
+    pub(crate) fn retained_key_for_node(&self, node_id: NodeId) -> Option<RetainedNodeKey> {
+        self.renderer.retained_key_for_node(node_id)
+    }
+
+    #[must_use]
+    pub(crate) fn retained_nodes(&self) -> &BTreeMap<RetainedNodeKey, NodeId> {
+        &self.renderer.retained_nodes
+    }
+}
+
+pub(crate) trait InteractiveHostViewModel {
+    fn app_mut(&mut self) -> &mut HostViewPreviewApp;
+    fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool;
+
+    fn dispatch_ui_facts(&mut self, _batch: UiFactBatch) -> bool {
+        false
+    }
+
+    fn render_snapshot(&mut self) -> (RenderRoot, FakeRenderState) {
+        let (root, state) = self.app_mut().render_snapshot();
+        (RenderRoot::UiTree(root), state)
+    }
+}
+
+struct InteractiveHostViewPreview<Model> {
+    model: Model,
+}
+
+impl<Model> InteractivePreview for InteractiveHostViewPreview<Model>
+where
+    Model: InteractiveHostViewModel,
+{
+    fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool {
+        self.model.dispatch_ui_events(batch)
+    }
+
+    fn dispatch_ui_facts(&mut self, batch: UiFactBatch) -> bool {
+        self.model.dispatch_ui_facts(batch)
+    }
+
+    fn render_snapshot(&mut self) -> (RenderRoot, FakeRenderState) {
+        self.model.render_snapshot()
+    }
+}
+
+pub(crate) fn render_interactive_host_view<Model>(model: Model) -> impl Element
+where
+    Model: InteractiveHostViewModel + 'static,
+{
+    render_interactive_preview(InteractiveHostViewPreview { model })
 }
 
 #[derive(Debug, Default)]
-pub struct HostViewPreviewRenderer {
+struct HostViewPreviewRenderer {
     retained_nodes: BTreeMap<RetainedNodeKey, NodeId>,
-    event_ports: BTreeMap<SourcePortId, EventPortId>,
+    rendered_keys: HashMap<NodeId, RetainedNodeKey>,
+    event_ports: BTreeMap<HostEventBindingKey, EventPortId>,
+    event_bindings: HashMap<EventPortId, HostEventBinding>,
 }
 
 impl HostViewPreviewRenderer {
-    #[must_use]
-    pub fn event_port_for_source(&self, source_port: SourcePortId) -> Option<EventPortId> {
-        self.event_ports.get(&source_port).copied()
+    #[cfg(test)]
+    fn event_port_for_binding(
+        &self,
+        source_port: SourcePortId,
+        mapped_item_identity: Option<u64>,
+    ) -> Option<EventPortId> {
+        self.event_ports
+            .get(&HostEventBindingKey {
+                source_port,
+                mapped_item_identity,
+            })
+            .copied()
+    }
+
+    fn attach_event_port(
+        &mut self,
+        ops: &mut Vec<RenderOp>,
+        id: NodeId,
+        source_port: SourcePortId,
+        mapped_item_identity: Option<u64>,
+        kind: UiEventKind,
+    ) -> EventPortId {
+        let event_port = *self
+            .event_ports
+            .entry(HostEventBindingKey {
+                source_port,
+                mapped_item_identity,
+            })
+            .or_insert_with(EventPortId::new);
+        self.event_bindings.insert(
+            event_port,
+            HostEventBinding {
+                source_port,
+                mapped_item_identity,
+            },
+        );
+        ops.push(RenderOp::AttachEventPort {
+            id,
+            port: event_port,
+            kind,
+        });
+        event_port
     }
 
     #[must_use]
-    pub fn render_snapshot(
+    fn event_port_for_source(&self, source_port: SourcePortId) -> Option<EventPortId> {
+        let mut matches = self
+            .event_bindings
+            .iter()
+            .filter_map(|(event_port, binding)| {
+                (binding.source_port == source_port).then_some(*event_port)
+            });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn event_port_for_mapped_source(
+        &self,
+        source_port: SourcePortId,
+        mapped_item_identity: u64,
+    ) -> Option<EventPortId> {
+        self.event_port_for_binding(source_port, Some(mapped_item_identity))
+    }
+
+    #[must_use]
+    fn event_binding_for_port(&self, event_port: EventPortId) -> Option<HostEventBinding> {
+        self.event_bindings.get(&event_port).copied()
+    }
+
+    #[must_use]
+    fn retained_key_for_node(&self, node_id: NodeId) -> Option<RetainedNodeKey> {
+        self.rendered_keys.get(&node_id).copied()
+    }
+
+    #[must_use]
+    fn render_snapshot(
         &mut self,
         host_view: &HostViewIr,
         sink_values: &BTreeMap<SinkPortId, KernelValue>,
@@ -107,6 +265,7 @@ impl HostViewPreviewRenderer {
             .retained_nodes
             .entry(node.retained_key)
             .or_insert_with(NodeId::new);
+        self.rendered_keys.insert(id, node.retained_key);
 
         let mut children = node
             .children
@@ -117,6 +276,30 @@ impl HostViewPreviewRenderer {
         let kind = match &node.kind {
             HostViewKind::Document => {
                 apply_document_styles(ops, id);
+                UiNodeKind::Element {
+                    tag: "div".to_string(),
+                    text: None,
+                    event_ports: Vec::new(),
+                }
+            }
+            HostViewKind::Container { center_row } => {
+                ops.push(RenderOp::SetStyle {
+                    id,
+                    name: "display".to_string(),
+                    value: Some("flex".to_string()),
+                });
+                if *center_row {
+                    ops.push(RenderOp::SetStyle {
+                        id,
+                        name: "justify-content".to_string(),
+                        value: Some("center".to_string()),
+                    });
+                    ops.push(RenderOp::SetStyle {
+                        id,
+                        name: "align-items".to_string(),
+                        value: Some("center".to_string()),
+                    });
+                }
                 UiNodeKind::Element {
                     tag: "div".to_string(),
                     text: None,
@@ -172,6 +355,93 @@ impl HostViewPreviewRenderer {
                 )),
                 event_ports: Vec::new(),
             },
+            HostViewKind::StaticLabel { text } => UiNodeKind::Element {
+                tag: "span".to_string(),
+                text: Some(text.clone()),
+                event_ports: Vec::new(),
+            },
+            HostViewKind::MatchGroup {
+                condition_sink,
+                arms,
+                fallback_child_count,
+            } => {
+                children = select_match_group_children(
+                    children,
+                    sink_values
+                        .get(condition_sink)
+                        .unwrap_or(&KernelValue::Skip),
+                    arms,
+                    *fallback_child_count,
+                );
+                UiNodeKind::Element {
+                    tag: "div".to_string(),
+                    text: None,
+                    event_ports: Vec::new(),
+                }
+            }
+            HostViewKind::ConditionalLabel {
+                condition_sink,
+                when_true,
+                when_false,
+            } => UiNodeKind::Element {
+                tag: "span".to_string(),
+                text: Some(
+                    if kernel_value_truthy(
+                        sink_values
+                            .get(condition_sink)
+                            .unwrap_or(&KernelValue::Skip),
+                    ) {
+                        when_true.clone()
+                    } else {
+                        when_false.clone()
+                    },
+                ),
+                event_ports: Vec::new(),
+            },
+            HostViewKind::Paragraph => UiNodeKind::Element {
+                tag: "p".to_string(),
+                text: None,
+                event_ports: Vec::new(),
+            },
+            HostViewKind::Link { href, new_tab } => {
+                ops.push(RenderOp::SetProperty {
+                    id,
+                    name: "href".to_string(),
+                    value: Some(href.clone()),
+                });
+                if *new_tab {
+                    ops.push(RenderOp::SetProperty {
+                        id,
+                        name: "target".to_string(),
+                        value: Some("_blank".to_string()),
+                    });
+                    ops.push(RenderOp::SetProperty {
+                        id,
+                        name: "rel".to_string(),
+                        value: Some("noopener noreferrer".to_string()),
+                    });
+                }
+                UiNodeKind::Element {
+                    tag: "a".to_string(),
+                    text: None,
+                    event_ports: Vec::new(),
+                }
+            }
+            HostViewKind::TemplatedLabel { parts } => UiNodeKind::Element {
+                tag: "span".to_string(),
+                text: Some(
+                    parts
+                        .iter()
+                        .map(|part| match part {
+                            HostTemplatedTextPart::Static(text) => text.clone(),
+                            HostTemplatedTextPart::Sink(sink) => render_sink_value(
+                                sink_values.get(sink).unwrap_or(&KernelValue::Skip),
+                            ),
+                        })
+                        .collect::<String>(),
+                ),
+                event_ports: Vec::new(),
+            },
             HostViewKind::StyledLabel {
                 sink,
                 font_size_px,
@@ -193,15 +463,13 @@ impl HostViewPreviewRenderer {
                 height_px,
                 background,
             } => {
-                let event_port = *self
-                    .event_ports
-                    .entry(*click_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+                let event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: event_port,
-                    kind: boon_scene::UiEventKind::Click,
-                });
+                    *click_port,
+                    node.retained_key.mapped_item_identity,
+                    UiEventKind::Click,
+                );
                 ops.push(RenderOp::SetStyle {
                     id,
                     name: "width".to_string(),
@@ -239,15 +507,13 @@ impl HostViewPreviewRenderer {
                 height_px,
                 background,
             } => {
-                let event_port = *self
-                    .event_ports
-                    .entry(*click_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+                let event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: event_port,
-                    kind: boon_scene::UiEventKind::Click,
-                });
+                    *click_port,
+                    node.retained_key.mapped_item_identity,
+                    UiEventKind::Click,
+                );
                 ops.push(RenderOp::SetStyle {
                     id,
                     name: "width".to_string(),
@@ -322,16 +588,18 @@ impl HostViewPreviewRenderer {
                     event_ports: Vec::new(),
                 }
             }
-            HostViewKind::ActionLabel { sink, press_port } => {
-                let event_port = *self
-                    .event_ports
-                    .entry(*press_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+            HostViewKind::ActionLabel {
+                sink,
+                press_port,
+                event_kind,
+            } => {
+                let event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: event_port,
-                    kind: boon_scene::UiEventKind::Click,
-                });
+                    *press_port,
+                    node.retained_key.mapped_item_identity,
+                    event_kind.clone(),
+                );
                 UiNodeKind::Element {
                     tag: "span".to_string(),
                     text: Some(render_sink_value(
@@ -340,21 +608,38 @@ impl HostViewPreviewRenderer {
                     event_ports: vec![event_port],
                 }
             }
+            HostViewKind::StaticActionLabel {
+                text,
+                press_port,
+                event_kind,
+            } => {
+                let event_port = self.attach_event_port(
+                    ops,
+                    id,
+                    *press_port,
+                    node.retained_key.mapped_item_identity,
+                    event_kind.clone(),
+                );
+                UiNodeKind::Element {
+                    tag: "span".to_string(),
+                    text: Some(text.clone()),
+                    event_ports: vec![event_port],
+                }
+            }
             HostViewKind::StyledActionLabel {
                 sink,
                 press_port,
+                event_kind,
                 width,
                 bold_sink,
             } => {
-                let event_port = *self
-                    .event_ports
-                    .entry(*press_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+                let event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: event_port,
-                    kind: boon_scene::UiEventKind::Click,
-                });
+                    *press_port,
+                    node.retained_key.mapped_item_identity,
+                    event_kind.clone(),
+                );
                 apply_button_styles(ops, id, width.as_ref(), None, false, None, None, None);
                 if sink_is_truthy(bold_sink, sink_values) {
                     set_style(ops, id, "font-weight", "700");
@@ -371,20 +656,18 @@ impl HostViewPreviewRenderer {
                 checked_sink,
                 click_port,
             } => {
-                let click_event_port = *self
-                    .event_ports
-                    .entry(*click_port)
-                    .or_insert_with(EventPortId::new);
+                let click_event_port = self.attach_event_port(
+                    ops,
+                    id,
+                    *click_port,
+                    node.retained_key.mapped_item_identity,
+                    UiEventKind::Click,
+                );
                 let checked = match sink_values.get(checked_sink) {
                     Some(KernelValue::Bool(value)) => *value,
                     Some(KernelValue::Text(text)) | Some(KernelValue::Tag(text)) => text == "true",
                     _ => false,
                 };
-                ops.push(RenderOp::AttachEventPort {
-                    id,
-                    port: click_event_port,
-                    kind: boon_scene::UiEventKind::Click,
-                });
                 ops.push(RenderOp::SetProperty {
                     id,
                     name: "type".to_string(),
@@ -412,31 +695,85 @@ impl HostViewPreviewRenderer {
                     event_ports: vec![click_event_port],
                 }
             }
+            HostViewKind::StaticCheckbox {
+                checked,
+                click_port,
+                labelled_by_view_site,
+            } => {
+                let click_event_port = self.attach_event_port(
+                    ops,
+                    id,
+                    *click_port,
+                    node.retained_key.mapped_item_identity,
+                    UiEventKind::Click,
+                );
+                ops.push(RenderOp::SetProperty {
+                    id,
+                    name: "type".to_string(),
+                    value: Some("checkbox".to_string()),
+                });
+                apply_checkbox_styles(ops, id);
+                ops.push(RenderOp::SetProperty {
+                    id,
+                    name: "role".to_string(),
+                    value: Some("checkbox".to_string()),
+                });
+                if let Some(view_site) = labelled_by_view_site {
+                    ops.push(RenderOp::SetProperty {
+                        id,
+                        name: "data-label-ref-view-site".to_string(),
+                        value: Some(view_site.0.to_string()),
+                    });
+                }
+                ops.push(RenderOp::SetProperty {
+                    id,
+                    name: "checked".to_string(),
+                    value: if *checked {
+                        Some("true".to_string())
+                    } else {
+                        None
+                    },
+                });
+                ops.push(RenderOp::SetChecked {
+                    id,
+                    checked: *checked,
+                });
+                UiNodeKind::Element {
+                    tag: "input".to_string(),
+                    text: None,
+                    event_ports: vec![click_event_port],
+                }
+            }
             HostViewKind::TextInput {
                 value_sink,
                 placeholder,
                 change_port,
                 key_down_port,
+                blur_port,
+                focus_port,
                 focus_on_mount,
                 disabled_sink,
             } => {
-                let input_event_port = *self
-                    .event_ports
-                    .entry(*change_port)
-                    .or_insert_with(EventPortId::new);
-                let key_down_event_port = *self
-                    .event_ports
-                    .entry(*key_down_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+                let mapped_item_identity = node.retained_key.mapped_item_identity;
+                let input_event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: input_event_port,
-                    kind: boon_scene::UiEventKind::Input,
+                    *change_port,
+                    mapped_item_identity,
+                    UiEventKind::Input,
+                );
+                let key_down_event_port = self.attach_event_port(
+                    ops,
+                    id,
+                    *key_down_port,
+                    mapped_item_identity,
+                    UiEventKind::KeyDown,
+                );
+                let blur_event_port = blur_port.map(|port| {
+                    self.attach_event_port(ops, id, port, mapped_item_identity, UiEventKind::Blur)
                 });
-                ops.push(RenderOp::AttachEventPort {
-                    id,
-                    port: key_down_event_port,
-                    kind: boon_scene::UiEventKind::KeyDown,
+                let focus_event_port = focus_port.map(|port| {
+                    self.attach_event_port(ops, id, port, mapped_item_identity, UiEventKind::Focus)
                 });
                 ops.push(RenderOp::SetProperty {
                     id,
@@ -466,7 +803,83 @@ impl HostViewPreviewRenderer {
                 UiNodeKind::Element {
                     tag: "input".to_string(),
                     text: None,
-                    event_ports: vec![input_event_port, key_down_event_port],
+                    event_ports: vec![
+                        Some(input_event_port),
+                        Some(key_down_event_port),
+                        blur_event_port,
+                        focus_event_port,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+                }
+            }
+            HostViewKind::StaticTextInput {
+                value,
+                placeholder,
+                change_port,
+                key_down_port,
+                blur_port,
+                focus_port,
+                focus_on_mount,
+                disabled,
+            } => {
+                let mapped_item_identity = node.retained_key.mapped_item_identity;
+                let input_event_port = self.attach_event_port(
+                    ops,
+                    id,
+                    *change_port,
+                    mapped_item_identity,
+                    UiEventKind::Input,
+                );
+                let key_down_event_port = self.attach_event_port(
+                    ops,
+                    id,
+                    *key_down_port,
+                    mapped_item_identity,
+                    UiEventKind::KeyDown,
+                );
+                let blur_event_port = blur_port.map(|port| {
+                    self.attach_event_port(ops, id, port, mapped_item_identity, UiEventKind::Blur)
+                });
+                let focus_event_port = focus_port.map(|port| {
+                    self.attach_event_port(ops, id, port, mapped_item_identity, UiEventKind::Focus)
+                });
+                ops.push(RenderOp::SetProperty {
+                    id,
+                    name: "type".to_string(),
+                    value: Some("text".to_string()),
+                });
+                ops.push(RenderOp::SetProperty {
+                    id,
+                    name: "placeholder".to_string(),
+                    value: Some(placeholder.clone()),
+                });
+                apply_text_input_styles(ops, id, None);
+                if *focus_on_mount {
+                    ops.push(RenderOp::SetProperty {
+                        id,
+                        name: "autofocus".to_string(),
+                        value: Some("true".to_string()),
+                    });
+                }
+                apply_disabled_state(ops, id, *disabled);
+                ops.push(RenderOp::SetInputValue {
+                    id,
+                    value: value.clone(),
+                });
+                UiNodeKind::Element {
+                    tag: "input".to_string(),
+                    text: None,
+                    event_ports: vec![
+                        Some(input_event_port),
+                        Some(key_down_event_port),
+                        blur_event_port,
+                        focus_event_port,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
                 }
             }
             HostViewKind::StyledTextInput {
@@ -474,27 +887,32 @@ impl HostViewPreviewRenderer {
                 placeholder,
                 change_port,
                 key_down_port,
+                blur_port,
+                focus_port,
                 focus_on_mount,
                 disabled_sink,
                 width,
             } => {
-                let input_event_port = *self
-                    .event_ports
-                    .entry(*change_port)
-                    .or_insert_with(EventPortId::new);
-                let key_down_event_port = *self
-                    .event_ports
-                    .entry(*key_down_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+                let mapped_item_identity = node.retained_key.mapped_item_identity;
+                let input_event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: input_event_port,
-                    kind: boon_scene::UiEventKind::Input,
+                    *change_port,
+                    mapped_item_identity,
+                    UiEventKind::Input,
+                );
+                let key_down_event_port = self.attach_event_port(
+                    ops,
+                    id,
+                    *key_down_port,
+                    mapped_item_identity,
+                    UiEventKind::KeyDown,
+                );
+                let blur_event_port = blur_port.map(|port| {
+                    self.attach_event_port(ops, id, port, mapped_item_identity, UiEventKind::Blur)
                 });
-                ops.push(RenderOp::AttachEventPort {
-                    id,
-                    port: key_down_event_port,
-                    kind: boon_scene::UiEventKind::KeyDown,
+                let focus_event_port = focus_port.map(|port| {
+                    self.attach_event_port(ops, id, port, mapped_item_identity, UiEventKind::Focus)
                 });
                 ops.push(RenderOp::SetProperty {
                     id,
@@ -524,7 +942,15 @@ impl HostViewPreviewRenderer {
                 UiNodeKind::Element {
                     tag: "input".to_string(),
                     text: None,
-                    event_ports: vec![input_event_port, key_down_event_port],
+                    event_ports: vec![
+                        Some(input_event_port),
+                        Some(key_down_event_port),
+                        blur_event_port,
+                        focus_event_port,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
                 }
             }
             HostViewKind::Slider {
@@ -535,15 +961,13 @@ impl HostViewPreviewRenderer {
                 step,
                 disabled_sink,
             } => {
-                let input_event_port = *self
-                    .event_ports
-                    .entry(*input_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+                let input_event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: input_event_port,
-                    kind: boon_scene::UiEventKind::Change,
-                });
+                    *input_port,
+                    node.retained_key.mapped_item_identity,
+                    UiEventKind::Change,
+                );
                 ops.push(RenderOp::SetProperty {
                     id,
                     name: "type".to_string(),
@@ -587,15 +1011,13 @@ impl HostViewPreviewRenderer {
                 disabled_sink,
                 width,
             } => {
-                let input_event_port = *self
-                    .event_ports
-                    .entry(*input_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+                let input_event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: input_event_port,
-                    kind: boon_scene::UiEventKind::Change,
-                });
+                    *input_port,
+                    node.retained_key.mapped_item_identity,
+                    UiEventKind::Change,
+                );
                 ops.push(RenderOp::SetProperty {
                     id,
                     name: "type".to_string(),
@@ -636,15 +1058,13 @@ impl HostViewPreviewRenderer {
                 options,
                 disabled_sink,
             } => {
-                let input_event_port = *self
-                    .event_ports
-                    .entry(*change_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+                let input_event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: input_event_port,
-                    kind: boon_scene::UiEventKind::Input,
-                });
+                    *change_port,
+                    node.retained_key.mapped_item_identity,
+                    UiEventKind::Input,
+                );
                 apply_select_styles(ops, id, None);
                 ops.push(RenderOp::SetInputValue {
                     id,
@@ -671,15 +1091,13 @@ impl HostViewPreviewRenderer {
                 disabled_sink,
                 width,
             } => {
-                let input_event_port = *self
-                    .event_ports
-                    .entry(*change_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+                let input_event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: input_event_port,
-                    kind: boon_scene::UiEventKind::Input,
-                });
+                    *change_port,
+                    node.retained_key.mapped_item_identity,
+                    UiEventKind::Input,
+                );
                 apply_select_styles(ops, id, width.as_ref());
                 ops.push(RenderOp::SetInputValue {
                     id,
@@ -705,15 +1123,13 @@ impl HostViewPreviewRenderer {
                 disabled_sink,
             } => {
                 let disabled = sink_is_truthy(disabled_sink, sink_values);
-                let event_port = *self
-                    .event_ports
-                    .entry(*press_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+                let event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: event_port,
-                    kind: boon_scene::UiEventKind::Click,
-                });
+                    *press_port,
+                    node.retained_key.mapped_item_identity,
+                    UiEventKind::Click,
+                );
                 apply_button_styles(ops, id, None, None, false, None, None, None);
                 apply_disabled_state(ops, id, disabled);
                 if !disabled {
@@ -721,7 +1137,7 @@ impl HostViewPreviewRenderer {
                 }
                 UiNodeKind::Element {
                     tag: "button".to_string(),
-                    text: Some(label.clone()),
+                    text: Some(render_button_label(label, sink_values)),
                     event_ports: vec![event_port],
                 }
             }
@@ -739,15 +1155,13 @@ impl HostViewPreviewRenderer {
                 active_outline,
             } => {
                 let disabled = sink_is_truthy(disabled_sink, sink_values);
-                let event_port = *self
-                    .event_ports
-                    .entry(*press_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+                let event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: event_port,
-                    kind: boon_scene::UiEventKind::Click,
-                });
+                    *press_port,
+                    node.retained_key.mapped_item_identity,
+                    UiEventKind::Click,
+                );
                 apply_button_styles(
                     ops,
                     id,
@@ -772,7 +1186,7 @@ impl HostViewPreviewRenderer {
                 }
                 UiNodeKind::Element {
                     tag: "button".to_string(),
-                    text: Some(label.clone()),
+                    text: Some(render_button_label(label, sink_values)),
                     event_ports: vec![event_port],
                 }
             }
@@ -780,15 +1194,13 @@ impl HostViewPreviewRenderer {
                 tick_port,
                 interval_ms,
             } => {
-                let event_port = *self
-                    .event_ports
-                    .entry(*tick_port)
-                    .or_insert_with(EventPortId::new);
-                ops.push(RenderOp::AttachEventPort {
+                let event_port = self.attach_event_port(
+                    ops,
                     id,
-                    port: event_port,
-                    kind: boon_scene::UiEventKind::Custom(format!("timer:{interval_ms}")),
-                });
+                    *tick_port,
+                    node.retained_key.mapped_item_identity,
+                    UiEventKind::Custom(format!("timer:{interval_ms}")),
+                );
                 ops.push(RenderOp::SetProperty {
                     id,
                     name: "aria-hidden".to_string(),
@@ -798,6 +1210,57 @@ impl HostViewPreviewRenderer {
                     tag: "span".to_string(),
                     text: None,
                     event_ports: vec![event_port],
+                }
+            }
+            HostViewKind::GenericElement {
+                tag,
+                text,
+                properties,
+                styles,
+                input_value,
+                checked,
+                event_bindings,
+            } => {
+                let mut event_ports = Vec::with_capacity(event_bindings.len());
+                for binding in event_bindings {
+                    event_ports.push(self.attach_event_port(
+                        ops,
+                        id,
+                        binding.source_port,
+                        node.retained_key.mapped_item_identity,
+                        binding.event_kind.clone(),
+                    ));
+                }
+                for (name, value) in properties {
+                    ops.push(RenderOp::SetProperty {
+                        id,
+                        name: name.clone(),
+                        value: value.clone(),
+                    });
+                }
+                for (name, value) in styles {
+                    ops.push(RenderOp::SetStyle {
+                        id,
+                        name: name.clone(),
+                        value: value.clone(),
+                    });
+                }
+                if let Some(value) = input_value {
+                    ops.push(RenderOp::SetInputValue {
+                        id,
+                        value: value.clone(),
+                    });
+                }
+                if let Some(checked) = checked {
+                    ops.push(RenderOp::SetChecked {
+                        id,
+                        checked: *checked,
+                    });
+                }
+                UiNodeKind::Element {
+                    tag: tag.clone(),
+                    text: text.clone(),
+                    event_ports,
                 }
             }
         };
@@ -840,6 +1303,7 @@ impl HostViewPreviewRenderer {
             mapped_item_identity: parent.retained_key.mapped_item_identity,
         };
         let id = *self.retained_nodes.entry(key).or_insert_with(NodeId::new);
+        self.rendered_keys.insert(id, key);
         ops.push(RenderOp::SetProperty {
             id,
             name: "value".to_string(),
@@ -944,7 +1408,7 @@ impl HostViewPreviewRenderer {
 }
 
 #[must_use]
-pub fn preview_text(node: &UiNode) -> String {
+fn preview_text(node: &UiNode) -> String {
     fn collect(node: &UiNode, out: &mut String) {
         match &node.kind {
             UiNodeKind::Element { text, .. } => {
@@ -964,11 +1428,10 @@ pub fn preview_text(node: &UiNode) -> String {
     out
 }
 
-pub fn render_static_host_view(app: HostViewPreviewApp) -> impl Element {
+pub(crate) fn render_static_host_view(app: HostViewPreviewApp) -> impl Element {
     let handlers = RenderInteractionHandlers::new(|_batch| {}, |_facts| {});
-    let (host_view, sink_values, renderer) = app.into_parts();
-    let mut renderer = renderer;
-    let (root, state) = renderer.render_snapshot(&host_view, &sink_values);
+    let mut app = app;
+    let (root, state) = app.render_snapshot();
     render_snapshot_root_with_handlers(&RenderRoot::UiTree(root), &state, &handlers)
 }
 
@@ -977,9 +1440,36 @@ fn render_sink_value(value: &KernelValue) -> String {
         KernelValue::Number(number) if number.fract() == 0.0 => format!("{}", *number as i64),
         KernelValue::Number(number) => number.to_string(),
         KernelValue::Text(text) | KernelValue::Tag(text) => text.clone(),
-        KernelValue::Bool(value) => value.to_string(),
+        KernelValue::Bool(value) => {
+            if *value {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
         KernelValue::Skip => String::new(),
         KernelValue::Object(_) | KernelValue::List(_) => format!("{value:?}"),
+    }
+}
+
+fn render_button_label(
+    label: &HostButtonLabel,
+    sink_values: &BTreeMap<SinkPortId, KernelValue>,
+) -> String {
+    match label {
+        HostButtonLabel::Static(text) => text.clone(),
+        HostButtonLabel::Sink(sink) => {
+            render_sink_value(sink_values.get(sink).unwrap_or(&KernelValue::Skip))
+        }
+        HostButtonLabel::Templated(parts) => parts
+            .iter()
+            .map(|part| match part {
+                HostTemplatedTextPart::Static(text) => text.clone(),
+                HostTemplatedTextPart::Sink(sink) => {
+                    render_sink_value(sink_values.get(sink).unwrap_or(&KernelValue::Skip))
+                }
+            })
+            .collect(),
     }
 }
 
@@ -1027,6 +1517,44 @@ fn apply_disabled_state(ops: &mut Vec<RenderOp>, id: NodeId, disabled: bool) {
         name: "filter".to_string(),
         value: disabled.then(|| "saturate(0.6)".to_string()),
     });
+}
+
+fn select_match_group_children(
+    children: Vec<UiNode>,
+    condition_value: &KernelValue,
+    arms: &[HostViewMatchArm],
+    fallback_child_count: usize,
+) -> Vec<UiNode> {
+    let mut arm_offsets = Vec::with_capacity(arms.len());
+    let mut start = 0usize;
+    for arm in arms {
+        arm_offsets.push((start, arm.child_count));
+        start += arm.child_count;
+    }
+
+    if let Some((index, _)) = arms
+        .iter()
+        .enumerate()
+        .find(|(_, arm)| host_match_value(condition_value, &arm.matcher))
+    {
+        let (start, count) = arm_offsets[index];
+        return children.into_iter().skip(start).take(count).collect();
+    }
+
+    children
+        .into_iter()
+        .skip(start)
+        .take(fallback_child_count)
+        .collect()
+}
+
+fn host_match_value(value: &KernelValue, matcher: &HostViewMatchValue) -> bool {
+    match (value, matcher) {
+        (KernelValue::Bool(value), HostViewMatchValue::Bool(expected)) => value == expected,
+        (KernelValue::Text(value), HostViewMatchValue::Text(expected)) => value == expected,
+        (KernelValue::Tag(value), HostViewMatchValue::Tag(expected)) => value == expected,
+        _ => false,
+    }
 }
 
 fn set_style(ops: &mut Vec<RenderOp>, id: NodeId, name: &str, value: &str) {
@@ -1303,6 +1831,47 @@ mod tests {
     }
 
     #[test]
+    fn preview_app_replaces_host_view_without_replacing_matching_retained_root() {
+        let retained_key = RetainedNodeKey {
+            view_site: ViewSiteId(11),
+            function_instance: Some(FunctionInstanceId(21)),
+            mapped_item_identity: None,
+        };
+        let mut app = HostViewPreviewApp::new(
+            HostViewIr {
+                root: Some(HostViewNode {
+                    retained_key,
+                    kind: HostViewKind::Label {
+                        sink: SinkPortId(8),
+                    },
+                    children: Vec::new(),
+                }),
+            },
+            BTreeMap::from([(SinkPortId(8), KernelValue::from("before"))]),
+        );
+
+        let first = app.render_root();
+        app.set_host_view(HostViewIr {
+            root: Some(HostViewNode {
+                retained_key,
+                kind: HostViewKind::TemplatedLabel {
+                    parts: vec![
+                        HostTemplatedTextPart::Static("[".to_string()),
+                        HostTemplatedTextPart::Sink(SinkPortId(8)),
+                        HostTemplatedTextPart::Static("]".to_string()),
+                    ],
+                },
+                children: Vec::new(),
+            }),
+        });
+        app.set_sink_value(SinkPortId(8), KernelValue::from("after"));
+        let second = app.render_root();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(preview_text(&second), "[after]");
+    }
+
+    #[test]
     fn checkbox_host_nodes_publish_click_port_and_checked_state() {
         let retained_key = RetainedNodeKey {
             view_site: ViewSiteId(3),
@@ -1328,7 +1897,84 @@ mod tests {
             renderer.event_port_for_source(SourcePortId(8)).is_some(),
             true
         );
+        assert_eq!(
+            renderer.event_binding_for_port(
+                renderer
+                    .event_port_for_source(SourcePortId(8))
+                    .expect("checkbox event port"),
+            ),
+            Some(HostEventBinding {
+                source_port: SourcePortId(8),
+                mapped_item_identity: None,
+            })
+        );
         assert!(matches!(root.kind, UiNodeKind::Element { ref tag, .. } if tag == "input"));
+    }
+
+    #[test]
+    fn mapped_items_publish_distinct_event_ports_per_item_identity() {
+        let host_view = HostViewIr {
+            root: Some(HostViewNode {
+                retained_key: RetainedNodeKey {
+                    view_site: ViewSiteId(40),
+                    function_instance: Some(FunctionInstanceId(40)),
+                    mapped_item_identity: None,
+                },
+                kind: HostViewKind::Stripe,
+                children: vec![
+                    HostViewNode {
+                        retained_key: RetainedNodeKey {
+                            view_site: ViewSiteId(41),
+                            function_instance: Some(FunctionInstanceId(40)),
+                            mapped_item_identity: Some(1),
+                        },
+                        kind: HostViewKind::Button {
+                            label: HostButtonLabel::Static("A".to_string()),
+                            press_port: SourcePortId(20),
+                            disabled_sink: None,
+                        },
+                        children: Vec::new(),
+                    },
+                    HostViewNode {
+                        retained_key: RetainedNodeKey {
+                            view_site: ViewSiteId(41),
+                            function_instance: Some(FunctionInstanceId(40)),
+                            mapped_item_identity: Some(2),
+                        },
+                        kind: HostViewKind::Button {
+                            label: HostButtonLabel::Static("B".to_string()),
+                            press_port: SourcePortId(20),
+                            disabled_sink: None,
+                        },
+                        children: Vec::new(),
+                    },
+                ],
+            }),
+        };
+        let mut renderer = HostViewPreviewRenderer::default();
+        let (_root, _state) = renderer.render_snapshot(&host_view, &BTreeMap::new());
+
+        let first = renderer
+            .event_port_for_mapped_source(SourcePortId(20), 1)
+            .expect("first mapped event port");
+        let second = renderer
+            .event_port_for_mapped_source(SourcePortId(20), 2)
+            .expect("second mapped event port");
+        assert_ne!(first, second);
+        assert_eq!(
+            renderer.event_binding_for_port(first),
+            Some(HostEventBinding {
+                source_port: SourcePortId(20),
+                mapped_item_identity: Some(1),
+            })
+        );
+        assert_eq!(
+            renderer.event_binding_for_port(second),
+            Some(HostEventBinding {
+                source_port: SourcePortId(20),
+                mapped_item_identity: Some(2),
+            })
+        );
     }
 
     #[test]
@@ -1370,6 +2016,7 @@ mod tests {
                 kind: HostViewKind::ActionLabel {
                     sink: SinkPortId(9),
                     press_port: SourcePortId(10),
+                    event_kind: UiEventKind::Click,
                 },
                 children: Vec::new(),
             }),
@@ -1388,6 +2035,40 @@ mod tests {
                 ..
             } if tag == "span" && text.as_deref() == Some("Clickable")
         ));
+    }
+
+    #[test]
+    fn action_label_host_nodes_publish_configured_double_click_port() {
+        let retained_key = RetainedNodeKey {
+            view_site: ViewSiteId(5),
+            function_instance: Some(FunctionInstanceId(5)),
+            mapped_item_identity: None,
+        };
+        let host_view = HostViewIr {
+            root: Some(HostViewNode {
+                retained_key,
+                kind: HostViewKind::ActionLabel {
+                    sink: SinkPortId(10),
+                    press_port: SourcePortId(11),
+                    event_kind: UiEventKind::DoubleClick,
+                },
+                children: Vec::new(),
+            }),
+        };
+        let mut sinks = BTreeMap::new();
+        sinks.insert(SinkPortId(10), KernelValue::from("Double"));
+        let mut renderer = HostViewPreviewRenderer::default();
+        let (root, state) = renderer.render_snapshot(&host_view, &sinks);
+
+        assert_eq!(
+            state.event_ports_for(root.id),
+            vec![(
+                renderer
+                    .event_port_for_source(SourcePortId(11))
+                    .expect("double-click event port"),
+                UiEventKind::DoubleClick
+            )]
+        );
     }
 
     #[test]
@@ -1575,6 +2256,8 @@ mod tests {
                             placeholder: "Name".to_string(),
                             change_port: SourcePortId(1),
                             key_down_port: SourcePortId(2),
+                            blur_port: None,
+                            focus_port: None,
                             focus_on_mount: false,
                             disabled_sink: None,
                         },
@@ -1583,7 +2266,7 @@ mod tests {
                     HostViewNode {
                         retained_key: button_key,
                         kind: HostViewKind::Button {
-                            label: "Create".to_string(),
+                            label: HostButtonLabel::Static("Create".to_string()),
                             press_port: SourcePortId(3),
                             disabled_sink: None,
                         },
@@ -1603,6 +2286,42 @@ mod tests {
         assert_eq!(state.style_value(input.id, "min-width"), Some("220px"));
         assert_eq!(state.style_value(button.id, "border-radius"), Some("10px"));
         assert_eq!(state.style_value(button.id, "cursor"), Some("pointer"));
+    }
+
+    #[test]
+    fn text_inputs_publish_optional_focus_and_blur_ports() {
+        let retained_key = RetainedNodeKey {
+            view_site: ViewSiteId(66),
+            function_instance: Some(FunctionInstanceId(66)),
+            mapped_item_identity: None,
+        };
+        let host_view = HostViewIr {
+            root: Some(HostViewNode {
+                retained_key,
+                kind: HostViewKind::TextInput {
+                    value_sink: SinkPortId(33),
+                    placeholder: "Focus".to_string(),
+                    change_port: SourcePortId(33),
+                    key_down_port: SourcePortId(34),
+                    blur_port: Some(SourcePortId(35)),
+                    focus_port: Some(SourcePortId(36)),
+                    focus_on_mount: false,
+                    disabled_sink: None,
+                },
+                children: Vec::new(),
+            }),
+        };
+        let mut renderer = HostViewPreviewRenderer::default();
+        let (root, _state) = renderer.render_snapshot(&host_view, &BTreeMap::new());
+
+        let UiNodeKind::Element { event_ports, .. } = root.kind else {
+            panic!("text input should render as element");
+        };
+        assert_eq!(event_ports.len(), 4);
+        assert!(renderer.event_port_for_source(SourcePortId(33)).is_some());
+        assert!(renderer.event_port_for_source(SourcePortId(34)).is_some());
+        assert!(renderer.event_port_for_source(SourcePortId(35)).is_some());
+        assert!(renderer.event_port_for_source(SourcePortId(36)).is_some());
     }
 
     #[test]
@@ -1634,6 +2353,8 @@ mod tests {
                             placeholder: "Disabled".to_string(),
                             change_port: SourcePortId(30),
                             key_down_port: SourcePortId(31),
+                            blur_port: None,
+                            focus_port: None,
                             focus_on_mount: false,
                             disabled_sink: Some(SinkPortId(31)),
                             width: Some(HostWidth::Fill),
@@ -1643,7 +2364,7 @@ mod tests {
                     HostViewNode {
                         retained_key: button_key,
                         kind: HostViewKind::StyledButton {
-                            label: "Book".to_string(),
+                            label: HostButtonLabel::Static("Book".to_string()),
                             press_port: SourcePortId(32),
                             disabled_sink: Some(SinkPortId(32)),
                             width: Some(HostWidth::Fill),
@@ -1731,6 +2452,8 @@ mod tests {
                             placeholder: "Name".to_string(),
                             change_port: SourcePortId(10),
                             key_down_port: SourcePortId(11),
+                            blur_port: None,
+                            focus_port: None,
                             focus_on_mount: false,
                             disabled_sink: None,
                             width: Some(HostWidth::Fill),
@@ -1767,7 +2490,7 @@ mod tests {
                     HostViewNode {
                         retained_key: button_key,
                         kind: HostViewKind::StyledButton {
-                            label: "Go".to_string(),
+                            label: HostButtonLabel::Static("Go".to_string()),
                             press_port: SourcePortId(14),
                             disabled_sink: None,
                             width: Some(HostWidth::Px(45)),
@@ -1824,6 +2547,7 @@ mod tests {
                 kind: HostViewKind::StyledActionLabel {
                     sink: SinkPortId(20),
                     press_port: SourcePortId(20),
+                    event_kind: UiEventKind::Click,
                     width: Some(HostWidth::Fill),
                     bold_sink: Some(SinkPortId(21)),
                 },
@@ -1852,7 +2576,7 @@ mod tests {
             root: Some(HostViewNode {
                 retained_key,
                 kind: HostViewKind::StyledButton {
-                    label: "+".to_string(),
+                    label: HostButtonLabel::Static("+".to_string()),
                     press_port: SourcePortId(21),
                     disabled_sink: None,
                     width: Some(HostWidth::Px(45)),

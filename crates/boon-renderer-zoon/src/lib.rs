@@ -689,7 +689,12 @@ impl MountedRenderHost {
         let dom_node: web_sys::Node = element.clone().into();
         self.nodes.insert(node.id, dom_node.clone());
         let _ = element.set_attribute("data-boon-scene-node-id", &node.id.0.to_string());
-        self.sync_inline_text(node.id, &element, None, Some(&scene_label(node.kind.clone())));
+        self.sync_inline_text(
+            node.id,
+            &element,
+            None,
+            Some(&scene_label(node.kind.clone())),
+        );
         for child in &node.children {
             let child_node = self.build_scene_node(child);
             let _ = element.append_child(&child_node);
@@ -746,15 +751,10 @@ impl MountedRenderHost {
                 };
 
                 self.sync_inline_text(new.id, element, old_text.as_deref(), new_text.as_deref());
-                self.sync_ui_element_state(element, new.id, new_tag, old_state, new_state, handlers);
-                self.sync_ui_children(
-                    element.as_ref(),
-                    old,
-                    new,
-                    old_state,
-                    new_state,
-                    handlers,
+                self.sync_ui_element_state(
+                    element, new.id, new_tag, old_state, new_state, handlers,
                 );
+                self.sync_ui_children(element.as_ref(), old, new, old_state, new_state, handlers);
             }
             _ => self.replace_ui_subtree(parent, old, new, new_state, handlers),
         }
@@ -769,7 +769,11 @@ impl MountedRenderHost {
         new_state: &FakeRenderState,
         handlers: &RenderInteractionHandlers,
     ) {
-        let new_ids = new.children.iter().map(|child| child.id).collect::<HashSet<_>>();
+        let new_ids = new
+            .children
+            .iter()
+            .map(|child| child.id)
+            .collect::<HashSet<_>>();
         for old_child in &old.children {
             if !new_ids.contains(&old_child.id) {
                 self.remove_ui_subtree(parent, old_child);
@@ -796,7 +800,8 @@ impl MountedRenderHost {
             }
 
             if let Some(node) = self.nodes.get(&new_child.id).cloned() {
-                let reference = child_dom_reference(parent, self.inline_child_offset(new.id), index);
+                let reference =
+                    child_dom_reference(parent, self.inline_child_offset(new.id), index);
                 if reference.as_ref() != Some(&node) {
                     let _ = insert_child_node(parent, reference.as_ref(), &node);
                 }
@@ -857,9 +862,18 @@ impl MountedRenderHost {
 
         let old_label = scene_label(old.kind.clone());
         let new_label = scene_label(new.kind.clone());
-        self.sync_inline_text(new.id, element, Some(old_label.as_str()), Some(new_label.as_str()));
+        self.sync_inline_text(
+            new.id,
+            element,
+            Some(old_label.as_str()),
+            Some(new_label.as_str()),
+        );
 
-        let new_ids = new.children.iter().map(|child| child.id).collect::<HashSet<_>>();
+        let new_ids = new
+            .children
+            .iter()
+            .map(|child| child.id)
+            .collect::<HashSet<_>>();
         for old_child in &old.children {
             if !new_ids.contains(&old_child.id) {
                 self.remove_scene_subtree(element.as_ref(), old_child);
@@ -1099,7 +1113,9 @@ fn child_dom_reference(
     inline_offset: usize,
     child_index: usize,
 ) -> Option<web_sys::Node> {
-    parent.child_nodes().item((inline_offset + child_index) as u32)
+    parent
+        .child_nodes()
+        .item((inline_offset + child_index) as u32)
 }
 
 fn insert_child_node(
@@ -1179,8 +1195,14 @@ fn sync_classes(
     old_state: &FakeRenderState,
     new_state: &FakeRenderState,
 ) {
-    let old_classes = old_state.enabled_classes_for(node_id).cloned().collect::<Vec<_>>();
-    let new_classes = new_state.enabled_classes_for(node_id).cloned().collect::<Vec<_>>();
+    let old_classes = old_state
+        .enabled_classes_for(node_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let new_classes = new_state
+        .enabled_classes_for(node_id)
+        .cloned()
+        .collect::<Vec<_>>();
     if old_classes == new_classes {
         return;
     }
@@ -1223,8 +1245,10 @@ fn sync_input_like_state(
             }
             if let Some(checked) = new_state.checked_value_for(node_id) {
                 input.set_checked(checked);
-                let _ = element.set_attribute("aria-checked", if checked { "true" } else { "false" });
-                let _ = element.set_attribute("data-checked", if checked { "true" } else { "false" });
+                let _ =
+                    element.set_attribute("aria-checked", if checked { "true" } else { "false" });
+                let _ =
+                    element.set_attribute("data-checked", if checked { "true" } else { "false" });
             } else {
                 let _ = element.remove_attribute("aria-checked");
                 let _ = element.remove_attribute("data-checked");
@@ -1285,7 +1309,8 @@ fn attach_fact_listeners(
             });
         }
     }));
-    let _ = target.add_event_listener_with_callback("mouseenter", mouse_enter.as_ref().unchecked_ref());
+    let _ =
+        target.add_event_listener_with_callback("mouseenter", mouse_enter.as_ref().unchecked_ref());
     entries.push(NodeAttachment::Listener {
         target: target.clone(),
         event_name: "mouseenter".to_string(),
@@ -1301,7 +1326,8 @@ fn attach_fact_listeners(
             });
         }
     }));
-    let _ = target.add_event_listener_with_callback("mouseleave", mouse_leave.as_ref().unchecked_ref());
+    let _ =
+        target.add_event_listener_with_callback("mouseleave", mouse_leave.as_ref().unchecked_ref());
     entries.push(NodeAttachment::Listener {
         target: target.clone(),
         event_name: "mouseleave".to_string(),
@@ -1353,16 +1379,17 @@ fn attach_port_listener(
     match kind {
         UiEventKind::Click => {
             let callback = Closure::<dyn FnMut(web_sys::Event)>::wrap(Box::new(move |event| {
-                let payload = event
-                    .dyn_ref::<web_sys::MouseEvent>()
-                    .map(|event| format!("{{\"x\":{},\"y\":{}}}", event.offset_x(), event.offset_y()));
+                let payload = event.dyn_ref::<web_sys::MouseEvent>().map(|event| {
+                    format!("{{\"x\":{},\"y\":{}}}", event.offset_x(), event.offset_y())
+                });
                 handlers.emit_event(UiEvent {
                     target: port,
                     kind: UiEventKind::Click,
                     payload,
                 });
             }));
-            let _ = target.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+            let _ =
+                target.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
             entries.push(NodeAttachment::Listener {
                 target,
                 event_name: "click".to_string(),
@@ -1377,7 +1404,8 @@ fn attach_port_listener(
                     payload: None,
                 });
             }));
-            let _ = target.add_event_listener_with_callback("dblclick", callback.as_ref().unchecked_ref());
+            let _ = target
+                .add_event_listener_with_callback("dblclick", callback.as_ref().unchecked_ref());
             entries.push(NodeAttachment::Listener {
                 target,
                 event_name: "dblclick".to_string(),
@@ -1399,7 +1427,8 @@ fn attach_port_listener(
                     payload,
                 });
             }));
-            let _ = target.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
+            let _ =
+                target.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
             entries.push(NodeAttachment::Listener {
                 target,
                 event_name: "input".to_string(),
@@ -1421,7 +1450,8 @@ fn attach_port_listener(
                     payload,
                 });
             }));
-            let _ = target.add_event_listener_with_callback("change", callback.as_ref().unchecked_ref());
+            let _ = target
+                .add_event_listener_with_callback("change", callback.as_ref().unchecked_ref());
             entries.push(NodeAttachment::Listener {
                 target,
                 event_name: "change".to_string(),
@@ -1439,7 +1469,8 @@ fn attach_port_listener(
                     });
                 });
             }));
-            let _ = target.add_event_listener_with_callback("blur", callback.as_ref().unchecked_ref());
+            let _ =
+                target.add_event_listener_with_callback("blur", callback.as_ref().unchecked_ref());
             entries.push(NodeAttachment::Listener {
                 target,
                 event_name: "blur".to_string(),
@@ -1454,7 +1485,8 @@ fn attach_port_listener(
                     payload: None,
                 });
             }));
-            let _ = target.add_event_listener_with_callback("focus", callback.as_ref().unchecked_ref());
+            let _ =
+                target.add_event_listener_with_callback("focus", callback.as_ref().unchecked_ref());
             entries.push(NodeAttachment::Listener {
                 target,
                 event_name: "focus".to_string(),
@@ -1464,21 +1496,20 @@ fn attach_port_listener(
         UiEventKind::KeyDown => {
             let listener_target = target.clone();
             let callback = Closure::<dyn FnMut(web_sys::Event)>::wrap(Box::new(move |event| {
-                let payload = event
-                    .dyn_ref::<web_sys::KeyboardEvent>()
-                    .map(|event| {
-                        encode_key_down_payload(
-                            &event.key(),
-                            input_event_value(Some(listener_target.clone())).as_deref(),
-                        )
-                    });
+                let payload = event.dyn_ref::<web_sys::KeyboardEvent>().map(|event| {
+                    encode_key_down_payload(
+                        &event.key(),
+                        input_event_value(Some(listener_target.clone())).as_deref(),
+                    )
+                });
                 handlers.emit_event(UiEvent {
                     target: port,
                     kind: UiEventKind::KeyDown,
                     payload,
                 });
             }));
-            let _ = target.add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
+            let _ = target
+                .add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
             entries.push(NodeAttachment::Listener {
                 target,
                 event_name: "keydown".to_string(),

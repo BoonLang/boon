@@ -1,8 +1,9 @@
 use crate::ids::ActorId;
-use crate::ir::{MirrorCellId, RetainedNodeKey, SinkPortId, SourcePortId};
+use crate::ir::{MirrorCellId, RetainedNodeKey, SinkPortId, SourcePortId, ViewSiteId};
 use crate::runtime::{Msg, RuntimeCore};
 use crate::semantics::CausalSeq;
 use boon::platform::browser::kernel::KernelValue;
+use boon_scene::UiEventKind;
 
 /// Passive retained host/view structure.
 ///
@@ -12,6 +13,25 @@ use boon::platform::browser::kernel::KernelValue;
 pub struct HostSelectOption {
     pub value: String,
     pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostElementEventBinding {
+    pub source_port: SourcePortId,
+    pub event_kind: UiEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostViewMatchValue {
+    Bool(bool),
+    Text(String),
+    Tag(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostViewMatchArm {
+    pub matcher: HostViewMatchValue,
+    pub child_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +56,9 @@ pub enum HostCrossAlign {
 pub enum HostViewKind {
     Document,
     Stripe,
+    Container {
+        center_row: bool,
+    },
     AbsolutePanel {
         width_px: u32,
         height_px: u32,
@@ -50,6 +73,27 @@ pub enum HostViewKind {
     },
     Label {
         sink: SinkPortId,
+    },
+    StaticLabel {
+        text: String,
+    },
+    MatchGroup {
+        condition_sink: SinkPortId,
+        arms: Vec<HostViewMatchArm>,
+        fallback_child_count: usize,
+    },
+    ConditionalLabel {
+        condition_sink: SinkPortId,
+        when_true: String,
+        when_false: String,
+    },
+    Paragraph,
+    Link {
+        href: String,
+        new_tab: bool,
+    },
+    TemplatedLabel {
+        parts: Vec<HostTemplatedTextPart>,
     },
     StyledLabel {
         sink: SinkPortId,
@@ -89,10 +133,17 @@ pub enum HostViewKind {
     ActionLabel {
         sink: SinkPortId,
         press_port: SourcePortId,
+        event_kind: UiEventKind,
+    },
+    StaticActionLabel {
+        text: String,
+        press_port: SourcePortId,
+        event_kind: UiEventKind,
     },
     StyledActionLabel {
         sink: SinkPortId,
         press_port: SourcePortId,
+        event_kind: UiEventKind,
         width: Option<HostWidth>,
         bold_sink: Option<SinkPortId>,
     },
@@ -100,19 +151,38 @@ pub enum HostViewKind {
         checked_sink: SinkPortId,
         click_port: SourcePortId,
     },
+    StaticCheckbox {
+        checked: bool,
+        click_port: SourcePortId,
+        labelled_by_view_site: Option<ViewSiteId>,
+    },
     TextInput {
         value_sink: SinkPortId,
         placeholder: String,
         change_port: SourcePortId,
         key_down_port: SourcePortId,
+        blur_port: Option<SourcePortId>,
+        focus_port: Option<SourcePortId>,
         focus_on_mount: bool,
         disabled_sink: Option<SinkPortId>,
+    },
+    StaticTextInput {
+        value: String,
+        placeholder: String,
+        change_port: SourcePortId,
+        key_down_port: SourcePortId,
+        blur_port: Option<SourcePortId>,
+        focus_port: Option<SourcePortId>,
+        focus_on_mount: bool,
+        disabled: bool,
     },
     StyledTextInput {
         value_sink: SinkPortId,
         placeholder: String,
         change_port: SourcePortId,
         key_down_port: SourcePortId,
+        blur_port: Option<SourcePortId>,
+        focus_port: Option<SourcePortId>,
         focus_on_mount: bool,
         disabled_sink: Option<SinkPortId>,
         width: Option<HostWidth>,
@@ -148,12 +218,12 @@ pub enum HostViewKind {
         width: Option<HostWidth>,
     },
     Button {
-        label: String,
+        label: HostButtonLabel,
         press_port: SourcePortId,
         disabled_sink: Option<SinkPortId>,
     },
     StyledButton {
-        label: String,
+        label: HostButtonLabel,
         press_port: SourcePortId,
         disabled_sink: Option<SinkPortId>,
         width: Option<HostWidth>,
@@ -169,6 +239,28 @@ pub enum HostViewKind {
         tick_port: SourcePortId,
         interval_ms: u32,
     },
+    GenericElement {
+        tag: String,
+        text: Option<String>,
+        properties: Vec<(String, Option<String>)>,
+        styles: Vec<(String, Option<String>)>,
+        input_value: Option<String>,
+        checked: Option<bool>,
+        event_bindings: Vec<HostElementEventBinding>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostTemplatedTextPart {
+    Static(String),
+    Sink(SinkPortId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostButtonLabel {
+    Static(String),
+    Sink(SinkPortId),
+    Templated(Vec<HostTemplatedTextPart>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,15 +292,37 @@ pub enum HostInput {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct HostSnapshot {
+#[cfg(test)]
+pub(crate) struct HostSnapshot {
     pub inputs: Vec<HostInput>,
 }
 
+#[cfg(test)]
 impl HostSnapshot {
     #[must_use]
-    pub fn new(inputs: Vec<HostInput>) -> Self {
+    pub(crate) fn new(inputs: Vec<HostInput>) -> Self {
         Self { inputs }
     }
+}
+
+pub(crate) fn enqueue_host_pulse(
+    runtime: &mut RuntimeCore,
+    actor: ActorId,
+    port: SourcePortId,
+    value: KernelValue,
+    seq: CausalSeq,
+) -> bool {
+    runtime.push_message(actor, Msg::SourcePulse { port, value, seq })
+}
+
+pub(crate) fn enqueue_host_mirror(
+    runtime: &mut RuntimeCore,
+    actor: ActorId,
+    cell: MirrorCellId,
+    value: KernelValue,
+    seq: CausalSeq,
+) -> bool {
+    runtime.push_message(actor, Msg::MirrorWrite { cell, value, seq })
 }
 
 /// Enqueue one coherent host snapshot into the runtime.
@@ -216,37 +330,28 @@ impl HostSnapshot {
 /// The bridge is responsible for collecting all pulse inputs and mirrored host
 /// state writes derived from one host event before calling this function.
 /// Ordering is preserved exactly as supplied by the bridge's lowering order.
-pub fn enqueue_host_snapshot(runtime: &mut RuntimeCore, snapshot: &HostSnapshot) -> usize {
+#[cfg(test)]
+pub(crate) fn enqueue_host_snapshot(runtime: &mut RuntimeCore, snapshot: &HostSnapshot) -> usize {
+    enqueue_host_inputs(runtime, &snapshot.inputs)
+}
+
+pub(crate) fn enqueue_host_inputs(runtime: &mut RuntimeCore, inputs: &[HostInput]) -> usize {
     let mut queued = 0;
 
-    for input in &snapshot.inputs {
+    for input in inputs {
         let accepted = match input {
             HostInput::Pulse {
                 actor,
                 port,
                 value,
                 seq,
-            } => runtime.push_message(
-                *actor,
-                Msg::SourcePulse {
-                    port: *port,
-                    value: value.clone(),
-                    seq: *seq,
-                },
-            ),
+            } => enqueue_host_pulse(runtime, *actor, *port, value.clone(), *seq),
             HostInput::Mirror {
                 actor,
                 cell,
                 value,
                 seq,
-            } => runtime.push_message(
-                *actor,
-                Msg::MirrorWrite {
-                    cell: *cell,
-                    value: value.clone(),
-                    seq: *seq,
-                },
-            ),
+            } => enqueue_host_mirror(runtime, *actor, *cell, value.clone(), *seq),
         };
 
         if accepted {
@@ -261,13 +366,12 @@ pub fn enqueue_host_snapshot(runtime: &mut RuntimeCore, snapshot: &HostSnapshot)
 mod tests {
     use super::*;
     use crate::ir::{FunctionInstanceId, ViewSiteId};
-    use crate::runtime::{ActorKind, RuntimeCore};
+    use crate::runtime::RuntimeCore;
 
     #[test]
     fn host_snapshot_preserves_batch_order_for_pulses_and_mirrors() {
         let mut runtime = RuntimeCore::new();
-        let scope = runtime.alloc_scope(None);
-        let actor = runtime.alloc_actor(ActorKind::SourcePort, scope);
+        let actor = runtime.alloc_actor();
 
         let snapshot = HostSnapshot::new(vec![
             HostInput::Mirror {
@@ -286,8 +390,7 @@ mod tests {
 
         assert_eq!(enqueue_host_snapshot(&mut runtime, &snapshot), 2);
 
-        let actor_slot = runtime.actors.get(actor).expect("actor exists");
-        let messages = actor_slot.mailbox.iter().cloned().collect::<Vec<_>>();
+        let messages = runtime.queued_messages_for_actor(actor);
         assert_eq!(
             messages,
             vec![
@@ -303,10 +406,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(
-            runtime.ready.iter().copied().collect::<Vec<_>>(),
-            vec![actor]
-        );
+        assert_eq!(runtime.ready_actor_ids(), vec![actor]);
     }
 
     #[test]
@@ -364,10 +464,9 @@ mod tests {
     #[test]
     fn snapshot_ignores_inputs_for_stale_actor_ids() {
         let mut runtime = RuntimeCore::new();
-        let scope = runtime.alloc_scope(None);
-        let actor = runtime.alloc_actor(ActorKind::SourcePort, scope);
-        assert!(runtime.actors.remove(actor).is_some());
-        let replacement = runtime.alloc_actor(ActorKind::SourcePort, scope);
+        let actor = runtime.alloc_actor();
+        assert!(runtime.remove_actor(actor));
+        let replacement = runtime.alloc_actor();
         assert_ne!(actor, replacement);
 
         let snapshot = HostSnapshot::new(vec![HostInput::Pulse {
@@ -378,13 +477,6 @@ mod tests {
         }]);
 
         assert_eq!(enqueue_host_snapshot(&mut runtime, &snapshot), 0);
-        assert!(
-            runtime
-                .actors
-                .get(replacement)
-                .expect("replacement actor exists")
-                .mailbox
-                .is_empty()
-        );
+        assert!(runtime.queued_messages_for_actor(replacement).is_empty());
     }
 }
