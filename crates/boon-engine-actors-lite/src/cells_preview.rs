@@ -102,6 +102,13 @@ impl CellsPreview {
         self.dispatch_host_ui_events(batch)
     }
 
+    /// Enable persistence on this preview.
+    /// TODO: Wire persistence collection into cells event dispatch.
+    pub fn enable_persistence(&mut self) {
+        // Persistence metadata exists in program.ir.persistence
+        // Collection and commit needs to happen after dispatch_host_ui_events
+    }
+
     pub fn dispatch_ui_facts(&mut self, batch: UiFactBatch) -> bool {
         self.dispatch_host_ui_facts(batch)
     }

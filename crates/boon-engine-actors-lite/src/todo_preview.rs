@@ -34,9 +34,9 @@ enum Filter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TodoItem {
-    title: String,
-    completed: bool,
+pub(crate) struct TodoItem {
+    pub(crate) title: String,
+    pub(crate) completed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,11 +100,17 @@ pub struct TodoPreview {
     todos: TargetedListRuntime<TodoItem>,
     app: HostViewPreviewApp,
     ui: RuntimeBackedPreviewState<TodoUiAction, FactTarget>,
+    persistence_enabled: bool,
 }
 
 impl InteractivePreview for TodoPreview {
     fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool {
-        RuntimeBackedDomain::dispatch_ui_events(self, batch)
+        // Dispatch events through RuntimeBackedDomain and save persistence if enabled
+        let changed = RuntimeBackedDomain::dispatch_ui_events(self, batch);
+        if changed && self.persistence_enabled {
+            self.save_persistence();
+        }
+        changed
     }
 
     fn dispatch_ui_facts(&mut self, batch: UiFactBatch) -> bool {
@@ -134,11 +140,19 @@ impl RuntimeBackedDomain for TodoPreview {
         kind: UiEventKind,
         payload: Option<&str>,
     ) -> bool {
-        TodoPreview::apply_event(self, action, kind, payload)
+        let changed = TodoPreview::apply_event(self, action, kind, payload);
+        if changed && self.persistence_enabled {
+            self.save_persistence();
+        }
+        changed
     }
 
     fn handle_fact(&mut self, target: Self::FactTarget, kind: UiFactKind) -> bool {
-        TodoPreview::apply_fact(self, target, kind)
+        let changed = TodoPreview::apply_fact(self, target, kind);
+        if changed && self.persistence_enabled {
+            self.save_persistence();
+        }
+        changed
     }
 
     fn fact_cell(target: &Self::FactTarget) -> MirrorCellId {
@@ -156,7 +170,11 @@ impl InteractiveHostViewModel for TodoPreview {
     }
 
     fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool {
-        self.dispatch_host_ui_events(batch)
+        let changed = self.dispatch_host_ui_events(batch);
+        if changed && self.persistence_enabled {
+            self.save_persistence();
+        }
+        changed
     }
 
     fn dispatch_ui_facts(&mut self, batch: UiFactBatch) -> bool {
@@ -176,37 +194,32 @@ impl TodoPreview {
     }
 
     pub fn from_program(program: TodoProgram) -> Result<Self, String> {
+        Self::from_program_with_initial_todos(program, vec![
+            (1, TodoItem { title: "Buy groceries".to_string(), completed: false }),
+            (2, TodoItem { title: "Clean room".to_string(), completed: false }),
+        ])
+    }
+
+    pub fn from_program_with_initial_todos(
+        program: TodoProgram,
+        initial_todos: Vec<(u64, TodoItem)>,
+    ) -> Result<Self, String> {
         let mut ui_state_runtime = PreviewRuntime::new();
         let ui_state_actor = ui_state_runtime.alloc_actor();
         let ui_state_executor = IrExecutor::new(program.ir.clone())?;
         let host_view = program.host_view.clone();
         let host_view_sink_values = program.host_view_sink_values(&ui_state_executor.sink_values());
+        let next_id = initial_todos.iter().map(|(id, _)| *id).max().unwrap_or(0) + 1;
+        let todos = TargetedListRuntime::new(initial_todos, next_id);
         let mut preview = Self {
             program,
             ui_state_runtime,
             ui_state_actor,
             ui_state_executor,
-            todos: TargetedListRuntime::new(
-                [
-                    (
-                        1,
-                        TodoItem {
-                            title: "Buy groceries".to_string(),
-                            completed: false,
-                        },
-                    ),
-                    (
-                        2,
-                        TodoItem {
-                            title: "Clean room".to_string(),
-                            completed: false,
-                        },
-                    ),
-                ],
-                3,
-            ),
+            todos,
             app: HostViewPreviewApp::new(host_view, host_view_sink_values),
             ui: RuntimeBackedPreviewState::default(),
+            persistence_enabled: false,
         };
         preview.refresh_host_view();
         Ok(preview)
@@ -224,7 +237,49 @@ impl TodoPreview {
     }
 
     pub fn dispatch_ui_events(&mut self, batch: UiEventBatch) -> bool {
-        self.dispatch_host_ui_events(batch)
+        let changed = self.dispatch_host_ui_events(batch);
+        if changed {
+            if self.persistence_enabled {
+                self.save_persistence();
+            }
+        }
+        changed
+    }
+
+    /// Enable persistence on this preview.
+    pub fn enable_persistence(&mut self) {
+        self.persistence_enabled = true;
+        crate::browser_debug::set_debug_marker("persistence:enabled");
+    }
+
+    /// Save the current todo list to localStorage.
+    #[cfg(target_arch = "wasm32")]
+    fn save_persistence(&self) {
+        use crate::persist::{PersistedRecord, PersistenceAdapter};
+        use crate::persist_browser::BrowserLocalStorage;
+        use boon::platform::browser::kernel::KernelValue;
+
+        let adapter = BrowserLocalStorage::instance();
+        let todos: Vec<KernelValue> = self.todos.list().iter().map(|mapped_item| {
+            KernelValue::Object(std::collections::BTreeMap::from([
+                ("id".to_string(), KernelValue::Number(mapped_item.id as f64)),
+                ("title".to_string(), KernelValue::Text(mapped_item.value.title.clone())),
+                ("completed".to_string(), KernelValue::Bool(mapped_item.value.completed)),
+            ]))
+        }).collect();
+        let json_value = crate::persistence::kernel_value_to_json(&KernelValue::List(todos));
+        let root_key = "store.todos".to_string();
+        let record = PersistedRecord::Hold {
+            root_key,
+            local_slot: 0,
+            value: json_value,
+        };
+        let _ = adapter.apply_batch(&[record], &[]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn save_persistence(&self) {
+        // No-op on non-wasm targets
     }
 
     #[must_use]

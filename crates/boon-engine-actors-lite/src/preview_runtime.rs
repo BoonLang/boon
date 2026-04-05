@@ -98,6 +98,29 @@ impl PreviewRuntime {
     pub(crate) fn telemetry_snapshot(&self) -> RuntimeTelemetrySnapshot {
         self.runtime.telemetry_snapshot()
     }
+
+    /// Current turn number.
+    #[must_use]
+    pub(crate) fn turn(&self) -> u64 {
+        self.turn
+    }
+
+    /// Dispatch inputs and drain to quiescence (no message delivery callback).
+    pub(crate) fn dispatch_inputs_quiet(&mut self, inputs: &[HostInput]) {
+        enqueue_host_inputs(&mut self.runtime, inputs);
+        self.drain_to_quiescence();
+        self.turn += 1;
+    }
+
+    fn drain_to_quiescence(&mut self) {
+        self.message_scratch.clear();
+        while self
+            .runtime
+            .drain_next_ready_messages(&mut self.message_scratch)
+        {
+            self.message_scratch.clear();
+        }
+    }
 }
 
 #[cfg(test)]

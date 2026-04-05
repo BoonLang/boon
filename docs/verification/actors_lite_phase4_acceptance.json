@@ -2,7 +2,7 @@
   "schema_version": 1,
   "phase": "phase4",
   "status": "green",
-  "verified_at_utc": "2026-03-27T00:00:00Z",
+  "verified_at_utc": "2026-04-05T00:00:00Z",
   "milestone_examples": [
     "counter",
     "todo_mvc",
@@ -17,14 +17,14 @@
     "cargo check -p boon-engine-actors-lite",
     "cargo test -p boon-engine-actors-lite",
     "cargo check --manifest-path playground/frontend/Cargo.toml --features engine-actors-lite --no-default-features",
-    "cargo run --manifest-path tools/Cargo.toml -- exec test-examples --engine ActorsLite --filter counter --skip-persistence",
-    "cargo run --manifest-path tools/Cargo.toml -- exec test-examples --engine ActorsLite --filter todo_mvc --skip-persistence",
-    "cargo run --manifest-path tools/Cargo.toml -- exec test-examples --engine ActorsLite --filter cells --skip-persistence",
-    "cargo run --manifest-path tools/Cargo.toml -- exec test-examples --engine ActorsLite --filter cells_dynamic --skip-persistence"
+    "cargo run --manifest-path tools/Cargo.toml -- exec test-examples --engine ActorsLite --filter counter",
+    "cargo run --manifest-path tools/Cargo.toml -- exec test-examples --engine ActorsLite --filter todo_mvc",
+    "cargo run --manifest-path tools/Cargo.toml -- exec test-examples --engine ActorsLite --filter cells",
+    "cargo run --manifest-path tools/Cargo.toml -- exec test-examples --engine ActorsLite --filter cells_dynamic"
   ],
   "verification_command": "cargo run --release --manifest-path tools/Cargo.toml -- verify actors-lite --check --pinned-env --warmed-session --single-visible-tab --no-devtools",
   "notes": [
-    "Public ActorsLite exposure is allowed only while this phase 4 acceptance record remains green.",
-    "The milestone browser traces are non-persistence traces; ActorsLite persistence remains explicitly gated off in v1."
+    "ActorsLite verification runs with persistence enabled (no --skip-persistence).",
+    "Persistence sequences from .expected files are verified via full page refresh."
   ]
 }

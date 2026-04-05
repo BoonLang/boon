@@ -10,7 +10,7 @@ use crate::host_view_preview::{
 };
 use crate::ids::ActorId;
 use crate::input_form_runtime::{FormInputBinding, FormInputEvent};
-use crate::ir::{MirrorCellId, SinkPortId, SourcePortId};
+use crate::ir::{IrProgram, MirrorCellId, SinkPortId, SourcePortId};
 use crate::ir_executor::IrExecutor;
 use crate::list_form_actions::update_selected_from_inputs;
 use crate::lower::{
@@ -61,6 +61,10 @@ struct RuntimeHostViewPreview {
     host_actor: ActorId,
     executor: IrExecutor,
     app: HostViewPreviewApp,
+    /// Persistence program metadata for dirty collection and commit.
+    program_ir: IrProgram,
+    /// Whether persistence is enabled.
+    persistence_enabled: bool,
 }
 
 struct FormRuntimeHostViewPreview {
@@ -336,6 +340,13 @@ impl LoweredPreview {
             LoweredProgram::TodoMvc(program) => {
                 LoweredPreviewModel::Todo(TodoPreview::from_program(program)?)
             }
+            LoweredProgram::TodoMvcWithInitialTodos { program, initial_todos } => {
+                let todos: Vec<(u64, crate::todo_preview::TodoItem)> = initial_todos
+                    .into_iter()
+                    .map(|(id, title, completed)| (id, crate::todo_preview::TodoItem { title, completed }))
+                    .collect();
+                LoweredPreviewModel::Todo(TodoPreview::from_program_with_initial_todos(program, todos)?)
+            }
             LoweredProgram::Crud(program) => {
                 LoweredPreviewModel::Crud(CrudHostViewPreview::from_program(program))
             }
@@ -408,6 +419,21 @@ impl LoweredPreview {
         self.model.app()
     }
 
+    /// Enable persistence on this preview.
+    ///
+    /// When persistence is enabled, the preview will collect dirty HOLD cells
+    /// after each dispatch and commit them to the browser's localStorage.
+    pub fn with_persistence(mut self) -> Self {
+        self.model.enable_persistence();
+        self
+    }
+
+    /// Inject a restored counter value into the counter sink.
+    /// Used to restore persisted counter state after page refresh.
+    pub fn inject_restored_counter_value(&mut self, value: i64) {
+        self.model.set_counter_sink_value(value);
+    }
+
     #[must_use]
     pub fn preview_text(&mut self) -> String {
         self.model.preview_text()
@@ -472,6 +498,29 @@ impl LoweredPreviewModel {
             Self::LocalState(preview) => &mut preview.app,
             Self::Latest(preview) => &mut preview.app,
             Self::Static(preview) => &mut preview.app,
+        }
+    }
+
+    /// Enable persistence on the underlying preview.
+    fn enable_persistence(&mut self) {
+        match self {
+            Self::Runtime(preview) => preview.enable_persistence(),
+            Self::FormRuntime(_) => {}
+            Self::Todo(preview) => preview.enable_persistence(),
+            Self::Cells(preview) => preview.enable_persistence(),
+            Self::Crud(_) => {}
+            Self::Pages(_) => {}
+            Self::LocalState(_) => {}
+            Self::Latest(_) => {}
+            Self::Static(_) => {}
+        }
+    }
+
+    /// Set the counter sink value for persistence restoration.
+    fn set_counter_sink_value(&mut self, value: i64) {
+        match self {
+            Self::Runtime(preview) => preview.set_counter_sink_value(value),
+            _ => {}
         }
     }
 
@@ -770,6 +819,8 @@ impl RuntimeHostViewPreview {
         } = program;
         let mut runtime = PreviewRuntime::new();
         let host_actor = runtime.alloc_actor();
+        let program_ir = ir.clone();
+        let program_ir = ir.clone();
         let executor = IrExecutor::new(ir)?;
         let app = HostViewPreviewApp::new(host_view, executor.sink_values());
         Ok(Self {
@@ -786,6 +837,8 @@ impl RuntimeHostViewPreview {
             host_actor,
             executor,
             app,
+            program_ir,
+            persistence_enabled: false,
         })
     }
 
@@ -799,8 +852,18 @@ impl RuntimeHostViewPreview {
         } = program;
         let mut runtime = PreviewRuntime::new();
         let host_actor = runtime.alloc_actor();
+        let program_ir = ir.clone();
         let executor = IrExecutor::new(ir)?;
         let app = HostViewPreviewApp::new(host_view, executor.sink_values());
+        #[cfg(target_arch = "wasm32")]
+        {
+            let msg = format!("PERSIST: from_counter_program: {} persistence entries, {} nodes", program_ir.persistence.len(), program_ir.nodes.len());
+            crate::browser_debug::set_debug_marker(&msg);
+            for entry in &program_ir.persistence {
+                let entry_msg = format!("PERSIST: persistence entry: node={:?}, policy={:?}", entry.node, entry.policy);
+                crate::browser_debug::set_debug_marker(&entry_msg);
+            }
+        }
         Ok(Self {
             kind: RuntimePreviewKind::Counter {
                 press_port,
@@ -810,6 +873,8 @@ impl RuntimeHostViewPreview {
             host_actor,
             executor,
             app,
+            program_ir,
+            persistence_enabled: false,
         })
     }
 
@@ -827,6 +892,7 @@ impl RuntimeHostViewPreview {
         } = program;
         let mut runtime = PreviewRuntime::new();
         let host_actor = runtime.alloc_actor();
+        let program_ir = ir.clone();
         let executor = IrExecutor::new(ir)?;
         let app = HostViewPreviewApp::new(
             host_view,
@@ -850,6 +916,8 @@ impl RuntimeHostViewPreview {
             host_actor,
             executor,
             app,
+            program_ir,
+            persistence_enabled: false,
         })
     }
 
@@ -867,6 +935,7 @@ impl RuntimeHostViewPreview {
         } = program;
         let mut runtime = PreviewRuntime::new();
         let host_actor = runtime.alloc_actor();
+        let program_ir = ir.clone();
         let executor = IrExecutor::new(ir)?;
         let app = HostViewPreviewApp::new(
             host_view,
@@ -890,6 +959,8 @@ impl RuntimeHostViewPreview {
             host_actor,
             executor,
             app,
+            program_ir,
+            persistence_enabled: false,
         })
     }
 
@@ -990,6 +1061,7 @@ impl RuntimeHostViewPreview {
     ) -> Result<Self, String> {
         let mut runtime = PreviewRuntime::new();
         let host_actor = runtime.alloc_actor();
+        let program_ir = ir.clone();
         let executor = IrExecutor::new(ir)?;
         let app = HostViewPreviewApp::new(
             host_view,
@@ -1019,6 +1091,8 @@ impl RuntimeHostViewPreview {
             host_actor,
             executor,
             app,
+            program_ir,
+            persistence_enabled: false,
         })
     }
 
@@ -1032,6 +1106,7 @@ impl RuntimeHostViewPreview {
         } = program;
         let mut runtime = PreviewRuntime::new();
         let host_actor = runtime.alloc_actor();
+        let program_ir = ir.clone();
         let executor = IrExecutor::new(ir)?;
         let app = HostViewPreviewApp::new(host_view, executor.sink_values());
         Ok(Self {
@@ -1043,6 +1118,8 @@ impl RuntimeHostViewPreview {
             host_actor,
             executor,
             app,
+            program_ir,
+            persistence_enabled: false,
         })
     }
 
@@ -1133,6 +1210,7 @@ impl RuntimeHostViewPreview {
     ) -> Result<Self, String> {
         let mut runtime = PreviewRuntime::new();
         let host_actor = runtime.alloc_actor();
+        let program_ir = ir.clone();
         let executor = IrExecutor::new(ir)?;
         let app = HostViewPreviewApp::new(host_view, executor.sink_values());
         Ok(Self {
@@ -1149,6 +1227,8 @@ impl RuntimeHostViewPreview {
             host_actor,
             executor,
             app,
+            program_ir,
+            persistence_enabled: false,
         })
     }
 
@@ -1164,6 +1244,7 @@ impl RuntimeHostViewPreview {
         } = program;
         let mut runtime = PreviewRuntime::new();
         let host_actor = runtime.alloc_actor();
+        let program_ir = ir.clone();
         let executor = IrExecutor::new(ir)?;
         let app = HostViewPreviewApp::new(host_view, executor.sink_values());
         Ok(Self {
@@ -1178,6 +1259,8 @@ impl RuntimeHostViewPreview {
             host_actor,
             executor,
             app,
+            program_ir,
+            persistence_enabled: false,
         })
     }
 
@@ -1381,6 +1464,11 @@ impl RuntimeHostViewPreview {
         if inputs.is_empty() {
             return false;
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let msg = format!("PERSIST: apply_messages called, persistence_enabled={}", self.persistence_enabled);
+            crate::browser_debug::set_debug_marker(&msg);
+        }
         let Self {
             runtime, executor, ..
         } = self;
@@ -1390,7 +1478,107 @@ impl RuntimeHostViewPreview {
                 .expect("lowered IR should execute");
         });
         self.refresh_sink_values();
+
+        // Collect dirty persistence and commit if enabled
+        if self.persistence_enabled {
+            self.collect_and_commit_persistence();
+        }
+
         true
+    }
+
+    /// Collect dirty persistence entries and commit to the adapter.
+    #[cfg(target_arch = "wasm32")]
+    fn collect_and_commit_persistence(&mut self) {
+        use crate::ir::IrNodeKind;
+        use crate::persist::{PersistedRecord, PersistenceAdapter};
+        use crate::persist_browser::BrowserLocalStorage;
+        use boon::parser::PersistenceId;
+
+        crate::browser_debug::set_debug_marker("collect_persist:start");
+
+        let adapter = BrowserLocalStorage::instance();
+        let all_sinks = self.executor.sink_values();
+        crate::browser_debug::set_debug_marker(&format!("collect_persist:sinks:{}", all_sinks.len()));
+
+        // Build mappings from node ID to SinkPortId
+        let mut node_to_sink: std::collections::BTreeMap<
+            crate::ir::NodeId,
+            crate::ir::SinkPortId,
+        > = std::collections::BTreeMap::new();
+        for node in &self.program_ir.nodes {
+            if let IrNodeKind::SinkPort { port, input } = node.kind {
+                node_to_sink.insert(node.id, port);
+                node_to_sink.insert(input, port);
+            }
+        }
+        crate::browser_debug::set_debug_marker(&format!("collect_persist:node_map:{}", node_to_sink.len()));
+        crate::browser_debug::set_debug_marker(&format!("collect_persist:persist_entries:{}", self.program_ir.persistence.len()));
+
+        // Collect dirty entries
+        let mut writes = Vec::new();
+        for entry in &self.program_ir.persistence {
+            if let crate::ir::PersistPolicy::Durable {
+                root_key,
+                local_slot,
+                persist_kind,
+            } = entry.policy
+            {
+                crate::browser_debug::set_debug_marker(&format!("collect_persist:entry:{root_key:?}:{local_slot}:{persist_kind:?}"));
+                if matches!(persist_kind, crate::ir::PersistKind::Hold | crate::ir::PersistKind::ListStore) {
+                    if let Some(sink_id) = node_to_sink.get(&entry.node) {
+                        crate::browser_debug::set_debug_marker(&format!("collect_persist:sink_found:{sink_id:?}"));
+                        if let Some(value) = all_sinks.get(sink_id) {
+                            crate::browser_debug::set_debug_marker(&format!("collect_persist:value:{value:?}"));
+                            let value_json = crate::persistence::kernel_value_to_json(value);
+                            writes.push(PersistedRecord::Hold {
+                                root_key: root_key.to_string(),
+                                local_slot: local_slot,
+                                value: value_json,
+                            });
+                        } else {
+                            crate::browser_debug::set_debug_marker(&format!("collect_persist:no_value_for_sink:{sink_id:?}"));
+                        }
+                    } else {
+                        crate::browser_debug::set_debug_marker(&format!("collect_persist:no_sink_for_node:{:?}", entry.node));
+                    }
+                }
+            }
+        }
+
+        crate::browser_debug::set_debug_marker(&format!("collect_persist:writes:{}", writes.len()));
+
+        // Commit if there are writes
+        if !writes.is_empty() {
+            match adapter.apply_batch(&writes, &[]) {
+                Ok(()) => {
+                    crate::browser_debug::set_debug_marker("collect_persist:commit_ok");
+                }
+                Err(e) => {
+                    crate::browser_debug::set_debug_marker(&format!("collect_persist:commit_err:{e}"));
+                }
+            }
+        } else {
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn collect_and_commit_persistence(&mut self) {
+        // No-op on non-wasm targets
+    }
+
+    /// Enable persistence on this preview.
+    pub fn enable_persistence(&mut self) {
+        self.persistence_enabled = true;
+        crate::browser_debug::set_debug_marker("persistence:enabled");
+    }
+
+    /// Set the counter sink value for persistence restoration.
+    pub fn set_counter_sink_value(&mut self, value: i64) {
+        if let RuntimePreviewKind::Counter { counter_sink, .. } = &self.kind {
+            self.app.set_sink_value(*counter_sink, KernelValue::Number(value as f64));
+            crate::browser_debug::set_debug_marker(&format!("persistence:counter_restored:{value}"));
+        }
     }
 
     fn refresh_sink_values(&mut self) {

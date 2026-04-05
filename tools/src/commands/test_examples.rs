@@ -391,7 +391,7 @@ async fn trigger_run_then_capture_immediate(
     if let WsResponse::Error { message } = response {
         anyhow::bail!("TriggerRun failed: {}", message);
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     wait_for_non_retry_preview_text(port, Duration::from_millis(250)).await
 }
 
@@ -668,6 +668,24 @@ async fn refresh_to_example(
         anyhow::bail!("ClearStates failed: {}", message);
     }
     tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Clear ActorsLite persistence data to ensure a fresh state
+    if engine == Some("ActorsLite") {
+        let clear_expression = r#"(function() {
+            var keys = [];
+            for (var i = 0; i < localStorage.length; i++) {
+                var key = localStorage.key(i);
+                if (key && key.startsWith("boon.actorslite")) {
+                    keys.push(key);
+                }
+            }
+            keys.forEach(function(k) { localStorage.removeItem(k); });
+            return keys.length;
+        })()"#;
+        let _ = send_command_to_server(port, WsCommand::EvalJs {
+            expression: clear_expression.to_string(),
+        }).await;
+    }
 
     if engine == Some("ActorsLite") {
         println!(
@@ -1874,7 +1892,7 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
         },
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Wait for initial output with smart waiting
     let (initial_passed, actual_output) = if spec.output.is_configured() {
@@ -2246,6 +2264,12 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
 
                 if !passed {
                     all_passed = false;
+                    // Capture debug info for persistence failures
+                    if opts.engine.as_deref() == Some("ActorsLite") {
+                        if let Ok(Some(debug)) = get_actors_lite_debug(opts.port).await {
+                            println!("[ActorsLite harness] PERSISTENCE debug => {}", debug);
+                        }
+                    }
                     break;
                 }
             }
@@ -2971,7 +2995,7 @@ async fn wait_for_focused_text_input_suffix(port: u16, expected_suffix: &str) ->
                 expected_suffix
             );
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -3800,6 +3824,24 @@ async fn execute_action(
         ParsedAction::ClearStates => {
             let _ = send_command_to_server(port, WsCommand::ClearStates).await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
+            // Also clear ActorsLite persistence data
+            if engine.as_deref() == Some("ActorsLite") {
+                let clear_expression = r#"(function() {
+                    var keys = [];
+                    for (var i = 0; i < localStorage.length; i++) {
+                        var key = localStorage.key(i);
+                        if (key && key.startsWith("boon.actorslite")) {
+                            keys.push(key);
+                        }
+                    }
+                    keys.forEach(function(k) { localStorage.removeItem(k); });
+                    return keys.length;
+                })()"#;
+                let _ = send_command_to_server(port, WsCommand::EvalJs {
+                    expression: clear_expression.to_string(),
+                }).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
         ParsedAction::Run => {
             let response = send_command_to_server(port, WsCommand::TriggerRun).await?;
@@ -4210,9 +4252,9 @@ async fn execute_action(
                 if let WsResponse::Error { message } = response {
                     anyhow::bail!("Double-click cells cell failed: {}", message);
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         ParsedAction::HoverText { text } => {
             let mut last_error = None;
@@ -4477,7 +4519,7 @@ async fn execute_action(
                     }
                     _ => anyhow::bail!("Unexpected response for GetFocusedElement"),
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
         ParsedAction::AssertFocusedInputValue { expected } => {
@@ -5032,7 +5074,7 @@ async fn execute_action(
                 }
                 _ => {}
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = wait_for_preview_change_then_settle(port, before_snapshot).await;
         }
         ParsedAction::SetInputValue { index, value } => {

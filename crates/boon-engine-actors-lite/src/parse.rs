@@ -379,12 +379,40 @@ pub fn persist_entry_for_path(
     local_slot: u32,
     persist_kind: PersistKind,
 ) -> Option<IrNodePersistence> {
-    persist_entry_for_binding(
-        binding_at_path(bindings, path),
+    // Only create a persistence entry if the binding actually exists
+    let binding = binding_at_path(bindings, path);
+    if binding.is_none() {
+        return None;
+    }
+    // Generate a DETERMINISTIC persistence key from the path.
+    // This ensures the same path always produces the same key,
+    // which is essential for persistence to survive page refreshes.
+    let deterministic_key = persistence_key_from_path(path);
+    Some(IrNodePersistence {
         node,
-        local_slot,
-        persist_kind,
-    )
+        policy: PersistPolicy::Durable {
+            root_key: deterministic_key,
+            local_slot,
+            persist_kind,
+        },
+    })
+}
+
+/// Generate a deterministic PersistenceId from a path.
+/// Uses a simple hash of the path segments to create a stable key.
+fn persistence_key_from_path(path: &[&str]) -> boon::parser::PersistenceId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    "boon.actorslite.persist".hash(&mut hasher);
+    for segment in path {
+        segment.hash(&mut hasher);
+    }
+    let hash = hasher.finish();
+    // Create a PersistenceId from the hash, using it as the high bits of a u128
+    let ulid_value = (hash as u128) << 64 | (hash as u128);
+    boon::parser::PersistenceId::from_raw(ulid_value)
 }
 
 pub fn persist_entries_for_path(

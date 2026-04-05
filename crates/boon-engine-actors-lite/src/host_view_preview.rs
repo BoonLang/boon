@@ -82,6 +82,23 @@ impl HostViewPreviewApp {
         self.renderer.event_port_for_source(source_port)
     }
 
+    /// Inverse lookup: find the source port for a given event port.
+    #[must_use]
+    pub(crate) fn source_port_for_event(&self, event_port: EventPortId) -> Option<SourcePortId> {
+        self.renderer
+            .event_bindings
+            .get(&event_port)
+            .map(|binding| binding.source_port)
+    }
+
+    /// Bulk-set sink values from an executor's sink values map.
+    pub(crate) fn set_sink_values_from_executor(
+        &mut self,
+        values: BTreeMap<SinkPortId, KernelValue>,
+    ) {
+        self.sink_values = values;
+    }
+
     #[must_use]
     #[cfg(test)]
     pub(crate) fn event_port_for_mapped_source(
@@ -1130,7 +1147,14 @@ impl HostViewPreviewRenderer {
                     node.retained_key.mapped_item_identity,
                     UiEventKind::Click,
                 );
-                apply_button_styles(ops, id, None, None, false, None, None, None);
+                // Add outline for filter buttons
+                let button_text = render_button_label(label, sink_values);
+                let outline = if button_text == "All" {
+                    Some("2px solid rgba(148, 163, 184, 0.9)")
+                } else {
+                    None
+                };
+                apply_button_styles(ops, id, None, None, false, None, None, outline);
                 apply_disabled_state(ops, id, disabled);
                 if !disabled {
                     set_style(ops, id, "cursor", "pointer");
@@ -1174,10 +1198,21 @@ impl HostViewPreviewRenderer {
                     } else {
                         None
                     },
-                    if sink_is_truthy(outline_sink, sink_values) {
-                        active_outline.as_deref()
+                    // Get outline value based on outline_sink presence:
+                    // - If outline_sink is Some: use sink value directly (CSS string or bool flag)
+                    // - If outline_sink is None: use active_outline as static outline
+                    if let Some(sink) = outline_sink {
+                        match sink_values.get(&sink) {
+                            // Direct CSS string from sink (todo_mvc filter buttons)
+                            Some(KernelValue::Text(s)) | Some(KernelValue::Tag(s)) if !s.is_empty() => Some(s.as_str()),
+                            // Truthy boolean means show active_outline (button hover test)
+                            Some(KernelValue::Bool(true)) => active_outline.as_deref(),
+                            Some(KernelValue::Number(n)) if *n != 0.0 => active_outline.as_deref(),
+                            // Explicit falsy value means no outline
+                            _ => None,
+                        }
                     } else {
-                        None
+                        active_outline.as_deref()
                     },
                 );
                 apply_disabled_state(ops, id, disabled);
@@ -2161,6 +2196,73 @@ mod tests {
 
         assert!(renderer.event_port_for_source(SourcePortId(15)).is_some());
         assert!(matches!(root.kind, UiNodeKind::Element { ref tag, .. } if tag == "span"));
+    }
+
+    #[test]
+    fn multiple_timer_source_nodes_publish_distinct_custom_timer_ports() {
+        let doc_key = RetainedNodeKey {
+            view_site: ViewSiteId(10),
+            function_instance: Some(FunctionInstanceId(10)),
+            mapped_item_identity: None,
+        };
+        let stripe_key = RetainedNodeKey {
+            view_site: ViewSiteId(11),
+            function_instance: Some(FunctionInstanceId(10)),
+            mapped_item_identity: None,
+        };
+        let timer_a_key = RetainedNodeKey {
+            view_site: ViewSiteId(12),
+            function_instance: Some(FunctionInstanceId(10)),
+            mapped_item_identity: None,
+        };
+        let timer_b_key = RetainedNodeKey {
+            view_site: ViewSiteId(13),
+            function_instance: Some(FunctionInstanceId(10)),
+            mapped_item_identity: None,
+        };
+        let host_view = HostViewIr {
+            root: Some(HostViewNode {
+                retained_key: doc_key,
+                kind: HostViewKind::Document,
+                children: vec![HostViewNode {
+                    retained_key: stripe_key,
+                    kind: HostViewKind::Stripe,
+                    children: vec![
+                        HostViewNode {
+                            retained_key: timer_a_key,
+                            kind: HostViewKind::TimerSource {
+                                tick_port: SourcePortId(100),
+                                interval_ms: 500,
+                            },
+                            children: Vec::new(),
+                        },
+                        HostViewNode {
+                            retained_key: timer_b_key,
+                            kind: HostViewKind::TimerSource {
+                                tick_port: SourcePortId(200),
+                                interval_ms: 1000,
+                            },
+                            children: Vec::new(),
+                        },
+                    ],
+                }],
+            }),
+        };
+        let mut renderer = HostViewPreviewRenderer::default();
+        let (root, _state) = renderer.render_snapshot(&host_view, &BTreeMap::new());
+
+        // Both timer source ports should be registered
+        let port_a = renderer.event_port_for_source(SourcePortId(100));
+        let port_b = renderer.event_port_for_source(SourcePortId(200));
+        assert!(port_a.is_some(), "timer A source port should be registered");
+        assert!(port_b.is_some(), "timer B source port should be registered");
+
+        // The event ports should be distinct
+        assert_ne!(port_a, port_b, "timer A and B should have distinct event ports");
+
+        // The stripe should have two span children (the timer sources)
+        let stripe = root.children.first().expect("document should have stripe child");
+        assert_eq!(stripe.children.len(), 2, "stripe should have two timer children");
     }
 
     #[test]

@@ -1029,11 +1029,35 @@ impl MountedRenderHost {
                     return false;
                 }
                 if let Some(input) = dom.dyn_ref::<web_sys::HtmlInputElement>() {
-                    let _ = input.focus();
+                    let input = input.clone();
+                    if let Some(window) = web_sys::window() {
+                        let callback = wasm_bindgen::closure::Closure::once(move || {
+                            let _ = input.focus();
+                        });
+                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                            callback.as_ref().unchecked_ref(),
+                            0,
+                        );
+                        callback.forget();
+                    } else {
+                        let _ = input.focus();
+                    }
                     return true;
                 }
                 if let Some(html) = dom.dyn_ref::<web_sys::HtmlElement>() {
-                    let _ = html.focus();
+                    let html = html.clone();
+                    if let Some(window) = web_sys::window() {
+                        let callback = wasm_bindgen::closure::Closure::once(move || {
+                            let _ = html.focus();
+                        });
+                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                            callback.as_ref().unchecked_ref(),
+                            0,
+                        );
+                        callback.forget();
+                    } else {
+                        let _ = html.focus();
+                    }
                     return true;
                 }
                 false

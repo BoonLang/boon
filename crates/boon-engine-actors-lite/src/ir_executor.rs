@@ -78078,11 +78078,11 @@ mod tests {
 
         assert_eq!(
             executor.sink_value(program.elapsed_value_sink),
-            Some(&KernelValue::from("0.2s"))
+            Some(&KernelValue::from(0.2))
         );
         assert_eq!(
             executor.sink_value(program.progress_percent_sink),
-            Some(&KernelValue::from("10%"))
+            Some(&KernelValue::from(10.0))
         );
         assert_eq!(
             executor.sink_value(program.duration_value_sink),
@@ -78102,7 +78102,7 @@ mod tests {
 
         assert_eq!(
             executor.sink_value(program.elapsed_value_sink),
-            Some(&KernelValue::from("0s"))
+            Some(&KernelValue::from(0.0))
         );
     }
 

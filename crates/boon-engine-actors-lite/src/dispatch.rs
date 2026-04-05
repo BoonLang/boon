@@ -138,7 +138,7 @@ pub fn classify_source(source: &str) -> Result<ActorsLiteSourceKind, Vec<String>
     match lower_program(source) {
         Ok(LoweredProgram::Counter(_)) => return Ok(ActorsLiteSourceKind::Counter),
         Ok(LoweredProgram::ComplexCounter(_)) => return Ok(ActorsLiteSourceKind::ComplexCounter),
-        Ok(LoweredProgram::TodoMvc(_)) => return Ok(ActorsLiteSourceKind::TodoMvc),
+        Ok(LoweredProgram::TodoMvc(_)) | Ok(LoweredProgram::TodoMvcWithInitialTodos { .. }) => return Ok(ActorsLiteSourceKind::TodoMvc),
         Ok(LoweredProgram::Interval(_)) => return Ok(ActorsLiteSourceKind::Interval),
         Ok(LoweredProgram::IntervalHold(_)) => return Ok(ActorsLiteSourceKind::IntervalHold),
         Ok(LoweredProgram::Fibonacci(_)) => return Ok(ActorsLiteSourceKind::Fibonacci),

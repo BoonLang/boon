@@ -790,6 +790,12 @@ fn main() {
     start_app("app", Playground::new);
 }
 
+/// Set a debug marker visible to the test harness via GetActorsLiteDebug.
+fn debug_marker(msg: &str) {
+    use boon_engine_actors_lite::browser_debug;
+    browser_debug::set_debug_marker(msg);
+}
+
 fn install_browser_panic_hook() {
     static ONCE: Once = Once::new();
 
@@ -1654,11 +1660,16 @@ impl Playground {
                     let persistence_enabled_for_set = persistence_enabled.clone();
                     let engine_type_for_persistence = engine_type.clone();
                     let set_persistence = Closure::wrap(Box::new(move |enabled: bool| -> bool {
-                        if enabled && !engine_supports_persistence(engine_type_for_persistence.get()) {
+                        let engine = engine_type_for_persistence.get();
+                        let supports = engine_supports_persistence(engine);
+                        crate::debug_marker(&format!("setPersistence:enabled={}:engine={:?}:supports={}", enabled, engine, supports));
+                        if enabled && !supports {
                             persistence_enabled_for_set.set(false);
+                            crate::debug_marker("setPersistence:REJECTED-no_engine_support");
                             return false;
                         }
                         persistence_enabled_for_set.set(enabled);
+                        crate::debug_marker(&format!("setPersistence:ACCEPTED:enabled={}", enabled));
                         enabled
                     }) as Box<dyn Fn(bool) -> bool>);
                     js_sys::Reflect::set(&api, &"setPersistence".into(), set_persistence.as_ref()).ok();
@@ -3308,7 +3319,14 @@ impl Playground {
                 filename,
                 source_code.len()
             ));
+            crate::debug_marker(&format!("example_runner:engine=ActorsLite:persistence={}", persistence_enabled));
             drop(files);
+            // Use persistence-aware entry point when persistence is enabled
+            if persistence_enabled {
+                crate::debug_marker("example_runner:using_persistence");
+                return boon_engine_actors_lite::run_actors_lite_with_persistence(&source_code).unify();
+            }
+            crate::debug_marker("example_runner:NOT_using_persistence");
             return run_actors_lite(&source_code).unify();
         }
 

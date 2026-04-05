@@ -263,6 +263,15 @@ pub enum HostButtonLabel {
     Templated(Vec<HostTemplatedTextPart>),
 }
 
+
+impl HostButtonLabel {
+    pub fn static_text(&self) -> Option<&str> {
+        match self {
+            Self::Static(text) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostViewNode {
     pub retained_key: RetainedNodeKey,
