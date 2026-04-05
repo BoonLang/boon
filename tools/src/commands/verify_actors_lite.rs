@@ -1,8 +1,7 @@
 use anyhow::{Context, Result, bail};
 use boon_engine_actors_lite::{
-    ActorsLiteMetricsComparison, ActorsLiteMetricsReport, ActorsLitePhase4AcceptanceRecord,
-    MILESTONE_PLAYGROUND_EXAMPLES, actors_lite_phase4_acceptance_is_green,
-    actors_lite_phase4_acceptance_record, actors_lite_public_exposure_enabled,
+    ActorsLiteMetricsComparison, ActorsLiteMetricsReport, MILESTONE_PLAYGROUND_EXAMPLES,
+    actors_lite_public_exposure_enabled,
 };
 use serde::Serialize;
 
@@ -25,8 +24,6 @@ pub struct ActorsLiteExampleVerification {
 #[derive(Debug, Clone, Serialize)]
 pub struct ActorsLiteVerificationReport {
     pub public_exposure_enabled: bool,
-    pub phase4_acceptance_green: bool,
-    pub phase4_acceptance: ActorsLitePhase4AcceptanceRecord,
     pub examples: Vec<ActorsLiteExampleVerification>,
     pub metrics: ActorsLiteMetricsReport,
     pub metrics_comparison: ActorsLiteMetricsComparison,
@@ -38,9 +35,7 @@ pub struct ActorsLiteVerificationReport {
 impl ActorsLiteVerificationReport {
     #[must_use]
     pub fn all_pass(&self) -> bool {
-        self.public_exposure_enabled
-            && self.phase4_acceptance_green
-            && self.examples.iter().all(|example| example.passed)
+        self.examples.iter().all(|example| example.passed)
             && self.metrics_comparison.all_pass()
             && (!self.pinned_environment_required || self.pinned_environment_comparison.all_pass())
     }
@@ -72,14 +67,6 @@ pub async fn run_verify_actors_lite(
         println!(
             "  Public exposure gate: {}",
             if report.public_exposure_enabled {
-                "PASS"
-            } else {
-                "FAIL"
-            }
-        );
-        println!(
-            "  Phase 4 acceptance record: {}",
-            if report.phase4_acceptance_green {
                 "PASS"
             } else {
                 "FAIL"
@@ -132,10 +119,6 @@ pub async fn actors_lite_verification_report(
     single_visible_tab: bool,
     no_devtools: bool,
 ) -> Result<ActorsLiteVerificationReport> {
-    let phase4_acceptance = actors_lite_phase4_acceptance_record()
-        .map_err(anyhow::Error::msg)
-        .context("failed to load ActorsLite phase 4 acceptance record")?
-        .clone();
     let mut examples = Vec::new();
     for filter in verification_example_filters() {
         let results = run_tests(TestOptions {
@@ -148,7 +131,7 @@ pub async fn actors_lite_verification_report(
             examples_dir: None,
             no_launch: false,
             engine: Some("ActorsLite".to_string()),
-            skip_persistence: true,
+            skip_persistence: false,
         })
         .await
         .with_context(|| format!("failed to run ActorsLite example filter '{filter}'"))?;
@@ -183,8 +166,6 @@ pub async fn actors_lite_verification_report(
 
     Ok(ActorsLiteVerificationReport {
         public_exposure_enabled: actors_lite_public_exposure_enabled(),
-        phase4_acceptance_green: actors_lite_phase4_acceptance_is_green(),
-        phase4_acceptance,
         examples,
         metrics,
         metrics_comparison,

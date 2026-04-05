@@ -89,8 +89,7 @@ pub mod toggle_examples_preview;
 pub mod validated_form_runtime;
 
 pub use acceptance::{
-    ActorsLitePhase4AcceptanceRecord, actors_lite_phase4_acceptance_is_green,
-    actors_lite_phase4_acceptance_record, actors_lite_public_exposure_enabled,
+    actors_lite_public_exposure_enabled,
 };
 pub use dispatch::{
     MILESTONE_PLAYGROUND_EXAMPLES, PUBLIC_PLAYGROUND_EXAMPLES, SUPPORTED_PLAYGROUND_EXAMPLES,

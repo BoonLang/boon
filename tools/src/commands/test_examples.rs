@@ -1151,7 +1151,7 @@ async fn get_server_status(port: u16) -> Option<ServerStatus> {
 
 fn setup_launch_engine(initial_engine: Option<&str>) -> &'static str {
     match initial_engine {
-        Some("ActorsLite") => "Actors",
+        Some("ActorsLite") => "ActorsLite",
         Some("Actors") => "Actors",
         Some("DD") => "DD",
         Some("Wasm") => "Wasm",

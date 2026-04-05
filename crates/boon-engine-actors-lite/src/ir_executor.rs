@@ -4913,10 +4913,10 @@ mod tests {
     use crate::bridge::{HostInput, HostSnapshot};
     use crate::ir::{CallSiteId, FunctionId, IrProgram, MatchArm};
     use crate::lower::{
-        TodoProgram, try_lower_circle_drawer, try_lower_complex_counter, try_lower_counter,
+        try_lower_circle_drawer, try_lower_complex_counter, try_lower_counter,
         try_lower_flight_booker, try_lower_list_retain_count, try_lower_list_retain_reactive,
         try_lower_list_retain_remove, try_lower_shopping_list, try_lower_then, try_lower_timer,
-        try_lower_todo_mvc, try_lower_when, try_lower_while,
+        try_lower_todo_mvc, try_lower_when, try_lower_while, TodoProgram,
     };
     use crate::runtime::Msg;
     use crate::text_input::KEYDOWN_TEXT_SEPARATOR;
@@ -5390,8 +5390,8 @@ mod tests {
     }
 
     #[test]
-    fn same_arm_when_source_update_below_selected_cutoff_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn same_arm_when_source_update_below_selected_cutoff_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -5596,8 +5596,8 @@ mod tests {
     }
 
     #[test]
-    fn same_arm_while_source_update_below_selected_cutoff_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn same_arm_while_source_update_below_selected_cutoff_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -5715,8 +5715,8 @@ mod tests {
     }
 
     #[test]
-    fn same_fallback_while_source_update_below_selected_cutoff_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn same_fallback_while_source_update_below_selected_cutoff_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -5839,8 +5839,8 @@ mod tests {
     }
 
     #[test]
-    fn same_fallback_when_source_update_below_selected_cutoff_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn same_fallback_when_source_update_below_selected_cutoff_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -15478,8 +15478,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_map_object_field_by_field_eq_result_revisits_hold_update()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_map_object_field_by_field_eq_result_revisits_hold_update(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -15603,8 +15603,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_map_object_field_by_field_eq_result_revisits_list_map_object_field_by_field_eq()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_map_object_field_by_field_eq_result_revisits_list_map_object_field_by_field_eq(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -15708,8 +15708,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_all_object_bool_field_result_revisits_hold_update()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_all_object_bool_field_result_revisits_hold_update(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -15818,8 +15818,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_all_object_bool_field_result_revisits_list_all_object_bool_field()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_all_object_bool_field_result_revisits_list_all_object_bool_field(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -15913,8 +15913,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_map_object_bool_field_result_revisits_hold_update()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_map_object_bool_field_result_revisits_hold_update(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -16031,8 +16031,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_map_object_bool_field_result_revisits_list_map_object_bool_field()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_map_object_bool_field_result_revisits_list_map_object_bool_field(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -16129,8 +16129,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_map_toggle_object_bool_field_by_field_eq_result_revisits_hold_update()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_map_toggle_object_bool_field_by_field_eq_result_revisits_hold_update(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -16264,8 +16264,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_map_toggle_object_bool_field_by_field_eq_result_revisits_list_map_toggle_object_bool_field_by_field_eq()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_map_toggle_object_bool_field_by_field_eq_result_revisits_list_map_toggle_object_bool_field_by_field_eq(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -16375,8 +16375,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_retain_object_bool_field_result_revisits_hold_update()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_retain_object_bool_field_result_revisits_hold_update(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -16500,8 +16500,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_retain_object_bool_field_result_revisits_list_retain_object_bool_field()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_retain_object_bool_field_result_revisits_list_retain_object_bool_field(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -16610,8 +16610,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_remove_object_by_field_eq_result_revisits_hold_update()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_remove_object_by_field_eq_result_revisits_hold_update(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -16727,8 +16727,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_remove_object_by_field_eq_result_revisits_list_remove_object_by_field_eq()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_remove_object_by_field_eq_result_revisits_list_remove_object_by_field_eq(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -17309,8 +17309,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_candidate_fallback_to_older_list_remove_last_result_revisits_list_remove_last()
-     {
+    fn winning_latest_candidate_fallback_to_older_list_remove_last_result_revisits_list_remove_last(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -18682,8 +18682,8 @@ mod tests {
     }
 
     #[test]
-    fn winning_latest_source_fallback_to_older_while_result_revisits_then_body_through_while_switch()
-     {
+    fn winning_latest_source_fallback_to_older_while_result_revisits_then_body_through_while_switch(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -19525,8 +19525,8 @@ mod tests {
     }
 
     #[test]
-    fn list_append_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn list_append_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -19941,8 +19941,8 @@ mod tests {
     }
 
     #[test]
-    fn list_remove_last_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn list_remove_last_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -20369,8 +20369,8 @@ mod tests {
     }
 
     #[test]
-    fn list_retain_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn list_retain_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -20605,8 +20605,8 @@ mod tests {
     }
 
     #[test]
-    fn list_retain_false_branch_same_source_list_value_update_with_newer_seq_revisits_downstream_closure()
-     {
+    fn list_retain_false_branch_same_source_list_value_update_with_newer_seq_revisits_downstream_closure(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -20853,8 +20853,8 @@ mod tests {
     }
 
     #[test]
-    fn list_remove_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn list_remove_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -21089,8 +21089,8 @@ mod tests {
     }
 
     #[test]
-    fn list_remove_true_branch_same_source_list_value_update_with_newer_seq_revisits_downstream_closure()
-     {
+    fn list_remove_true_branch_same_source_list_value_update_with_newer_seq_revisits_downstream_closure(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -21164,8 +21164,8 @@ mod tests {
     }
 
     #[test]
-    fn list_map_object_bool_same_value_update_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn list_map_object_bool_same_value_update_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -21245,8 +21245,8 @@ mod tests {
     }
 
     #[test]
-    fn list_map_object_bool_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn list_map_object_bool_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -21563,8 +21563,8 @@ mod tests {
     }
 
     #[test]
-    fn list_map_toggle_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn list_map_toggle_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -21963,8 +21963,8 @@ mod tests {
     }
 
     #[test]
-    fn list_map_object_field_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn list_map_object_field_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -22301,8 +22301,8 @@ mod tests {
     }
 
     #[test]
-    fn list_remove_object_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn list_remove_object_same_source_list_value_update_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -22522,8 +22522,8 @@ mod tests {
     }
 
     #[test]
-    fn list_retain_object_filtered_out_update_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn list_retain_object_filtered_out_update_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -34594,8 +34594,8 @@ mod tests {
     }
 
     #[test]
-    fn list_all_object_bool_same_truthiness_update_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn list_all_object_bool_same_truthiness_update_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -35125,8 +35125,8 @@ mod tests {
     }
 
     #[test]
-    fn text_to_number_same_numeric_value_update_does_not_revisit_downstream_closure_after_convergence()
-     {
+    fn text_to_number_same_numeric_value_update_does_not_revisit_downstream_closure_after_convergence(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -36221,6 +36221,149 @@ mod tests {
         assert!(executor.evaluation_count(NodeId(2)) > before_call);
         assert!(executor.evaluation_count(NodeId(4)) > before_then);
         assert!(executor.evaluation_count(NodeId(5)) > before_sink);
+    }
+
+    #[test]
+    fn call_capture_multi_source_same_value_update_revisits_then_control_dependent() {
+        let program = IrProgram {
+            nodes: vec![
+                IrNode {
+                    id: NodeId(1),
+                    source_expr: None,
+                    kind: IrNodeKind::SourcePort(SourcePortId(895)),
+                },
+                IrNode {
+                    id: NodeId(2),
+                    source_expr: None,
+                    kind: IrNodeKind::SourcePort(SourcePortId(896)),
+                },
+                IrNode {
+                    id: NodeId(3),
+                    source_expr: None,
+                    kind: IrNodeKind::SourcePort(SourcePortId(897)),
+                },
+                IrNode {
+                    id: NodeId(4),
+                    source_expr: None,
+                    kind: IrNodeKind::Call {
+                        function: FunctionId(17),
+                        call_site: CallSiteId(895),
+                        args: vec![NodeId(1)],
+                    },
+                },
+                IrNode {
+                    id: NodeId(5),
+                    source_expr: None,
+                    kind: IrNodeKind::Literal(KernelValue::from("selected")),
+                },
+                IrNode {
+                    id: NodeId(6),
+                    source_expr: None,
+                    kind: IrNodeKind::Then {
+                        source: NodeId(4),
+                        body: NodeId(5),
+                    },
+                },
+                IrNode {
+                    id: NodeId(7),
+                    source_expr: None,
+                    kind: IrNodeKind::SinkPort {
+                        port: SinkPortId(895),
+                        input: NodeId(6),
+                    },
+                },
+            ],
+            functions: vec![IrFunctionTemplate {
+                id: FunctionId(17),
+                parameter_count: 1,
+                output: NodeId(502),
+                nodes: vec![
+                    IrNode {
+                        id: NodeId(500),
+                        source_expr: None,
+                        kind: IrNodeKind::Parameter { index: 0 },
+                    },
+                    IrNode {
+                        id: NodeId(501),
+                        source_expr: None,
+                        kind: IrNodeKind::Add {
+                            lhs: NodeId(500),
+                            rhs: NodeId(2),
+                        },
+                    },
+                    IrNode {
+                        id: NodeId(502),
+                        source_expr: None,
+                        kind: IrNodeKind::Add {
+                            lhs: NodeId(501),
+                            rhs: NodeId(3),
+                        },
+                    },
+                ],
+            }],
+            persistence: Vec::new(),
+        };
+        let mut executor = IrExecutor::new_program(program).expect("call capture then ir executes");
+        let actor = ActorId {
+            index: 0,
+            generation: 0,
+        };
+
+        executor
+            .apply_messages(&[
+                (
+                    actor,
+                    Msg::SourcePulse {
+                        port: SourcePortId(895),
+                        value: KernelValue::from(7.0),
+                        seq: CausalSeq::new(1, 0),
+                    },
+                ),
+                (
+                    actor,
+                    Msg::SourcePulse {
+                        port: SourcePortId(896),
+                        value: KernelValue::from(10.0),
+                        seq: CausalSeq::new(1, 1),
+                    },
+                ),
+                (
+                    actor,
+                    Msg::SourcePulse {
+                        port: SourcePortId(897),
+                        value: KernelValue::from(20.0),
+                        seq: CausalSeq::new(1, 2),
+                    },
+                ),
+            ])
+            .expect("initial multi-source captured-call then pulse is accepted");
+        assert_eq!(
+            executor.sink_value(SinkPortId(895)),
+            Some(&KernelValue::from("selected"))
+        );
+
+        let before_call = executor.evaluation_count(NodeId(4));
+        let before_then = executor.evaluation_count(NodeId(6));
+        let before_sink = executor.evaluation_count(NodeId(7));
+
+        executor
+            .apply_messages(&[(
+                actor,
+                Msg::SourcePulse {
+                    port: SourcePortId(897),
+                    value: KernelValue::from(20.0),
+                    seq: CausalSeq::new(2, 0),
+                },
+            )])
+            .expect("same-value multi-source captured-call then pulse is accepted");
+
+        assert_eq!(
+            executor.sink_value(SinkPortId(895)),
+            Some(&KernelValue::from("selected"))
+        );
+        assert!(executor.evaluation_count(NodeId(4)) > before_call);
+        assert!(executor.evaluation_count(NodeId(6)) > before_then);
+        assert!(executor.evaluation_count(NodeId(7)) > before_sink);
     }
 
     #[test]
@@ -42619,8 +42762,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_link_bind_does_not_revisit_hold_update_through_list_map_toggle_object_bool_field_by_field_eq()
-     {
+    fn stale_link_bind_does_not_revisit_hold_update_through_list_map_toggle_object_bool_field_by_field_eq(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -52688,8 +52831,8 @@ mod tests {
     }
 
     #[test]
-    fn same_target_newer_seq_link_update_revisits_hold_update_through_list_retain_object_bool_field()
-     {
+    fn same_target_newer_seq_link_update_revisits_hold_update_through_list_retain_object_bool_field(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -53046,8 +53189,8 @@ mod tests {
     }
 
     #[test]
-    fn same_target_newer_seq_link_update_revisits_hold_update_through_list_remove_object_by_field_eq()
-     {
+    fn same_target_newer_seq_link_update_revisits_hold_update_through_list_remove_object_by_field_eq(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -53781,8 +53924,8 @@ mod tests {
     }
 
     #[test]
-    fn same_target_newer_seq_link_update_revisits_hold_update_through_list_map_toggle_object_bool_field_by_field_eq()
-     {
+    fn same_target_newer_seq_link_update_revisits_hold_update_through_list_map_toggle_object_bool_field_by_field_eq(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -54157,8 +54300,8 @@ mod tests {
     }
 
     #[test]
-    fn same_target_newer_seq_link_update_revisits_hold_update_through_list_map_object_field_by_field_eq()
-     {
+    fn same_target_newer_seq_link_update_revisits_hold_update_through_list_map_object_field_by_field_eq(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -64957,8 +65100,8 @@ mod tests {
     }
 
     #[test]
-    fn newer_link_bind_target_change_revisits_hold_update_through_list_map_toggle_object_bool_field_by_field_eq()
-     {
+    fn newer_link_bind_target_change_revisits_hold_update_through_list_map_toggle_object_bool_field_by_field_eq(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),
@@ -65364,8 +65507,8 @@ mod tests {
     }
 
     #[test]
-    fn newer_link_bind_target_change_revisits_hold_update_through_list_map_object_field_by_field_eq()
-     {
+    fn newer_link_bind_target_change_revisits_hold_update_through_list_map_object_field_by_field_eq(
+    ) {
         let nodes = vec![
             IrNode {
                 id: NodeId(1),

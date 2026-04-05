@@ -140,7 +140,7 @@ fn clear_all_compiled_engine_persisted_states() {
 }
 
 fn engine_supports_persistence(engine: EngineType) -> bool {
-    !matches!(engine, EngineType::ActorsLite | EngineType::FactoryFabric)
+    !matches!(engine, EngineType::FactoryFabric)
 }
 
 fn default_engine_status(engine: EngineType) -> JsValue {
@@ -3309,13 +3309,6 @@ impl Playground {
                 source_code.len()
             ));
             drop(files);
-            if persistence_enabled {
-                set_page_engine_status_snapshot(engine_type, false, 0);
-                return El::new()
-                    .s(Font::new().color(color!("LightCoral")))
-                    .child("ActorsLite: persistence is not supported in v1 yet")
-                    .unify();
-            }
             return run_actors_lite(&source_code).unify();
         }
 
@@ -4292,8 +4285,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn actors_lite_persistence_is_capability_gated() {
-        assert!(!engine_supports_persistence(EngineType::ActorsLite));
+    fn actors_lite_supports_persistence() {
+        assert!(engine_supports_persistence(EngineType::ActorsLite));
     }
 
     #[test]
@@ -4422,7 +4415,7 @@ mod tests {
     }
 
     #[test]
-    fn actors_lite_engine_visibility_requires_phase4_acceptance_record() {
+    fn actors_lite_engine_visibility_is_supported() {
         assert!(actors_lite_public_exposure_enabled());
         assert!(is_engine_available(EngineType::ActorsLite));
         assert!(available_engines().contains(&EngineType::ActorsLite));
