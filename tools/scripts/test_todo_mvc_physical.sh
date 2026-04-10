@@ -6,13 +6,13 @@
 # theme switching, dark/light mode, counter text.
 #
 # Prerequisites:
-#   - Playground running at localhost:8083
+#   - Playground running from this workspace's MoonZoon.toml port
 #   - WebSocket server running
 #   - Browser with extension connected
 #
 # Usage: ./test_todo_mvc_physical.sh [--engine ENGINE] [--port PORT]
 #   --engine   Test only one engine: Actors, ActorsLite, DD, Wasm (default: all)
-#   --port     WebSocket port (default: 9224)
+#   --port     WebSocket port (default: auto-detected from MoonZoon.toml)
 #
 # Exit code 0 = all tests pass, non-zero = failures.
 
@@ -23,7 +23,7 @@ PASS=0
 FAIL=0
 SKIP=0
 ERRORS=""
-PORT=9224
+PORT=""
 ENGINE_FILTER=""
 
 while [[ $# -gt 0 ]]; do
@@ -42,7 +42,11 @@ if [ ! -f "$BT" ]; then
 fi
 
 bt() {
-    "$BT" exec --port "$PORT" "$@" 2>/dev/null
+    if [[ -n "$PORT" ]]; then
+        "$BT" exec --port "$PORT" "$@" 2>/dev/null
+    else
+        "$BT" exec "$@" 2>/dev/null
+    fi
 }
 
 ok() {

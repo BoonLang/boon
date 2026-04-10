@@ -1,11 +1,11 @@
-port = 8083
+port = 8086
 # port = 8443
 https = false
 cache_busting = true
 backend_log_level = "warn" # "error" / "warn" / "info" / "debug" / "trace"
 
 [redirect]
-port = 8083
+port = 8086
 enabled = false
 
 [cors]

@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 /// Port offset: WS port = playground port + this value
 pub const WS_PORT_OFFSET: u16 = 1141;
 
-pub const DEFAULT_PLAYGROUND_PORT: u16 = 8083;
-pub const DEFAULT_WS_PORT: u16 = DEFAULT_PLAYGROUND_PORT + WS_PORT_OFFSET; // 9224
+pub const DEFAULT_PLAYGROUND_PORT: u16 = 8086;
+pub const DEFAULT_WS_PORT: u16 = DEFAULT_PLAYGROUND_PORT + WS_PORT_OFFSET; // 9227
 
 pub struct PortConfig {
     pub playground_port: u16,

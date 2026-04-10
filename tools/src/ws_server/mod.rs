@@ -1,7 +1,7 @@
 //! WebSocket server for browser extension communication
 //!
 //! Architecture:
-//! - Server listens on localhost:9223 (configurable)
+//! - Server listens on a configurable localhost port
 //! - Chrome extension connects via WebSocket
 //! - CLI sends commands to server, server forwards to extension
 //! - Extension executes in browser, returns response

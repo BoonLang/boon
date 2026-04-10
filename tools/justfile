@@ -115,4 +115,4 @@ chrome_profile := ".chrome-profile"
 # Launch Chromium with extension loaded (first run: enable Developer mode in chrome://extensions)
 browser:
     @mkdir -p {{chrome_profile}}
-    chromium --user-data-dir={{chrome_profile}} --load-extension={{extension_dir}} --no-first-run --no-default-browser-check http://localhost:8083
+    chromium --user-data-dir={{chrome_profile}} --load-extension={{extension_dir}} --no-first-run --no-default-browser-check http://localhost:$$(sed -n 's/^port = \\([0-9][0-9]*\\)/\\1/p' ../playground/MoonZoon.toml | head -1)

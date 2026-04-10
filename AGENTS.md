@@ -10,7 +10,7 @@ The interactive app is in `playground/`: `frontend/` contains examples and the w
 
 - `cargo check -p boon`: fast validation for the main library crate.
 - `cargo test -p boon`: run Rust tests for the main crate.
-- `cd playground && makers mzoon start`: run the local playground at `http://localhost:8083`.
+- `cd playground && makers mzoon start`: run the local playground at the configured workspace port, currently `http://localhost:8086`.
 - `cd tools && cargo run --release -- server start --watch ./extension`: start the browser automation server.
 - `./tools/scripts/verify_7guis_complete.sh --static-only`: run static 7GUIs verification.
 - `cd tools && just test-examples --filter cells --engine Actors`: run a targeted browser-driven example test.

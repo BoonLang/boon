@@ -3,8 +3,8 @@
 
 // Port convention: WS port = playground port + 1141
 const WS_PORT_OFFSET = 1141;
-const DEFAULT_PLAYGROUND_PORT = 8083;
-const DEFAULT_WS_PORT = DEFAULT_PLAYGROUND_PORT + WS_PORT_OFFSET; // 9224
+const DEFAULT_PLAYGROUND_PORT = 8086;
+const DEFAULT_WS_PORT = DEFAULT_PLAYGROUND_PORT + WS_PORT_OFFSET; // 9227
 
 let ws = null;
 let reconnectTimer = null;

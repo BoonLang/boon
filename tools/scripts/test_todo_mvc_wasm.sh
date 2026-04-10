@@ -10,12 +10,12 @@
 # plus visual regression.
 #
 # Prerequisites:
-#   - Playground running at localhost:8083 (cd playground && makers mzoon start)
+#   - Playground running from this workspace's MoonZoon.toml port (cd playground && makers mzoon start)
 #   - WebSocket server running (cd tools && cargo run --release -- server start --watch ./extension)
 #   - Browser with extension connected to playground
 #
 # Usage: ./test_todo_mvc_wasm.sh [--port PORT]
-#   --port     WebSocket port (default: 9224)
+#   --port     WebSocket port (default: auto-detected from MoonZoon.toml)
 #
 # Exit code 0 = all tests pass, non-zero = failures.
 
@@ -28,7 +28,7 @@ FAIL=0
 EXPECTED_FAIL=0
 SKIP=0
 ERRORS=""
-PORT=9224
+PORT=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -50,7 +50,11 @@ if [ ! -f "$BT" ]; then
 fi
 
 bt() {
-    "$BT" exec --port "$PORT" "$@" 2>/dev/null
+    if [[ -n "$PORT" ]]; then
+        "$BT" exec --port "$PORT" "$@" 2>/dev/null
+    else
+        "$BT" exec "$@" 2>/dev/null
+    fi
 }
 
 ok() {

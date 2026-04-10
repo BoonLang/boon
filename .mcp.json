@@ -1,7 +1,7 @@
 {
   "mcpServers": {
-    "boon-browser": {
-      "command": "/home/martinkavik/repos/boon/target/release/boon-tools",
+    "boon-diet-actors-browser": {
+      "command": "/home/martinkavik/repos/boon_diet_actors/target/release/boon-tools",
       "args": ["mcp"]
     }
   }

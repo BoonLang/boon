@@ -61,10 +61,10 @@ cargo test -p boon
 
 ### Running the playground (development server)
 
-**DO NOT** kill processes on port 8083 aggressively (e.g., `lsof -ti:8083 | xargs -r kill -9`).
+**DO NOT** kill processes on port 8086 aggressively (e.g., `lsof -ti:8086 | xargs -r kill -9`).
 
 Reasons:
-1. This can kill the user's browser if it's using port 8083
+1. This can kill the user's browser if it's using port 8086
 2. MoonZoon (mzoon) supports **auto-reload** and **auto-compilation** - manual restarts are unnecessary
 3. When you edit Rust files, mzoon will automatically recompile and hot-reload
 
@@ -82,7 +82,7 @@ cd playground && mzoon/bin/mzoon start &
 
 Wait for compilation (1-2 minutes fresh, seconds incremental). Check if running:
 ```bash
-curl -s http://localhost:8083 | head -5
+curl -s http://localhost:8086 | head -5
 ```
 
 **Stopping the playground (kill zombie processes on Linux):**
@@ -137,7 +137,7 @@ cd tools && cargo run --release -- server start --watch ./extension
 # 1. Open chrome://extensions/
 # 2. Enable "Developer mode"
 # 3. Click "Load unpacked" → select tools/extension/
-# 4. Navigate to http://localhost:8083
+# 4. Navigate to http://localhost:8086
 
 # Terminal 4: Execute commands
 boon-tools exec status                    # Check connection
@@ -240,9 +240,9 @@ To work on multiple features simultaneously (each with its own mzoon + browser),
 
 | Workspace | Playground | WebSocket |
 |-----------|-----------|-----------|
-| default (~/repos/boon) | 8083 | 9224 |
-| next workspace | 8084 | 9225 |
-| next after that | 8085 | 9226 |
+| boon_diet_actors (~/repos/boon_diet_actors) | 8086 | 9227 |
+| next workspace | 8087 | 9228 |
+| next after that | 8088 | 9229 |
 | ... | +1 | +1 |
 
 **Steps:**
@@ -280,7 +280,7 @@ To work on multiple features simultaneously (each with its own mzoon + browser),
 - Chrome profiles are per-workspace automatically (resolved relative to repo root)
 - All workspaces share the same jj repo — `jj log` from any workspace shows all commits
 - The Chrome extension is port-agnostic — it works with any localhost port, no editing needed
-- `.mcp.json` is the same across all workspaces (ports auto-detected from CWD)
+- `.mcp.json` should point at the current workspace's `target/release/boon-tools`; ports are still auto-detected from CWD
 
 ## Architecture
 

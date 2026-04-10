@@ -2,14 +2,14 @@
 
 use anyhow::{Context, Result};
 use boon_engine_actors_lite::cells_acceptance::{
-    CellsAcceptanceAction, CellsAcceptanceSequence, cells_dynamic_acceptance_sequences,
-    cells_static_acceptance_sequences,
+    cells_dynamic_acceptance_sequences, cells_static_acceptance_sequences, CellsAcceptanceAction,
+    CellsAcceptanceSequence,
 };
 use boon_engine_actors_lite::counter_acceptance::{
-    CounterAcceptanceAction, CounterAcceptanceSequence, counter_acceptance_sequences,
+    counter_acceptance_sequences, CounterAcceptanceAction, CounterAcceptanceSequence,
 };
 use boon_engine_actors_lite::todo_acceptance::{
-    TodoAcceptanceAction, TodoAcceptanceSequence, todo_edit_save_acceptance_sequences,
+    todo_edit_save_acceptance_sequences, TodoAcceptanceAction, TodoAcceptanceSequence,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -762,10 +762,12 @@ pub fn parsed_action_from_cells_acceptance_action(action: &CellsAcceptanceAction
             column: *column,
             expected: (*expected).to_string(),
         },
-        CellsAcceptanceAction::DblClickCellsCell { row, column } => ParsedAction::DblClickCellsCell {
-            row: *row,
-            column: *column,
-        },
+        CellsAcceptanceAction::DblClickCellsCell { row, column } => {
+            ParsedAction::DblClickCellsCell {
+                row: *row,
+                column: *column,
+            }
+        }
         CellsAcceptanceAction::AssertFocused => ParsedAction::AssertFocused { input_index: None },
         CellsAcceptanceAction::AssertFocusedInputValue { expected } => {
             ParsedAction::AssertFocusedInputValue {
@@ -796,7 +798,9 @@ pub fn parsed_action_from_counter_acceptance_action(
     action: &CounterAcceptanceAction,
 ) -> ParsedAction {
     match action {
-        CounterAcceptanceAction::ClickButton { index } => ParsedAction::ClickButton { index: *index },
+        CounterAcceptanceAction::ClickButton { index } => {
+            ParsedAction::ClickButton { index: *index }
+        }
     }
 }
 
@@ -919,9 +923,12 @@ fn contains_sequence_window(
         return true;
     }
 
-    actual
-        .windows(expected.len())
-        .any(|window| window.iter().zip(expected.iter()).all(|(left, right)| left == right))
+    actual.windows(expected.len()).any(|window| {
+        window
+            .iter()
+            .zip(expected.iter())
+            .all(|(left, right)| left == right)
+    })
 }
 
 pub fn validate_required_shared_sequences(
@@ -1068,24 +1075,32 @@ pub fn matches_inline(text: &str, expected: &str, mode: &MatchMode) -> Result<bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    fn repo_path(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(relative)
+    }
 
     fn assert_expected_file_matches_shared_cells_sequences(
-        path: &str,
+        path: &Path,
         shared: &[CellsAcceptanceSequence],
     ) {
-        let spec = ExpectedSpec::from_file(&PathBuf::from(path)).expect("expected file parses");
+        let spec = ExpectedSpec::from_file(path).expect("expected file parses");
         assert_eq!(
             spec.sequence.len(),
             shared.len(),
-            "sequence count mismatch for {path}"
+            "sequence count mismatch for {}",
+            path.display()
         );
 
         for (index, (actual, expected)) in spec.sequence.iter().zip(shared.iter()).enumerate() {
             assert_eq!(
                 actual.description.as_deref(),
                 Some(expected.description),
-                "description mismatch in {path} sequence {index}"
+                "description mismatch in {} sequence {index}",
+                path.display()
             );
             let parsed_actions = actual
                 .actions
@@ -1098,8 +1113,10 @@ mod tests {
                 .map(parsed_action_from_cells_acceptance_action)
                 .collect::<Vec<_>>();
             assert_eq!(
-                parsed_actions, expected_actions,
-                "actions mismatch in {path} sequence {index}"
+                parsed_actions,
+                expected_actions,
+                "actions mismatch in {} sequence {index}",
+                path.display()
             );
         }
     }
@@ -1163,8 +1180,8 @@ expect = "1"
 
     #[test]
     fn counter_expected_matches_shared_acceptance_sequences() {
-        let spec = ExpectedSpec::from_file(&PathBuf::from(
-            "/home/martinkavik/repos/boon/playground/frontend/src/examples/counter/counter.expected",
+        let spec = ExpectedSpec::from_file(&repo_path(
+            "playground/frontend/src/examples/counter/counter.expected",
         ))
         .expect("expected file parses");
         let actual = parse_interaction_sequences(&spec.sequence).expect("sequence parses");
@@ -1178,7 +1195,7 @@ expect = "1"
     #[test]
     fn cells_expected_matches_shared_acceptance_sequences() {
         assert_expected_file_matches_shared_cells_sequences(
-            "/home/martinkavik/repos/boon/playground/frontend/src/examples/cells/cells.expected",
+            &repo_path("playground/frontend/src/examples/cells/cells.expected"),
             &cells_static_acceptance_sequences(),
         );
     }
@@ -1186,15 +1203,15 @@ expect = "1"
     #[test]
     fn cells_dynamic_expected_matches_shared_acceptance_sequences() {
         assert_expected_file_matches_shared_cells_sequences(
-            "/home/martinkavik/repos/boon/playground/frontend/src/examples/cells_dynamic/cells_dynamic.expected",
+            &repo_path("playground/frontend/src/examples/cells_dynamic/cells_dynamic.expected"),
             &cells_dynamic_acceptance_sequences(),
         );
     }
 
     #[test]
     fn todo_mvc_expected_contains_shared_edit_save_acceptance_sequences() {
-        let spec = ExpectedSpec::from_file(&PathBuf::from(
-            "/home/martinkavik/repos/boon/playground/frontend/src/examples/todo_mvc/todo_mvc.expected",
+        let spec = ExpectedSpec::from_file(&repo_path(
+            "playground/frontend/src/examples/todo_mvc/todo_mvc.expected",
         ))
         .expect("expected file parses");
         let actual = parse_interaction_sequences(&spec.sequence).expect("sequence parses");

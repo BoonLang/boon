@@ -162,7 +162,7 @@ async fn handle_request(request: McpRequest, ws_port: u16, playground_port: u16)
                     "tools": {}
                 },
                 "serverInfo": {
-                    "name": "boon-browser",
+                    "name": "boon-diet-actors-browser",
                     "version": "0.1.0"
                 }
             })),
@@ -1485,15 +1485,13 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
 
         Response::ActorsLiteDebug { value } => Ok(value.unwrap_or_default()),
 
-        Response::EngineStatus { status } => Ok(
-            serde_json::to_string_pretty(&status)
-                .unwrap_or_else(|_| "{\"error\":\"failed to encode engine status\"}".to_string()),
-        ),
+        Response::EngineStatus { status } => Ok(serde_json::to_string_pretty(&status)
+            .unwrap_or_else(|_| "{\"error\":\"failed to encode engine status\"}".to_string())),
 
-        Response::EngineDebug { debug } => Ok(
-            serde_json::to_string_pretty(&debug.unwrap_or(serde_json::Value::Null))
-                .unwrap_or_else(|_| "{\"error\":\"failed to encode engine debug\"}".to_string()),
-        ),
+        Response::EngineDebug { debug } => Ok(serde_json::to_string_pretty(
+            &debug.unwrap_or(serde_json::Value::Null),
+        )
+        .unwrap_or_else(|_| "{\"error\":\"failed to encode engine debug\"}".to_string())),
 
         Response::Error { message } => Err(message),
     }

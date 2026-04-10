@@ -36,7 +36,7 @@ CURRENT="$OUTPUT_DIR/current.png"
 DIFF="$OUTPUT_DIR/diff.png"
 THRESHOLD="0.90"
 REFERENCE=""
-WS_PORT="9224"
+WS_PORT=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -59,7 +59,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  -r, --reference PATH   Path to reference image (required)"
             echo "  -t, --threshold VALUE  SSIM threshold (default: 0.90)"
-            echo "  -p, --port PORT        WebSocket server port (default: 9224)"
+            echo "  -p, --port PORT        WebSocket server port (default: auto-detected from MoonZoon.toml)"
             echo "  -h, --help             Show this help"
             exit 0
             ;;
@@ -108,7 +108,12 @@ while true; do
 
     # Take screenshot
     echo "Taking screenshot..."
-    if ! "$BOON_TOOLS" exec --port "$WS_PORT" screenshot-preview --output "$CURRENT" --width 700 --height 700 --hidpi 2>/dev/null; then
+    if [[ -n "$WS_PORT" ]]; then
+        SCREENSHOT_CMD=("$BOON_TOOLS" exec --port "$WS_PORT" screenshot-preview --output "$CURRENT" --width 700 --height 700 --hidpi)
+    else
+        SCREENSHOT_CMD=("$BOON_TOOLS" exec screenshot-preview --output "$CURRENT" --width 700 --height 700 --hidpi)
+    fi
+    if ! "${SCREENSHOT_CMD[@]}" 2>/dev/null; then
         echo -e "${RED}ERROR: Failed to take screenshot${NC}"
         echo "Make sure the browser is connected and playground is running."
         echo ""

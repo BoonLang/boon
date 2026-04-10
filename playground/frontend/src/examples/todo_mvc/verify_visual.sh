@@ -6,7 +6,7 @@
 #   1 = FAIL (SSIM < threshold or error)
 #
 # USAGE:
-#   ./verify_visual.sh [--threshold 0.95] [--output /tmp/diff.png]
+#   ./verify_visual.sh [--threshold 0.95] [--output /tmp/diff.png] [--port PORT]
 #
 # PREREQUISITES:
 #   - Boon playground running (cd playground && makers mzoon start)
@@ -23,6 +23,7 @@ OUTPUT_DIR="/tmp/boon-visual-tests"
 OUTPUT="$OUTPUT_DIR/todo_mvc_screenshot.png"
 DIFF="$OUTPUT_DIR/todo_mvc_diff.png"
 SSIM_THRESHOLD="0.90"
+PORT=""
 
 # Anti-cheat: Canonical reference hash
 # MUST NOT be changed without explicit team review and commit message explanation
@@ -43,13 +44,25 @@ while [[ $# -gt 0 ]]; do
             DIFF="$2"
             shift 2
             ;;
+        --port)
+            PORT="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--threshold 0.95] [--output /tmp/diff.png]"
+            echo "Usage: $0 [--threshold 0.95] [--output /tmp/diff.png] [--port PORT]"
             exit 1
             ;;
     esac
 done
+
+bt_exec() {
+    if [[ -n "$PORT" ]]; then
+        "$BOON_TOOLS" exec --port "$PORT" "$@"
+    else
+        "$BOON_TOOLS" exec "$@"
+    fi
+}
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -94,7 +107,7 @@ echo ""
 
 # Step 1: Select todo_mvc example
 echo "[1/3] Selecting todo_mvc example..."
-"$BOON_TOOLS" exec --port 9224 select todo_mvc || {
+bt_exec select todo_mvc || {
     echo "ERROR: Failed to select todo_mvc example"
     exit 1
 }
@@ -104,7 +117,7 @@ echo "[2/3] Taking screenshot of preview pane..."
 sleep 1  # Allow time for render
 
 # Try boon-tools screenshot first, fall back to recent MCP screenshot if available
-if ! "$BOON_TOOLS" exec --port 9224 screenshot-preview --output "$OUTPUT" --width 700 --height 700 --hidpi 2>/dev/null; then
+if ! bt_exec screenshot-preview --output "$OUTPUT" --width 700 --height 700 --hidpi 2>/dev/null; then
     echo "      boon-tools screenshot failed, checking for existing screenshot..."
     # Find most recent 1400x1400 screenshot from MCP (within last 5 minutes)
     # Filter by name pattern (screenshot_* are preview shots, fullpage_* are full page)

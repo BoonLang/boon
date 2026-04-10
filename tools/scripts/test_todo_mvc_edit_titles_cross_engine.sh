@@ -4,7 +4,7 @@ set -euo pipefail
 
 TOOLS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BT="$TOOLS_DIR/../target/release/boon-tools"
-PORT=9224
+PORT=""
 
 PASS=0
 FAIL=0
@@ -23,7 +23,11 @@ if [[ ! -f "$BT" ]]; then
 fi
 
 bt() {
-    "$BT" exec --port "$PORT" "$@"
+    if [[ -n "$PORT" ]]; then
+        "$BT" exec --port "$PORT" "$@"
+    else
+        "$BT" exec "$@"
+    fi
 }
 
 reset_project_cache() {
