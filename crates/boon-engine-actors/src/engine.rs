@@ -1387,9 +1387,23 @@ pub struct SubscriptionSetup {
     pub starting_version: u64,
 }
 
+pub type EmissionSeq = u64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmissionIdentity {
+    pub key: ValueIdempotencyKey,
+    pub seq: EmissionSeq,
+}
+
+impl EmissionIdentity {
+    pub fn new(key: ValueIdempotencyKey, seq: EmissionSeq) -> Self {
+        Self { key, seq }
+    }
+}
+
 /// Request for getting the current stored value from a ValueActor.
 pub struct StoredValueQuery {
-    pub before_emission: Option<(ValueIdempotencyKey, u64)>,
+    pub before_emission: Option<EmissionIdentity>,
     pub reply: oneshot::Sender<Option<Value>>,
 }
 
@@ -2140,14 +2154,14 @@ pub struct ActorContext {
     ///
     /// This implements "glitch freedom" from FRP theory: ensuring that a late
     /// subscriber doesn't receive events that happened before it subscribed.
-    pub subscription_time: Option<u64>,
+    pub subscription_time: Option<EmissionSeq>,
     /// Source emission identity for snapshot evaluation contexts.
     ///
     /// When THEN/WHEN evaluate a body for a triggering emission, sibling consumers of the
     /// same source can update shared state in parallel. Snapshot readers use this identity
     /// to request the latest value that existed before the current emission, rather than
     /// whatever sibling happened to store first.
-    pub snapshot_emission_identity: Option<(ValueIdempotencyKey, u64)>,
+    pub snapshot_emission_identity: Option<EmissionIdentity>,
     /// Registry scope ID for deterministic actor ownership.
     ///
     /// When set, actors created in this context are registered under this scope.
@@ -4206,15 +4220,14 @@ impl ValueHistory {
     /// Get the latest value that existed before the given source emission.
     pub fn get_latest_before_emission(
         &self,
-        emission_idempotency_key: ValueIdempotencyKey,
-        emission_lamport_time: u64,
+        emission: EmissionIdentity,
     ) -> Option<Value> {
         self.values.iter().rev().find_map(|(_, value)| {
             let metadata = value.metadata();
-            let is_same_emission = metadata.idempotency_key == emission_idempotency_key
-                && metadata.lamport_time == emission_lamport_time;
-            let is_before = metadata.lamport_time < emission_lamport_time
-                || (metadata.lamport_time == emission_lamport_time && !is_same_emission);
+            let is_same_emission =
+                metadata.idempotency_key == emission.key && metadata.lamport_time == emission.seq;
+            let is_before = metadata.lamport_time < emission.seq
+                || (metadata.lamport_time == emission.seq && !is_same_emission);
             is_before.then(|| value.clone())
         })
     }
@@ -5521,6 +5534,15 @@ impl Value {
             Self::List(_, metadata) => metadata,
             Self::Flushed(_, metadata) => metadata,
         }
+    }
+
+    pub fn emission_identity(&self) -> EmissionIdentity {
+        EmissionIdentity::new(self.idempotency_key(), self.lamport_time())
+    }
+
+    pub fn set_emission_identity(&mut self, identity: EmissionIdentity) {
+        self.set_idempotency_key(identity.key);
+        self.metadata_mut().lamport_time = identity.seq;
     }
 
     /// Get the Lamport timestamp of when this value was created.
