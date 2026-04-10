@@ -24,10 +24,8 @@ use crate::lower::builtin_registry::BuiltinRegistry;
 use crate::parse::{
     StaticExpression, StaticSpannedExpression, parse_static_expressions, top_level_bindings,
 };
-use boon::parser::static_expression::{
-    Argument, Expression, Literal, Spanned, TextPart, Variable,
-};
 use boon::parser::StrSlice;
+use boon::parser::static_expression::{Argument, Expression, Literal, Spanned, TextPart, Variable};
 use boon_scene::UiEventKind;
 use std::collections::BTreeMap;
 
@@ -138,10 +136,7 @@ pub(crate) fn extract_top_level_functions(
             {
                 let func_name = name.as_str().to_string();
                 names.push(func_name.clone());
-                defs.insert(
-                    func_name,
-                    (parameters.clone(), body.as_ref().clone()),
-                );
+                defs.insert(func_name, (parameters.clone(), body.as_ref().clone()));
             }
         }
     }
@@ -200,9 +195,7 @@ fn lower_view_expr(
         Expression::FunctionCall { path, arguments } => {
             lower_view_function_call(path, arguments, bindings, port_alloc, site_alloc)
         }
-        Expression::Pipe { to, .. } => {
-            lower_view_expr(to, bindings, port_alloc, site_alloc)
-        }
+        Expression::Pipe { to, .. } => lower_view_expr(to, bindings, port_alloc, site_alloc),
         _ => Err(format!("unsupported expression type in view lowering")),
     }
 }
@@ -223,12 +216,8 @@ fn lower_view_function_call(
         ["Element", "label"] => lower_element_label(arguments, bindings, port_alloc, site_alloc),
         ["Element", "container"] => lower_container(arguments, bindings, port_alloc, site_alloc),
         ["Element", "checkbox"] => lower_checkbox(arguments, bindings, port_alloc, site_alloc),
-        ["Element", "text_input"] => {
-            lower_text_input(arguments, bindings, port_alloc, site_alloc)
-        }
-        ["Element", "paragraph"] => {
-            lower_paragraph(arguments, bindings, port_alloc, site_alloc)
-        }
+        ["Element", "text_input"] => lower_text_input(arguments, bindings, port_alloc, site_alloc),
+        ["Element", "paragraph"] => lower_paragraph(arguments, bindings, port_alloc, site_alloc),
         ["Element", "link"] => lower_link(arguments, bindings, port_alloc, site_alloc),
         _ => {
             let func_name = path_strs.first().copied().unwrap_or("");
@@ -351,7 +340,8 @@ fn lower_button(
             }
             "label" => {
                 if let Some(ref val) = arg.node.value {
-                    label_text = extract_text(val, bindings).unwrap_or_else(|| "Button".to_string());
+                    label_text =
+                        extract_text(val, bindings).unwrap_or_else(|| "Button".to_string());
                 }
             }
             _ => {}
@@ -599,11 +589,7 @@ fn extract_text(
                     }
                 }
             }
-            if text.is_empty() {
-                None
-            } else {
-                Some(text)
-            }
+            if text.is_empty() { None } else { Some(text) }
         }
         Expression::Literal(Literal::Text(s)) => Some(s.as_str().to_string()),
         Expression::Literal(Literal::Tag(s)) => Some(s.as_str().to_string()),

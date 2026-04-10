@@ -61,11 +61,8 @@ pub trait PersistenceAdapter {
     fn load_records(&self) -> Result<Vec<PersistedRecord>, String>;
 
     /// Apply a batch of changes (writes + deletes).
-    fn apply_batch(
-        &self,
-        writes: &[PersistedRecord],
-        delete_keys: &[String],
-    ) -> Result<(), String>;
+    fn apply_batch(&self, writes: &[PersistedRecord], delete_keys: &[String])
+    -> Result<(), String>;
 }
 
 /// In-memory no-op adapter for testing without persistence.
@@ -109,10 +106,18 @@ impl PersistenceAdapter for InMemoryPersistence {
         for del_key in delete_keys {
             guard.retain(|r| {
                 let r_key = match r {
-                    PersistedRecord::Hold { root_key, local_slot, .. } => {
+                    PersistedRecord::Hold {
+                        root_key,
+                        local_slot,
+                        ..
+                    } => {
                         format!("{root_key}.{local_slot}.hold")
                     }
-                    PersistedRecord::ListStore { root_key, local_slot, .. } => {
+                    PersistedRecord::ListStore {
+                        root_key,
+                        local_slot,
+                        ..
+                    } => {
                         format!("{root_key}.{local_slot}.list")
                     }
                 };
@@ -123,19 +128,35 @@ impl PersistenceAdapter for InMemoryPersistence {
         // Upsert writes
         for write in writes {
             let w_key = match write {
-                PersistedRecord::Hold { root_key, local_slot, .. } => {
+                PersistedRecord::Hold {
+                    root_key,
+                    local_slot,
+                    ..
+                } => {
                     format!("{root_key}.{local_slot}.hold")
                 }
-                PersistedRecord::ListStore { root_key, local_slot, .. } => {
+                PersistedRecord::ListStore {
+                    root_key,
+                    local_slot,
+                    ..
+                } => {
                     format!("{root_key}.{local_slot}.list")
                 }
             };
             guard.retain(|r| {
                 let r_key = match r {
-                    PersistedRecord::Hold { root_key, local_slot, .. } => {
+                    PersistedRecord::Hold {
+                        root_key,
+                        local_slot,
+                        ..
+                    } => {
                         format!("{root_key}.{local_slot}.hold")
                     }
-                    PersistedRecord::ListStore { root_key, local_slot, .. } => {
+                    PersistedRecord::ListStore {
+                        root_key,
+                        local_slot,
+                        ..
+                    } => {
                         format!("{root_key}.{local_slot}.list")
                     }
                 };

@@ -263,7 +263,6 @@ pub enum HostButtonLabel {
     Templated(Vec<HostTemplatedTextPart>),
 }
 
-
 impl HostButtonLabel {
     pub fn static_text(&self) -> Option<&str> {
         match self {

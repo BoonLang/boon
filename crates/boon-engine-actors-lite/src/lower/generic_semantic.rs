@@ -9,10 +9,10 @@ use crate::ir::{
     MatchArm, NodeId, PersistPolicy, SinkPortId, SourcePortId,
 };
 use crate::lower::builtin_registry::BuiltinRegistry;
-use boon::parser::{Span as SimpleSpan, Spanned, StrSlice};
 use boon::parser::static_expression::{
     ArithmeticOperator, Comparator, Expression, Literal, Pattern, TextPart,
 };
+use boon::parser::{Span as SimpleSpan, Spanned, StrSlice};
 use boon::platform::browser::kernel::KernelValue;
 use std::collections::BTreeMap;
 
@@ -30,7 +30,13 @@ pub struct GenericSemanticLowerCtx<'a> {
     /// Top-level bindings: name -> expression.
     pub bindings: &'a BTreeMap<String, &'a StaticSpannedExpression>,
     /// Top-level function definitions: name -> (parameters, body).
-    pub functions: &'a BTreeMap<String, (Vec<boon::parser::static_expression::Spanned<StrSlice>>, StaticSpannedExpression)>,
+    pub functions: &'a BTreeMap<
+        String,
+        (
+            Vec<boon::parser::static_expression::Spanned<StrSlice>>,
+            StaticSpannedExpression,
+        ),
+    >,
     /// Builtin registry for function-call dispatch.
     pub builtins: &'a BuiltinRegistry,
     /// Nodes accumulated during lowering.
@@ -67,9 +73,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         functions: &'a BTreeMap<
             String,
             (
-                Vec<boon::parser::static_expression::Spanned<
-                    StrSlice,
-                >>,
+                Vec<boon::parser::static_expression::Spanned<StrSlice>>,
                 StaticSpannedExpression,
             ),
         >,
@@ -100,7 +104,8 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         self.next_node += 1;
         self.nodes.push(IrNode {
             id,
-            source_expr: source_span.map(|s| boon::platform::browser::kernel::ExprId(s.start as u32)),
+            source_expr: source_span
+                .map(|s| boon::platform::browser::kernel::ExprId(s.start as u32)),
             kind,
         });
         id
@@ -149,7 +154,9 @@ impl<'a> GenericSemanticLowerCtx<'a> {
             Expression::Link => self.lower_link(expr.span),
             Expression::Skip => self.lower_skip(expr.span),
             Expression::Pipe { from, to } => self.lower_pipe(from, to, expr.span),
-            Expression::Block { variables, output } => self.lower_block(variables, output, expr.span),
+            Expression::Block { variables, output } => {
+                self.lower_block(variables, output, expr.span)
+            }
             Expression::Comparator(comp) => self.lower_comparator(comp, expr.span),
             Expression::ArithmeticOperator(op) => self.lower_arithmetic(op, expr.span),
             Expression::Latest { inputs } => self.lower_latest(inputs, expr.span),
@@ -173,14 +180,19 @@ impl<'a> GenericSemanticLowerCtx<'a> {
             Expression::Flush { value } => self.lower_flush(value, expr.span),
             Expression::Spread { value } => self.lower_spread(value, expr.span),
             Expression::Map { entries } => self.lower_map(entries, expr.span),
-            Expression::Function { name, parameters, body } => {
-                self.lower_function_def(name, parameters, body, expr.span)
-            }
+            Expression::Function {
+                name,
+                parameters,
+                body,
+            } => self.lower_function_def(name, parameters, body, expr.span),
             Expression::LinkSetter { alias } => self.lower_link_setter(alias, expr.span),
             Expression::Bits { .. } | Expression::Memory { .. } | Expression::Bytes { .. } => {
                 self.unsupported(
                     expr.span,
-                    format!("hardware type {:?} not supported in generic lowering", expr.node),
+                    format!(
+                        "hardware type {:?} not supported in generic lowering",
+                        expr.node
+                    ),
                 );
                 self.alloc_node(
                     IrNodeKind::Literal(KernelValue::Number(f64::NAN)),
@@ -190,11 +202,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         }
     }
 
-    fn lower_literal(
-        &mut self,
-        lit: &Literal,
-        span: SimpleSpan,
-    ) -> NodeId {
+    fn lower_literal(&mut self, lit: &Literal, span: SimpleSpan) -> NodeId {
         let value = match lit {
             Literal::Number(n) => KernelValue::Number(*n),
             Literal::Tag(tag) => KernelValue::Tag(tag.as_str().to_string()),
@@ -213,10 +221,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
             node_id
         } else {
             // Unresolved variable — emit diagnostic and return a placeholder
-            self.unsupported(
-                var.value.span,
-                format!("unresolved variable: {name}"),
-            );
+            self.unsupported(var.value.span, format!("unresolved variable: {name}"));
             self.alloc_node(
                 IrNodeKind::Literal(KernelValue::Number(f64::NAN)),
                 Some(var.value.span),
@@ -264,7 +269,8 @@ impl<'a> GenericSemanticLowerCtx<'a> {
                 // PASSED aliases like `PASSED.store.todos` or `PASSED.store.elements.filter_buttons.all`
                 // These refer to values passed from the parent function's scope via PASS.
                 // We create LINK-based access: a LINK cell that will be bound at runtime.
-                let full_path: Vec<String> = extra_parts.iter().map(|s| s.as_str().to_string()).collect();
+                let full_path: Vec<String> =
+                    extra_parts.iter().map(|s| s.as_str().to_string()).collect();
                 let path_str = full_path.join(".");
 
                 // Check if this is a known source port path within PASSED scope
@@ -274,10 +280,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
 
                 // Create a LINK read - the LINK will be bound at runtime via PASS
                 let link_cell = self.alloc_node(IrNodeKind::LinkCell, Some(span));
-                self.alloc_node(
-                    IrNodeKind::LinkRead { cell: link_cell },
-                    Some(span),
-                )
+                self.alloc_node(IrNodeKind::LinkRead { cell: link_cell }, Some(span))
             }
         }
     }
@@ -307,15 +310,9 @@ impl<'a> GenericSemanticLowerCtx<'a> {
             Expression::FieldAccess { path } => {
                 self.lower_piped_field_access(from_node, path, span)
             }
-            Expression::When { arms } => {
-                self.lower_piped_when(from_node, arms, span)
-            }
-            Expression::While { arms } => {
-                self.lower_piped_while(from_node, arms, span)
-            }
-            Expression::Then { body } => {
-                self.lower_piped_then(from_node, body, span)
-            }
+            Expression::When { arms } => self.lower_piped_when(from_node, arms, span),
+            Expression::While { arms } => self.lower_piped_while(from_node, arms, span),
+            Expression::Then { body } => self.lower_piped_then(from_node, body, span),
             Expression::Hold { state_param, body } => {
                 self.lower_piped_hold(from_node, state_param, body, span)
             }
@@ -335,9 +332,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
                 // `from |> a == b` — replace operand_a with from if it looks like a placeholder
                 self.lower_piped_comparator(from_node, comp, span)
             }
-            Expression::ArithmeticOperator(op) => {
-                self.lower_piped_arithmetic(from_node, op, span)
-            }
+            Expression::ArithmeticOperator(op) => self.lower_piped_arithmetic(from_node, op, span),
             _ => {
                 // Generic: lower `to` and create a block with both
                 let to_node = self.lower_expr(to);
@@ -355,7 +350,9 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         &mut self,
         receiver: NodeId,
         path: &[StrSlice],
-        arguments: &Vec<boon::parser::static_expression::Spanned<boon::parser::static_expression::Argument>>,
+        arguments: &Vec<
+            boon::parser::static_expression::Spanned<boon::parser::static_expression::Argument>,
+        >,
         span: SimpleSpan,
     ) -> NodeId {
         let path_strs: Vec<String> = path.iter().map(|s| s.as_str().to_string()).collect();
@@ -441,10 +438,8 @@ impl<'a> GenericSemanticLowerCtx<'a> {
 
         if path_strs == ["List", "range"] {
             // List/range(from: from_val, to: to_val)
-            let mut from_node = self.alloc_node(
-                IrNodeKind::Literal(KernelValue::Number(1.0)),
-                Some(span),
-            );
+            let mut from_node =
+                self.alloc_node(IrNodeKind::Literal(KernelValue::Number(1.0)), Some(span));
             let mut to_node = receiver;
             for arg in arguments {
                 if arg.node.name.as_str() == "from" {
@@ -472,10 +467,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         }
 
         if path_strs == ["List", "is_empty"] {
-            return self.alloc_node(
-                IrNodeKind::ListIsEmpty { list: receiver },
-                Some(span),
-            );
+            return self.alloc_node(IrNodeKind::ListIsEmpty { list: receiver }, Some(span));
         }
 
         if path_strs == ["List", "sum"] {
@@ -487,18 +479,18 @@ impl<'a> GenericSemanticLowerCtx<'a> {
                 IrNodeKind::Literal(KernelValue::Number(f64::NAN)),
                 Some(span),
             );
-            return self.alloc_node(IrNodeKind::ListGet {
-                list: receiver,
-                index,
-            }, Some(span));
+            return self.alloc_node(
+                IrNodeKind::ListGet {
+                    list: receiver,
+                    index,
+                },
+                Some(span),
+            );
         }
 
         self.unsupported(
             span,
-            format!(
-                "unsupported piped function call: {}",
-                path_strs.join(".")
-            ),
+            format!("unsupported piped function call: {}", path_strs.join(".")),
         );
         receiver
     }
@@ -506,21 +498,28 @@ impl<'a> GenericSemanticLowerCtx<'a> {
     fn lower_list_map(
         &mut self,
         list: NodeId,
-        arguments: &Vec<boon::parser::static_expression::Spanned<boon::parser::static_expression::Argument>>,
+        arguments: &Vec<
+            boon::parser::static_expression::Spanned<boon::parser::static_expression::Argument>,
+        >,
         span: SimpleSpan,
     ) -> NodeId {
         // Find the `new:` argument which contains the function call for mapping
         for arg in arguments {
             if arg.node.name.as_str() == "new" {
                 if let Some(ref new_val) = arg.node.value {
-                    if let Expression::FunctionCall { path, arguments: inner_args } = &new_val.node {
+                    if let Expression::FunctionCall {
+                        path,
+                        arguments: inner_args,
+                    } = &new_val.node
+                    {
                         let func_name = path.first().map(|s| s.as_str()).unwrap_or("");
                         let func_id = self.alloc_function_id();
                         let call_site = self.alloc_call_site_id();
 
                         // Lower the function body with the map parameter in scope
                         // We need to create a function template
-                        let param_name = arguments.first().map(|a| a.node.name.as_str().to_string());
+                        let param_name =
+                            arguments.first().map(|a| a.node.name.as_str().to_string());
 
                         // Lower each inner argument with the parameter in scope
                         let mut lowered_args = Vec::new();
@@ -594,20 +593,19 @@ impl<'a> GenericSemanticLowerCtx<'a> {
             "Text.trim" => self.alloc_node(IrNodeKind::TextTrim { input: a0 }, Some(span)),
             "Text.is_not_empty" | "Text.is_empty" => a0,
             "Text.to_number" => self.alloc_node(IrNodeKind::TextToNumber { input: a0 }, Some(span)),
-            "Text.empty" => {
-                self.alloc_node(IrNodeKind::Literal(KernelValue::Text(String::new())), Some(span))
-            }
-            "Text.space" => {
-                self.alloc_node(IrNodeKind::Literal(KernelValue::Text(" ".to_string())), Some(span))
-            }
+            "Text.empty" => self.alloc_node(
+                IrNodeKind::Literal(KernelValue::Text(String::new())),
+                Some(span),
+            ),
+            "Text.space" => self.alloc_node(
+                IrNodeKind::Literal(KernelValue::Text(" ".to_string())),
+                Some(span),
+            ),
             "List.count" => self.alloc_node(IrNodeKind::ListCount { list: a0 }, Some(span)),
             "List.is_empty" => self.alloc_node(IrNodeKind::ListIsEmpty { list: a0 }, Some(span)),
             "List.sum" => self.alloc_node(IrNodeKind::ListSum { list: a0 }, Some(span)),
             _ => {
-                self.unsupported(
-                    span,
-                    format!("unsupported builtin: {path_str}"),
-                );
+                self.unsupported(span, format!("unsupported builtin: {path_str}"));
                 a0
             }
         }
@@ -716,10 +714,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         let old = self.var_nodes.get(&param_name).copied();
 
         // Create a placeholder node for the state param (will be resolved at runtime)
-        let state_param_node = self.alloc_node(
-            IrNodeKind::Parameter { index: 0 },
-            Some(span),
-        );
+        let state_param_node = self.alloc_node(IrNodeKind::Parameter { index: 0 }, Some(span));
         self.var_nodes.insert(param_name.clone(), state_param_node);
 
         let updates_node = self.lower_expr(body);
@@ -740,18 +735,21 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         )
     }
 
-    fn lower_latest(
-        &mut self,
-        inputs: &Vec<StaticSpannedExpression>,
-        span: SimpleSpan,
-    ) -> NodeId {
+    fn lower_latest(&mut self, inputs: &Vec<StaticSpannedExpression>, span: SimpleSpan) -> NodeId {
         let input_nodes: Vec<NodeId> = inputs.iter().map(|e| self.lower_expr(e)).collect();
-        self.alloc_node(IrNodeKind::Latest { inputs: input_nodes }, Some(span))
+        self.alloc_node(
+            IrNodeKind::Latest {
+                inputs: input_nodes,
+            },
+            Some(span),
+        )
     }
 
     fn lower_block(
         &mut self,
-        variables: &Vec<boon::parser::static_expression::Spanned<boon::parser::static_expression::Variable>>,
+        variables: &Vec<
+            boon::parser::static_expression::Spanned<boon::parser::static_expression::Variable>,
+        >,
         output: &StaticSpannedExpression,
         span: SimpleSpan,
     ) -> NodeId {
@@ -759,7 +757,8 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         let mut input_nodes = Vec::new();
         for var in variables {
             let node_id = self.lower_expr(&var.node.value);
-            self.var_nodes.insert(var.node.name.as_str().to_string(), node_id);
+            self.var_nodes
+                .insert(var.node.name.as_str().to_string(), node_id);
             input_nodes.push(node_id);
         }
 
@@ -773,32 +772,34 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         )
     }
 
-    fn lower_comparator(
-        &mut self,
-        comp: &Comparator,
-        span: SimpleSpan,
-    ) -> NodeId {
+    fn lower_comparator(&mut self, comp: &Comparator, span: SimpleSpan) -> NodeId {
         match comp {
-            Comparator::Equal { operand_a, operand_b } => {
+            Comparator::Equal {
+                operand_a,
+                operand_b,
+            } => {
                 let lhs = self.lower_expr(operand_a);
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Eq { lhs, rhs }, Some(span))
             }
-            Comparator::Greater { operand_a, operand_b } => {
+            Comparator::Greater {
+                operand_a,
+                operand_b,
+            } => {
                 let lhs = self.lower_expr(operand_a);
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Ge { lhs, rhs }, Some(span))
             }
-            Comparator::GreaterOrEqual { operand_a, operand_b } => {
+            Comparator::GreaterOrEqual {
+                operand_a,
+                operand_b,
+            } => {
                 let lhs = self.lower_expr(operand_a);
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Ge { lhs, rhs }, Some(span))
             }
             _ => {
-                self.unsupported(
-                    span,
-                    format!("unsupported comparator: {comp:?}"),
-                );
+                self.unsupported(span, format!("unsupported comparator: {comp:?}"));
                 self.alloc_node(
                     IrNodeKind::Literal(KernelValue::Tag("False".to_string())),
                     Some(span),
@@ -807,39 +808,51 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         }
     }
 
-    fn lower_arithmetic(
-        &mut self,
-        op: &ArithmeticOperator,
-        span: SimpleSpan,
-    ) -> NodeId {
+    fn lower_arithmetic(&mut self, op: &ArithmeticOperator, span: SimpleSpan) -> NodeId {
         match op {
-            ArithmeticOperator::Add { operand_a, operand_b } => {
+            ArithmeticOperator::Add {
+                operand_a,
+                operand_b,
+            } => {
                 let lhs = self.lower_expr(operand_a);
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Add { lhs, rhs }, Some(span))
             }
-            ArithmeticOperator::Subtract { operand_a, operand_b } => {
+            ArithmeticOperator::Subtract {
+                operand_a,
+                operand_b,
+            } => {
                 let lhs = self.lower_expr(operand_a);
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Sub { lhs, rhs }, Some(span))
             }
-            ArithmeticOperator::Multiply { operand_a, operand_b } => {
+            ArithmeticOperator::Multiply {
+                operand_a,
+                operand_b,
+            } => {
                 let lhs = self.lower_expr(operand_a);
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Mul { lhs, rhs }, Some(span))
             }
-            ArithmeticOperator::Divide { operand_a, operand_b } => {
+            ArithmeticOperator::Divide {
+                operand_a,
+                operand_b,
+            } => {
                 let lhs = self.lower_expr(operand_a);
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Div { lhs, rhs }, Some(span))
             }
             ArithmeticOperator::Negate { operand } => {
                 let input = self.lower_expr(operand);
-                let zero = self.alloc_node(
-                    IrNodeKind::Literal(KernelValue::Number(0.0)),
+                let zero =
+                    self.alloc_node(IrNodeKind::Literal(KernelValue::Number(0.0)), Some(span));
+                self.alloc_node(
+                    IrNodeKind::Sub {
+                        lhs: zero,
+                        rhs: input,
+                    },
                     Some(span),
-                );
-                self.alloc_node(IrNodeKind::Sub { lhs: zero, rhs: input }, Some(span))
+                )
             }
         }
     }
@@ -852,19 +865,22 @@ impl<'a> GenericSemanticLowerCtx<'a> {
     ) -> NodeId {
         // Replace the first operand with the receiver
         match comp {
-            Comparator::Equal { operand_a, operand_b } => {
+            Comparator::Equal {
+                operand_a,
+                operand_b,
+            } => {
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Eq { lhs: receiver, rhs }, Some(span))
             }
-            Comparator::Greater { operand_a, operand_b } => {
+            Comparator::Greater {
+                operand_a,
+                operand_b,
+            } => {
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Ge { lhs: receiver, rhs }, Some(span))
             }
             _ => {
-                self.unsupported(
-                    span,
-                    format!("unsupported piped comparator: {comp:?}"),
-                );
+                self.unsupported(span, format!("unsupported piped comparator: {comp:?}"));
                 receiver
             }
         }
@@ -877,27 +893,36 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         span: SimpleSpan,
     ) -> NodeId {
         match op {
-            ArithmeticOperator::Add { operand_a: _, operand_b } => {
+            ArithmeticOperator::Add {
+                operand_a: _,
+                operand_b,
+            } => {
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Add { lhs: receiver, rhs }, Some(span))
             }
-            ArithmeticOperator::Subtract { operand_a: _, operand_b } => {
+            ArithmeticOperator::Subtract {
+                operand_a: _,
+                operand_b,
+            } => {
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Sub { lhs: receiver, rhs }, Some(span))
             }
-            ArithmeticOperator::Multiply { operand_a: _, operand_b } => {
+            ArithmeticOperator::Multiply {
+                operand_a: _,
+                operand_b,
+            } => {
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Mul { lhs: receiver, rhs }, Some(span))
             }
-            ArithmeticOperator::Divide { operand_a: _, operand_b } => {
+            ArithmeticOperator::Divide {
+                operand_a: _,
+                operand_b,
+            } => {
                 let rhs = self.lower_expr(operand_b);
                 self.alloc_node(IrNodeKind::Div { lhs: receiver, rhs }, Some(span))
             }
             _ => {
-                self.unsupported(
-                    span,
-                    format!("unsupported piped arithmetic: {op:?}"),
-                );
+                self.unsupported(span, format!("unsupported piped arithmetic: {op:?}"));
                 receiver
             }
         }
@@ -925,11 +950,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         self.alloc_node(IrNodeKind::ObjectLiteral { fields }, Some(span))
     }
 
-    fn lower_text_literal(
-        &mut self,
-        parts: &[TextPart],
-        span: SimpleSpan,
-    ) -> NodeId {
+    fn lower_text_literal(&mut self, parts: &[TextPart], span: SimpleSpan) -> NodeId {
         let mut text = String::new();
         let mut needs_interp = false;
         for part in parts {
@@ -940,10 +961,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         }
 
         if !needs_interp && parts.iter().all(|p| matches!(p, TextPart::Text(_))) {
-            return self.alloc_node(
-                IrNodeKind::Literal(KernelValue::Text(text)),
-                Some(span),
-            );
+            return self.alloc_node(IrNodeKind::Literal(KernelValue::Text(text)), Some(span));
         }
 
         // For interpolated text, create a TextJoin node
@@ -976,7 +994,12 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         if input_nodes.len() == 1 {
             input_nodes.remove(0)
         } else {
-            self.alloc_node(IrNodeKind::TextJoin { inputs: input_nodes }, Some(span))
+            self.alloc_node(
+                IrNodeKind::TextJoin {
+                    inputs: input_nodes,
+                },
+                Some(span),
+            )
         }
     }
 
@@ -992,11 +1015,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         obj_node
     }
 
-    fn lower_field_access(
-        &mut self,
-        path: &[StrSlice],
-        span: SimpleSpan,
-    ) -> NodeId {
+    fn lower_field_access(&mut self, path: &[StrSlice], span: SimpleSpan) -> NodeId {
         if path.is_empty() {
             self.unsupported(span, "empty field access path".to_string());
             return self.alloc_node(
@@ -1047,19 +1066,11 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         )
     }
 
-    fn lower_flush(
-        &mut self,
-        value: &StaticSpannedExpression,
-        span: SimpleSpan,
-    ) -> NodeId {
+    fn lower_flush(&mut self, value: &StaticSpannedExpression, span: SimpleSpan) -> NodeId {
         self.lower_expr(value) // FLUSH is just passthrough semantically
     }
 
-    fn lower_spread(
-        &mut self,
-        value: &StaticSpannedExpression,
-        span: SimpleSpan,
-    ) -> NodeId {
+    fn lower_spread(&mut self, value: &StaticSpannedExpression, span: SimpleSpan) -> NodeId {
         self.lower_expr(value)
     }
 
@@ -1069,7 +1080,10 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         span: SimpleSpan,
     ) -> NodeId {
         // Maps are not yet fully supported in generic lowering
-        self.unsupported(span, "Map expressions not yet supported in generic lowering".to_string());
+        self.unsupported(
+            span,
+            "Map expressions not yet supported in generic lowering".to_string(),
+        );
         self.alloc_node(
             IrNodeKind::Literal(KernelValue::Number(f64::NAN)),
             Some(span),
@@ -1113,10 +1127,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         )
     }
 
-    fn lower_pattern(
-        &mut self,
-        pattern: &Pattern,
-    ) -> Option<KernelValue> {
+    fn lower_pattern(&mut self, pattern: &Pattern) -> Option<KernelValue> {
         match pattern {
             Pattern::Literal(lit) => Some(match lit {
                 Literal::Number(n) => KernelValue::Number(*n),
@@ -1128,7 +1139,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
                 // Pattern comparisons are handled specially; return a placeholder
                 Some(KernelValue::Number(f64::NAN))
             }
-            _ => None // Complex patterns not yet supported
+            _ => None, // Complex patterns not yet supported
         }
     }
 
@@ -1185,11 +1196,7 @@ impl<'a> GenericSemanticLowerCtx<'a> {
         self.alloc_node(IrNodeKind::Skip, Some(span))
     }
 
-    fn lower_then(
-        &mut self,
-        body: &StaticSpannedExpression,
-        span: SimpleSpan,
-    ) -> NodeId {
+    fn lower_then(&mut self, body: &StaticSpannedExpression, span: SimpleSpan) -> NodeId {
         self.unsupported(
             span,
             "THEN without a piped source is not supported".to_string(),
@@ -1200,7 +1207,9 @@ impl<'a> GenericSemanticLowerCtx<'a> {
     fn lower_function_call(
         &mut self,
         path: &[StrSlice],
-        arguments: &Vec<boon::parser::static_expression::Spanned<boon::parser::static_expression::Argument>>,
+        arguments: &Vec<
+            boon::parser::static_expression::Spanned<boon::parser::static_expression::Argument>,
+        >,
         span: SimpleSpan,
     ) -> NodeId {
         let path_strs: Vec<String> = path.iter().map(|s| s.as_str().to_string()).collect();

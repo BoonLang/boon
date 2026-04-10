@@ -3,8 +3,10 @@
 //! The original CLI depended on engine_v2/evaluator_v2 which don't exist.
 //! This stub provides basic functionality until the engine is complete.
 
-use boon::parser::{Input, Parser, Spanned, lexer, parser, reset_expression_depth, span_at, resolve_references};
 use boon::parser::SourceCode;
+use boon::parser::{
+    Input, Parser, Spanned, lexer, parser, reset_expression_depth, resolve_references, span_at,
+};
 use clap::{Parser as ClapParser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
@@ -86,7 +88,14 @@ fn parse_and_report(source: &str) -> Result<usize, String> {
     reset_expression_depth();
     let source_len = source.len();
     let (ast, parse_errors) = parser()
-        .parse(tokens.map(span_at(source_len), |Spanned { node, span, persistence: _ }| (node, span)))
+        .parse(tokens.map(
+            span_at(source_len),
+            |Spanned {
+                 node,
+                 span,
+                 persistence: _,
+             }| (node, span),
+        ))
         .into_output_errors();
     if let Some(error) = parse_errors.into_iter().next() {
         return Err(format!("parse error: {error}"));

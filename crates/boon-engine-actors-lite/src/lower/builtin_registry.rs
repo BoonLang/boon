@@ -40,7 +40,11 @@ impl BuiltinRegistry {
 
     /// Look up a builtin by its full path (e.g., `&["Math", "sum"]`).
     pub fn lookup(&self, path: &[impl AsRef<str>]) -> Option<BuiltinId> {
-        let key = path.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(".");
+        let key = path
+            .iter()
+            .map(|s| s.as_ref())
+            .collect::<Vec<_>>()
+            .join(".");
         self.by_path.get(&key).copied()
     }
 

@@ -3527,7 +3527,7 @@ impl LatestCombinator {
         #[derive(Default, Clone, Serialize, Deserialize)]
         #[serde(crate = "serde")]
         struct State {
-            input_emission_keys: BTreeMap<usize, (ValueIdempotencyKey, u64)>,
+            input_emission_keys: BTreeMap<usize, EmissionIdentity>,
         }
 
         let construct_info = construct_info.complete(ConstructType::LatestCombinator);
@@ -3579,27 +3579,23 @@ impl LatestCombinator {
                     if let Some(new_state) = new_state {
                         *state = new_state;
                     }
-                    let idempotency_key = value.idempotency_key();
-                    let lamport_time = value.lamport_time();
+                    let emission = value.emission_identity();
                     let skip_value = state.input_emission_keys.get(&index).is_some_and(
-                        |(previous_idempotency_key, previous_lamport_time)| {
-                            *previous_idempotency_key == idempotency_key
-                                && *previous_lamport_time == lamport_time
+                        |previous_emission| {
+                            *previous_emission == emission
                                 && latest_values[index]
                                     .as_ref()
                                     .is_some_and(|previous| values_equal(previous, &value))
                         },
                     );
-                    state
-                        .input_emission_keys
-                        .insert(index, (idempotency_key, lamport_time));
+                    state.input_emission_keys.insert(index, emission);
                     if skip_value {
                         return future::ready(Some(None));
                     }
 
                     if latest_values[index]
                         .as_ref()
-                        .is_some_and(|previous| previous.lamport_time() > value.lamport_time())
+                        .is_some_and(|previous| previous.emission_identity().seq > emission.seq)
                     {
                         return future::ready(Some(None));
                     }
@@ -3612,8 +3608,9 @@ impl LatestCombinator {
                             current.as_ref().map(|current| (input_index, current))
                         })
                         .max_by(|(lhs_idx, lhs), (rhs_idx, rhs)| {
-                            lhs.lamport_time()
-                                .cmp(&rhs.lamport_time())
+                            lhs.emission_identity()
+                                .seq
+                                .cmp(&rhs.emission_identity().seq)
                                 .then_with(|| rhs_idx.cmp(lhs_idx))
                         })
                         .map(|(_, selected)| selected.clone());
@@ -4218,10 +4215,7 @@ impl ValueHistory {
     }
 
     /// Get the latest value that existed before the given source emission.
-    pub fn get_latest_before_emission(
-        &self,
-        emission: EmissionIdentity,
-    ) -> Option<Value> {
+    pub fn get_latest_before_emission(&self, emission: EmissionIdentity) -> Option<Value> {
         self.values.iter().rev().find_map(|(_, value)| {
             let metadata = value.metadata();
             let is_same_emission =
@@ -4648,8 +4642,7 @@ impl ActorHandle {
 
     pub async fn current_value_before_emission(
         &self,
-        emission_idempotency_key: ValueIdempotencyKey,
-        emission_lamport_time: u64,
+        emission: EmissionIdentity,
     ) -> Result<Value, CurrentValueError> {
         if let Some(constant_value) = &self.constant_value {
             return Ok((**constant_value).clone());
@@ -4659,7 +4652,7 @@ impl ActorHandle {
         if self
             .stored_value_query_sender
             .send(StoredValueQuery {
-                before_emission: Some((emission_idempotency_key, emission_lamport_time)),
+                before_emission: Some(emission),
                 reply: reply_tx,
             })
             .await
@@ -4947,11 +4940,7 @@ fn create_actor_arc_info_with_output_valve<S: Stream<Item = Value> + 'static>(
                     query = stored_value_query_receiver.next() => {
                         if let Some(StoredValueQuery { before_emission, reply }) = query {
                             let current_value = match before_emission {
-                                Some((emission_idempotency_key, emission_lamport_time)) => value_history
-                                    .get_latest_before_emission(
-                                        emission_idempotency_key,
-                                        emission_lamport_time,
-                                    ),
+                                Some(emission) => value_history.get_latest_before_emission(emission),
                                 None => value_history.get_latest(),
                             };
                             if reply.send(current_value).is_err() && LOG_DEBUG {
@@ -6117,12 +6106,8 @@ pub async fn materialize_snapshot_value(
         actor: &ActorHandle,
         actor_context: &ActorContext,
     ) -> Result<Value, CurrentValueError> {
-        if let Some((emission_idempotency_key, emission_lamport_time)) =
-            actor_context.snapshot_emission_identity
-        {
-            actor
-                .current_value_before_emission(emission_idempotency_key, emission_lamport_time)
-                .await
+        if let Some(emission) = actor_context.snapshot_emission_identity {
+            actor.current_value_before_emission(emission).await
         } else {
             actor.current_value().await
         }

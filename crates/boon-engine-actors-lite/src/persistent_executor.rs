@@ -29,10 +29,7 @@ pub struct PersistentExecutor<'a> {
 
 impl<'a> PersistentExecutor<'a> {
     /// Create a new persistent executor.
-    pub fn new(
-        program: IrProgram,
-        adapter: &'a dyn PersistenceAdapter,
-    ) -> Result<Self, String> {
+    pub fn new(program: IrProgram, adapter: &'a dyn PersistenceAdapter) -> Result<Self, String> {
         let executor = IrExecutor::new_program(program.clone())?;
         let mut tracker = PersistenceTracker::new();
 
@@ -71,8 +68,7 @@ impl<'a> PersistentExecutor<'a> {
         // The actual injection happens during HOLD node evaluation
         for ((root_key, local_slot), value) in holds {
             // Mark as pre-loaded so the tracker knows the baseline
-            self.tracker
-                .mark_hold_dirty(root_key, local_slot, value);
+            self.tracker.mark_hold_dirty(root_key, local_slot, value);
         }
         // Clear the dirty markers since these are baseline values, not changes
         self.tracker.clear_dirty();
@@ -260,11 +256,9 @@ mod tests {
         assert_eq!(restored, 0);
 
         // Simulate increment: mark the hold as dirty with new value
-        executor.tracker.mark_hold_dirty(
-            root_key.to_string(),
-            0,
-            KernelValue::Number(1.0),
-        );
+        executor
+            .tracker
+            .mark_hold_dirty(root_key.to_string(), 0, KernelValue::Number(1.0));
 
         // Commit the change
         let written = executor.commit().unwrap();
@@ -343,16 +337,12 @@ mod tests {
         executor.load_persisted_state().unwrap();
 
         // Set both values
-        executor.tracker.mark_hold_dirty(
-            root_key_a.to_string(),
-            0,
-            KernelValue::Number(10.0),
-        );
-        executor.tracker.mark_hold_dirty(
-            root_key_b.to_string(),
-            0,
-            KernelValue::Number(20.0),
-        );
+        executor
+            .tracker
+            .mark_hold_dirty(root_key_a.to_string(), 0, KernelValue::Number(10.0));
+        executor
+            .tracker
+            .mark_hold_dirty(root_key_b.to_string(), 0, KernelValue::Number(20.0));
         executor.commit().unwrap();
 
         // Verify both are stored
@@ -366,11 +356,9 @@ mod tests {
         assert_eq!(restored, 2); // Both restored
 
         // Change only A
-        executor2.tracker.mark_hold_dirty(
-            root_key_a.to_string(),
-            0,
-            KernelValue::Number(15.0),
-        );
+        executor2
+            .tracker
+            .mark_hold_dirty(root_key_a.to_string(), 0, KernelValue::Number(15.0));
         executor2.commit().unwrap();
 
         // Third run: B should still be 20.0

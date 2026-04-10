@@ -437,7 +437,9 @@ impl LoweredProgram {
         match self {
             Self::Counter(program) => Ok(program.host_view),
             Self::ComplexCounter(program) => Ok(program.host_view),
-            Self::TodoMvc(program) | Self::TodoMvcWithInitialTodos { program, .. } => Ok(program.host_view),
+            Self::TodoMvc(program) | Self::TodoMvcWithInitialTodos { program, .. } => {
+                Ok(program.host_view)
+            }
             Self::Interval(program) => Ok(program.host_view),
             Self::IntervalHold(program) => Ok(program.host_view),
             Self::Fibonacci(program) => Ok(program.host_view),
@@ -478,7 +480,9 @@ impl LoweredProgram {
             Self::ComplexCounter(_) => {
                 Err("generic lowerer matched complex_counter, not counter".to_string())
             }
-            Self::TodoMvc(_) | Self::TodoMvcWithInitialTodos { .. } => Err("generic lowerer matched todo_mvc, not counter".to_string()),
+            Self::TodoMvc(_) | Self::TodoMvcWithInitialTodos { .. } => {
+                Err("generic lowerer matched todo_mvc, not counter".to_string())
+            }
             Self::Interval(_) => Err("generic lowerer matched interval, not counter".to_string()),
             Self::IntervalHold(_) => {
                 Err("generic lowerer matched interval_hold, not counter".to_string())
@@ -643,7 +647,9 @@ impl LoweredProgram {
             Self::ComplexCounter(_) => {
                 Err("generic lowerer matched complex_counter, not latest".to_string())
             }
-            Self::TodoMvc(_) | Self::TodoMvcWithInitialTodos { .. } => Err("generic lowerer matched todo_mvc, not latest".to_string()),
+            Self::TodoMvc(_) | Self::TodoMvcWithInitialTodos { .. } => {
+                Err("generic lowerer matched todo_mvc, not latest".to_string())
+            }
             Self::Interval(_) => Err("generic lowerer matched interval, not latest".to_string()),
             Self::IntervalHold(_) => {
                 Err("generic lowerer matched interval_hold, not latest".to_string())
@@ -724,7 +730,9 @@ impl LoweredProgram {
             Self::ComplexCounter(_) => {
                 Err("generic lowerer matched complex_counter, not then".to_string())
             }
-            Self::TodoMvc(_) | Self::TodoMvcWithInitialTodos { .. } => Err("generic lowerer matched todo_mvc, not then".to_string()),
+            Self::TodoMvc(_) | Self::TodoMvcWithInitialTodos { .. } => {
+                Err("generic lowerer matched todo_mvc, not then".to_string())
+            }
             Self::Interval(_) => Err("generic lowerer matched interval, not then".to_string()),
             Self::IntervalHold(_) => {
                 Err("generic lowerer matched interval_hold, not then".to_string())
@@ -915,7 +923,9 @@ impl LoweredProgram {
             Self::ComplexCounter(_) => {
                 Err("generic lowerer matched complex_counter, not when".to_string())
             }
-            Self::TodoMvc(_) | Self::TodoMvcWithInitialTodos { .. } => Err("generic lowerer matched todo_mvc, not when".to_string()),
+            Self::TodoMvc(_) | Self::TodoMvcWithInitialTodos { .. } => {
+                Err("generic lowerer matched todo_mvc, not when".to_string())
+            }
             Self::Interval(_) => Err("generic lowerer matched interval, not when".to_string()),
             Self::IntervalHold(_) => {
                 Err("generic lowerer matched interval_hold, not when".to_string())
@@ -996,7 +1006,9 @@ impl LoweredProgram {
             Self::ComplexCounter(_) => {
                 Err("generic lowerer matched complex_counter, not while".to_string())
             }
-            Self::TodoMvc(_) | Self::TodoMvcWithInitialTodos { .. } => Err("generic lowerer matched todo_mvc, not while".to_string()),
+            Self::TodoMvc(_) | Self::TodoMvcWithInitialTodos { .. } => {
+                Err("generic lowerer matched todo_mvc, not while".to_string())
+            }
             Self::Interval(_) => Err("generic lowerer matched interval, not while".to_string()),
             Self::IntervalHold(_) => {
                 Err("generic lowerer matched interval_hold, not while".to_string())
@@ -1168,7 +1180,9 @@ fn lowered_program_subset(program: &LoweredProgram) -> &'static str {
     match program {
         LoweredProgram::Counter(_) => "single_action_accumulator_document",
         LoweredProgram::ComplexCounter(_) => "dual_action_accumulator_document",
-        LoweredProgram::TodoMvc(_) | LoweredProgram::TodoMvcWithInitialTodos { .. } => "editable_filterable_list_document",
+        LoweredProgram::TodoMvc(_) | LoweredProgram::TodoMvcWithInitialTodos { .. } => {
+            "editable_filterable_list_document"
+        }
         LoweredProgram::Interval(_) => "summed_interval_signal_document",
         LoweredProgram::IntervalHold(_) => "held_interval_signal_document",
         LoweredProgram::Fibonacci(_) => "sequence_message_display",
@@ -2285,12 +2299,33 @@ fn derive_editable_filterable_list_host_view_sink_values(
     );
     // Set outline values for filter buttons based on selected filter
     let selected_filter = editable_filterable_list_selected_filter(base_sink_values);
-    let outline_all = if matches!(selected_filter, TodoSelectedFilter::All) { "2px solid rgba(148, 163, 184, 0.9)" } else { "none" };
-    let outline_active = if matches!(selected_filter, TodoSelectedFilter::Active) { "2px solid rgba(148, 163, 184, 0.9)" } else { "none" };
-    let outline_completed = if matches!(selected_filter, TodoSelectedFilter::Completed) { "2px solid rgba(148, 163, 184, 0.9)" } else { "none" };
-    sink_values.insert(TodoProgram::FILTER_ALL_OUTLINE_SINK, KernelValue::from(outline_all));
-    sink_values.insert(TodoProgram::FILTER_ACTIVE_OUTLINE_SINK, KernelValue::from(outline_active));
-    sink_values.insert(TodoProgram::FILTER_COMPLETED_OUTLINE_SINK, KernelValue::from(outline_completed));
+    let outline_all = if matches!(selected_filter, TodoSelectedFilter::All) {
+        "2px solid rgba(148, 163, 184, 0.9)"
+    } else {
+        "none"
+    };
+    let outline_active = if matches!(selected_filter, TodoSelectedFilter::Active) {
+        "2px solid rgba(148, 163, 184, 0.9)"
+    } else {
+        "none"
+    };
+    let outline_completed = if matches!(selected_filter, TodoSelectedFilter::Completed) {
+        "2px solid rgba(148, 163, 184, 0.9)"
+    } else {
+        "none"
+    };
+    sink_values.insert(
+        TodoProgram::FILTER_ALL_OUTLINE_SINK,
+        KernelValue::from(outline_all),
+    );
+    sink_values.insert(
+        TodoProgram::FILTER_ACTIVE_OUTLINE_SINK,
+        KernelValue::from(outline_active),
+    );
+    sink_values.insert(
+        TodoProgram::FILTER_COMPLETED_OUTLINE_SINK,
+        KernelValue::from(outline_completed),
+    );
     sink_values
 }
 
@@ -2356,10 +2391,14 @@ fn editable_filterable_list_selected_filter(
     base_sink_values: &BTreeMap<SinkPortId, KernelValue>,
 ) -> TodoSelectedFilter {
     match base_sink_values.get(&TodoProgram::SELECTED_FILTER_SINK) {
-        Some(KernelValue::Text(text)) | Some(KernelValue::Tag(text)) if text == "active" || text == "Active" => {
+        Some(KernelValue::Text(text)) | Some(KernelValue::Tag(text))
+            if text == "active" || text == "Active" =>
+        {
             TodoSelectedFilter::Active
         }
-        Some(KernelValue::Text(text)) | Some(KernelValue::Tag(text)) if text == "completed" || text == "Completed" => {
+        Some(KernelValue::Text(text)) | Some(KernelValue::Tag(text))
+            if text == "completed" || text == "Completed" =>
+        {
             TodoSelectedFilter::Completed
         }
         _ => TodoSelectedFilter::All,
@@ -5488,7 +5527,10 @@ fn lower_append_list_program_surface_owned(
     let (mut ir, host_view) = lower_append_list_surface_owned(expressions, config.surface)?;
     // Add persistence for the items hold node in shopping_list (clearable_append_list_document)
     // The items hold node is NodeId(10023) for the shopping_list example
-    if let IrHostViewLoweredProgramSpec::ClearableAppendList { items_list_sink, .. } = &config.program {
+    if let IrHostViewLoweredProgramSpec::ClearableAppendList {
+        items_list_sink, ..
+    } = &config.program
+    {
         // Find the hold node that feeds into items_list_sink
         for node in &ir.nodes {
             if let crate::ir::IrNodeKind::SinkPort { port, input } = &node.kind {
@@ -10018,7 +10060,13 @@ fn lower_timer_backed_signal_host_view<'a>(
         root_binding_name,
     )?;
     let mut view_site_counter = next_free_view_site(&host_view);
-    append_timer_source_child(&mut host_view, function_instance, tick_port, interval_ms, &mut view_site_counter);
+    append_timer_source_child(
+        &mut host_view,
+        function_instance,
+        tick_port,
+        interval_ms,
+        &mut view_site_counter,
+    );
     Ok(host_view)
 }
 
@@ -10132,7 +10180,8 @@ fn try_lower_todo_mvc_from_expressions(
         &LIST_PERSISTENT_SEMANTIC_BINDINGS_GROUP,
         "editable_filterable_list_document",
         |program| match program {
-            LoweredProgram::TodoMvc(program) | LoweredProgram::TodoMvcWithInitialTodos { program, .. } => Some(program),
+            LoweredProgram::TodoMvc(program)
+            | LoweredProgram::TodoMvcWithInitialTodos { program, .. } => Some(program),
             _ => None,
         },
     )
@@ -18677,9 +18726,3 @@ store: [
         );
     }
 }
-
-
-
-
-
-

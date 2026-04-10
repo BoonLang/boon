@@ -128,12 +128,8 @@ fn event_value(kind: &UiEventKind, payload: Option<&str>) -> KernelValue {
     match kind {
         UiEventKind::Click => KernelValue::Tag("Click".to_string()),
         UiEventKind::DoubleClick => KernelValue::Tag("DoubleClick".to_string()),
-        UiEventKind::Input => {
-            KernelValue::Text(payload.unwrap_or("").to_string())
-        }
-        UiEventKind::Change => {
-            KernelValue::Text(payload.unwrap_or("").to_string())
-        }
+        UiEventKind::Input => KernelValue::Text(payload.unwrap_or("").to_string()),
+        UiEventKind::Change => KernelValue::Text(payload.unwrap_or("").to_string()),
         UiEventKind::KeyDown => {
             // KeyDown events carry key text in the payload
             KernelValue::Text(payload.unwrap_or("").to_string())
@@ -176,9 +172,16 @@ mod tests {
         let source = include_str!("../../../playground/frontend/src/examples/counter/counter.bn");
         let program = lower_program_generic(source).expect("counter should lower");
         // Verify the IR was produced
-        assert!(!program.ir.nodes.is_empty(), "IR should have nodes: {:?}", program.diagnostics);
+        assert!(
+            !program.ir.nodes.is_empty(),
+            "IR should have nodes: {:?}",
+            program.diagnostics
+        );
         // Verify the view tree was produced
-        assert!(program.host_view.root.is_some(), "HostViewIr should have a root");
+        assert!(
+            program.host_view.root.is_some(),
+            "HostViewIr should have a root"
+        );
         // Check view tree structure
         let root = program.host_view.root.as_ref().unwrap();
         check_view_tree(root, 0);
@@ -188,10 +191,10 @@ mod tests {
 
     #[test]
     fn generic_lowering_finds_increment_button() {
-        use boon::parser::static_expression::Expression;
         use crate::bridge::HostViewKind;
         use crate::lower::lower_view_generic;
         use crate::parse::{parse_static_expressions, top_level_bindings};
+        use boon::parser::static_expression::Expression;
 
         let source = include_str!("../../../playground/frontend/src/examples/counter/counter.bn");
         let expressions = parse_static_expressions(source).expect("should parse");
@@ -205,18 +208,32 @@ mod tests {
                 if arg.node.name.as_str() == "root" {
                     if let Some(ref root_val) = arg.node.value {
                         // Element/stripe
-                        if let Expression::FunctionCall { arguments: stripe_args, .. } = &root_val.node {
+                        if let Expression::FunctionCall {
+                            arguments: stripe_args,
+                            ..
+                        } = &root_val.node
+                        {
                             for stripe_arg in stripe_args {
                                 if stripe_arg.node.name.as_str() == "items" {
                                     if let Some(ref items_val) = stripe_arg.node.value {
                                         if let Expression::List { items } = &items_val.node {
                                             for (i, item) in items.iter().enumerate() {
-                                                let is_var = matches!(&item.node, Expression::Variable { .. });
-                                                let is_alias = matches!(&item.node, Expression::Alias { .. });
-                                                let is_pipe = matches!(&item.node, Expression::Pipe { .. });
-                                                std::println!("LIST item {i}: is_var={is_var}, is_alias={is_alias}, is_pipe={is_pipe}");
+                                                let is_var = matches!(
+                                                    &item.node,
+                                                    Expression::Variable { .. }
+                                                );
+                                                let is_alias =
+                                                    matches!(&item.node, Expression::Alias { .. });
+                                                let is_pipe =
+                                                    matches!(&item.node, Expression::Pipe { .. });
+                                                std::println!(
+                                                    "LIST item {i}: is_var={is_var}, is_alias={is_alias}, is_pipe={is_pipe}"
+                                                );
                                                 if let Expression::Variable(v) = &item.node {
-                                                    std::println!("  variable name: {}", v.name.as_str());
+                                                    std::println!(
+                                                        "  variable name: {}",
+                                                        v.name.as_str()
+                                                    );
                                                 }
                                             }
                                         }
@@ -230,28 +247,52 @@ mod tests {
         }
 
         // Check increment_button binding exists
-        assert!(bindings.contains_key("increment_button"), "should have increment_button binding");
+        assert!(
+            bindings.contains_key("increment_button"),
+            "should have increment_button binding"
+        );
         let btn_expr = bindings.get("increment_button").unwrap();
         let is_function_call = matches!(&btn_expr.node, Expression::FunctionCall { .. });
-        assert!(is_function_call, "increment_button should be a FunctionCall");
+        assert!(
+            is_function_call,
+            "increment_button should be a FunctionCall"
+        );
 
         // Try view lowering directly
-        let host_view = lower_view_generic(&expressions, &bindings).expect("view lowering should succeed");
+        let host_view =
+            lower_view_generic(&expressions, &bindings).expect("view lowering should succeed");
         assert!(host_view.root.is_some(), "host view should have root");
 
         // Check the view tree
         let root = host_view.root.as_ref().unwrap();
-        assert!(matches!(root.kind, HostViewKind::Document), "root should be Document");
+        assert!(
+            matches!(root.kind, HostViewKind::Document),
+            "root should be Document"
+        );
 
         // Check stripe
         let stripe = &root.children[0];
-        assert!(matches!(stripe.kind, HostViewKind::StripeLayout { .. }), "child should be StripeLayout");
+        assert!(
+            matches!(stripe.kind, HostViewKind::StripeLayout { .. }),
+            "child should be StripeLayout"
+        );
 
         // Check stripe children
-        assert!(!stripe.children.is_empty(), "StripeLayout should have children, but got: {:?}", stripe.children.iter().map(|c| format!("{:?}", c.kind)).collect::<Vec<_>>());
+        assert!(
+            !stripe.children.is_empty(),
+            "StripeLayout should have children, but got: {:?}",
+            stripe
+                .children
+                .iter()
+                .map(|c| format!("{:?}", c.kind))
+                .collect::<Vec<_>>()
+        );
 
         // Find the button
-        let has_button = stripe.children.iter().any(|c| matches!(c.kind, HostViewKind::Button { .. }));
+        let has_button = stripe
+            .children
+            .iter()
+            .any(|c| matches!(c.kind, HostViewKind::Button { .. }));
         assert!(has_button, "StripeLayout should have a Button child");
     }
 
@@ -267,9 +308,14 @@ mod tests {
     fn assert_has_button(node: &crate::bridge::HostViewNode, msg: &str) {
         use crate::bridge::HostViewKind;
         let has_button = matches!(node.kind, HostViewKind::Button { .. })
-            || node.children.iter().any(|c| matches!(c.kind, HostViewKind::Button { .. }))
+            || node
+                .children
+                .iter()
+                .any(|c| matches!(c.kind, HostViewKind::Button { .. }))
             || node.children.iter().any(|c| {
-                c.children.iter().any(|gc| matches!(gc.kind, HostViewKind::Button { .. }))
+                c.children
+                    .iter()
+                    .any(|gc| matches!(gc.kind, HostViewKind::Button { .. }))
             });
         assert!(has_button, "{msg}");
     }
@@ -302,9 +348,9 @@ mod tests {
     #[test]
     fn generic_semantic_handles_todo_mvc_patterns() {
         use crate::lower::builtin_registry::BuiltinRegistry;
+        use crate::lower::extract_top_level_functions;
         use crate::lower::generic_semantic::generic_lower_semantic;
         use crate::parse::{parse_static_expressions, top_level_bindings};
-        use crate::lower::extract_top_level_functions;
 
         let source = include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
         let expressions = parse_static_expressions(source).expect("todo_mvc should parse");
@@ -330,15 +376,18 @@ mod tests {
 
     #[test]
     fn generic_view_lowering_for_todo_mvc() {
-        use crate::lower::lower_program_generic;
         use crate::bridge::HostViewKind;
+        use crate::lower::lower_program_generic;
 
         let source = include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
         let result = lower_program_generic(source);
         // todo_mvc uses custom functions (root_element, main_panel, etc.) that the generic
         // view lowering doesn't handle yet, so it fails with "unknown view function".
         // This is expected - the generic lowering needs extension to handle user-defined functions.
-        assert!(result.is_err(), "todo_mvc generic lowering should fail due to custom functions");
+        assert!(
+            result.is_err(),
+            "todo_mvc generic lowering should fail due to custom functions"
+        );
         let err = result.err().unwrap();
         assert!(
             err.contains("unknown view function"),

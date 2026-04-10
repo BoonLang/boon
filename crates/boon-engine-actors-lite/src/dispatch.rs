@@ -1,5 +1,5 @@
 use crate::acceptance::actors_lite_public_exposure_enabled;
-use crate::lower::{lower_program, LoweredProgram};
+use crate::lower::{LoweredProgram, lower_program};
 
 pub const SUPPORTED_PLAYGROUND_EXAMPLES: &[&str] = &[
     "minimal",
@@ -138,7 +138,9 @@ pub fn classify_source(source: &str) -> Result<ActorsLiteSourceKind, Vec<String>
     match lower_program(source) {
         Ok(LoweredProgram::Counter(_)) => return Ok(ActorsLiteSourceKind::Counter),
         Ok(LoweredProgram::ComplexCounter(_)) => return Ok(ActorsLiteSourceKind::ComplexCounter),
-        Ok(LoweredProgram::TodoMvc(_)) | Ok(LoweredProgram::TodoMvcWithInitialTodos { .. }) => return Ok(ActorsLiteSourceKind::TodoMvc),
+        Ok(LoweredProgram::TodoMvc(_)) | Ok(LoweredProgram::TodoMvcWithInitialTodos { .. }) => {
+            return Ok(ActorsLiteSourceKind::TodoMvc);
+        }
         Ok(LoweredProgram::Interval(_)) => return Ok(ActorsLiteSourceKind::Interval),
         Ok(LoweredProgram::IntervalHold(_)) => return Ok(ActorsLiteSourceKind::IntervalHold),
         Ok(LoweredProgram::Fibonacci(_)) => return Ok(ActorsLiteSourceKind::Fibonacci),
@@ -432,66 +434,106 @@ mod tests {
         let unsupported = "FUNCTION unsupported() { True }";
         let errors = classify_source(unsupported).expect_err("unsupported source should fail");
         assert!(errors.iter().any(|error| error.starts_with("generic:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("single_action_accumulator_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("editable_filterable_list_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("persistent_indexed_text_grid_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("dual_action_accumulator_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("retained_toggle_filter_list_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("external_mode_mapped_items_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("dual_mapped_label_stripes_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("counted_filtered_append_list_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("independent_object_counters_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("removable_append_list_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("clearable_append_list_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("filterable_checkbox_list_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("independent_checkbox_list_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("removable_checkbox_list_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("canvas_history_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("selectable_record_column_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("bidirectional_conversion_form_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("selectable_dual_date_form_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("resettable_timed_progress_document:")));
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("static_document_display:")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("single_action_accumulator_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("editable_filterable_list_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("persistent_indexed_text_grid_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("dual_action_accumulator_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("retained_toggle_filter_list_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("external_mode_mapped_items_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("dual_mapped_label_stripes_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("counted_filtered_append_list_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("independent_object_counters_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("removable_append_list_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("clearable_append_list_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("filterable_checkbox_list_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("independent_checkbox_list_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("removable_checkbox_list_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("canvas_history_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("selectable_record_column_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("bidirectional_conversion_form_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("selectable_dual_date_form_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("resettable_timed_progress_document:"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("static_document_display:"))
+        );
     }
 
     #[test]

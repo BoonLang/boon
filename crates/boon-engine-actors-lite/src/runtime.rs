@@ -4674,8 +4674,8 @@ mod tests {
     }
 
     #[test]
-    fn retained_evaluator_call_capture_multi_source_same_value_update_revisits_then_control_dependent(
-    ) {
+    fn retained_evaluator_call_capture_multi_source_same_value_update_revisits_then_control_dependent()
+     {
         let program = IrProgram {
             nodes: vec![
                 crate::ir::IrNode {
@@ -5669,8 +5669,8 @@ mod tests {
     }
 
     #[test]
-    fn retained_evaluator_text_to_number_same_numeric_value_update_revisits_then_through_eq_control_dependent(
-    ) {
+    fn retained_evaluator_text_to_number_same_numeric_value_update_revisits_then_through_eq_control_dependent()
+     {
         let program = IrProgram::from(vec![
             crate::ir::IrNode {
                 id: NodeId(1),
@@ -6677,8 +6677,8 @@ mod tests {
     }
 
     #[test]
-    fn retained_evaluator_list_all_object_bool_same_truthiness_update_revisits_when_control_dependent(
-    ) {
+    fn retained_evaluator_list_all_object_bool_same_truthiness_update_revisits_when_control_dependent()
+     {
         let program = IrProgram::from(vec![
             crate::ir::IrNode {
                 id: NodeId(1),
@@ -8984,8 +8984,8 @@ mod tests {
     }
 
     #[test]
-    fn retained_evaluator_list_map_object_bool_same_source_list_value_update_advances_sink_control_seq(
-    ) {
+    fn retained_evaluator_list_map_object_bool_same_source_list_value_update_advances_sink_control_seq()
+     {
         let program = IrProgram::from(vec![
             crate::ir::IrNode {
                 id: NodeId(1),
@@ -9281,8 +9281,8 @@ mod tests {
     }
 
     #[test]
-    fn retained_evaluator_list_map_object_field_same_source_list_value_update_advances_sink_control_seq(
-    ) {
+    fn retained_evaluator_list_map_object_field_same_source_list_value_update_advances_sink_control_seq()
+     {
         let program = IrProgram::from(vec![
             crate::ir::IrNode {
                 id: NodeId(1),
@@ -9445,8 +9445,8 @@ mod tests {
     }
 
     #[test]
-    fn retained_evaluator_list_remove_object_same_source_list_value_update_advances_sink_control_seq(
-    ) {
+    fn retained_evaluator_list_remove_object_same_source_list_value_update_advances_sink_control_seq()
+     {
         let program = IrProgram::from(vec![
             crate::ir::IrNode {
                 id: NodeId(1),
@@ -9506,8 +9506,8 @@ mod tests {
     }
 
     #[test]
-    fn retained_evaluator_list_remove_object_unmatched_value_update_revisits_then_control_dependent(
-    ) {
+    fn retained_evaluator_list_remove_object_unmatched_value_update_revisits_then_control_dependent()
+     {
         let program = IrProgram::from(vec![
             crate::ir::IrNode {
                 id: NodeId(1),
@@ -9595,8 +9595,8 @@ mod tests {
     }
 
     #[test]
-    fn retained_evaluator_list_retain_object_same_source_list_value_update_advances_sink_control_seq(
-    ) {
+    fn retained_evaluator_list_retain_object_same_source_list_value_update_advances_sink_control_seq()
+     {
         let program = IrProgram::from(vec![
             crate::ir::IrNode {
                 id: NodeId(1),
@@ -11865,8 +11865,8 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_retained_runtime_from_owned_previous_prefers_preserved_input_seq_floor_over_live_sink_seq(
-    ) {
+    fn rebuild_retained_runtime_from_owned_previous_prefers_preserved_input_seq_floor_over_live_sink_seq()
+     {
         let mut evaluator = RetainedMirrorEvaluator::new(
             IrProgram::from(vec![
                 crate::ir::IrNode {
@@ -12007,8 +12007,8 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_retained_runtime_from_owned_previous_prefers_live_sink_output_seq_over_stale_cached_output_seq(
-    ) {
+    fn rebuild_retained_runtime_from_owned_previous_prefers_live_sink_output_seq_over_stale_cached_output_seq()
+     {
         let mut evaluator = RetainedMirrorEvaluator::new(
             IrProgram::from(vec![
                 crate::ir::IrNode {
@@ -12082,8 +12082,8 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_retained_runtime_from_owned_previous_recovers_missing_output_seq_from_live_sink_state(
-    ) {
+    fn rebuild_retained_runtime_from_owned_previous_recovers_missing_output_seq_from_live_sink_state()
+     {
         let program = IrProgram::from(vec![
             crate::ir::IrNode {
                 id: NodeId(1),
@@ -12168,8 +12168,8 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_retained_runtime_from_owned_previous_recovers_missing_leaf_input_value_from_live_sink_state(
-    ) {
+    fn rebuild_retained_runtime_from_owned_previous_recovers_missing_leaf_input_value_from_live_sink_state()
+     {
         let mut evaluator = RetainedMirrorEvaluator::new(
             IrProgram::from(vec![
                 crate::ir::IrNode {
@@ -12255,8 +12255,8 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_retained_runtime_from_owned_previous_prefers_live_sink_value_over_stale_cached_input_value(
-    ) {
+    fn rebuild_retained_runtime_from_owned_previous_prefers_live_sink_value_over_stale_cached_input_value()
+     {
         let mut evaluator = RetainedMirrorEvaluator::new(
             IrProgram::from(vec![
                 crate::ir::IrNode {
@@ -21507,8 +21507,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_hold_through_list_map_object_bool_field_for_newer_link_rebinds(
-    ) {
+    fn recompute_retained_members_revisits_hold_through_list_map_object_bool_field_for_newer_link_rebinds()
+     {
         let initial = KernelValue::List(vec![KernelValue::Object(
             std::collections::BTreeMap::from([
                 ("done".to_string(), KernelValue::from(false)),
@@ -21532,8 +21532,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_list_map_toggle_object_bool_field_by_field_eq_for_newer_link_rebinds(
-    ) {
+    fn recompute_retained_members_revisits_list_map_toggle_object_bool_field_by_field_eq_for_newer_link_rebinds()
+     {
         assert_newer_link_rebind_revisits_higher_order_operator(
             KernelValue::from(1.0),
             KernelValue::from(2.0),
@@ -21562,8 +21562,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_hold_through_list_map_toggle_object_bool_field_by_field_eq_for_newer_link_rebinds(
-    ) {
+    fn recompute_retained_members_revisits_hold_through_list_map_toggle_object_bool_field_by_field_eq_for_newer_link_rebinds()
+     {
         let initial = KernelValue::List(vec![
             KernelValue::Object(std::collections::BTreeMap::from([
                 ("done".to_string(), KernelValue::from(true)),
@@ -21595,8 +21595,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_list_map_object_field_by_field_eq_for_newer_link_rebinds(
-    ) {
+    fn recompute_retained_members_revisits_list_map_object_field_by_field_eq_for_newer_link_rebinds()
+     {
         assert_newer_link_rebind_revisits_higher_order_operator(
             KernelValue::from("left"),
             KernelValue::from("right"),
@@ -21617,8 +21617,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_hold_through_list_map_object_field_by_field_eq_for_newer_link_rebinds(
-    ) {
+    fn recompute_retained_members_revisits_hold_through_list_map_object_field_by_field_eq_for_newer_link_rebinds()
+     {
         let initial = KernelValue::List(vec![KernelValue::Object(
             std::collections::BTreeMap::from([
                 ("id".to_string(), KernelValue::from(1.0)),
@@ -21656,8 +21656,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_arm_when_source_updates_below_selected_cutoff_through_then_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_arm_when_source_updates_below_selected_cutoff_through_then_shell()
+     {
         assert_source_update_below_selected_cutoff_is_cut_off_through_then_shell(
             when_switch_with_dynamic_values_evaluator(SinkPortId(5), "left"),
             "left",
@@ -21672,8 +21672,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_arm_while_source_updates_below_selected_cutoff_through_then_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_arm_while_source_updates_below_selected_cutoff_through_then_shell()
+     {
         assert_source_update_below_selected_cutoff_is_cut_off_through_then_shell(
             while_switch_with_dynamic_values_evaluator(SinkPortId(5), "left"),
             "left",
@@ -21688,8 +21688,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_fallback_when_source_updates_below_selected_cutoff_through_then_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_fallback_when_source_updates_below_selected_cutoff_through_then_shell()
+     {
         assert_source_update_below_selected_cutoff_is_cut_off_through_then_shell(
             when_switch_with_dynamic_values_evaluator(SinkPortId(5), "left"),
             "other-a",
@@ -21704,8 +21704,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_fallback_while_source_updates_below_selected_cutoff_through_then_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_fallback_while_source_updates_below_selected_cutoff_through_then_shell()
+     {
         assert_source_update_below_selected_cutoff_is_cut_off_through_then_shell(
             while_switch_with_dynamic_values_evaluator(SinkPortId(5), "left"),
             "other-a",
@@ -21720,8 +21720,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_arm_when_source_updates_below_selected_cutoff_through_hold_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_arm_when_source_updates_below_selected_cutoff_through_hold_shell()
+     {
         assert_source_update_below_selected_cutoff_is_cut_off_through_hold_shell(
             when_switch_with_dynamic_values_evaluator(SinkPortId(4), "left"),
             "left",
@@ -21736,8 +21736,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_arm_while_source_updates_below_selected_cutoff_through_hold_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_arm_while_source_updates_below_selected_cutoff_through_hold_shell()
+     {
         assert_source_update_below_selected_cutoff_is_cut_off_through_hold_shell(
             while_switch_with_dynamic_values_evaluator(SinkPortId(4), "left"),
             "left",
@@ -21752,8 +21752,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_fallback_when_source_updates_below_selected_cutoff_through_hold_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_fallback_when_source_updates_below_selected_cutoff_through_hold_shell()
+     {
         assert_source_update_below_selected_cutoff_is_cut_off_through_hold_shell(
             when_switch_with_dynamic_values_evaluator(SinkPortId(4), "left"),
             "other-a",
@@ -21768,8 +21768,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_fallback_while_source_updates_below_selected_cutoff_through_hold_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_fallback_while_source_updates_below_selected_cutoff_through_hold_shell()
+     {
         assert_source_update_below_selected_cutoff_is_cut_off_through_hold_shell(
             while_switch_with_dynamic_values_evaluator(SinkPortId(4), "left"),
             "other-a",
@@ -21784,8 +21784,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_selected_when_arm_updates_below_selected_cutoff_through_then_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_selected_when_arm_updates_below_selected_cutoff_through_then_shell()
+     {
         assert_same_selected_source_update_below_selected_cutoff_is_cut_off_through_then_shell(
             when_selected_arm_hold_switch_evaluator(SinkPortId(4), "left", "shared", "fallback"),
             "left",
@@ -21795,8 +21795,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_selected_while_arm_updates_below_selected_cutoff_through_then_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_selected_while_arm_updates_below_selected_cutoff_through_then_shell()
+     {
         assert_same_selected_source_update_below_selected_cutoff_is_cut_off_through_then_shell(
             while_selected_arm_hold_switch_evaluator(SinkPortId(4), "left", "shared", "fallback"),
             "left",
@@ -21806,8 +21806,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_selected_when_arm_updates_below_selected_cutoff_through_hold_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_selected_when_arm_updates_below_selected_cutoff_through_hold_shell()
+     {
         assert_same_selected_source_update_below_selected_cutoff_is_cut_off_through_hold_shell(
             when_selected_arm_hold_switch_evaluator(SinkPortId(3), "left", "shared", "fallback"),
             "left",
@@ -21817,8 +21817,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_selected_while_arm_updates_below_selected_cutoff_through_hold_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_selected_while_arm_updates_below_selected_cutoff_through_hold_shell()
+     {
         assert_same_selected_source_update_below_selected_cutoff_is_cut_off_through_hold_shell(
             while_selected_arm_hold_switch_evaluator(SinkPortId(3), "left", "shared", "fallback"),
             "left",
@@ -21828,8 +21828,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_selected_when_source_hold_arm_updates_below_selected_cutoff_through_then_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_selected_when_source_hold_arm_updates_below_selected_cutoff_through_then_shell()
+     {
         assert_source_hold_same_selected_source_update_below_selected_cutoff_is_cut_off_through_then_shell(
             when_source_hold_selected_arm_hold_switch_evaluator(
                 SinkPortId(4),
@@ -21845,8 +21845,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_selected_while_source_hold_arm_updates_below_selected_cutoff_through_then_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_selected_while_source_hold_arm_updates_below_selected_cutoff_through_then_shell()
+     {
         assert_source_hold_same_selected_source_update_below_selected_cutoff_is_cut_off_through_then_shell(
             while_source_hold_selected_arm_hold_switch_evaluator(
                 SinkPortId(4),
@@ -21862,8 +21862,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_selected_when_source_hold_arm_updates_below_selected_cutoff_through_hold_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_selected_when_source_hold_arm_updates_below_selected_cutoff_through_hold_shell()
+     {
         assert_source_hold_same_selected_source_update_below_selected_cutoff_is_cut_off_through_hold_shell(
             when_source_hold_selected_arm_hold_switch_evaluator(
                 SinkPortId(3),
@@ -21879,8 +21879,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_selected_while_source_hold_arm_updates_below_selected_cutoff_through_hold_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_selected_while_source_hold_arm_updates_below_selected_cutoff_through_hold_shell()
+     {
         assert_source_hold_same_selected_source_update_below_selected_cutoff_is_cut_off_through_hold_shell(
             while_source_hold_selected_arm_hold_switch_evaluator(
                 SinkPortId(3),
@@ -21896,8 +21896,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_arm_when_source_hold_updates_below_selected_cutoff_through_then_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_arm_when_source_hold_updates_below_selected_cutoff_through_then_shell()
+     {
         assert_source_hold_update_below_selected_cutoff_is_cut_off_through_then_shell(
             when_source_hold_switch_with_dynamic_values_evaluator(SinkPortId(5), "left", "left"),
             "left",
@@ -21912,8 +21912,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_arm_while_source_hold_updates_below_selected_cutoff_through_then_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_arm_while_source_hold_updates_below_selected_cutoff_through_then_shell()
+     {
         assert_source_hold_update_below_selected_cutoff_is_cut_off_through_then_shell(
             while_source_hold_switch_with_dynamic_values_evaluator(SinkPortId(5), "left", "left"),
             "left",
@@ -21928,8 +21928,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_fallback_when_source_hold_updates_below_selected_cutoff_through_then_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_fallback_when_source_hold_updates_below_selected_cutoff_through_then_shell()
+     {
         assert_source_hold_update_below_selected_cutoff_is_cut_off_through_then_shell(
             when_source_hold_switch_with_dynamic_values_evaluator(SinkPortId(5), "other-a", "left"),
             "other-a",
@@ -21944,8 +21944,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_fallback_while_source_hold_updates_below_selected_cutoff_through_then_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_fallback_while_source_hold_updates_below_selected_cutoff_through_then_shell()
+     {
         assert_source_hold_update_below_selected_cutoff_is_cut_off_through_then_shell(
             while_source_hold_switch_with_dynamic_values_evaluator(
                 SinkPortId(5),
@@ -21964,8 +21964,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_arm_when_source_hold_updates_below_selected_cutoff_through_hold_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_arm_when_source_hold_updates_below_selected_cutoff_through_hold_shell()
+     {
         assert_source_hold_update_below_selected_cutoff_is_cut_off_through_hold_shell(
             when_source_hold_switch_with_dynamic_values_evaluator(SinkPortId(4), "left", "left"),
             "left",
@@ -21980,8 +21980,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_arm_while_source_hold_updates_below_selected_cutoff_through_hold_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_arm_while_source_hold_updates_below_selected_cutoff_through_hold_shell()
+     {
         assert_source_hold_update_below_selected_cutoff_is_cut_off_through_hold_shell(
             while_source_hold_switch_with_dynamic_values_evaluator(SinkPortId(4), "left", "left"),
             "left",
@@ -21996,8 +21996,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_fallback_when_source_hold_updates_below_selected_cutoff_through_hold_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_fallback_when_source_hold_updates_below_selected_cutoff_through_hold_shell()
+     {
         assert_source_hold_update_below_selected_cutoff_is_cut_off_through_hold_shell(
             when_source_hold_switch_with_dynamic_values_evaluator(SinkPortId(4), "other-a", "left"),
             "other-a",
@@ -22012,8 +22012,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_ignores_same_fallback_while_source_hold_updates_below_selected_cutoff_through_hold_shell(
-    ) {
+    fn recompute_retained_members_ignores_same_fallback_while_source_hold_updates_below_selected_cutoff_through_hold_shell()
+     {
         assert_source_hold_update_below_selected_cutoff_is_cut_off_through_hold_shell(
             while_source_hold_switch_with_dynamic_values_evaluator(
                 SinkPortId(4),
@@ -22032,8 +22032,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_selected_when_arm_updates_with_newer_seq_through_then_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_selected_when_arm_updates_with_newer_seq_through_then_shell()
+     {
         assert_same_selected_source_update_with_newer_seq_revisits_then_shell(
             when_selected_arm_hold_switch_evaluator(SinkPortId(4), "left", "shared", "fallback"),
             "left",
@@ -22043,8 +22043,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_selected_while_arm_updates_with_newer_seq_through_then_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_selected_while_arm_updates_with_newer_seq_through_then_shell()
+     {
         assert_same_selected_source_update_with_newer_seq_revisits_then_shell(
             while_selected_arm_hold_switch_evaluator(SinkPortId(4), "left", "shared", "fallback"),
             "left",
@@ -22054,8 +22054,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_selected_when_arm_updates_with_newer_seq_through_hold_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_selected_when_arm_updates_with_newer_seq_through_hold_shell()
+     {
         assert_same_selected_source_update_with_newer_seq_revisits_hold_shell(
             when_selected_arm_hold_switch_evaluator(SinkPortId(3), "left", "shared", "fallback"),
             "left",
@@ -22065,8 +22065,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_selected_while_arm_updates_with_newer_seq_through_hold_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_selected_while_arm_updates_with_newer_seq_through_hold_shell()
+     {
         assert_same_selected_source_update_with_newer_seq_revisits_hold_shell(
             while_selected_arm_hold_switch_evaluator(SinkPortId(3), "left", "shared", "fallback"),
             "left",
@@ -22076,8 +22076,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_selected_when_source_hold_arm_updates_with_newer_seq_through_then_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_selected_when_source_hold_arm_updates_with_newer_seq_through_then_shell()
+     {
         assert_source_hold_same_selected_source_update_with_newer_seq_revisits_then_shell(
             when_source_hold_selected_arm_hold_switch_evaluator(
                 SinkPortId(4),
@@ -22093,8 +22093,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_selected_while_source_hold_arm_updates_with_newer_seq_through_then_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_selected_while_source_hold_arm_updates_with_newer_seq_through_then_shell()
+     {
         assert_source_hold_same_selected_source_update_with_newer_seq_revisits_then_shell(
             while_source_hold_selected_arm_hold_switch_evaluator(
                 SinkPortId(4),
@@ -22110,8 +22110,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_selected_when_source_hold_arm_updates_with_newer_seq_through_hold_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_selected_when_source_hold_arm_updates_with_newer_seq_through_hold_shell()
+     {
         assert_source_hold_same_selected_source_update_with_newer_seq_revisits_hold_shell(
             when_source_hold_selected_arm_hold_switch_evaluator(
                 SinkPortId(3),
@@ -22127,8 +22127,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_selected_while_source_hold_arm_updates_with_newer_seq_through_hold_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_selected_while_source_hold_arm_updates_with_newer_seq_through_hold_shell()
+     {
         assert_source_hold_same_selected_source_update_with_newer_seq_revisits_hold_shell(
             while_source_hold_selected_arm_hold_switch_evaluator(
                 SinkPortId(3),
@@ -22144,8 +22144,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_arm_when_source_updates_with_newer_seq_through_then_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_arm_when_source_updates_with_newer_seq_through_then_shell()
+     {
         assert_source_update_with_newer_seq_revisits_then_shell(
             when_switch_with_dynamic_values_evaluator(SinkPortId(5), "left"),
             "left",
@@ -22159,8 +22159,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_arm_while_source_updates_with_newer_seq_through_then_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_arm_while_source_updates_with_newer_seq_through_then_shell()
+     {
         assert_source_update_with_newer_seq_revisits_then_shell(
             while_switch_with_dynamic_values_evaluator(SinkPortId(5), "left"),
             "left",
@@ -22174,8 +22174,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_fallback_when_source_updates_with_newer_seq_through_then_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_fallback_when_source_updates_with_newer_seq_through_then_shell()
+     {
         assert_source_update_with_newer_seq_revisits_then_shell(
             when_switch_with_dynamic_values_evaluator(SinkPortId(5), "left"),
             "other-a",
@@ -22189,8 +22189,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_fallback_while_source_updates_with_newer_seq_through_then_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_fallback_while_source_updates_with_newer_seq_through_then_shell()
+     {
         assert_source_update_with_newer_seq_revisits_then_shell(
             while_switch_with_dynamic_values_evaluator(SinkPortId(5), "left"),
             "other-a",
@@ -22204,8 +22204,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_arm_when_source_updates_with_newer_seq_through_hold_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_arm_when_source_updates_with_newer_seq_through_hold_shell()
+     {
         assert_source_update_with_newer_seq_revisits_hold_shell(
             when_switch_with_dynamic_values_evaluator(SinkPortId(4), "left"),
             "left",
@@ -22219,8 +22219,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_arm_while_source_updates_with_newer_seq_through_hold_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_arm_while_source_updates_with_newer_seq_through_hold_shell()
+     {
         assert_source_update_with_newer_seq_revisits_hold_shell(
             while_switch_with_dynamic_values_evaluator(SinkPortId(4), "left"),
             "left",
@@ -22234,8 +22234,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_fallback_when_source_updates_with_newer_seq_through_hold_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_fallback_when_source_updates_with_newer_seq_through_hold_shell()
+     {
         assert_source_update_with_newer_seq_revisits_hold_shell(
             when_switch_with_dynamic_values_evaluator(SinkPortId(4), "left"),
             "other-a",
@@ -22249,8 +22249,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_fallback_while_source_updates_with_newer_seq_through_hold_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_fallback_while_source_updates_with_newer_seq_through_hold_shell()
+     {
         assert_source_update_with_newer_seq_revisits_hold_shell(
             while_switch_with_dynamic_values_evaluator(SinkPortId(4), "left"),
             "other-a",
@@ -22264,8 +22264,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_arm_when_source_hold_updates_with_newer_seq_through_then_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_arm_when_source_hold_updates_with_newer_seq_through_then_shell()
+     {
         assert_source_hold_update_with_newer_seq_revisits_then_shell(
             when_source_hold_switch_evaluator(SinkPortId(3), "left", "left", "shared", "fallback"),
             "left",
@@ -22275,8 +22275,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_arm_while_source_hold_updates_with_newer_seq_through_then_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_arm_while_source_hold_updates_with_newer_seq_through_then_shell()
+     {
         assert_source_hold_update_with_newer_seq_revisits_then_shell(
             while_source_hold_switch_evaluator(SinkPortId(3), "left", "left", "shared", "fallback"),
             "left",
@@ -22286,8 +22286,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_fallback_when_source_hold_updates_with_newer_seq_through_then_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_fallback_when_source_hold_updates_with_newer_seq_through_then_shell()
+     {
         assert_source_hold_update_with_newer_seq_revisits_then_shell(
             when_source_hold_switch_evaluator(
                 SinkPortId(3),
@@ -22303,8 +22303,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_fallback_while_source_hold_updates_with_newer_seq_through_then_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_fallback_while_source_hold_updates_with_newer_seq_through_then_shell()
+     {
         assert_source_hold_update_with_newer_seq_revisits_then_shell(
             while_source_hold_switch_evaluator(
                 SinkPortId(3),
@@ -22320,8 +22320,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_arm_when_source_hold_updates_with_newer_seq_through_hold_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_arm_when_source_hold_updates_with_newer_seq_through_hold_shell()
+     {
         assert_source_hold_update_with_newer_seq_revisits_hold_shell(
             when_source_hold_switch_evaluator(SinkPortId(2), "left", "left", "shared", "fallback"),
             "left",
@@ -22331,8 +22331,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_arm_while_source_hold_updates_with_newer_seq_through_hold_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_arm_while_source_hold_updates_with_newer_seq_through_hold_shell()
+     {
         assert_source_hold_update_with_newer_seq_revisits_hold_shell(
             while_source_hold_switch_evaluator(SinkPortId(2), "left", "left", "shared", "fallback"),
             "left",
@@ -22342,8 +22342,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_fallback_when_source_hold_updates_with_newer_seq_through_hold_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_fallback_when_source_hold_updates_with_newer_seq_through_hold_shell()
+     {
         assert_source_hold_update_with_newer_seq_revisits_hold_shell(
             when_source_hold_switch_evaluator(
                 SinkPortId(2),
@@ -22359,8 +22359,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_same_fallback_while_source_hold_updates_with_newer_seq_through_hold_shell(
-    ) {
+    fn recompute_retained_members_revisits_same_fallback_while_source_hold_updates_with_newer_seq_through_hold_shell()
+     {
         assert_source_hold_update_with_newer_seq_revisits_hold_shell(
             while_source_hold_switch_evaluator(
                 SinkPortId(2),
@@ -23854,8 +23854,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_hold_through_list_map_for_same_target_newer_seq_link_update(
-    ) {
+    fn recompute_retained_members_revisits_hold_through_list_map_for_same_target_newer_seq_link_update()
+     {
         let mut source = RetainedMirrorEvaluator::new(
             IrProgram::from(vec![
                 crate::ir::IrNode {
@@ -24372,8 +24372,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_hold_through_add_wrapped_call_for_same_target_newer_seq_link_update(
-    ) {
+    fn recompute_retained_members_revisits_hold_through_add_wrapped_call_for_same_target_newer_seq_link_update()
+     {
         let mut source = RetainedMirrorEvaluator::new(
             IrProgram::from(vec![
                 crate::ir::IrNode {
@@ -24898,8 +24898,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_hold_through_while_switch_for_same_target_newer_seq_link_update(
-    ) {
+    fn recompute_retained_members_revisits_hold_through_while_switch_for_same_target_newer_seq_link_update()
+     {
         let mut source = RetainedMirrorEvaluator::new(
             IrProgram::from(vec![
                 crate::ir::IrNode {
@@ -25204,8 +25204,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_revisits_hold_through_latest_for_same_target_newer_seq_link_update(
-    ) {
+    fn recompute_retained_members_revisits_hold_through_latest_for_same_target_newer_seq_link_update()
+     {
         let mut source = RetainedMirrorEvaluator::new(
             IrProgram::from(vec![
                 crate::ir::IrNode {
@@ -25983,8 +25983,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_with_value_recovery_prefers_live_sink_value_over_stale_cached_non_root_value(
-    ) {
+    fn recompute_retained_members_with_value_recovery_prefers_live_sink_value_over_stale_cached_non_root_value()
+     {
         let mut leaf = RetainedMirrorEvaluator::new(
             IrProgram::from(vec![
                 crate::ir::IrNode {
@@ -26147,8 +26147,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_with_value_recovery_prefers_live_sink_value_over_stale_cached_root_value(
-    ) {
+    fn recompute_retained_members_with_value_recovery_prefers_live_sink_value_over_stale_cached_root_value()
+     {
         let mut leaf = RetainedMirrorEvaluator::new(
             IrProgram::from(vec![
                 crate::ir::IrNode {
@@ -26498,8 +26498,8 @@ mod tests {
     }
 
     #[test]
-    fn recompute_retained_members_prefers_live_sink_non_root_input_value_over_stale_cached_input_value(
-    ) {
+    fn recompute_retained_members_prefers_live_sink_non_root_input_value_over_stale_cached_input_value()
+     {
         let mut left = RetainedMirrorEvaluator::new(
             IrProgram::from(vec![
                 crate::ir::IrNode {

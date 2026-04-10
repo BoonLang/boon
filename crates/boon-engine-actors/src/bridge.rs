@@ -951,8 +951,8 @@ fn actor_current_or_future_stream(actor: ActorHandle) -> LocalBoxStream<'static,
     let initial = stream::once(async move { actor_for_initial.value().await.ok() })
         .filter_map(|value| async move { value });
     stream::select(initial, actor.stream_from_now())
-        .scan(None::<(ValueIdempotencyKey, u64)>, |last_seen, value| {
-            let current = (value.idempotency_key(), value.lamport_time());
+        .scan(None::<EmissionIdentity>, |last_seen, value| {
+            let current = value.emission_identity();
             let should_emit = last_seen.as_ref() != Some(&current);
             *last_seen = Some(current);
             future::ready(Some(if should_emit { Some(value) } else { None }))

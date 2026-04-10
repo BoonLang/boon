@@ -96,9 +96,7 @@ pub mod todo_preview;
 pub mod toggle_examples_preview;
 pub mod validated_form_runtime;
 
-pub use acceptance::{
-    actors_lite_public_exposure_enabled,
-};
+pub use acceptance::actors_lite_public_exposure_enabled;
 pub use dispatch::{
     MILESTONE_PLAYGROUND_EXAMPLES, PUBLIC_PLAYGROUND_EXAMPLES, SUPPORTED_PLAYGROUND_EXAMPLES,
     is_public_playground_example, is_supported_playground_example,
@@ -145,34 +143,55 @@ pub fn run_actors_lite_with_persistence(source: &str) -> impl Element {
         Ok(program) => {
             crate::browser_debug::set_debug_marker("run_persist:lowered");
             // Try to restore persisted state based on program type
-            crate::browser_debug::set_debug_marker("run_persist:program_variant_START"); let variant_name = match &program {
+            crate::browser_debug::set_debug_marker("run_persist:program_variant_START");
+            let variant_name = match &program {
                 LoweredProgram::ShoppingList(_) => "ShoppingList",
                 LoweredProgram::Counter(_) => "Counter",
                 LoweredProgram::TodoMvc(_) => "TodoMvc",
-                _ => "Other"}; crate::browser_debug::set_debug_marker(&format!("run_persist:program_variant:{}", variant_name));
-            
+                _ => "Other",
+            };
+            crate::browser_debug::set_debug_marker(&format!(
+                "run_persist:program_variant:{}",
+                variant_name
+            ));
+
             let program = match program {
                 LoweredProgram::Counter(mut counter_program) => {
                     if let Some(restored) = try_restore_counter_value() {
                         counter_program.initial_value = restored;
-                        crate::browser_debug::set_debug_marker(&format!("run_persist:counter_initial_value_set:{}", restored));
+                        crate::browser_debug::set_debug_marker(&format!(
+                            "run_persist:counter_initial_value_set:{}",
+                            restored
+                        ));
                         // Also update the IR's literal node with the restored value
                         let mut modified = false;
                         for node in &mut counter_program.ir.nodes {
-                            if let crate::ir::IrNodeKind::Literal(KernelValue::Number(n)) = &mut node.kind {
-                                crate::browser_debug::set_debug_marker(&format!("run_persist:found_literal_node:{n}"));
+                            if let crate::ir::IrNodeKind::Literal(KernelValue::Number(n)) =
+                                &mut node.kind
+                            {
+                                crate::browser_debug::set_debug_marker(&format!(
+                                    "run_persist:found_literal_node:{n}"
+                                ));
                                 if *n == 0.0 {
                                     *n = restored as f64;
                                     modified = true;
-                                    crate::browser_debug::set_debug_marker(&format!("run_persist:modified_literal_to:{}", restored));
+                                    crate::browser_debug::set_debug_marker(&format!(
+                                        "run_persist:modified_literal_to:{}",
+                                        restored
+                                    ));
                                     break;
                                 }
                             }
                         }
                         if !modified {
-                            crate::browser_debug::set_debug_marker("run_persist:NO_literal_modified");
+                            crate::browser_debug::set_debug_marker(
+                                "run_persist:NO_literal_modified",
+                            );
                         }
-                        crate::browser_debug::set_debug_marker(&format!("run_persist:counter_restored:{}", restored));
+                        crate::browser_debug::set_debug_marker(&format!(
+                            "run_persist:counter_restored:{}",
+                            restored
+                        ));
                         LoweredProgram::Counter(counter_program)
                     } else {
                         crate::browser_debug::set_debug_marker("run_persist:NO_value_to_restore");
@@ -181,15 +200,21 @@ pub fn run_actors_lite_with_persistence(source: &str) -> impl Element {
                 }
                 LoweredProgram::TodoMvc(mut todo_program) => {
                     if let Some(restored_todos) = try_restore_todo_list() {
-                        crate::browser_debug::set_debug_marker(&format!("run_persist:todo_list_restored:{} items", restored_todos.len()));
+                        crate::browser_debug::set_debug_marker(&format!(
+                            "run_persist:todo_list_restored:{} items",
+                            restored_todos.len()
+                        ));
                         // Convert restored todos to KernelValue::List
-                        let todos_kv: Vec<KernelValue> = restored_todos.iter().map(|(id, title, completed)| {
-                            KernelValue::Object(std::collections::BTreeMap::from([
-                                ("id".to_string(), KernelValue::Number(*id as f64)),
-                                ("title".to_string(), KernelValue::Text(title.clone())),
-                                ("completed".to_string(), KernelValue::Bool(*completed)),
-                            ]))
-                        }).collect();
+                        let todos_kv: Vec<KernelValue> = restored_todos
+                            .iter()
+                            .map(|(id, title, completed)| {
+                                KernelValue::Object(std::collections::BTreeMap::from([
+                                    ("id".to_string(), KernelValue::Number(*id as f64)),
+                                    ("title".to_string(), KernelValue::Text(title.clone())),
+                                    ("completed".to_string(), KernelValue::Bool(*completed)),
+                                ]))
+                            })
+                            .collect();
                         // The TODOS_LIST_HOLD_NODE is NodeId(1430)
                         let todos_hold_node_id = crate::ir::NodeId(1430);
                         // Find the hold node and update its seed with the restored list
@@ -199,11 +224,18 @@ pub fn run_actors_lite_with_persistence(source: &str) -> impl Element {
                                 if let crate::ir::IrNodeKind::Hold { seed, .. } = &mut node.kind {
                                     // Find the seed node and update its value
                                     let seed_id = *seed;
-                                    if let Some(seed_node) = todo_program.ir.nodes.iter_mut().find(|n| n.id == seed_id) {
-                                        if let crate::ir::IrNodeKind::Literal(ref mut val) = seed_node.kind {
+                                    if let Some(seed_node) =
+                                        todo_program.ir.nodes.iter_mut().find(|n| n.id == seed_id)
+                                    {
+                                        if let crate::ir::IrNodeKind::Literal(ref mut val) =
+                                            seed_node.kind
+                                        {
                                             *val = KernelValue::List(todos_kv.clone());
                                             modified = true;
-                                            crate::browser_debug::set_debug_marker(&format!("run_persist:modified_todos_seed_node:{} items", restored_todos.len()));
+                                            crate::browser_debug::set_debug_marker(&format!(
+                                                "run_persist:modified_todos_seed_node:{} items",
+                                                restored_todos.len()
+                                            ));
                                         }
                                     }
                                     break;
@@ -211,47 +243,78 @@ pub fn run_actors_lite_with_persistence(source: &str) -> impl Element {
                             }
                         }
                         if !modified {
-                            crate::browser_debug::set_debug_marker("run_persist:NO_todos_seed_modified");
+                            crate::browser_debug::set_debug_marker(
+                                "run_persist:NO_todos_seed_modified",
+                            );
                         }
                         LoweredProgram::TodoMvc(todo_program)
                     } else {
-                        crate::browser_debug::set_debug_marker("run_persist:NO_todo_list_to_restore");
+                        crate::browser_debug::set_debug_marker(
+                            "run_persist:NO_todo_list_to_restore",
+                        );
                         LoweredProgram::TodoMvc(todo_program)
                     }
                 }
                 LoweredProgram::ShoppingList(mut shopping_program) => {
                     // Use persistence metadata from the IR to find the hold node to restore
-                    let persistence_entries: Vec<_> = shopping_program.ir.persistence.iter()
-                        .filter(|p| matches!(p.policy, crate::ir::PersistPolicy::Durable { persist_kind: crate::ir::PersistKind::ListStore, .. }))
+                    let persistence_entries: Vec<_> = shopping_program
+                        .ir
+                        .persistence
+                        .iter()
+                        .filter(|p| {
+                            matches!(
+                                p.policy,
+                                crate::ir::PersistPolicy::Durable {
+                                    persist_kind: crate::ir::PersistKind::ListStore,
+                                    ..
+                                }
+                            )
+                        })
                         .cloned()
                         .collect();
-                    
+
                     if !persistence_entries.is_empty() {
                         if let Some(restored_items) = try_restore_shopping_list() {
-                            crate::browser_debug::set_debug_marker(&format!("run_persist:shopping_list_restored:{} items", restored_items.len()));
-                            let items_kv: Vec<KernelValue> = restored_items.iter()
+                            crate::browser_debug::set_debug_marker(&format!(
+                                "run_persist:shopping_list_restored:{} items",
+                                restored_items.len()
+                            ));
+                            let items_kv: Vec<KernelValue> = restored_items
+                                .iter()
                                 .map(|s| KernelValue::Text(s.clone()))
                                 .collect();
-                            
+
                             let mut modified = false;
                             for persist_entry in &persistence_entries {
                                 // Find the hold node index
-                                let hold_node_idx = shopping_program.ir.nodes.iter()
+                                let hold_node_idx = shopping_program
+                                    .ir
+                                    .nodes
+                                    .iter()
                                     .position(|n| n.id == persist_entry.node);
-                                
+
                                 if let Some(idx) = hold_node_idx {
                                     // Get the seed node ID from the hold node
-                                    if let crate::ir::IrNodeKind::Hold { seed, .. } = &shopping_program.ir.nodes[idx].kind {
+                                    if let crate::ir::IrNodeKind::Hold { seed, .. } =
+                                        &shopping_program.ir.nodes[idx].kind
+                                    {
                                         let seed_id = *seed;
                                         // Find the seed node index
-                                        let seed_node_idx = shopping_program.ir.nodes.iter()
+                                        let seed_node_idx = shopping_program
+                                            .ir
+                                            .nodes
+                                            .iter()
                                             .position(|n| n.id == seed_id);
-                                        
+
                                         if let Some(seed_idx) = seed_node_idx {
-                                            if let crate::ir::IrNodeKind::Literal(ref mut val) = shopping_program.ir.nodes[seed_idx].kind {
+                                            if let crate::ir::IrNodeKind::Literal(ref mut val) =
+                                                shopping_program.ir.nodes[seed_idx].kind
+                                            {
                                                 *val = KernelValue::List(items_kv.clone());
                                                 modified = true;
-                                                crate::browser_debug::set_debug_marker("run_persist:shopping_list_seed_modified");
+                                                crate::browser_debug::set_debug_marker(
+                                                    "run_persist:shopping_list_seed_modified",
+                                                );
                                                 break;
                                             }
                                         }
@@ -259,13 +322,19 @@ pub fn run_actors_lite_with_persistence(source: &str) -> impl Element {
                                 }
                             }
                             if !modified {
-                                crate::browser_debug::set_debug_marker("run_persist:NO_shopping_list_seed_modified");
+                                crate::browser_debug::set_debug_marker(
+                                    "run_persist:NO_shopping_list_seed_modified",
+                                );
                             }
                         } else {
-                            crate::browser_debug::set_debug_marker("run_persist:NO_shopping_list_to_restore");
+                            crate::browser_debug::set_debug_marker(
+                                "run_persist:NO_shopping_list_to_restore",
+                            );
                         }
                     } else {
-                        crate::browser_debug::set_debug_marker("run_persist:NO_shopping_list_persistence_metadata");
+                        crate::browser_debug::set_debug_marker(
+                            "run_persist:NO_shopping_list_persistence_metadata",
+                        );
                     }
                     LoweredProgram::ShoppingList(shopping_program)
                 }
@@ -274,7 +343,9 @@ pub fn run_actors_lite_with_persistence(source: &str) -> impl Element {
             // Enable persistence on the preview
             match lowered_preview::LoweredPreview::from_program(program) {
                 Ok(preview) => {
-                    crate::browser_debug::set_debug_marker("run_actors_lite_with_persistence:preview_with_persistence");
+                    crate::browser_debug::set_debug_marker(
+                        "run_actors_lite_with_persistence:preview_with_persistence",
+                    );
                     lowered_preview::render_lowered_preview(preview.with_persistence()).unify()
                 }
                 Err(error) => render_dispatch_error(format!("lowered preview: {error}")).unify(),
@@ -314,7 +385,9 @@ fn try_restore_counter_value() -> Option<i64> {
     for record in records {
         if let PersistedRecord::Hold { value, .. } = record {
             let kernel_value = json_to_kernel_value(&value);
-            crate::browser_debug::set_debug_marker(&format!("restore_counter:kernel:{kernel_value:?}"));
+            crate::browser_debug::set_debug_marker(&format!(
+                "restore_counter:kernel:{kernel_value:?}"
+            ));
             if let KernelValue::Number(n) = kernel_value {
                 crate::browser_debug::set_debug_marker(&format!("restore_counter:restored:{n}"));
                 return Some(n as i64);
@@ -337,7 +410,10 @@ fn try_restore_todo_list() -> Option<Vec<(u64, String, bool)>> {
     let adapter = BrowserLocalStorage::instance();
     let records = match adapter.load_records() {
         Ok(r) => {
-            crate::browser_debug::set_debug_marker(&format!("restore_todo_list:records:{}", r.len()));
+            crate::browser_debug::set_debug_marker(&format!(
+                "restore_todo_list:records:{}",
+                r.len()
+            ));
             r
         }
         Err(e) => {
@@ -348,25 +424,42 @@ fn try_restore_todo_list() -> Option<Vec<(u64, String, bool)>> {
     for record in records {
         if let PersistedRecord::Hold { value, .. } = record {
             let kernel_value = json_to_kernel_value(&value);
-            crate::browser_debug::set_debug_marker(&format!("restore_todo_list:kernel:{kernel_value:?}"));
+            crate::browser_debug::set_debug_marker(&format!(
+                "restore_todo_list:kernel:{kernel_value:?}"
+            ));
             if let KernelValue::List(items) = kernel_value {
                 let mut todos = Vec::new();
                 for (idx, item) in items.iter().enumerate() {
                     if let KernelValue::Object(fields) = item {
-                        let id = fields.get("id")
-                            .and_then(|v| match v { KernelValue::Number(n) => Some(*n as u64), _ => None })
+                        let id = fields
+                            .get("id")
+                            .and_then(|v| match v {
+                                KernelValue::Number(n) => Some(*n as u64),
+                                _ => None,
+                            })
                             .unwrap_or((idx + 1) as u64);
-                        let title = fields.get("title")
-                            .and_then(|v| match v { KernelValue::Text(s) | KernelValue::Tag(s) => Some(s.clone()), _ => None })
+                        let title = fields
+                            .get("title")
+                            .and_then(|v| match v {
+                                KernelValue::Text(s) | KernelValue::Tag(s) => Some(s.clone()),
+                                _ => None,
+                            })
                             .unwrap_or_default();
-                        let completed = fields.get("completed")
-                            .and_then(|v| match v { KernelValue::Bool(b) => Some(*b), _ => None })
+                        let completed = fields
+                            .get("completed")
+                            .and_then(|v| match v {
+                                KernelValue::Bool(b) => Some(*b),
+                                _ => None,
+                            })
                             .unwrap_or(false);
                         todos.push((id, title, completed));
                     }
                 }
                 if !todos.is_empty() {
-                    crate::browser_debug::set_debug_marker(&format!("restore_todo_list:restored:{} items", todos.len()));
+                    crate::browser_debug::set_debug_marker(&format!(
+                        "restore_todo_list:restored:{} items",
+                        todos.len()
+                    ));
                     return Some(todos);
                 }
             }
@@ -388,7 +481,10 @@ fn try_restore_shopping_list() -> Option<Vec<String>> {
     let adapter = BrowserLocalStorage::instance();
     let records = match adapter.load_records() {
         Ok(r) => {
-            crate::browser_debug::set_debug_marker(&format!("restore_shopping_list:records:{}", r.len()));
+            crate::browser_debug::set_debug_marker(&format!(
+                "restore_shopping_list:records:{}",
+                r.len()
+            ));
             r
         }
         Err(e) => {
@@ -399,7 +495,9 @@ fn try_restore_shopping_list() -> Option<Vec<String>> {
     for record in records {
         if let PersistedRecord::Hold { value, .. } = record {
             let kernel_value = json_to_kernel_value(&value);
-            crate::browser_debug::set_debug_marker(&format!("restore_shopping_list:kernel:{kernel_value:?}"));
+            crate::browser_debug::set_debug_marker(&format!(
+                "restore_shopping_list:kernel:{kernel_value:?}"
+            ));
             if let KernelValue::List(items) = kernel_value {
                 let mut list_items = Vec::new();
                 for item in items.iter() {
@@ -408,7 +506,10 @@ fn try_restore_shopping_list() -> Option<Vec<String>> {
                     }
                 }
                 if !list_items.is_empty() {
-                    crate::browser_debug::set_debug_marker(&format!("restore_shopping_list:restored:{} items", list_items.len()));
+                    crate::browser_debug::set_debug_marker(&format!(
+                        "restore_shopping_list:restored:{} items",
+                        list_items.len()
+                    ));
                     return Some(list_items);
                 }
             }

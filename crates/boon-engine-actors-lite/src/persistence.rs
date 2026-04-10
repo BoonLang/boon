@@ -53,17 +53,22 @@ impl PersistenceTracker {
     }
 
     /// Collect keys to delete (live roots not matching current program).
-    pub fn collect_deletes(
-        &self,
-        existing_records: &[PersistedRecord],
-    ) -> Vec<String> {
+    pub fn collect_deletes(&self, existing_records: &[PersistedRecord]) -> Vec<String> {
         let mut delete_keys = Vec::new();
         for record in existing_records {
             let record_key = match record {
-                PersistedRecord::Hold { root_key, local_slot, .. } => {
+                PersistedRecord::Hold {
+                    root_key,
+                    local_slot,
+                    ..
+                } => {
                     format!("{root_key}.{local_slot}")
                 }
-                PersistedRecord::ListStore { root_key, local_slot, .. } => {
+                PersistedRecord::ListStore {
+                    root_key,
+                    local_slot,
+                    ..
+                } => {
                     format!("{root_key}.{local_slot}")
                 }
             };
@@ -98,7 +103,10 @@ pub(crate) fn kernel_value_to_json(value: &KernelValue) -> serde_json::Value {
         KernelValue::Tag(t) => serde_json::json!({ "Tag": t }),
         KernelValue::Bool(b) => serde_json::json!({ "Bool": b }),
         KernelValue::List(items) => {
-            let json_items: Vec<serde_json::Value> = items.iter().map(|item| kernel_value_to_json(item)).collect();
+            let json_items: Vec<serde_json::Value> = items
+                .iter()
+                .map(|item| kernel_value_to_json(item))
+                .collect();
             serde_json::json!({ "List": json_items })
         }
         KernelValue::Object(map) => {
@@ -168,10 +176,7 @@ pub fn load_persisted_holds(
             value,
         } = record
         {
-            holds.insert(
-                (root_key.clone(), local_slot),
-                json_to_kernel_value(&value),
-            );
+            holds.insert((root_key.clone(), local_slot), json_to_kernel_value(&value));
         }
     }
 
@@ -227,7 +232,11 @@ mod tests {
         let writes = tracker.collect_writes();
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            PersistedRecord::Hold { root_key, local_slot, value } => {
+            PersistedRecord::Hold {
+                root_key,
+                local_slot,
+                value,
+            } => {
                 assert_eq!(root_key, "test.root");
                 assert_eq!(*local_slot, 0);
                 assert_eq!(value.get("Number").and_then(|v| v.as_f64()), Some(42.0));

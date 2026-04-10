@@ -1204,7 +1204,11 @@ impl HostViewPreviewRenderer {
                     if let Some(sink) = outline_sink {
                         match sink_values.get(&sink) {
                             // Direct CSS string from sink (todo_mvc filter buttons)
-                            Some(KernelValue::Text(s)) | Some(KernelValue::Tag(s)) if !s.is_empty() => Some(s.as_str()),
+                            Some(KernelValue::Text(s)) | Some(KernelValue::Tag(s))
+                                if !s.is_empty() =>
+                            {
+                                Some(s.as_str())
+                            }
                             // Truthy boolean means show active_outline (button hover test)
                             Some(KernelValue::Bool(true)) => active_outline.as_deref(),
                             Some(KernelValue::Number(n)) if *n != 0.0 => active_outline.as_deref(),
@@ -2258,11 +2262,21 @@ mod tests {
         assert!(port_b.is_some(), "timer B source port should be registered");
 
         // The event ports should be distinct
-        assert_ne!(port_a, port_b, "timer A and B should have distinct event ports");
+        assert_ne!(
+            port_a, port_b,
+            "timer A and B should have distinct event ports"
+        );
 
         // The stripe should have two span children (the timer sources)
-        let stripe = root.children.first().expect("document should have stripe child");
-        assert_eq!(stripe.children.len(), 2, "stripe should have two timer children");
+        let stripe = root
+            .children
+            .first()
+            .expect("document should have stripe child");
+        assert_eq!(
+            stripe.children.len(),
+            2,
+            "stripe should have two timer children"
+        );
     }
 
     #[test]

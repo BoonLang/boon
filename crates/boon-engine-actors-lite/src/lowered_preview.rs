@@ -340,12 +340,19 @@ impl LoweredPreview {
             LoweredProgram::TodoMvc(program) => {
                 LoweredPreviewModel::Todo(TodoPreview::from_program(program)?)
             }
-            LoweredProgram::TodoMvcWithInitialTodos { program, initial_todos } => {
+            LoweredProgram::TodoMvcWithInitialTodos {
+                program,
+                initial_todos,
+            } => {
                 let todos: Vec<(u64, crate::todo_preview::TodoItem)> = initial_todos
                     .into_iter()
-                    .map(|(id, title, completed)| (id, crate::todo_preview::TodoItem { title, completed }))
+                    .map(|(id, title, completed)| {
+                        (id, crate::todo_preview::TodoItem { title, completed })
+                    })
                     .collect();
-                LoweredPreviewModel::Todo(TodoPreview::from_program_with_initial_todos(program, todos)?)
+                LoweredPreviewModel::Todo(TodoPreview::from_program_with_initial_todos(
+                    program, todos,
+                )?)
             }
             LoweredProgram::Crud(program) => {
                 LoweredPreviewModel::Crud(CrudHostViewPreview::from_program(program))
@@ -857,10 +864,17 @@ impl RuntimeHostViewPreview {
         let app = HostViewPreviewApp::new(host_view, executor.sink_values());
         #[cfg(target_arch = "wasm32")]
         {
-            let msg = format!("PERSIST: from_counter_program: {} persistence entries, {} nodes", program_ir.persistence.len(), program_ir.nodes.len());
+            let msg = format!(
+                "PERSIST: from_counter_program: {} persistence entries, {} nodes",
+                program_ir.persistence.len(),
+                program_ir.nodes.len()
+            );
             crate::browser_debug::set_debug_marker(&msg);
             for entry in &program_ir.persistence {
-                let entry_msg = format!("PERSIST: persistence entry: node={:?}, policy={:?}", entry.node, entry.policy);
+                let entry_msg = format!(
+                    "PERSIST: persistence entry: node={:?}, policy={:?}",
+                    entry.node, entry.policy
+                );
                 crate::browser_debug::set_debug_marker(&entry_msg);
             }
         }
@@ -1466,7 +1480,10 @@ impl RuntimeHostViewPreview {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let msg = format!("PERSIST: apply_messages called, persistence_enabled={}", self.persistence_enabled);
+            let msg = format!(
+                "PERSIST: apply_messages called, persistence_enabled={}",
+                self.persistence_enabled
+            );
             crate::browser_debug::set_debug_marker(&msg);
         }
         let Self {
@@ -1499,21 +1516,28 @@ impl RuntimeHostViewPreview {
 
         let adapter = BrowserLocalStorage::instance();
         let all_sinks = self.executor.sink_values();
-        crate::browser_debug::set_debug_marker(&format!("collect_persist:sinks:{}", all_sinks.len()));
+        crate::browser_debug::set_debug_marker(&format!(
+            "collect_persist:sinks:{}",
+            all_sinks.len()
+        ));
 
         // Build mappings from node ID to SinkPortId
-        let mut node_to_sink: std::collections::BTreeMap<
-            crate::ir::NodeId,
-            crate::ir::SinkPortId,
-        > = std::collections::BTreeMap::new();
+        let mut node_to_sink: std::collections::BTreeMap<crate::ir::NodeId, crate::ir::SinkPortId> =
+            std::collections::BTreeMap::new();
         for node in &self.program_ir.nodes {
             if let IrNodeKind::SinkPort { port, input } = node.kind {
                 node_to_sink.insert(node.id, port);
                 node_to_sink.insert(input, port);
             }
         }
-        crate::browser_debug::set_debug_marker(&format!("collect_persist:node_map:{}", node_to_sink.len()));
-        crate::browser_debug::set_debug_marker(&format!("collect_persist:persist_entries:{}", self.program_ir.persistence.len()));
+        crate::browser_debug::set_debug_marker(&format!(
+            "collect_persist:node_map:{}",
+            node_to_sink.len()
+        ));
+        crate::browser_debug::set_debug_marker(&format!(
+            "collect_persist:persist_entries:{}",
+            self.program_ir.persistence.len()
+        ));
 
         // Collect dirty entries
         let mut writes = Vec::new();
@@ -1524,12 +1548,21 @@ impl RuntimeHostViewPreview {
                 persist_kind,
             } = entry.policy
             {
-                crate::browser_debug::set_debug_marker(&format!("collect_persist:entry:{root_key:?}:{local_slot}:{persist_kind:?}"));
-                if matches!(persist_kind, crate::ir::PersistKind::Hold | crate::ir::PersistKind::ListStore) {
+                crate::browser_debug::set_debug_marker(&format!(
+                    "collect_persist:entry:{root_key:?}:{local_slot}:{persist_kind:?}"
+                ));
+                if matches!(
+                    persist_kind,
+                    crate::ir::PersistKind::Hold | crate::ir::PersistKind::ListStore
+                ) {
                     if let Some(sink_id) = node_to_sink.get(&entry.node) {
-                        crate::browser_debug::set_debug_marker(&format!("collect_persist:sink_found:{sink_id:?}"));
+                        crate::browser_debug::set_debug_marker(&format!(
+                            "collect_persist:sink_found:{sink_id:?}"
+                        ));
                         if let Some(value) = all_sinks.get(sink_id) {
-                            crate::browser_debug::set_debug_marker(&format!("collect_persist:value:{value:?}"));
+                            crate::browser_debug::set_debug_marker(&format!(
+                                "collect_persist:value:{value:?}"
+                            ));
                             let value_json = crate::persistence::kernel_value_to_json(value);
                             writes.push(PersistedRecord::Hold {
                                 root_key: root_key.to_string(),
@@ -1537,10 +1570,15 @@ impl RuntimeHostViewPreview {
                                 value: value_json,
                             });
                         } else {
-                            crate::browser_debug::set_debug_marker(&format!("collect_persist:no_value_for_sink:{sink_id:?}"));
+                            crate::browser_debug::set_debug_marker(&format!(
+                                "collect_persist:no_value_for_sink:{sink_id:?}"
+                            ));
                         }
                     } else {
-                        crate::browser_debug::set_debug_marker(&format!("collect_persist:no_sink_for_node:{:?}", entry.node));
+                        crate::browser_debug::set_debug_marker(&format!(
+                            "collect_persist:no_sink_for_node:{:?}",
+                            entry.node
+                        ));
                     }
                 }
             }
@@ -1555,7 +1593,9 @@ impl RuntimeHostViewPreview {
                     crate::browser_debug::set_debug_marker("collect_persist:commit_ok");
                 }
                 Err(e) => {
-                    crate::browser_debug::set_debug_marker(&format!("collect_persist:commit_err:{e}"));
+                    crate::browser_debug::set_debug_marker(&format!(
+                        "collect_persist:commit_err:{e}"
+                    ));
                 }
             }
         } else {
@@ -1576,8 +1616,11 @@ impl RuntimeHostViewPreview {
     /// Set the counter sink value for persistence restoration.
     pub fn set_counter_sink_value(&mut self, value: i64) {
         if let RuntimePreviewKind::Counter { counter_sink, .. } = &self.kind {
-            self.app.set_sink_value(*counter_sink, KernelValue::Number(value as f64));
-            crate::browser_debug::set_debug_marker(&format!("persistence:counter_restored:{value}"));
+            self.app
+                .set_sink_value(*counter_sink, KernelValue::Number(value as f64));
+            crate::browser_debug::set_debug_marker(&format!(
+                "persistence:counter_restored:{value}"
+            ));
         }
     }
 

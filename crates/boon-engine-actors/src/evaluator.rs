@@ -3244,12 +3244,8 @@ async fn freeze_snapshot_root_actor(
     actor_context: ActorContext,
     label: String,
 ) -> ActorHandle {
-    let snapshot_value = if let Some((emission_idempotency_key, emission_lamport_time)) =
-        actor_context.snapshot_emission_identity
-    {
-        actor
-            .current_value_before_emission(emission_idempotency_key, emission_lamport_time)
-            .await
+    let snapshot_value = if let Some(emission) = actor_context.snapshot_emission_identity {
+        actor.current_value_before_emission(emission).await
     } else {
         actor.current_value().await
     };
@@ -3278,12 +3274,8 @@ async fn snapshot_current_value(
     actor: &ActorHandle,
     actor_context: &ActorContext,
 ) -> Result<Value, CurrentValueError> {
-    if let Some((emission_idempotency_key, emission_lamport_time)) =
-        actor_context.snapshot_emission_identity
-    {
-        actor
-            .current_value_before_emission(emission_idempotency_key, emission_lamport_time)
-            .await
+    if let Some(emission) = actor_context.snapshot_emission_identity {
+        actor.current_value_before_emission(emission).await
     } else {
         actor.current_value().await
     }
@@ -3344,8 +3336,7 @@ fn build_then_actor(
             let permit_clone = backpressure_permit_for_then.clone();
             let hold_callback_clone = hold_callback_for_then.clone();
             let should_materialize = permit_clone.is_some();
-            let (source_idempotency_key, source_lamport_time) =
-                branch_condition_emission_identity(&value);
+            let source_emission = branch_condition_emission_identity(&value);
             Box::pin(async move {
                 // Acquire permit BEFORE body evaluation - this ensures HOLD's state update
                 // completes before we read state for the next iteration. Without this,
@@ -3487,7 +3478,7 @@ fn build_then_actor(
                     // THEN body uses snapshot semantics for variables - don't filter stale values
                     // The filtering should only happen on the piped stream, not all variable refs
                     subscription_time: None,
-                    snapshot_emission_identity: Some((source_idempotency_key, source_lamport_time)),
+                    snapshot_emission_identity: Some(source_emission),
                     registry_scope_id: actor_context_clone.registry_scope_id,
                 };
 
@@ -3544,13 +3535,11 @@ fn build_then_actor(
                                     let construct_context_for_map =
                                         construct_context_for_map.clone();
                                     let actor_context_for_map = actor_context_for_map.clone();
-                                    let source_idempotency_key = source_idempotency_key;
-                                    let source_lamport_time = source_lamport_time;
+                                    let source_emission = source_emission;
                                     async move {
                                         preserve_emission_identity(
                                             &mut result_value,
-                                            source_idempotency_key,
-                                            source_lamport_time,
+                                            source_emission,
                                         );
                                         if should_materialize {
                                             result_value = materialize_value(
@@ -3561,8 +3550,7 @@ fn build_then_actor(
                                             .await;
                                             preserve_emission_identity(
                                                 &mut result_value,
-                                                source_idempotency_key,
-                                                source_lamport_time,
+                                                source_emission,
                                             );
                                         }
                                         // CRITICAL: Call HOLD's callback synchronously if present.
@@ -3656,22 +3644,17 @@ enum BranchConditionDedupKey {
 
 #[derive(Clone, PartialEq, Eq)]
 enum BranchConditionEmissionDedupKey {
-    Text(String, ValueIdempotencyKey, u64),
-    Tag(String, ValueIdempotencyKey, u64),
-    Number(u64, ValueIdempotencyKey, u64),
+    Text(String, EmissionIdentity),
+    Tag(String, EmissionIdentity),
+    Number(u64, EmissionIdentity),
 }
 
-fn branch_condition_emission_identity(value: &Value) -> (ValueIdempotencyKey, u64) {
-    (value.idempotency_key(), value.lamport_time())
+fn branch_condition_emission_identity(value: &Value) -> EmissionIdentity {
+    value.emission_identity()
 }
 
-fn preserve_emission_identity(
-    value: &mut Value,
-    idempotency_key: ValueIdempotencyKey,
-    lamport_time: u64,
-) {
-    value.set_idempotency_key(idempotency_key);
-    value.metadata_mut().lamport_time = lamport_time;
+fn preserve_emission_identity(value: &mut Value, emission: EmissionIdentity) {
+    value.set_emission_identity(emission);
 }
 
 fn branch_condition_dedup_key(value: &Value) -> Option<BranchConditionDedupKey> {
@@ -3687,22 +3670,19 @@ fn branch_condition_dedup_key(value: &Value) -> Option<BranchConditionDedupKey> 
 }
 
 fn branch_condition_emission_dedup_key(value: &Value) -> Option<BranchConditionEmissionDedupKey> {
-    let (idempotency_key, lamport_time) = branch_condition_emission_identity(value);
+    let emission = branch_condition_emission_identity(value);
     match value {
         Value::Text(text, _) => Some(BranchConditionEmissionDedupKey::Text(
             text.text().to_string(),
-            idempotency_key,
-            lamport_time,
+            emission,
         )),
         Value::Tag(tag, _) => Some(BranchConditionEmissionDedupKey::Tag(
             tag.tag().to_string(),
-            idempotency_key,
-            lamport_time,
+            emission,
         )),
         Value::Number(number, _) => Some(BranchConditionEmissionDedupKey::Number(
             number.number().to_bits(),
-            idempotency_key,
-            lamport_time,
+            emission,
         )),
         Value::Flushed(inner, _) => branch_condition_emission_dedup_key(inner),
         Value::Object(_, _) | Value::TaggedObject(_, _) | Value::List(_, _) => None,
@@ -3714,15 +3694,12 @@ fn current_or_future_stream(actor: ActorHandle) -> LocalBoxStream<'static, Value
     let initial = stream::once(async move { actor_for_initial.value().await.ok() })
         .filter_map(|value| async move { value });
     stream::select(initial, actor.stream_from_now())
-        .scan(
-            None::<(ValueIdempotencyKey, u64)>,
-            |last_emission, value| {
-                let current_emission = (value.idempotency_key(), value.lamport_time());
-                let should_emit = Some(current_emission) != *last_emission;
-                *last_emission = Some(current_emission);
-                future::ready(Some(if should_emit { Some(value) } else { None }))
-            },
-        )
+        .scan(None::<EmissionIdentity>, |last_emission, value| {
+            let current_emission = value.emission_identity();
+            let should_emit = Some(current_emission) != *last_emission;
+            *last_emission = Some(current_emission);
+            future::ready(Some(if should_emit { Some(value) } else { None }))
+        })
         .filter_map(future::ready)
         .boxed_local()
 }
@@ -3773,8 +3750,7 @@ fn build_when_actor(
             let current_module_clone = current_module_for_when.clone();
             let _persistence_clone = persistence_for_when.clone();
             let arms_clone = arms.clone();
-            let (source_idempotency_key, source_lamport_time) =
-                branch_condition_emission_identity(&value);
+            let source_emission = branch_condition_emission_identity(&value);
 
             Box::pin(async move {
                 // Debug: log what WHEN receives
@@ -3964,10 +3940,7 @@ fn build_when_actor(
                             // WHEN body uses snapshot semantics for variables - don't filter stale values
                             // The filtering should only happen on the piped stream, not all variable refs
                             subscription_time: None,
-                            snapshot_emission_identity: Some((
-                                source_idempotency_key,
-                                source_lamport_time,
-                            )),
+                            snapshot_emission_identity: Some(source_emission),
                             registry_scope_id: arm_registry_scope
                                 .as_ref()
                                 .map(|(id, _)| *id)
@@ -4006,13 +3979,11 @@ fn build_when_actor(
                                                 construct_context_for_map.clone();
                                             let actor_context_for_map =
                                                 actor_context_for_map.clone();
-                                            let source_idempotency_key = source_idempotency_key;
-                                            let source_lamport_time = source_lamport_time;
+                                            let source_emission = source_emission;
                                             async move {
                                                 preserve_emission_identity(
                                                     &mut result_value,
-                                                    source_idempotency_key,
-                                                    source_lamport_time,
+                                                    source_emission,
                                                 );
                                                 if should_materialize {
                                                     result_value = materialize_value(
@@ -4023,8 +3994,7 @@ fn build_when_actor(
                                                     .await;
                                                     preserve_emission_identity(
                                                         &mut result_value,
-                                                        source_idempotency_key,
-                                                        source_lamport_time,
+                                                        source_emission,
                                                     );
                                                 }
                                                 result_value
@@ -4050,10 +4020,7 @@ fn build_when_actor(
                                             let actor_context_for_map =
                                                 actor_context_for_map.clone();
                                             async move {
-                                                let emission_idempotency_key =
-                                                    result_value.idempotency_key();
-                                                let emission_lamport_time =
-                                                    result_value.lamport_time();
+                                                let emission = result_value.emission_identity();
                                                 if should_materialize {
                                                     result_value = materialize_value(
                                                         result_value,
@@ -4063,20 +4030,17 @@ fn build_when_actor(
                                                     .await;
                                                     preserve_emission_identity(
                                                         &mut result_value,
-                                                        emission_idempotency_key,
-                                                        emission_lamport_time,
+                                                        emission,
                                                     );
                                                 }
                                                 result_value
                                             }
                                         })
                                         .scan(
-                                            None::<(ValueIdempotencyKey, u64)>,
+                                            None::<EmissionIdentity>,
                                             |last_emission, result_value| {
-                                                let current_emission = (
-                                                    result_value.idempotency_key(),
-                                                    result_value.lamport_time(),
-                                                );
+                                                let current_emission =
+                                                    result_value.emission_identity();
                                                 let should_emit =
                                                     Some(current_emission) != *last_emission;
                                                 *last_emission = Some(current_emission);
@@ -4261,8 +4225,7 @@ fn build_while_actor(
 
             if let Some((arm_idx, bindings)) = matched_arm_with_bindings {
                 let arm = &arms_clone[arm_idx];
-                let source_idempotency_key = value.idempotency_key();
-                let source_lamport_time = value.lamport_time();
+                let source_emission = value.emission_identity();
                 // Create a new subscription scope for this arm
                 // The ScopeGuard will cancel the scope when dropped (when switch_map drops the inner stream)
                 let arm_scope = Arc::new(SubscriptionScope::new());
@@ -4329,7 +4292,7 @@ fn build_while_actor(
                     // UI events and drive reopen loops on examples like Cells.
                     scope: {
                         use boon::parser::Scope;
-                        let scope_id = format!("while_arm_{}_{}", arm_idx, source_lamport_time);
+                        let scope_id = format!("while_arm_{}_{}", arm_idx, source_emission.seq);
                         match &actor_context_clone.scope {
                             Scope::Root => Scope::Nested(scope_id),
                             Scope::Nested(existing) => {
@@ -4348,8 +4311,8 @@ fn build_while_actor(
                     // Freshly recreated arm-local variables should ignore stale values from
                     // earlier incarnations of the same arm. Parameter/global references opt
                     // out in evaluate_alias_immediate, but object-local roots keep this filter.
-                    subscription_time: Some(source_lamport_time),
-                    snapshot_emission_identity: Some((source_idempotency_key, source_lamport_time)),
+                    subscription_time: Some(source_emission.seq),
+                    snapshot_emission_identity: Some(source_emission),
                     // Use the arm's registry scope (if available) so actors are owned by this arm
                     registry_scope_id: arm_registry_scope
                         .as_ref()
@@ -4381,8 +4344,7 @@ fn build_while_actor(
                                 let construct_context_for_map = construct_context_for_map.clone();
                                 let actor_context_for_map = actor_context_for_map.clone();
                                 async move {
-                                    let emission_idempotency_key = result_value.idempotency_key();
-                                    let emission_lamport_time = result_value.lamport_time();
+                                    let emission = result_value.emission_identity();
                                     if should_materialize {
                                         result_value = materialize_value(
                                             result_value,
@@ -4390,28 +4352,17 @@ fn build_while_actor(
                                             actor_context_for_map,
                                         )
                                         .await;
-                                        preserve_emission_identity(
-                                            &mut result_value,
-                                            emission_idempotency_key,
-                                            emission_lamport_time,
-                                        );
+                                        preserve_emission_identity(&mut result_value, emission);
                                     }
                                     result_value
                                 }
                             })
                             .boxed_local();
                         let body_stream = stream::unfold(
-                            (
-                                body_stream,
-                                None::<(ValueIdempotencyKey, u64)>,
-                                None::<Value>,
-                            ),
+                            (body_stream, None::<EmissionIdentity>, None::<Value>),
                             |(mut upstream, mut last_emission, mut last_value)| async move {
                                 while let Some(result_value) = upstream.next().await {
-                                    let current_emission = (
-                                        result_value.idempotency_key(),
-                                        result_value.lamport_time(),
-                                    );
+                                    let current_emission = result_value.emission_identity();
                                     let same_emission = Some(current_emission) == last_emission;
                                     let structurally_equal = if same_emission {
                                         false

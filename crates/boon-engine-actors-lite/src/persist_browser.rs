@@ -3,9 +3,7 @@
 //! Used in wasm32 builds to persist durable HOLD cells and list stores
 //! to the browser's localStorage API.
 
-use crate::persist::{
-    PersistManifest, PersistedRecord, PersistenceAdapter, ENGINE_PREFIX,
-};
+use crate::persist::{ENGINE_PREFIX, PersistManifest, PersistedRecord, PersistenceAdapter};
 
 /// Get the localStorage instance, or return an error.
 fn storage() -> Result<boon::zoon::web_sys::Storage, String> {
@@ -63,7 +61,9 @@ impl PersistenceAdapter for BrowserLocalStorage {
         let prefix = format!("{ENGINE_PREFIX}.");
         let mut records = Vec::new();
 
-        let len = storage.length().map_err(|e| format!("length error: {e:?}"))?;
+        let len = storage
+            .length()
+            .map_err(|e| format!("length error: {e:?}"))?;
         for i in 0..len {
             let key = match storage.key(i) {
                 Ok(Some(k)) => k,

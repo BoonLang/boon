@@ -194,10 +194,25 @@ impl TodoPreview {
     }
 
     pub fn from_program(program: TodoProgram) -> Result<Self, String> {
-        Self::from_program_with_initial_todos(program, vec![
-            (1, TodoItem { title: "Buy groceries".to_string(), completed: false }),
-            (2, TodoItem { title: "Clean room".to_string(), completed: false }),
-        ])
+        Self::from_program_with_initial_todos(
+            program,
+            vec![
+                (
+                    1,
+                    TodoItem {
+                        title: "Buy groceries".to_string(),
+                        completed: false,
+                    },
+                ),
+                (
+                    2,
+                    TodoItem {
+                        title: "Clean room".to_string(),
+                        completed: false,
+                    },
+                ),
+            ],
+        )
     }
 
     pub fn from_program_with_initial_todos(
@@ -260,13 +275,24 @@ impl TodoPreview {
         use boon::platform::browser::kernel::KernelValue;
 
         let adapter = BrowserLocalStorage::instance();
-        let todos: Vec<KernelValue> = self.todos.list().iter().map(|mapped_item| {
-            KernelValue::Object(std::collections::BTreeMap::from([
-                ("id".to_string(), KernelValue::Number(mapped_item.id as f64)),
-                ("title".to_string(), KernelValue::Text(mapped_item.value.title.clone())),
-                ("completed".to_string(), KernelValue::Bool(mapped_item.value.completed)),
-            ]))
-        }).collect();
+        let todos: Vec<KernelValue> = self
+            .todos
+            .list()
+            .iter()
+            .map(|mapped_item| {
+                KernelValue::Object(std::collections::BTreeMap::from([
+                    ("id".to_string(), KernelValue::Number(mapped_item.id as f64)),
+                    (
+                        "title".to_string(),
+                        KernelValue::Text(mapped_item.value.title.clone()),
+                    ),
+                    (
+                        "completed".to_string(),
+                        KernelValue::Bool(mapped_item.value.completed),
+                    ),
+                ]))
+            })
+            .collect();
         let json_value = crate::persistence::kernel_value_to_json(&KernelValue::List(todos));
         let root_key = "store.todos".to_string();
         let record = PersistedRecord::Hold {

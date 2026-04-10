@@ -146,8 +146,7 @@ pub fn render_persistent_counter_preview(mut preview: PersistentCounterPreview) 
 
     // Simple render: show counter value and increment button
     // In a real implementation, this would use the HostViewIr tree
-    El::new()
-        .child(format!("Counter: {counter_text}"))
+    El::new().child(format!("Counter: {counter_text}"))
 }
 
 /// Non-persistence in-memory version for testing.
@@ -216,9 +215,9 @@ impl InMemoryCounterPreview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lower::LoweredProgram;
     use crate::lower::lower_program;
     use crate::persist::{InMemoryPersistence, PersistedRecord};
-    use crate::lower::LoweredProgram;
 
     #[test]
     fn persistent_counter_preview_roundtrip() {
@@ -227,12 +226,7 @@ mod tests {
         let program = lower_program(source).expect("counter should lower");
 
         let (mut ir, host_view, press_port, counter_sink) = match program {
-            LoweredProgram::Counter(p) => (
-                p.ir,
-                p.host_view,
-                p.press_port,
-                p.counter_sink,
-            ),
+            LoweredProgram::Counter(p) => (p.ir, p.host_view, p.press_port, p.counter_sink),
             _ => panic!("expected Counter program, got other variant"),
         };
 
@@ -301,7 +295,10 @@ mod tests {
         let has_hold = records
             .iter()
             .any(|r| matches!(r, PersistedRecord::Hold { .. }));
-        assert!(has_hold, "should have persisted HOLD record after increment");
+        assert!(
+            has_hold,
+            "should have persisted HOLD record after increment"
+        );
     }
 
     #[test]
@@ -320,10 +317,13 @@ mod tests {
             );
             // Verify it's a HOLD persistence entry
             let has_hold = p.ir.persistence.iter().any(|e| {
-                matches!(e.policy, crate::ir::PersistPolicy::Durable {
-                    persist_kind: crate::ir::PersistKind::Hold,
-                    ..
-                })
+                matches!(
+                    e.policy,
+                    crate::ir::PersistPolicy::Durable {
+                        persist_kind: crate::ir::PersistKind::Hold,
+                        ..
+                    }
+                )
             });
             assert!(has_hold, "counter IR should have HOLD persistence entry");
             // Verify the program structure is correct
