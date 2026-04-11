@@ -63,7 +63,7 @@ pub struct List {
 }
 ```
 
-Plus supporting types: `ListDiff`, `ListChange`, `ListSubscription`, `ListDiffSubscription`, `ItemId`, `ListBindingFunction`, `ListBindingConfig`.
+Plus supporting types: `ListDiff`, `ListChange`, `ItemId`, `ListBindingFunction`, `ListBindingConfig`.
 
 ### Specific Issues
 

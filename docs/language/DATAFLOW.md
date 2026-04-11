@@ -417,14 +417,14 @@ notify_senders.retain_mut(|sender| {
 
 **Legacy model:** `ListSubscription` still uses unbounded channels for `ListChange` broadcast.
 
-**New model:** `ListDiffSubscription` uses bounded(1) channels with pull-based diffs.
+**New model:** `List::diff_stream(...)` uses direct stored-state polling with pull-based diffs.
 
 ```rust
-// Use subscribe_diffs() for memory-efficient subscription
-let subscription = list.subscribe_diffs();  // Returns ListDiffSubscription
+// Use diff_stream() for memory-efficient subscription
+let updates = list.clone().diff_stream(0);
 ```
 
-**Recommendation:** Prefer `subscribe_diffs()` for memory-efficient list handling.
+**Recommendation:** Prefer `diff_stream(...)` for memory-efficient list handling.
 
 ### 3. State Channel in HOLD
 

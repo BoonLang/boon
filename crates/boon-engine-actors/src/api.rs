@@ -4,9 +4,7 @@ use std::sync::Arc;
 use zoon::Timer;
 use zoon::futures_channel::mpsc;
 use zoon::futures_util::{
-    FutureExt, SinkExt,
-    future::join_all,
-    pin_mut, select,
+    FutureExt, SinkExt, pin_mut, select,
     stream::{self, LocalBoxStream, Stream, StreamExt},
 };
 use zoon::{Closure, JsCast, JsValue, SendWrapper, UnwrapThrowExt, history, window};
@@ -17,6 +15,22 @@ use crate::engine::*;
 use boon::parser::PersistenceId;
 
 // @TODO make sure Values are deduplicated everywhere it makes sense
+
+fn event_actor_from_constant_element(
+    argument_element: &ActorHandle,
+    scope_id: ScopeId,
+) -> ActorHandle {
+    argument_element
+        .current_value()
+        .ok()
+        .and_then(|element_value| {
+            element_value
+                .expect_object()
+                .variable("event")
+                .map(|event_variable| event_variable.value_actor())
+        })
+        .unwrap_or_else(|| create_actor_forwarding(PersistenceId::new(), scope_id))
+}
 
 /// ```text
 /// Document/new(root<INTO_ELEMENT>) -> [root_element<INTO_ELEMENT>]
@@ -61,7 +75,7 @@ pub fn function_document_new(
         panic!("Unexpected argument count")
     };
     let scoped_id = function_call_persistence_id;
-    Object::new_constant(
+    stream::once(future::ready(Object::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -75,13 +89,12 @@ pub fn function_document_new(
                 None,
                 "Document/new(..) -> [root_element]",
             ),
-            construct_context,
             "root_element",
             argument_root.clone(),
             scoped_id.with_child_index(1),
             actor_context.scope.clone(),
         )],
-    )
+    )))
 }
 
 /// ```text
@@ -114,7 +127,7 @@ pub fn function_element_stripe(
         );
     };
     let scoped_id = function_call_persistence_id;
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -129,7 +142,6 @@ pub fn function_element_stripe(
                 None,
                 "Element/stripe(..) -> ElementStripe[settings]",
             ),
-            construct_context.clone(),
             "settings",
             Object::new_arc_value_actor(
                 ConstructInfo::new(
@@ -147,7 +159,6 @@ pub fn function_element_stripe(
                             None,
                             "Element/stripe(..) -> ElementStripe[settings: [element]]",
                         ),
-                        construct_context.clone(),
                         "element",
                         argument_element.clone(),
                         scoped_id.with_child_index(7),
@@ -159,7 +170,6 @@ pub fn function_element_stripe(
                             None,
                             "Element/stripe(..) -> ElementStripe[settings: [direction]]",
                         ),
-                        construct_context.clone(),
                         "direction",
                         argument_direction.clone(),
                         scoped_id.with_child_index(3),
@@ -171,7 +181,6 @@ pub fn function_element_stripe(
                             None,
                             "Element/stripe(..) -> ElementStripe[settings: [gap]]",
                         ),
-                        construct_context.clone(),
                         "gap",
                         argument_gap.clone(),
                         scoped_id.with_child_index(6),
@@ -183,7 +192,6 @@ pub fn function_element_stripe(
                             None,
                             "Element/stripe(..) -> ElementStripe[settings: [style]]",
                         ),
-                        construct_context.clone(),
                         "style",
                         argument_style.clone(),
                         scoped_id.with_child_index(4),
@@ -195,7 +203,6 @@ pub fn function_element_stripe(
                             None,
                             "Element/stripe(..) -> ElementStripe[settings: [items]]",
                         ),
-                        construct_context,
                         "items",
                         argument_items.clone(),
                         scoped_id.with_child_index(5),
@@ -206,7 +213,7 @@ pub fn function_element_stripe(
             scoped_id.with_child_index(1),
             actor_context.scope,
         )],
-    )
+    )))
 }
 
 /// ```text
@@ -227,7 +234,7 @@ pub fn function_element_container(
         panic!("Element/container expects 3 arguments")
     };
     let scoped_id = function_call_persistence_id;
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -242,7 +249,6 @@ pub fn function_element_container(
                 None,
                 "Element/container(..) -> ElementContainer[settings]",
             ),
-            construct_context.clone(),
             "settings",
             Object::new_arc_value_actor(
                 ConstructInfo::new(
@@ -260,7 +266,6 @@ pub fn function_element_container(
                             None,
                             "Element/container(..) -> ElementContainer[settings: [element]]",
                         ),
-                        construct_context.clone(),
                         "element",
                         argument_element.clone(),
                         scoped_id.with_child_index(5),
@@ -272,7 +277,6 @@ pub fn function_element_container(
                             None,
                             "Element/container(..) -> ElementContainer[settings: [style]]",
                         ),
-                        construct_context.clone(),
                         "style",
                         argument_style.clone(),
                         scoped_id.with_child_index(3),
@@ -284,7 +288,6 @@ pub fn function_element_container(
                             None,
                             "Element/container(..) -> ElementContainer[settings: [child]]",
                         ),
-                        construct_context,
                         "child",
                         argument_child.clone(),
                         scoped_id.with_child_index(4),
@@ -295,7 +298,7 @@ pub fn function_element_container(
             scoped_id.with_child_index(1),
             actor_context.scope,
         )],
-    )
+    )))
 }
 
 /// ```text
@@ -319,7 +322,7 @@ pub fn function_element_stack(
         );
     };
     let scoped_id = function_call_persistence_id;
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -334,7 +337,6 @@ pub fn function_element_stack(
                 None,
                 "Element/stack(..) -> ElementStack[settings]",
             ),
-            construct_context.clone(),
             "settings",
             Object::new_arc_value_actor(
                 ConstructInfo::new(
@@ -352,7 +354,6 @@ pub fn function_element_stack(
                             None,
                             "Element/stack(..) -> ElementStack[settings: [element]]",
                         ),
-                        construct_context.clone(),
                         "element",
                         argument_element.clone(),
                         scoped_id.with_child_index(5),
@@ -364,7 +365,6 @@ pub fn function_element_stack(
                             None,
                             "Element/stack(..) -> ElementStack[settings: [style]]",
                         ),
-                        construct_context.clone(),
                         "style",
                         argument_style.clone(),
                         scoped_id.with_child_index(3),
@@ -376,7 +376,6 @@ pub fn function_element_stack(
                             None,
                             "Element/stack(..) -> ElementStack[settings: [layers]]",
                         ),
-                        construct_context,
                         "layers",
                         argument_layers.clone(),
                         scoped_id.with_child_index(4),
@@ -387,7 +386,7 @@ pub fn function_element_stack(
             scoped_id.with_child_index(1),
             actor_context.scope,
         )],
-    )
+    )))
 }
 
 /// ```text
@@ -412,36 +411,9 @@ pub fn function_element_button(
         panic!("Unexpected argument count")
     };
     let scoped_id = function_call_persistence_id;
-    // Create a derived actor that extracts `event` from argument_element
-    // This allows direct access via `.event` instead of `.element.event`
-    // Use current_value() since argument_element is a constant object that doesn't change
-    let event_stream = stream::once({
-        let argument_element = argument_element.clone();
-        async move {
-            // Get element value once (it's a constant argument)
-            let element_value = argument_element.current_value().await.ok()?;
-            // Extract the event variable
-            let event_variable = element_value.expect_object().variable("event")?;
-            // Subscribe to events using stream_safe() for cancellation safety
-            Some(event_variable.value_actor().stream())
-        }
-    })
-    .filter_map(future::ready)
-    .flatten();
+    let event_actor = event_actor_from_constant_element(argument_element, actor_context.scope_id());
 
-    let event_actor = create_actor(
-        ConstructInfo::new(
-            function_call_id.with_child_id(7),
-            None,
-            "ElementButton[event] (derived)",
-        ),
-        actor_context.clone(),
-        TypedStream::infinite(event_stream.chain(stream::pending())),
-        PersistenceId::new(),
-        actor_context.scope_id(),
-    );
-
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -457,7 +429,6 @@ pub fn function_element_button(
                     None,
                     "ElementButton[element]",
                 ),
-                construct_context.clone(),
                 "element",
                 argument_element.clone(),
                 scoped_id.with_child_index(1),
@@ -469,7 +440,6 @@ pub fn function_element_button(
                     None,
                     "ElementButton[event]",
                 ),
-                construct_context.clone(),
                 "event",
                 event_actor,
                 scoped_id.with_child_index(2),
@@ -481,7 +451,6 @@ pub fn function_element_button(
                     None,
                     "Element/stripe(..) -> ElementButton[settings]",
                 ),
-                construct_context.clone(),
                 "settings",
                 Object::new_arc_value_actor(
                     ConstructInfo::new(
@@ -499,7 +468,6 @@ pub fn function_element_button(
                                 None,
                                 "Element/stripe(..) -> ElementButton[settings: [style]]",
                             ),
-                            construct_context.clone(),
                             "style",
                             argument_style.clone(),
                             scoped_id.with_child_index(5),
@@ -511,7 +479,6 @@ pub fn function_element_button(
                                 None,
                                 "Element/stripe(..) -> ElementButton[settings: [label]]",
                             ),
-                            construct_context,
                             "label",
                             argument_label.clone(),
                             scoped_id.with_child_index(6),
@@ -523,7 +490,7 @@ pub fn function_element_button(
                 actor_context.scope,
             ),
         ],
-    )
+    )))
 }
 
 /// ```text
@@ -555,37 +522,9 @@ pub fn function_element_text_input(
         panic!("Element/text_input expects 6 arguments")
     };
     let scoped_id = function_call_persistence_id;
+    let event_actor = event_actor_from_constant_element(argument_element, actor_context.scope_id());
 
-    // Create a derived actor that extracts `event` from argument_element
-    // This allows direct access via `.event` instead of `.element.event`
-    // Use current_value() since argument_element is a constant object that doesn't change
-    let event_stream = stream::once({
-        let argument_element = argument_element.clone();
-        async move {
-            // Get element value once (it's a constant argument)
-            let element_value = argument_element.current_value().await.ok()?;
-            // Extract the event variable
-            let event_variable = element_value.expect_object().variable("event")?;
-            // Subscribe to events using stream_safe() for cancellation safety
-            Some(event_variable.value_actor().stream())
-        }
-    })
-    .filter_map(future::ready)
-    .flatten();
-
-    let event_actor = create_actor(
-        ConstructInfo::new(
-            function_call_id.with_child_id(9),
-            None,
-            "ElementTextInput[event] (derived)",
-        ),
-        actor_context.clone(),
-        TypedStream::infinite(event_stream.chain(stream::pending())),
-        PersistenceId::new(),
-        actor_context.scope_id(),
-    );
-
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -601,7 +540,6 @@ pub fn function_element_text_input(
                     None,
                     "ElementTextInput[element]",
                 ),
-                construct_context.clone(),
                 "element",
                 argument_element.clone(),
                 scoped_id.with_child_index(1),
@@ -613,7 +551,6 @@ pub fn function_element_text_input(
                     None,
                     "ElementTextInput[event]",
                 ),
-                construct_context.clone(),
                 "event",
                 event_actor,
                 scoped_id.with_child_index(10),
@@ -625,7 +562,6 @@ pub fn function_element_text_input(
                     None,
                     "ElementTextInput[text]",
                 ),
-                construct_context.clone(),
                 "text",
                 argument_text.clone(),
                 scoped_id.with_child_index(11),
@@ -637,7 +573,6 @@ pub fn function_element_text_input(
                     None,
                     "ElementTextInput[settings]",
                 ),
-                construct_context.clone(),
                 "settings",
                 Object::new_arc_value_actor(
                     ConstructInfo::new(
@@ -655,7 +590,6 @@ pub fn function_element_text_input(
                                 None,
                                 "ElementTextInput[settings: [style]]",
                             ),
-                            construct_context.clone(),
                             "style",
                             argument_style.clone(),
                             scoped_id.with_child_index(4),
@@ -667,7 +601,6 @@ pub fn function_element_text_input(
                                 None,
                                 "ElementTextInput[settings: [label]]",
                             ),
-                            construct_context.clone(),
                             "label",
                             argument_label.clone(),
                             scoped_id.with_child_index(5),
@@ -679,7 +612,6 @@ pub fn function_element_text_input(
                                 None,
                                 "ElementTextInput[settings: [text]]",
                             ),
-                            construct_context.clone(),
                             "text",
                             argument_text.clone(),
                             scoped_id.with_child_index(6),
@@ -691,7 +623,6 @@ pub fn function_element_text_input(
                                 None,
                                 "ElementTextInput[settings: [placeholder]]",
                             ),
-                            construct_context.clone(),
                             "placeholder",
                             argument_placeholder.clone(),
                             scoped_id.with_child_index(7),
@@ -703,7 +634,6 @@ pub fn function_element_text_input(
                                 None,
                                 "ElementTextInput[settings: [focus]]",
                             ),
-                            construct_context,
                             "focus",
                             argument_focus.clone(),
                             scoped_id.with_child_index(8),
@@ -715,7 +645,7 @@ pub fn function_element_text_input(
                 actor_context.scope,
             ),
         ],
-    )
+    )))
 }
 
 /// ```text
@@ -745,37 +675,9 @@ pub fn function_element_checkbox(
         panic!("Element/checkbox expects 5 arguments")
     };
     let scoped_id = function_call_persistence_id;
+    let event_actor = event_actor_from_constant_element(argument_element, actor_context.scope_id());
 
-    // Create a derived actor that extracts `event` from argument_element
-    // This allows direct access via `.event` instead of `.element.event`
-    // Use current_value() since argument_element is a constant object that doesn't change
-    let event_stream = stream::once({
-        let argument_element = argument_element.clone();
-        async move {
-            // Get element value once (it's a constant argument)
-            let element_value = argument_element.current_value().await.ok()?;
-            // Extract the event variable
-            let event_variable = element_value.expect_object().variable("event")?;
-            // Subscribe to events using stream_safe() for cancellation safety
-            Some(event_variable.value_actor().stream())
-        }
-    })
-    .filter_map(future::ready)
-    .flatten();
-
-    let event_actor = create_actor(
-        ConstructInfo::new(
-            function_call_id.with_child_id(8),
-            None,
-            "ElementCheckbox[event] (derived)",
-        ),
-        actor_context.clone(),
-        TypedStream::infinite(event_stream.chain(stream::pending())),
-        PersistenceId::new(),
-        actor_context.scope_id(),
-    );
-
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -791,7 +693,6 @@ pub fn function_element_checkbox(
                     None,
                     "ElementCheckbox[element]",
                 ),
-                construct_context.clone(),
                 "element",
                 argument_element.clone(),
                 scoped_id.with_child_index(1),
@@ -803,7 +704,6 @@ pub fn function_element_checkbox(
                     None,
                     "ElementCheckbox[event]",
                 ),
-                construct_context.clone(),
                 "event",
                 event_actor,
                 scoped_id.with_child_index(9),
@@ -815,7 +715,6 @@ pub fn function_element_checkbox(
                     None,
                     "ElementCheckbox[settings]",
                 ),
-                construct_context.clone(),
                 "settings",
                 Object::new_arc_value_actor(
                     ConstructInfo::new(
@@ -833,7 +732,6 @@ pub fn function_element_checkbox(
                                 None,
                                 "ElementCheckbox[settings: [style]]",
                             ),
-                            construct_context.clone(),
                             "style",
                             argument_style.clone(),
                             scoped_id.with_child_index(4),
@@ -845,7 +743,6 @@ pub fn function_element_checkbox(
                                 None,
                                 "ElementCheckbox[settings: [label]]",
                             ),
-                            construct_context.clone(),
                             "label",
                             argument_label.clone(),
                             scoped_id.with_child_index(5),
@@ -857,7 +754,6 @@ pub fn function_element_checkbox(
                                 None,
                                 "ElementCheckbox[settings: [checked]]",
                             ),
-                            construct_context.clone(),
                             "checked",
                             argument_checked.clone(),
                             scoped_id.with_child_index(6),
@@ -869,7 +765,6 @@ pub fn function_element_checkbox(
                                 None,
                                 "ElementCheckbox[settings: [icon]]",
                             ),
-                            construct_context,
                             "icon",
                             argument_icon.clone(),
                             scoped_id.with_child_index(7),
@@ -881,7 +776,7 @@ pub fn function_element_checkbox(
                 actor_context.scope,
             ),
         ],
-    )
+    )))
 }
 
 /// ```text
@@ -915,31 +810,9 @@ pub fn function_element_slider(
         panic!("Element/slider expects 7 arguments")
     };
     let scoped_id = function_call_persistence_id;
+    let event_actor = event_actor_from_constant_element(argument_element, actor_context.scope_id());
 
-    let event_stream = stream::once({
-        let argument_element = argument_element.clone();
-        async move {
-            let element_value = argument_element.current_value().await.ok()?;
-            let event_variable = element_value.expect_object().variable("event")?;
-            Some(event_variable.value_actor().stream())
-        }
-    })
-    .filter_map(future::ready)
-    .flatten();
-
-    let event_actor = create_actor(
-        ConstructInfo::new(
-            function_call_id.with_child_id(10),
-            None,
-            "ElementSlider[event] (derived)",
-        ),
-        actor_context.clone(),
-        TypedStream::infinite(event_stream.chain(stream::pending())),
-        PersistenceId::new(),
-        actor_context.scope_id(),
-    );
-
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -955,7 +828,6 @@ pub fn function_element_slider(
                     None,
                     "ElementSlider[element]",
                 ),
-                construct_context.clone(),
                 "element",
                 argument_element.clone(),
                 scoped_id.with_child_index(1),
@@ -967,7 +839,6 @@ pub fn function_element_slider(
                     None,
                     "ElementSlider[event]",
                 ),
-                construct_context.clone(),
                 "event",
                 event_actor,
                 scoped_id.with_child_index(11),
@@ -979,7 +850,6 @@ pub fn function_element_slider(
                     None,
                     "ElementSlider[settings]",
                 ),
-                construct_context.clone(),
                 "settings",
                 Object::new_arc_value_actor(
                     ConstructInfo::new(
@@ -997,7 +867,6 @@ pub fn function_element_slider(
                                 None,
                                 "ElementSlider[settings: [style]]",
                             ),
-                            construct_context.clone(),
                             "style",
                             argument_style.clone(),
                             scoped_id.with_child_index(4),
@@ -1009,7 +878,6 @@ pub fn function_element_slider(
                                 None,
                                 "ElementSlider[settings: [label]]",
                             ),
-                            construct_context.clone(),
                             "label",
                             argument_label.clone(),
                             scoped_id.with_child_index(5),
@@ -1021,7 +889,6 @@ pub fn function_element_slider(
                                 None,
                                 "ElementSlider[settings: [value]]",
                             ),
-                            construct_context.clone(),
                             "value",
                             argument_value.clone(),
                             scoped_id.with_child_index(6),
@@ -1033,7 +900,6 @@ pub fn function_element_slider(
                                 None,
                                 "ElementSlider[settings: [min]]",
                             ),
-                            construct_context.clone(),
                             "min",
                             argument_min.clone(),
                             scoped_id.with_child_index(7),
@@ -1045,7 +911,6 @@ pub fn function_element_slider(
                                 None,
                                 "ElementSlider[settings: [max]]",
                             ),
-                            construct_context.clone(),
                             "max",
                             argument_max.clone(),
                             scoped_id.with_child_index(8),
@@ -1057,7 +922,6 @@ pub fn function_element_slider(
                                 None,
                                 "ElementSlider[settings: [step]]",
                             ),
-                            construct_context,
                             "step",
                             argument_step.clone(),
                             scoped_id.with_child_index(9),
@@ -1069,7 +933,7 @@ pub fn function_element_slider(
                 actor_context.scope,
             ),
         ],
-    )
+    )))
 }
 
 /// ```text
@@ -1099,31 +963,9 @@ pub fn function_element_select(
         panic!("Element/select expects 5 arguments")
     };
     let scoped_id = function_call_persistence_id;
+    let event_actor = event_actor_from_constant_element(argument_element, actor_context.scope_id());
 
-    let event_stream = stream::once({
-        let argument_element = argument_element.clone();
-        async move {
-            let element_value = argument_element.current_value().await.ok()?;
-            let event_variable = element_value.expect_object().variable("event")?;
-            Some(event_variable.value_actor().stream())
-        }
-    })
-    .filter_map(future::ready)
-    .flatten();
-
-    let event_actor = create_actor(
-        ConstructInfo::new(
-            function_call_id.with_child_id(10),
-            None,
-            "ElementSelect[event] (derived)",
-        ),
-        actor_context.clone(),
-        TypedStream::infinite(event_stream.chain(stream::pending())),
-        PersistenceId::new(),
-        actor_context.scope_id(),
-    );
-
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -1139,7 +981,6 @@ pub fn function_element_select(
                     None,
                     "ElementSelect[element]",
                 ),
-                construct_context.clone(),
                 "element",
                 argument_element.clone(),
                 scoped_id.with_child_index(1),
@@ -1151,7 +992,6 @@ pub fn function_element_select(
                     None,
                     "ElementSelect[event]",
                 ),
-                construct_context.clone(),
                 "event",
                 event_actor,
                 scoped_id.with_child_index(9),
@@ -1163,7 +1003,6 @@ pub fn function_element_select(
                     None,
                     "ElementSelect[settings]",
                 ),
-                construct_context.clone(),
                 "settings",
                 Object::new_arc_value_actor(
                     ConstructInfo::new(
@@ -1181,7 +1020,6 @@ pub fn function_element_select(
                                 None,
                                 "ElementSelect[settings: [style]]",
                             ),
-                            construct_context.clone(),
                             "style",
                             argument_style.clone(),
                             scoped_id.with_child_index(4),
@@ -1193,7 +1031,6 @@ pub fn function_element_select(
                                 None,
                                 "ElementSelect[settings: [label]]",
                             ),
-                            construct_context.clone(),
                             "label",
                             argument_label.clone(),
                             scoped_id.with_child_index(5),
@@ -1205,7 +1042,6 @@ pub fn function_element_select(
                                 None,
                                 "ElementSelect[settings: [options]]",
                             ),
-                            construct_context.clone(),
                             "options",
                             argument_options.clone(),
                             scoped_id.with_child_index(6),
@@ -1217,7 +1053,6 @@ pub fn function_element_select(
                                 None,
                                 "ElementSelect[settings: [selected]]",
                             ),
-                            construct_context,
                             "selected",
                             argument_selected.clone(),
                             scoped_id.with_child_index(7),
@@ -1229,7 +1064,7 @@ pub fn function_element_select(
                 actor_context.scope,
             ),
         ],
-    )
+    )))
 }
 
 /// ```text
@@ -1251,32 +1086,9 @@ pub fn function_element_svg(
     };
     let scoped_id = function_call_persistence_id;
 
-    // Create a derived actor that extracts `event` from argument_element
-    // This allows direct access via `.event` instead of `.element.event`
-    let event_stream = stream::once({
-        let argument_element = argument_element.clone();
-        async move {
-            let element_value = argument_element.current_value().await.ok()?;
-            let event_variable = element_value.expect_object().variable("event")?;
-            Some(event_variable.value_actor().stream())
-        }
-    })
-    .filter_map(future::ready)
-    .flatten();
+    let event_actor = event_actor_from_constant_element(argument_element, actor_context.scope_id());
 
-    let event_actor = create_actor(
-        ConstructInfo::new(
-            function_call_id.with_child_id(6),
-            None,
-            "ElementSvg[event] (derived)",
-        ),
-        actor_context.clone(),
-        TypedStream::infinite(event_stream.chain(stream::pending())),
-        PersistenceId::new(),
-        actor_context.scope_id(),
-    );
-
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -1292,7 +1104,6 @@ pub fn function_element_svg(
                     None,
                     "ElementSvg[element]",
                 ),
-                construct_context.clone(),
                 "element",
                 argument_element.clone(),
                 scoped_id.with_child_index(1),
@@ -1300,7 +1111,6 @@ pub fn function_element_svg(
             ),
             Variable::new_arc(
                 ConstructInfo::new(function_call_id.with_child_id(7), None, "ElementSvg[event]"),
-                construct_context.clone(),
                 "event",
                 event_actor,
                 scoped_id.with_child_index(7),
@@ -1312,7 +1122,6 @@ pub fn function_element_svg(
                     None,
                     "ElementSvg[settings]",
                 ),
-                construct_context.clone(),
                 "settings",
                 Object::new_arc_value_actor(
                     ConstructInfo::new(
@@ -1330,7 +1139,6 @@ pub fn function_element_svg(
                                 None,
                                 "ElementSvg[settings: [style]]",
                             ),
-                            construct_context.clone(),
                             "style",
                             argument_style.clone(),
                             scoped_id.with_child_index(4),
@@ -1342,7 +1150,6 @@ pub fn function_element_svg(
                                 None,
                                 "ElementSvg[settings: [children]]",
                             ),
-                            construct_context,
                             "children",
                             argument_children.clone(),
                             scoped_id.with_child_index(5),
@@ -1354,7 +1161,7 @@ pub fn function_element_svg(
                 actor_context.scope,
             ),
         ],
-    )
+    )))
 }
 
 /// ```text
@@ -1385,31 +1192,9 @@ pub fn function_element_svg_circle(
     };
     let scoped_id = function_call_persistence_id;
 
-    // Create a derived actor that extracts `event` from argument_element
-    let event_stream = stream::once({
-        let argument_element = argument_element.clone();
-        async move {
-            let element_value = argument_element.current_value().await.ok()?;
-            let event_variable = element_value.expect_object().variable("event")?;
-            Some(event_variable.value_actor().stream())
-        }
-    })
-    .filter_map(future::ready)
-    .flatten();
+    let event_actor = event_actor_from_constant_element(argument_element, actor_context.scope_id());
 
-    let event_actor = create_actor(
-        ConstructInfo::new(
-            function_call_id.with_child_id(8),
-            None,
-            "ElementSvgCircle[event] (derived)",
-        ),
-        actor_context.clone(),
-        TypedStream::infinite(event_stream.chain(stream::pending())),
-        PersistenceId::new(),
-        actor_context.scope_id(),
-    );
-
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -1425,7 +1210,6 @@ pub fn function_element_svg_circle(
                     None,
                     "ElementSvgCircle[element]",
                 ),
-                construct_context.clone(),
                 "element",
                 argument_element.clone(),
                 scoped_id.with_child_index(1),
@@ -1437,7 +1221,6 @@ pub fn function_element_svg_circle(
                     None,
                     "ElementSvgCircle[event]",
                 ),
-                construct_context.clone(),
                 "event",
                 event_actor,
                 scoped_id.with_child_index(9),
@@ -1449,7 +1232,6 @@ pub fn function_element_svg_circle(
                     None,
                     "ElementSvgCircle[settings]",
                 ),
-                construct_context.clone(),
                 "settings",
                 Object::new_arc_value_actor(
                     ConstructInfo::new(
@@ -1467,7 +1249,6 @@ pub fn function_element_svg_circle(
                                 None,
                                 "ElementSvgCircle[settings: [cx]]",
                             ),
-                            construct_context.clone(),
                             "cx",
                             argument_cx.clone(),
                             scoped_id.with_child_index(4),
@@ -1479,7 +1260,6 @@ pub fn function_element_svg_circle(
                                 None,
                                 "ElementSvgCircle[settings: [cy]]",
                             ),
-                            construct_context.clone(),
                             "cy",
                             argument_cy.clone(),
                             scoped_id.with_child_index(5),
@@ -1491,7 +1271,6 @@ pub fn function_element_svg_circle(
                                 None,
                                 "ElementSvgCircle[settings: [r]]",
                             ),
-                            construct_context.clone(),
                             "r",
                             argument_r.clone(),
                             scoped_id.with_child_index(6),
@@ -1503,7 +1282,6 @@ pub fn function_element_svg_circle(
                                 None,
                                 "ElementSvgCircle[settings: [style]]",
                             ),
-                            construct_context,
                             "style",
                             argument_style.clone(),
                             scoped_id.with_child_index(7),
@@ -1515,7 +1293,7 @@ pub fn function_element_svg_circle(
                 actor_context.scope,
             ),
         ],
-    )
+    )))
 }
 
 /// ```text
@@ -1537,36 +1315,9 @@ pub fn function_element_label(
     };
     let scoped_id = function_call_persistence_id;
 
-    // Create a derived actor that extracts `event` from argument_element
-    // This allows direct access via `.event` instead of `.element.event`
-    // Use current_value() since argument_element is a constant object that doesn't change
-    let event_stream = stream::once({
-        let argument_element = argument_element.clone();
-        async move {
-            // Get element value once (it's a constant argument)
-            let element_value = argument_element.current_value().await.ok()?;
-            // Extract the event variable
-            let event_variable = element_value.expect_object().variable("event")?;
-            // Subscribe to events using stream_safe() for cancellation safety
-            Some(event_variable.value_actor().stream())
-        }
-    })
-    .filter_map(future::ready)
-    .flatten();
+    let event_actor = event_actor_from_constant_element(argument_element, actor_context.scope_id());
 
-    let event_actor = create_actor(
-        ConstructInfo::new(
-            function_call_id.with_child_id(6),
-            None,
-            "ElementLabel[event] (derived)",
-        ),
-        actor_context.clone(),
-        TypedStream::infinite(event_stream.chain(stream::pending())),
-        PersistenceId::new(),
-        actor_context.scope_id(),
-    );
-
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -1582,7 +1333,6 @@ pub fn function_element_label(
                     None,
                     "ElementLabel[element]",
                 ),
-                construct_context.clone(),
                 "element",
                 argument_element.clone(),
                 scoped_id.with_child_index(1),
@@ -1594,7 +1344,6 @@ pub fn function_element_label(
                     None,
                     "ElementLabel[event]",
                 ),
-                construct_context.clone(),
                 "event",
                 event_actor,
                 scoped_id.with_child_index(7),
@@ -1606,7 +1355,6 @@ pub fn function_element_label(
                     None,
                     "ElementLabel[settings]",
                 ),
-                construct_context.clone(),
                 "settings",
                 Object::new_arc_value_actor(
                     ConstructInfo::new(
@@ -1624,7 +1372,6 @@ pub fn function_element_label(
                                 None,
                                 "ElementLabel[settings: [style]]",
                             ),
-                            construct_context.clone(),
                             "style",
                             argument_style.clone(),
                             scoped_id.with_child_index(4),
@@ -1636,7 +1383,6 @@ pub fn function_element_label(
                                 None,
                                 "ElementLabel[settings: [label]]",
                             ),
-                            construct_context,
                             "label",
                             argument_label.clone(),
                             scoped_id.with_child_index(5),
@@ -1648,7 +1394,7 @@ pub fn function_element_label(
                 actor_context.scope,
             ),
         ],
-    )
+    )))
 }
 
 /// ```text
@@ -1669,7 +1415,7 @@ pub fn function_element_paragraph(
         panic!("Element/paragraph expects 3 arguments")
     };
     let scoped_id = function_call_persistence_id;
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -1685,7 +1431,6 @@ pub fn function_element_paragraph(
                     None,
                     "ElementParagraph[element]",
                 ),
-                construct_context.clone(),
                 "element",
                 argument_element.clone(),
                 scoped_id.with_child_index(1),
@@ -1697,7 +1442,6 @@ pub fn function_element_paragraph(
                     None,
                     "ElementParagraph[settings]",
                 ),
-                construct_context.clone(),
                 "settings",
                 Object::new_arc_value_actor(
                     ConstructInfo::new(
@@ -1715,7 +1459,6 @@ pub fn function_element_paragraph(
                                 None,
                                 "ElementParagraph[settings: [style]]",
                             ),
-                            construct_context.clone(),
                             "style",
                             argument_style.clone(),
                             scoped_id.with_child_index(4),
@@ -1727,7 +1470,6 @@ pub fn function_element_paragraph(
                                 None,
                                 "ElementParagraph[settings: [contents]]",
                             ),
-                            construct_context,
                             "contents",
                             argument_contents.clone(),
                             scoped_id.with_child_index(5),
@@ -1739,7 +1481,7 @@ pub fn function_element_paragraph(
                 actor_context.scope,
             ),
         ],
-    )
+    )))
 }
 
 /// ```text
@@ -1769,7 +1511,7 @@ pub fn function_element_link(
         panic!("Element/link expects 5 arguments")
     };
     let scoped_id = function_call_persistence_id;
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -1785,7 +1527,6 @@ pub fn function_element_link(
                     None,
                     "ElementLink[element]",
                 ),
-                construct_context.clone(),
                 "element",
                 argument_element.clone(),
                 scoped_id.with_child_index(1),
@@ -1797,7 +1538,6 @@ pub fn function_element_link(
                     None,
                     "ElementLink[settings]",
                 ),
-                construct_context.clone(),
                 "settings",
                 Object::new_arc_value_actor(
                     ConstructInfo::new(
@@ -1815,7 +1555,6 @@ pub fn function_element_link(
                                 None,
                                 "ElementLink[settings: [style]]",
                             ),
-                            construct_context.clone(),
                             "style",
                             argument_style.clone(),
                             scoped_id.with_child_index(4),
@@ -1827,7 +1566,6 @@ pub fn function_element_link(
                                 None,
                                 "ElementLink[settings: [label]]",
                             ),
-                            construct_context.clone(),
                             "label",
                             argument_label.clone(),
                             scoped_id.with_child_index(5),
@@ -1839,7 +1577,6 @@ pub fn function_element_link(
                                 None,
                                 "ElementLink[settings: [to]]",
                             ),
-                            construct_context.clone(),
                             "to",
                             argument_to.clone(),
                             scoped_id.with_child_index(6),
@@ -1851,7 +1588,6 @@ pub fn function_element_link(
                                 None,
                                 "ElementLink[settings: [new_tab]]",
                             ),
-                            construct_context,
                             "new_tab",
                             argument_new_tab.clone(),
                             scoped_id.with_child_index(7),
@@ -1863,7 +1599,7 @@ pub fn function_element_link(
                 actor_context.scope,
             ),
         ],
-    )
+    )))
 }
 
 // @TODO refactor
@@ -2102,47 +1838,21 @@ pub fn function_timer_interval(
         panic!("Unexpected argument count")
     };
     let argument_duration_for_stream = argument_duration.clone();
-    let duration_stream = stream::once(async move {
-        argument_duration_for_stream
-            .stream()
-            .then(|value| async move {
-                let duration_object = value.expect_tagged_object("Duration");
-                if let Some(seconds) = duration_object.variable("seconds") {
-                    seconds
-                        .stream()
-                        .map(|value| value.expect_number().number() * 1000.0)
-                        .left_stream()
-                } else if let Some(milliseconds) = duration_object.variable("milliseconds") {
-                    milliseconds
-                        .stream()
-                        .map(|value| value.expect_number().number())
-                        .right_stream()
-                } else {
-                    panic!(
-                        "Failed to get property 'seconds' or 'milliseconds' from tagged object 'Duration'"
-                    );
-                }
-            })
-            .flatten()
-    })
-    .flatten()
-    .scan(None::<u32>, |last_ms, milliseconds| {
-        let normalized_ms = milliseconds.round().max(0.0).min(u32::MAX as f64) as u32;
-        if *last_ms == Some(normalized_ms) {
-            future::ready(Some(None))
-        } else {
-            *last_ms = Some(normalized_ms);
-            future::ready(Some(Some(normalized_ms)))
-        }
-    })
-    .filter_map(future::ready);
+    let duration_stream = duration_actor_current_and_future_ms(argument_duration_for_stream)
+        .scan(None::<u32>, |last_ms, milliseconds| {
+            let normalized_ms = milliseconds.round().max(0.0).min(u32::MAX as f64) as u32;
+            if *last_ms == Some(normalized_ms) {
+                future::ready(Some(None))
+            } else {
+                *last_ms = Some(normalized_ms);
+                future::ready(Some(Some(normalized_ms)))
+            }
+        })
+        .filter_map(future::ready);
 
     let (tick_sender, tick_receiver) = mpsc::channel::<Value>(16);
-    let driver_loop_holder: Arc<std::sync::OnceLock<ActorLoop>> =
-        Arc::new(std::sync::OnceLock::new());
-    let driver_loop_holder_for_stream = driver_loop_holder.clone();
 
-    let driver = ActorLoop::new(async move {
+    let driver = zoon::Task::start_droppable(async move {
         let mut tick_sender = tick_sender;
         let mut duration_stream = Box::pin(duration_stream.fuse());
         let mut current_milliseconds = None::<u32>;
@@ -2190,11 +1900,15 @@ pub fn function_timer_interval(
         }
     });
 
-    let _ = driver_loop_holder.set(driver);
-    tick_receiver.map(move |value| {
-        let _keepalive = &driver_loop_holder_for_stream;
-        value
-    })
+    stream::unfold(
+        (tick_receiver, driver),
+        |(mut receiver, driver)| async move {
+            receiver
+                .next()
+                .await
+                .map(|value| (value, (receiver, driver)))
+        },
+    )
 }
 
 // --- Text functions ---
@@ -2400,14 +2114,9 @@ pub fn function_text_starts_with(
         Text(String),
         Prefix(String),
     }
-    let text_stream = argument_text.clone().stream().map(|v| match &v {
-        Value::Text(t, _) => Input::Text(t.text().to_string()),
-        _ => panic!("Text/starts_with expects Text for first argument"),
-    });
-    let prefix_stream = argument_prefix.clone().stream().map(|v| match &v {
-        Value::Text(t, _) => Input::Prefix(t.text().to_string()),
-        _ => panic!("Text/starts_with expects Text for second argument"),
-    });
+    let text_stream = text_actor_current_and_future_strings(argument_text.clone()).map(Input::Text);
+    let prefix_stream =
+        text_actor_current_and_future_strings(argument_prefix.clone()).map(Input::Prefix);
     stream::select(text_stream, prefix_stream)
         .scan(
             (None::<String>, None::<String>, None::<bool>),
@@ -2581,6 +2290,103 @@ pub fn function_bool_or(
 
 // --- List functions ---
 
+fn list_actor_stream(list_actor: ActorHandle) -> LocalBoxStream<'static, Arc<List>> {
+    list_actor
+        .stream()
+        .filter_map(move |value| {
+            future::ready(match &value {
+                Value::List(list, _) => Some(list.clone()),
+                _ => None,
+            })
+        })
+        .boxed_local()
+}
+
+fn current_list_items_stream_from_actor(
+    list_actor: ActorHandle,
+) -> LocalBoxStream<'static, Vec<ActorHandle>> {
+    switch_map(list_actor_stream(list_actor), current_list_items_stream)
+}
+
+fn list_change_stream_from_actor(list_actor: ActorHandle) -> LocalBoxStream<'static, ListChange> {
+    switch_map(list_actor_stream(list_actor), |list| {
+        list.stream().boxed_local()
+    })
+}
+
+fn selected_list_item_stream(
+    list_actor: ActorHandle,
+    index_actor: ActorHandle,
+) -> LocalBoxStream<'static, Option<ActorHandle>> {
+    enum Input {
+        Items(Vec<ActorHandle>),
+        Index(Option<usize>),
+    }
+
+    let items_stream = current_list_items_stream_from_actor(list_actor).map(Input::Items);
+    let index_stream = number_actor_current_and_future_numbers(index_actor).map(|number| {
+        Input::Index(if number >= 1.0 {
+            Some((number as usize) - 1)
+        } else {
+            None
+        })
+    });
+
+    let selection_stream = stream::select(items_stream, index_stream)
+        .scan(
+            (None::<Vec<ActorHandle>>, None::<Option<usize>>),
+            |(items, index), input| {
+                match input {
+                    Input::Items(next_items) => *items = Some(next_items),
+                    Input::Index(next_index) => *index = Some(next_index),
+                }
+                future::ready(Some(match (items.as_ref(), *index) {
+                    (Some(current_items), Some(current_index)) => {
+                        Some(current_index.and_then(|idx| current_items.get(idx).cloned()))
+                    }
+                    _ => None,
+                }))
+            },
+        )
+        .filter_map(future::ready);
+
+    dedupe_selected_actor_stream(selection_stream)
+}
+
+fn list_length_stream(list_actor: ActorHandle) -> LocalBoxStream<'static, usize> {
+    current_list_items_stream_from_actor(list_actor)
+        .scan(None::<usize>, move |last_len, items| {
+            let current_len = items.len();
+            if *last_len == Some(current_len) {
+                future::ready(Some(None))
+            } else {
+                *last_len = Some(current_len);
+                future::ready(Some(Some(current_len)))
+            }
+        })
+        .filter_map(future::ready)
+        .boxed_local()
+}
+
+fn current_list_items_stream(list: Arc<List>) -> LocalBoxStream<'static, Vec<ActorHandle>> {
+    list.stream()
+        .scan(
+            (Vec::<ActorHandle>::new(), None::<Vec<ActorId>>),
+            |(items, last_key), change| {
+                change.apply_to_vec(items);
+                let current_key = items.iter().map(|item| item.actor_id()).collect::<Vec<_>>();
+                if last_key.as_ref() == Some(&current_key) {
+                    future::ready(Some(None))
+                } else {
+                    *last_key = Some(current_key);
+                    future::ready(Some(Some(items.clone())))
+                }
+            },
+        )
+        .filter_map(future::ready)
+        .boxed_local()
+}
+
 /// List/is_empty() -> Tag (True/False)
 /// Checks if the piped list is empty
 /// Deduplicated: only emits when the result actually changes
@@ -2591,44 +2397,18 @@ pub fn function_list_is_empty(
     construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let list_actor = arguments[0].clone();
-    let list_stream = list_actor.stream().filter_map(move |value| {
-        let result = match &value {
-            Value::List(list, _) => Some(list.clone()),
-            _ => None,
-        };
-        future::ready(result)
-    });
-    switch_map(list_stream, move |list| {
-        let construct_context = construct_context.clone();
-        let function_call_id = function_call_id.clone();
-        list.stream()
-            .scan(
-                (Vec::<ActorHandle>::new(), None::<bool>),
-                move |(items, last_result), change| {
-                    change.apply_to_vec(items);
-                    let current_result = items.is_empty();
-
-                    // Only emit when result actually changes
-                    if *last_result != Some(current_result) {
-                        *last_result = Some(current_result);
-                        let tag = if current_result { "True" } else { "False" };
-                        future::ready(Some(Some(Tag::new_value(
-                            ConstructInfo::new(
-                                function_call_id.with_child_id(0),
-                                None,
-                                "List/is_empty result",
-                            ),
-                            construct_context.clone(),
-                            ValueIdempotencyKey::new(),
-                            tag.to_string(),
-                        ))))
-                    } else {
-                        future::ready(Some(None))
-                    }
-                },
-            )
-            .filter_map(future::ready)
+    list_length_stream(arguments[0].clone()).map(move |current_len| {
+        let tag = if current_len == 0 { "True" } else { "False" };
+        Tag::new_value(
+            ConstructInfo::new(
+                function_call_id.with_child_id(0),
+                None,
+                "List/is_empty result",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            tag.to_string(),
+        )
     })
 }
 
@@ -2642,43 +2422,13 @@ pub fn function_list_count(
     construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let list_actor = arguments[0].clone();
-    let list_stream = list_actor.stream().filter_map(move |value| {
-        let result = match &value {
-            Value::List(list, _) => Some(list.clone()),
-            _ => None,
-        };
-        future::ready(result)
-    });
-    switch_map(list_stream, move |list| {
-        let construct_context = construct_context.clone();
-        let function_call_id = function_call_id.clone();
-        list.stream()
-            .scan(
-                (Vec::<ActorHandle>::new(), None::<usize>),
-                move |(items, last_count), change| {
-                    change.apply_to_vec(items);
-                    let current_count = items.len();
-
-                    // Only emit when count actually changes
-                    if *last_count != Some(current_count) {
-                        *last_count = Some(current_count);
-                        future::ready(Some(Some(Number::new_value(
-                            ConstructInfo::new(
-                                function_call_id.with_child_id(0),
-                                None,
-                                "List/count result",
-                            ),
-                            construct_context.clone(),
-                            ValueIdempotencyKey::new(),
-                            current_count as f64,
-                        ))))
-                    } else {
-                        future::ready(Some(None))
-                    }
-                },
-            )
-            .filter_map(future::ready)
+    list_length_stream(arguments[0].clone()).map(move |current_len| {
+        Number::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "List/count result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            current_len as f64,
+        )
     })
 }
 
@@ -2692,44 +2442,18 @@ pub fn function_list_is_not_empty(
     construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let list_actor = arguments[0].clone();
-    let list_stream = list_actor.stream().filter_map(move |value| {
-        let result = match &value {
-            Value::List(list, _) => Some(list.clone()),
-            _ => None,
-        };
-        future::ready(result)
-    });
-    switch_map(list_stream, move |list| {
-        let construct_context = construct_context.clone();
-        let function_call_id = function_call_id.clone();
-        list.stream()
-            .scan(
-                (Vec::<ActorHandle>::new(), None::<bool>),
-                move |(items, last_result), change| {
-                    change.apply_to_vec(items);
-                    let current_result = !items.is_empty();
-
-                    // Only emit when result actually changes
-                    if *last_result != Some(current_result) {
-                        *last_result = Some(current_result);
-                        let tag = if current_result { "True" } else { "False" };
-                        future::ready(Some(Some(Tag::new_value(
-                            ConstructInfo::new(
-                                function_call_id.with_child_id(0),
-                                None,
-                                "List/is_not_empty result",
-                            ),
-                            construct_context.clone(),
-                            ValueIdempotencyKey::new(),
-                            tag.to_string(),
-                        ))))
-                    } else {
-                        future::ready(Some(None))
-                    }
-                },
-            )
-            .filter_map(future::ready)
+    list_length_stream(arguments[0].clone()).map(move |current_len| {
+        let tag = if current_len == 0 { "False" } else { "True" };
+        Tag::new_value(
+            ConstructInfo::new(
+                function_call_id.with_child_id(0),
+                None,
+                "List/is_not_empty result",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            tag.to_string(),
+        )
     })
 }
 
@@ -2761,7 +2485,6 @@ pub fn function_list_append(
     // We use scan to ensure proper ordering: buffer append changes until
     // after the first list change arrives.
     let change_stream = {
-        let function_call_id_for_append = function_call_id.clone();
         let actor_context_for_append = actor_context.clone();
 
         // Tag changes with their source so we can ensure proper ordering
@@ -2770,32 +2493,17 @@ pub fn function_list_append(
             FromAppend(ListChange),
         }
 
-        let list_changes = list_actor
-            .clone()
-            .stream()
-            .filter_map(|value| {
-                future::ready(match value {
-                    Value::List(list, _) => Some(list),
-                    _ => None,
-                })
-            })
-            .flat_map(|list| list.stream())
-            .map(TaggedChange::FromList);
+        let list_changes =
+            list_change_stream_from_actor(list_actor.clone()).map(TaggedChange::FromList);
 
         let append_changes = item_actor.clone().stream().map(move |value| {
             // When item stream produces a value, create a new constant ValueActor
             // containing that specific value and push it.
             // Note: SKIP is not a Value - it's a stream behavior where streams end without
             // producing values. If item is SKIP, this map closure is never called.
-            let new_item_actor = create_actor(
-                ConstructInfo::new(
-                    function_call_id_for_append.with_child_id("appended_item"),
-                    None,
-                    "List/append appended item",
-                ),
-                actor_context_for_append.clone(),
-                constant(value),
+            let new_item_actor = create_constant_actor(
                 PersistenceId::new(),
+                value,
                 actor_context_for_append.scope_id(),
             );
             TaggedChange::FromAppend(ListChange::Push {
@@ -2852,10 +2560,10 @@ pub fn function_list_append(
         (list_actor, item_actor),
     );
 
-    constant(Value::List(
+    stream::once(future::ready(Value::List(
         Arc::new(list),
         ValueMetadata::new(ValueIdempotencyKey::new()),
-    ))
+    )))
     .right_stream()
 }
 
@@ -2888,16 +2596,10 @@ pub fn function_list_clear(
             Clear,
         }
 
-        let list_changes = list_actor
-            .clone()
-            .stream()
-            .filter_map(|value| {
-                future::ready(match value {
-                    Value::List(list, _) => Some(list),
-                    _ => None,
-                })
+        let list_changes = current_list_items_stream_from_actor(list_actor.clone())
+            .map(|items| ListChange::Replace {
+                items: Arc::from(items),
             })
-            .flat_map(|list| list.stream())
             .map(TaggedChange::FromList);
 
         // When trigger stream emits any value, emit Clear
@@ -2908,70 +2610,41 @@ pub fn function_list_clear(
 
         // Merge both streams, use scan for proper ordering
         stream::select(list_changes, clear_changes)
-            .scan(
-                (false, false, Vec::<ActorHandle>::new()),
-                |state, tagged_change| {
-                    let (has_received_first, has_pending_clear, tracked_items) = state;
+            .scan((None::<Vec<ActorHandle>>, false), |state, tagged_change| {
+                let (tracked_items, has_pending_clear) = state;
 
-                    let changes_to_emit = match tagged_change {
-                        TaggedChange::FromList(change) => {
-                            // Update tracked items based on the change
-                            match &change {
-                                ListChange::Replace { items } => {
-                                    *tracked_items = items.to_vec();
-                                }
-                                ListChange::Push { item } => {
-                                    tracked_items.push(item.clone());
-                                }
-                                ListChange::Pop => {
-                                    tracked_items.pop();
-                                }
-                                ListChange::Clear => {
-                                    tracked_items.clear();
-                                }
-                                ListChange::Remove { id } => {
-                                    if let Some(pos) =
-                                        tracked_items.iter().position(|i| i.persistence_id() == *id)
-                                    {
-                                        tracked_items.remove(pos);
-                                    }
-                                }
-                                _ => {}
+                let changes_to_emit = match tagged_change {
+                    TaggedChange::FromList(ListChange::Replace { items }) => {
+                        *tracked_items = Some(items.to_vec());
+                        if *has_pending_clear {
+                            *has_pending_clear = false;
+                            if let Some(current_items) = tracked_items.as_mut() {
+                                clear_source_storage_for_items(current_items);
+                                current_items.clear();
                             }
-
-                            if !*has_received_first {
-                                *has_received_first = true;
-                                // First list change - emit it plus pending clear if any
-                                if *has_pending_clear {
-                                    *has_pending_clear = false;
-                                    // Clear storage for tracked items
-                                    clear_source_storage_for_items(tracked_items);
-                                    tracked_items.clear();
-                                    vec![change, ListChange::Clear]
-                                } else {
-                                    vec![change]
-                                }
-                            } else {
-                                vec![change]
-                            }
+                            vec![ListChange::Replace { items }, ListChange::Clear]
+                        } else {
+                            vec![ListChange::Replace { items }]
                         }
-                        TaggedChange::Clear => {
-                            if *has_received_first {
-                                // Clear storage for tracked items
-                                clear_source_storage_for_items(tracked_items);
-                                tracked_items.clear();
-                                vec![ListChange::Clear]
-                            } else {
-                                // Buffer the clear until first list change arrives
-                                *has_pending_clear = true;
-                                vec![]
-                            }
+                    }
+                    TaggedChange::FromList(_) => {
+                        unreachable!("list snapshot feed only emits Replace")
+                    }
+                    TaggedChange::Clear => {
+                        if let Some(current_items) = tracked_items.as_mut() {
+                            clear_source_storage_for_items(current_items);
+                            current_items.clear();
+                            vec![ListChange::Clear]
+                        } else {
+                            // Buffer the clear until first list change arrives
+                            *has_pending_clear = true;
+                            vec![]
                         }
-                    };
+                    }
+                };
 
-                    future::ready(Some(changes_to_emit))
-                },
-            )
+                future::ready(Some(changes_to_emit))
+            })
             .flat_map(|changes| stream::iter(changes))
     };
 
@@ -2984,10 +2657,10 @@ pub fn function_list_clear(
         function_call_persistence_id,
     );
 
-    constant(Value::List(
+    stream::once(future::ready(Value::List(
         Arc::new(list),
         ValueMetadata::new(ValueIdempotencyKey::new()),
-    ))
+    )))
     .right_stream()
 }
 
@@ -3027,24 +2700,14 @@ pub fn function_list_last(
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
     // Get the last item's ActorHandle, re-emitting whenever the list changes
-    let last_item_stream = switch_map(
-        list_actor.stream().filter_map(|value| {
-            future::ready(match value {
-                Value::List(list, _) => Some(list),
-                _ => None,
-            })
-        }),
-        |list| {
-            list.stream()
-                .scan(Vec::<ActorHandle>::new(), |items, change| {
-                    change.apply_to_vec(items);
-                    future::ready(Some(items.last().cloned()))
-                })
-                .filter_map(future::ready)
-        },
+    let last_item_stream = dedupe_selected_actor_stream(
+        current_list_items_stream_from_actor(list_actor).map(|items| items.last().cloned()),
     );
     // switch_map: when the last item changes identity, cancel old subscription and start new
-    switch_map(last_item_stream, |actor| actor.stream())
+    switch_map(last_item_stream, |item_opt| match item_opt {
+        Some(actor) => actor.current_or_future_stream(),
+        None => stream::empty().boxed_local(),
+    })
 }
 
 /// List/remove_last() -> List
@@ -3073,16 +2736,10 @@ pub fn function_list_remove_last(
             RemoveLast,
         }
 
-        let list_changes = list_actor
-            .clone()
-            .stream()
-            .filter_map(|value| {
-                future::ready(match value {
-                    Value::List(list, _) => Some(list),
-                    _ => None,
-                })
+        let list_changes = current_list_items_stream_from_actor(list_actor.clone())
+            .map(|items| ListChange::Replace {
+                items: Arc::from(items),
             })
-            .flat_map(|list| list.stream())
             .map(TaggedChange::FromList);
 
         let remove_changes = trigger_actor
@@ -3091,48 +2748,50 @@ pub fn function_list_remove_last(
             .map(|_value| TaggedChange::RemoveLast);
 
         stream::select(list_changes, remove_changes)
-            .scan(
-                (false, false, Vec::<ActorHandle>::new()),
-                |state, tagged_change| {
-                    let (has_received_first, has_pending_remove, tracked_items) = state;
+            .scan((None::<Vec<ActorHandle>>, false), |state, tagged_change| {
+                let (tracked_items, has_pending_remove) = state;
 
-                    let change_to_emit = match tagged_change {
-                        TaggedChange::FromList(change) => {
-                            change.clone().apply_to_vec(tracked_items);
-                            if !*has_received_first {
-                                *has_received_first = true;
-                                // If we had a pending remove, apply it now
-                                if *has_pending_remove {
-                                    *has_pending_remove = false;
-                                    if !tracked_items.is_empty() {
-                                        tracked_items.pop();
-                                        Some(vec![change, ListChange::Pop])
-                                    } else {
-                                        Some(vec![change])
-                                    }
+                let change_to_emit = match tagged_change {
+                    TaggedChange::FromList(ListChange::Replace { items }) => {
+                        *tracked_items = Some(items.to_vec());
+                        if *has_pending_remove {
+                            *has_pending_remove = false;
+                            if let Some(current_items) = tracked_items.as_mut() {
+                                if !current_items.is_empty() {
+                                    current_items.pop();
+                                    Some(vec![ListChange::Replace { items }, ListChange::Pop])
                                 } else {
-                                    Some(vec![change])
+                                    Some(vec![ListChange::Replace { items }])
                                 }
                             } else {
-                                Some(vec![change])
+                                Some(vec![ListChange::Replace { items }])
                             }
+                        } else {
+                            Some(vec![ListChange::Replace { items }])
                         }
-                        TaggedChange::RemoveLast => {
-                            if !*has_received_first {
-                                *has_pending_remove = true;
-                                None
-                            } else if !tracked_items.is_empty() {
-                                tracked_items.pop();
-                                Some(vec![ListChange::Pop])
-                            } else {
-                                None
-                            }
+                    }
+                    TaggedChange::FromList(_) => {
+                        unreachable!("list snapshot feed only emits Replace")
+                    }
+                    TaggedChange::RemoveLast => {
+                        if tracked_items.is_none() {
+                            *has_pending_remove = true;
+                            None
+                        } else {
+                            tracked_items.as_mut().and_then(|current_items| {
+                                if !current_items.is_empty() {
+                                    current_items.pop();
+                                    Some(vec![ListChange::Pop])
+                                } else {
+                                    None
+                                }
+                            })
                         }
-                    };
+                    }
+                };
 
-                    future::ready(Some(change_to_emit))
-                },
-            )
+                future::ready(Some(change_to_emit))
+            })
             .filter_map(future::ready)
             .flat_map(stream::iter)
     };
@@ -3150,10 +2809,10 @@ pub fn function_list_remove_last(
         function_call_persistence_id,
     );
 
-    constant(Value::List(
+    stream::once(future::ready(Value::List(
         Arc::new(list),
         ValueMetadata::new(ValueIdempotencyKey::new()),
-    ))
+    )))
     .right_stream()
 }
 
@@ -3162,41 +2821,24 @@ pub fn function_list_remove_last(
 /// Returns the value from the stream that most recently produced
 pub fn function_list_latest(
     arguments: Arc<Vec<ActorHandle>>,
-    function_call_id: ConstructId,
+    _function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
-    construct_context: ConstructContext,
+    _construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
 
-    let items_stream = switch_map(
-        list_actor.stream().filter_map(|value| {
-            future::ready(match value {
-                Value::List(list, _) => Some(list),
-                _ => None,
-            })
-        }),
-        move |list| {
-            let _construct_context = construct_context.clone();
-            let _function_call_id = function_call_id.clone();
-
-            list.stream()
-                .scan(Vec::<ActorHandle>::new(), move |items, change| {
-                    change.apply_to_vec(items);
-                    future::ready(Some(items.clone()))
-                })
-        },
-    );
+    let items_stream = current_list_items_stream_from_actor(list_actor);
 
     switch_map(items_stream, move |items| {
         if items.is_empty() {
-            stream::pending().boxed_local()
+            stream::empty().boxed_local()
         } else {
             let streams: Vec<_> = items.into_iter().map(|item| item.stream()).collect();
             stream::select_all(streams)
                 .ready_chunks(16)
                 .flat_map(|mut chunk| {
-                    chunk.sort_by_key(|value| value.lamport_time());
+                    chunk.sort_by_key(|value| value.emission_seq());
                     stream::iter(chunk)
                 })
                 .boxed_local()
@@ -3433,25 +3075,108 @@ fn resolve_actor_value_for_log(
     timeout_ms: u32,
 ) -> Pin<Box<dyn Future<Output = String>>> {
     Box::pin(async move {
-        use zoon::futures_util::StreamExt;
-
-        // Race subscription against timeout
-        let get_value = async { actor.stream().next().await };
-        let timeout = Timer::sleep(timeout_ms);
-
-        select! {
-            value = get_value.fuse() => {
-                if let Some(value) = value {
-                    resolve_value_for_log(value, timeout_ms).await
-                } else {
-                    "?".to_string()
+        match actor.current_value() {
+            Ok(value) => resolve_value_for_log(value, timeout_ms).await,
+            Err(CurrentValueError::ActorDropped) => "?".to_string(),
+            Err(CurrentValueError::NoValueYet) => {
+                let timeout = Timer::sleep(timeout_ms);
+                select! {
+                    value = actor.value().fuse() => {
+                        match value {
+                            Ok(value) => resolve_value_for_log(value, timeout_ms).await,
+                            Err(_) => "?".to_string(),
+                        }
+                    }
+                    _ = timeout.fuse() => {
+                        "?".to_string()
+                    }
                 }
-            }
-            _ = timeout.fuse() => {
-                "?".to_string()
             }
         }
     })
+}
+
+async fn actor_current_value_or_wait(actor: &ActorHandle) -> Option<Value> {
+    match actor.current_value() {
+        Ok(value) => Some(value),
+        Err(CurrentValueError::NoValueYet) => actor.value().await.ok(),
+        Err(CurrentValueError::ActorDropped) => None,
+    }
+}
+
+fn extract_duration_ms_from_value_now(value: &Value) -> f64 {
+    let duration_object = value.clone().expect_tagged_object("Duration");
+    if let Some(seconds) = duration_object.variable("seconds") {
+        if let Ok(value) = seconds.value_actor().current_value() {
+            return value.expect_number().number() * 1000.0;
+        }
+    }
+    if let Some(ms) = duration_object.variable("ms") {
+        if let Ok(value) = ms.value_actor().current_value() {
+            return value.expect_number().number();
+        }
+    }
+    if let Some(milliseconds) = duration_object.variable("milliseconds") {
+        if let Ok(value) = milliseconds.value_actor().current_value() {
+            return value.expect_number().number();
+        }
+    }
+    0.0
+}
+
+fn duration_value_current_and_future_ms(value: Value) -> LocalBoxStream<'static, f64> {
+    let duration_object = value.expect_tagged_object("Duration");
+    if let Some(seconds) = duration_object.variable("seconds") {
+        seconds
+            .value_actor()
+            .current_or_future_stream()
+            .map(|value| value.expect_number().number() * 1000.0)
+            .boxed_local()
+    } else if let Some(milliseconds) = duration_object.variable("milliseconds") {
+        milliseconds
+            .value_actor()
+            .current_or_future_stream()
+            .map(|value| value.expect_number().number())
+            .boxed_local()
+    } else {
+        panic!("Failed to get property 'seconds' or 'milliseconds' from tagged object 'Duration'");
+    }
+}
+
+fn duration_actor_current_and_future_ms(
+    duration_actor: ActorHandle,
+) -> LocalBoxStream<'static, f64> {
+    duration_actor
+        .current_or_future_stream()
+        .map(duration_value_current_and_future_ms)
+        .flatten()
+        .boxed_local()
+}
+
+fn count_actor_current_and_future_values(
+    count_actor: ActorHandle,
+) -> LocalBoxStream<'static, Value> {
+    count_actor.current_or_future_stream()
+}
+
+fn text_actor_current_and_future_strings(actor: ActorHandle) -> LocalBoxStream<'static, String> {
+    actor
+        .current_or_future_stream()
+        .map(|value| match &value {
+            Value::Text(text, _) => text.text().to_string(),
+            _ => panic!("expected Text value"),
+        })
+        .boxed_local()
+}
+
+fn number_actor_current_and_future_numbers(actor: ActorHandle) -> LocalBoxStream<'static, f64> {
+    actor
+        .current_or_future_stream()
+        .map(|value| match &value {
+            Value::Number(number, _) => number.number(),
+            _ => panic!("expected Number value"),
+        })
+        .boxed_local()
 }
 
 /// Resolve a value for logging with a specific timeout.
@@ -3465,12 +3190,10 @@ async fn resolve_value_for_log_with_timeout(value: Value, timeout_ms: u32) -> St
 /// - 'timeout': Duration[seconds: N] or Duration[milliseconds: N] for nested value resolution
 /// Returns LogOptions with defaults if fields are not present.
 async fn extract_log_options_from_with(with_actor: ActorHandle) -> LogOptions {
-    use zoon::futures_util::StreamExt;
-
     let mut options = LogOptions::default();
 
     // Get the 'with' object value
-    let with_value = match with_actor.stream().next().await {
+    let with_value = match actor_current_value_or_wait(&with_actor).await {
         Some(v) => v,
         None => return options,
     };
@@ -3479,26 +3202,28 @@ async fn extract_log_options_from_with(with_actor: ActorHandle) -> LogOptions {
     if let Value::Object(obj, _) = with_value {
         // Extract label
         if let Some(label_var) = obj.variable("label") {
-            if let Some(label_value) = label_var.value_actor().stream().next().await {
+            if let Some(label_value) = actor_current_value_or_wait(&label_var.value_actor()).await {
                 options.label = Some(resolve_value_for_log(label_value, options.timeout_ms).await);
             }
         }
 
         // Extract timeout from Duration[seconds: N] or Duration[milliseconds: N]
         if let Some(timeout_var) = obj.variable("timeout") {
-            if let Some(timeout_value) = timeout_var.value_actor().stream().next().await {
+            if let Some(timeout_value) =
+                actor_current_value_or_wait(&timeout_var.value_actor()).await
+            {
                 if let Value::TaggedObject(tagged, _) = timeout_value {
                     if tagged.tag() == "Duration" {
                         if let Some(seconds_var) = tagged.variable("seconds") {
                             if let Some(Value::Number(num, _)) =
-                                seconds_var.value_actor().stream().next().await
+                                actor_current_value_or_wait(&seconds_var.value_actor()).await
                             {
                                 options.timeout_ms =
                                     (num.number() * 1000.0).max(0.0).min(u32::MAX as f64) as u32;
                             }
                         } else if let Some(milliseconds_var) = tagged.variable("milliseconds") {
                             if let Some(Value::Number(num, _)) =
-                                milliseconds_var.value_actor().stream().next().await
+                                actor_current_value_or_wait(&milliseconds_var.value_actor()).await
                             {
                                 options.timeout_ms =
                                     num.number().max(0.0).min(u32::MAX as f64) as u32;
@@ -3533,8 +3258,8 @@ pub fn function_log_info(
     // Create a bounded channel for log requests - actor model compliant pattern
     let (log_sender, log_receiver) = mpsc::channel::<(Value, Option<ActorHandle>)>(16);
 
-    // Create an ActorLoop that processes log messages
-    let log_actor = ActorLoop::new(async move {
+    // Create a retained task that processes log messages
+    let log_actor = zoon::Task::start_droppable(async move {
         let mut receiver = log_receiver;
         while let Some((value, with_actor)) = receiver.next().await {
             // Extract options (label and timeout) from 'with' object
@@ -3555,37 +3280,18 @@ pub fn function_log_info(
         }
     });
 
-    // Use unfold to emit values while keeping the log actor alive
-    let value_stream = value_actor.stream();
-    stream::unfold(
-        (value_stream.boxed_local(), log_sender, Some(log_actor)),
-        move |(mut stream, mut sender, actor)| {
-            let with_actor = with_actor.clone();
-            async move {
-                if let Some(value) = stream.next().await {
-                    // Send log request to the actor (backpressure if channel full)
-                    if sender.send((value.clone(), with_actor)).await.is_err() {
-                        zoon::eprintln!("[Log/info] Failed to send log request - receiver dropped");
-                    }
-                    Some((value, (stream, sender, actor)))
-                } else {
-                    // Input stream ended - keep actor alive with pending
-                    let _keep_alive = &actor;
-                    future::pending::<
-                        Option<(
-                            Value,
-                            (
-                                LocalBoxStream<'static, Value>,
-                                mpsc::Sender<(Value, Option<ActorHandle>)>,
-                                Option<ActorLoop>,
-                            ),
-                        )>,
-                    >()
-                    .await
-                }
+    value_actor.stream().then(move |value| {
+        let mut sender = log_sender.clone();
+        let with_actor = with_actor.clone();
+        let _log_actor = &log_actor;
+        async move {
+            // Send log request to the actor (backpressure if channel full)
+            if sender.send((value.clone(), with_actor)).await.is_err() {
+                zoon::eprintln!("[Log/info] Failed to send log request - receiver dropped");
             }
-        },
-    )
+            value
+        }
+    })
 }
 
 /// Log/error(value: T) -> T
@@ -3608,8 +3314,8 @@ pub fn function_log_error(
     // Create a bounded channel for log requests - actor model compliant pattern
     let (log_sender, log_receiver) = mpsc::channel::<(Value, Option<ActorHandle>)>(16);
 
-    // Create an ActorLoop that processes log messages
-    let log_actor = ActorLoop::new(async move {
+    // Create a retained task that processes log messages
+    let log_actor = zoon::Task::start_droppable(async move {
         let mut receiver = log_receiver;
         while let Some((value, with_actor)) = receiver.next().await {
             // Extract options (label and timeout) from 'with' object
@@ -3630,39 +3336,18 @@ pub fn function_log_error(
         }
     });
 
-    // Use unfold to emit values while keeping the log actor alive
-    let value_stream = value_actor.stream();
-    stream::unfold(
-        (value_stream.boxed_local(), log_sender, Some(log_actor)),
-        move |(mut stream, mut sender, actor)| {
-            let with_actor = with_actor.clone();
-            async move {
-                if let Some(value) = stream.next().await {
-                    // Send log request to the actor (backpressure if channel full)
-                    if sender.send((value.clone(), with_actor)).await.is_err() {
-                        zoon::eprintln!(
-                            "[Log/error] Failed to send log request - receiver dropped"
-                        );
-                    }
-                    Some((value, (stream, sender, actor)))
-                } else {
-                    // Input stream ended - keep actor alive with pending
-                    let _keep_alive = &actor;
-                    future::pending::<
-                        Option<(
-                            Value,
-                            (
-                                LocalBoxStream<'static, Value>,
-                                mpsc::Sender<(Value, Option<ActorHandle>)>,
-                                Option<ActorLoop>,
-                            ),
-                        )>,
-                    >()
-                    .await
-                }
+    value_actor.stream().then(move |value| {
+        let mut sender = log_sender.clone();
+        let with_actor = with_actor.clone();
+        let _log_actor = &log_actor;
+        async move {
+            // Send log request to the actor (backpressure if channel full)
+            if sender.send((value.clone(), with_actor)).await.is_err() {
+                zoon::eprintln!("[Log/error] Failed to send log request - receiver dropped");
             }
-        },
-    )
+            value
+        }
+    })
 }
 
 // --- Build functions ---
@@ -3736,7 +3421,6 @@ pub fn function_element_text(
                 None,
                 "ElementText[element]",
             ),
-            construct_context.clone(),
             "element",
             argument_element.clone(),
             scoped_id.with_child_index(1),
@@ -3750,7 +3434,6 @@ pub fn function_element_text(
             None,
             "ElementText[settings]",
         ),
-        construct_context.clone(),
         "settings",
         Object::new_arc_value_actor(
             ConstructInfo::new(
@@ -3768,7 +3451,6 @@ pub fn function_element_text(
                         None,
                         "ElementText[settings: [style]]",
                     ),
-                    construct_context.clone(),
                     "style",
                     argument_style.clone(),
                     scoped_id.with_child_index(4),
@@ -3780,7 +3462,6 @@ pub fn function_element_text(
                         None,
                         "ElementText[settings: [text]]",
                     ),
-                    construct_context.clone(),
                     "text",
                     argument_text.clone(),
                     scoped_id.with_child_index(5),
@@ -3792,7 +3473,7 @@ pub fn function_element_text(
         actor_context.scope,
     ));
 
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -3802,7 +3483,7 @@ pub fn function_element_text(
         ValueIdempotencyKey::new(),
         "ElementText",
         vars,
-    )
+    )))
 }
 
 /// Element/block(element?, style, child) -> ElementBlock[settings[element, style, child]]
@@ -3830,7 +3511,6 @@ pub fn function_element_block(
                 None,
                 "ElementBlock[element]",
             ),
-            construct_context.clone(),
             "element",
             argument_element.clone(),
             scoped_id.with_child_index(1),
@@ -3844,7 +3524,6 @@ pub fn function_element_block(
             None,
             "ElementBlock[settings]",
         ),
-        construct_context.clone(),
         "settings",
         Object::new_arc_value_actor(
             ConstructInfo::new(
@@ -3862,7 +3541,6 @@ pub fn function_element_block(
                         None,
                         "ElementBlock[settings: [style]]",
                     ),
-                    construct_context.clone(),
                     "style",
                     argument_style.clone(),
                     scoped_id.with_child_index(4),
@@ -3874,7 +3552,6 @@ pub fn function_element_block(
                         None,
                         "ElementBlock[settings: [child]]",
                     ),
-                    construct_context.clone(),
                     "child",
                     argument_child.clone(),
                     scoped_id.with_child_index(5),
@@ -3886,7 +3563,7 @@ pub fn function_element_block(
         actor_context.scope,
     ));
 
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -3896,7 +3573,7 @@ pub fn function_element_block(
         ValueIdempotencyKey::new(),
         "ElementBlock",
         vars,
-    )
+    )))
 }
 
 // --- Scene functions ---
@@ -3928,7 +3605,6 @@ pub fn function_scene_new(
             None,
             "Scene/new(..) -> [root_element]",
         ),
-        construct_context.clone(),
         "root_element",
         argument_root.clone(),
         scoped_id.with_child_index(1),
@@ -3942,7 +3618,6 @@ pub fn function_scene_new(
                 None,
                 "Scene/new(..) -> [lights]",
             ),
-            construct_context.clone(),
             "lights",
             argument_lights.clone(),
             scoped_id.with_child_index(2),
@@ -3957,7 +3632,6 @@ pub fn function_scene_new(
                 None,
                 "Scene/new(..) -> [geometry]",
             ),
-            construct_context.clone(),
             "geometry",
             argument_geometry.clone(),
             scoped_id.with_child_index(3),
@@ -3965,7 +3639,7 @@ pub fn function_scene_new(
         ));
     }
 
-    Object::new_constant(
+    stream::once(future::ready(Object::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -3974,7 +3648,7 @@ pub fn function_scene_new(
         construct_context,
         ValueIdempotencyKey::new(),
         vars,
-    )
+    )))
 }
 
 // --- Light functions ---
@@ -4000,7 +3674,7 @@ pub fn function_light_directional(
     };
     let scoped_id = function_call_persistence_id;
 
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -4016,7 +3690,6 @@ pub fn function_light_directional(
                     None,
                     "DirectionalLight[azimuth]",
                 ),
-                construct_context.clone(),
                 "azimuth",
                 arg_azimuth.clone(),
                 scoped_id.with_child_index(1),
@@ -4028,7 +3701,6 @@ pub fn function_light_directional(
                     None,
                     "DirectionalLight[altitude]",
                 ),
-                construct_context.clone(),
                 "altitude",
                 arg_altitude.clone(),
                 scoped_id.with_child_index(2),
@@ -4040,7 +3712,6 @@ pub fn function_light_directional(
                     None,
                     "DirectionalLight[spread]",
                 ),
-                construct_context.clone(),
                 "spread",
                 arg_spread.clone(),
                 scoped_id.with_child_index(3),
@@ -4052,7 +3723,6 @@ pub fn function_light_directional(
                     None,
                     "DirectionalLight[intensity]",
                 ),
-                construct_context.clone(),
                 "intensity",
                 arg_intensity.clone(),
                 scoped_id.with_child_index(4),
@@ -4064,14 +3734,13 @@ pub fn function_light_directional(
                     None,
                     "DirectionalLight[color]",
                 ),
-                construct_context,
                 "color",
                 arg_color.clone(),
                 scoped_id.with_child_index(5),
                 actor_context.scope,
             ),
         ],
-    )
+    )))
 }
 
 /// Light/ambient(intensity, color) -> AmbientLight[...]
@@ -4088,7 +3757,7 @@ pub fn function_light_ambient(
     };
     let scoped_id = function_call_persistence_id;
 
-    TaggedObject::new_constant(
+    stream::once(future::ready(TaggedObject::new_value(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
@@ -4104,7 +3773,6 @@ pub fn function_light_ambient(
                     None,
                     "AmbientLight[intensity]",
                 ),
-                construct_context.clone(),
                 "intensity",
                 arg_intensity.clone(),
                 scoped_id.with_child_index(1),
@@ -4116,14 +3784,13 @@ pub fn function_light_ambient(
                     None,
                     "AmbientLight[color]",
                 ),
-                construct_context,
                 "color",
                 arg_color.clone(),
                 scoped_id.with_child_index(2),
                 actor_context.scope,
             ),
         ],
-    )
+    )))
 }
 
 // --- Theme functions ---
@@ -4320,7 +3987,7 @@ pub fn function_stream_skip(
         };
         let mut count_sub = match count_sub_opt {
             Some(s) => s,
-            None => count_actor.clone().stream().boxed_local().fuse(),
+            None => count_actor_current_and_future_values(count_actor.clone()).fuse(),
         };
 
         loop {
@@ -4464,7 +4131,7 @@ pub fn function_stream_take(
         };
         let mut count_sub = match count_sub_opt {
             Some(s) => s,
-            None => count_actor.clone().stream().boxed_local().fuse(),
+            None => count_actor_current_and_future_values(count_actor.clone()).fuse(),
         };
 
         loop {
@@ -4616,8 +4283,7 @@ pub fn function_stream_pulses(
     };
 
     // Subscribe to count actor and generate pulses for each count value
-    count_actor
-        .stream()
+    count_actor_current_and_future_values(count_actor)
         .flat_map(move |v| stream::iter(make_pulses(&v)))
 }
 
@@ -4639,35 +4305,12 @@ pub fn function_stream_debounce(
     let stream_actor = arguments[0].clone();
     let duration_actor = arguments[1].clone();
 
-    // Helper to extract milliseconds from Duration tagged object
-    fn extract_duration_ms(value: &Value) -> f64 {
-        let duration_object = value.clone().expect_tagged_object("Duration");
-        if let Some(seconds) = duration_object.variable("seconds") {
-            let mut sub = seconds.value_actor().stream();
-            if let Some(value) = sub.next().now_or_never().flatten() {
-                return value.expect_number().number() * 1000.0;
-            }
-        }
-        if let Some(ms) = duration_object.variable("ms") {
-            let mut sub = ms.value_actor().stream();
-            if let Some(value) = sub.next().now_or_never().flatten() {
-                return value.expect_number().number();
-            }
-        }
-        if let Some(milliseconds) = duration_object.variable("milliseconds") {
-            let mut sub = milliseconds.value_actor().stream();
-            if let Some(value) = sub.next().now_or_never().flatten() {
-                return value.expect_number().number();
-            }
-        }
-        0.0
-    }
-
     // State type for unfold
-    type FusedSub = stream::Fuse<LocalBoxStream<'static, Value>>;
+    type InputSub = stream::Fuse<LocalBoxStream<'static, Value>>;
+    type DurationSub = stream::Fuse<LocalBoxStream<'static, f64>>;
     type DebounceState = (
-        Option<FusedSub>,
-        Option<FusedSub>,
+        Option<InputSub>,
+        Option<DurationSub>,
         ActorHandle,
         ActorHandle,
         Option<Value>,
@@ -4694,7 +4337,7 @@ pub fn function_stream_debounce(
         };
         let mut duration_stream = match duration_opt {
             Some(s) => s,
-            None => duration_actor.clone().stream().boxed_local().fuse(),
+            None => duration_actor_current_and_future_ms(duration_actor.clone()).fuse(),
         };
 
         loop {
@@ -4721,8 +4364,8 @@ pub fn function_stream_debounce(
                         }
                     }
                     new_duration = duration_stream.next() => {
-                        if let Some(duration_value) = new_duration {
-                            duration_ms = extract_duration_ms(&duration_value);
+                        if let Some(next_duration_ms) = new_duration {
+                            duration_ms = next_duration_ms;
                         }
                         // Continue with updated duration
                     }
@@ -4745,8 +4388,8 @@ pub fn function_stream_debounce(
                         }
                     }
                     new_duration = duration_stream.next() => {
-                        if let Some(duration_value) = new_duration {
-                            duration_ms = extract_duration_ms(&duration_value);
+                        if let Some(next_duration_ms) = new_duration {
+                            duration_ms = next_duration_ms;
                         }
                     }
                 }
@@ -4853,14 +4496,9 @@ pub fn function_text_char_at(
         Text(String),
         Index(f64),
     }
-    let text_stream = argument_text.clone().stream().map(|v| match &v {
-        Value::Text(t, _) => Input::Text(t.text().to_string()),
-        _ => panic!("Text/char_at expects Text for first argument"),
-    });
-    let index_stream = argument_index.clone().stream().map(|v| match &v {
-        Value::Number(n, _) => Input::Index(n.number()),
-        _ => panic!("Text/char_at expects Number for index argument"),
-    });
+    let text_stream = text_actor_current_and_future_strings(argument_text.clone()).map(Input::Text);
+    let index_stream =
+        number_actor_current_and_future_numbers(argument_index.clone()).map(Input::Index);
     stream::select(text_stream, index_stream)
         .scan(
             (None::<String>, None::<f64>),
@@ -4910,14 +4548,9 @@ pub fn function_text_find(
         Text(String),
         Search(String),
     }
-    let text_stream = argument_text.clone().stream().map(|v| match &v {
-        Value::Text(t, _) => Input::Text(t.text().to_string()),
-        _ => panic!("Text/find expects Text for first argument"),
-    });
-    let search_stream = argument_search.clone().stream().map(|v| match &v {
-        Value::Text(t, _) => Input::Search(t.text().to_string()),
-        _ => panic!("Text/find expects Text for search argument"),
-    });
+    let text_stream = text_actor_current_and_future_strings(argument_text.clone()).map(Input::Text);
+    let search_stream =
+        text_actor_current_and_future_strings(argument_search.clone()).map(Input::Search);
     stream::select(text_stream, search_stream)
         .scan(
             (None::<String>, None::<String>),
@@ -5198,6 +4831,34 @@ pub fn function_text_from_char_code(
 
 // --- List functions (Cells spreadsheet) ---
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectedActorKey {
+    Missing,
+    Actor(ActorId),
+}
+
+fn dedupe_selected_actor_stream<S>(source: S) -> LocalBoxStream<'static, Option<ActorHandle>>
+where
+    S: Stream<Item = Option<ActorHandle>> + 'static,
+{
+    source
+        .scan(None::<SelectedActorKey>, |last_key, selection| {
+            let current_key = selection
+                .as_ref()
+                .map_or(SelectedActorKey::Missing, |actor| {
+                    SelectedActorKey::Actor(actor.actor_id())
+                });
+            if *last_key == Some(current_key) {
+                future::ready(Some(None))
+            } else {
+                *last_key = Some(current_key);
+                future::ready(Some(Some(selection)))
+            }
+        })
+        .filter_map(future::ready)
+        .boxed_local()
+}
+
 /// List/get(list, index) -> Value
 /// Returns the item at the given 1-based index in the list.
 /// Index 1 = first element, index 2 = second, etc.
@@ -5215,82 +4876,28 @@ pub fn function_list_get(
     let list_actor = argument_list.clone();
     let index_actor = argument_index.clone();
 
-    enum Input {
-        List(Arc<List>),
-        Index(f64),
-    }
-    let list_stream = list_actor.stream().filter_map(|value| {
-        future::ready(match value {
-            Value::List(list, _) => Some(Input::List(list)),
-            _ => None,
-        })
-    });
-    let index_stream = index_actor.stream().filter_map(|value| {
-        future::ready(match value {
-            Value::Number(n, _) => Some(Input::Index(n.number())),
-            _ => None,
-        })
-    });
-
-    // When list or index changes, get item at index and subscribe to its values
-    let item_stream = stream::select(list_stream, index_stream)
-        .scan(
-            (None::<Arc<List>>, None::<f64>),
-            move |(last_list, last_index), input| {
-                match input {
-                    Input::List(l) => *last_list = Some(l),
-                    Input::Index(i) => *last_index = Some(i),
-                }
-                future::ready(Some((last_list.clone(), *last_index)))
-            },
-        )
-        .filter_map(|(list_opt, index_opt)| {
-            future::ready(match (list_opt, index_opt) {
-                (Some(list), Some(index)) => Some((list, index)),
-                _ => None,
-            })
-        });
-
     let construct_context_for_oob = _construct_context.clone();
-    switch_map(item_stream, move |(list, index)| {
-        // Convert 1-based Boon index to 0-based Rust index
-        let idx = if index >= 1.0 {
-            (index as usize) - 1
-        } else {
-            usize::MAX
-        };
-        let function_call_id = function_call_id.clone();
-        let construct_context = construct_context_for_oob.clone();
-        list.stream()
-            .scan(Vec::<ActorHandle>::new(), move |items, change| {
-                change.apply_to_vec(items);
-                future::ready(Some(items.get(idx).cloned()))
-            })
-            .flat_map(move |item_opt| -> LocalBoxStream<'static, Value> {
-                match item_opt {
-                    Some(actor) => {
-                        let actor_for_initial = actor.clone();
-                        Box::pin(
-                            stream::once(
-                                async move { actor_for_initial.current_value().await.ok() },
-                            )
-                            .filter_map(future::ready)
-                            .chain(actor.stream_from_now()),
-                        )
-                    }
-                    None => Box::pin(stream::once(future::ready(Tag::new_value(
-                        ConstructInfo::new(
-                            function_call_id.with_child_id(0),
-                            None,
-                            "List/get OutOfBounds",
-                        ),
-                        construct_context.clone(),
-                        ValueIdempotencyKey::new(),
-                        "OutOfBounds".to_string(),
-                    )))),
-                }
-            })
-    })
+    switch_map(
+        selected_list_item_stream(list_actor, index_actor),
+        move |item_opt| {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context_for_oob.clone();
+            match item_opt {
+                Some(actor) => actor.current_or_future_stream(),
+                None => stream::once(future::ready(Tag::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "List/get OutOfBounds",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    "OutOfBounds".to_string(),
+                )))
+                .boxed_local(),
+            }
+        },
+    )
 }
 
 /// List/range(from, to) -> List {from, from+1, ..., to}
@@ -5361,7 +4968,7 @@ pub fn function_list_range(
                 )
             })
             .collect();
-        constant(List::new_value(
+        stream::once(future::ready(List::new_value(
             ConstructInfo::new(
                 function_call_id.with_child_id("list"),
                 None,
@@ -5371,13 +4978,78 @@ pub fn function_list_range(
             ValueIdempotencyKey::new(),
             actor_context.clone(),
             items,
-        ))
+        )))
     })
 }
 
 /// List/sum(list) -> Number
 /// Returns the sum of all Number items in the list. Empty list → 0.
 /// Re-emits whenever any item value changes.
+fn list_number_aggregate_stream<F>(
+    items: Vec<ActorHandle>,
+    function_call_id: ConstructId,
+    construct_context: ConstructContext,
+    empty_description: &'static str,
+    result_description: &'static str,
+    initial_value: f64,
+    aggregate: F,
+) -> LocalBoxStream<'static, Value>
+where
+    F: Fn(&[f64]) -> f64 + Copy + 'static,
+{
+    if items.is_empty() {
+        return stream::once(future::ready(Number::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, empty_description),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            initial_value,
+        )))
+        .boxed_local();
+    }
+
+    let item_count = items.len();
+    let streams: Vec<_> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            Box::pin(
+                item.clone()
+                    .current_or_future_stream()
+                    .map(move |value| (i, value)),
+            ) as Pin<Box<dyn Stream<Item = (usize, Value)>>>
+        })
+        .collect();
+
+    stream::select_all(streams)
+        .scan(
+            (
+                vec![initial_value; item_count],
+                vec![false; item_count],
+                item_count,
+            ),
+            move |(values, initialized, pending_count), (i, value)| {
+                if let Value::Number(number, _) = &value {
+                    values[i] = number.number();
+                }
+                if !initialized[i] {
+                    initialized[i] = true;
+                    *pending_count = pending_count.saturating_sub(1);
+                }
+                if *pending_count > 0 {
+                    return future::ready(Some(None));
+                }
+                future::ready(Some(Some(Number::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, result_description),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    aggregate(values),
+                ))))
+            },
+        )
+        .filter_map(future::ready)
+        .boxed_local()
+}
+
 pub fn function_list_sum(
     arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
@@ -5386,100 +5058,17 @@ pub fn function_list_sum(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
-    list_actor
-        .stream()
-        .filter_map(|value| {
-            future::ready(match value {
-                Value::List(list, _) => Some(list),
-                _ => None,
-            })
-        })
-        .flat_map(move |list| {
-            let construct_context = construct_context.clone();
-            let function_call_id = function_call_id.clone();
-            list.stream()
-                .scan(Vec::<ActorHandle>::new(), move |items, change| {
-                    change.apply_to_vec(items);
-                    future::ready(Some(items.clone()))
-                })
-                .flat_map(move |items| {
-                    let construct_context = construct_context.clone();
-                    let function_call_id = function_call_id.clone();
-                    if items.is_empty() {
-                        return stream::once(future::ready(Number::new_value(
-                            ConstructInfo::new(
-                                function_call_id.with_child_id(0),
-                                None,
-                                "List/sum empty",
-                            ),
-                            construct_context,
-                            ValueIdempotencyKey::new(),
-                            0.0,
-                        )))
-                        .left_stream();
-                    }
-                    let items_for_initial = items.clone();
-                    let items_for_updates = items.clone();
-                    stream::once(async move {
-                        join_all(
-                            items_for_initial
-                                .into_iter()
-                                .map(|item| async move { item.value().await.ok() }),
-                        )
-                        .await
-                    })
-                    .flat_map(move |initial_values| {
-                        let construct_context = construct_context.clone();
-                        let function_call_id = function_call_id.clone();
-                        let streams: Vec<_> = items_for_updates
-                            .iter()
-                            .enumerate()
-                            .map(|(i, item)| {
-                                Box::pin(item.clone().stream_from_now().map(move |v| (i, v)))
-                                    as Pin<Box<dyn Stream<Item = (usize, Value)>>>
-                            })
-                            .collect();
-                        let values: Vec<f64> = initial_values
-                            .into_iter()
-                            .map(|value| match value {
-                                Some(Value::Number(number, _)) => number.number(),
-                                _ => 0.0,
-                            })
-                            .collect();
-                        let initial_sum: f64 = values.iter().sum();
-                        stream::once(future::ready(Number::new_value(
-                            ConstructInfo::new(
-                                function_call_id.with_child_id(0),
-                                None,
-                                "List/sum result",
-                            ),
-                            construct_context.clone(),
-                            ValueIdempotencyKey::new(),
-                            initial_sum,
-                        )))
-                        .chain(stream::select_all(streams).scan(
-                            values,
-                            move |values, (i, value)| {
-                                if let Value::Number(n, _) = &value {
-                                    values[i] = n.number();
-                                }
-                                let sum: f64 = values.iter().sum();
-                                future::ready(Some(Number::new_value(
-                                    ConstructInfo::new(
-                                        function_call_id.with_child_id(0),
-                                        None,
-                                        "List/sum result",
-                                    ),
-                                    construct_context.clone(),
-                                    ValueIdempotencyKey::new(),
-                                    sum,
-                                )))
-                            },
-                        ))
-                    })
-                    .right_stream()
-                })
-        })
+    current_list_items_stream_from_actor(list_actor).flat_map(move |items| {
+        list_number_aggregate_stream(
+            items,
+            function_call_id.clone(),
+            construct_context.clone(),
+            "List/sum empty",
+            "List/sum result",
+            0.0,
+            |values| values.iter().sum(),
+        )
+    })
 }
 
 /// List/product(list) -> Number
@@ -5493,64 +5082,17 @@ pub fn function_list_product(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
-    list_actor
-        .stream()
-        .filter_map(|value| {
-            future::ready(match value {
-                Value::List(list, _) => Some(list),
-                _ => None,
-            })
-        })
-        .flat_map(move |list| {
-            let construct_context = construct_context.clone();
-            let function_call_id = function_call_id.clone();
-            list.stream()
-                .scan(Vec::<ActorHandle>::new(), move |items, change| {
-                    change.apply_to_vec(items);
-                    future::ready(Some(items.clone()))
-                })
-                .flat_map(move |items| {
-                    let construct_context = construct_context.clone();
-                    let function_call_id = function_call_id.clone();
-                    if items.is_empty() {
-                        return stream::once(future::ready(Number::new_value(
-                            ConstructInfo::new(
-                                function_call_id.with_child_id(0),
-                                None,
-                                "List/product empty",
-                            ),
-                            construct_context,
-                            ValueIdempotencyKey::new(),
-                            1.0,
-                        )))
-                        .left_stream();
-                    }
-                    let streams: Vec<_> = items
-                        .iter()
-                        .enumerate()
-                        .map(|(i, item)| item.clone().stream().map(move |v| (i, v)))
-                        .collect();
-                    let item_count = items.len();
-                    stream::select_all(streams)
-                        .scan(vec![1.0f64; item_count], move |values, (i, value)| {
-                            if let Value::Number(n, _) = &value {
-                                values[i] = n.number();
-                            }
-                            let product: f64 = values.iter().product();
-                            future::ready(Some(Number::new_value(
-                                ConstructInfo::new(
-                                    function_call_id.with_child_id(0),
-                                    None,
-                                    "List/product result",
-                                ),
-                                construct_context.clone(),
-                                ValueIdempotencyKey::new(),
-                                product,
-                            )))
-                        })
-                        .right_stream()
-                })
-        })
+    current_list_items_stream_from_actor(list_actor).flat_map(move |items| {
+        list_number_aggregate_stream(
+            items,
+            function_call_id.clone(),
+            construct_context.clone(),
+            "List/product empty",
+            "List/product result",
+            1.0,
+            |values| values.iter().product(),
+        )
+    })
 }
 
 // --- Math functions (Cells spreadsheet) ---
@@ -5604,4 +5146,733 @@ pub fn function_math_modulo(
             },
         )
         .filter_map(future::ready)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        struct ThreadWake(std::thread::Thread);
+
+        impl Wake for ThreadWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::park_timeout(std::time::Duration::from_millis(10)),
+            }
+        }
+    }
+
+    fn poll_once<F: std::future::Future>(future: F) -> Poll<F::Output> {
+        struct ThreadWake(std::thread::Thread);
+
+        impl Wake for ThreadWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        future.as_mut().poll(&mut cx)
+    }
+
+    fn test_construct_context() -> ConstructContext {
+        ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        }
+    }
+
+    fn test_actor_context() -> ActorContext {
+        ActorContext {
+            registry_scope_id: Some(create_registry_scope(None)),
+            scope: boon::parser::Scope::Root,
+            parameters: Arc::new(HashMap::new()),
+            ..Default::default()
+        }
+    }
+
+    fn number_value(value: f64, construct_context: ConstructContext) -> Value {
+        Number::new_value(
+            ConstructInfo::new(
+                format!("test.number.{value}"),
+                None,
+                format!("test number {value}"),
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            value,
+        )
+    }
+
+    #[test]
+    fn event_actor_from_constant_element_reuses_nested_event_actor_directly() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let event_actor = create_constant_actor(
+            PersistenceId::new(),
+            Text::new_value(
+                ConstructInfo::new("test.event.value", None, "test event value"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "event",
+            ),
+            scope_id,
+        );
+
+        let element_actor = create_constant_actor(
+            PersistenceId::new(),
+            Object::new_value(
+                ConstructInfo::new("test.element.value", None, "test element value"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    ConstructInfo::new("test.element.event", None, "test element event"),
+                    "event",
+                    event_actor.clone(),
+                    PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            ),
+            scope_id,
+        );
+
+        let derived_event_actor = event_actor_from_constant_element(&element_actor, scope_id);
+        assert_eq!(
+            derived_event_actor.actor_id(),
+            event_actor.actor_id(),
+            "constant element wrappers should reuse the nested event actor directly"
+        );
+
+        let missing_event_actor = create_constant_actor(
+            PersistenceId::new(),
+            Object::new_value(
+                ConstructInfo::new("test.element.no_event", None, "test element without event"),
+                construct_context,
+                ValueIdempotencyKey::new(),
+                [],
+            ),
+            scope_id,
+        );
+        let fallback_event_actor =
+            event_actor_from_constant_element(&missing_event_actor, scope_id);
+        assert!(
+            fallback_event_actor.current_value().is_err(),
+            "missing event field should fall back to an empty direct actor"
+        );
+    }
+
+    #[test]
+    fn resolve_actor_value_for_log_uses_ready_current_value() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let actor = create_constant_actor(
+            PersistenceId::new(),
+            Text::new_value(
+                ConstructInfo::new("test.log.ready_text", None, "test log ready text"),
+                construct_context,
+                ValueIdempotencyKey::new(),
+                "ready",
+            ),
+            scope_id,
+        );
+
+        let rendered = block_on(resolve_actor_value_for_log(actor, 1));
+        assert_eq!(rendered, "ready");
+    }
+
+    #[test]
+    fn extract_log_options_from_with_reads_ready_fields_directly() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let label_actor = create_constant_actor(
+            PersistenceId::new(),
+            Text::new_value(
+                ConstructInfo::new("test.log.with.label", None, "test log with label"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "label",
+            ),
+            scope_id,
+        );
+        let timeout_actor = create_constant_actor(
+            PersistenceId::new(),
+            TaggedObject::new_value(
+                ConstructInfo::new("test.log.with.timeout", None, "test log with timeout"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "Duration",
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        "test.log.with.timeout.ms",
+                        None,
+                        "test log with timeout ms",
+                    ),
+                    "milliseconds",
+                    create_constant_actor(
+                        PersistenceId::new(),
+                        number_value(250.0, construct_context.clone()),
+                        scope_id,
+                    ),
+                    PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            ),
+            scope_id,
+        );
+        let with_actor = create_constant_actor(
+            PersistenceId::new(),
+            Object::new_value(
+                ConstructInfo::new("test.log.with", None, "test log with"),
+                construct_context,
+                ValueIdempotencyKey::new(),
+                [
+                    Variable::new_arc(
+                        ConstructInfo::new("test.log.with.label.var", None, "test label var"),
+                        "label",
+                        label_actor,
+                        PersistenceId::new(),
+                        actor_context.scope.clone(),
+                    ),
+                    Variable::new_arc(
+                        ConstructInfo::new("test.log.with.timeout.var", None, "test timeout var"),
+                        "timeout",
+                        timeout_actor,
+                        PersistenceId::new(),
+                        actor_context.scope.clone(),
+                    ),
+                ],
+            ),
+            scope_id,
+        );
+
+        let options = block_on(extract_log_options_from_with(with_actor));
+        assert_eq!(options.label.as_deref(), Some("label"));
+        assert_eq!(options.timeout_ms, 250);
+    }
+
+    #[test]
+    fn extract_log_options_from_with_skips_stale_buffered_history_for_nested_fields() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let label_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        label_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.log.with.stale_label.old",
+                None,
+                "test log stale label old",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "old-label",
+        ));
+        label_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.log.with.stale_label.current",
+                None,
+                "test log stale label current",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "current-label",
+        ));
+
+        let milliseconds_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        milliseconds_actor.store_value_directly(number_value(25.0, construct_context.clone()));
+        milliseconds_actor.store_value_directly(number_value(250.0, construct_context.clone()));
+
+        let timeout_actor = create_constant_actor(
+            PersistenceId::new(),
+            TaggedObject::new_value(
+                ConstructInfo::new(
+                    "test.log.with.stale_timeout",
+                    None,
+                    "test log stale timeout",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "Duration",
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        "test.log.with.stale_timeout.ms",
+                        None,
+                        "test log stale timeout ms",
+                    ),
+                    "milliseconds",
+                    milliseconds_actor,
+                    PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            ),
+            scope_id,
+        );
+        let with_actor = create_constant_actor(
+            PersistenceId::new(),
+            Object::new_value(
+                ConstructInfo::new("test.log.with.stale", None, "test log stale with"),
+                construct_context,
+                ValueIdempotencyKey::new(),
+                [
+                    Variable::new_arc(
+                        ConstructInfo::new(
+                            "test.log.with.stale.label.var",
+                            None,
+                            "test stale label var",
+                        ),
+                        "label",
+                        label_actor,
+                        PersistenceId::new(),
+                        actor_context.scope.clone(),
+                    ),
+                    Variable::new_arc(
+                        ConstructInfo::new(
+                            "test.log.with.stale.timeout.var",
+                            None,
+                            "test stale timeout var",
+                        ),
+                        "timeout",
+                        timeout_actor,
+                        PersistenceId::new(),
+                        actor_context.scope.clone(),
+                    ),
+                ],
+            ),
+            scope_id,
+        );
+
+        let options = block_on(extract_log_options_from_with(with_actor));
+        assert_eq!(options.label.as_deref(), Some("current-label"));
+        assert_eq!(options.timeout_ms, 250);
+    }
+
+    #[test]
+    fn extract_duration_ms_from_value_now_uses_current_nested_field_without_replaying_history() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let milliseconds_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        milliseconds_actor.store_value_directly(number_value(25.0, construct_context.clone()));
+        milliseconds_actor.store_value_directly(number_value(250.0, construct_context.clone()));
+
+        let duration_value = TaggedObject::new_value(
+            ConstructInfo::new(
+                "test.duration.extract.current",
+                None,
+                "test duration extract current",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            "Duration",
+            [Variable::new_arc(
+                ConstructInfo::new(
+                    "test.duration.extract.current.ms",
+                    None,
+                    "test duration extract current ms",
+                ),
+                "milliseconds",
+                milliseconds_actor,
+                PersistenceId::new(),
+                actor_context.scope.clone(),
+            )],
+        );
+
+        assert_eq!(extract_duration_ms_from_value_now(&duration_value), 250.0);
+    }
+
+    #[test]
+    fn duration_value_current_and_future_ms_uses_current_nested_field_without_replaying_history() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let milliseconds_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        milliseconds_actor.store_value_directly(number_value(25.0, construct_context.clone()));
+        milliseconds_actor.store_value_directly(number_value(250.0, construct_context.clone()));
+
+        let duration_value = TaggedObject::new_value(
+            ConstructInfo::new(
+                "test.duration.stream.current",
+                None,
+                "test duration stream current",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            "Duration",
+            [Variable::new_arc(
+                ConstructInfo::new(
+                    "test.duration.stream.current.ms",
+                    None,
+                    "test duration stream current ms",
+                ),
+                "milliseconds",
+                milliseconds_actor,
+                PersistenceId::new(),
+                actor_context.scope.clone(),
+            )],
+        );
+
+        let mut stream = std::pin::pin!(duration_value_current_and_future_ms(duration_value));
+        let Poll::Ready(Some(value)) = poll_once(stream.as_mut().next()) else {
+            panic!("duration stream helper should emit current nested duration immediately");
+        };
+        assert_eq!(value, 250.0);
+        assert!(
+            matches!(poll_once(stream.as_mut().next()), Poll::Pending),
+            "duration stream helper should skip stale buffered history and wait for future updates"
+        );
+    }
+
+    #[test]
+    fn duration_actor_current_and_future_ms_uses_current_duration_without_replaying_history() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let old_duration = TaggedObject::new_value(
+            ConstructInfo::new("test.duration.actor.old", None, "test duration actor old"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "Duration",
+            [Variable::new_arc(
+                ConstructInfo::new(
+                    "test.duration.actor.old.ms",
+                    None,
+                    "test duration actor old ms",
+                ),
+                "milliseconds",
+                create_constant_actor(
+                    PersistenceId::new(),
+                    number_value(25.0, construct_context.clone()),
+                    scope_id,
+                ),
+                PersistenceId::new(),
+                actor_context.scope.clone(),
+            )],
+        );
+        let current_duration = TaggedObject::new_value(
+            ConstructInfo::new(
+                "test.duration.actor.current",
+                None,
+                "test duration actor current",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "Duration",
+            [Variable::new_arc(
+                ConstructInfo::new(
+                    "test.duration.actor.current.ms",
+                    None,
+                    "test duration actor current ms",
+                ),
+                "milliseconds",
+                create_constant_actor(
+                    PersistenceId::new(),
+                    number_value(250.0, construct_context.clone()),
+                    scope_id,
+                ),
+                PersistenceId::new(),
+                actor_context.scope.clone(),
+            )],
+        );
+
+        let duration_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        duration_actor.store_value_directly(old_duration);
+        duration_actor.store_value_directly(current_duration);
+
+        let mut stream = std::pin::pin!(duration_actor_current_and_future_ms(duration_actor));
+        let Poll::Ready(Some(value)) = poll_once(stream.as_mut().next()) else {
+            panic!("duration actor helper should emit current duration immediately");
+        };
+        assert_eq!(value, 250.0);
+        assert!(
+            matches!(poll_once(stream.as_mut().next()), Poll::Pending),
+            "duration actor helper should skip stale buffered duration history and wait for future updates"
+        );
+    }
+
+    #[test]
+    fn count_actor_current_and_future_values_uses_current_count_without_replaying_history() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let count_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        count_actor.store_value_directly(number_value(1.0, construct_context.clone()));
+        count_actor.store_value_directly(number_value(3.0, construct_context));
+
+        let mut stream = std::pin::pin!(count_actor_current_and_future_values(count_actor));
+        let Poll::Ready(Some(Value::Number(number, _))) = poll_once(stream.as_mut().next()) else {
+            panic!("count helper should emit current count immediately");
+        };
+        assert_eq!(number.number(), 3.0);
+        assert!(
+            matches!(poll_once(stream.as_mut().next()), Poll::Pending),
+            "count helper should skip stale buffered count history and wait for future updates"
+        );
+    }
+
+    #[test]
+    fn stream_pulses_uses_current_count_without_replaying_history() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let count_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        count_actor.store_value_directly(number_value(1.0, construct_context.clone()));
+        count_actor.store_value_directly(number_value(3.0, construct_context.clone()));
+
+        let stream = function_stream_pulses(
+            Arc::new(vec![count_actor]),
+            ConstructId::new("test.stream.pulses"),
+            PersistenceId::new(),
+            construct_context,
+            actor_context,
+        );
+        let mut stream = std::pin::pin!(stream);
+
+        let Poll::Ready(Some(first)) = poll_once(stream.as_mut().next()) else {
+            panic!("pulses stream should emit the first pulse from the current count");
+        };
+        let Poll::Ready(Some(second)) = poll_once(stream.as_mut().next()) else {
+            panic!("pulses stream should emit the second pulse from the current count");
+        };
+        let Poll::Ready(Some(third)) = poll_once(stream.as_mut().next()) else {
+            panic!("pulses stream should emit the third pulse from the current count");
+        };
+
+        assert_eq!(number_from_value(first), 1.0);
+        assert_eq!(number_from_value(second), 2.0);
+        assert_eq!(number_from_value(third), 3.0);
+        assert!(
+            matches!(poll_once(stream.as_mut().next()), Poll::Pending),
+            "pulses stream should skip stale buffered count history and wait for future updates"
+        );
+    }
+
+    #[test]
+    fn selected_list_item_stream_uses_current_index_without_replaying_history() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let first = create_constant_actor(
+            PersistenceId::new(),
+            Text::new_value(
+                ConstructInfo::new(
+                    "test.list.selection.first",
+                    None,
+                    "test list selection first",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "first",
+            ),
+            scope_id,
+        );
+        let second = create_constant_actor(
+            PersistenceId::new(),
+            Text::new_value(
+                ConstructInfo::new(
+                    "test.list.selection.second",
+                    None,
+                    "test list selection second",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "second",
+            ),
+            scope_id,
+        );
+        let third = create_constant_actor(
+            PersistenceId::new(),
+            Text::new_value(
+                ConstructInfo::new(
+                    "test.list.selection.third",
+                    None,
+                    "test list selection third",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "third",
+            ),
+            scope_id,
+        );
+
+        let list_actor = create_constant_actor(
+            PersistenceId::new(),
+            List::new_value(
+                ConstructInfo::new("test.list.selection.list", None, "test list selection list"),
+                construct_context,
+                ValueIdempotencyKey::new(),
+                actor_context.clone(),
+                vec![first, second, third],
+            ),
+            scope_id,
+        );
+
+        let index_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        index_actor.store_value_directly(number_value(1.0, test_construct_context()));
+        index_actor.store_value_directly(number_value(3.0, test_construct_context()));
+
+        let mut stream = std::pin::pin!(selected_list_item_stream(list_actor, index_actor));
+        let Poll::Ready(Some(Some(actor))) = poll_once(stream.as_mut().next()) else {
+            panic!("selected list item stream should emit the current indexed item");
+        };
+        let Value::Text(text, _) = actor
+            .current_value()
+            .expect("selected item should be ready")
+        else {
+            panic!("selected list item should stay text");
+        };
+        assert_eq!(text.text(), "third");
+        assert!(
+            matches!(poll_once(stream.as_mut().next()), Poll::Pending),
+            "selected list item stream should skip stale buffered index history and wait for future updates"
+        );
+    }
+
+    #[test]
+    fn text_find_uses_current_arguments_without_replaying_history() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let text_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        text_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new("test.text.find.old_text", None, "test text find old text"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "old text",
+        ));
+        text_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.text.find.current_text",
+                None,
+                "test text find current text",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "hello current",
+        ));
+
+        let search_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        search_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.text.find.old_search",
+                None,
+                "test text find old search",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "old",
+        ));
+        search_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.text.find.current_search",
+                None,
+                "test text find current search",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "current",
+        ));
+
+        let stream = function_text_find(
+            Arc::new(vec![text_actor, search_actor]),
+            ConstructId::new("test.text.find"),
+            PersistenceId::new(),
+            construct_context,
+            actor_context,
+        );
+        let mut stream = std::pin::pin!(stream);
+
+        let Poll::Ready(Some(value)) = poll_once(stream.as_mut().next()) else {
+            panic!("Text/find should emit from current arguments immediately");
+        };
+        assert_eq!(number_from_value(value), 6.0);
+        assert!(
+            matches!(poll_once(stream.as_mut().next()), Poll::Pending),
+            "Text/find should skip stale buffered argument history and wait for future updates"
+        );
+    }
+
+    fn number_from_value(value: Value) -> f64 {
+        match value {
+            Value::Number(number, _) => number.number(),
+            other => panic!("Expected number, got {}", other.construct_info()),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires wasm/js runtime; host lib tests still touch js-sys statics"]
+    fn list_product_waits_for_all_items_before_emitting() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let first_item = create_constant_actor(
+            PersistenceId::new(),
+            number_value(2.0, construct_context.clone()),
+            scope_id,
+        );
+        let second_item = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let list_value = List::new_value(
+            ConstructInfo::new("test.list.product", None, "test list product"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            actor_context.clone(),
+            vec![first_item, second_item.clone()],
+        );
+        let list_actor = create_constant_actor(PersistenceId::new(), list_value, scope_id);
+
+        let mut stream = std::pin::pin!(function_list_product(
+            Arc::new(vec![list_actor]),
+            "test.function.list_product".to_string().into(),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context.clone(),
+        ));
+
+        assert!(matches!(poll_once(stream.as_mut().next()), Poll::Pending));
+
+        second_item.store_value_directly(number_value(3.0, construct_context));
+
+        let first_value = block_on(stream.as_mut().next()).expect("expected product value");
+        assert_eq!(number_from_value(first_value), 6.0);
+    }
 }

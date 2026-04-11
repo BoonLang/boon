@@ -9,14 +9,13 @@ use zoon::futures_util::{StreamExt, future, select, stream};
 use zoon::*;
 
 use super::engine::{
-    ActorContext, ActorHandle, ActorLoop, BRIDGE_BLUR_CAPACITY, BRIDGE_FOCUS_CAPACITY,
-    BRIDGE_HOVER_CAPACITY, BRIDGE_KEY_DOWN_CAPACITY, BRIDGE_PENDING_BLUR_CAP,
-    BRIDGE_PENDING_FOCUS_CAP, BRIDGE_PENDING_KEY_DOWN_CAP, BRIDGE_PRESS_EVENT_CAPACITY,
-    BRIDGE_TEXT_CHANGE_CAPACITY, ConstructContext, ConstructInfo, ConstructInfoComplete,
-    ConstructType, LOG_DEBUG, ListChange, NamedChannel, Number as EngineNumber, Object, ScopeId,
-    Tag as EngineTag, TaggedObject, Text as EngineText, TimestampedEvent, TypedStream, Value,
-    ValueIdempotencyKey, ValueMetadata, Variable, create_actor, create_constant_actor, inc_metric,
-    switch_map,
+    ActorHandle, BRIDGE_BLUR_CAPACITY, BRIDGE_FOCUS_CAPACITY, BRIDGE_HOVER_CAPACITY,
+    BRIDGE_KEY_DOWN_CAPACITY, BRIDGE_PENDING_BLUR_CAP, BRIDGE_PENDING_FOCUS_CAP,
+    BRIDGE_PENDING_KEY_DOWN_CAP, BRIDGE_PRESS_EVENT_CAPACITY, BRIDGE_TEXT_CHANGE_CAPACITY,
+    ConstructContext, ConstructInfo, ConstructInfoComplete, ConstructType, LOG_DEBUG, ListChange,
+    NamedChannel, Number as EngineNumber, Object, ScopeId, Tag as EngineTag, TaggedObject,
+    Text as EngineText, TimestampedEvent, Value, ValueIdempotencyKey, ValueMetadata, Variable,
+    create_constant_actor, inc_metric, switch_map,
 };
 
 // --- Cached ConstructInfoComplete for hot bridge paths ---
@@ -54,7 +53,7 @@ fn get_scene_ctx(construct_context: &ConstructContext) -> Option<&PhysicalSceneP
 
 async fn read_number_variable(variable: Option<Arc<Variable>>) -> Option<f64> {
     let variable = variable?;
-    match variable.value_actor().current_value().await.ok()? {
+    match variable.value_actor().current_value().ok()? {
         Value::Number(number, _) => Some(number.number()),
         _ => None,
     }
@@ -64,8 +63,7 @@ async fn derive_scene_params(scene: &SceneHandles<Arc<Variable>>) -> PhysicalSce
     let mut params = PhysicalSceneParams::default();
 
     if let Some(geometry_var) = &scene.geometry {
-        if let Ok(Value::Object(geometry_obj, _)) = geometry_var.value_actor().current_value().await
-        {
+        if let Ok(Value::Object(geometry_obj, _)) = geometry_var.value_actor().current_value() {
             if let Some(bevel_angle) =
                 read_number_variable(geometry_obj.variable("bevel_angle")).await
             {
@@ -75,9 +73,9 @@ async fn derive_scene_params(scene: &SceneHandles<Arc<Variable>>) -> PhysicalSce
     }
 
     if let Some(lights_var) = &scene.lights {
-        if let Ok(Value::List(lights, _)) = lights_var.value_actor().current_value().await {
+        if let Ok(Value::List(lights, _)) = lights_var.value_actor().current_value() {
             for (_, item) in lights.snapshot().await {
-                let Ok(Value::TaggedObject(light, _)) = item.current_value().await else {
+                let Ok(Value::TaggedObject(light, _)) = item.current_value() else {
                     continue;
                 };
                 match light.tag() {
@@ -142,7 +140,7 @@ fn resolve_document_root(document_object: &Arc<Object>) -> RenderRootHandle<Arc<
 
 /// Generate physical CSS properties from a style Value in a scene context.
 /// Must be called from an async context (inside stream filter_map, etc.)
-/// because reading variable values requires `.current_value().await`.
+/// because reading variable values requires `.current_value()`.
 ///
 /// Maps physical Boon properties to CSS:
 /// - `depth: N` → multi-layer box-shadow
@@ -168,7 +166,7 @@ async fn physical_css_from_style_value(
     /// Helper to read a number from a variable (async).
     async fn read_number(obj: &Arc<Object>, key: &str) -> Option<f64> {
         let var = obj.variable(key)?;
-        match var.value_actor().current_value().await {
+        match var.value_actor().current_value() {
             Ok(Value::Number(n, _)) => Some(n.number()),
             _ => None,
         }
@@ -179,15 +177,15 @@ async fn physical_css_from_style_value(
 
     // --- move → elevation/recession adjustment ---
     let (elevation, is_inset) = if let Some(move_v) = obj.variable("move") {
-        match move_v.value_actor().current_value().await {
+        match move_v.value_actor().current_value() {
             Ok(Value::Object(move_obj, _)) => {
                 if let Some(closer_v) = move_obj.variable("closer") {
-                    match closer_v.value_actor().current_value().await {
+                    match closer_v.value_actor().current_value() {
                         Ok(Value::Number(n, _)) => (n.number(), false),
                         _ => (0.0, false),
                     }
                 } else if let Some(further_v) = move_obj.variable("further") {
-                    match further_v.value_actor().current_value().await {
+                    match further_v.value_actor().current_value() {
                         Ok(Value::Number(n, _)) => (n.number(), true),
                         _ => (0.0, false),
                     }
@@ -230,13 +228,13 @@ async fn physical_css_from_style_value(
 
     // --- material properties ---
     if let Some(material_v) = obj.variable("material") {
-        if let Ok(Value::Object(mat_obj, _)) = material_v.value_actor().current_value().await {
+        if let Ok(Value::Object(mat_obj, _)) = material_v.value_actor().current_value() {
             // material.glow → colored outer shadow
             if let Some(glow_v) = mat_obj.variable("glow") {
-                match glow_v.value_actor().current_value().await {
+                match glow_v.value_actor().current_value() {
                     Ok(Value::Object(glow_obj, _)) => {
                         let color = match glow_obj.variable("color") {
-                            Some(cv) => match cv.value_actor().current_value().await {
+                            Some(cv) => match cv.value_actor().current_value() {
                                 Ok(ref v) => value_to_css_color_async(v)
                                     .await
                                     .unwrap_or_else(|| "rgba(100,150,255,0.5)".to_string()),
@@ -258,7 +256,7 @@ async fn physical_css_from_style_value(
             // material.color → background-color (fallback when no background.color)
             if obj.variable("background").is_none() {
                 if let Some(color_v) = mat_obj.variable("color") {
-                    if let Ok(color_val) = color_v.value_actor().current_value().await {
+                    if let Ok(color_val) = color_v.value_actor().current_value() {
                         if let Some(color_css) = value_to_css_color_async(&color_val).await {
                             css.push_str(&format!("background-color:{color_css};"));
                         }
@@ -268,7 +266,7 @@ async fn physical_css_from_style_value(
 
             // material.gloss → specular gradient overlay
             if let Some(gloss_v) = mat_obj.variable("gloss") {
-                if let Ok(Value::Number(n, _)) = gloss_v.value_actor().current_value().await {
+                if let Ok(Value::Number(n, _)) = gloss_v.value_actor().current_value() {
                     let gloss = n.number().clamp(0.0, 1.0);
                     if gloss > 0.0 {
                         let alpha = gloss * 0.25;
@@ -283,7 +281,7 @@ async fn physical_css_from_style_value(
 
             // material.transparency → opacity
             if let Some(transp_v) = mat_obj.variable("transparency") {
-                if let Ok(Value::Number(n, _)) = transp_v.value_actor().current_value().await {
+                if let Ok(Value::Number(n, _)) = transp_v.value_actor().current_value() {
                     let opacity = n.number().clamp(0.0, 1.0);
                     css.push_str(&format!("opacity:{opacity:.2};"));
                     // Also add backdrop-filter for glass effect
@@ -300,7 +298,7 @@ async fn physical_css_from_style_value(
 
     // --- rounded_corners → border-radius ---
     if let Some(rc_v) = obj.variable("rounded_corners") {
-        match rc_v.value_actor().current_value().await {
+        match rc_v.value_actor().current_value() {
             Ok(Value::Number(n, _)) => {
                 css.push_str(&format!("border-radius:{}px;", n.number()));
             }
@@ -313,7 +311,7 @@ async fn physical_css_from_style_value(
 
     // --- spring_range → CSS transition ---
     if let Some(sr_v) = obj.variable("spring_range") {
-        match sr_v.value_actor().current_value().await {
+        match sr_v.value_actor().current_value() {
             Ok(Value::Object(sr_obj, _)) => {
                 // [extend: N, compress: N] → use max as duration basis
                 let extend = read_number(&sr_obj, "extend").await.unwrap_or(0.0);
@@ -357,7 +355,7 @@ async fn value_to_css_color_async(value: &Value) -> Option<String> {
             // Inline Oklch extraction (avoids reconstructing Value with metadata)
             async fn get_num(tagged: &TaggedObject, name: &str, default: f64) -> f64 {
                 if let Some(v) = tagged.variable(name) {
-                    match v.value_actor().current_value().await {
+                    match v.value_actor().current_value() {
                         Ok(Value::Number(n, _)) => n.number(),
                         _ => default,
                     }
@@ -501,9 +499,7 @@ fn apply_physical_css<E: RawEl>(
                     .right_stream()
                     .left_stream()
             } else {
-                stream::once(future::ready(ShadowComponent::MoveCloser(0.0)))
-                    .chain(stream::pending())
-                    .right_stream()
+                stream::once(future::ready(ShadowComponent::MoveCloser(0.0))).right_stream()
             }
         })
         .boxed_local()
@@ -531,7 +527,6 @@ fn apply_physical_css<E: RawEl>(
                             None => stream::once(future::ready(GlowComp::Color(
                                 "rgba(100,150,255,0.5)".to_string(),
                             )))
-                            .chain(stream::pending())
                             .boxed_local(),
                         };
 
@@ -547,9 +542,7 @@ fn apply_physical_css<E: RawEl>(
                                 })
                             })
                             .boxed_local(),
-                        None => stream::once(future::ready(GlowComp::Intensity(0.1)))
-                            .chain(stream::pending())
-                            .boxed_local(),
+                        None => stream::once(future::ready(GlowComp::Intensity(0.1))).boxed_local(),
                     };
 
                     stream::select_all([color_sub, intensity_sub])
@@ -572,11 +565,10 @@ fn apply_physical_css<E: RawEl>(
                 // glow: None → no glow
                 Value::Tag(tag, _) if tag.tag() == "None" => {
                     stream::once(future::ready(ShadowComponent::Glow(String::new())))
-                        .chain(stream::pending())
                         .right_stream()
                         .left_stream()
                 }
-                _ => stream::pending::<ShadowComponent>().right_stream(),
+                _ => stream::empty::<ShadowComponent>().right_stream(),
             }
         })
         .boxed_local()
@@ -681,7 +673,7 @@ fn apply_physical_css<E: RawEl>(
                 Value::Object(sr_obj, _) => {
                     async fn read_num(obj: &Object, name: &str) -> f64 {
                         if let Some(v) = obj.variable(name) {
-                            match v.value_actor().current_value().await {
+                            match v.value_actor().current_value() {
                                 Ok(Value::Number(n, _)) => n.number(),
                                 _ => 0.0,
                             }
@@ -764,7 +756,7 @@ fn apply_physical_css<E: RawEl>(
                     .right_stream()
                     .left_stream()
             } else {
-                stream::pending::<String>().right_stream()
+                stream::once(future::ready("none".to_string())).right_stream()
             }
         })
         .boxed_local()
@@ -946,23 +938,8 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
     }
 }
 
-fn actor_current_or_future_stream(actor: ActorHandle) -> LocalBoxStream<'static, Value> {
-    let actor_for_initial = actor.clone();
-    let initial = stream::once(async move { actor_for_initial.value().await.ok() })
-        .filter_map(|value| async move { value });
-    stream::select(initial, actor.stream_from_now())
-        .scan(None::<EmissionIdentity>, |last_seen, value| {
-            let current = value.emission_identity();
-            let should_emit = last_seen.as_ref() != Some(&current);
-            *last_seen = Some(current);
-            future::ready(Some(if should_emit { Some(value) } else { None }))
-        })
-        .filter_map(future::ready)
-        .boxed_local()
-}
-
 fn variable_current_or_future_stream(variable: Arc<Variable>) -> LocalBoxStream<'static, Value> {
-    actor_current_or_future_stream(variable.value_actor())
+    variable.value_actor().current_or_future_stream()
 }
 
 /// Create a reactive visible signal from a settings variable.
@@ -1078,13 +1055,13 @@ fn element_container(
                 }
                 Value::Object(obj, _) => {
                     let top = if let Some(v) = obj.variable("top") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
                         }
                     } else if let Some(v) = obj.variable("column") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
@@ -1093,13 +1070,13 @@ fn element_container(
                         0
                     };
                     let right = if let Some(v) = obj.variable("right") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
                         }
                     } else if let Some(v) = obj.variable("row") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
@@ -1108,13 +1085,13 @@ fn element_container(
                         0
                     };
                     let bottom = if let Some(v) = obj.variable("bottom") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
                         }
                     } else if let Some(v) = obj.variable("column") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
@@ -1123,13 +1100,13 @@ fn element_container(
                         0
                     };
                     let left = if let Some(v) = obj.variable("left") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
                         }
                     } else if let Some(v) = obj.variable("row") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
@@ -1335,7 +1312,7 @@ fn element_container(
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     // In scene mode, physical CSS handles background-color via material.color — skip typed API
     let background_signal = signal::from_stream(if is_scene {
-        stream::pending::<String>().boxed_local()
+        stream::empty::<String>().boxed_local()
     } else {
         let style_stream = switch_map(sv4.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
@@ -1412,7 +1389,7 @@ fn element_container(
     // Border radius - produces u32 for typed RoundedCorners API
     // In scene mode, physical CSS handles border-radius via rounded_corners — skip typed API
     let border_radius_signal = signal::from_stream(if is_scene {
-        stream::pending::<u32>().boxed_local()
+        stream::empty::<u32>().boxed_local()
     } else {
         let style_stream = switch_map(sv5.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
@@ -1449,7 +1426,7 @@ fn element_container(
         .filter_map(|value| async move {
             let obj = value.expect_object();
             let move_right = if let Some(v) = obj.variable("move_right") {
-                match v.value_actor().current_value().await {
+                match v.value_actor().current_value() {
                     Ok(Value::Number(n, _)) => n.number(),
                     _ => 0.0,
                 }
@@ -1457,7 +1434,7 @@ fn element_container(
                 0.0
             };
             let move_down = if let Some(v) = obj.variable("move_down") {
-                match v.value_actor().current_value().await {
+                match v.value_actor().current_value() {
                     Ok(Value::Number(n, _)) => n.number(),
                     _ => 0.0,
                 }
@@ -1465,7 +1442,7 @@ fn element_container(
                 0.0
             };
             let rotate = if let Some(v) = obj.variable("rotate") {
-                match v.value_actor().current_value().await {
+                match v.value_actor().current_value() {
                     Ok(Value::Number(n, _)) => n.number(),
                     _ => 0.0,
                 }
@@ -1586,58 +1563,79 @@ fn element_stripe(
         let obj = value.expect_object();
         future::ready(obj.variable("hovered"))
     })
-    .map(|variable| variable.expect_link_value_sender())
-    .chain(stream::pending());
+    .map(|variable| variable.expect_link_value_sender());
 
-    let hovered_handler_loop = ActorLoop::new({
+    let hovered_handler_loop = Task::start_droppable({
         let _construct_context = construct_context.clone();
         async move {
             let mut hovered_link_value_sender: Option<NamedChannel<Value>> = None;
-            let mut hovered_stream = hovered_stream.fuse();
+            let mut hovered_stream = Some(hovered_stream.fuse());
             let mut last_hover_state: Option<bool> = None;
             loop {
-                select! {
-                    new_sender = hovered_stream.next() => {
-                        if let Some(sender) = new_sender {
-                            // Send initial hover state (false) when link is established
-                            let initial_hover_value = EngineTag::new_value_cached(
-                                HOVER_TAG_INFO.with(|info| info.clone()),
-                                ValueIdempotencyKey::new(),
-                                "False",
-                            );
-                            sender.send_or_drop(initial_hover_value);
-                            last_hover_state = Some(false);
-                            hovered_link_value_sender = Some(sender);
+                let mut clear_hovered_stream = false;
+                if let Some(active_hovered_stream) = hovered_stream.as_mut() {
+                    select! {
+                        new_sender = active_hovered_stream.next() => {
+                            if let Some(sender) = new_sender {
+                                // Send initial hover state (false) when link is established
+                                let initial_hover_value = EngineTag::new_value_cached(
+                                    HOVER_TAG_INFO.with(|info| info.clone()),
+                                    ValueIdempotencyKey::new(),
+                                    "False",
+                                );
+                                sender.send_or_drop(initial_hover_value);
+                                last_hover_state = Some(false);
+                                hovered_link_value_sender = Some(sender);
+                            } else {
+                                clear_hovered_stream = true;
+                            }
+                        }
+                        event = hovered_receiver.select_next_some() => {
+                            if last_hover_state == Some(event.data) {
+                                inc_metric!(HOVER_EVENTS_DEDUPED);
+                                continue;
+                            }
+                            if let Some(sender) = hovered_link_value_sender.as_ref() {
+                                inc_metric!(HOVER_EVENTS_EMITTED);
+                                last_hover_state = Some(event.data);
+                                let hover_tag = if event.data { "True" } else { "False" };
+                                let event_value = EngineTag::new_value_cached_with_emission_seq(
+                                    HOVER_TAG_INFO.with(|info| info.clone()),
+                                    ValueIdempotencyKey::new(),
+                                    event.emission_seq,
+                                    hover_tag,
+                                );
+                                sender.send_or_drop(event_value);
+                            }
                         }
                     }
-                    event = hovered_receiver.select_next_some() => {
-                        if last_hover_state == Some(event.data) {
-                            inc_metric!(HOVER_EVENTS_DEDUPED);
-                            continue;
-                        }
-                        if let Some(sender) = hovered_link_value_sender.as_ref() {
-                            inc_metric!(HOVER_EVENTS_EMITTED);
-                            last_hover_state = Some(event.data);
-                            let hover_tag = if event.data { "True" } else { "False" };
-                            let event_value = EngineTag::new_value_cached_with_lamport_time(
-                                HOVER_TAG_INFO.with(|info| info.clone()),
-                                ValueIdempotencyKey::new(),
-                                event.lamport_time,
-                                hover_tag,
-                            );
-                            sender.send_or_drop(event_value);
-                        }
+                } else {
+                    let event = hovered_receiver.select_next_some().await;
+                    if last_hover_state == Some(event.data) {
+                        inc_metric!(HOVER_EVENTS_DEDUPED);
+                        continue;
                     }
+                    if let Some(sender) = hovered_link_value_sender.as_ref() {
+                        inc_metric!(HOVER_EVENTS_EMITTED);
+                        last_hover_state = Some(event.data);
+                        let hover_tag = if event.data { "True" } else { "False" };
+                        let event_value = EngineTag::new_value_cached_with_emission_seq(
+                            HOVER_TAG_INFO.with(|info| info.clone()),
+                            ValueIdempotencyKey::new(),
+                            event.emission_seq,
+                            hover_tag,
+                        );
+                        sender.send_or_drop(event_value);
+                    }
+                }
+                if clear_hovered_stream {
+                    hovered_stream = None;
                 }
             }
         }
     });
 
     let settings_variable = tagged_object.expect_variable("settings");
-
-    // CRITICAL: Use switch_map (not flat_map) because variable streams are infinite.
-    // These are Arc-wrapped, so when we call `expect_variable()`, we get an Arc<Variable>
-    // that stays alive independently of the parent Object. switch_map keeps the Variable
     // alive for its subscription lifetime.
 
     let direction_stream = switch_map(settings_variable.clone().stream(), |value| {
@@ -1692,7 +1690,7 @@ fn element_stripe(
                     // Handle [sizing: Fill, minimum: X, maximum: Y]
                     // Parse sizing (Fill or exact value)
                     let base_width = if let Some(v) = obj.variable("sizing") {
-                        match v.value_actor().current_value().await {
+                        match v.value_actor().current_value() {
                             Ok(Value::Tag(tag, _)) if tag.tag() == "Fill" => Some(Width::fill()),
                             Ok(Value::Number(n, _)) => Some(Width::exact(n.number() as u32)),
                             _ => None,
@@ -1705,14 +1703,14 @@ fn element_stripe(
 
                     // Apply minimum constraint
                     if let Some(v) = obj.variable("minimum") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             width = width.min(n.number() as u32);
                         }
                     }
 
                     // Apply maximum constraint
                     if let Some(v) = obj.variable("maximum") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             width = width.max(n.number() as u32);
                         }
                     }
@@ -1747,7 +1745,7 @@ fn element_stripe(
                 Value::Object(obj, _) => {
                     // Parse sizing (Fill or exact value)
                     let base_height = if let Some(v) = obj.variable("sizing") {
-                        match v.value_actor().current_value().await {
+                        match v.value_actor().current_value() {
                             Ok(Value::Tag(tag, _)) if tag.tag() == "Fill" => Some(Height::fill()),
                             Ok(Value::Number(n, _)) => Some(Height::exact(n.number() as u32)),
                             _ => None,
@@ -1760,7 +1758,7 @@ fn element_stripe(
 
                     // Apply minimum constraint (supports Screen for 100vh and pixel values)
                     if let Some(v) = obj.variable("minimum") {
-                        match v.value_actor().current_value().await {
+                        match v.value_actor().current_value() {
                             Ok(Value::Tag(tag, _)) if tag.tag() == "Screen" => {
                                 height = height.min_screen();
                             }
@@ -1785,7 +1783,7 @@ fn element_stripe(
     // In scene mode, physical CSS handles background-color via material.color — skip typed API
     let sv_bg = tagged_object.expect_variable("settings");
     let background_signal = signal::from_stream(if is_scene {
-        stream::pending::<String>().boxed_local()
+        stream::empty::<String>().boxed_local()
     } else {
         let style_stream = switch_map(sv_bg.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
@@ -1833,7 +1831,7 @@ fn element_stripe(
                 Value::Object(obj, _) => {
                     async fn get_num(obj: &Object, name: &str) -> u32 {
                         if let Some(v) = obj.variable(name) {
-                            match v.value_actor().current_value().await {
+                            match v.value_actor().current_value() {
                                 Ok(Value::Number(n, _)) => n.number() as u32,
                                 _ => 0,
                             }
@@ -1871,7 +1869,7 @@ fn element_stripe(
     // In scene mode, physical CSS handles box-shadow via depth/move/glow — skip typed API
     let sv_shadows = tagged_object.expect_variable("settings");
     let shadows_typed_signal = signal::from_stream(if is_scene {
-        stream::pending::<Vec<Shadow>>().boxed_local()
+        stream::empty::<Vec<Shadow>>().boxed_local()
     } else {
         let style_stream = switch_map(sv_shadows.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
@@ -1889,11 +1887,11 @@ fn element_stripe(
                 // Get all items from the list (snapshot returns (ItemId, ActorHandle) pairs)
                 let snapshot = list.snapshot().await;
                 for (_item_id, actor) in snapshot {
-                    let item = actor.current_value().await;
+                    let item = actor.current_value();
                     if let Ok(Value::Object(obj, _)) = item {
                         async fn get_num(obj: &Object, name: &str) -> f64 {
                             if let Some(v) = obj.variable(name) {
-                                match v.value_actor().current_value().await {
+                                match v.value_actor().current_value() {
                                     Ok(Value::Number(n, _)) => n.number(),
                                     _ => 0.0,
                                 }
@@ -1908,7 +1906,7 @@ fn element_stripe(
 
                         // Check for inset (direction: Inwards)
                         let inset = if let Some(v) = obj.variable("direction") {
-                            match v.value_actor().current_value().await {
+                            match v.value_actor().current_value() {
                                 Ok(Value::Tag(tag, _)) if tag.tag() == "Inwards" => true,
                                 _ => false,
                             }
@@ -1918,7 +1916,7 @@ fn element_stripe(
 
                         // Get color using typed API
                         let color: Option<Color> = if let Some(v) = obj.variable("color") {
-                            if let Ok(color_value) = v.value_actor().current_value().await {
+                            if let Ok(color_value) = v.value_actor().current_value() {
                                 oklch_to_color(color_value).await
                             } else {
                                 None
@@ -2078,7 +2076,7 @@ fn element_stripe(
                 let snapshot = list.snapshot().await;
                 let mut families: Vec<FontFamily<'static>> = Vec::new();
                 for (_item_id, actor) in snapshot {
-                    if let Ok(item) = actor.current_value().await {
+                    if let Ok(item) = actor.current_value() {
                         match item {
                             Value::Text(t, _) => {
                                 // Custom font name - leak to get 'static lifetime
@@ -2225,9 +2223,7 @@ fn element_stripe(
         match &value {
             Value::Tag(tag, _) if tag.tag() == "NoOutline" => {
                 // Return None to remove outline
-                stream::once(future::ready(None::<zoon::Outline>))
-                    .chain(stream::pending())
-                    .boxed_local()
+                stream::once(future::ready(None::<zoon::Outline>)).boxed_local()
             }
             Value::Object(obj, _) => {
                 let obj = obj.clone();
@@ -2288,10 +2284,9 @@ fn element_stripe(
                     }
                     None
                 })
-                .chain(stream::pending())
                 .boxed_local()
             }
-            _ => stream::pending::<Option<zoon::Outline>>().boxed_local(),
+            _ => stream::empty::<Option<zoon::Outline>>().boxed_local(),
         }
     }));
 
@@ -2484,7 +2479,7 @@ fn element_stripe(
             if let Value::Object(obj, _) = &value {
                 async fn get_num(obj: &Object, name: &str) -> f64 {
                     if let Some(v) = obj.variable(name) {
-                        match v.value_actor().current_value().await {
+                        match v.value_actor().current_value() {
                             Ok(Value::Number(n, _)) => n.number(),
                             _ => 0.0,
                         }
@@ -2496,7 +2491,7 @@ fn element_stripe(
                 let y = get_num(obj, "y").await;
                 let blur = get_num(obj, "blur").await;
                 let color_css = if let Some(color_var) = obj.variable("color") {
-                    match color_var.value_actor().current_value().await {
+                    match color_var.value_actor().current_value() {
                         Ok(Value::TaggedObject(tagged, _)) if tagged.tag() == "Oklch" => {
                             async fn get_oklch(
                                 tagged: &TaggedObject,
@@ -2539,7 +2534,7 @@ fn element_stripe(
         .direction_signal(signal::from_stream(direction_stream).map(Option::unwrap_or_default))
         .items_signal_vec(VecDiffStreamSignalVec(items_vec_diff_stream).map_signal(
             move |value_actor| {
-                signal::from_stream(actor_current_or_future_stream(value_actor).map({
+                signal::from_stream(value_actor.current_or_future_stream().map({
                     let construct_context = construct_context.clone();
                     move |value| value_to_element(value, construct_context.clone())
                 }))
@@ -2681,7 +2676,7 @@ fn element_stack(
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     // In scene mode, physical CSS handles background-color via material.color — skip typed API
     let background_signal = signal::from_stream(if is_scene {
-        stream::pending::<String>().boxed_local()
+        stream::empty::<String>().boxed_local()
     } else {
         let style_stream = switch_map(settings_variable_4.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
@@ -2713,7 +2708,7 @@ fn element_stack(
         .s(Visible::with_signal(visible_sig))
         .layers_signal_vec(VecDiffStreamSignalVec(layers_vec_diff_stream).map_signal(
             move |value_actor| {
-                signal::from_stream(actor_current_or_future_stream(value_actor).map({
+                signal::from_stream(value_actor.current_or_future_stream().map({
                     let construct_context = construct_context.clone();
                     move |value| value_to_element(value, construct_context.clone())
                 }))
@@ -2872,9 +2867,7 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
                         })
                         .boxed_local()
                 } else {
-                    stream::once(future::ready((Component::Lightness, 0.5)))
-                        .chain(stream::pending())
-                        .boxed_local()
+                    stream::once(future::ready((Component::Lightness, 0.5))).boxed_local()
                 };
 
             let chroma_stream: LocalBoxStream<'static, (Component, f64)> =
@@ -2888,9 +2881,7 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
                         })
                         .boxed_local()
                 } else {
-                    stream::once(future::ready((Component::Chroma, 0.0)))
-                        .chain(stream::pending())
-                        .boxed_local()
+                    stream::once(future::ready((Component::Chroma, 0.0))).boxed_local()
                 };
 
             let hue_stream: LocalBoxStream<'static, (Component, f64)> =
@@ -2904,9 +2895,7 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
                         })
                         .boxed_local()
                 } else {
-                    stream::once(future::ready((Component::Hue, 0.0)))
-                        .chain(stream::pending())
-                        .boxed_local()
+                    stream::once(future::ready((Component::Hue, 0.0))).boxed_local()
                 };
 
             let alpha_stream: LocalBoxStream<'static, (Component, f64)> =
@@ -2920,9 +2909,7 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
                         })
                         .boxed_local()
                 } else {
-                    stream::once(future::ready((Component::Alpha, 1.0)))
-                        .chain(stream::pending())
-                        .boxed_local()
+                    stream::once(future::ready((Component::Alpha, 1.0))).boxed_local()
                 };
 
             // Combine all streams - emit new CSS whenever any component changes
@@ -2964,9 +2951,7 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
                 "Transparent" => "transparent",
                 _ => return stream::empty().boxed_local(),
             };
-            stream::once(future::ready(color.to_string()))
-                .chain(stream::pending())
-                .boxed_local()
+            stream::once(future::ready(color.to_string())).boxed_local()
         }
         _ => stream::empty().boxed_local(),
     }
@@ -2974,7 +2959,7 @@ fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
 
 /// Hybrid reactive Oklch-to-CSS conversion.
 ///
-/// 1. Reads all 4 Oklch components atomically via `current_value().await` → correct initial CSS
+/// 1. Reads all 4 Oklch components atomically via `current_value()` → correct initial CSS
 /// 2. Subscribes to each component via `stream_from_now()` → only future updates, no replay
 /// 3. `select_all + scan` initialized with the correct values from step 1
 ///
@@ -2988,7 +2973,7 @@ fn oklch_to_css_reactive(value: Value) -> LocalBoxStream<'static, String> {
                 // Step 1: Read current values atomically
                 async fn read_f64(tagged: &TaggedObject, name: &str, default: f64) -> f64 {
                     match tagged.variable(name) {
-                        Some(v) => match v.value_actor().current_value().await {
+                        Some(v) => match v.value_actor().current_value() {
                             Ok(Value::Number(n, _)) => n.number(),
                             _ => default,
                         },
@@ -3026,7 +3011,7 @@ fn oklch_to_css_reactive(value: Value) -> LocalBoxStream<'static, String> {
                                 })
                             })
                             .boxed_local(),
-                        None => stream::pending().boxed_local(),
+                        None => stream::empty().boxed_local(),
                     }
                 }
 
@@ -3062,9 +3047,7 @@ fn oklch_to_css_reactive(value: Value) -> LocalBoxStream<'static, String> {
                 "Transparent" => "transparent",
                 _ => return stream::empty().boxed_local(),
             };
-            stream::once(future::ready(color.to_string()))
-                .chain(stream::pending())
-                .boxed_local()
+            stream::once(future::ready(color.to_string())).boxed_local()
         }
         _ => stream::empty().boxed_local(),
     }
@@ -3098,84 +3081,212 @@ fn element_button(
     let element_variable = tagged_object.expect_variable("element");
 
     // Set up press event handler - use same subscription pattern as text_input
-    // Chain with pending() to prevent stream termination, which would cause busy-polling
-    // in the select! loop (fused stream returns Ready(None) immediately when exhausted)
     // Use switch_map (not flat_map) because variable.stream() is infinite.
     // When element is recreated, switch_map cancels old subscription and re-subscribes to new one.
-    let mut press_stream = switch_map(
+    let press_stream = switch_map(
         variable_current_or_future_stream(element_variable.clone())
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
         |variable| variable_current_or_future_stream(variable),
     )
     .filter_map(|value| future::ready(value.expect_object().variable("press")))
     .map(|variable| variable.expect_link_value_sender())
-    .chain(stream::pending())
     .fuse();
 
-    // Set up hovered link if element field exists with hovered property
-    // Chain with pending() to prevent stream termination (same as press_stream)
+    // Set up hovered link if element field exists with hovered property.
     let hovered_stream = variable_current_or_future_stream(element_variable.clone())
         .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
-        .map(|variable| variable.expect_link_value_sender())
-        .chain(stream::pending());
+        .map(|variable| variable.expect_link_value_sender());
 
-    let event_handler_loop = ActorLoop::new({
+    let event_handler_loop = Task::start_droppable({
         let construct_context_for_events = construct_context.clone();
         async move {
             let mut press_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut hovered_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut press_event_object_value_version = 0u64;
-            let mut hovered_stream = hovered_stream.fuse();
+            let mut press_stream = Some(press_stream);
+            let mut hovered_stream = Some(hovered_stream.fuse());
             let mut last_hover_state: Option<bool> = None;
             loop {
-                select! {
-                    new_press_link_value_sender = press_stream.next() => {
-                        if let Some(new_press_link_value_sender) = new_press_link_value_sender {
-                            press_link_value_sender = Some(new_press_link_value_sender);
+                if let Some(press_sender_stream) = press_stream.as_mut() {
+                    if let Some(hovered_sender_stream) = hovered_stream.as_mut() {
+                        select! {
+                            result = press_sender_stream.next() => {
+                                if let Some(new_press_link_value_sender) = result {
+                                    press_link_value_sender = Some(new_press_link_value_sender);
+                                } else {
+                                    press_stream = None;
+                                }
+                            }
+                            result = hovered_sender_stream.next() => {
+                                if let Some(sender) = result {
+                                    // Send initial hover state (false) when link is established.
+                                    let initial_hover_value = EngineTag::new_value_cached(
+                                        HOVER_TAG_INFO.with(|info| info.clone()),
+                                        ValueIdempotencyKey::new(),
+                                        "False",
+                                    );
+                                    sender.send_or_drop(initial_hover_value);
+                                    last_hover_state = Some(false);
+                                    hovered_link_value_sender = Some(sender);
+                                } else {
+                                    hovered_stream = None;
+                                }
+                            }
+                            event = press_event_receiver.select_next_some() => {
+                                if let Some(press_link_value_sender) = press_link_value_sender.as_ref() {
+                                    let press_event_object_value = Object::new_value_with_emission_seq(
+                                        ConstructInfo::new(format!("bridge::element_button::press_event, version: {press_event_object_value_version}"), None, "Button press event"),
+                                        construct_context_for_events.clone(),
+                                        ValueIdempotencyKey::new(),
+                                        event.emission_seq,
+                                        [],
+                                    );
+                                    press_event_object_value_version += 1;
+                                    press_link_value_sender.send_or_drop(press_event_object_value);
+                                }
+                            }
+                            event = hovered_receiver.select_next_some() => {
+                                if last_hover_state == Some(event.data) {
+                                    inc_metric!(HOVER_EVENTS_DEDUPED);
+                                    continue;
+                                }
+                                if let Some(sender) = hovered_link_value_sender.as_ref() {
+                                    inc_metric!(HOVER_EVENTS_EMITTED);
+                                    last_hover_state = Some(event.data);
+                                    let hover_tag = if event.data { "True" } else { "False" };
+                                    let event_value = EngineTag::new_value_cached_with_emission_seq(
+                                        HOVER_TAG_INFO.with(|info| info.clone()),
+                                        ValueIdempotencyKey::new(),
+                                        event.emission_seq,
+                                        hover_tag,
+                                    );
+                                    sender.send_or_drop(event_value);
+                                }
+                            }
+                        }
+                    } else {
+                        select! {
+                            result = press_sender_stream.next() => {
+                                if let Some(new_press_link_value_sender) = result {
+                                    press_link_value_sender = Some(new_press_link_value_sender);
+                                } else {
+                                    press_stream = None;
+                                }
+                            }
+                            event = press_event_receiver.select_next_some() => {
+                                if let Some(press_link_value_sender) = press_link_value_sender.as_ref() {
+                                    let press_event_object_value = Object::new_value_with_emission_seq(
+                                        ConstructInfo::new(format!("bridge::element_button::press_event, version: {press_event_object_value_version}"), None, "Button press event"),
+                                        construct_context_for_events.clone(),
+                                        ValueIdempotencyKey::new(),
+                                        event.emission_seq,
+                                        [],
+                                    );
+                                    press_event_object_value_version += 1;
+                                    press_link_value_sender.send_or_drop(press_event_object_value);
+                                }
+                            }
+                            event = hovered_receiver.select_next_some() => {
+                                if last_hover_state == Some(event.data) {
+                                    inc_metric!(HOVER_EVENTS_DEDUPED);
+                                    continue;
+                                }
+                                if let Some(sender) = hovered_link_value_sender.as_ref() {
+                                    inc_metric!(HOVER_EVENTS_EMITTED);
+                                    last_hover_state = Some(event.data);
+                                    let hover_tag = if event.data { "True" } else { "False" };
+                                    let event_value = EngineTag::new_value_cached_with_emission_seq(
+                                        HOVER_TAG_INFO.with(|info| info.clone()),
+                                        ValueIdempotencyKey::new(),
+                                        event.emission_seq,
+                                        hover_tag,
+                                    );
+                                    sender.send_or_drop(event_value);
+                                }
+                            }
                         }
                     }
-                    new_sender = hovered_stream.next() => {
-                        if let Some(sender) = new_sender {
-                            // Send initial hover state (false) when link is established
-                            let initial_hover_value = EngineTag::new_value_cached(
-                                HOVER_TAG_INFO.with(|info| info.clone()),
-                                ValueIdempotencyKey::new(),
-                                "False",
-                            );
-                            sender.send_or_drop(initial_hover_value);
-                            last_hover_state = Some(false);
-                            hovered_link_value_sender = Some(sender);
+                } else if let Some(hovered_sender_stream) = hovered_stream.as_mut() {
+                    select! {
+                        result = hovered_sender_stream.next() => {
+                            if let Some(sender) = result {
+                                // Send initial hover state (false) when link is established.
+                                let initial_hover_value = EngineTag::new_value_cached(
+                                    HOVER_TAG_INFO.with(|info| info.clone()),
+                                    ValueIdempotencyKey::new(),
+                                    "False",
+                                );
+                                sender.send_or_drop(initial_hover_value);
+                                last_hover_state = Some(false);
+                                hovered_link_value_sender = Some(sender);
+                            } else {
+                                hovered_stream = None;
+                            }
+                        }
+                        event = press_event_receiver.select_next_some() => {
+                            if let Some(press_link_value_sender) = press_link_value_sender.as_ref() {
+                                let press_event_object_value = Object::new_value_with_emission_seq(
+                                    ConstructInfo::new(format!("bridge::element_button::press_event, version: {press_event_object_value_version}"), None, "Button press event"),
+                                    construct_context_for_events.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    event.emission_seq,
+                                    [],
+                                );
+                                press_event_object_value_version += 1;
+                                press_link_value_sender.send_or_drop(press_event_object_value);
+                            }
+                        }
+                        event = hovered_receiver.select_next_some() => {
+                            if last_hover_state == Some(event.data) {
+                                inc_metric!(HOVER_EVENTS_DEDUPED);
+                                continue;
+                            }
+                            if let Some(sender) = hovered_link_value_sender.as_ref() {
+                                inc_metric!(HOVER_EVENTS_EMITTED);
+                                last_hover_state = Some(event.data);
+                                let hover_tag = if event.data { "True" } else { "False" };
+                                let event_value = EngineTag::new_value_cached_with_emission_seq(
+                                    HOVER_TAG_INFO.with(|info| info.clone()),
+                                    ValueIdempotencyKey::new(),
+                                    event.emission_seq,
+                                    hover_tag,
+                                );
+                                sender.send_or_drop(event_value);
+                            }
                         }
                     }
-                    event = press_event_receiver.select_next_some() => {
-                        if let Some(press_link_value_sender) = press_link_value_sender.as_ref() {
-                            let press_event_object_value = Object::new_value_with_lamport_time(
-                                ConstructInfo::new(format!("bridge::element_button::press_event, version: {press_event_object_value_version}"), None, "Button press event"),
-                                construct_context_for_events.clone(),
-                                ValueIdempotencyKey::new(),
-                                event.lamport_time,
-                                [],
-                            );
-                            press_event_object_value_version += 1;
-                            press_link_value_sender.send_or_drop(press_event_object_value);
+                } else {
+                    select! {
+                        event = press_event_receiver.select_next_some() => {
+                            if let Some(press_link_value_sender) = press_link_value_sender.as_ref() {
+                                let press_event_object_value = Object::new_value_with_emission_seq(
+                                    ConstructInfo::new(format!("bridge::element_button::press_event, version: {press_event_object_value_version}"), None, "Button press event"),
+                                    construct_context_for_events.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    event.emission_seq,
+                                    [],
+                                );
+                                press_event_object_value_version += 1;
+                                press_link_value_sender.send_or_drop(press_event_object_value);
+                            }
                         }
-                    }
-                    event = hovered_receiver.select_next_some() => {
-                        if last_hover_state == Some(event.data) {
-                            inc_metric!(HOVER_EVENTS_DEDUPED);
-                            continue;
-                        }
-                        if let Some(sender) = hovered_link_value_sender.as_ref() {
-                            inc_metric!(HOVER_EVENTS_EMITTED);
-                            last_hover_state = Some(event.data);
-                            let hover_tag = if event.data { "True" } else { "False" };
-                            let event_value = EngineTag::new_value_cached_with_lamport_time(
-                                HOVER_TAG_INFO.with(|info| info.clone()),
-                                ValueIdempotencyKey::new(),
-                                event.lamport_time,
-                                hover_tag,
-                            );
-                            sender.send_or_drop(event_value);
+                        event = hovered_receiver.select_next_some() => {
+                            if last_hover_state == Some(event.data) {
+                                inc_metric!(HOVER_EVENTS_DEDUPED);
+                                continue;
+                            }
+                            if let Some(sender) = hovered_link_value_sender.as_ref() {
+                                inc_metric!(HOVER_EVENTS_EMITTED);
+                                last_hover_state = Some(event.data);
+                                let hover_tag = if event.data { "True" } else { "False" };
+                                let event_value = EngineTag::new_value_cached_with_emission_seq(
+                                    HOVER_TAG_INFO.with(|info| info.clone()),
+                                    ValueIdempotencyKey::new(),
+                                    event.emission_seq,
+                                    hover_tag,
+                                );
+                                sender.send_or_drop(event_value);
+                            }
                         }
                     }
                 }
@@ -3279,13 +3390,13 @@ fn element_button(
                 }
                 Value::Object(obj, _) => {
                     let top = if let Some(v) = obj.variable("top") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
                         }
                     } else if let Some(v) = obj.variable("column") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
@@ -3294,13 +3405,13 @@ fn element_button(
                         0
                     };
                     let right = if let Some(v) = obj.variable("right") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
                         }
                     } else if let Some(v) = obj.variable("row") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
@@ -3309,13 +3420,13 @@ fn element_button(
                         0
                     };
                     let bottom = if let Some(v) = obj.variable("bottom") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
                         }
                     } else if let Some(v) = obj.variable("column") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
@@ -3324,13 +3435,13 @@ fn element_button(
                         0
                     };
                     let left = if let Some(v) = obj.variable("left") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
                         }
                     } else if let Some(v) = obj.variable("row") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
@@ -3406,7 +3517,7 @@ fn element_button(
     // In scene mode, physical CSS handles border-radius via rounded_corners — skip typed API
     let sv_rounded = settings_variable.clone();
     let rounded_signal = signal::from_stream(if is_scene {
-        stream::pending::<u32>().boxed_local()
+        stream::empty::<u32>().boxed_local()
     } else {
         let style_stream = switch_map(sv_rounded.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
@@ -3446,7 +3557,7 @@ fn element_button(
         .filter_map(|value| async move {
             if let Value::Object(obj, _) = value {
                 let move_left = if let Some(v) = obj.variable("move_left") {
-                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                         n.number()
                     } else {
                         0.0
@@ -3455,7 +3566,7 @@ fn element_button(
                     0.0
                 };
                 let move_down = if let Some(v) = obj.variable("move_down") {
-                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                         n.number()
                     } else {
                         0.0
@@ -3464,7 +3575,7 @@ fn element_button(
                     0.0
                 };
                 let move_up = if let Some(v) = obj.variable("move_up") {
-                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                         n.number()
                     } else {
                         0.0
@@ -3473,7 +3584,7 @@ fn element_button(
                     0.0
                 };
                 let move_right = if let Some(v) = obj.variable("move_right") {
-                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                         n.number()
                     } else {
                         0.0
@@ -3482,7 +3593,7 @@ fn element_button(
                     0.0
                 };
                 let rotate = if let Some(v) = obj.variable("rotate") {
-                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                         n.number()
                     } else {
                         0.0
@@ -3608,7 +3719,7 @@ fn element_button(
     // In scene mode, physical CSS handles background-color via material.color — skip typed API
     let sv_background = settings_variable.clone();
     let background_signal = signal::from_stream(if is_scene {
-        stream::pending::<String>().boxed_local()
+        stream::empty::<String>().boxed_local()
     } else {
         let style_stream = switch_map(sv_background.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
@@ -3635,7 +3746,6 @@ fn element_button(
 
     // Outline signal - handles both NoOutline tag and Object with color/thickness/style fields.
     // CRITICAL: Uses nested switch_map (not flat_map) because all variable streams are infinite.
-    // The innermost switch_map handles pending() streams from NoOutline tag.
     let sv_outline = settings_variable.clone();
     let button_id = Arc::as_ptr(&sv_outline) as usize;
     let outline_value_stream = {
@@ -3691,9 +3801,7 @@ fn element_button(
         match &value {
             Value::Tag(tag, _) if tag.tag() == "NoOutline" => {
                 // Return None to remove outline
-                stream::once(future::ready(None::<zoon::Outline>))
-                    .chain(stream::pending())
-                    .boxed_local()
+                stream::once(future::ready(None::<zoon::Outline>)).boxed_local()
             }
             Value::Object(obj, _) => {
                 let obj = obj.clone();
@@ -3761,12 +3869,11 @@ fn element_button(
                         }
                         None
                     })
-                    .chain(stream::pending())
                     .boxed_local()
             }
             other => {
                 log_unexpected_type("button outline", "Object or NoOutline tag", other);
-                stream::pending::<Option<zoon::Outline>>().boxed_local()
+                stream::empty::<Option<zoon::Outline>>().boxed_local()
             }
         }
     }));
@@ -3842,6 +3949,14 @@ fn element_text_input(
         KeyDown(TimestampedEvent<KeyDownPayload>),
     }
 
+    enum TextInputSenderUpdate {
+        Input(NamedChannel<Value>),
+        Change(NamedChannel<Value>),
+        KeyDown(NamedChannel<Value>),
+        Blur(NamedChannel<Value>),
+        Focus(NamedChannel<Value>),
+    }
+
     if LOG_DEBUG {
         zoon::println!("[EVENT:TextInput:v2] element_text_input CALLED - creating new TextInput");
     }
@@ -3861,96 +3976,81 @@ fn element_text_input(
 
     let element_variable = tagged_object.expect_variable("element");
 
-    // Set up event handlers - create separate subscriptions for each event type
-    // Chain with pending() to prevent stream termination causing busy-polling in select!
+    // Set up event handlers - create separate subscriptions for each event type.
     // CRITICAL: Use switch_map (not flat_map) because variable.stream() is infinite.
     // When element is recreated during example switching, switch_map cancels old subscription
     // and re-subscribes to the new element's event streams, preventing stale LINK bugs.
-    let mut change_stream = switch_map(
+    let change_stream = switch_map(
         variable_current_or_future_stream(element_variable.clone())
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
         |variable| variable_current_or_future_stream(variable),
     )
     .filter_map(|value| future::ready(value.expect_object().variable("change")))
-    .map(move |variable| variable.expect_link_value_sender())
-    .chain(stream::pending())
-    .fuse();
+    .map(move |variable| TextInputSenderUpdate::Change(variable.expect_link_value_sender()));
 
-    let mut input_stream = switch_map(
+    let input_stream = switch_map(
         variable_current_or_future_stream(element_variable.clone())
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
         |variable| variable_current_or_future_stream(variable),
     )
     .filter_map(|value| future::ready(value.expect_object().variable("input")))
-    .map(move |variable| variable.expect_link_value_sender())
-    .chain(stream::pending())
-    .fuse();
+    .map(move |variable| TextInputSenderUpdate::Input(variable.expect_link_value_sender()));
 
-    let mut key_down_stream = switch_map(
+    let key_down_stream = switch_map(
         variable_current_or_future_stream(element_variable.clone())
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
         |variable| variable_current_or_future_stream(variable),
     )
     .filter_map(|value| future::ready(value.expect_object().variable("key_down")))
-    .map(move |variable| variable.expect_link_value_sender())
-    .chain(stream::pending())
-    .fuse();
+    .map(move |variable| TextInputSenderUpdate::KeyDown(variable.expect_link_value_sender()));
 
-    let mut blur_stream = switch_map(
+    let blur_stream = switch_map(
         variable_current_or_future_stream(element_variable.clone())
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
         |variable| variable_current_or_future_stream(variable),
     )
     .filter_map(|value| future::ready(value.expect_object().variable("blur")))
-    .map(move |variable| variable.expect_link_value_sender())
-    .chain(stream::pending())
-    .fuse();
+    .map(move |variable| TextInputSenderUpdate::Blur(variable.expect_link_value_sender()));
 
-    let mut focus_stream = switch_map(
+    let focus_stream = switch_map(
         variable_current_or_future_stream(element_variable.clone())
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
         |variable| variable_current_or_future_stream(variable),
     )
     .filter_map(|value| future::ready(value.expect_object().variable("focus")))
-    .map(move |variable| variable.expect_link_value_sender())
-    .chain(stream::pending())
+    .map(move |variable| TextInputSenderUpdate::Focus(variable.expect_link_value_sender()));
+
+    let sender_updates = stream::select(
+        stream::select(input_stream, change_stream),
+        stream::select(stream::select(key_down_stream, blur_stream), focus_stream),
+    )
     .fuse();
 
-    // Helper to create change event value with captured Lamport timestamp
+    // Helper to create change event value with a captured emission sequence.
     fn create_change_event_value(
         construct_context: &ConstructContext,
         text: String,
-        lamport_time: u64,
+        emission_seq: u64,
         scope_id: ScopeId,
     ) -> Value {
         inc_metric!(CHANGE_EVENTS_CONSTRUCTED);
         // C1: Use cached ConstructInfoComplete for the inner text value
         // to avoid ConstructInfo::new() allocation on every keystroke
-        let text_value = EngineText::new_value_cached_with_lamport_time(
+        let text_value = EngineText::new_value_cached_with_emission_seq(
             CHANGE_EVENT_TEXT_INFO.with(|info| info.clone()),
             ValueIdempotencyKey::new(),
-            lamport_time,
+            emission_seq,
             text,
         );
-        Object::new_value_with_lamport_time(
+        Object::new_value_with_emission_seq(
             ConstructInfo::new("text_input::change_event", None, "TextInput change event"),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
-            lamport_time,
+            emission_seq,
             [Variable::new_arc(
                 ConstructInfo::new("text_input::change_event::text", None, "change text"),
-                construct_context.clone(),
                 "text",
-                create_constant_actor(
-                    ConstructInfo::new(
-                        "text_input::change_event::text_actor",
-                        None,
-                        "change text actor",
-                    ),
-                    parser::PersistenceId::new(),
-                    text_value,
-                    scope_id,
-                ),
+                create_constant_actor(parser::PersistenceId::new(), text_value, scope_id),
                 parser::PersistenceId::default(),
                 parser::Scope::Root,
             )],
@@ -3960,63 +4060,53 @@ fn element_text_input(
     fn create_input_event_value(
         construct_context: &ConstructContext,
         text: String,
-        lamport_time: u64,
+        emission_seq: u64,
         scope_id: ScopeId,
     ) -> Value {
         inc_metric!(CHANGE_EVENTS_CONSTRUCTED);
-        let text_value = EngineText::new_value_cached_with_lamport_time(
+        let text_value = EngineText::new_value_cached_with_emission_seq(
             CHANGE_EVENT_TEXT_INFO.with(|info| info.clone()),
             ValueIdempotencyKey::new(),
-            lamport_time,
+            emission_seq,
             text,
         );
-        Object::new_value_with_lamport_time(
+        Object::new_value_with_emission_seq(
             ConstructInfo::new("text_input::input_event", None, "TextInput input event"),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
-            lamport_time,
+            emission_seq,
             [Variable::new_arc(
                 ConstructInfo::new("text_input::input_event::text", None, "input text"),
-                construct_context.clone(),
                 "text",
-                create_constant_actor(
-                    ConstructInfo::new(
-                        "text_input::input_event::text_actor",
-                        None,
-                        "input text actor",
-                    ),
-                    parser::PersistenceId::new(),
-                    text_value,
-                    scope_id,
-                ),
+                create_constant_actor(parser::PersistenceId::new(), text_value, scope_id),
                 parser::PersistenceId::default(),
                 parser::Scope::Root,
             )],
         )
     }
 
-    // Helper to create key_down event value with captured Lamport timestamp
+    // Helper to create key_down event value with a captured emission sequence.
     fn create_key_down_event_value(
         construct_context: &ConstructContext,
         payload: KeyDownPayload,
-        lamport_time: u64,
+        emission_seq: u64,
         scope_id: ScopeId,
     ) -> Value {
         inc_metric!(KEYDOWN_EVENTS_CONSTRUCTED);
         // C1: Use cached ConstructInfoComplete for the inner tag value
-        let tag_value = EngineTag::new_value_cached_with_lamport_time(
+        let tag_value = EngineTag::new_value_cached_with_emission_seq(
             KEY_DOWN_EVENT_TAG_INFO.with(|info| info.clone()),
             ValueIdempotencyKey::new(),
-            lamport_time,
+            emission_seq,
             payload.key,
         );
-        let text_value = EngineText::new_value_cached_with_lamport_time(
+        let text_value = EngineText::new_value_cached_with_emission_seq(
             KEY_DOWN_EVENT_TEXT_INFO.with(|info| info.clone()),
             ValueIdempotencyKey::new(),
-            lamport_time,
+            emission_seq,
             payload.text,
         );
-        Object::new_value_with_lamport_time(
+        Object::new_value_with_emission_seq(
             ConstructInfo::new(
                 "text_input::key_down_event",
                 None,
@@ -4024,39 +4114,19 @@ fn element_text_input(
             ),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
-            lamport_time,
+            emission_seq,
             [
                 Variable::new_arc(
                     ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
-                    construct_context.clone(),
                     "key",
-                    create_constant_actor(
-                        ConstructInfo::new(
-                            "text_input::key_down_event::key_actor",
-                            None,
-                            "key_down key actor",
-                        ),
-                        parser::PersistenceId::new(),
-                        tag_value,
-                        scope_id,
-                    ),
+                    create_constant_actor(parser::PersistenceId::new(), tag_value, scope_id),
                     parser::PersistenceId::default(),
                     parser::Scope::Root,
                 ),
                 Variable::new_arc(
                     ConstructInfo::new("text_input::key_down_event::text", None, "key_down text"),
-                    construct_context.clone(),
                     "text",
-                    create_constant_actor(
-                        ConstructInfo::new(
-                            "text_input::key_down_event::text_actor",
-                            None,
-                            "key_down text actor",
-                        ),
-                        parser::PersistenceId::new(),
-                        text_value,
-                        scope_id,
-                    ),
+                    create_constant_actor(parser::PersistenceId::new(), text_value, scope_id),
                     parser::PersistenceId::default(),
                     parser::Scope::Root,
                 ),
@@ -4064,7 +4134,7 @@ fn element_text_input(
         )
     }
 
-    let event_handler_loop = ActorLoop::new({
+    let event_handler_loop = Task::start_droppable({
         let construct_context_for_events = construct_context.clone();
         async move {
             if LOG_DEBUG {
@@ -4091,170 +4161,249 @@ fn element_text_input(
             let mut pending_key_down_events: Vec<TimestampedEvent<KeyDownPayload>> = Vec::new();
             let mut pending_blur_events: Vec<TimestampedEvent<()>> = Vec::new();
             let mut pending_focus_events: Vec<TimestampedEvent<()>> = Vec::new();
+            let mut sender_updates = Some(sender_updates);
 
             loop {
-                select! {
-                    // These branches get the Boon-side senders for each event type
-                    result = input_stream.next() => {
-                        if let Some(sender) = result {
-                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] input_link_value_sender READY"); }
-                            if let Some(buffered_event) = pending_input_event.take() {
-                                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered input event: lamport={}", buffered_event.lamport_time); }
-                                sender.send_or_drop(create_input_event_value(&construct_context, buffered_event.data, buffered_event.lamport_time, scope_id));
+                if let Some(sender_update_stream) = sender_updates.as_mut() {
+                    select! {
+                        result = sender_update_stream.next() => {
+                            if let Some(update) = result {
+                                match update {
+                                    TextInputSenderUpdate::Input(sender) => {
+                                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] input_link_value_sender READY"); }
+                                        if let Some(buffered_event) = pending_input_event.take() {
+                                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered input event: lamport={}", buffered_event.emission_seq); }
+                                            sender.send_or_drop(create_input_event_value(&construct_context, buffered_event.data, buffered_event.emission_seq, scope_id));
+                                        }
+                                        input_link_value_sender = Some(sender);
+                                    }
+                                    TextInputSenderUpdate::Change(sender) => {
+                                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] change_link_value_sender READY"); }
+                                        if let Some(buffered_event) = pending_change_event.take() {
+                                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered change event: lamport={}", buffered_event.emission_seq); }
+                                            sender.send_or_drop(create_change_event_value(&construct_context, buffered_event.data, buffered_event.emission_seq, scope_id));
+                                        }
+                                        change_link_value_sender = Some(sender);
+                                    }
+                                    TextInputSenderUpdate::KeyDown(sender) => {
+                                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] key_down_link_value_sender READY"); }
+                                        for buffered_event in pending_key_down_events.drain(..) {
+                                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered key_down event: key='{}', lamport={}", buffered_event.data.key, buffered_event.emission_seq); }
+                                            let event_value = create_key_down_event_value(&construct_context, buffered_event.data, buffered_event.emission_seq, scope_id);
+                                            let _ = sender.try_send(event_value);
+                                        }
+                                        key_down_link_value_sender = Some(sender);
+                                    }
+                                    TextInputSenderUpdate::Blur(sender) => {
+                                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] blur_link_value_sender READY"); }
+                                        for buffered_event in pending_blur_events.drain(..) {
+                                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered blur event: lamport={}", buffered_event.emission_seq); }
+                                            let event_value = Object::new_value_with_emission_seq(
+                                                ConstructInfo::new("text_input::blur_event", None, "TextInput blur event"),
+                                                construct_context_for_events.clone(),
+                                                ValueIdempotencyKey::new(),
+                                                buffered_event.emission_seq,
+                                                [],
+                                            );
+                                            sender.send_or_drop(event_value);
+                                        }
+                                        blur_link_value_sender = Some(sender);
+                                    }
+                                    TextInputSenderUpdate::Focus(sender) => {
+                                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] focus_link_value_sender READY"); }
+                                        for buffered_event in pending_focus_events.drain(..) {
+                                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered focus event: lamport={}", buffered_event.emission_seq); }
+                                            let event_value = Object::new_value_with_emission_seq(
+                                                ConstructInfo::new("text_input::focus_event", None, "TextInput focus event"),
+                                                construct_context.clone(),
+                                                ValueIdempotencyKey::new(),
+                                                buffered_event.emission_seq,
+                                                [],
+                                            );
+                                            sender.send_or_drop(event_value);
+                                        }
+                                        focus_link_value_sender = Some(sender);
+                                    }
+                                }
+                            } else {
+                                sender_updates = None;
                             }
-                            input_link_value_sender = Some(sender);
                         }
-                    }
-                    result = change_stream.next() => {
-                        if let Some(sender) = result {
-                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] change_link_value_sender READY"); }
-                            // Flush the latest buffered change event (only most recent matters)
-                            if let Some(buffered_event) = pending_change_event.take() {
-                                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered change event: lamport={}", buffered_event.lamport_time); }
-                                sender.send_or_drop(create_change_event_value(&construct_context, buffered_event.data, buffered_event.lamport_time, scope_id));
-                            }
-                            change_link_value_sender = Some(sender);
-                        }
-                    }
-                    result = key_down_stream.next() => {
-                        if let Some(sender) = result {
-                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] key_down_link_value_sender READY"); }
-                            // Flush any buffered events first
-                            for buffered_event in pending_key_down_events.drain(..) {
-                                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered key_down event: key='{}', lamport={}", buffered_event.data.key, buffered_event.lamport_time); }
-                                let event_value = create_key_down_event_value(&construct_context, buffered_event.data, buffered_event.lamport_time, scope_id);
-                                let _ = sender.try_send(event_value);
-                            }
-                            key_down_link_value_sender = Some(sender);
-                        }
-                    }
-                    result = blur_stream.next() => {
-                        if let Some(sender) = result {
-                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] blur_link_value_sender READY"); }
-                            // Flush any buffered events first
-                            for buffered_event in pending_blur_events.drain(..) {
-                                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered blur event: lamport={}", buffered_event.lamport_time); }
-                                let event_value = Object::new_value_with_lamport_time(
-                                    ConstructInfo::new("text_input::blur_event", None, "TextInput blur event"),
+                        event = focus_event_receiver.select_next_some() => {
+                            if let Some(sender) = focus_link_value_sender.as_ref() {
+                                let event_value = Object::new_value_with_emission_seq(
+                                    ConstructInfo::new("text_input::focus_event", None, "TextInput focus event"),
                                     construct_context_for_events.clone(),
                                     ValueIdempotencyKey::new(),
-                                    buffered_event.lamport_time,
+                                    event.emission_seq,
                                     [],
                                 );
                                 sender.send_or_drop(event_value);
-                            }
-                            blur_link_value_sender = Some(sender);
-                        }
-                    }
-                    result = focus_stream.next() => {
-                        if let Some(sender) = result {
-                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] focus_link_value_sender READY"); }
-                            // Flush any buffered events first
-                            for buffered_event in pending_focus_events.drain(..) {
-                                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered focus event: lamport={}", buffered_event.lamport_time); }
-                                let event_value = Object::new_value_with_lamport_time(
-                                    ConstructInfo::new("text_input::focus_event", None, "TextInput focus event"),
-                                    construct_context.clone(),
-                                    ValueIdempotencyKey::new(),
-                                    buffered_event.lamport_time,
-                                    [],
-                                );
-                                sender.send_or_drop(event_value);
-                            }
-                            focus_link_value_sender = Some(sender);
-                        }
-                    }
-                    event = focus_event_receiver.select_next_some() => {
-                        if let Some(sender) = focus_link_value_sender.as_ref() {
-                            let event_value = Object::new_value_with_lamport_time(
-                                ConstructInfo::new("text_input::focus_event", None, "TextInput focus event"),
-                                construct_context_for_events.clone(),
-                                ValueIdempotencyKey::new(),
-                                event.lamport_time,
-                                [],
-                            );
-                            sender.send_or_drop(event_value);
-                        } else {
-                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering focus event (sender not ready)"); }
-                            if pending_focus_events.len() < BRIDGE_PENDING_FOCUS_CAP {
-                                pending_focus_events.push(event);
+                            } else {
+                                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering focus event (sender not ready)"); }
+                                if pending_focus_events.len() < BRIDGE_PENDING_FOCUS_CAP {
+                                    pending_focus_events.push(event);
+                                }
                             }
                         }
-                    }
-                    // TimestampedEvent carries Lamport time captured at DOM callback
-                    // This ensures correct ordering even when select! processes events out of order
-                    event = dom_event_receiver.select_next_some() => {
-                        match event {
-                            TextInputDomEvent::Input(event) => {
-                                if LOG_DEBUG {
-                                    zoon::println!("[EVENT:TextInput] LOOP received input: text='{}', lamport={}, sender_ready={}",
-                                        if event.data.len() > 50 { format!("{}...", &event.data[..50]) } else { event.data.clone() },
-                                        event.lamport_time,
-                                        input_link_value_sender.is_some());
+                        // TimestampedEvent carries Lamport time captured at DOM callback
+                        // This ensures correct ordering even when select! processes events out of order
+                        event = dom_event_receiver.select_next_some() => {
+                            match event {
+                                TextInputDomEvent::Input(event) => {
+                                    if LOG_DEBUG {
+                                        zoon::println!("[EVENT:TextInput] LOOP received input: text='{}', lamport={}, sender_ready={}",
+                                            if event.data.len() > 50 { format!("{}...", &event.data[..50]) } else { event.data.clone() },
+                                            event.emission_seq,
+                                            input_link_value_sender.is_some());
+                                    }
+                                    if last_input_text.as_ref() == Some(&event.data) {
+                                        inc_metric!(CHANGE_EVENTS_DEDUPED);
+                                        continue;
+                                    }
+                                    last_input_text = Some(event.data.clone());
+                                    if let Some(sender) = input_link_value_sender.as_ref() {
+                                        sender.send_or_drop(create_input_event_value(&construct_context, event.data, event.emission_seq, scope_id));
+                                    } else {
+                                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering input event (sender not ready)"); }
+                                        pending_input_event = Some(event);
+                                    }
                                 }
-                                if last_input_text.as_ref() == Some(&event.data) {
-                                    inc_metric!(CHANGE_EVENTS_DEDUPED);
-                                    continue;
+                                TextInputDomEvent::Change(event) => {
+                                    if LOG_DEBUG {
+                                        zoon::println!("[EVENT:TextInput] LOOP received change: text='{}', lamport={}, sender_ready={}",
+                                            if event.data.len() > 50 { format!("{}...", &event.data[..50]) } else { event.data.clone() },
+                                            event.emission_seq,
+                                            change_link_value_sender.is_some());
+                                    }
+                                    if last_change_text.as_ref() == Some(&event.data) {
+                                        inc_metric!(CHANGE_EVENTS_DEDUPED);
+                                        continue;
+                                    }
+                                    last_change_text = Some(event.data.clone());
+                                    if let Some(sender) = change_link_value_sender.as_ref() {
+                                        sender.send_or_drop(create_change_event_value(&construct_context, event.data, event.emission_seq, scope_id));
+                                    } else {
+                                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering change event (sender not ready)"); }
+                                        pending_change_event = Some(event);
+                                    }
                                 }
-                                last_input_text = Some(event.data.clone());
-                                if let Some(sender) = input_link_value_sender.as_ref() {
-                                    sender.send_or_drop(create_input_event_value(&construct_context, event.data, event.lamport_time, scope_id));
-                                } else {
-                                    if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering input event (sender not ready)"); }
-                                    pending_input_event = Some(event);
-                                }
-                            }
-                            TextInputDomEvent::Change(event) => {
-                                if LOG_DEBUG {
-                                    zoon::println!("[EVENT:TextInput] LOOP received change: text='{}', lamport={}, sender_ready={}",
-                                        if event.data.len() > 50 { format!("{}...", &event.data[..50]) } else { event.data.clone() },
-                                        event.lamport_time,
-                                        change_link_value_sender.is_some());
-                                }
-                                // Dedup: skip if text hasn't changed since last emission
-                                if last_change_text.as_ref() == Some(&event.data) {
-                                    inc_metric!(CHANGE_EVENTS_DEDUPED);
-                                    continue;
-                                }
-                                last_change_text = Some(event.data.clone());
-                                if let Some(sender) = change_link_value_sender.as_ref() {
-                                    sender.send_or_drop(create_change_event_value(&construct_context, event.data, event.lamport_time, scope_id));
-                                } else {
-                                    // Buffer latest event until sender is ready (keep-latest, lossy)
-                                    if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering change event (sender not ready)"); }
-                                    pending_change_event = Some(event);
-                                }
-                            }
-                            TextInputDomEvent::KeyDown(event) => {
-                                if let Some(sender) = key_down_link_value_sender.as_ref() {
-                                    let event_value = create_key_down_event_value(&construct_context, event.data, event.lamport_time, scope_id);
-                                    let _ = sender.try_send(event_value);
-                                } else {
-                                    // Buffer event until sender is ready (bounded)
-                                    if pending_key_down_events.len() < BRIDGE_PENDING_KEY_DOWN_CAP {
+                                TextInputDomEvent::KeyDown(event) => {
+                                    if let Some(sender) = key_down_link_value_sender.as_ref() {
+                                        let event_value = create_key_down_event_value(&construct_context, event.data, event.emission_seq, scope_id);
+                                        let _ = sender.try_send(event_value);
+                                    } else if pending_key_down_events.len() < BRIDGE_PENDING_KEY_DOWN_CAP {
                                         pending_key_down_events.push(event);
                                     }
                                 }
                             }
                         }
+                        event = blur_event_receiver.select_next_some() => {
+                            let blur_lamport = event.emission_seq;
+                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LOOP received blur: lamport={}, sender_ready={}", blur_lamport, blur_link_value_sender.is_some()); }
+                            if let Some(sender) = blur_link_value_sender.as_ref() {
+                                let event_value = Object::new_value_with_emission_seq(
+                                    ConstructInfo::new("text_input::blur_event", None, "TextInput blur event"),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    blur_lamport,
+                                    [],
+                                );
+                                sender.send_or_drop(event_value);
+                            } else {
+                                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering blur event (sender not ready)"); }
+                                if pending_blur_events.len() < BRIDGE_PENDING_BLUR_CAP {
+                                    pending_blur_events.push(event);
+                                }
+                            }
+                        }
                     }
-                    event = blur_event_receiver.select_next_some() => {
-                        let blur_lamport = event.lamport_time;
-                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LOOP received blur: lamport={}, sender_ready={}", blur_lamport, blur_link_value_sender.is_some()); }
-                        if let Some(sender) = blur_link_value_sender.as_ref() {
-                            let event_value = Object::new_value_with_lamport_time(
-                                ConstructInfo::new("text_input::blur_event", None, "TextInput blur event"),
-                                construct_context.clone(),
-                                ValueIdempotencyKey::new(),
-                                blur_lamport,
-                                [],
-                            );
-                            sender.send_or_drop(event_value);
-                        } else {
-                            // Buffer event until sender is ready (bounded)
-                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering blur event (sender not ready)"); }
-                            if pending_blur_events.len() < BRIDGE_PENDING_BLUR_CAP {
-                                pending_blur_events.push(event);
+                } else {
+                    select! {
+                        event = focus_event_receiver.select_next_some() => {
+                            if let Some(sender) = focus_link_value_sender.as_ref() {
+                                let event_value = Object::new_value_with_emission_seq(
+                                    ConstructInfo::new("text_input::focus_event", None, "TextInput focus event"),
+                                    construct_context_for_events.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    event.emission_seq,
+                                    [],
+                                );
+                                sender.send_or_drop(event_value);
+                            } else {
+                                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering focus event (sender not ready)"); }
+                                if pending_focus_events.len() < BRIDGE_PENDING_FOCUS_CAP {
+                                    pending_focus_events.push(event);
+                                }
+                            }
+                        }
+                        event = dom_event_receiver.select_next_some() => {
+                            match event {
+                                TextInputDomEvent::Input(event) => {
+                                    if LOG_DEBUG {
+                                        zoon::println!("[EVENT:TextInput] LOOP received input: text='{}', lamport={}, sender_ready={}",
+                                            if event.data.len() > 50 { format!("{}...", &event.data[..50]) } else { event.data.clone() },
+                                            event.emission_seq,
+                                            input_link_value_sender.is_some());
+                                    }
+                                    if last_input_text.as_ref() == Some(&event.data) {
+                                        inc_metric!(CHANGE_EVENTS_DEDUPED);
+                                        continue;
+                                    }
+                                    last_input_text = Some(event.data.clone());
+                                    if let Some(sender) = input_link_value_sender.as_ref() {
+                                        sender.send_or_drop(create_input_event_value(&construct_context, event.data, event.emission_seq, scope_id));
+                                    } else {
+                                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering input event (sender not ready)"); }
+                                        pending_input_event = Some(event);
+                                    }
+                                }
+                                TextInputDomEvent::Change(event) => {
+                                    if LOG_DEBUG {
+                                        zoon::println!("[EVENT:TextInput] LOOP received change: text='{}', lamport={}, sender_ready={}",
+                                            if event.data.len() > 50 { format!("{}...", &event.data[..50]) } else { event.data.clone() },
+                                            event.emission_seq,
+                                            change_link_value_sender.is_some());
+                                    }
+                                    if last_change_text.as_ref() == Some(&event.data) {
+                                        inc_metric!(CHANGE_EVENTS_DEDUPED);
+                                        continue;
+                                    }
+                                    last_change_text = Some(event.data.clone());
+                                    if let Some(sender) = change_link_value_sender.as_ref() {
+                                        sender.send_or_drop(create_change_event_value(&construct_context, event.data, event.emission_seq, scope_id));
+                                    } else {
+                                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering change event (sender not ready)"); }
+                                        pending_change_event = Some(event);
+                                    }
+                                }
+                                TextInputDomEvent::KeyDown(event) => {
+                                    if let Some(sender) = key_down_link_value_sender.as_ref() {
+                                        let event_value = create_key_down_event_value(&construct_context, event.data, event.emission_seq, scope_id);
+                                        let _ = sender.try_send(event_value);
+                                    } else if pending_key_down_events.len() < BRIDGE_PENDING_KEY_DOWN_CAP {
+                                        pending_key_down_events.push(event);
+                                    }
+                                }
+                            }
+                        }
+                        event = blur_event_receiver.select_next_some() => {
+                            let blur_lamport = event.emission_seq;
+                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LOOP received blur: lamport={}, sender_ready={}", blur_lamport, blur_link_value_sender.is_some()); }
+                            if let Some(sender) = blur_link_value_sender.as_ref() {
+                                let event_value = Object::new_value_with_emission_seq(
+                                    ConstructInfo::new("text_input::blur_event", None, "TextInput blur event"),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    blur_lamport,
+                                    [],
+                                );
+                                sender.send_or_drop(event_value);
+                            } else {
+                                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering blur event (sender not ready)"); }
+                                if pending_blur_events.len() < BRIDGE_PENDING_BLUR_CAP {
+                                    pending_blur_events.push(event);
+                                }
                             }
                         }
                     }
@@ -4387,7 +4536,7 @@ fn element_text_input(
                     // Handle directional padding: [top, column, left, right, row, bottom]
                     async fn get_num(obj: &Object, name: &str) -> u32 {
                         if let Some(v) = obj.variable(name) {
-                            match v.value_actor().current_value().await {
+                            match v.value_actor().current_value() {
                                 Ok(Value::Number(n, _)) => n.number() as u32,
                                 _ => 0,
                             }
@@ -4483,7 +4632,7 @@ fn element_text_input(
     // In scene mode, physical CSS handles background-color via material.color — skip typed API
     let sv_bg_color = tagged_object.expect_variable("settings");
     let background_color_signal = signal::from_stream(if is_scene {
-        stream::pending::<String>().boxed_local()
+        stream::empty::<String>().boxed_local()
     } else {
         let style_stream = switch_map(sv_bg_color.stream(), |value| {
             value.expect_object().expect_variable("style").stream()
@@ -4530,7 +4679,7 @@ fn element_text_input(
     });
 
     // Task to update focus from stream - must be kept alive
-    let focus_loop = ActorLoop::new({
+    let focus_loop = Task::start_droppable({
         let focus_mutable = focus_mutable.clone();
         async move {
             futures_util::pin_mut!(focus_stream);
@@ -4567,7 +4716,7 @@ fn element_text_input(
                                 } else {
                                     event.data.clone()
                                 },
-                                event.lamport_time
+                                event.emission_seq
                             );
                         }
                         sender.send_or_drop(TextInputDomEvent::Input(event));
@@ -4587,7 +4736,7 @@ fn element_text_input(
                         } else {
                             event.data.clone()
                         },
-                        event.lamport_time
+                        event.emission_seq
                     );
                 }
                 sender.send_or_drop(TextInputDomEvent::Change(event));
@@ -4632,7 +4781,7 @@ fn element_text_input(
                         zoon::println!(
                             "[EVENT:TextInput] on_key_down (commit) key='{}', lamport={}",
                             ts_event.data.key,
-                            ts_event.lamport_time
+                            ts_event.emission_seq
                         );
                     }
                     sender.send_or_drop(TextInputDomEvent::KeyDown(ts_event));
@@ -4646,7 +4795,7 @@ fn element_text_input(
                         zoon::println!(
                             "[EVENT:TextInput] on_key_down fired: key='{}', lamport={}",
                             ts_event.data.key,
-                            ts_event.lamport_time
+                            ts_event.emission_seq
                         );
                     }
                     sender.send_or_drop(TextInputDomEvent::KeyDown(ts_event));
@@ -4666,7 +4815,7 @@ fn element_text_input(
                 if LOG_DEBUG {
                     zoon::println!(
                         "[EVENT:TextInput] on_blur fired: lamport={}",
-                        event.lamport_time
+                        event.emission_seq
                     );
                 }
                 sender.send_or_drop(event);
@@ -4680,7 +4829,7 @@ fn element_text_input(
                     if LOG_DEBUG {
                         zoon::println!(
                             "[EVENT:TextInput] on_focus fired: lamport={}",
-                            event.lamport_time
+                            event.emission_seq
                         );
                     }
                     sender.send_or_drop(event);
@@ -4741,13 +4890,12 @@ fn element_checkbox(
         event_stream.filter_map(|value| future::ready(value.expect_object().variable("click")));
 
     // Map to sender - the Variable stream already handles uniqueness via persistence_id + scope
-    // Chain with pending() to prevent stream termination causing busy-polling in select!
     let click_sender_stream =
         click_var_stream.map(move |variable| variable.expect_link_value_sender());
 
-    let mut click_sender_stream = click_sender_stream.chain(stream::pending()).fuse();
+    let mut click_sender_stream = Some(click_sender_stream.fuse());
 
-    let event_handler_loop = ActorLoop::new({
+    let event_handler_loop = Task::start_droppable({
         let construct_context_for_events = construct_context.clone();
         async move {
             let mut click_link_value_sender: Option<NamedChannel<Value>> = None;
@@ -4755,39 +4903,61 @@ fn element_checkbox(
             let mut pending_clicks: usize = 0;
 
             loop {
-                select! {
-                    result = click_sender_stream.next() => {
-                        if let Some(sender) = result {
-                            click_link_value_sender = Some(sender.clone());
+                if let Some(sender_stream) = click_sender_stream.as_mut() {
+                    select! {
+                        result = sender_stream.next() => {
+                            if let Some(sender) = result {
+                                click_link_value_sender = Some(sender.clone());
 
-                            // Send any pending clicks that were buffered
-                            for _ in 0..pending_clicks {
-                                let event_value = Object::new_value(
+                                // Send any pending clicks that were buffered
+                                for _ in 0..pending_clicks {
+                                    let event_value = Object::new_value(
+                                        ConstructInfo::new("checkbox::click_event", None, "Checkbox click event"),
+                                        construct_context_for_events.clone(),
+                                        ValueIdempotencyKey::new(),
+                                        [],
+                                    );
+                                    sender.send_or_drop(event_value);
+                                }
+                                pending_clicks = 0;
+                            } else {
+                                click_sender_stream = None;
+                            }
+                        }
+                        event = click_event_receiver.select_next_some() => {
+                            if let Some(sender) = click_link_value_sender.as_ref() {
+                                let event_value = Object::new_value_with_emission_seq(
                                     ConstructInfo::new("checkbox::click_event", None, "Checkbox click event"),
                                     construct_context_for_events.clone(),
                                     ValueIdempotencyKey::new(),
+                                    event.emission_seq,
                                     [],
                                 );
                                 sender.send_or_drop(event_value);
+                            } else {
+                                // Buffer the click to send when sender becomes available
+                                // Note: Buffered clicks use fresh timestamps when processed (edge case)
+                                pending_clicks += 1;
                             }
-                            pending_clicks = 0;
                         }
                     }
-                    event = click_event_receiver.select_next_some() => {
-                        if let Some(sender) = click_link_value_sender.as_ref() {
-                            let event_value = Object::new_value_with_lamport_time(
-                                ConstructInfo::new("checkbox::click_event", None, "Checkbox click event"),
-                                construct_context_for_events.clone(),
-                                ValueIdempotencyKey::new(),
-                                event.lamport_time,
-                                [],
-                            );
-                            sender.send_or_drop(event_value);
-                        } else {
-                            // Buffer the click to send when sender becomes available
-                            // Note: Buffered clicks use fresh timestamps when processed (edge case)
-                            pending_clicks += 1;
-                        }
+                } else {
+                    let event = click_event_receiver.select_next_some().await;
+                    if let Some(sender) = click_link_value_sender.as_ref() {
+                        let event_value = Object::new_value_with_emission_seq(
+                            ConstructInfo::new(
+                                "checkbox::click_event",
+                                None,
+                                "Checkbox click event",
+                            ),
+                            construct_context_for_events.clone(),
+                            ValueIdempotencyKey::new(),
+                            event.emission_seq,
+                            [],
+                        );
+                        sender.send_or_drop(event_value);
+                    } else {
+                        pending_clicks += 1;
                     }
                 }
             }
@@ -4861,13 +5031,13 @@ fn element_checkbox(
                 }
                 Value::Object(obj, _) => {
                     let top = if let Some(v) = obj.variable("top") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
                         }
                     } else if let Some(v) = obj.variable("column") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
@@ -4876,13 +5046,13 @@ fn element_checkbox(
                         0
                     };
                     let right = if let Some(v) = obj.variable("right") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
                         }
                     } else if let Some(v) = obj.variable("row") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
@@ -4891,13 +5061,13 @@ fn element_checkbox(
                         0
                     };
                     let bottom = if let Some(v) = obj.variable("bottom") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
                         }
                     } else if let Some(v) = obj.variable("column") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
@@ -4906,13 +5076,13 @@ fn element_checkbox(
                         0
                     };
                     let left = if let Some(v) = obj.variable("left") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
                         }
                     } else if let Some(v) = obj.variable("row") {
-                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value() {
                             n.number() as u32
                         } else {
                             0
@@ -4987,9 +5157,9 @@ fn element_slider(
     let change_sender_stream =
         change_var_stream.map(move |variable| variable.expect_link_value_sender());
 
-    let mut change_sender_stream = change_sender_stream.chain(stream::pending()).fuse();
+    let mut change_sender_stream = Some(change_sender_stream.fuse());
 
-    let event_handler_loop = ActorLoop::new({
+    let event_handler_loop = Task::start_droppable({
         let _construct_context = construct_context.clone();
         async move {
             let scope_id = construct_context
@@ -4998,44 +5168,78 @@ fn element_slider(
             let mut change_link_value_sender: Option<NamedChannel<Value>> = None;
 
             loop {
-                select! {
-                    result = change_sender_stream.next() => {
-                        if let Some(sender) = result {
-                            change_link_value_sender = Some(sender);
+                if let Some(sender_stream) = change_sender_stream.as_mut() {
+                    select! {
+                        result = sender_stream.next() => {
+                            if let Some(sender) = result {
+                                change_link_value_sender = Some(sender);
+                            } else {
+                                change_sender_stream = None;
+                            }
+                        }
+                        event = input_event_receiver.select_next_some() => {
+                            if let Some(sender) = change_link_value_sender.as_ref() {
+                                let number_value = super::engine::Number::new_value(
+                                    ConstructInfo::new("slider::change_number", None, "Slider change number"),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    event.data,
+                                );
+                                let event_value = Object::new_value_with_emission_seq(
+                                    ConstructInfo::new("slider::change_event", None, "Slider change event"),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    event.emission_seq,
+                                    [Variable::new_arc(
+                                        ConstructInfo::new("slider::change_value", None, "Slider change value"),
+                                        "value",
+                                        create_constant_actor(parser::PersistenceId::new(),
+                                            number_value,
+                                            scope_id,
+                                        ),
+                                        parser::PersistenceId::default(),
+                                        parser::Scope::Root,
+                                    )],
+                                );
+                                sender.send_or_drop(event_value);
+                            }
                         }
                     }
-                    event = input_event_receiver.select_next_some() => {
-                        if let Some(sender) = change_link_value_sender.as_ref() {
-                            let number_value = super::engine::Number::new_value(
-                                ConstructInfo::new("slider::change_number", None, "Slider change number"),
-                                construct_context.clone(),
-                                ValueIdempotencyKey::new(),
-                                event.data,
-                            );
-                            let event_value = Object::new_value_with_lamport_time(
-                                ConstructInfo::new("slider::change_event", None, "Slider change event"),
-                                construct_context.clone(),
-                                ValueIdempotencyKey::new(),
-                                event.lamport_time,
-                                [Variable::new_arc(
-                                    ConstructInfo::new("slider::change_value", None, "Slider change value"),
-                                    construct_context.clone(),
-                                    "value",
-                                    create_actor(
-                                        ConstructInfo::new("slider::change_value_actor", None, "Slider change value actor"),
-                                        ActorContext::default(),
-                                        TypedStream::infinite(
-                                            stream::once(future::ready(number_value)).chain(stream::pending()),
-                                        ),
-                                        parser::PersistenceId::new(),
-                                        scope_id,
-                                    ),
-                                    parser::PersistenceId::default(),
-                                    parser::Scope::Root,
-                                )],
-                            );
-                            sender.send_or_drop(event_value);
-                        }
+                } else {
+                    let event = input_event_receiver.select_next_some().await;
+                    if let Some(sender) = change_link_value_sender.as_ref() {
+                        let number_value = super::engine::Number::new_value(
+                            ConstructInfo::new(
+                                "slider::change_number",
+                                None,
+                                "Slider change number",
+                            ),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            event.data,
+                        );
+                        let event_value = Object::new_value_with_emission_seq(
+                            ConstructInfo::new("slider::change_event", None, "Slider change event"),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            event.emission_seq,
+                            [Variable::new_arc(
+                                ConstructInfo::new(
+                                    "slider::change_value",
+                                    None,
+                                    "Slider change value",
+                                ),
+                                "value",
+                                create_constant_actor(
+                                    parser::PersistenceId::new(),
+                                    number_value,
+                                    scope_id,
+                                ),
+                                parser::PersistenceId::default(),
+                                parser::Scope::Root,
+                            )],
+                        );
+                        sender.send_or_drop(event_value);
                     }
                 }
             }
@@ -5161,9 +5365,9 @@ fn element_select(
     let change_sender_stream =
         change_var_stream.map(move |variable| variable.expect_link_value_sender());
 
-    let mut change_sender_stream = change_sender_stream.chain(stream::pending()).fuse();
+    let mut change_sender_stream = Some(change_sender_stream.fuse());
 
-    let event_handler_loop = ActorLoop::new({
+    let event_handler_loop = Task::start_droppable({
         let _construct_context = construct_context.clone();
         async move {
             let scope_id = construct_context
@@ -5172,44 +5376,74 @@ fn element_select(
             let mut change_link_value_sender: Option<NamedChannel<Value>> = None;
 
             loop {
-                select! {
-                    result = change_sender_stream.next() => {
-                        if let Some(sender) = result {
-                            change_link_value_sender = Some(sender);
+                if let Some(sender_stream) = change_sender_stream.as_mut() {
+                    select! {
+                        result = sender_stream.next() => {
+                            if let Some(sender) = result {
+                                change_link_value_sender = Some(sender);
+                            } else {
+                                change_sender_stream = None;
+                            }
+                        }
+                        event = change_event_receiver.select_next_some() => {
+                            if let Some(sender) = change_link_value_sender.as_ref() {
+                                let text_value = super::engine::Text::new_value(
+                                    ConstructInfo::new("select::change_text", None, "Select change text"),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    event.data.clone(),
+                                );
+                                let event_value = Object::new_value_with_emission_seq(
+                                    ConstructInfo::new("select::change_event", None, "Select change event"),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    event.emission_seq,
+                                    [Variable::new_arc(
+                                        ConstructInfo::new("select::change_value", None, "Select change value"),
+                                        "value",
+                                        create_constant_actor(parser::PersistenceId::new(),
+                                            text_value,
+                                            scope_id,
+                                        ),
+                                        parser::PersistenceId::default(),
+                                        parser::Scope::Root,
+                                    )],
+                                );
+                                sender.send_or_drop(event_value);
+                            }
                         }
                     }
-                    event = change_event_receiver.select_next_some() => {
-                        if let Some(sender) = change_link_value_sender.as_ref() {
-                            let text_value = super::engine::Text::new_value(
-                                ConstructInfo::new("select::change_text", None, "Select change text"),
-                                construct_context.clone(),
-                                ValueIdempotencyKey::new(),
-                                event.data.clone(),
-                            );
-                            let event_value = Object::new_value_with_lamport_time(
-                                ConstructInfo::new("select::change_event", None, "Select change event"),
-                                construct_context.clone(),
-                                ValueIdempotencyKey::new(),
-                                event.lamport_time,
-                                [Variable::new_arc(
-                                    ConstructInfo::new("select::change_value", None, "Select change value"),
-                                    construct_context.clone(),
-                                    "value",
-                                    create_actor(
-                                        ConstructInfo::new("select::change_value_actor", None, "Select change value actor"),
-                                        ActorContext::default(),
-                                        TypedStream::infinite(
-                                            stream::once(future::ready(text_value)).chain(stream::pending()),
-                                        ),
-                                        parser::PersistenceId::new(),
-                                        scope_id,
-                                    ),
-                                    parser::PersistenceId::default(),
-                                    parser::Scope::Root,
-                                )],
-                            );
-                            sender.send_or_drop(event_value);
-                        }
+                } else {
+                    let event = change_event_receiver.select_next_some().await;
+                    if let Some(sender) = change_link_value_sender.as_ref() {
+                        let text_value = super::engine::Text::new_value(
+                            ConstructInfo::new("select::change_text", None, "Select change text"),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            event.data.clone(),
+                        );
+                        let event_value = Object::new_value_with_emission_seq(
+                            ConstructInfo::new("select::change_event", None, "Select change event"),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            event.emission_seq,
+                            [Variable::new_arc(
+                                ConstructInfo::new(
+                                    "select::change_value",
+                                    None,
+                                    "Select change value",
+                                ),
+                                "value",
+                                create_constant_actor(
+                                    parser::PersistenceId::new(),
+                                    text_value,
+                                    scope_id,
+                                ),
+                                parser::PersistenceId::default(),
+                                parser::Scope::Root,
+                            )],
+                        );
+                        sender.send_or_drop(event_value);
                     }
                 }
             }
@@ -5241,9 +5475,9 @@ fn element_select(
                 let snapshot = list.snapshot().await;
                 let mut pairs = Vec::new();
                 for (_item_id, actor) in snapshot {
-                    if let Ok(Value::Object(obj, _)) = actor.current_value().await {
+                    if let Ok(Value::Object(obj, _)) = actor.current_value() {
                         let val = if let Some(var) = obj.variable("value") {
-                            if let Ok(Value::Text(t, _)) = var.value_actor().current_value().await {
+                            if let Ok(Value::Text(t, _)) = var.value_actor().current_value() {
                                 t.text().to_string()
                             } else {
                                 String::new()
@@ -5252,7 +5486,7 @@ fn element_select(
                             String::new()
                         };
                         let label = if let Some(var) = obj.variable("label") {
-                            if let Ok(Value::Text(t, _)) = var.value_actor().current_value().await {
+                            if let Ok(Value::Text(t, _)) = var.value_actor().current_value() {
                                 t.text().to_string()
                             } else {
                                 val.clone()
@@ -5330,17 +5564,18 @@ fn element_svg(
         NamedChannel::<TimestampedEvent<(f64, f64)>>::new("svg.click", BRIDGE_PRESS_EVENT_CAPACITY);
 
     let element_variable = tagged_object.expect_variable("element");
-    let mut click_stream = switch_map(
+    let click_stream = switch_map(
         variable_current_or_future_stream(element_variable.clone())
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
         |variable| variable_current_or_future_stream(variable),
     )
     .filter_map(|value| future::ready(value.expect_object().variable("click")))
     .map(move |variable| variable.expect_link_value_sender())
-    .chain(stream::pending())
     .fuse();
 
-    let event_handler_loop = ActorLoop::new({
+    let mut click_stream = Some(click_stream);
+
+    let event_handler_loop = Task::start_droppable({
         let construct_context = construct_context.clone();
         async move {
             let scope_id = construct_context
@@ -5348,75 +5583,129 @@ fn element_svg(
                 .expect("Bug: bridge_scope_id not set for svg event handler");
             let mut click_link_sender: Option<NamedChannel<Value>> = None;
             loop {
-                select! {
-                    link = click_stream.next() => {
-                        if let Some(link) = link {
-                            click_link_sender = Some(link);
-                        }
-                    }
-                    event = click_receiver.next() => {
-                        if let Some(event) = event {
-                            if let Some(ref sender) = click_link_sender {
-                                let (x, y) = event.data;
-                                let x_value = Value::Number(
-                                    EngineNumber::new_arc(
-                                        ConstructInfo::new("svg::click_x_num", None, "svg click x number"),
-                                        construct_context.clone(),
-                                        x,
-                                    ),
-                                    ValueMetadata::with_lamport_time(ValueIdempotencyKey::new(), event.lamport_time),
-                                );
-                                let y_value = Value::Number(
-                                    EngineNumber::new_arc(
-                                        ConstructInfo::new("svg::click_y_num", None, "svg click y number"),
-                                        construct_context.clone(),
-                                        y,
-                                    ),
-                                    ValueMetadata::with_lamport_time(ValueIdempotencyKey::new(), event.lamport_time),
-                                );
-                                let event_value = Object::new_value_with_lamport_time(
-                                    ConstructInfo::new("svg::click_event", None, "svg click event [x, y]"),
-                                    construct_context.clone(),
-                                    ValueIdempotencyKey::new(),
-                                    event.lamport_time,
-                                    [
-                                        Variable::new_arc(
-                                            ConstructInfo::new("svg::click_x", None, "svg click x"),
-                                            construct_context.clone(),
-                                            "x",
-                                            create_actor(
-                                                ConstructInfo::new("svg::click_x_actor", None, "svg click x actor"),
-                                                ActorContext::default(),
-                                                TypedStream::infinite(
-                                                    stream::once(future::ready(x_value)).chain(stream::pending()),
-                                                ),
-                                                parser::PersistenceId::new(),
-                                                scope_id,
-                                            ),
-                                            parser::PersistenceId::default(),
-                                            parser::Scope::Root,
-                                        ),
-                                        Variable::new_arc(
-                                            ConstructInfo::new("svg::click_y", None, "svg click y"),
-                                            construct_context.clone(),
-                                            "y",
-                                            create_actor(
-                                                ConstructInfo::new("svg::click_y_actor", None, "svg click y actor"),
-                                                ActorContext::default(),
-                                                TypedStream::infinite(
-                                                    stream::once(future::ready(y_value)).chain(stream::pending()),
-                                                ),
-                                                parser::PersistenceId::new(),
-                                                scope_id,
-                                            ),
-                                            parser::PersistenceId::default(),
-                                            parser::Scope::Root,
-                                        ),
-                                    ],
-                                );
-                                sender.send_or_drop(event_value);
+                if let Some(link_stream) = click_stream.as_mut() {
+                    select! {
+                        link = link_stream.next() => {
+                            if let Some(link) = link {
+                                click_link_sender = Some(link);
+                            } else {
+                                click_stream = None;
                             }
                         }
+                        event = click_receiver.next() => {
+                            if let Some(event) = event {
+                                if let Some(ref sender) = click_link_sender {
+                                    let (x, y) = event.data;
+                                    let x_value = Value::Number(
+                                        EngineNumber::new_arc(
+                                            ConstructInfo::new("svg::click_x_num", None, "svg click x number"),
+                                            construct_context.clone(),
+                                            x,
+                                        ),
+                                        ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), event.emission_seq),
+                                    );
+                                    let y_value = Value::Number(
+                                        EngineNumber::new_arc(
+                                            ConstructInfo::new("svg::click_y_num", None, "svg click y number"),
+                                            construct_context.clone(),
+                                            y,
+                                        ),
+                                        ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), event.emission_seq),
+                                    );
+                                    let event_value = Object::new_value_with_emission_seq(
+                                        ConstructInfo::new("svg::click_event", None, "svg click event [x, y]"),
+                                        construct_context.clone(),
+                                        ValueIdempotencyKey::new(),
+                                        event.emission_seq,
+                                        [
+                                            Variable::new_arc(
+                                                ConstructInfo::new("svg::click_x", None, "svg click x"),
+                                                "x",
+                                                create_constant_actor(parser::PersistenceId::new(),
+                                                    x_value,
+                                                    scope_id,
+                                                ),
+                                                parser::PersistenceId::default(),
+                                                parser::Scope::Root,
+                                            ),
+                                            Variable::new_arc(
+                                                ConstructInfo::new("svg::click_y", None, "svg click y"),
+                                                "y",
+                                                create_constant_actor(parser::PersistenceId::new(),
+                                                    y_value,
+                                                    scope_id,
+                                                ),
+                                                parser::PersistenceId::default(),
+                                                parser::Scope::Root,
+                                            ),
+                                        ],
+                                    );
+                                    sender.send_or_drop(event_value);
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    let Some(event) = click_receiver.next().await else {
+                        break;
+                    };
+                    if let Some(ref sender) = click_link_sender {
+                        let (x, y) = event.data;
+                        let x_value = Value::Number(
+                            EngineNumber::new_arc(
+                                ConstructInfo::new("svg::click_x_num", None, "svg click x number"),
+                                construct_context.clone(),
+                                x,
+                            ),
+                            ValueMetadata::with_emission_seq(
+                                ValueIdempotencyKey::new(),
+                                event.emission_seq,
+                            ),
+                        );
+                        let y_value = Value::Number(
+                            EngineNumber::new_arc(
+                                ConstructInfo::new("svg::click_y_num", None, "svg click y number"),
+                                construct_context.clone(),
+                                y,
+                            ),
+                            ValueMetadata::with_emission_seq(
+                                ValueIdempotencyKey::new(),
+                                event.emission_seq,
+                            ),
+                        );
+                        let event_value = Object::new_value_with_emission_seq(
+                            ConstructInfo::new("svg::click_event", None, "svg click event [x, y]"),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            event.emission_seq,
+                            [
+                                Variable::new_arc(
+                                    ConstructInfo::new("svg::click_x", None, "svg click x"),
+                                    "x",
+                                    create_constant_actor(
+                                        parser::PersistenceId::new(),
+                                        x_value,
+                                        scope_id,
+                                    ),
+                                    parser::PersistenceId::default(),
+                                    parser::Scope::Root,
+                                ),
+                                Variable::new_arc(
+                                    ConstructInfo::new("svg::click_y", None, "svg click y"),
+                                    "y",
+                                    create_constant_actor(
+                                        parser::PersistenceId::new(),
+                                        y_value,
+                                        scope_id,
+                                    ),
+                                    parser::PersistenceId::default(),
+                                    parser::Scope::Root,
+                                ),
+                            ],
+                        );
+                        sender.send_or_drop(event_value);
                     }
                 }
             }
@@ -5524,94 +5813,167 @@ fn element_svg_circle(
     );
 
     let element_variable = tagged_object.expect_variable("element");
-    let mut click_stream = switch_map(
+    let click_stream = switch_map(
         variable_current_or_future_stream(element_variable.clone())
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
         |variable| variable_current_or_future_stream(variable),
     )
     .filter_map(|value| future::ready(value.expect_object().variable("click")))
     .map(move |variable| variable.expect_link_value_sender())
-    .chain(stream::pending())
-    .fuse();
+    .boxed_local();
 
-    let event_handler_loop = ActorLoop::new({
+    let event_handler_loop = Task::start_droppable({
         let construct_context = construct_context.clone();
         async move {
             let scope_id = construct_context
                 .bridge_scope_id
                 .expect("Bug: bridge_scope_id not set for svg_circle event handler");
             let mut click_link_sender: Option<NamedChannel<Value>> = None;
+            let mut click_stream = Some(click_stream.fuse());
             loop {
-                select! {
-                    link = click_stream.next() => {
-                        if let Some(link) = link {
-                            click_link_sender = Some(link);
+                let mut clear_click_stream = false;
+                if let Some(active_click_stream) = click_stream.as_mut() {
+                    select! {
+                        link = active_click_stream.next() => {
+                            if let Some(link) = link {
+                                click_link_sender = Some(link);
+                            } else {
+                                clear_click_stream = true;
+                            }
                         }
-                    }
-                    event = click_receiver.next() => {
-                        if let Some(event) = event {
-                            if let Some(ref sender) = click_link_sender {
-                                let (x, y) = event.data;
-                                let x_value = Value::Number(
-                                    EngineNumber::new_arc(
-                                        ConstructInfo::new("svg_circle::click_x_num", None, "svg_circle click x number"),
-                                        construct_context.clone(),
-                                        x,
-                                    ),
-                                    ValueMetadata::with_lamport_time(ValueIdempotencyKey::new(), event.lamport_time),
-                                );
-                                let y_value = Value::Number(
-                                    EngineNumber::new_arc(
-                                        ConstructInfo::new("svg_circle::click_y_num", None, "svg_circle click y number"),
-                                        construct_context.clone(),
-                                        y,
-                                    ),
-                                    ValueMetadata::with_lamport_time(ValueIdempotencyKey::new(), event.lamport_time),
-                                );
-                                let event_value = Object::new_value_with_lamport_time(
-                                    ConstructInfo::new("svg_circle::click_event", None, "svg_circle click event [x, y]"),
-                                    construct_context.clone(),
-                                    ValueIdempotencyKey::new(),
-                                    event.lamport_time,
-                                    [
-                                        Variable::new_arc(
-                                            ConstructInfo::new("svg_circle::click_x", None, "svg_circle click x"),
+                        event = click_receiver.next() => {
+                            if let Some(event) = event {
+                                if let Some(ref sender) = click_link_sender {
+                                    let (x, y) = event.data;
+                                    let x_value = Value::Number(
+                                        EngineNumber::new_arc(
+                                            ConstructInfo::new("svg_circle::click_x_num", None, "svg_circle click x number"),
                                             construct_context.clone(),
-                                            "x",
-                                            create_actor(
-                                                ConstructInfo::new("svg_circle::click_x_actor", None, "svg_circle click x actor"),
-                                                ActorContext::default(),
-                                                TypedStream::infinite(
-                                                    stream::once(future::ready(x_value)).chain(stream::pending()),
-                                                ),
-                                                parser::PersistenceId::new(),
-                                                scope_id,
-                                            ),
-                                            parser::PersistenceId::default(),
-                                            parser::Scope::Root,
+                                            x,
                                         ),
-                                        Variable::new_arc(
-                                            ConstructInfo::new("svg_circle::click_y", None, "svg_circle click y"),
+                                        ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), event.emission_seq),
+                                    );
+                                    let y_value = Value::Number(
+                                        EngineNumber::new_arc(
+                                            ConstructInfo::new("svg_circle::click_y_num", None, "svg_circle click y number"),
                                             construct_context.clone(),
-                                            "y",
-                                            create_actor(
-                                                ConstructInfo::new("svg_circle::click_y_actor", None, "svg_circle click y actor"),
-                                                ActorContext::default(),
-                                                TypedStream::infinite(
-                                                    stream::once(future::ready(y_value)).chain(stream::pending()),
-                                                ),
-                                                parser::PersistenceId::new(),
-                                                scope_id,
-                                            ),
-                                            parser::PersistenceId::default(),
-                                            parser::Scope::Root,
+                                            y,
                                         ),
-                                    ],
-                                );
-                                sender.send_or_drop(event_value);
+                                        ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), event.emission_seq),
+                                    );
+                                    let event_value = Object::new_value_with_emission_seq(
+                                        ConstructInfo::new("svg_circle::click_event", None, "svg_circle click event [x, y]"),
+                                        construct_context.clone(),
+                                        ValueIdempotencyKey::new(),
+                                        event.emission_seq,
+                                        [
+                                            Variable::new_arc(
+                                                ConstructInfo::new("svg_circle::click_x", None, "svg_circle click x"),
+                                                "x",
+                                                create_constant_actor(parser::PersistenceId::new(),
+                                                    x_value,
+                                                    scope_id,
+                                                ),
+                                                parser::PersistenceId::default(),
+                                                parser::Scope::Root,
+                                            ),
+                                            Variable::new_arc(
+                                                ConstructInfo::new("svg_circle::click_y", None, "svg_circle click y"),
+                                                "y",
+                                                create_constant_actor(parser::PersistenceId::new(),
+                                                    y_value,
+                                                    scope_id,
+                                                ),
+                                                parser::PersistenceId::default(),
+                                                parser::Scope::Root,
+                                            ),
+                                        ],
+                                    );
+                                    sender.send_or_drop(event_value);
+                                }
                             }
                         }
                     }
+                } else if let Some(event) = click_receiver.next().await {
+                    if let Some(ref sender) = click_link_sender {
+                        let (x, y) = event.data;
+                        let x_value = Value::Number(
+                            EngineNumber::new_arc(
+                                ConstructInfo::new(
+                                    "svg_circle::click_x_num",
+                                    None,
+                                    "svg_circle click x number",
+                                ),
+                                construct_context.clone(),
+                                x,
+                            ),
+                            ValueMetadata::with_emission_seq(
+                                ValueIdempotencyKey::new(),
+                                event.emission_seq,
+                            ),
+                        );
+                        let y_value = Value::Number(
+                            EngineNumber::new_arc(
+                                ConstructInfo::new(
+                                    "svg_circle::click_y_num",
+                                    None,
+                                    "svg_circle click y number",
+                                ),
+                                construct_context.clone(),
+                                y,
+                            ),
+                            ValueMetadata::with_emission_seq(
+                                ValueIdempotencyKey::new(),
+                                event.emission_seq,
+                            ),
+                        );
+                        let event_value = Object::new_value_with_emission_seq(
+                            ConstructInfo::new(
+                                "svg_circle::click_event",
+                                None,
+                                "svg_circle click event [x, y]",
+                            ),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            event.emission_seq,
+                            [
+                                Variable::new_arc(
+                                    ConstructInfo::new(
+                                        "svg_circle::click_x",
+                                        None,
+                                        "svg_circle click x",
+                                    ),
+                                    "x",
+                                    create_constant_actor(
+                                        parser::PersistenceId::new(),
+                                        x_value,
+                                        scope_id,
+                                    ),
+                                    parser::PersistenceId::default(),
+                                    parser::Scope::Root,
+                                ),
+                                Variable::new_arc(
+                                    ConstructInfo::new(
+                                        "svg_circle::click_y",
+                                        None,
+                                        "svg_circle click y",
+                                    ),
+                                    "y",
+                                    create_constant_actor(
+                                        parser::PersistenceId::new(),
+                                        y_value,
+                                        scope_id,
+                                    ),
+                                    parser::PersistenceId::default(),
+                                    parser::Scope::Root,
+                                ),
+                            ],
+                        );
+                        sender.send_or_drop(event_value);
+                    }
+                }
+                if clear_click_stream {
+                    click_stream = None;
                 }
             }
         }
@@ -5747,12 +6109,10 @@ fn element_label(
     let element_variable = tagged_object.expect_variable("element");
 
     // Set up hovered link
-    // Chain with pending() to prevent stream termination causing busy-polling in select!
     let hovered_stream = element_variable.clone();
     let hovered_stream = variable_current_or_future_stream(hovered_stream)
         .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
-        .map(|variable| variable.expect_link_value_sender())
-        .chain(stream::pending());
+        .map(|variable| variable.expect_link_value_sender());
 
     // Set up double_click event
     // Use switch_map (not flat_map) because variable.stream() is infinite.
@@ -5765,53 +6125,136 @@ fn element_label(
         move |variable| variable_current_or_future_stream(variable),
     );
 
-    // Chain with pending() to prevent stream termination causing busy-polling in select!
-    let mut double_click_stream = event_stream
+    let double_click_stream = event_stream
         .filter_map(move |value| {
             let obj = value.expect_object();
             future::ready(obj.variable("double_click"))
         })
         .map(move |variable| variable.expect_link_value_sender())
-        .chain(stream::pending())
-        .fuse();
+        .boxed_local();
 
-    let event_handler_loop = ActorLoop::new({
+    let event_handler_loop = Task::start_droppable({
         let construct_context_for_events = construct_context.clone();
         async move {
             let mut double_click_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut _hovered_link_value_sender: Option<NamedChannel<Value>> = None;
-            let mut hovered_stream = hovered_stream.fuse();
+            let mut hovered_stream = Some(hovered_stream.fuse());
+            let mut double_click_stream = Some(double_click_stream.fuse());
             loop {
-                select! {
-                    new_sender = double_click_stream.next() => {
-                        if let Some(sender) = new_sender {
-                            double_click_link_value_sender = Some(sender);
+                let mut clear_double_click_stream = false;
+                let mut clear_hovered_stream = false;
+                match (double_click_stream.as_mut(), hovered_stream.as_mut()) {
+                    (Some(active_double_click_stream), Some(active_hovered_stream)) => {
+                        select! {
+                            new_sender = active_double_click_stream.next() => {
+                                if let Some(sender) = new_sender {
+                                    double_click_link_value_sender = Some(sender);
+                                } else {
+                                    clear_double_click_stream = true;
+                                }
+                            }
+                            new_sender = active_hovered_stream.next() => {
+                                if let Some(sender) = new_sender {
+                                    let initial_hover_value = EngineTag::new_value_cached(
+                                        HOVER_TAG_INFO.with(|info| info.clone()),
+                                        ValueIdempotencyKey::new(),
+                                        "False",
+                                    );
+                                    sender.send_or_drop(initial_hover_value);
+                                    _hovered_link_value_sender = Some(sender);
+                                } else {
+                                    clear_hovered_stream = true;
+                                }
+                            }
+                            event = double_click_receiver.select_next_some() => {
+                                if let Some(sender) = double_click_link_value_sender.as_ref() {
+                                    let event_value = Object::new_value_with_emission_seq(
+                                        ConstructInfo::new("label::double_click_event", None, "Label double_click event"),
+                                        construct_context_for_events.clone(),
+                                        ValueIdempotencyKey::new(),
+                                        event.emission_seq,
+                                        [],
+                                    );
+                                    sender.send_or_drop(event_value);
+                                }
+                            }
                         }
                     }
-                    new_sender = hovered_stream.next() => {
-                        if let Some(sender) = new_sender {
-                            // Send initial hover state (false) when link is established
-                            let initial_hover_value = EngineTag::new_value_cached(
-                                HOVER_TAG_INFO.with(|info| info.clone()),
-                                ValueIdempotencyKey::new(),
-                                "False",
-                            );
-                            sender.send_or_drop(initial_hover_value);
-                            _hovered_link_value_sender = Some(sender);
+                    (Some(active_double_click_stream), None) => {
+                        select! {
+                            new_sender = active_double_click_stream.next() => {
+                                if let Some(sender) = new_sender {
+                                    double_click_link_value_sender = Some(sender);
+                                } else {
+                                    clear_double_click_stream = true;
+                                }
+                            }
+                            event = double_click_receiver.select_next_some() => {
+                                if let Some(sender) = double_click_link_value_sender.as_ref() {
+                                    let event_value = Object::new_value_with_emission_seq(
+                                        ConstructInfo::new("label::double_click_event", None, "Label double_click event"),
+                                        construct_context_for_events.clone(),
+                                        ValueIdempotencyKey::new(),
+                                        event.emission_seq,
+                                        [],
+                                    );
+                                    sender.send_or_drop(event_value);
+                                }
+                            }
                         }
                     }
-                    event = double_click_receiver.select_next_some() => {
+                    (None, Some(active_hovered_stream)) => {
+                        select! {
+                            new_sender = active_hovered_stream.next() => {
+                                if let Some(sender) = new_sender {
+                                    let initial_hover_value = EngineTag::new_value_cached(
+                                        HOVER_TAG_INFO.with(|info| info.clone()),
+                                        ValueIdempotencyKey::new(),
+                                        "False",
+                                    );
+                                    sender.send_or_drop(initial_hover_value);
+                                    _hovered_link_value_sender = Some(sender);
+                                } else {
+                                    clear_hovered_stream = true;
+                                }
+                            }
+                            event = double_click_receiver.select_next_some() => {
+                                if let Some(sender) = double_click_link_value_sender.as_ref() {
+                                    let event_value = Object::new_value_with_emission_seq(
+                                        ConstructInfo::new("label::double_click_event", None, "Label double_click event"),
+                                        construct_context_for_events.clone(),
+                                        ValueIdempotencyKey::new(),
+                                        event.emission_seq,
+                                        [],
+                                    );
+                                    sender.send_or_drop(event_value);
+                                }
+                            }
+                        }
+                    }
+                    (None, None) => {
+                        let event = double_click_receiver.select_next_some().await;
                         if let Some(sender) = double_click_link_value_sender.as_ref() {
-                            let event_value = Object::new_value_with_lamport_time(
-                                ConstructInfo::new("label::double_click_event", None, "Label double_click event"),
+                            let event_value = Object::new_value_with_emission_seq(
+                                ConstructInfo::new(
+                                    "label::double_click_event",
+                                    None,
+                                    "Label double_click event",
+                                ),
                                 construct_context_for_events.clone(),
                                 ValueIdempotencyKey::new(),
-                                event.lamport_time,
+                                event.emission_seq,
                                 [],
                             );
                             sender.send_or_drop(event_value);
                         }
                     }
+                }
+                if clear_double_click_stream {
+                    double_click_stream = None;
+                }
+                if clear_hovered_stream {
+                    hovered_stream = None;
                 }
             }
         }
@@ -6065,7 +6508,7 @@ fn element_paragraph(
         // white-space: pre-wrap is already global in MoonZoon's basic.css
         .contents_signal_vec(VecDiffStreamSignalVec(contents_vec_diff_stream).map_signal(
             move |value_actor| {
-                signal::from_stream(actor_current_or_future_stream(value_actor).map({
+                signal::from_stream(value_actor.current_or_future_stream().map({
                     let construct_context = construct_context.clone();
                     move |value| value_to_element(value, construct_context.clone())
                 }))
@@ -6089,50 +6532,75 @@ fn element_link(
     let element_variable = tagged_object.expect_variable("element");
 
     // Set up hovered handler
-    // Chain with pending() to prevent stream termination causing busy-polling in select!
-    let mut hovered_stream = variable_current_or_future_stream(element_variable)
+    let hovered_stream = variable_current_or_future_stream(element_variable)
         .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
-        .map(|variable| variable.expect_link_value_sender())
-        .chain(stream::pending())
-        .fuse();
+        .map(|variable| variable.expect_link_value_sender());
 
-    let event_handler_loop = ActorLoop::new({
+    let event_handler_loop = Task::start_droppable({
         let _construct_context = construct_context.clone();
         async move {
             let mut hovered_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut last_hover_state: Option<bool> = None;
+            let mut hovered_stream = Some(hovered_stream.fuse());
 
             loop {
-                select! {
-                    sender = hovered_stream.select_next_some() => {
-                        // Send initial hover state (false) when link is established
-                        let initial_hover_value = EngineTag::new_value_cached(
+                let mut clear_hovered_stream = false;
+                if let Some(active_hovered_stream) = hovered_stream.as_mut() {
+                    select! {
+                        sender = active_hovered_stream.next() => {
+                            if let Some(sender) = sender {
+                                let initial_hover_value = EngineTag::new_value_cached(
+                                    HOVER_TAG_INFO.with(|info| info.clone()),
+                                    ValueIdempotencyKey::new(),
+                                    "False",
+                                );
+                                sender.send_or_drop(initial_hover_value);
+                                last_hover_state = Some(false);
+                                hovered_link_value_sender = Some(sender);
+                            } else {
+                                clear_hovered_stream = true;
+                            }
+                        }
+                        event = hovered_receiver.select_next_some() => {
+                            if last_hover_state == Some(event.data) {
+                                inc_metric!(HOVER_EVENTS_DEDUPED);
+                                continue;
+                            }
+                            if let Some(sender) = hovered_link_value_sender.as_ref() {
+                                inc_metric!(HOVER_EVENTS_EMITTED);
+                                last_hover_state = Some(event.data);
+                                let hover_tag = if event.data { "True" } else { "False" };
+                                let event_value = EngineTag::new_value_cached_with_emission_seq(
+                                    HOVER_TAG_INFO.with(|info| info.clone()),
+                                    ValueIdempotencyKey::new(),
+                                    event.emission_seq,
+                                    hover_tag,
+                                );
+                                sender.send_or_drop(event_value);
+                            }
+                        }
+                    }
+                } else {
+                    let event = hovered_receiver.select_next_some().await;
+                    if last_hover_state == Some(event.data) {
+                        inc_metric!(HOVER_EVENTS_DEDUPED);
+                        continue;
+                    }
+                    if let Some(sender) = hovered_link_value_sender.as_ref() {
+                        inc_metric!(HOVER_EVENTS_EMITTED);
+                        last_hover_state = Some(event.data);
+                        let hover_tag = if event.data { "True" } else { "False" };
+                        let event_value = EngineTag::new_value_cached_with_emission_seq(
                             HOVER_TAG_INFO.with(|info| info.clone()),
                             ValueIdempotencyKey::new(),
-                            "False",
+                            event.emission_seq,
+                            hover_tag,
                         );
-                        sender.send_or_drop(initial_hover_value);
-                        last_hover_state = Some(false);
-                        hovered_link_value_sender = Some(sender);
+                        sender.send_or_drop(event_value);
                     }
-                    event = hovered_receiver.select_next_some() => {
-                        if last_hover_state == Some(event.data) {
-                            inc_metric!(HOVER_EVENTS_DEDUPED);
-                            continue;
-                        }
-                        if let Some(sender) = hovered_link_value_sender.as_ref() {
-                            inc_metric!(HOVER_EVENTS_EMITTED);
-                            last_hover_state = Some(event.data);
-                            let hover_tag = if event.data { "True" } else { "False" };
-                            let event_value = EngineTag::new_value_cached_with_lamport_time(
-                                HOVER_TAG_INFO.with(|info| info.clone()),
-                                ValueIdempotencyKey::new(),
-                                event.lamport_time,
-                                hover_tag,
-                            );
-                            sender.send_or_drop(event_value);
-                        }
-                    }
+                }
+                if clear_hovered_stream {
+                    hovered_stream = None;
                 }
             }
         }
@@ -6407,7 +6875,7 @@ fn element_block(
 
                 // Padding
                 if let Some(v) = obj.variable("padding") {
-                    match v.value_actor().current_value().await {
+                    match v.value_actor().current_value() {
                         Ok(Value::Number(n, _)) => {
                             css.push_str(&format!("padding:{}px;", n.number()));
                         }
@@ -6419,14 +6887,14 @@ fn element_block(
                                 async move {
                                     if let Some(v) = obj.variable(&key) {
                                         if let Ok(Value::Number(n, _)) =
-                                            v.value_actor().current_value().await
+                                            v.value_actor().current_value()
                                         {
                                             return n.number();
                                         }
                                     }
                                     if let Some(v) = obj.variable(&fallback) {
                                         if let Ok(Value::Number(n, _)) =
-                                            v.value_actor().current_value().await
+                                            v.value_actor().current_value()
                                         {
                                             return n.number();
                                         }
@@ -6449,11 +6917,9 @@ fn element_block(
 
                 // Align
                 if let Some(v) = obj.variable("align") {
-                    if let Ok(Value::Object(align_obj, _)) = v.value_actor().current_value().await {
+                    if let Ok(Value::Object(align_obj, _)) = v.value_actor().current_value() {
                         if let Some(row_v) = align_obj.variable("row") {
-                            if let Ok(Value::Tag(tag, _)) =
-                                row_v.value_actor().current_value().await
-                            {
+                            if let Ok(Value::Tag(tag, _)) = row_v.value_actor().current_value() {
                                 match tag.tag() {
                                     "Center" => css.push_str("text-align:center;"),
                                     "Right" => css.push_str("text-align:right;"),
