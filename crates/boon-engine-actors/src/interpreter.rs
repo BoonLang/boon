@@ -13,8 +13,8 @@ const LOG_SOURCE_AND_AST: bool = false;
 
 use crate::{
     engine::{
-        ConstructContext, LinkConnector, Object, PassThroughConnector, ReferenceConnector,
-        ScopeDestroyGuard, VirtualFilesystem,
+        ConstructContext, LinkConnector, Object, ReferenceConnector, ScopeDestroyGuard,
+        VirtualFilesystem,
     },
     evaluator::{FunctionRegistry, ModuleLoader, evaluate_with_registry},
 };
@@ -41,7 +41,6 @@ pub fn run(
     ConstructContext,
     Arc<ReferenceConnector>,
     Arc<LinkConnector>,
-    Arc<PassThroughConnector>,
     ScopeDestroyGuard,
 )> {
     let states_local_storage_key = states_local_storage_key.into();
@@ -169,14 +168,12 @@ pub fn run(
             _module_loader,
             reference_connector,
             link_connector,
-            pass_through_connector,
             root_scope_guard,
         )) => Some((
             root_object,
             construct_context,
             reference_connector,
             link_connector,
-            pass_through_connector,
             root_scope_guard,
         )),
         Err(error) => {
@@ -233,7 +230,6 @@ pub fn run_with_registry(
     ModuleLoader,
     Arc<ReferenceConnector>,
     Arc<LinkConnector>,
-    Arc<PassThroughConnector>,
     ScopeDestroyGuard,
 )> {
     let states_local_storage_key = states_local_storage_key.into();
@@ -351,7 +347,6 @@ pub fn run_with_registry(
             module_loader,
             reference_connector,
             link_connector,
-            pass_through_connector,
             root_scope_guard,
         )) => Some((
             root_object,
@@ -360,7 +355,6 @@ pub fn run_with_registry(
             module_loader,
             reference_connector,
             link_connector,
-            pass_through_connector,
             root_scope_guard,
         )),
         Err(error) => {
@@ -465,5 +459,528 @@ fn report_errors<'code, T: fmt::Display + 'code>(
             .read_to_string(&mut report_string)
             .unwrap_throw();
         eprintln!("{report_string}");
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::run_with_registry;
+    use crate::engine::{Value, VirtualFilesystem};
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+    use zoon::Timer;
+    use zoon::futures_util::{FutureExt, StreamExt, future::select, pin_mut};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    async fn next_value_with_timeout<S>(stream: &mut S, timeout_ms: u32, context: &str) -> Value
+    where
+        S: zoon::futures_util::stream::Stream<Item = Value> + Unpin,
+    {
+        let next_value = stream.next().fuse();
+        let timeout = Timer::sleep(timeout_ms).fuse();
+        pin_mut!(next_value);
+        pin_mut!(timeout);
+
+        match select(next_value, timeout).await {
+            zoon::futures_util::future::Either::Left((Some(value), _)) => value,
+            zoon::futures_util::future::Either::Left((None, _)) => {
+                panic!("{context}: stream ended before emitting a value")
+            }
+            zoon::futures_util::future::Either::Right((_, _)) => {
+                panic!("{context}: timed out waiting for the next value")
+            }
+        }
+    }
+
+    async fn assert_no_value_before_timeout<S>(stream: &mut S, timeout_ms: u32, context: &str)
+    where
+        S: zoon::futures_util::stream::Stream<Item = Value> + Unpin,
+    {
+        let next_value = stream.next().fuse();
+        let timeout = Timer::sleep(timeout_ms).fuse();
+        pin_mut!(next_value);
+        pin_mut!(timeout);
+
+        match select(next_value, timeout).await {
+            zoon::futures_util::future::Either::Left((Some(_), _)) => {
+                panic!("{context}: unexpected early value")
+            }
+            zoon::futures_util::future::Either::Left((None, _)) => {
+                panic!("{context}: stream ended before timeout")
+            }
+            zoon::futures_util::future::Either::Right((_, _)) => {}
+        }
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn parsed_interval_then_sum_variable_stream_updates_across_multiple_ticks() {
+        let source = r#"
+value:
+    Duration[milliseconds: 50]
+    |> Timer/interval()
+    |> THEN { 1 }
+    |> Math/sum()
+"#;
+
+        let (
+            object,
+            _construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = run_with_registry(
+            "parsed_interval_then_sum_variable_stream_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("parsed interval-then-sum variable source should run");
+
+        let value_actor = object.expect_variable("value").value_actor();
+        let stream = value_actor.current_or_future_stream();
+        pin_mut!(stream);
+
+        let first = next_value_with_timeout(
+            &mut stream,
+            2_000,
+            "parsed interval-then-sum variable first tick",
+        )
+        .await;
+        let second = next_value_with_timeout(
+            &mut stream,
+            2_000,
+            "parsed interval-then-sum variable second tick",
+        )
+        .await;
+
+        let Value::Number(first, _) = first else {
+            panic!("first parsed interval-then-sum variable tick should be a number");
+        };
+        assert_eq!(first.number(), 1.0);
+
+        let Value::Number(second, _) = second else {
+            panic!("second parsed interval-then-sum variable tick should be a number");
+        };
+        assert_eq!(second.number(), 2.0);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn parsed_interval_hold_variable_stream_updates_across_multiple_ticks() {
+        let source = r#"
+tick: Duration[milliseconds: 50] |> Timer/interval()
+
+counter:
+    0
+    |> HOLD counter {
+        tick |> THEN { counter + 1 }
+    }
+    |> Stream/skip(count: 1)
+"#;
+
+        let (
+            object,
+            _construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = run_with_registry(
+            "parsed_interval_hold_variable_stream_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("parsed interval_hold variable source should run");
+
+        let value_actor = object.expect_variable("counter").value_actor();
+        let stream = value_actor.current_or_future_stream();
+        pin_mut!(stream);
+
+        let first =
+            next_value_with_timeout(&mut stream, 2_000, "parsed interval_hold first tick").await;
+        let second =
+            next_value_with_timeout(&mut stream, 2_000, "parsed interval_hold second tick").await;
+
+        let Value::Number(first, _) = first else {
+            panic!("first parsed interval_hold tick should be a number");
+        };
+        assert_eq!(first.number(), 1.0);
+
+        let Value::Number(second, _) = second else {
+            panic!("second parsed interval_hold tick should be a number");
+        };
+        assert_eq!(second.number(), 2.0);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn parsed_timer_elapsed_variable_caps_after_multiple_ticks() {
+        let source = r#"
+tick: Duration[milliseconds: 50] |> Timer/interval()
+
+raw_elapsed:
+    0
+    |> HOLD state {
+        tick |> THEN { state + 0.1 }
+    }
+
+elapsed: raw_elapsed |> Math/min(b: 0.2)
+"#;
+
+        let (
+            object,
+            _construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = run_with_registry(
+            "parsed_timer_elapsed_variable_stream_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("parsed timer elapsed variable source should run");
+
+        let value_actor = object.expect_variable("elapsed").value_actor();
+        let stream = value_actor.current_or_future_stream();
+        pin_mut!(stream);
+
+        let initial =
+            next_value_with_timeout(&mut stream, 500, "parsed timer elapsed initial value").await;
+        let first =
+            next_value_with_timeout(&mut stream, 2_000, "parsed timer elapsed first tick").await;
+        let second =
+            next_value_with_timeout(&mut stream, 2_000, "parsed timer elapsed second tick").await;
+
+        let Value::Number(initial, _) = initial else {
+            panic!("initial parsed timer elapsed value should be a number");
+        };
+        assert!((initial.number() - 0.0).abs() < f64::EPSILON);
+
+        let Value::Number(first, _) = first else {
+            panic!("first parsed timer elapsed tick should be a number");
+        };
+        assert!((first.number() - 0.1).abs() < 0.000_001);
+
+        let Value::Number(second, _) = second else {
+            panic!("second parsed timer elapsed tick should be a number");
+        };
+        assert!((second.number() - 0.2).abs() < 0.000_001);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn parsed_hold_latest_reset_discards_stale_pre_reset_tick_results() {
+        let source = r#"
+tick: Duration[milliseconds: 40] |> Timer/interval()
+reset: Duration[milliseconds: 180] |> Timer/interval()
+
+counter:
+    0
+    |> HOLD state {
+        LATEST {
+            tick |> THEN { state + 1 }
+            reset |> THEN { 0 }
+        }
+    }
+    |> Stream/skip(count: 1)
+"#;
+
+        let (
+            object,
+            _construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = run_with_registry(
+            "parsed_hold_latest_reset_stream_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("parsed HOLD LATEST reset source should run");
+
+        let value_actor = object.expect_variable("counter").value_actor();
+        let stream = value_actor.current_or_future_stream();
+        pin_mut!(stream);
+
+        let first = next_value_with_timeout(&mut stream, 2_000, "first pre-reset tick").await;
+        let second = next_value_with_timeout(&mut stream, 2_000, "second pre-reset tick").await;
+        let third = next_value_with_timeout(&mut stream, 2_000, "third pre-reset tick").await;
+        let fourth = next_value_with_timeout(&mut stream, 2_000, "fourth pre-reset tick").await;
+        let reset_value = next_value_with_timeout(&mut stream, 2_000, "reset value").await;
+        let first_after_reset =
+            next_value_with_timeout(&mut stream, 2_000, "first post-reset tick").await;
+
+        let Value::Number(first, _) = first else {
+            panic!("first pre-reset tick should be a number");
+        };
+        assert_eq!(first.number(), 1.0);
+
+        let Value::Number(second, _) = second else {
+            panic!("second pre-reset tick should be a number");
+        };
+        assert_eq!(second.number(), 2.0);
+
+        let Value::Number(third, _) = third else {
+            panic!("third pre-reset tick should be a number");
+        };
+        assert_eq!(third.number(), 3.0);
+
+        let Value::Number(fourth, _) = fourth else {
+            panic!("fourth pre-reset tick should be a number");
+        };
+        assert_eq!(fourth.number(), 4.0);
+
+        let Value::Number(reset_value, _) = reset_value else {
+            panic!("reset value should be a number");
+        };
+        assert_eq!(reset_value.number(), 0.0);
+
+        let Value::Number(first_after_reset, _) = first_after_reset else {
+            panic!("first post-reset tick should be a number");
+        };
+        assert_eq!(first_after_reset.number(), 1.0);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn parsed_then_variable_waits_for_trigger_before_emitting_snapshot() {
+        let source = r#"
+tick: Duration[milliseconds: 40] |> Timer/interval()
+trigger: Duration[milliseconds: 180] |> Timer/interval()
+
+input:
+    0
+    |> HOLD sum {
+        tick |> THEN { sum + 1 }
+    }
+
+captured: trigger |> THEN { input }
+"#;
+
+        let (
+            object,
+            _construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = run_with_registry(
+            "parsed_then_variable_trigger_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("parsed then variable source should run");
+
+        let value_actor = object.expect_variable("captured").value_actor();
+        let stream = value_actor.current_or_future_stream();
+        pin_mut!(stream);
+
+        assert_no_value_before_timeout(
+            &mut stream,
+            100,
+            "parsed THEN result should stay pending before the trigger fires",
+        )
+        .await;
+
+        let first = next_value_with_timeout(&mut stream, 2_000, "parsed THEN first trigger").await;
+        let second =
+            next_value_with_timeout(&mut stream, 2_000, "parsed THEN second trigger").await;
+
+        let Value::Number(first, _) = first else {
+            panic!("first parsed THEN trigger should produce a number");
+        };
+        assert!(
+            first.number() >= 2.0,
+            "first parsed THEN snapshot should reflect accumulated input ticks"
+        );
+
+        let Value::Number(second, _) = second else {
+            panic!("second parsed THEN trigger should produce a number");
+        };
+        assert!(
+            second.number() > first.number(),
+            "later parsed THEN trigger should capture a newer snapshot"
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn parsed_when_variable_ignores_input_ticks_until_branch_switch() {
+        let source = r#"
+tick_a: Duration[milliseconds: 40] |> Timer/interval()
+tick_b: Duration[milliseconds: 60] |> Timer/interval()
+switch: Duration[milliseconds: 180] |> Timer/interval() |> THEN { Subtraction }
+
+input_a:
+    0
+    |> HOLD sum {
+        tick_a |> THEN { sum + 1 }
+    }
+
+input_b:
+    0
+    |> HOLD sum {
+        tick_b |> THEN { sum + 10 }
+    }
+
+operation: LATEST {
+    Addition
+    switch
+}
+
+current_result: operation |> WHEN {
+    Addition => input_a + input_b
+    Subtraction => input_a - input_b
+}
+"#;
+
+        let (
+            object,
+            _construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = run_with_registry(
+            "parsed_when_variable_switch_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("parsed when variable source should run");
+
+        let value_actor = object.expect_variable("current_result").value_actor();
+        let stream = value_actor.current_or_future_stream();
+        pin_mut!(stream);
+
+        let initial = next_value_with_timeout(&mut stream, 500, "parsed WHEN initial value").await;
+        let Value::Number(initial, _) = initial else {
+            panic!("initial parsed WHEN value should be a number");
+        };
+        assert!((initial.number() - 0.0).abs() < f64::EPSILON);
+
+        assert_no_value_before_timeout(
+            &mut stream,
+            120,
+            "parsed WHEN result should ignore input ticks while branch stays the same",
+        )
+        .await;
+
+        let switched =
+            next_value_with_timeout(&mut stream, 2_000, "parsed WHEN switched branch").await;
+        let Value::Number(switched, _) = switched else {
+            panic!("switched parsed WHEN value should be a number");
+        };
+        assert!(
+            switched.number() < 0.0,
+            "parsed WHEN should recompute once the operation branch changes"
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn parsed_while_variable_keeps_updating_with_active_branch_ticks() {
+        let source = r#"
+tick_a: Duration[milliseconds: 40] |> Timer/interval()
+tick_b: Duration[milliseconds: 60] |> Timer/interval()
+switch: Duration[milliseconds: 180] |> Timer/interval() |> THEN { Subtraction }
+
+input_a:
+    0
+    |> HOLD sum {
+        tick_a |> THEN { sum + 1 }
+    }
+
+input_b:
+    0
+    |> HOLD sum {
+        tick_b |> THEN { sum + 10 }
+    }
+
+operation: LATEST {
+    Addition
+    switch
+}
+
+current_result: operation |> WHILE {
+    Addition => input_a + input_b
+    Subtraction => input_a - input_b
+}
+"#;
+
+        let (
+            object,
+            _construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = run_with_registry(
+            "parsed_while_variable_switch_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("parsed while variable source should run");
+
+        let value_actor = object.expect_variable("current_result").value_actor();
+        let stream = value_actor.current_or_future_stream();
+        pin_mut!(stream);
+
+        let initial = next_value_with_timeout(&mut stream, 500, "parsed WHILE initial value").await;
+        let Value::Number(initial, _) = initial else {
+            panic!("initial parsed WHILE value should be a number");
+        };
+        assert!((initial.number() - 0.0).abs() < f64::EPSILON);
+
+        let while_update =
+            next_value_with_timeout(&mut stream, 120, "parsed WHILE update before branch switch")
+                .await;
+        let Value::Number(while_update, _) = while_update else {
+            panic!("parsed WHILE update before branch switch should be a number");
+        };
+        assert!(
+            while_update.number() > 0.0,
+            "parsed WHILE should keep updating while the initial branch stays active"
+        );
+
+        let switched =
+            next_value_with_timeout(&mut stream, 2_000, "parsed WHILE switched branch").await;
+        let Value::Number(switched, _) = switched else {
+            panic!("parsed WHILE switched value should be a number");
+        };
+        assert!(
+            switched.number() < while_update.number(),
+            "parsed WHILE should switch to the new branch after the operation changes"
+        );
     }
 }

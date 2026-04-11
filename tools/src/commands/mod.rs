@@ -3,13 +3,17 @@ pub mod browser;
 pub mod expected;
 pub mod pixel_diff;
 pub mod test_examples;
+pub mod verify_actors;
 pub mod verify_actors_lite;
 pub mod verify_factory_fabric;
 pub mod verify_integrity;
 pub mod verify_wasm_lowering;
 
 pub fn is_valid_engine_name(engine: &str) -> bool {
-    matches!(engine, "Actors" | "FactoryFabric" | "DD" | "Wasm" | "ActorsLite")
+    matches!(
+        engine,
+        "Actors" | "FactoryFabric" | "DD" | "Wasm" | "ActorsLite"
+    )
 }
 
 pub fn resolve_requested_engine(requested: &str, available_engines: &[String]) -> String {

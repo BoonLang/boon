@@ -1,15 +1,16 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
 use chumsky::Parser as ChumskyParser;
 use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
 use ulid::Ulid;
-use zoon::futures_channel::oneshot;
 use zoon::futures_util::future;
 use zoon::futures_util::stream::{self, LocalBoxStream};
-use zoon::{SinkExt, Stream, StreamExt, Task, TaskHandle, mpsc};
+use zoon::{Stream, StreamExt, mpsc};
 
 use super::engine::*;
 use crate::api;
@@ -44,6 +45,28 @@ async fn actor_current_value_or_wait(actor: &ActorHandle) -> Option<Value> {
     }
 }
 
+fn actor_current_value_now(actor: &ActorHandle) -> Option<Value> {
+    actor.current_value().ok()
+}
+
+fn extract_field_path_now(value: &Value, path: &[String]) -> Option<Value> {
+    let mut current = value.clone();
+    for field_name in path {
+        match &current {
+            Value::Object(object, _) => {
+                let variable_actor = object.expect_variable(field_name).value_actor();
+                current = actor_current_value_now(&variable_actor)?;
+            }
+            Value::TaggedObject(tagged_object, _) => {
+                let variable_actor = tagged_object.expect_variable(field_name).value_actor();
+                current = actor_current_value_now(&variable_actor)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
 async fn actor_field_actor_from_current_or_wait(
     base_actor: &ActorHandle,
     field_path: &[String],
@@ -75,11 +98,1473 @@ async fn actor_field_actor_from_current_or_wait(
     None
 }
 
+fn expression_supports_runtime_local_direct_eval(
+    expression: &static_expression::Spanned<static_expression::Expression>,
+) -> bool {
+    expression_supports_runtime_local_direct_eval_with_registry(expression, None, None)
+}
+
+fn resolve_user_defined_function_for_direct_eval<'a>(
+    function_registry_snapshot: Option<&'a Arc<HashMap<String, StaticFunctionDefinition>>>,
+    current_module: Option<&str>,
+    path: &[boon::parser::StrSlice],
+) -> Option<(String, &'a StaticFunctionDefinition)> {
+    let registry = function_registry_snapshot?;
+    let full_path = path
+        .iter()
+        .map(|part| part.as_str())
+        .collect::<Vec<_>>()
+        .join("/");
+    if let Some(func_def) = registry.get(&full_path) {
+        return Some((full_path, func_def));
+    }
+
+    if !full_path.contains('/')
+        && let Some(module_name) = current_module
+    {
+        let qualified = format!("{module_name}/{full_path}");
+        if let Some(func_def) = registry.get(&qualified) {
+            return Some((qualified, func_def));
+        }
+    }
+
+    None
+}
+
+fn expression_supports_runtime_local_direct_eval_with_registry(
+    expression: &static_expression::Spanned<static_expression::Expression>,
+    function_registry_snapshot: Option<&Arc<HashMap<String, StaticFunctionDefinition>>>,
+    current_module: Option<&str>,
+) -> bool {
+    fn pattern_supports_runtime_local_direct_match_without_context(
+        pattern: &static_expression::Pattern,
+    ) -> bool {
+        match pattern {
+            static_expression::Pattern::WildCard
+            | static_expression::Pattern::Alias { .. }
+            | static_expression::Pattern::Literal(_) => true,
+            static_expression::Pattern::Object { variables }
+            | static_expression::Pattern::TaggedObject { variables, .. } => {
+                variables.iter().all(|variable| {
+                    variable.value.as_ref().is_none_or(|nested| {
+                        pattern_supports_runtime_local_direct_match_without_context(nested)
+                    })
+                })
+            }
+            static_expression::Pattern::ValueComparison { .. }
+            | static_expression::Pattern::List { .. }
+            | static_expression::Pattern::Map { .. } => false,
+        }
+    }
+
+    fn inner(
+        expression: &static_expression::Spanned<static_expression::Expression>,
+        function_registry_snapshot: Option<&Arc<HashMap<String, StaticFunctionDefinition>>>,
+        current_module: Option<&str>,
+        visiting_functions: &mut HashSet<String>,
+    ) -> bool {
+        match &expression.node {
+            static_expression::Expression::Alias(_)
+            | static_expression::Expression::Literal(_)
+            | static_expression::Expression::TextLiteral { .. }
+            | static_expression::Expression::Skip
+            | static_expression::Expression::LinkSetter { .. } => true,
+            static_expression::Expression::ArithmeticOperator(operator) => match operator {
+                static_expression::ArithmeticOperator::Negate { operand } => inner(
+                    operand,
+                    function_registry_snapshot,
+                    current_module,
+                    visiting_functions,
+                ),
+                static_expression::ArithmeticOperator::Add {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::ArithmeticOperator::Subtract {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::ArithmeticOperator::Multiply {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::ArithmeticOperator::Divide {
+                    operand_a,
+                    operand_b,
+                } => {
+                    inner(
+                        operand_a,
+                        function_registry_snapshot,
+                        current_module,
+                        visiting_functions,
+                    ) && inner(
+                        operand_b,
+                        function_registry_snapshot,
+                        current_module,
+                        visiting_functions,
+                    )
+                }
+            },
+            static_expression::Expression::Comparator(comparator) => match comparator {
+                static_expression::Comparator::Equal {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::NotEqual {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::Greater {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::GreaterOrEqual {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::Less {
+                    operand_a,
+                    operand_b,
+                }
+                | static_expression::Comparator::LessOrEqual {
+                    operand_a,
+                    operand_b,
+                } => {
+                    inner(
+                        operand_a,
+                        function_registry_snapshot,
+                        current_module,
+                        visiting_functions,
+                    ) && inner(
+                        operand_b,
+                        function_registry_snapshot,
+                        current_module,
+                        visiting_functions,
+                    )
+                }
+            },
+            static_expression::Expression::PostfixFieldAccess { expr, .. } => inner(
+                expr,
+                function_registry_snapshot,
+                current_module,
+                visiting_functions,
+            ),
+            static_expression::Expression::FieldAccess { .. } => true,
+            static_expression::Expression::Pipe { from, to } => {
+                inner(
+                    from,
+                    function_registry_snapshot,
+                    current_module,
+                    visiting_functions,
+                ) && inner(
+                    to,
+                    function_registry_snapshot,
+                    current_module,
+                    visiting_functions,
+                )
+            }
+            static_expression::Expression::Latest { inputs } => inputs.iter().all(|input| {
+                inner(
+                    input,
+                    function_registry_snapshot,
+                    current_module,
+                    visiting_functions,
+                )
+            }),
+            static_expression::Expression::FunctionCall { path, arguments } => {
+                if function_call_supports_runtime_local_direct_eval(path, arguments, false) {
+                    return true;
+                }
+
+                let arguments_supported = arguments.iter().all(|argument| {
+                    !argument.node.is_referenced
+                        && argument.node.name.as_str() != "PASS"
+                        && match &argument.node.value {
+                            Some(value) => inner(
+                                value,
+                                function_registry_snapshot,
+                                current_module,
+                                visiting_functions,
+                            ),
+                            None => true,
+                        }
+                });
+                if !arguments_supported {
+                    return false;
+                }
+
+                let Some((resolved_path, func_def)) = resolve_user_defined_function_for_direct_eval(
+                    function_registry_snapshot,
+                    current_module,
+                    path,
+                ) else {
+                    return false;
+                };
+
+                if !visiting_functions.insert(resolved_path.clone()) {
+                    return false;
+                }
+                let supported = inner(
+                    &func_def.body,
+                    function_registry_snapshot,
+                    func_def.module_name.as_deref(),
+                    visiting_functions,
+                );
+                visiting_functions.remove(&resolved_path);
+                supported
+            }
+            static_expression::Expression::Block { variables, output } => {
+                variables.iter().all(|variable| {
+                    !variable.node.name.to_string().is_empty()
+                        && !matches!(
+                            variable.node.value.node,
+                            static_expression::Expression::Link
+                                | static_expression::Expression::Spread { .. }
+                        )
+                        && inner(
+                            &variable.node.value,
+                            function_registry_snapshot,
+                            current_module,
+                            visiting_functions,
+                        )
+                }) && inner(
+                    output,
+                    function_registry_snapshot,
+                    current_module,
+                    visiting_functions,
+                )
+            }
+            static_expression::Expression::List { items } => items.iter().all(|item| {
+                inner(
+                    item,
+                    function_registry_snapshot,
+                    current_module,
+                    visiting_functions,
+                )
+            }),
+            static_expression::Expression::Spread { value } => inner(
+                value,
+                function_registry_snapshot,
+                current_module,
+                visiting_functions,
+            ),
+            static_expression::Expression::Hold { body, .. } => inner(
+                body,
+                function_registry_snapshot,
+                current_module,
+                visiting_functions,
+            ),
+            static_expression::Expression::Then { body }
+            | static_expression::Expression::Flush { value: body } => inner(
+                body,
+                function_registry_snapshot,
+                current_module,
+                visiting_functions,
+            ),
+            static_expression::Expression::When { arms }
+            | static_expression::Expression::While { arms } => arms.iter().all(|arm| {
+                pattern_supports_runtime_local_direct_match_without_context(&arm.pattern)
+                    && inner(
+                        &arm.body,
+                        function_registry_snapshot,
+                        current_module,
+                        visiting_functions,
+                    )
+            }),
+            static_expression::Expression::Object(object) => {
+                object.variables.iter().all(|variable| {
+                    !matches!(
+                        variable.node.value.node,
+                        static_expression::Expression::Link
+                    ) && inner(
+                        &variable.node.value,
+                        function_registry_snapshot,
+                        current_module,
+                        visiting_functions,
+                    )
+                })
+            }
+            static_expression::Expression::TaggedObject { object, .. } => {
+                object.variables.iter().all(|variable| {
+                    !matches!(
+                        variable.node.value.node,
+                        static_expression::Expression::Link
+                    ) && inner(
+                        &variable.node.value,
+                        function_registry_snapshot,
+                        current_module,
+                        visiting_functions,
+                    )
+                })
+            }
+            _ => false,
+        }
+    }
+
+    inner(
+        expression,
+        function_registry_snapshot,
+        current_module,
+        &mut HashSet::new(),
+    )
+}
+
+fn builtin_function_has_runtime_local_direct_actor(path: &[boon::parser::StrSlice]) -> bool {
+    matches!(
+        path.iter()
+            .map(|part| part.as_str())
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["Math", "round"]
+            | ["Math", "min"]
+            | ["Math", "max"]
+            | ["Math", "sum"]
+            | ["Math", "modulo"]
+            | ["Text", "trim"]
+            | ["Text", "is_empty"]
+            | ["Text", "is_not_empty"]
+            | ["Text", "to_number"]
+            | ["Text", "length"]
+            | ["Text", "to_uppercase"]
+            | ["Text", "char_code"]
+            | ["Text", "from_char_code"]
+            | ["Text", "starts_with"]
+            | ["Bool", "not"]
+            | ["Bool", "or"]
+            | ["Document", "new"]
+            | ["Element", "stripe"]
+            | ["Element", "container"]
+            | ["Element", "stack"]
+            | ["Element", "button"]
+            | ["List", "count"]
+            | ["List", "is_empty"]
+            | ["List", "is_not_empty"]
+            | ["List", "last"]
+            | ["List", "get"]
+            | ["List", "latest"]
+            | ["List", "sum"]
+            | ["List", "product"]
+    )
+}
+
+fn try_create_runtime_local_direct_unary_builtin_actor(
+    reg: Option<&mut ActorRegistry>,
+    source_actor: ActorHandle,
+    actor_context: &ActorContext,
+    map_value: impl FnMut(Value) -> Value + 'static,
+) -> Option<ActorHandle> {
+    try_create_direct_state_subscriber_actor_with_registry(
+        reg,
+        vec![source_actor],
+        PersistenceId::new(),
+        actor_context.scope_id(),
+        {
+            let mut map_value = map_value;
+            move |_idx, value| Some(map_value(value))
+        },
+    )
+}
+
+fn try_create_runtime_local_direct_optional_unary_builtin_actor(
+    reg: Option<&mut ActorRegistry>,
+    source_actor: ActorHandle,
+    actor_context: &ActorContext,
+    map_value: impl FnMut(Value) -> Option<Value> + 'static,
+) -> Option<ActorHandle> {
+    try_create_direct_state_subscriber_actor_with_registry(
+        reg,
+        vec![source_actor],
+        PersistenceId::new(),
+        actor_context.scope_id(),
+        {
+            let mut map_value = map_value;
+            move |_idx, value| map_value(value)
+        },
+    )
+}
+
+fn try_create_runtime_local_direct_binary_builtin_actor(
+    reg: Option<&mut ActorRegistry>,
+    actor_a: ActorHandle,
+    actor_b: ActorHandle,
+    actor_context: &ActorContext,
+    map_values: impl FnMut(&Value, &Value) -> Option<Value> + 'static,
+) -> Option<ActorHandle> {
+    let latest_values = Rc::new(RefCell::new((None::<Value>, None::<Value>)));
+    try_create_direct_state_subscriber_actor_with_registry(
+        reg,
+        vec![actor_a, actor_b],
+        PersistenceId::new(),
+        actor_context.scope_id(),
+        {
+            let latest_values = latest_values.clone();
+            let mut map_values = map_values;
+            move |idx, value| {
+                let mut latest_values = latest_values.borrow_mut();
+                match idx {
+                    0 => latest_values.0 = Some(value),
+                    1 => latest_values.1 = Some(value),
+                    _ => unreachable!("binary direct builtin actor received unexpected source"),
+                }
+                let (Some(value_a), Some(value_b)) =
+                    (latest_values.0.as_ref(), latest_values.1.as_ref())
+                else {
+                    return None;
+                };
+                map_values(value_a, value_b)
+            }
+        },
+    )
+}
+
+fn function_call_supports_runtime_local_direct_eval(
+    path: &[boon::parser::StrSlice],
+    arguments: &[static_expression::Spanned<static_expression::Argument>],
+    allow_implicit_piped: bool,
+) -> bool {
+    builtin_function_has_runtime_local_direct_actor(path)
+        && arguments.iter().all(|argument| {
+            !argument.node.is_referenced
+                && argument.node.name.as_str() != "PASS"
+                && match &argument.node.value {
+                    Some(value) => expression_supports_runtime_local_direct_eval(value),
+                    None => allow_implicit_piped,
+                }
+        })
+}
+
+fn try_create_runtime_local_direct_builtin_function_actor(
+    mut reg: Option<&mut ActorRegistry>,
+    path: &[boon::parser::StrSlice],
+    evaluated_args: Arc<Vec<ActorHandle>>,
+    persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Result<Option<ActorHandle>, String> {
+    let path_strs: Vec<&str> = path.iter().map(|part| part.as_str()).collect();
+    let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+
+    match path_strs.as_slice() {
+        ["Math", "round"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => api::function_math_round_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+            None => api::function_math_round_actor(
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+        }),
+        ["Math", "min"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => api::function_math_min_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+            None => api::function_math_min_actor(
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+        }),
+        ["Math", "max"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => api::function_math_max_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+            None => api::function_math_max_actor(
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+        }),
+        ["Math", "sum"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => api::function_math_sum_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+            None => api::function_math_sum_actor(
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+        }),
+        ["Math", "modulo"] => {
+            let [argument_a, argument_divisor] = evaluated_args.as_ref().as_slice() else {
+                panic!("Math/modulo expects 2 arguments")
+            };
+            Ok(try_create_runtime_local_direct_binary_builtin_actor(
+                reg,
+                argument_a.clone(),
+                argument_divisor.clone(),
+                &actor_context,
+                {
+                    let function_call_id = function_call_id.clone();
+                    let construct_context = construct_context.clone();
+                    move |value_a, value_divisor| {
+                        let a = match value_a {
+                            Value::Number(number, _) => number.number(),
+                            _ => panic!("Math/modulo expects Number arguments"),
+                        };
+                        let divisor = match value_divisor {
+                            Value::Number(number, _) => number.number(),
+                            _ => panic!("Math/modulo expects Number arguments"),
+                        };
+                        Some(Number::new_value(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(0),
+                                None,
+                                "Math/modulo result",
+                            ),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            a % divisor,
+                        ))
+                    }
+                },
+            ))
+        }
+        ["Text", "trim"] => {
+            let [argument_text] = evaluated_args.as_ref().as_slice() else {
+                panic!("Text/trim expects 1 argument")
+            };
+            Ok(try_create_runtime_local_direct_unary_builtin_actor(
+                reg,
+                argument_text.clone(),
+                &actor_context,
+                {
+                    let function_call_id = function_call_id.clone();
+                    let construct_context = construct_context.clone();
+                    move |value| {
+                        let text = match &value {
+                            Value::Text(text, _) => text.text(),
+                            _ => panic!("Text/trim expects a Text value"),
+                        };
+                        Text::new_value(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(0),
+                                None,
+                                "Text/trim result",
+                            ),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            text.trim().to_string(),
+                        )
+                    }
+                },
+            ))
+        }
+        ["Text", "is_empty"] => {
+            let [argument_text] = evaluated_args.as_ref().as_slice() else {
+                panic!("Text/is_empty expects 1 argument")
+            };
+            Ok(
+                try_create_runtime_local_direct_optional_unary_builtin_actor(
+                    reg,
+                    argument_text.clone(),
+                    &actor_context,
+                    {
+                        let function_call_id = function_call_id.clone();
+                        let construct_context = construct_context.clone();
+                        let mut last_result = None::<bool>;
+                        move |value| {
+                            let text = match &value {
+                                Value::Text(text, _) => text.text(),
+                                _ => panic!("Text/is_empty expects a Text value"),
+                            };
+                            let current_result = text.is_empty();
+                            if last_result == Some(current_result) {
+                                return None;
+                            }
+                            last_result = Some(current_result);
+                            Some(Tag::new_value(
+                                ConstructInfo::new(
+                                    function_call_id.with_child_id(0),
+                                    None,
+                                    "Text/is_empty result",
+                                ),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                if current_result { "True" } else { "False" }.to_string(),
+                            ))
+                        }
+                    },
+                ),
+            )
+        }
+        ["Text", "is_not_empty"] => {
+            let [argument_text] = evaluated_args.as_ref().as_slice() else {
+                panic!("Text/is_not_empty expects 1 argument")
+            };
+            Ok(
+                try_create_runtime_local_direct_optional_unary_builtin_actor(
+                    reg,
+                    argument_text.clone(),
+                    &actor_context,
+                    {
+                        let function_call_id = function_call_id.clone();
+                        let construct_context = construct_context.clone();
+                        let mut last_result = None::<bool>;
+                        move |value| {
+                            let text = match &value {
+                                Value::Text(text, _) => text.text(),
+                                _ => panic!("Text/is_not_empty expects a Text value"),
+                            };
+                            let current_result = !text.is_empty();
+                            if last_result == Some(current_result) {
+                                return None;
+                            }
+                            last_result = Some(current_result);
+                            Some(Tag::new_value(
+                                ConstructInfo::new(
+                                    function_call_id.with_child_id(0),
+                                    None,
+                                    "Text/is_not_empty result",
+                                ),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                if current_result { "True" } else { "False" }.to_string(),
+                            ))
+                        }
+                    },
+                ),
+            )
+        }
+        ["Text", "to_number"] => {
+            let [argument_text] = evaluated_args.as_ref().as_slice() else {
+                panic!("Text/to_number expects 1 argument")
+            };
+            Ok(try_create_runtime_local_direct_unary_builtin_actor(
+                reg,
+                argument_text.clone(),
+                &actor_context,
+                {
+                    let function_call_id = function_call_id.clone();
+                    let construct_context = construct_context.clone();
+                    move |value| {
+                        let text = match &value {
+                            Value::Text(text, _) => text.text(),
+                            _ => panic!("Text/to_number expects a Text value"),
+                        };
+                        match text.trim().parse::<f64>() {
+                            Ok(number) => Number::new_value(
+                                ConstructInfo::new(
+                                    function_call_id.with_child_id(0),
+                                    None,
+                                    "Text/to_number result",
+                                ),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                number,
+                            ),
+                            Err(_) => Tag::new_value(
+                                ConstructInfo::new(
+                                    function_call_id.with_child_id(1),
+                                    None,
+                                    "Text/to_number NaN",
+                                ),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                "NaN".to_string(),
+                            ),
+                        }
+                    }
+                },
+            ))
+        }
+        ["Text", "length"] => {
+            let [argument_text] = evaluated_args.as_ref().as_slice() else {
+                panic!("Text/length expects 1 argument")
+            };
+            Ok(try_create_runtime_local_direct_unary_builtin_actor(
+                reg,
+                argument_text.clone(),
+                &actor_context,
+                {
+                    let function_call_id = function_call_id.clone();
+                    let construct_context = construct_context.clone();
+                    move |value| {
+                        let text = match &value {
+                            Value::Text(text, _) => text.text(),
+                            _ => panic!("Text/length expects a Text value"),
+                        };
+                        Number::new_value(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(0),
+                                None,
+                                "Text/length result",
+                            ),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            text.chars().count() as f64,
+                        )
+                    }
+                },
+            ))
+        }
+        ["Text", "to_uppercase"] => {
+            let [argument_text] = evaluated_args.as_ref().as_slice() else {
+                panic!("Text/to_uppercase expects 1 argument")
+            };
+            Ok(try_create_runtime_local_direct_unary_builtin_actor(
+                reg,
+                argument_text.clone(),
+                &actor_context,
+                {
+                    let function_call_id = function_call_id.clone();
+                    let construct_context = construct_context.clone();
+                    move |value| {
+                        let text = match &value {
+                            Value::Text(text, _) => text.text(),
+                            _ => panic!("Text/to_uppercase expects a Text value"),
+                        };
+                        Text::new_value(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(0),
+                                None,
+                                "Text/to_uppercase result",
+                            ),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            text.to_uppercase(),
+                        )
+                    }
+                },
+            ))
+        }
+        ["Text", "char_code"] => {
+            let [argument_text] = evaluated_args.as_ref().as_slice() else {
+                panic!("Text/char_code expects 1 argument")
+            };
+            Ok(try_create_runtime_local_direct_unary_builtin_actor(
+                reg,
+                argument_text.clone(),
+                &actor_context,
+                {
+                    let function_call_id = function_call_id.clone();
+                    let construct_context = construct_context.clone();
+                    move |value| {
+                        let text = match &value {
+                            Value::Text(text, _) => text.text(),
+                            _ => panic!("Text/char_code expects a Text value"),
+                        };
+                        let code = text.chars().next().map(|c| c as u32 as f64).unwrap_or(0.0);
+                        Number::new_value(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(0),
+                                None,
+                                "Text/char_code result",
+                            ),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            code,
+                        )
+                    }
+                },
+            ))
+        }
+        ["Text", "from_char_code"] => {
+            let [argument_code] = evaluated_args.as_ref().as_slice() else {
+                panic!("Text/from_char_code expects 1 argument")
+            };
+            Ok(try_create_runtime_local_direct_unary_builtin_actor(
+                reg,
+                argument_code.clone(),
+                &actor_context,
+                {
+                    let function_call_id = function_call_id.clone();
+                    let construct_context = construct_context.clone();
+                    move |value| {
+                        let code = match &value {
+                            Value::Number(number, _) => number.number(),
+                            _ => panic!("Text/from_char_code expects a Number value"),
+                        };
+                        let ch = char::from_u32(code as u32).unwrap_or('\0');
+                        Text::new_value(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(0),
+                                None,
+                                "Text/from_char_code result",
+                            ),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            ch.to_string(),
+                        )
+                    }
+                },
+            ))
+        }
+        ["Text", "starts_with"] => {
+            let [argument_text, argument_prefix] = evaluated_args.as_ref().as_slice() else {
+                panic!("Text/starts_with expects 2 arguments")
+            };
+            Ok(try_create_runtime_local_direct_binary_builtin_actor(
+                reg,
+                argument_text.clone(),
+                argument_prefix.clone(),
+                &actor_context,
+                {
+                    let function_call_id = function_call_id.clone();
+                    let construct_context = construct_context.clone();
+                    let mut last_result = None::<bool>;
+                    move |value_text, value_prefix| {
+                        let text = match value_text {
+                            Value::Text(text, _) => text.text(),
+                            _ => panic!("Text/starts_with expects Text arguments"),
+                        };
+                        let prefix = match value_prefix {
+                            Value::Text(text, _) => text.text(),
+                            _ => panic!("Text/starts_with expects Text arguments"),
+                        };
+                        let current_result = text.starts_with(prefix);
+                        if last_result == Some(current_result) {
+                            return None;
+                        }
+                        last_result = Some(current_result);
+                        Some(Tag::new_value(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(0),
+                                None,
+                                "Text/starts_with result",
+                            ),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            if current_result { "True" } else { "False" }.to_string(),
+                        ))
+                    }
+                },
+            ))
+        }
+        ["Bool", "not"] => {
+            let [argument_value] = evaluated_args.as_ref().as_slice() else {
+                panic!("Bool/not expects 1 argument")
+            };
+            Ok(try_create_runtime_local_direct_unary_builtin_actor(
+                reg,
+                argument_value.clone(),
+                &actor_context,
+                {
+                    let function_call_id = function_call_id.clone();
+                    let construct_context = construct_context.clone();
+                    move |value| {
+                        let is_true = match &value {
+                            Value::Tag(tag, _) => tag.tag() == "True",
+                            _ => panic!("Bool/not expects a Tag (True/False)"),
+                        };
+                        Tag::new_value(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(0),
+                                None,
+                                "Bool/not result",
+                            ),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            if is_true { "False" } else { "True" }.to_string(),
+                        )
+                    }
+                },
+            ))
+        }
+        ["Bool", "or"] => {
+            let [argument_this, argument_that] = evaluated_args.as_ref().as_slice() else {
+                panic!("Bool/or expects 2 arguments")
+            };
+            Ok(try_create_runtime_local_direct_binary_builtin_actor(
+                reg,
+                argument_this.clone(),
+                argument_that.clone(),
+                &actor_context,
+                {
+                    let function_call_id = function_call_id.clone();
+                    let construct_context = construct_context.clone();
+                    move |value_this, value_that| {
+                        let this_is_true =
+                            matches!(value_this, Value::Tag(tag, _) if tag.tag() == "True");
+                        let that_is_true =
+                            matches!(value_that, Value::Tag(tag, _) if tag.tag() == "True");
+                        Some(Tag::new_value(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(0),
+                                None,
+                                "Bool/or result",
+                            ),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            if this_is_true || that_is_true {
+                                "True"
+                            } else {
+                                "False"
+                            }
+                            .to_string(),
+                        ))
+                    }
+                },
+            ))
+        }
+        ["Document", "new"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => Some(create_actor_with_registry(
+                reg,
+                api::function_document_new(
+                    evaluated_args,
+                    function_call_id,
+                    persistence_id,
+                    construct_context,
+                    actor_context.clone(),
+                ),
+                PersistenceId::new(),
+                actor_context.scope_id(),
+            )),
+            None => Some(create_actor(
+                api::function_document_new(
+                    evaluated_args,
+                    function_call_id,
+                    persistence_id,
+                    construct_context,
+                    actor_context.clone(),
+                ),
+                PersistenceId::new(),
+                actor_context.scope_id(),
+            )),
+        }),
+        ["Element", "stripe"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => Some(api::function_element_stripe_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )),
+            None => Some(create_actor(
+                api::function_element_stripe(
+                    evaluated_args,
+                    function_call_id,
+                    persistence_id,
+                    construct_context,
+                    actor_context.clone(),
+                ),
+                PersistenceId::new(),
+                actor_context.scope_id(),
+            )),
+        }),
+        ["Element", "container"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => Some(api::function_element_container_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )),
+            None => Some(create_actor(
+                api::function_element_container(
+                    evaluated_args,
+                    function_call_id,
+                    persistence_id,
+                    construct_context,
+                    actor_context.clone(),
+                ),
+                PersistenceId::new(),
+                actor_context.scope_id(),
+            )),
+        }),
+        ["Element", "stack"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => Some(api::function_element_stack_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )),
+            None => Some(create_actor(
+                api::function_element_stack(
+                    evaluated_args,
+                    function_call_id,
+                    persistence_id,
+                    construct_context,
+                    actor_context.clone(),
+                ),
+                PersistenceId::new(),
+                actor_context.scope_id(),
+            )),
+        }),
+        ["Element", "button"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => Some(api::function_element_button_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            )),
+            None => Some(create_actor(
+                api::function_element_button(
+                    evaluated_args,
+                    function_call_id,
+                    persistence_id,
+                    construct_context,
+                    actor_context.clone(),
+                ),
+                PersistenceId::new(),
+                actor_context.scope_id(),
+            )),
+        }),
+        ["List", "count"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => api::function_list_count_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+            None => api::function_list_count_actor(
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+        }),
+        ["List", "is_empty"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => api::function_list_is_empty_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+            None => api::function_list_is_empty_actor(
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+        }),
+        ["List", "is_not_empty"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => api::function_list_is_not_empty_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+            None => api::function_list_is_not_empty_actor(
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+        }),
+        ["List", "last"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => api::function_list_last_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+            None => api::function_list_last_actor(
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+        }),
+        ["List", "get"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => api::function_list_get_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+            None => api::function_list_get_actor(
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+        }),
+        ["List", "latest"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => api::function_list_latest_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+            None => api::function_list_latest_actor(
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+        }),
+        ["List", "sum"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => api::function_list_sum_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+            None => api::function_list_sum_actor(
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+        }),
+        ["List", "product"] => Ok(match reg.as_deref_mut() {
+            Some(reg) => api::function_list_product_actor_with_registry(
+                reg,
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+            None => api::function_list_product_actor(
+                evaluated_args,
+                function_call_id,
+                persistence_id,
+                construct_context,
+                actor_context,
+            ),
+        }),
+        _ => Err(
+            "runtime-local direct builtin function support is missing for this path".to_string(),
+        ),
+    }
+}
+
+fn pattern_supports_runtime_local_direct_match(
+    pattern: &static_expression::Pattern,
+    actor_context: &ActorContext,
+) -> bool {
+    match pattern {
+        static_expression::Pattern::WildCard
+        | static_expression::Pattern::Alias { .. }
+        | static_expression::Pattern::Literal(_) => true,
+        static_expression::Pattern::Object { variables }
+        | static_expression::Pattern::TaggedObject { variables, .. } => {
+            variables.iter().all(|variable| {
+                variable.value.as_ref().is_none_or(|nested| {
+                    pattern_supports_runtime_local_direct_match(nested, actor_context)
+                })
+            })
+        }
+        static_expression::Pattern::ValueComparison {
+            path,
+            referenced_span,
+        } => {
+            let base_name = path.first().map(|part| part.as_str().to_string());
+            base_name
+                .as_ref()
+                .is_some_and(|base_name| actor_context.parameters.contains_key(base_name))
+                || referenced_span
+                    .as_ref()
+                    .is_some_and(|span| actor_context.object_locals.contains_key(span))
+        }
+        static_expression::Pattern::List { .. } | static_expression::Pattern::Map { .. } => false,
+    }
+}
+
+fn resolve_comparison_values_now(
+    arms: &[static_expression::Arm],
+    actor_context: &ActorContext,
+) -> HashMap<String, Value> {
+    let mut resolved = HashMap::new();
+    for arm in arms {
+        if let static_expression::Pattern::ValueComparison {
+            path,
+            referenced_span,
+        } = &arm.pattern
+        {
+            let base_name = path[0].as_str().to_string();
+            let base_actor = if let Some(actor) = actor_context.parameters.get(&base_name) {
+                Some(actor.clone())
+            } else if let Some(ref_span) = referenced_span {
+                actor_context.object_locals.get(ref_span).cloned()
+            } else {
+                None
+            };
+
+            if let Some(actor) = base_actor.and_then(|actor| actor_current_value_now(&actor)) {
+                if path.len() == 1 {
+                    resolved.insert(base_name, actor);
+                } else {
+                    let field_path: Vec<String> =
+                        path[1..].iter().map(|s| s.as_str().to_string()).collect();
+                    if let Some(field_value) = extract_field_path_now(&actor, &field_path) {
+                        let key = path
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        resolved.insert(key, field_value);
+                    }
+                }
+            }
+        }
+    }
+    resolved
+}
+
+fn match_pattern_now(
+    pattern: &static_expression::Pattern,
+    value: &Value,
+    comparison_values: &HashMap<String, Value>,
+) -> Option<HashMap<String, Value>> {
+    let mut bindings = HashMap::new();
+
+    match pattern {
+        static_expression::Pattern::WildCard => Some(bindings),
+        static_expression::Pattern::Alias { name } => {
+            bindings.insert(name.to_string(), value.clone());
+            Some(bindings)
+        }
+        static_expression::Pattern::Literal(lit) => match (lit, value) {
+            (static_expression::Literal::Number(n), Value::Number(v, _)) => {
+                ((*n - v.number()).abs() < f64::EPSILON).then_some(bindings)
+            }
+            (static_expression::Literal::Tag(t), Value::Tag(v, _)) => {
+                (t.as_str() == v.tag()).then_some(bindings)
+            }
+            (static_expression::Literal::Text(t), Value::Text(v, _)) => {
+                (t.as_str() == v.text()).then_some(bindings)
+            }
+            _ => None,
+        },
+        static_expression::Pattern::TaggedObject { tag, variables } => {
+            let Value::TaggedObject(tagged_object, _) = value else {
+                return None;
+            };
+            if tagged_object.tag() != tag.as_str() {
+                return None;
+            }
+            for pattern_var in variables {
+                let var_name = pattern_var.name.as_str();
+                let variable = tagged_object
+                    .variables()
+                    .iter()
+                    .find(|variable| variable.name() == var_name)?;
+                let field_value = actor_current_value_now(&variable.value_actor())?;
+                if let Some(nested_pattern) = &pattern_var.value {
+                    bindings.extend(match_pattern_now(
+                        nested_pattern,
+                        &field_value,
+                        comparison_values,
+                    )?);
+                } else {
+                    bindings.insert(var_name.to_string(), field_value);
+                }
+            }
+            Some(bindings)
+        }
+        static_expression::Pattern::Object { variables } => {
+            let object_variables = match value {
+                Value::Object(object, _) => object.variables(),
+                Value::TaggedObject(tagged_object, _) => tagged_object.variables(),
+                _ => return None,
+            };
+            for pattern_var in variables {
+                let var_name = pattern_var.name.as_str();
+                let variable = object_variables
+                    .iter()
+                    .find(|variable| variable.name() == var_name)?;
+                let field_value = actor_current_value_now(&variable.value_actor())?;
+                if let Some(nested_pattern) = &pattern_var.value {
+                    bindings.extend(match_pattern_now(
+                        nested_pattern,
+                        &field_value,
+                        comparison_values,
+                    )?);
+                } else {
+                    bindings.insert(var_name.to_string(), field_value);
+                }
+            }
+            Some(bindings)
+        }
+        static_expression::Pattern::ValueComparison { path, .. } => {
+            let key = path
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            let comparison_value = comparison_values.get(&key)?;
+            match (comparison_value, value) {
+                (Value::Tag(a, _), Value::Tag(b, _)) if a.tag() == b.tag() => Some(bindings),
+                (Value::Text(a, _), Value::Text(b, _)) if a.text() == b.text() => Some(bindings),
+                (Value::Number(a, _), Value::Number(b, _))
+                    if (a.number() - b.number()).abs() < f64::EPSILON =>
+                {
+                    Some(bindings)
+                }
+                _ => None,
+            }
+        }
+        static_expression::Pattern::List { .. } | static_expression::Pattern::Map { .. } => None,
+    }
+}
+
+fn create_text_interpolation_field_actor_with_registry(
+    reg: Option<&mut ActorRegistry>,
+    base_actor: ActorHandle,
+    field_path: Vec<String>,
+    actor_context: ActorContext,
+) -> ActorHandle {
+    create_field_path_alias_actor_with_registry(reg, actor_context, base_actor, field_path)
+        .expect("non-empty text interpolation field paths should stay on the direct alias path")
+}
+
+fn create_text_interpolation_field_actor(
+    base_actor: ActorHandle,
+    field_path: Vec<String>,
+    actor_context: ActorContext,
+) -> ActorHandle {
+    create_text_interpolation_field_actor_with_registry(None, base_actor, field_path, actor_context)
+}
+
+fn text_part_value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(text, _) => Some(text.text().to_string()),
+        Value::Number(num, _) => Some(num.number().to_string()),
+        Value::Tag(tag, _) => Some(tag.tag().to_string()),
+        _ => None,
+    }
+}
+
+fn make_combined_text_literal_value(
+    construct_context: &ConstructContext,
+    span: Span,
+    combined_text: String,
+) -> Value {
+    Value::Text(
+        Arc::new(Text::new(
+            ConstructInfo::new(
+                "TextLiteral combined",
+                None,
+                format!("{span}; TextLiteral combined"),
+            ),
+            construct_context.clone(),
+            combined_text,
+        )),
+        ValueMetadata::new(ValueIdempotencyKey::new()),
+    )
+}
+
+fn try_create_direct_state_text_literal_actor_with_runtime_registry(
+    reg: Option<&mut ActorRegistry>,
+    part_actors: &[(bool, ActorHandle)],
+    span: Span,
+    persistence_id: PersistenceId,
+    ctx: &EvaluationContext,
+) -> Option<ActorHandle> {
+    let latest_values = Rc::new(RefCell::new(vec![None::<Value>; part_actors.len()]));
+    try_create_direct_state_subscriber_actor_with_registry(
+        reg,
+        part_actors.iter().map(|(_, actor)| actor.clone()).collect(),
+        persistence_id,
+        ctx.actor_context.scope_id(),
+        {
+            let latest_values = latest_values.clone();
+            let construct_context = ctx.construct_context.clone();
+            move |idx, value| {
+                latest_values.borrow_mut()[idx] = Some(value);
+                let latest_values = latest_values.borrow();
+                if latest_values.iter().all(|value| value.is_some()) {
+                    let combined: String = latest_values
+                        .iter()
+                        .filter_map(|value| value.as_ref().and_then(text_part_value_to_string))
+                        .collect();
+                    Some(make_combined_text_literal_value(
+                        &construct_context,
+                        span,
+                        combined,
+                    ))
+                } else {
+                    None
+                }
+            }
+        },
+    )
+}
+
+fn try_create_direct_state_text_literal_actor(
+    part_actors: &[(bool, ActorHandle)],
+    span: Span,
+    persistence_id: PersistenceId,
+    ctx: &EvaluationContext,
+) -> Option<ActorHandle> {
+    try_create_direct_state_text_literal_actor_with_runtime_registry(
+        None,
+        part_actors,
+        span,
+        persistence_id,
+        ctx,
+    )
+}
+
 fn wrap_restored_list_append_item_with_origin(
     item_actor: ActorHandle,
     origin: ListItemOrigin,
     scope_id: ScopeId,
 ) -> ActorHandle {
+    // Try direct-state path first when the source is non-lazy.
+    // This avoids spawning a retained feeder task for simple list items.
+    if !item_actor.has_lazy_delegate() && item_actor.is_alive() {
+        if let Some(result) = crate::engine::try_create_direct_state_subscriber_actor_with_origin(
+            None,
+            vec![item_actor.clone()],
+            PersistenceId::new(),
+            scope_id,
+            origin.clone(),
+            |_idx, value| Some(value),
+        ) {
+            return result;
+        }
+    }
+
+    // Fall back to stream-driven path for lazy sources or multi-value streams.
     create_actor_with_origin(
         Box::pin(restored_list_append_item_current_and_future_values(
             item_actor,
@@ -240,6 +1725,254 @@ fn create_variable_persistence_stream(
     .right_stream()
 }
 
+fn variable_persistence_json_now(value: &Value) -> Option<zoon::serde_json::Value> {
+    match value {
+        Value::List(..) => None,
+        Value::Text(text, _) => Some(zoon::serde_json::Value::String(text.text().to_string())),
+        Value::Number(number, _) => Some(zoon::serde_json::json!(number.number())),
+        Value::Tag(tag, _) => {
+            let mut obj = zoon::serde_json::Map::new();
+            obj.insert(
+                "_tag".to_string(),
+                zoon::serde_json::Value::String(tag.tag().to_string()),
+            );
+            Some(zoon::serde_json::Value::Object(obj))
+        }
+        _ => None,
+    }
+}
+
+fn save_value_if_applicable_now(
+    value: &Value,
+    scoped_id: PersistenceId,
+    storage: &ConstructStorage,
+) {
+    if let Some(json) = variable_persistence_json_now(value) {
+        storage.save_state(scoped_id, &json);
+    }
+}
+
+fn try_create_direct_state_variable_persistence_actor(
+    source_actor: ActorHandle,
+    storage: Arc<ConstructStorage>,
+    persistence_id: PersistenceId,
+    scope: Scope,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+    value_changed: bool,
+) -> Option<ActorHandle> {
+    try_create_direct_state_variable_persistence_actor_with_registry(
+        None,
+        source_actor,
+        storage,
+        persistence_id,
+        scope,
+        construct_context,
+        actor_context,
+        value_changed,
+    )
+}
+
+fn try_create_direct_state_variable_persistence_actor_with_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    source_actor: ActorHandle,
+    storage: Arc<ConstructStorage>,
+    persistence_id: PersistenceId,
+    scope: Scope,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+    value_changed: bool,
+) -> Option<ActorHandle> {
+    let scope_id = actor_context.scope_id();
+    let scoped_id = persistence_id.in_scope(&scope);
+    let output = match reg.as_deref_mut() {
+        Some(reg) => create_actor_forwarding_with_registry(reg, persistence_id, scope_id),
+        None => create_actor_forwarding(persistence_id, scope_id),
+    };
+    retain_actor_handles_with_registry(
+        reg.as_deref_mut(),
+        &output,
+        std::iter::once(source_actor.clone()),
+    );
+    let skip_next_source = Rc::new(Cell::new(false));
+    let source_is_lazy = match reg.as_deref_mut() {
+        Some(reg) => source_actor.has_lazy_delegate_with_registry(reg),
+        None => source_actor.has_lazy_delegate(),
+    };
+
+    if !(value_changed || actor_context.sequential_processing) {
+        let restored_value = storage
+            .load_state_now(scoped_id)
+            .and_then(|json| match &json {
+                zoon::serde_json::Value::String(_)
+                | zoon::serde_json::Value::Number(_)
+                | zoon::serde_json::Value::Bool(_)
+                | zoon::serde_json::Value::Null => Some(Value::from_json(
+                    &json,
+                    ConstructId::new("variable restored from storage"),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    actor_context.clone(),
+                )),
+                zoon::serde_json::Value::Object(obj)
+                    if obj.len() == 1 && obj.contains_key("_tag") =>
+                {
+                    Some(Value::from_json(
+                        &json,
+                        ConstructId::new("variable restored from storage"),
+                        construct_context.clone(),
+                        ValueIdempotencyKey::new(),
+                        actor_context.clone(),
+                    ))
+                }
+                zoon::serde_json::Value::Object(_) | zoon::serde_json::Value::Array(_) => None,
+            });
+
+        if let Some(value) = restored_value {
+            output.store_value_directly(value);
+            skip_next_source.set(true);
+        } else if let Ok(current_value) = source_actor.current_value() {
+            save_value_if_applicable_now(&current_value, scoped_id, &storage);
+            output.store_value_directly(current_value);
+        }
+    } else if let Ok(current_value) = source_actor.current_value() {
+        save_value_if_applicable_now(&current_value, scoped_id, &storage);
+        output.store_value_directly(current_value);
+    }
+
+    if source_is_lazy {
+        watch_actor_current_and_future_with_registry(
+            reg.as_deref_mut(),
+            &output,
+            &source_actor,
+            false,
+            {
+                let output = output.clone();
+                let storage = storage.clone();
+                let skip_next_source = skip_next_source.clone();
+                move |reg, value| {
+                    if !output.is_alive() {
+                        return;
+                    }
+                    if skip_next_source.replace(false) {
+                        return;
+                    }
+                    save_value_if_applicable_now(&value, scoped_id, &storage);
+                    enqueue_actor_value_on_runtime_queue_with_registry(reg, &output, value);
+                }
+            },
+        );
+        return Some(output);
+    }
+
+    match reg {
+        Some(reg) => {
+            source_actor.register_direct_subscriber_with_registry(reg, {
+                let output = output.clone();
+                let storage = storage.clone();
+                let skip_next_source = skip_next_source.clone();
+                move |reg, value| {
+                    if !output.is_alive() {
+                        return false;
+                    }
+                    if skip_next_source.replace(false) {
+                        return true;
+                    }
+                    let Some(value) = value else {
+                        return true;
+                    };
+                    save_value_if_applicable_now(value, scoped_id, &storage);
+                    enqueue_actor_value_on_runtime_queue_with_registry(reg, &output, value.clone());
+                    true
+                }
+            });
+            drain_runtime_ready_queue_with_registry(reg);
+        }
+        None => REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            source_actor.register_direct_subscriber_with_registry(&mut reg, {
+                let output = output.clone();
+                let storage = storage.clone();
+                let skip_next_source = skip_next_source.clone();
+                move |reg, value| {
+                    if !output.is_alive() {
+                        return false;
+                    }
+                    if skip_next_source.replace(false) {
+                        return true;
+                    }
+                    let Some(value) = value else {
+                        return true;
+                    };
+                    save_value_if_applicable_now(value, scoped_id, &storage);
+                    enqueue_actor_value_on_runtime_queue_with_registry(reg, &output, value.clone());
+                    true
+                }
+            });
+            drain_runtime_ready_queue_with_registry(&mut reg);
+        }),
+    }
+
+    Some(output)
+}
+
+fn create_variable_persistence_actor(
+    source_actor: ActorHandle,
+    storage: Arc<ConstructStorage>,
+    persistence_id: PersistenceId,
+    scope: Scope,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+    value_changed: bool,
+) -> ActorHandle {
+    create_variable_persistence_actor_with_registry(
+        None,
+        source_actor,
+        storage,
+        persistence_id,
+        scope,
+        construct_context,
+        actor_context,
+        value_changed,
+    )
+}
+
+fn create_variable_persistence_actor_with_registry(
+    reg: Option<&mut ActorRegistry>,
+    source_actor: ActorHandle,
+    storage: Arc<ConstructStorage>,
+    persistence_id: PersistenceId,
+    scope: Scope,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+    value_changed: bool,
+) -> ActorHandle {
+    if let Some(actor) = try_create_direct_state_variable_persistence_actor_with_registry(
+        reg,
+        source_actor.clone(),
+        storage.clone(),
+        persistence_id,
+        scope.clone(),
+        construct_context.clone(),
+        actor_context.clone(),
+        value_changed,
+    ) {
+        return actor;
+    }
+
+    let persistence_stream = create_variable_persistence_stream(
+        source_actor,
+        storage,
+        persistence_id,
+        scope,
+        construct_context,
+        actor_context.clone(),
+        value_changed,
+    );
+
+    create_actor(persistence_stream, persistence_id, actor_context.scope_id())
+}
+
 enum PersistenceState {
     LoadingStored,
     SkipFirstSource {
@@ -286,7 +2019,6 @@ pub struct EvaluationContext {
     pub actor_context: ActorContext,
     pub reference_connector: Weak<ReferenceConnector>,
     pub link_connector: Weak<LinkConnector>,
-    pub pass_through_connector: Weak<PassThroughConnector>,
     pub module_loader: ModuleLoader,
     pub source_code: SourceCode,
     /// Optional snapshot of function registry for nested evaluations (closures).
@@ -306,7 +2038,6 @@ impl EvaluationContext {
         actor_context: ActorContext,
         reference_connector: Arc<ReferenceConnector>,
         link_connector: Arc<LinkConnector>,
-        pass_through_connector: Arc<PassThroughConnector>,
         module_loader: ModuleLoader,
         source_code: SourceCode,
     ) -> Self {
@@ -315,7 +2046,6 @@ impl EvaluationContext {
             actor_context,
             reference_connector: Arc::downgrade(&reference_connector),
             link_connector: Arc::downgrade(&link_connector),
-            pass_through_connector: Arc::downgrade(&pass_through_connector),
             module_loader,
             source_code,
             function_registry_snapshot: None,
@@ -378,12 +2108,6 @@ impl EvaluationContext {
     /// Returns None if the connector has been dropped (program shutting down).
     pub fn try_link_connector(&self) -> Option<Arc<LinkConnector>> {
         self.link_connector.upgrade()
-    }
-
-    /// Try to upgrade the weak pass_through_connector to a strong Arc.
-    /// Returns None if the connector has been dropped (program shutting down).
-    pub fn try_pass_through_connector(&self) -> Option<Arc<PassThroughConnector>> {
-        self.pass_through_connector.upgrade()
     }
 }
 
@@ -620,6 +2344,16 @@ fn prepare_struct_build(
     ctx: &EvaluationContext,
     force_reactive_locals: bool,
 ) -> PreparedStructBuild {
+    prepare_struct_build_with_registry(state, variables, ctx, force_reactive_locals, None)
+}
+
+fn prepare_struct_build_with_registry(
+    state: &mut EvaluationState,
+    variables: Vec<static_expression::Spanned<static_expression::Variable>>,
+    ctx: &EvaluationContext,
+    force_reactive_locals: bool,
+    mut reg: Option<&mut ActorRegistry>,
+) -> PreparedStructBuild {
     let mut variable_data = Vec::new();
     let mut vars_to_schedule = Vec::new();
     let mut object_locals = (*ctx.actor_context.object_locals).clone();
@@ -653,10 +2387,21 @@ fn prepare_struct_build(
                 .as_ref()
                 .expect("variable persistence should be set by resolver")
                 .id;
-            let actor = create_actor_forwarding(var_persistence_id, ctx.actor_context.scope_id());
+            let actor = match reg.as_deref_mut() {
+                Some(reg) => create_actor_forwarding_with_registry(
+                    reg,
+                    var_persistence_id,
+                    ctx.actor_context.scope_id(),
+                ),
+                None => create_actor_forwarding(var_persistence_id, ctx.actor_context.scope_id()),
+            };
             object_locals.insert(var_span, actor.clone());
             if let Some(ref_connector) = ctx.try_reference_connector() {
-                ref_connector.register_referenceable(var_span, actor.clone());
+                ref_connector.register_referenceable_with_registry(
+                    reg.as_deref_mut(),
+                    var_span,
+                    actor.clone(),
+                );
             }
             Some(actor)
         } else {
@@ -705,14 +2450,35 @@ fn schedule_struct_fields(
     vars_to_schedule: Vec<ScheduledStructField>,
     ctx: EvaluationContext,
 ) -> Result<(), String> {
+    schedule_struct_fields_with_runtime_registry(state, vars_to_schedule, ctx, None)
+}
+
+fn schedule_struct_fields_with_runtime_registry(
+    state: &mut EvaluationState,
+    vars_to_schedule: Vec<ScheduledStructField>,
+    ctx: EvaluationContext,
+    mut reg: Option<&mut ActorRegistry>,
+) -> Result<(), String> {
     for (var_expr, var_slot, is_referenced) in vars_to_schedule.iter() {
         if !*is_referenced {
-            schedule_expression(state, var_expr.clone(), ctx.clone(), *var_slot)?;
+            schedule_expression_with_runtime_registry(
+                state,
+                var_expr.clone(),
+                ctx.clone(),
+                *var_slot,
+                reg.as_deref_mut(),
+            )?;
         }
     }
     for (var_expr, var_slot, is_referenced) in vars_to_schedule {
         if is_referenced {
-            schedule_expression(state, var_expr, ctx.clone(), var_slot)?;
+            schedule_expression_with_runtime_registry(
+                state,
+                var_expr,
+                ctx.clone(),
+                var_slot,
+                reg.as_deref_mut(),
+            )?;
         }
     }
     Ok(())
@@ -722,6 +2488,15 @@ fn resolve_struct_variables(
     variable_data: &[ObjectVariableData],
     state: &EvaluationState,
     ctx: &EvaluationContext,
+) -> ResolvedStructVariables {
+    resolve_struct_variables_with_registry(variable_data, state, ctx, None)
+}
+
+fn resolve_struct_variables_with_registry(
+    variable_data: &[ObjectVariableData],
+    state: &EvaluationState,
+    ctx: &EvaluationContext,
+    mut reg: Option<&mut ActorRegistry>,
 ) -> ResolvedStructVariables {
     let mut variables = Vec::new();
     let mut spread_actors = Vec::new();
@@ -734,10 +2509,12 @@ fn resolve_struct_variables(
             continue;
         }
 
-        let Some(variable) = build_struct_variable(vd, state, ctx) else {
+        let Some(variable) =
+            build_struct_variable_with_registry(vd, state, ctx, reg.as_deref_mut())
+        else {
             continue;
         };
-        register_struct_variable(vd, &variable, ctx);
+        register_struct_variable(vd, &variable, ctx, reg.as_deref_mut());
         variables.push(variable);
     }
 
@@ -774,6 +2551,61 @@ fn try_resolve_spread_struct_variables_now(
     Some(all_variables)
 }
 
+fn create_waiting_spread_struct_actor_with_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    spread_actors: Vec<ActorHandle>,
+    variables: Vec<Arc<Variable>>,
+    persistence_id: PersistenceId,
+    scope_id: ScopeId,
+    build_value: impl Fn(Vec<Arc<Variable>>) -> Value + 'static,
+) -> ActorHandle {
+    let output = match reg.as_deref_mut() {
+        Some(reg) => create_actor_forwarding_with_registry(reg, persistence_id, scope_id),
+        None => create_actor_forwarding(persistence_id, scope_id),
+    };
+    retain_actor_handles_with_registry(reg.as_deref_mut(), &output, spread_actors.iter().cloned());
+
+    let build_value: Rc<dyn Fn(Vec<Arc<Variable>>) -> Value> = Rc::new(build_value);
+    let published = Rc::new(Cell::new(false));
+
+    for spread_actor in spread_actors.iter() {
+        watch_actor_current_and_future_until_with_registry(
+            reg.as_deref_mut(),
+            &output,
+            spread_actor,
+            false,
+            {
+                let output = output.clone();
+                let spread_actors = spread_actors.clone();
+                let variables = variables.clone();
+                let build_value = build_value.clone();
+                let published = published.clone();
+                move |reg, _value| {
+                    if published.get() || !output.is_alive() {
+                        return true;
+                    }
+
+                    let Some(merged_variables) =
+                        try_resolve_spread_struct_variables_now(&spread_actors, variables.clone())
+                    else {
+                        return false;
+                    };
+
+                    enqueue_actor_value_on_runtime_queue_with_registry(
+                        reg,
+                        &output,
+                        build_value(merged_variables),
+                    );
+                    published.set(true);
+                    true
+                }
+            },
+        );
+    }
+
+    output
+}
+
 async fn resolve_spread_struct_variables(
     spread_actors: Vec<ActorHandle>,
     variables: Vec<Arc<Variable>>,
@@ -795,6 +2627,15 @@ fn build_struct_variable(
     state: &EvaluationState,
     ctx: &EvaluationContext,
 ) -> Option<Arc<Variable>> {
+    build_struct_variable_with_registry(vd, state, ctx, None)
+}
+
+fn build_struct_variable_with_registry(
+    vd: &ObjectVariableData,
+    state: &EvaluationState,
+    ctx: &EvaluationContext,
+    mut reg: Option<&mut ActorRegistry>,
+) -> Option<Arc<Variable>> {
     let var_persistence_id = vd
         .persistence
         .as_ref()
@@ -804,20 +2645,37 @@ fn build_struct_variable(
     let variable = if vd.is_link && vd.forwarding_actor.is_some() {
         let forwarding_actor = vd.forwarding_actor.as_ref().unwrap();
 
-        let temp_link = Variable::new_link_arc(
-            ConstructInfo::new(
-                format!("PersistenceId: {}", var_persistence_id),
-                vd.persistence.clone(),
-                format!("{}: (link variable internal)", vd.name),
+        let temp_link = match reg.as_deref_mut() {
+            Some(reg) => Variable::new_link_arc_with_registry(
+                reg,
+                ConstructInfo::new(
+                    format!("PersistenceId: {}", var_persistence_id),
+                    vd.persistence.clone(),
+                    format!("{}: (link variable internal)", vd.name),
+                ),
+                vd.name.clone(),
+                ctx.actor_context.clone(),
+                var_persistence_id,
             ),
-            vd.name.clone(),
-            ctx.actor_context.clone(),
-            var_persistence_id,
-        );
+            None => Variable::new_link_arc(
+                ConstructInfo::new(
+                    format!("PersistenceId: {}", var_persistence_id),
+                    vd.persistence.clone(),
+                    format!("{}: (link variable internal)", vd.name),
+                ),
+                vd.name.clone(),
+                ctx.actor_context.clone(),
+                var_persistence_id,
+            ),
+        };
 
         let link_value_actor = temp_link.value_actor();
         let link_value_sender = temp_link.expect_link_value_sender();
-        connect_forwarding_current_and_future(forwarding_actor.clone(), link_value_actor);
+        connect_forwarding_current_and_future_with_registry(
+            reg.as_deref_mut(),
+            forwarding_actor.clone(),
+            link_value_actor,
+        );
 
         Variable::new_link_arc_with_forwarding_actor(
             ConstructInfo::new(
@@ -832,19 +2690,36 @@ fn build_struct_variable(
             link_value_sender,
         )
     } else if vd.is_link {
-        Variable::new_link_arc(
-            ConstructInfo::new(
-                format!("PersistenceId: {}", var_persistence_id),
-                vd.persistence.clone(),
-                format!("{}: (link variable)", vd.name),
+        match reg.as_deref_mut() {
+            Some(reg) => Variable::new_link_arc_with_registry(
+                reg,
+                ConstructInfo::new(
+                    format!("PersistenceId: {}", var_persistence_id),
+                    vd.persistence.clone(),
+                    format!("{}: (link variable)", vd.name),
+                ),
+                vd.name.clone(),
+                ctx.actor_context.clone(),
+                var_persistence_id,
             ),
-            vd.name.clone(),
-            ctx.actor_context.clone(),
-            var_persistence_id,
-        )
+            None => Variable::new_link_arc(
+                ConstructInfo::new(
+                    format!("PersistenceId: {}", var_persistence_id),
+                    vd.persistence.clone(),
+                    format!("{}: (link variable)", vd.name),
+                ),
+                vd.name.clone(),
+                ctx.actor_context.clone(),
+                var_persistence_id,
+            ),
+        }
     } else if let Some(forwarding_actor) = &vd.forwarding_actor {
         let source_actor = state.get(vd.value_slot)?;
-        connect_forwarding_current_and_future(forwarding_actor.clone(), source_actor);
+        connect_forwarding_current_and_future_with_registry(
+            reg.as_deref_mut(),
+            forwarding_actor.clone(),
+            source_actor,
+        );
         Variable::new_arc(
             ConstructInfo::new(
                 format!("PersistenceId: {}", var_persistence_id),
@@ -862,7 +2737,8 @@ fn build_struct_variable(
         let effective_actor = if ctx.construct_context.construct_storage.is_disabled() {
             value_actor
         } else {
-            let persistence_stream = create_variable_persistence_stream(
+            create_variable_persistence_actor_with_registry(
+                reg.as_deref_mut(),
                 value_actor.clone(),
                 ctx.construct_context.construct_storage.clone(),
                 var_persistence_id,
@@ -870,12 +2746,6 @@ fn build_struct_variable(
                 ctx.construct_context.clone(),
                 ctx.actor_context.clone(),
                 vd.value_changed,
-            );
-
-            create_actor(
-                persistence_stream,
-                var_persistence_id,
-                ctx.actor_context.scope_id(),
             )
         };
 
@@ -899,10 +2769,15 @@ fn register_struct_variable(
     vd: &ObjectVariableData,
     variable: &Arc<Variable>,
     ctx: &EvaluationContext,
+    reg: Option<&mut ActorRegistry>,
 ) {
     if vd.forwarding_actor.is_none() {
         if let Some(ref_connector) = ctx.try_reference_connector() {
-            ref_connector.register_referenceable(vd.span, variable.value_actor());
+            ref_connector.register_referenceable_with_registry(
+                reg,
+                vd.span,
+                variable.value_actor(),
+            );
         }
     }
 
@@ -1034,17 +2909,31 @@ pub fn evaluate_expression(
     expression: static_expression::Spanned<static_expression::Expression>,
     ctx: EvaluationContext,
 ) -> Result<Option<ActorHandle>, String> {
+    evaluate_expression_stack_safe_with_runtime_registry(None, expression, ctx)
+}
+
+fn evaluate_expression_stack_safe_with_runtime_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    expression: static_expression::Spanned<static_expression::Expression>,
+    ctx: EvaluationContext,
+) -> Result<Option<ActorHandle>, String> {
     let mut state = EvaluationState::new();
     let final_slot = state.alloc_slot();
 
     // Debug: log the expression type
 
     // Schedule the root expression
-    schedule_expression(&mut state, expression, ctx, final_slot)?;
+    schedule_expression_with_runtime_registry(
+        &mut state,
+        expression,
+        ctx,
+        final_slot,
+        reg.as_deref_mut(),
+    )?;
 
     // Process work items until the queue is empty
     while let Some(item) = state.pop() {
-        process_work_item(&mut state, item)?;
+        process_work_item(&mut state, item, reg.as_deref_mut())?;
     }
 
     // Get the final result - SKIP returns None (no actor)
@@ -1059,6 +2948,1180 @@ pub fn evaluate_expression(
     }
 }
 
+fn evaluate_struct_expression_with_runtime_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    variables: Vec<static_expression::Spanned<static_expression::Variable>>,
+    tag: Option<String>,
+    span: Span,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+) -> Result<Option<ActorHandle>, String> {
+    let mut state = EvaluationState::new();
+    let PreparedStructBuild {
+        variable_data,
+        vars_to_schedule,
+        ctx_with_locals,
+    } = prepare_struct_build_with_registry(&mut state, variables, &ctx, false, reg.as_deref_mut());
+
+    for (expr, slot, is_referenced) in &vars_to_schedule {
+        if *is_referenced {
+            continue;
+        }
+        if let Some(actor) = evaluate_expression_with_runtime_registry(
+            reg.as_deref_mut(),
+            expr.clone(),
+            ctx_with_locals.clone(),
+        )? {
+            state.store(*slot, actor);
+        }
+    }
+
+    for (expr, slot, is_referenced) in vars_to_schedule {
+        if !is_referenced {
+            continue;
+        }
+        if let Some(actor) = evaluate_expression_with_runtime_registry(
+            reg.as_deref_mut(),
+            expr,
+            ctx_with_locals.clone(),
+        )? {
+            state.store(slot, actor);
+        }
+    }
+
+    let ResolvedStructVariables {
+        variables,
+        spread_actors,
+    } = resolve_struct_variables_with_registry(
+        &variable_data,
+        &state,
+        &ctx_with_locals,
+        reg.as_deref_mut(),
+    );
+
+    match tag {
+        Some(tag) => {
+            let construct_info = ConstructInfo::new(
+                format!("PersistenceId: {persistence_id}"),
+                persistence.clone(),
+                format!("{span}; {tag} {{..}}"),
+            );
+            if spread_actors.is_empty() {
+                let actor = match reg.as_deref_mut() {
+                    Some(reg) => TaggedObject::new_arc_value_actor_with_registry(
+                        Some(reg),
+                        construct_info,
+                        ctx.construct_context,
+                        persistence_id,
+                        ctx.actor_context,
+                        tag,
+                        variables,
+                    ),
+                    None => TaggedObject::new_arc_value_actor(
+                        construct_info,
+                        ctx.construct_context,
+                        persistence_id,
+                        ctx.actor_context,
+                        tag,
+                        variables,
+                    ),
+                };
+                return Ok(Some(actor));
+            }
+
+            if let Some(merged_variables) =
+                try_resolve_spread_struct_variables_now(&spread_actors, variables.clone())
+            {
+                let actor = match reg.as_deref_mut() {
+                    Some(reg) => TaggedObject::new_arc_value_actor_with_registry(
+                        Some(reg),
+                        construct_info,
+                        ctx.construct_context,
+                        persistence_id,
+                        ctx.actor_context,
+                        tag,
+                        merged_variables,
+                    ),
+                    None => TaggedObject::new_arc_value_actor(
+                        construct_info,
+                        ctx.construct_context,
+                        persistence_id,
+                        ctx.actor_context,
+                        tag,
+                        merged_variables,
+                    ),
+                };
+                return Ok(Some(actor));
+            }
+
+            let construct_context = ctx.construct_context.clone();
+            let persistence_for_actor = persistence.clone();
+            let tag_for_actor = tag.clone();
+            let actor = create_waiting_spread_struct_actor_with_registry(
+                reg,
+                spread_actors,
+                variables,
+                persistence_id,
+                ctx.actor_context.scope_id(),
+                move |merged_variables| {
+                    TaggedObject::new_value(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {persistence_id}"),
+                            persistence_for_actor.clone(),
+                            format!("{span}; {tag_for_actor} {{..}}"),
+                        ),
+                        construct_context.clone(),
+                        persistence_id,
+                        tag_for_actor.clone(),
+                        merged_variables,
+                    )
+                },
+            );
+            Ok(Some(actor))
+        }
+        None => {
+            let construct_info = ConstructInfo::new(
+                format!("PersistenceId: {persistence_id}"),
+                persistence.clone(),
+                format!("{span}; Object {{..}}"),
+            );
+            if spread_actors.is_empty() {
+                let actor = match reg.as_deref_mut() {
+                    Some(reg) => Object::new_arc_value_actor_with_registry(
+                        Some(reg),
+                        construct_info,
+                        ctx.construct_context,
+                        persistence_id,
+                        ctx.actor_context,
+                        variables,
+                    ),
+                    None => Object::new_arc_value_actor(
+                        construct_info,
+                        ctx.construct_context,
+                        persistence_id,
+                        ctx.actor_context,
+                        variables,
+                    ),
+                };
+                return Ok(Some(actor));
+            }
+
+            if let Some(merged_variables) =
+                try_resolve_spread_struct_variables_now(&spread_actors, variables.clone())
+            {
+                let actor = match reg.as_deref_mut() {
+                    Some(reg) => Object::new_arc_value_actor_with_registry(
+                        Some(reg),
+                        construct_info,
+                        ctx.construct_context,
+                        persistence_id,
+                        ctx.actor_context,
+                        merged_variables,
+                    ),
+                    None => Object::new_arc_value_actor(
+                        construct_info,
+                        ctx.construct_context,
+                        persistence_id,
+                        ctx.actor_context,
+                        merged_variables,
+                    ),
+                };
+                return Ok(Some(actor));
+            }
+
+            let construct_context = ctx.construct_context.clone();
+            let persistence_for_actor = persistence.clone();
+            let actor = create_waiting_spread_struct_actor_with_registry(
+                reg,
+                spread_actors,
+                variables,
+                persistence_id,
+                ctx.actor_context.scope_id(),
+                move |merged_variables| {
+                    Object::new_value(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {persistence_id}"),
+                            persistence_for_actor.clone(),
+                            format!("{span}; Object {{..}}"),
+                        ),
+                        construct_context.clone(),
+                        persistence_id,
+                        merged_variables,
+                    )
+                },
+            );
+            Ok(Some(actor))
+        }
+    }
+}
+
+fn evaluate_expression_with_runtime_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    expression: static_expression::Spanned<static_expression::Expression>,
+    ctx: EvaluationContext,
+) -> Result<Option<ActorHandle>, String> {
+    let expression_persistence = expression.persistence.clone();
+    let expression_persistence_id = expression_persistence
+        .as_ref()
+        .map(|p| p.id)
+        .unwrap_or_else(PersistenceId::new);
+
+    if let static_expression::Expression::Literal(literal) = expression.node.clone() {
+        let span = expression.span;
+        let persistence = expression.persistence.clone();
+        let persistence_id = persistence
+            .as_ref()
+            .map(|p| p.id)
+            .unwrap_or_else(PersistenceId::new);
+        let value = match literal {
+            static_expression::Literal::Number(number) => Number::new_value(
+                ConstructInfo::new(
+                    format!("PersistenceId: {persistence_id}"),
+                    persistence,
+                    format!("{span}; Number {number}"),
+                ),
+                ctx.construct_context.clone(),
+                persistence_id,
+                number,
+            ),
+            static_expression::Literal::Tag(tag) => {
+                let tag = tag.to_string();
+                Tag::new_value(
+                    ConstructInfo::new(
+                        format!("PersistenceId: {persistence_id}"),
+                        expression.persistence.clone(),
+                        format!("{span}; Tag {tag}"),
+                    ),
+                    ctx.construct_context.clone(),
+                    persistence_id,
+                    tag,
+                )
+            }
+            static_expression::Literal::Text(text) => {
+                let text = text.to_string();
+                Text::new_value(
+                    ConstructInfo::new(
+                        format!("PersistenceId: {persistence_id}"),
+                        expression.persistence.clone(),
+                        format!("{span}; Text {text}"),
+                    ),
+                    ctx.construct_context.clone(),
+                    persistence_id,
+                    text,
+                )
+            }
+        };
+        let actor = match reg.as_deref_mut() {
+            Some(reg) => create_constant_actor_with_registry(
+                reg,
+                persistence_id,
+                value,
+                ctx.actor_context.scope_id(),
+            ),
+            None => create_constant_actor(persistence_id, value, ctx.actor_context.scope_id()),
+        };
+        return Ok(Some(actor));
+    }
+
+    if let static_expression::Expression::Alias(alias) = expression.node.clone() {
+        let (root_actor, field_path, clear_subscription_after_seq) = match alias {
+            static_expression::Alias::WithPassed { extra_parts } => {
+                let Some(root_actor) = ctx
+                    .actor_context
+                    .passed
+                    .clone()
+                    .or_else(|| ctx.actor_context.piped.clone())
+                else {
+                    return evaluate_expression_stack_safe_with_runtime_registry(
+                        reg, expression, ctx,
+                    );
+                };
+                (
+                    root_actor,
+                    extra_parts
+                        .iter()
+                        .map(|part| part.to_string())
+                        .collect::<Vec<_>>(),
+                    false,
+                )
+            }
+            static_expression::Alias::WithoutPassed {
+                parts,
+                referenced_span,
+            } => {
+                let Some(first_part) = parts.first() else {
+                    return evaluate_expression_stack_safe_with_runtime_registry(
+                        reg, expression, ctx,
+                    );
+                };
+                let root_actor = if let Some(param_actor) = ctx
+                    .actor_context
+                    .parameters
+                    .get(first_part.as_str())
+                    .cloned()
+                {
+                    param_actor
+                } else if let Some(ref_span) = referenced_span {
+                    let Some(local_actor) = ctx.actor_context.object_locals.get(&ref_span).cloned()
+                    else {
+                        return evaluate_expression_stack_safe_with_runtime_registry(
+                            reg, expression, ctx,
+                        );
+                    };
+                    local_actor
+                } else {
+                    return evaluate_expression_stack_safe_with_runtime_registry(
+                        reg, expression, ctx,
+                    );
+                };
+                (
+                    root_actor,
+                    parts
+                        .iter()
+                        .skip(1)
+                        .map(|part| part.to_string())
+                        .collect::<Vec<_>>(),
+                    referenced_span.is_none(),
+                )
+            }
+        };
+
+        let mut alias_actor_context = ctx.actor_context.clone();
+        if clear_subscription_after_seq {
+            alias_actor_context.subscription_after_seq = None;
+        }
+        if field_path.is_empty() {
+            return Ok(Some(root_actor));
+        }
+        if let Some(field_actor) = create_field_path_alias_actor_with_registry(
+            reg.as_deref_mut(),
+            alias_actor_context,
+            root_actor,
+            field_path,
+        ) {
+            return Ok(Some(field_actor));
+        }
+        return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+    }
+
+    if let static_expression::Expression::LinkSetter { alias } = expression.node.clone() {
+        let actor = build_link_setter_actor_with_runtime_registry(
+            reg,
+            alias,
+            expression.span,
+            expression_persistence,
+            expression_persistence_id,
+            ctx,
+        )?;
+        return Ok(Some(actor));
+    }
+
+    if let static_expression::Expression::FunctionCall { path, arguments } = expression.node.clone()
+    {
+        if !expression_supports_runtime_local_direct_eval_with_registry(
+            &expression,
+            ctx.function_registry_snapshot.as_ref(),
+            ctx.current_module.as_deref(),
+        ) {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        }
+
+        let mut evaluated_args = Vec::new();
+        for argument in arguments {
+            let Some(value_expr) = argument.node.value else {
+                return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+            };
+            let Some(actor) = evaluate_expression_with_runtime_registry(
+                reg.as_deref_mut(),
+                value_expr,
+                ctx.clone(),
+            )?
+            else {
+                return Ok(None);
+            };
+            evaluated_args.push((argument.node.name.to_string(), actor));
+        }
+
+        let path = path.iter().map(|part| part.to_string()).collect::<Vec<_>>();
+        let registry_snapshot = ctx.function_registry_snapshot.clone();
+        let empty_registry = HashMap::new();
+        let function_registry = registry_snapshot.as_deref().unwrap_or(&empty_registry);
+
+        return call_function_with_runtime_registry(
+            reg.as_deref_mut(),
+            path,
+            evaluated_args,
+            expression.span,
+            expression_persistence,
+            expression_persistence_id,
+            ctx,
+            false,
+            function_registry,
+        );
+    }
+
+    if let static_expression::Expression::TextLiteral { parts, .. } = &expression.node {
+        let (persistence, persistence_id) = match expression.persistence {
+            Some(p) => (Some(p), p.id),
+            None => (None, PersistenceId::new()),
+        };
+        let actor = build_text_literal_actor_with_runtime_registry(
+            reg,
+            parts.clone(),
+            expression.span,
+            persistence,
+            persistence_id,
+            ctx,
+        )?;
+        return Ok(Some(actor));
+    }
+
+    if let static_expression::Expression::Latest { inputs } = expression.node.clone() {
+        let persistence = expression.persistence.clone();
+        let persistence_id = persistence
+            .as_ref()
+            .map(|p| p.id)
+            .unwrap_or_else(PersistenceId::new);
+        let mut evaluated_inputs = Vec::new();
+        for input in inputs {
+            if let Some(actor) =
+                evaluate_expression_with_runtime_registry(reg.as_deref_mut(), input, ctx.clone())?
+            {
+                evaluated_inputs.push(actor);
+            }
+        }
+        let actor = match reg.as_deref_mut() {
+            Some(reg) => LatestCombinator::new_arc_value_actor_with_registry(
+                reg,
+                ConstructInfo::new(
+                    format!("PersistenceId: {persistence_id}"),
+                    persistence,
+                    format!("{}; LATEST {{..}}", expression.span),
+                ),
+                ctx.construct_context,
+                ctx.actor_context,
+                evaluated_inputs,
+            ),
+            None => LatestCombinator::new_arc_value_actor(
+                ConstructInfo::new(
+                    format!("PersistenceId: {persistence_id}"),
+                    expression.persistence,
+                    format!("{}; LATEST {{..}}", expression.span),
+                ),
+                ctx.construct_context,
+                ctx.actor_context,
+                evaluated_inputs,
+            ),
+        };
+        return Ok(Some(actor));
+    }
+
+    if let static_expression::Expression::ArithmeticOperator(op) = expression.node.clone() {
+        let (operand_a_expr, operand_b_expr, kind) = match op {
+            static_expression::ArithmeticOperator::Negate { operand } => {
+                let Some(operand) = evaluate_expression_with_runtime_registry(
+                    reg.as_deref_mut(),
+                    *operand,
+                    ctx.clone(),
+                )?
+                else {
+                    return Ok(None);
+                };
+
+                let neg_one_value = Number::new_value(
+                    ConstructInfo::new("neg_one", None, "-1 constant"),
+                    ctx.construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    -1.0,
+                );
+                let neg_one_actor = match reg.as_deref_mut() {
+                    Some(reg) => create_constant_actor_with_registry(
+                        reg,
+                        PersistenceId::new(),
+                        neg_one_value,
+                        ctx.actor_context.scope_id(),
+                    ),
+                    None => create_constant_actor(
+                        PersistenceId::new(),
+                        neg_one_value,
+                        ctx.actor_context.scope_id(),
+                    ),
+                };
+
+                let actor = BinaryOperatorCombinator::try_create_direct_state_actor_with_registry(
+                    reg.as_deref_mut(),
+                    ctx.construct_context,
+                    ctx.actor_context,
+                    operand,
+                    neg_one_actor,
+                    Rc::new(move |a, b, ctx, key| {
+                        let Value::Number(a, _) = a else {
+                            panic!("Expected Number for runtime-local arithmetic negate operand");
+                        };
+                        let Value::Number(b, _) = b else {
+                            panic!("Expected Number for runtime-local arithmetic negate constant");
+                        };
+                        Number::new_value(
+                            ConstructInfo::new("arithmetic_result", None, "negate result"),
+                            ctx,
+                            key,
+                            a.number() * b.number(),
+                        )
+                    }),
+                )
+                .ok_or_else(|| {
+                    "runtime-local negate fallback still requires direct-state operands".to_string()
+                })?;
+                return Ok(Some(actor));
+            }
+            static_expression::ArithmeticOperator::Add {
+                operand_a,
+                operand_b,
+            } => (*operand_a, *operand_b, BinaryOpKind::Add),
+            static_expression::ArithmeticOperator::Subtract {
+                operand_a,
+                operand_b,
+            } => (*operand_a, *operand_b, BinaryOpKind::Subtract),
+            static_expression::ArithmeticOperator::Multiply {
+                operand_a,
+                operand_b,
+            } => (*operand_a, *operand_b, BinaryOpKind::Multiply),
+            static_expression::ArithmeticOperator::Divide {
+                operand_a,
+                operand_b,
+            } => (*operand_a, *operand_b, BinaryOpKind::Divide),
+        };
+
+        let Some(operand_a) = evaluate_expression_with_runtime_registry(
+            reg.as_deref_mut(),
+            operand_a_expr,
+            ctx.clone(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(operand_b) = evaluate_expression_with_runtime_registry(
+            reg.as_deref_mut(),
+            operand_b_expr,
+            ctx.clone(),
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let number = |value: &Value| match value {
+            Value::Number(n, _) => n.number(),
+            other => panic!(
+                "Expected Number for runtime-local arithmetic operation, got {}",
+                other.construct_info()
+            ),
+        };
+
+        let actor = match kind {
+            BinaryOpKind::Add => {
+                BinaryOperatorCombinator::try_create_direct_state_actor_with_registry(
+                    reg.as_deref_mut(),
+                    ctx.construct_context,
+                    ctx.actor_context,
+                    operand_a,
+                    operand_b,
+                    Rc::new(move |a, b, ctx, key| {
+                        Number::new_value(
+                            ConstructInfo::new("arithmetic_result", None, "+ result"),
+                            ctx,
+                            key,
+                            number(&a) + number(&b),
+                        )
+                    }),
+                )
+            }
+            BinaryOpKind::Subtract => {
+                BinaryOperatorCombinator::try_create_direct_state_actor_with_registry(
+                    reg.as_deref_mut(),
+                    ctx.construct_context,
+                    ctx.actor_context,
+                    operand_a,
+                    operand_b,
+                    Rc::new(move |a, b, ctx, key| {
+                        Number::new_value(
+                            ConstructInfo::new("arithmetic_result", None, "- result"),
+                            ctx,
+                            key,
+                            number(&a) - number(&b),
+                        )
+                    }),
+                )
+            }
+            BinaryOpKind::Multiply => {
+                BinaryOperatorCombinator::try_create_direct_state_actor_with_registry(
+                    reg.as_deref_mut(),
+                    ctx.construct_context,
+                    ctx.actor_context,
+                    operand_a,
+                    operand_b,
+                    Rc::new(move |a, b, ctx, key| {
+                        Number::new_value(
+                            ConstructInfo::new("arithmetic_result", None, "* result"),
+                            ctx,
+                            key,
+                            number(&a) * number(&b),
+                        )
+                    }),
+                )
+            }
+            BinaryOpKind::Divide => {
+                BinaryOperatorCombinator::try_create_direct_state_actor_with_registry(
+                    reg.as_deref_mut(),
+                    ctx.construct_context,
+                    ctx.actor_context,
+                    operand_a,
+                    operand_b,
+                    Rc::new(move |a, b, ctx, key| {
+                        Number::new_value(
+                            ConstructInfo::new("arithmetic_result", None, "/ result"),
+                            ctx,
+                            key,
+                            number(&a) / number(&b),
+                        )
+                    }),
+                )
+            }
+            _ => unreachable!(),
+        }
+        .ok_or_else(|| {
+            "runtime-local arithmetic fallback still requires direct-state operands".to_string()
+        })?;
+        return Ok(Some(actor));
+    }
+
+    if let static_expression::Expression::Comparator(cmp) = expression.node.clone() {
+        let (operand_a_expr, operand_b_expr, kind, construct_label) = match cmp {
+            static_expression::Comparator::Equal {
+                operand_a,
+                operand_b,
+            } => (*operand_a, *operand_b, BinaryOpKind::Equal, "== result"),
+            static_expression::Comparator::NotEqual {
+                operand_a,
+                operand_b,
+            } => (*operand_a, *operand_b, BinaryOpKind::NotEqual, "=/= result"),
+            static_expression::Comparator::Greater {
+                operand_a,
+                operand_b,
+            } => (*operand_a, *operand_b, BinaryOpKind::Greater, "> result"),
+            static_expression::Comparator::GreaterOrEqual {
+                operand_a,
+                operand_b,
+            } => (
+                *operand_a,
+                *operand_b,
+                BinaryOpKind::GreaterOrEqual,
+                ">= result",
+            ),
+            static_expression::Comparator::Less {
+                operand_a,
+                operand_b,
+            } => (*operand_a, *operand_b, BinaryOpKind::Less, "< result"),
+            static_expression::Comparator::LessOrEqual {
+                operand_a,
+                operand_b,
+            } => (
+                *operand_a,
+                *operand_b,
+                BinaryOpKind::LessOrEqual,
+                "<= result",
+            ),
+        };
+
+        let Some(operand_a) = evaluate_expression_with_runtime_registry(
+            reg.as_deref_mut(),
+            operand_a_expr,
+            ctx.clone(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(operand_b) = evaluate_expression_with_runtime_registry(
+            reg.as_deref_mut(),
+            operand_b_expr,
+            ctx.clone(),
+        )?
+        else {
+            return Ok(None);
+        };
+
+        if matches!(kind, BinaryOpKind::Equal | BinaryOpKind::NotEqual) {
+            let can_use_scalar_direct_state = operand_a
+                .current_value()
+                .ok()
+                .zip(operand_b.current_value().ok())
+                .and_then(|(a, b)| try_values_equal_now(&a, &b))
+                .is_some();
+
+            if can_use_scalar_direct_state {
+                let actor = BinaryOperatorCombinator::try_create_direct_state_actor_with_registry(
+                    reg.as_deref_mut(),
+                    ctx.construct_context,
+                    ctx.actor_context,
+                    operand_a,
+                    operand_b,
+                    Rc::new(move |a, b, ctx, key| {
+                        let result = try_values_equal_now(&a, &b).expect(
+                            "scalar equality direct-state actor should stay on scalar values",
+                        );
+                        let result = if matches!(kind, BinaryOpKind::NotEqual) {
+                            !result
+                        } else {
+                            result
+                        };
+                        Tag::new_value(
+                            ConstructInfo::new("comparator_result", None, construct_label),
+                            ctx,
+                            key,
+                            if result { "True" } else { "False" },
+                        )
+                    }),
+                )
+                .ok_or_else(|| {
+                    "runtime-local equality fallback still requires direct-state operands"
+                        .to_string()
+                })?;
+                return Ok(Some(actor));
+            }
+
+            return Ok(Some(create_binary_op_actor(
+                kind,
+                ctx.construct_context,
+                ctx.actor_context,
+                operand_a,
+                operand_b,
+            )));
+        }
+
+        let actor = BinaryOperatorCombinator::try_create_direct_state_actor_with_registry(
+            reg.as_deref_mut(),
+            ctx.construct_context,
+            ctx.actor_context,
+            operand_a,
+            operand_b,
+            Rc::new(move |a, b, ctx, key| {
+                let result = compare_values(&a, &b)
+                    .map(|ordering| match kind {
+                        BinaryOpKind::Greater => ordering.is_gt(),
+                        BinaryOpKind::GreaterOrEqual => ordering.is_ge(),
+                        BinaryOpKind::Less => ordering.is_lt(),
+                        BinaryOpKind::LessOrEqual => ordering.is_le(),
+                        _ => unreachable!(),
+                    })
+                    .unwrap_or(false);
+                Tag::new_value(
+                    ConstructInfo::new("comparator_result", None, construct_label),
+                    ctx,
+                    key,
+                    if result { "True" } else { "False" },
+                )
+            }),
+        )
+        .ok_or_else(|| {
+            "runtime-local comparator fallback still requires direct-state operands".to_string()
+        })?;
+        return Ok(Some(actor));
+    }
+
+    if let static_expression::Expression::FieldAccess { path } = expression.node.clone() {
+        let Some(piped) = ctx.actor_context.piped.clone() else {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        };
+        let path_strings = path.iter().map(|part| part.to_string()).collect::<Vec<_>>();
+        let mut alias_actor_context = ctx.actor_context.clone();
+        alias_actor_context.subscription_after_seq = None;
+        if let Some(field_actor) = create_field_path_alias_actor_with_registry(
+            reg.as_deref_mut(),
+            alias_actor_context,
+            piped,
+            path_strings,
+        ) {
+            return Ok(Some(field_actor));
+        }
+        return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+    }
+
+    if let static_expression::Expression::PostfixFieldAccess { expr, field } =
+        expression.node.clone()
+    {
+        let Some(base_actor) =
+            evaluate_expression_with_runtime_registry(reg.as_deref_mut(), *expr, ctx.clone())?
+        else {
+            return Ok(None);
+        };
+
+        let mut alias_actor_context = ctx.actor_context.clone();
+        alias_actor_context.subscription_after_seq = None;
+        if let Some(field_actor) = create_field_path_alias_actor_with_registry(
+            reg.as_deref_mut(),
+            alias_actor_context,
+            base_actor,
+            vec![field.to_string()],
+        ) {
+            return Ok(Some(field_actor));
+        }
+
+        return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+    }
+
+    if let static_expression::Expression::Pipe { from, to } = expression.node.clone() {
+        if !expression_supports_runtime_local_direct_eval_with_registry(
+            &expression,
+            ctx.function_registry_snapshot.as_ref(),
+            ctx.current_module.as_deref(),
+        ) {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        }
+        let Some(from_actor) =
+            evaluate_expression_with_runtime_registry(reg.as_deref_mut(), *from, ctx.clone())?
+        else {
+            return Ok(None);
+        };
+        let piped_ctx = ctx.with_piped(from_actor);
+        if let static_expression::Expression::FunctionCall { path, arguments } = &to.node {
+            if function_call_supports_runtime_local_direct_eval(path, arguments, false) {
+                let mut evaluated_args =
+                    vec![piped_ctx.actor_context.piped.clone().ok_or_else(|| {
+                        "runtime-local piped function call lost piped actor".to_string()
+                    })?];
+                for argument in arguments {
+                    let Some(value_expr) = argument.node.value.clone() else {
+                        return evaluate_expression_stack_safe_with_runtime_registry(
+                            reg, expression, ctx,
+                        );
+                    };
+                    let actor = evaluate_expression_with_runtime_registry(
+                        reg.as_deref_mut(),
+                        value_expr,
+                        piped_ctx.clone(),
+                    )?
+                    .ok_or_else(|| {
+                        "runtime-local piped function call argument resolved to SKIP".to_string()
+                    })?;
+                    evaluated_args.push(actor);
+                }
+
+                return try_create_runtime_local_direct_builtin_function_actor(
+                    reg.as_deref_mut(),
+                    path,
+                    Arc::new(evaluated_args),
+                    to.persistence
+                        .as_ref()
+                        .map(|p| p.id)
+                        .unwrap_or_else(PersistenceId::new),
+                    piped_ctx.construct_context,
+                    ActorContext {
+                        output_valve_signal: piped_ctx.actor_context.output_valve_signal,
+                        piped: None,
+                        passed: piped_ctx.actor_context.passed,
+                        parameters: piped_ctx.actor_context.parameters,
+                        sequential_processing: piped_ctx.actor_context.sequential_processing,
+                        backpressure_permit: piped_ctx.actor_context.backpressure_permit,
+                        hold_state_update_callback: None,
+                        use_lazy_actors: piped_ctx.actor_context.use_lazy_actors,
+                        is_snapshot_context: false,
+                        object_locals: Arc::new(HashMap::new()),
+                        scope: piped_ctx.actor_context.scope,
+                        subscription_scope: piped_ctx.actor_context.subscription_scope,
+                        call_recorder: piped_ctx.actor_context.call_recorder,
+                        is_restoring: piped_ctx.actor_context.is_restoring,
+                        list_append_storage_key: piped_ctx.actor_context.list_append_storage_key,
+                        recording_counter: piped_ctx.actor_context.recording_counter,
+                        subscription_after_seq: piped_ctx.actor_context.subscription_after_seq,
+                        snapshot_emission_seq: piped_ctx.actor_context.snapshot_emission_seq,
+                        registry_scope_id: piped_ctx.actor_context.registry_scope_id,
+                    },
+                );
+            }
+        }
+        return evaluate_expression_with_runtime_registry(reg.as_deref_mut(), *to, piped_ctx);
+    }
+
+    if let static_expression::Expression::Block { variables, output } = expression.node.clone() {
+        if !expression_supports_runtime_local_direct_eval_with_registry(
+            &expression,
+            ctx.function_registry_snapshot.as_ref(),
+            ctx.current_module.as_deref(),
+        ) {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        }
+
+        let mut parameters = (*ctx.actor_context.parameters).clone();
+        let mut object_locals = (*ctx.actor_context.object_locals).clone();
+
+        for variable in variables {
+            let mut variable_actor_context = ctx.actor_context.clone();
+            variable_actor_context.parameters = Arc::new(parameters.clone());
+            variable_actor_context.object_locals = Arc::new(object_locals.clone());
+            let variable_ctx = ctx.with_actor_context(variable_actor_context);
+            let Some(value_actor) = evaluate_expression_with_runtime_registry(
+                reg.as_deref_mut(),
+                variable.node.value.clone(),
+                variable_ctx,
+            )?
+            else {
+                return Ok(None);
+            };
+
+            let variable_name = variable.node.name.to_string();
+            parameters.insert(variable_name, value_actor.clone());
+            object_locals.insert(variable.span, value_actor);
+        }
+
+        let mut output_actor_context = ctx.actor_context.clone();
+        output_actor_context.parameters = Arc::new(parameters);
+        output_actor_context.object_locals = Arc::new(object_locals);
+        let output_ctx = ctx.with_actor_context(output_actor_context);
+        return evaluate_expression_with_runtime_registry(reg.as_deref_mut(), *output, output_ctx);
+    }
+
+    if let static_expression::Expression::List { items } = expression.node.clone() {
+        if !expression_supports_runtime_local_direct_eval_with_registry(
+            &expression,
+            ctx.function_registry_snapshot.as_ref(),
+            ctx.current_module.as_deref(),
+        ) {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        }
+
+        let mut evaluated_items = Vec::with_capacity(items.len());
+        for (idx, item) in items.into_iter().enumerate() {
+            let scope_id = if let Some(ref persistence) = item.persistence {
+                format!("list_item_{}_{}", idx, persistence.id.as_u128())
+            } else {
+                format!("list_item_{}_{}", idx, Ulid::new())
+            };
+            let item_ctx = EvaluationContext {
+                actor_context: ctx.actor_context.with_child_scope(&scope_id),
+                current_module: ctx.current_module.clone(),
+                ..ctx.clone()
+            };
+            let Some(item_actor) =
+                evaluate_expression_with_runtime_registry(reg.as_deref_mut(), item, item_ctx)?
+            else {
+                continue;
+            };
+            evaluated_items.push(item_actor);
+        }
+
+        let actor = match reg.as_deref_mut() {
+            Some(reg) => List::new_arc_value_actor_with_persistence_with_registry(
+                reg,
+                ConstructInfo::new(
+                    format!("PersistenceId: {expression_persistence_id}"),
+                    expression_persistence,
+                    format!("{}; LIST {{..}}", expression.span),
+                ),
+                ctx.construct_context,
+                expression_persistence_id,
+                ctx.actor_context,
+                evaluated_items,
+            ),
+            None => List::new_arc_value_actor_with_persistence(
+                ConstructInfo::new(
+                    format!("PersistenceId: {expression_persistence_id}"),
+                    expression_persistence,
+                    format!("{}; LIST {{..}}", expression.span),
+                ),
+                ctx.construct_context,
+                expression_persistence_id,
+                ctx.actor_context,
+                evaluated_items,
+            ),
+        };
+        return Ok(Some(actor));
+    }
+
+    if let static_expression::Expression::Spread { value } = expression.node.clone() {
+        if !expression_supports_runtime_local_direct_eval_with_registry(
+            &expression,
+            ctx.function_registry_snapshot.as_ref(),
+            ctx.current_module.as_deref(),
+        ) {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        }
+        return evaluate_expression_with_runtime_registry(reg, *value, ctx);
+    }
+
+    if let static_expression::Expression::Object(object) = expression.node.clone() {
+        if !expression_supports_runtime_local_direct_eval_with_registry(
+            &expression,
+            ctx.function_registry_snapshot.as_ref(),
+            ctx.current_module.as_deref(),
+        ) {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        }
+
+        return evaluate_struct_expression_with_runtime_registry(
+            reg,
+            object.variables,
+            None,
+            expression.span,
+            expression_persistence,
+            expression_persistence_id,
+            ctx,
+        );
+    }
+
+    if let static_expression::Expression::TaggedObject { tag, object } = expression.node.clone() {
+        if !expression_supports_runtime_local_direct_eval_with_registry(
+            &expression,
+            ctx.function_registry_snapshot.as_ref(),
+            ctx.current_module.as_deref(),
+        ) {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        }
+
+        return evaluate_struct_expression_with_runtime_registry(
+            reg,
+            object.variables,
+            Some(tag.to_string()),
+            expression.span,
+            expression_persistence,
+            expression_persistence_id,
+            ctx,
+        );
+    }
+
+    if let static_expression::Expression::Then { body } = expression.node.clone() {
+        if !expression_supports_runtime_local_direct_eval_with_registry(
+            &expression,
+            ctx.function_registry_snapshot.as_ref(),
+            ctx.current_module.as_deref(),
+        ) {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        }
+
+        let function_registry_snapshot = ctx
+            .function_registry_snapshot
+            .clone()
+            .unwrap_or_else(|| Arc::new(HashMap::new()));
+        let actor = build_then_actor_with_runtime_registry(
+            reg,
+            *body,
+            expression.span,
+            expression_persistence,
+            expression_persistence_id,
+            ctx,
+            function_registry_snapshot,
+        )?;
+        return Ok(Some(actor));
+    }
+
+    if let static_expression::Expression::When { arms } = expression.node.clone() {
+        if !expression_supports_runtime_local_direct_eval_with_registry(
+            &expression,
+            ctx.function_registry_snapshot.as_ref(),
+            ctx.current_module.as_deref(),
+        ) {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        }
+
+        let function_registry_snapshot = ctx
+            .function_registry_snapshot
+            .clone()
+            .unwrap_or_else(|| Arc::new(HashMap::new()));
+        let actor = build_when_actor_with_runtime_registry(
+            reg,
+            arms,
+            expression.span,
+            expression_persistence,
+            expression_persistence_id,
+            ctx,
+            function_registry_snapshot,
+        )?;
+        return Ok(Some(actor));
+    }
+
+    if let static_expression::Expression::While { arms } = expression.node.clone() {
+        if !expression_supports_runtime_local_direct_eval_with_registry(
+            &expression,
+            ctx.function_registry_snapshot.as_ref(),
+            ctx.current_module.as_deref(),
+        ) {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        }
+
+        let function_registry_snapshot = ctx
+            .function_registry_snapshot
+            .clone()
+            .unwrap_or_else(|| Arc::new(HashMap::new()));
+        let actor = build_while_actor_with_runtime_registry(
+            reg,
+            arms,
+            expression.span,
+            expression_persistence,
+            expression_persistence_id,
+            ctx,
+            function_registry_snapshot,
+        )?;
+        return Ok(Some(actor));
+    }
+
+    if let static_expression::Expression::Hold { state_param, body } = expression.node.clone() {
+        if !expression_supports_runtime_local_direct_eval_with_registry(
+            &expression,
+            ctx.function_registry_snapshot.as_ref(),
+            ctx.current_module.as_deref(),
+        ) {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        }
+
+        let Some(initial_actor) = ctx.actor_context.piped.clone() else {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        };
+        let actor = build_hold_actor_with_runtime_registry(
+            reg,
+            initial_actor,
+            state_param.to_string(),
+            *body,
+            expression.span,
+            expression_persistence,
+            expression_persistence_id,
+            ctx,
+        )?;
+        return Ok(actor);
+    }
+
+    if let static_expression::Expression::Flush { value } = expression.node.clone() {
+        if !expression_supports_runtime_local_direct_eval_with_registry(
+            &expression,
+            ctx.function_registry_snapshot.as_ref(),
+            ctx.current_module.as_deref(),
+        ) {
+            return evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx);
+        }
+
+        let Some(source_actor) =
+            evaluate_expression_with_runtime_registry(reg.as_deref_mut(), *value, ctx.clone())?
+        else {
+            return Ok(None);
+        };
+
+        let actor = try_create_runtime_local_direct_unary_builtin_actor(
+            reg.as_deref_mut(),
+            source_actor,
+            &ctx.actor_context,
+            Value::into_flushed,
+        )
+        .ok_or_else(|| {
+            "runtime-local FLUSH fallback still requires direct-state operand".to_string()
+        })?;
+        return Ok(Some(actor));
+    }
+
+    if let static_expression::Expression::Skip = expression.node {
+        return Ok(None);
+    }
+
+    evaluate_expression_stack_safe_with_runtime_registry(reg, expression, ctx)
+}
+
 /// Schedule an expression for evaluation.
 /// This converts an expression into work items and pushes them onto the queue.
 /// For expressions with sub-expressions, it schedules the sub-expressions first,
@@ -1068,6 +4131,16 @@ fn schedule_expression(
     expression: static_expression::Spanned<static_expression::Expression>,
     ctx: EvaluationContext,
     result_slot: SlotId,
+) -> Result<(), String> {
+    schedule_expression_with_runtime_registry(state, expression, ctx, result_slot, None)
+}
+
+fn schedule_expression_with_runtime_registry(
+    state: &mut EvaluationState,
+    expression: static_expression::Spanned<static_expression::Expression>,
+    ctx: EvaluationContext,
+    result_slot: SlotId,
+    mut reg: Option<&mut ActorRegistry>,
 ) -> Result<(), String> {
     let static_expression::Spanned {
         span,
@@ -1190,7 +4263,13 @@ fn schedule_expression(
                     current_module: ctx.current_module.clone(),
                     ..ctx.clone()
                 };
-                schedule_expression(state, item, item_ctx, slot)?;
+                schedule_expression_with_runtime_registry(
+                    state,
+                    item,
+                    item_ctx,
+                    slot,
+                    reg.as_deref_mut(),
+                )?;
             }
         }
 
@@ -1211,7 +4290,14 @@ fn schedule_expression(
         static_expression::Expression::Alias(alias) => {
             // For now, fall back to the recursive function for complex alias handling
             // This will be migrated in a future phase
-            let actor = evaluate_alias_immediate(alias, span, persistence, persistence_id, ctx)?;
+            let actor = evaluate_alias_immediate_with_runtime_registry(
+                reg.as_deref_mut(),
+                alias,
+                span,
+                persistence,
+                persistence_id,
+                ctx,
+            )?;
             state.store(result_slot, actor);
         }
 
@@ -1223,7 +4309,8 @@ fn schedule_expression(
             // THEN creates an actor that evaluates body at runtime for each piped value
             // We can build it immediately since the body is evaluated lazily
             let registry_snapshot = state.merged_registry_snapshot(&ctx);
-            let actor = build_then_actor(
+            let actor = build_then_actor_with_runtime_registry(
+                reg.as_deref_mut(),
                 *body,
                 span,
                 persistence,
@@ -1236,7 +4323,8 @@ fn schedule_expression(
 
         static_expression::Expression::When { arms } => {
             let registry_snapshot = state.merged_registry_snapshot(&ctx);
-            let actor = build_when_actor(
+            let actor = build_when_actor_with_runtime_registry(
+                reg.as_deref_mut(),
                 arms,
                 span,
                 persistence,
@@ -1249,7 +4337,8 @@ fn schedule_expression(
 
         static_expression::Expression::While { arms } => {
             let registry_snapshot = state.merged_registry_snapshot(&ctx);
-            let actor = build_while_actor(
+            let actor = build_while_actor_with_runtime_registry(
+                reg.as_deref_mut(),
                 arms,
                 span,
                 persistence,
@@ -1329,7 +4418,13 @@ fn schedule_expression(
             }
 
             // Schedule first step LAST (will be processed first due to LIFO)
-            schedule_expression(state, first_step, ctx.clone(), first_slot)?;
+            schedule_expression_with_runtime_registry(
+                state,
+                first_step,
+                ctx.clone(),
+                first_slot,
+                reg.as_deref_mut(),
+            )?;
         }
 
         // ============================================================
@@ -1359,7 +4454,13 @@ fn schedule_expression(
             // Schedule output expression second - these work items will be processed AFTER BuildObject
             // This is important because the output may reference block variables (like `state.iteration`)
             // which need to be registered with the reference_connector by BuildObject first
-            schedule_expression(state, *output, ctx_with_locals.clone(), output_expr_slot)?;
+            schedule_expression_with_runtime_registry(
+                state,
+                *output,
+                ctx_with_locals.clone(),
+                output_expr_slot,
+                reg.as_deref_mut(),
+            )?;
 
             // Push BuildObject third - will be processed AFTER variable expressions but BEFORE output
             // This registers variables with reference_connector so output can resolve them
@@ -1375,7 +4476,12 @@ fn schedule_expression(
             // (LIFO), matching object-field behavior. This is required when a sibling block
             // variable is consumed through nested function-call arguments, e.g.
             // `display_value: compute_value(formula_text: formula_text)`.
-            schedule_struct_fields(state, vars_to_schedule, ctx_with_locals)?;
+            schedule_struct_fields_with_runtime_registry(
+                state,
+                vars_to_schedule,
+                ctx_with_locals,
+                reg.as_deref_mut(),
+            )?;
         }
 
         // ============================================================
@@ -1401,7 +4507,12 @@ fn schedule_expression(
             // This ensures that when `count: prev + 1` is evaluated, the `prev` field's forwarding
             // actor already has its value, because `prev: state.count` was processed first.
 
-            schedule_struct_fields(state, vars_to_schedule, ctx_with_locals)?;
+            schedule_struct_fields_with_runtime_registry(
+                state,
+                vars_to_schedule,
+                ctx_with_locals,
+                reg.as_deref_mut(),
+            )?;
         }
 
         static_expression::Expression::TaggedObject { tag, object } => {
@@ -1426,7 +4537,12 @@ fn schedule_expression(
             // This ensures that when `count: prev + 1` is evaluated, the `prev` field's forwarding
             // actor already has its value, because `prev: state.count` was processed first.
 
-            schedule_struct_fields(state, vars_to_schedule, ctx_with_locals)?;
+            schedule_struct_fields_with_runtime_registry(
+                state,
+                vars_to_schedule,
+                ctx_with_locals,
+                reg.as_deref_mut(),
+            )?;
         }
 
         // ============================================================
@@ -1444,7 +4560,13 @@ fn schedule_expression(
             });
 
             for (item, slot) in inputs.into_iter().zip(item_slots.into_iter()) {
-                schedule_expression(state, item, ctx.clone(), slot)?;
+                schedule_expression_with_runtime_registry(
+                    state,
+                    item,
+                    ctx.clone(),
+                    slot,
+                    reg.as_deref_mut(),
+                )?;
             }
         }
 
@@ -1536,8 +4658,11 @@ fn schedule_expression(
                             arg_locals.insert(arg_span, forwarding_actor.clone());
                             // Also register with ReferenceConnector for backward compatibility
                             if let Some(ref_connector) = ctx.try_reference_connector() {
-                                ref_connector
-                                    .register_referenceable(arg_span, forwarding_actor.clone());
+                                ref_connector.register_referenceable_with_registry(
+                                    reg.as_deref_mut(),
+                                    arg_span,
+                                    forwarding_actor.clone(),
+                                );
                             }
                             forwarding_connections.push((arg_slot, forwarding_actor.clone()));
                         }
@@ -1644,11 +4769,12 @@ fn schedule_expression(
                     // Schedule argument expressions last (will be processed first due to LIFO)
                     // Use ctx_with_arg_locals so subsequent args can resolve references to earlier args
                     for (arg_expr, arg_slot) in args_to_schedule {
-                        schedule_expression(
+                        schedule_expression_with_runtime_registry(
                             state,
                             arg_expr,
                             ctx_with_arg_locals.clone(),
                             arg_slot,
+                            reg.as_deref_mut(),
                         )?;
                     }
                 }
@@ -1730,7 +4856,13 @@ fn schedule_expression(
             });
 
             // Schedule inner expression LAST (LIFO - processed first)
-            schedule_expression(state, *expr, ctx, inner_slot)?;
+            schedule_expression_with_runtime_registry(
+                state,
+                *expr,
+                ctx,
+                inner_slot,
+                reg.as_deref_mut(),
+            )?;
         }
 
         // ============================================================
@@ -1844,7 +4976,13 @@ fn schedule_arithmetic_op(
             state.store(neg_one_slot, neg_one);
 
             // Schedule operand
-            schedule_expression(state, *operand, ctx.clone(), operand_slot)?;
+            schedule_expression_with_runtime_registry(
+                state,
+                *operand,
+                ctx.clone(),
+                operand_slot,
+                None,
+            )?;
 
             // Push multiply operation
             state.push(WorkItem::BinaryOp {
@@ -1964,6 +5102,30 @@ fn schedule_binary_op(
     ctx: EvaluationContext,
     result_slot: SlotId,
 ) -> Result<(), String> {
+    schedule_binary_op_with_runtime_registry(
+        state,
+        op,
+        operand_a,
+        operand_b,
+        span,
+        persistence,
+        ctx,
+        result_slot,
+        None,
+    )
+}
+
+fn schedule_binary_op_with_runtime_registry(
+    state: &mut EvaluationState,
+    op: BinaryOpKind,
+    operand_a: static_expression::Spanned<static_expression::Expression>,
+    operand_b: static_expression::Spanned<static_expression::Expression>,
+    span: Span,
+    persistence: Option<Persistence>,
+    ctx: EvaluationContext,
+    result_slot: SlotId,
+    mut reg: Option<&mut ActorRegistry>,
+) -> Result<(), String> {
     let a_slot = state.alloc_slot();
     let b_slot = state.alloc_slot();
 
@@ -1979,14 +5141,24 @@ fn schedule_binary_op(
     });
 
     // Schedule operands (pushed last = processed first)
-    schedule_expression(state, operand_a, ctx.clone(), a_slot)?;
-    schedule_expression(state, operand_b, ctx, b_slot)?;
+    schedule_expression_with_runtime_registry(
+        state,
+        operand_a,
+        ctx.clone(),
+        a_slot,
+        reg.as_deref_mut(),
+    )?;
+    schedule_expression_with_runtime_registry(state, operand_b, ctx, b_slot, reg.as_deref_mut())?;
 
     Ok(())
 }
 
 /// Process a single work item from the queue.
-fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), String> {
+fn process_work_item(
+    state: &mut EvaluationState,
+    item: WorkItem,
+    mut reg: Option<&mut ActorRegistry>,
+) -> Result<(), String> {
     match item {
         WorkItem::Evaluate {
             expr,
@@ -1994,7 +5166,13 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
             result_slot,
         } => {
             // This delegates back to schedule_expression
-            schedule_expression(state, expr, ctx, result_slot)?;
+            schedule_expression_with_runtime_registry(
+                state,
+                expr,
+                ctx,
+                result_slot,
+                reg.as_deref_mut(),
+            )?;
         }
 
         WorkItem::BinaryOp {
@@ -2064,9 +5242,68 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 spread_actors,
             } = resolve_struct_variables(&variable_data, state, &ctx);
 
-            if spread_actors.is_empty() {
-                // No spreads — use existing sync path
-                let actor = Object::new_arc_value_actor(
+            let actor = if let Some(reg) = reg.as_deref_mut() {
+                {
+                    if spread_actors.is_empty() {
+                        Object::new_arc_value_actor_with_registry(
+                            Some(reg),
+                            ConstructInfo::new(
+                                format!("PersistenceId: {persistence_id}"),
+                                persistence,
+                                format!("{span}; Object {{..}}"),
+                            ),
+                            ctx.construct_context,
+                            persistence_id,
+                            ctx.actor_context,
+                            variables,
+                        )
+                    } else {
+                        let object_construct_info = ConstructInfo::new(
+                            format!("PersistenceId: {persistence_id}; spread-merged Object"),
+                            persistence.clone(),
+                            format!("{span}; Object {{..}} (spread)"),
+                        );
+                        if let Some(merged_variables) = try_resolve_spread_struct_variables_now(
+                            &spread_actors,
+                            variables.clone(),
+                        ) {
+                            Object::new_arc_value_actor_with_registry(
+                                Some(reg),
+                                object_construct_info,
+                                ctx.construct_context,
+                                persistence_id,
+                                ctx.actor_context,
+                                merged_variables,
+                            )
+                        } else {
+                            let construct_context = ctx.construct_context.clone();
+                            let persistence_for_actor = persistence.clone();
+                            create_waiting_spread_struct_actor_with_registry(
+                                Some(reg),
+                                spread_actors,
+                                variables,
+                                persistence_id,
+                                ctx.actor_context.scope_id(),
+                                move |merged_variables| {
+                                    Object::new_value(
+                                        ConstructInfo::new(
+                                            format!(
+                                                "PersistenceId: {persistence_id}; spread-merged Object"
+                                            ),
+                                            persistence_for_actor.clone(),
+                                            format!("{span}; Object {{..}} (spread)"),
+                                        ),
+                                        construct_context.clone(),
+                                        persistence_id,
+                                        merged_variables,
+                                    )
+                                },
+                            )
+                        }
+                    }
+                }
+            } else if spread_actors.is_empty() {
+                Object::new_arc_value_actor(
                     ConstructInfo::new(
                         format!("PersistenceId: {persistence_id}"),
                         persistence,
@@ -2076,12 +5313,8 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                     persistence_id,
                     ctx.actor_context,
                     variables,
-                );
-                state.store(result_slot, actor);
+                )
             } else {
-                // Has spreads — create async stream that awaits spread values
-                // and merges their variables with the explicit ones.
-                // Spread variables come first so explicit fields override via rposition lookup.
                 let object_construct_info = ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}; spread-merged Object"),
                     persistence.clone(),
@@ -2090,31 +5323,40 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 if let Some(merged_variables) =
                     try_resolve_spread_struct_variables_now(&spread_actors, variables.clone())
                 {
-                    let actor = Object::new_arc_value_actor(
+                    Object::new_arc_value_actor(
                         object_construct_info,
                         ctx.construct_context,
                         persistence_id,
                         ctx.actor_context,
                         merged_variables,
-                    );
-                    state.store(result_slot, actor);
+                    )
                 } else {
                     let construct_context = ctx.construct_context.clone();
-                    let scope_id = ctx.actor_context.scope_id();
-
-                    let merge_future = async move {
-                        Object::new_value(
-                            object_construct_info,
-                            construct_context,
-                            persistence_id,
-                            resolve_spread_struct_variables(spread_actors, variables).await,
-                        )
-                    };
-
-                    let actor = create_actor_from_future(merge_future, persistence_id, scope_id);
-                    state.store(result_slot, actor);
+                    let persistence_for_actor = persistence.clone();
+                    create_waiting_spread_struct_actor_with_registry(
+                        None,
+                        spread_actors,
+                        variables,
+                        persistence_id,
+                        ctx.actor_context.scope_id(),
+                        move |merged_variables| {
+                            Object::new_value(
+                                ConstructInfo::new(
+                                    format!(
+                                        "PersistenceId: {persistence_id}; spread-merged Object"
+                                    ),
+                                    persistence_for_actor.clone(),
+                                    format!("{span}; Object {{..}} (spread)"),
+                                ),
+                                construct_context.clone(),
+                                persistence_id,
+                                merged_variables,
+                            )
+                        },
+                    )
                 }
-            }
+            };
+            state.store(result_slot, actor);
         }
 
         WorkItem::BuildTaggedObject {
@@ -2134,9 +5376,72 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 spread_actors,
             } = resolve_struct_variables(&variable_data, state, &ctx);
 
-            if spread_actors.is_empty() {
-                // No spreads — use existing sync path
-                let actor = TaggedObject::new_arc_value_actor(
+            let actor = if let Some(reg) = reg.as_deref_mut() {
+                {
+                    if spread_actors.is_empty() {
+                        TaggedObject::new_arc_value_actor_with_registry(
+                            Some(reg),
+                            ConstructInfo::new(
+                                format!("PersistenceId: {persistence_id}"),
+                                persistence,
+                                format!("{span}; {} {{..}}", tag),
+                            ),
+                            ctx.construct_context,
+                            persistence_id,
+                            ctx.actor_context,
+                            tag,
+                            variables,
+                        )
+                    } else {
+                        let object_construct_info = ConstructInfo::new(
+                            format!("PersistenceId: {persistence_id}; spread-merged TaggedObject"),
+                            persistence.clone(),
+                            format!("{span}; {} {{..}} (spread)", tag),
+                        );
+                        if let Some(merged_variables) = try_resolve_spread_struct_variables_now(
+                            &spread_actors,
+                            variables.clone(),
+                        ) {
+                            TaggedObject::new_arc_value_actor_with_registry(
+                                Some(reg),
+                                object_construct_info,
+                                ctx.construct_context,
+                                persistence_id,
+                                ctx.actor_context,
+                                tag,
+                                merged_variables,
+                            )
+                        } else {
+                            let construct_context = ctx.construct_context.clone();
+                            let persistence_for_actor = persistence.clone();
+                            let tag_for_actor = tag.clone();
+                            create_waiting_spread_struct_actor_with_registry(
+                                Some(reg),
+                                spread_actors,
+                                variables,
+                                persistence_id,
+                                ctx.actor_context.scope_id(),
+                                move |merged_variables| {
+                                    TaggedObject::new_value(
+                                        ConstructInfo::new(
+                                            format!(
+                                                "PersistenceId: {persistence_id}; spread-merged TaggedObject"
+                                            ),
+                                            persistence_for_actor.clone(),
+                                            format!("{span}; {} {{..}} (spread)", tag_for_actor),
+                                        ),
+                                        construct_context.clone(),
+                                        persistence_id,
+                                        tag_for_actor.clone(),
+                                        merged_variables,
+                                    )
+                                },
+                            )
+                        }
+                    }
+                }
+            } else if spread_actors.is_empty() {
+                TaggedObject::new_arc_value_actor(
                     ConstructInfo::new(
                         format!("PersistenceId: {persistence_id}"),
                         persistence,
@@ -2147,10 +5452,8 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                     ctx.actor_context,
                     tag,
                     variables,
-                );
-                state.store(result_slot, actor);
+                )
             } else {
-                // Has spreads — async merge (same as BuildObject spread path)
                 let object_construct_info = ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}; spread-merged TaggedObject"),
                     persistence.clone(),
@@ -2159,33 +5462,43 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 if let Some(merged_variables) =
                     try_resolve_spread_struct_variables_now(&spread_actors, variables.clone())
                 {
-                    let actor = TaggedObject::new_arc_value_actor(
+                    TaggedObject::new_arc_value_actor(
                         object_construct_info,
                         ctx.construct_context,
                         persistence_id,
                         ctx.actor_context,
                         tag,
                         merged_variables,
-                    );
-                    state.store(result_slot, actor);
+                    )
                 } else {
                     let construct_context = ctx.construct_context.clone();
-                    let scope_id = ctx.actor_context.scope_id();
-
-                    let merge_future = async move {
-                        TaggedObject::new_value(
-                            object_construct_info,
-                            construct_context,
-                            persistence_id,
-                            tag,
-                            resolve_spread_struct_variables(spread_actors, variables).await,
-                        )
-                    };
-
-                    let actor = create_actor_from_future(merge_future, persistence_id, scope_id);
-                    state.store(result_slot, actor);
+                    let persistence_for_actor = persistence.clone();
+                    let tag_for_actor = tag.clone();
+                    create_waiting_spread_struct_actor_with_registry(
+                        None,
+                        spread_actors,
+                        variables,
+                        persistence_id,
+                        ctx.actor_context.scope_id(),
+                        move |merged_variables| {
+                            TaggedObject::new_value(
+                                ConstructInfo::new(
+                                    format!(
+                                        "PersistenceId: {persistence_id}; spread-merged TaggedObject"
+                                    ),
+                                    persistence_for_actor.clone(),
+                                    format!("{span}; {} {{..}} (spread)", tag_for_actor),
+                                ),
+                                construct_context.clone(),
+                                persistence_id,
+                                tag_for_actor.clone(),
+                                merged_variables,
+                            )
+                        },
+                    )
                 }
-            }
+            };
+            state.store(result_slot, actor);
         }
 
         WorkItem::BuildLatest {
@@ -2231,7 +5544,8 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 .expect("persistence should be set by resolver")
                 .id;
             let registry_snapshot = state.merged_registry_snapshot(&ctx);
-            let actor = build_then_actor(
+            let actor = build_then_actor_with_runtime_registry(
+                reg.as_deref_mut(),
                 *body,
                 span,
                 persistence,
@@ -2255,7 +5569,8 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 .expect("persistence should be set by resolver")
                 .id;
             let registry_snapshot = state.merged_registry_snapshot(&ctx);
-            let actor = build_when_actor(
+            let actor = build_when_actor_with_runtime_registry(
+                reg.as_deref_mut(),
                 arms,
                 span,
                 persistence,
@@ -2279,7 +5594,8 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 .expect("persistence should be set by resolver")
                 .id;
             let registry_snapshot = state.merged_registry_snapshot(&ctx);
-            let actor = build_while_actor(
+            let actor = build_while_actor_with_runtime_registry(
+                reg.as_deref_mut(),
                 arms,
                 span,
                 persistence,
@@ -2307,7 +5623,8 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 .as_ref()
                 .expect("persistence should be set by resolver")
                 .id;
-            if let Some(actor) = build_hold_actor(
+            let actor = build_hold_actor_with_runtime_registry(
+                reg.as_deref_mut(),
                 initial_actor,
                 state_param,
                 *body,
@@ -2315,7 +5632,8 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 persistence,
                 persistence_id,
                 ctx,
-            )? {
+            )?;
+            if let Some(actor) = actor {
                 state.store(result_slot, actor);
             }
         }
@@ -2375,7 +5693,13 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                         // Handle List binding functions specially - they have their own handling
                         // These use the piped value from the context
                         // List/append also has special handling for call recording (persistence)
-                        schedule_expression(state, expr, new_ctx, result_slot)?;
+                        schedule_expression_with_runtime_registry(
+                            state,
+                            expr,
+                            new_ctx,
+                            result_slot,
+                            reg.as_deref_mut(),
+                        )?;
                     }
                     _ => {
                         // Normal function call - pre-evaluate arguments and create CallFunction with use_piped_for_builtin: true
@@ -2430,43 +5754,57 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
 
                         // Schedule argument expressions
                         for (arg_expr, arg_slot) in args_to_schedule {
-                            schedule_expression(state, arg_expr, new_ctx.clone(), arg_slot)?;
+                            schedule_expression_with_runtime_registry(
+                                state,
+                                arg_expr,
+                                new_ctx.clone(),
+                                arg_slot,
+                                reg.as_deref_mut(),
+                            )?;
                         }
                     }
                 }
             } else if let static_expression::Expression::LinkSetter { alias } = &expr.node {
-                // Handle `value |> LINK { target }` without blocking visible pass-through
-                // on sender resolution. The source actor keeps the async link-hook
-                // sidecar alive directly in its owned actor slot.
-                let alias_for_stream = alias.node.clone();
-                let ctx_for_stream = new_ctx.clone();
-                let prev_actor_for_link_updates = prev_actor.clone();
-                let subscription_scope_for_stream =
-                    new_ctx.actor_context.subscription_scope.clone();
-                start_retained_actor_task(&prev_actor, async move {
-                    let Some(link_sender) =
-                        get_link_sender_from_alias(alias_for_stream, ctx_for_stream).await
-                    else {
-                        return;
-                    };
-
-                    let mut updates = prev_actor_for_link_updates.current_or_future_stream();
-                    while let Some(value) = updates.next().await {
-                        let is_active = subscription_scope_for_stream
-                            .as_ref()
-                            .map_or(true, |scope| !scope.is_cancelled());
-                        if !is_active {
-                            break;
+                // Handle `value |> LINK { target }` through normal actor forwarding so
+                // direct-state sources reuse the runtime queue/subscriber path instead of
+                // retaining a per-link sidecar task just to push current+future values.
+                if let Some(link_target_actor) =
+                    try_get_link_target_actor_now(alias.node.clone(), &new_ctx)
+                {
+                    match reg.as_deref_mut() {
+                        Some(reg) => {
+                            connect_forwarding_current_and_future_with_registry(
+                                Some(reg),
+                                link_target_actor,
+                                prev_actor.clone(),
+                            );
+                            drain_runtime_ready_queue_with_registry(reg);
                         }
-                        if link_sender.send(value).await.is_err() {
-                            break;
+                        None => {
+                            connect_forwarding_current_and_future(
+                                link_target_actor,
+                                prev_actor.clone(),
+                            );
                         }
                     }
-                });
+                } else {
+                    let _ = try_connect_waiting_link_target_without_scope_task_with_registry(
+                        reg.as_deref_mut(),
+                        alias.node.clone(),
+                        &new_ctx,
+                        prev_actor.clone(),
+                    );
+                }
                 state.store(result_slot, prev_actor);
             } else {
                 // For non-FunctionCall expressions, just schedule normally
-                schedule_expression(state, expr, new_ctx, result_slot)?;
+                schedule_expression_with_runtime_registry(
+                    state,
+                    expr,
+                    new_ctx,
+                    result_slot,
+                    reg.as_deref_mut(),
+                )?;
             }
         }
 
@@ -2517,7 +5855,6 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
-                        pass_through_connector: ctx.pass_through_connector,
                         function_registry_snapshot: ctx.function_registry_snapshot,
                         current_module: ctx.current_module.clone(),
                         module_loader: ctx.module_loader,
@@ -2530,7 +5867,8 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 .as_ref()
                 .expect("persistence should be set by resolver")
                 .id;
-            let actor_opt = call_function(
+            let actor_opt = call_function_with_runtime_registry(
+                reg.as_deref_mut(),
                 path.clone(),
                 args,
                 span,
@@ -2579,7 +5917,7 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                 if LOG_DEBUG {
                     zoon::println!("[DEBUG] Found source actor, wrapping with persistence");
                 }
-                let persistence_stream = create_variable_persistence_stream(
+                let persisted_actor = create_variable_persistence_actor(
                     source_actor.clone(),
                     ctx.construct_context.construct_storage.clone(),
                     persistence_id,
@@ -2587,12 +5925,6 @@ fn process_work_item(state: &mut EvaluationState, item: WorkItem) -> Result<(), 
                     ctx.construct_context.clone(),
                     ctx.actor_context.clone(),
                     value_changed,
-                );
-
-                let persisted_actor = create_actor(
-                    persistence_stream,
-                    persistence_id,
-                    ctx.actor_context.scope_id(),
                 );
 
                 state.store(result_slot, persisted_actor);
@@ -2645,6 +5977,24 @@ fn create_binary_op_actor(
 
 /// Evaluate an Alias expression immediately (for simple cases).
 fn evaluate_alias_immediate(
+    alias: static_expression::Alias,
+    _span: Span,
+    _persistence: Option<Persistence>,
+    _persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+) -> Result<ActorHandle, String> {
+    evaluate_alias_immediate_with_runtime_registry(
+        None,
+        alias,
+        _span,
+        _persistence,
+        _persistence_id,
+        ctx,
+    )
+}
+
+fn evaluate_alias_immediate_with_runtime_registry(
+    mut reg: Option<&mut ActorRegistry>,
     alias: static_expression::Alias,
     _span: Span,
     _persistence: Option<Persistence>,
@@ -2736,7 +6086,13 @@ fn evaluate_alias_immediate(
                                 false,
                             )
                         } else {
-                            (Box::pin(ref_connector.referenceable(ref_span)), false)
+                            let waiting_actor = ref_connector
+                                .referenceable_or_waiting_actor_with_registry(
+                                    reg.as_deref_mut(),
+                                    ref_span,
+                                    ctx.actor_context.scope_id(),
+                                );
+                            (Box::pin(async move { waiting_actor }), false)
                         }
                     }
                 } else if parts.len() >= 2 {
@@ -2756,11 +6112,17 @@ fn evaluate_alias_immediate(
         actor_context.subscription_after_seq = None;
     }
 
-    Ok(VariableOrArgumentReference::new_arc_value_actor(
-        actor_context,
-        alias,
-        root_value_actor,
-    ))
+    Ok(match reg {
+        Some(reg) => VariableOrArgumentReference::new_arc_value_actor_with_registry(
+            reg,
+            actor_context,
+            alias,
+            root_value_actor,
+        ),
+        None => {
+            VariableOrArgumentReference::new_arc_value_actor(actor_context, alias, root_value_actor)
+        }
+    })
 }
 
 async fn freeze_snapshot_root_actor(
@@ -2835,8 +6197,1529 @@ fn one_shot_actor_value_stream<K: 'static>(
     }
 }
 
+fn evaluate_top_level_function_call_body_with_runtime_registry(
+    reg: &mut ActorRegistry,
+    span: Span,
+    persistence: Option<Persistence>,
+    path: Vec<boon::parser::StrSlice>,
+    arguments: Vec<static_expression::Spanned<static_expression::Argument>>,
+    ctx: EvaluationContext,
+) -> Result<Option<ActorHandle>, String> {
+    let mut evaluated_args = Vec::new();
+    for argument in arguments {
+        let Some(value_expr) = argument.node.value.clone() else {
+            return Err(
+                "runtime-local direct function call body requires explicit arguments".to_string(),
+            );
+        };
+        let Some(actor) =
+            evaluate_expression_with_runtime_registry(Some(reg), value_expr, ctx.clone())?
+        else {
+            return Ok(None);
+        };
+        evaluated_args.push((argument.node.name.to_string(), actor));
+    }
+
+    let path = path.iter().map(|part| part.to_string()).collect::<Vec<_>>();
+    let persistence_id = persistence
+        .as_ref()
+        .expect("persistence should be set by resolver")
+        .id;
+    let registry_snapshot = ctx.function_registry_snapshot.clone();
+    let empty_registry = HashMap::new();
+    let function_registry = registry_snapshot.as_deref().unwrap_or(&empty_registry);
+    call_function_with_runtime_registry(
+        Some(reg),
+        path,
+        evaluated_args,
+        span,
+        persistence,
+        persistence_id,
+        ctx,
+        false,
+        function_registry,
+    )
+}
+
+fn evaluate_branch_body_actor(
+    body_expr: static_expression::Spanned<static_expression::Expression>,
+    new_ctx: EvaluationContext,
+) -> Result<Option<ActorHandle>, String> {
+    if expression_supports_runtime_local_direct_eval_with_registry(
+        &body_expr,
+        new_ctx.function_registry_snapshot.as_ref(),
+        new_ctx.current_module.as_deref(),
+    ) {
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            if let static_expression::Expression::FunctionCall { path, arguments } =
+                body_expr.node.clone()
+            {
+                evaluate_top_level_function_call_body_with_runtime_registry(
+                    &mut reg,
+                    body_expr.span,
+                    body_expr.persistence.clone(),
+                    path,
+                    arguments,
+                    new_ctx,
+                )
+            } else {
+                evaluate_expression_with_runtime_registry(Some(&mut reg), body_expr, new_ctx)
+            }
+        })
+    } else {
+        evaluate_expression(body_expr, new_ctx)
+    }
+}
+
+struct DirectWhenActiveBranch {
+    _scope_guard: ScopeGuard,
+    _registry_scope_guard: Option<ScopeDestroyGuard>,
+}
+
+fn freeze_snapshot_actor_now_best_effort(
+    mut reg: Option<&mut ActorRegistry>,
+    actor: &ActorHandle,
+    construct_context: &ConstructContext,
+    actor_context: &ActorContext,
+) -> ActorHandle {
+    if let Ok(current_value) = snapshot_current_value(actor, actor_context) {
+        if let Some(frozen_value) = try_materialize_snapshot_value_now(
+            current_value,
+            construct_context.clone(),
+            actor_context.clone(),
+        ) {
+            match reg.as_deref_mut() {
+                Some(reg) => create_constant_actor_with_registry(
+                    reg,
+                    PersistenceId::new(),
+                    frozen_value,
+                    actor_context.scope_id(),
+                ),
+                None => create_constant_actor(
+                    PersistenceId::new(),
+                    frozen_value,
+                    actor_context.scope_id(),
+                ),
+            }
+        } else {
+            actor.clone()
+        }
+    } else {
+        actor.clone()
+    }
+}
+
+fn try_values_equal_now(a: &Value, b: &Value) -> Option<bool> {
+    match (a, b) {
+        (Value::Flushed(inner_a, _), other) => try_values_equal_now(inner_a, other),
+        (other, Value::Flushed(inner_b, _)) => try_values_equal_now(other, inner_b),
+        (Value::Number(a, _), Value::Number(b, _)) => {
+            Some((a.number() - b.number()).abs() < f64::EPSILON)
+        }
+        (Value::Text(a, _), Value::Text(b, _)) => Some(a.text() == b.text()),
+        (Value::Tag(a, _), Value::Tag(b, _)) => Some(a.tag() == b.tag()),
+        _ => None,
+    }
+}
+
+fn evaluate_then_body_value_with_registry(
+    reg: &mut ActorRegistry,
+    body: &static_expression::Spanned<static_expression::Expression>,
+    value: Value,
+    ctx: &EvaluationContext,
+    function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
+) -> Option<Value> {
+    let source_emission = branch_condition_emission_seq(&value);
+    let actor_context = ctx.actor_context.clone();
+    let preserve_live_link_targets =
+        matches!(body.node, static_expression::Expression::LinkSetter { .. });
+    let value_actor = create_constant_actor_with_registry(
+        reg,
+        PersistenceId::new(),
+        value,
+        actor_context.scope_id(),
+    );
+
+    let mut frozen_parameters: HashMap<String, ActorHandle> = HashMap::new();
+    for (name, actor) in actor_context.parameters.iter() {
+        frozen_parameters.insert(
+            name.clone(),
+            if preserve_live_link_targets {
+                actor.clone()
+            } else {
+                freeze_snapshot_actor_now_best_effort(
+                    Some(reg),
+                    actor,
+                    &ctx.construct_context,
+                    &actor_context,
+                )
+            },
+        );
+    }
+
+    let frozen_passed = actor_context.passed.as_ref().map(|passed_actor| {
+        if preserve_live_link_targets {
+            passed_actor.clone()
+        } else {
+            freeze_snapshot_actor_now_best_effort(
+                Some(reg),
+                passed_actor,
+                &ctx.construct_context,
+                &actor_context,
+            )
+        }
+    });
+
+    let mut frozen_object_locals: HashMap<Span, ActorHandle> = HashMap::new();
+    for (span, actor) in actor_context.object_locals.iter() {
+        frozen_object_locals.insert(
+            *span,
+            if preserve_live_link_targets {
+                actor.clone()
+            } else {
+                freeze_snapshot_actor_now_best_effort(
+                    Some(reg),
+                    actor,
+                    &ctx.construct_context,
+                    &actor_context,
+                )
+            },
+        );
+    }
+
+    let new_actor_context = ActorContext {
+        output_valve_signal: actor_context.output_valve_signal.clone(),
+        piped: Some(value_actor),
+        passed: frozen_passed,
+        parameters: Arc::new(frozen_parameters),
+        sequential_processing: actor_context.sequential_processing,
+        backpressure_permit: actor_context.backpressure_permit.clone(),
+        hold_state_update_callback: None,
+        use_lazy_actors: actor_context.use_lazy_actors,
+        is_snapshot_context: true,
+        object_locals: Arc::new(frozen_object_locals),
+        scope: actor_context.scope.clone(),
+        subscription_scope: actor_context.subscription_scope.clone(),
+        call_recorder: actor_context.call_recorder.clone(),
+        is_restoring: actor_context.is_restoring,
+        list_append_storage_key: actor_context.list_append_storage_key.clone(),
+        recording_counter: actor_context.recording_counter.clone(),
+        subscription_after_seq: None,
+        snapshot_emission_seq: Some(source_emission),
+        registry_scope_id: actor_context.registry_scope_id,
+    };
+
+    let new_ctx = EvaluationContext {
+        construct_context: ctx.construct_context.clone(),
+        actor_context: new_actor_context,
+        reference_connector: ctx.reference_connector.clone(),
+        link_connector: ctx.link_connector.clone(),
+        module_loader: ctx.module_loader.clone(),
+        source_code: ctx.source_code.clone(),
+        function_registry_snapshot: Some(function_registry_snapshot),
+        current_module: ctx.current_module.clone(),
+    };
+
+    let result_actor = if let static_expression::Expression::FunctionCall { path, arguments } =
+        body.node.clone()
+    {
+        evaluate_top_level_function_call_body_with_runtime_registry(
+            reg,
+            body.span,
+            body.persistence.clone(),
+            path,
+            arguments,
+            new_ctx,
+        )
+        .ok()
+        .flatten()?
+    } else {
+        evaluate_expression_with_runtime_registry(Some(reg), body.clone(), new_ctx)
+            .ok()
+            .flatten()?
+    };
+    drain_runtime_ready_queue_with_registry(reg);
+    let mut result_value = result_actor.current_value().ok()?;
+    preserve_emission_seq(&mut result_value, source_emission);
+    Some(result_value)
+}
+
+fn try_create_direct_state_then_actor(
+    mut reg: Option<&mut ActorRegistry>,
+    body: &static_expression::Spanned<static_expression::Expression>,
+    persistence_id: PersistenceId,
+    ctx: &EvaluationContext,
+    function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
+) -> Option<ActorHandle> {
+    let piped = ctx.actor_context.piped.clone()?;
+    let piped_is_lazy = match reg.as_deref() {
+        Some(reg) => piped.has_lazy_delegate_with_registry(reg),
+        None => piped.has_lazy_delegate(),
+    };
+    if ctx.actor_context.sequential_processing
+        || ctx.actor_context.backpressure_permit.is_some()
+        || ctx.actor_context.use_lazy_actors
+        || ctx.actor_context.hold_state_update_callback.is_some()
+        || !expression_supports_runtime_local_direct_eval_with_registry(
+            body,
+            Some(&function_registry_snapshot),
+            ctx.current_module.as_deref(),
+        )
+    {
+        return None;
+    }
+
+    let output_actor = match reg.as_deref_mut() {
+        Some(reg) => {
+            create_actor_forwarding_with_registry(reg, persistence_id, ctx.actor_context.scope_id())
+        }
+        None => create_actor_forwarding(persistence_id, ctx.actor_context.scope_id()),
+    };
+    retain_actor_handles_with_registry(
+        reg.as_deref_mut(),
+        &output_actor,
+        std::iter::once(piped.clone()),
+    );
+    let subscription_after_seq = current_emission_seq();
+
+    if piped_is_lazy {
+        watch_actor_current_and_future_with_registry(
+            reg.as_deref_mut(),
+            &output_actor,
+            &piped,
+            false,
+            {
+                let output_actor = output_actor.clone();
+                let body = body.clone();
+                let ctx = ctx.clone();
+                let function_registry_snapshot = function_registry_snapshot.clone();
+                move |reg, value| {
+                    if !output_actor.is_alive() {
+                        return;
+                    }
+                    if !value.is_emitted_after(subscription_after_seq) {
+                        return;
+                    }
+                    if let Some(result_value) = evaluate_then_body_value_with_registry(
+                        reg,
+                        &body,
+                        value,
+                        &ctx,
+                        function_registry_snapshot.clone(),
+                    ) {
+                        enqueue_actor_value_on_runtime_queue_with_registry(
+                            reg,
+                            &output_actor,
+                            result_value,
+                        );
+                    }
+                }
+            },
+        );
+        return Some(output_actor);
+    }
+
+    let emit_value = |reg: &mut ActorRegistry, value: &Value, respect_subscription_floor: bool| {
+        if respect_subscription_floor && !value.is_emitted_after(subscription_after_seq) {
+            return;
+        }
+        if let Some(result_value) = evaluate_then_body_value_with_registry(
+            reg,
+            body,
+            value.clone(),
+            ctx,
+            function_registry_snapshot.clone(),
+        ) {
+            enqueue_actor_value_on_runtime_queue_with_registry(reg, &output_actor, result_value);
+        }
+    };
+
+    match reg {
+        Some(reg) => {
+            if ctx.actor_context.is_snapshot_context {
+                if let Ok(current_value) = piped.current_value() {
+                    emit_value(reg, &current_value, false);
+                }
+            }
+            piped.register_direct_subscriber_with_registry(reg, {
+                let output_actor = output_actor.clone();
+                let body = body.clone();
+                let ctx = ctx.clone();
+                let function_registry_snapshot = function_registry_snapshot.clone();
+                move |reg, value| {
+                    if !output_actor.is_alive() {
+                        return false;
+                    }
+                    let Some(value) = value else {
+                        return true;
+                    };
+                    if !value.is_emitted_after(subscription_after_seq) {
+                        return true;
+                    }
+                    if let Some(result_value) = evaluate_then_body_value_with_registry(
+                        reg,
+                        &body,
+                        value.clone(),
+                        &ctx,
+                        function_registry_snapshot.clone(),
+                    ) {
+                        enqueue_actor_value_on_runtime_queue_with_registry(
+                            reg,
+                            &output_actor,
+                            result_value,
+                        );
+                    }
+                    true
+                }
+            });
+            drain_runtime_ready_queue_with_registry(reg);
+        }
+        None => {
+            REGISTRY.with(|reg| {
+                let mut reg = reg.borrow_mut();
+                if ctx.actor_context.is_snapshot_context {
+                    if let Ok(current_value) = piped.current_value() {
+                        emit_value(&mut reg, &current_value, false);
+                    }
+                }
+                piped.register_direct_subscriber_with_registry(&mut reg, {
+                    let output_actor = output_actor.clone();
+                    let body = body.clone();
+                    let ctx = ctx.clone();
+                    let function_registry_snapshot = function_registry_snapshot.clone();
+                    move |reg, value| {
+                        if !output_actor.is_alive() {
+                            return false;
+                        }
+                        let Some(value) = value else {
+                            return true;
+                        };
+                        if !value.is_emitted_after(subscription_after_seq) {
+                            return true;
+                        }
+                        if let Some(result_value) = evaluate_then_body_value_with_registry(
+                            reg,
+                            &body,
+                            value.clone(),
+                            &ctx,
+                            function_registry_snapshot.clone(),
+                        ) {
+                            enqueue_actor_value_on_runtime_queue_with_registry(
+                                reg,
+                                &output_actor,
+                                result_value,
+                            );
+                        }
+                        true
+                    }
+                });
+                drain_runtime_ready_queue_with_registry(&mut reg);
+            });
+        }
+    }
+
+    Some(output_actor)
+}
+
+fn record_piped_function_invocation(
+    path: &[String],
+    invocation_id: &str,
+    piped_value: &Value,
+    ctx: &EvaluationContext,
+) {
+    let Some(call_recorder) = &ctx.actor_context.call_recorder else {
+        return;
+    };
+
+    let captured_input = CapturedValue::capture(piped_value);
+    if LOG_DEBUG {
+        zoon::println!(
+            "[DEBUG] Recording call: {:?} with id: {} and input: {:?}",
+            path,
+            invocation_id,
+            captured_input
+        );
+    }
+    let recorded_call = RecordedCall {
+        id: invocation_id.to_owned(),
+        path: path.to_vec(),
+        inputs: captured_input,
+    };
+    call_recorder.send_or_drop(recorded_call);
+}
+
+fn next_piped_function_invocation_id(ctx: &EvaluationContext) -> String {
+    ctx.actor_context
+        .recording_counter
+        .as_ref()
+        .map(|counter| {
+            format!(
+                "call_{}",
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            )
+        })
+        .unwrap_or_else(|| format!("call_{}", ulid::Ulid::new()))
+}
+
+fn evaluate_piped_function_body_value_with_registry(
+    reg: &mut ActorRegistry,
+    func_def: &StaticFunctionDefinition,
+    parameters: &HashMap<String, ActorHandle>,
+    param_name: &str,
+    piped_value: Value,
+    invocation_id: String,
+    ctx: &EvaluationContext,
+) -> Option<Value> {
+    let value_actor = create_constant_actor_with_registry(
+        reg,
+        PersistenceId::new(),
+        piped_value,
+        ctx.actor_context.scope_id(),
+    );
+
+    let mut params = parameters.clone();
+    params.insert(param_name.to_owned(), value_actor);
+
+    let call_scope = match &ctx.actor_context.scope {
+        Scope::Root => Scope::Nested(invocation_id),
+        Scope::Nested(existing) => Scope::Nested(format!("{}:{}", existing, invocation_id)),
+    };
+
+    let new_actor_context = ActorContext {
+        output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
+        piped: None,
+        passed: ctx.actor_context.passed.clone(),
+        parameters: Arc::new(params),
+        sequential_processing: ctx.actor_context.sequential_processing,
+        backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
+        hold_state_update_callback: None,
+        use_lazy_actors: ctx.actor_context.use_lazy_actors,
+        is_snapshot_context: false,
+        object_locals: Arc::new(HashMap::new()),
+        scope: call_scope,
+        subscription_scope: ctx.actor_context.subscription_scope.clone(),
+        call_recorder: ctx.actor_context.call_recorder.clone(),
+        is_restoring: ctx.actor_context.is_restoring,
+        list_append_storage_key: ctx.actor_context.list_append_storage_key.clone(),
+        recording_counter: ctx.actor_context.recording_counter.clone(),
+        subscription_after_seq: None,
+        snapshot_emission_seq: None,
+        registry_scope_id: ctx.actor_context.registry_scope_id,
+    };
+
+    let new_ctx = EvaluationContext {
+        construct_context: ctx.construct_context.clone(),
+        actor_context: new_actor_context,
+        reference_connector: ctx.reference_connector.clone(),
+        link_connector: ctx.link_connector.clone(),
+        module_loader: ctx.module_loader.clone(),
+        source_code: ctx.source_code.clone(),
+        function_registry_snapshot: ctx.function_registry_snapshot.clone(),
+        current_module: func_def.module_name.clone(),
+    };
+
+    let result_actor =
+        evaluate_expression_with_runtime_registry(Some(reg), func_def.body.clone(), new_ctx)
+            .ok()
+            .flatten()?;
+    drain_runtime_ready_queue_with_registry(reg);
+    result_actor.current_value().ok()
+}
+
+fn try_create_direct_state_piped_function_actor(
+    mut reg: Option<&mut ActorRegistry>,
+    path: &[String],
+    piped: &ActorHandle,
+    param_name: &str,
+    func_def: &StaticFunctionDefinition,
+    parameters: &HashMap<String, ActorHandle>,
+    persistence_id: PersistenceId,
+    ctx: &EvaluationContext,
+) -> Option<ActorHandle> {
+    if ctx.actor_context.use_lazy_actors
+        || !expression_supports_runtime_local_direct_eval_with_registry(
+            &func_def.body,
+            ctx.function_registry_snapshot.as_ref(),
+            func_def.module_name.as_deref(),
+        )
+    {
+        return None;
+    }
+
+    let output_actor = match reg.as_deref_mut() {
+        Some(reg) => {
+            create_actor_forwarding_with_registry(reg, persistence_id, ctx.actor_context.scope_id())
+        }
+        None => create_actor_forwarding(persistence_id, ctx.actor_context.scope_id()),
+    };
+    let retained_inputs: Vec<_> = std::iter::once(piped.clone())
+        .chain(parameters.values().cloned())
+        .collect();
+    retain_actor_handles_with_registry(reg.as_deref_mut(), &output_actor, retained_inputs);
+
+    let piped_is_lazy = match reg.as_deref() {
+        Some(reg) => piped.has_lazy_delegate_with_registry(reg),
+        None => piped.has_lazy_delegate(),
+    };
+
+    if piped_is_lazy {
+        watch_actor_current_and_future_with_registry(
+            reg.as_deref_mut(),
+            &output_actor,
+            &piped,
+            false,
+            {
+                let output_actor = output_actor.clone();
+                let path = path.to_vec();
+                let func_def = func_def.clone();
+                let parameters = parameters.clone();
+                let param_name = param_name.to_owned();
+                let ctx = ctx.clone();
+                move |reg, value| {
+                    if !output_actor.is_alive() {
+                        return;
+                    }
+                    let invocation_id = next_piped_function_invocation_id(&ctx);
+                    record_piped_function_invocation(&path, &invocation_id, &value, &ctx);
+                    if let Some(result_value) = evaluate_piped_function_body_value_with_registry(
+                        reg,
+                        &func_def,
+                        &parameters,
+                        &param_name,
+                        value,
+                        invocation_id,
+                        &ctx,
+                    ) {
+                        enqueue_actor_value_on_runtime_queue_with_registry(
+                            reg,
+                            &output_actor,
+                            result_value,
+                        );
+                    }
+                }
+            },
+        );
+        return Some(output_actor);
+    }
+
+    let emit_value = |reg: &mut ActorRegistry, piped_value: Value| {
+        let invocation_id = next_piped_function_invocation_id(ctx);
+        record_piped_function_invocation(path, &invocation_id, &piped_value, ctx);
+        if let Some(result_value) = evaluate_piped_function_body_value_with_registry(
+            reg,
+            func_def,
+            parameters,
+            param_name,
+            piped_value,
+            invocation_id,
+            ctx,
+        ) {
+            enqueue_actor_value_on_runtime_queue_with_registry(reg, &output_actor, result_value);
+        }
+    };
+
+    match reg {
+        Some(reg) => {
+            if let Ok(current_value) = piped.current_value() {
+                emit_value(reg, current_value);
+            }
+
+            piped.register_direct_subscriber_with_registry(reg, {
+                let output_actor = output_actor.clone();
+                let path = path.to_vec();
+                let func_def = func_def.clone();
+                let parameters = parameters.clone();
+                let param_name = param_name.to_owned();
+                let ctx = ctx.clone();
+                move |reg, value| {
+                    if !output_actor.is_alive() {
+                        return false;
+                    }
+                    let Some(value) = value else {
+                        return true;
+                    };
+
+                    let invocation_id = next_piped_function_invocation_id(&ctx);
+                    record_piped_function_invocation(&path, &invocation_id, value, &ctx);
+                    if let Some(result_value) = evaluate_piped_function_body_value_with_registry(
+                        reg,
+                        &func_def,
+                        &parameters,
+                        &param_name,
+                        value.clone(),
+                        invocation_id,
+                        &ctx,
+                    ) {
+                        enqueue_actor_value_on_runtime_queue_with_registry(
+                            reg,
+                            &output_actor,
+                            result_value,
+                        );
+                    }
+                    true
+                }
+            });
+            drain_runtime_ready_queue_with_registry(reg);
+        }
+        None => {
+            REGISTRY.with(|reg| {
+                let mut reg = reg.borrow_mut();
+
+                if let Ok(current_value) = piped.current_value() {
+                    emit_value(&mut reg, current_value);
+                }
+
+                piped.register_direct_subscriber_with_registry(&mut reg, {
+                    let output_actor = output_actor.clone();
+                    let path = path.to_vec();
+                    let func_def = func_def.clone();
+                    let parameters = parameters.clone();
+                    let param_name = param_name.to_owned();
+                    let ctx = ctx.clone();
+                    move |reg, value| {
+                        if !output_actor.is_alive() {
+                            return false;
+                        }
+                        let Some(value) = value else {
+                            return true;
+                        };
+
+                        let invocation_id = next_piped_function_invocation_id(&ctx);
+                        record_piped_function_invocation(&path, &invocation_id, value, &ctx);
+                        if let Some(result_value) = evaluate_piped_function_body_value_with_registry(
+                            reg,
+                            &func_def,
+                            &parameters,
+                            &param_name,
+                            value.clone(),
+                            invocation_id,
+                            &ctx,
+                        ) {
+                            enqueue_actor_value_on_runtime_queue_with_registry(
+                                reg,
+                                &output_actor,
+                                result_value,
+                            );
+                        }
+                        true
+                    }
+                });
+                drain_runtime_ready_queue_with_registry(&mut reg);
+            });
+        }
+    }
+
+    Some(output_actor)
+}
+
+fn builtin_function_supports_live_runtime_local_piped_binding(
+    path: &[boon::parser::StrSlice],
+) -> bool {
+    matches!(
+        path.iter()
+            .map(|part| part.as_str())
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["List", "last"]
+            | ["List", "get"]
+            | ["List", "latest"]
+            | ["List", "sum"]
+            | ["List", "product"]
+    )
+}
+
+fn function_body_supports_live_runtime_local_piped_binding(
+    body: &static_expression::Spanned<static_expression::Expression>,
+    param_name: &str,
+) -> bool {
+    match &body.node {
+        static_expression::Expression::Pipe { from, to } => {
+            let static_expression::Expression::Alias(static_expression::Alias::WithoutPassed {
+                parts,
+                ..
+            }) = &from.node
+            else {
+                return false;
+            };
+            if parts.len() != 1 || parts[0].as_str() != param_name {
+                return false;
+            }
+            let static_expression::Expression::FunctionCall { path, arguments } = &to.node else {
+                return false;
+            };
+            let _ = arguments;
+            builtin_function_supports_live_runtime_local_piped_binding(path)
+        }
+        _ => false,
+    }
+}
+
+fn try_create_live_runtime_local_piped_function_actor(
+    piped: &ActorHandle,
+    param_name: &str,
+    func_def: &StaticFunctionDefinition,
+    parameters: &HashMap<String, ActorHandle>,
+    persistence_id: PersistenceId,
+    ctx: &EvaluationContext,
+) -> Option<ActorHandle> {
+    if ctx.actor_context.use_lazy_actors
+        || ctx.actor_context.call_recorder.is_some()
+        || !function_body_supports_live_runtime_local_piped_binding(&func_def.body, param_name)
+    {
+        return None;
+    }
+
+    let output_actor = REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+
+        let mut params = parameters.clone();
+        params.insert(param_name.to_owned(), piped.clone());
+
+        let new_ctx = EvaluationContext {
+            construct_context: ctx.construct_context.clone(),
+            actor_context: ActorContext {
+                output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
+                piped: None,
+                passed: ctx.actor_context.passed.clone(),
+                parameters: Arc::new(params),
+                sequential_processing: ctx.actor_context.sequential_processing,
+                backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
+                hold_state_update_callback: None,
+                use_lazy_actors: ctx.actor_context.use_lazy_actors,
+                is_snapshot_context: false,
+                object_locals: ctx.actor_context.object_locals.clone(),
+                scope: ctx.actor_context.scope.clone(),
+                subscription_scope: ctx.actor_context.subscription_scope.clone(),
+                call_recorder: ctx.actor_context.call_recorder.clone(),
+                is_restoring: ctx.actor_context.is_restoring,
+                list_append_storage_key: ctx.actor_context.list_append_storage_key.clone(),
+                recording_counter: ctx.actor_context.recording_counter.clone(),
+                subscription_after_seq: None,
+                snapshot_emission_seq: None,
+                registry_scope_id: ctx.actor_context.registry_scope_id,
+            },
+            reference_connector: ctx.reference_connector.clone(),
+            link_connector: ctx.link_connector.clone(),
+            module_loader: ctx.module_loader.clone(),
+            source_code: ctx.source_code.clone(),
+            function_registry_snapshot: ctx.function_registry_snapshot.clone(),
+            current_module: func_def.module_name.clone(),
+        };
+
+        let result_actor = evaluate_expression_with_runtime_registry(
+            Some(&mut reg),
+            func_def.body.clone(),
+            new_ctx,
+        )
+        .ok()
+        .flatten()?;
+
+        let output_actor = create_actor_forwarding_with_registry(
+            &mut reg,
+            persistence_id,
+            ctx.actor_context.scope_id(),
+        );
+        retain_actor_handles_with_registry(
+            Some(&mut reg),
+            &output_actor,
+            std::iter::once(result_actor.clone()),
+        );
+        connect_forwarding_current_and_future_with_registry(
+            Some(&mut reg),
+            output_actor.clone(),
+            result_actor,
+        );
+        drain_runtime_ready_queue_with_registry(&mut reg);
+        Some(output_actor)
+    });
+    crate::engine::poll_spawned_async_source_tasks_after_insertion();
+    output_actor
+}
+
+fn enqueue_direct_when_body_value_with_registry(
+    reg: &mut ActorRegistry,
+    output_actor: &ActorHandle,
+    last_emission: &Cell<Option<EmissionSeq>>,
+    value: Value,
+) {
+    let emission = value.emission_seq();
+    if last_emission.get() == Some(emission) {
+        return;
+    }
+    last_emission.set(Some(emission));
+    enqueue_actor_value_on_runtime_queue_with_registry(reg, output_actor, value);
+}
+
+fn enqueue_direct_while_body_value_with_registry(
+    reg: &mut ActorRegistry,
+    output_actor: &ActorHandle,
+    last_emission: &Cell<Option<EmissionSeq>>,
+    last_value: &RefCell<Option<Value>>,
+    value: Value,
+) {
+    let emission = value.emission_seq();
+    last_emission.set(Some(emission));
+    if last_value
+        .borrow()
+        .as_ref()
+        .is_some_and(|previous| crate::engine::values_equal(previous, &value))
+    {
+        return;
+    }
+    *last_value.borrow_mut() = Some(value.clone());
+    enqueue_actor_value_on_runtime_queue_with_registry(reg, output_actor, value);
+}
+
+fn connect_direct_when_body_actor_with_registry(
+    reg: &mut ActorRegistry,
+    output_actor: &ActorHandle,
+    result_actor: ActorHandle,
+    generation: u64,
+    active_generation: Rc<Cell<u64>>,
+    last_emission: Rc<Cell<Option<EmissionSeq>>>,
+) {
+    if let Ok(value) = result_actor.current_value() {
+        enqueue_direct_when_body_value_with_registry(reg, output_actor, &last_emission, value);
+    }
+
+    watch_actor_current_and_future_with_registry(Some(reg), output_actor, &result_actor, true, {
+        let output_actor = output_actor.clone();
+        move |reg, value| {
+            if !output_actor.is_alive() || active_generation.get() != generation {
+                return;
+            }
+            enqueue_direct_when_body_value_with_registry(reg, &output_actor, &last_emission, value);
+        }
+    });
+}
+
+fn connect_direct_while_body_actor_with_registry(
+    reg: &mut ActorRegistry,
+    output_actor: &ActorHandle,
+    result_actor: ActorHandle,
+    generation: u64,
+    active_generation: Rc<Cell<u64>>,
+    last_emission: Rc<Cell<Option<EmissionSeq>>>,
+    last_value: Rc<RefCell<Option<Value>>>,
+) {
+    if let Ok(value) = result_actor.current_value() {
+        enqueue_direct_while_body_value_with_registry(
+            reg,
+            output_actor,
+            &last_emission,
+            &last_value,
+            value,
+        );
+    }
+
+    watch_actor_current_and_future_with_registry(Some(reg), output_actor, &result_actor, true, {
+        let output_actor = output_actor.clone();
+        move |reg, value| {
+            if !output_actor.is_alive() || active_generation.get() != generation {
+                return;
+            }
+            let current_emission = value.emission_seq();
+            if last_emission.get() == Some(current_emission) {
+                return;
+            }
+            enqueue_direct_while_body_value_with_registry(
+                reg,
+                &output_actor,
+                &last_emission,
+                &last_value,
+                value,
+            );
+        }
+    });
+}
+
+fn try_create_direct_state_when_actor(
+    mut reg: Option<&mut ActorRegistry>,
+    arms: &[static_expression::Arm],
+    persistence_id: PersistenceId,
+    ctx: &EvaluationContext,
+    function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
+) -> Option<ActorHandle> {
+    let piped = ctx.actor_context.piped.clone()?;
+    let piped_is_lazy = match reg.as_deref() {
+        Some(reg) => piped.has_lazy_delegate_with_registry(reg),
+        None => piped.has_lazy_delegate(),
+    };
+    if ctx.actor_context.backpressure_permit.is_some()
+        || arms.iter().any(|arm| {
+            !expression_supports_runtime_local_direct_eval_with_registry(
+                &arm.body,
+                Some(&function_registry_snapshot),
+                ctx.current_module.as_deref(),
+            ) || !pattern_supports_runtime_local_direct_match(&arm.pattern, &ctx.actor_context)
+        })
+    {
+        return None;
+    }
+
+    let output_actor = match reg.as_deref_mut() {
+        Some(reg) => {
+            create_actor_forwarding_with_registry(reg, persistence_id, ctx.actor_context.scope_id())
+        }
+        None => create_actor_forwarding(persistence_id, ctx.actor_context.scope_id()),
+    };
+    retain_actor_handles_with_registry(
+        reg.as_deref_mut(),
+        &output_actor,
+        std::iter::once(piped.clone()),
+    );
+
+    let active_generation = Rc::new(Cell::new(0u64));
+    let active_branch = Rc::new(RefCell::new(None::<DirectWhenActiveBranch>));
+    let last_condition_key = Rc::new(RefCell::new(None::<BranchConditionEmissionDedupKey>));
+    let switch_branch = Rc::new({
+        let output_actor = output_actor.clone();
+        let construct_context = ctx.construct_context.clone();
+        let actor_context = ctx.actor_context.clone();
+        let reference_connector = ctx.reference_connector.clone();
+        let link_connector = ctx.link_connector.clone();
+        let module_loader = ctx.module_loader.clone();
+        let source_code = ctx.source_code.clone();
+        let current_module = ctx.current_module.clone();
+        let arms = arms.to_vec();
+        let function_registry_snapshot = function_registry_snapshot.clone();
+        let active_generation = active_generation.clone();
+        let active_branch = active_branch.clone();
+        let last_condition_key = last_condition_key.clone();
+        move |reg: &mut ActorRegistry, value: Value| {
+            let current_key = branch_condition_emission_dedup_key(&value);
+            {
+                let mut last_key = last_condition_key.borrow_mut();
+                if current_key.as_ref() == last_key.as_ref() {
+                    return;
+                }
+                *last_key = current_key;
+            }
+
+            active_branch.borrow_mut().take();
+            let generation = active_generation.get().wrapping_add(1);
+            active_generation.set(generation);
+            let comparison_values = resolve_comparison_values_now(&arms, &actor_context);
+            let source_emission = branch_condition_emission_seq(&value);
+
+            for (arm_idx, arm) in arms.iter().enumerate() {
+                let Some(bindings) = match_pattern_now(&arm.pattern, &value, &comparison_values)
+                else {
+                    continue;
+                };
+
+                let arm_scope = Arc::new(SubscriptionScope::new());
+                let scope_guard = ScopeGuard::new(arm_scope.clone());
+                let arm_registry_scope = actor_context.registry_scope_id.map(|parent_scope| {
+                    let scope_id = create_registry_scope_with_registry(reg, Some(parent_scope));
+                    (scope_id, ScopeDestroyGuard::new(scope_id))
+                });
+                let value_actor = create_constant_actor_with_registry(
+                    reg,
+                    PersistenceId::new(),
+                    value.clone(),
+                    actor_context.scope_id(),
+                );
+                let preserve_live_link_targets = matches!(
+                    arm.body.node,
+                    static_expression::Expression::LinkSetter { .. }
+                );
+
+                let mut parameters: HashMap<String, ActorHandle> = HashMap::new();
+                for (name, actor) in actor_context.parameters.iter() {
+                    parameters.insert(
+                        name.clone(),
+                        if preserve_live_link_targets {
+                            actor.clone()
+                        } else {
+                            freeze_snapshot_actor_now_best_effort(
+                                Some(reg),
+                                actor,
+                                &construct_context,
+                                &actor_context,
+                            )
+                        },
+                    );
+                }
+                for (name, bound_value) in bindings {
+                    let bound_actor = create_constant_actor_with_registry(
+                        reg,
+                        PersistenceId::new(),
+                        bound_value,
+                        actor_context.scope_id(),
+                    );
+                    parameters.insert(name, bound_actor);
+                }
+
+                let frozen_passed = actor_context.passed.as_ref().map(|passed_actor| {
+                    if preserve_live_link_targets {
+                        passed_actor.clone()
+                    } else {
+                        freeze_snapshot_actor_now_best_effort(
+                            Some(reg),
+                            passed_actor,
+                            &construct_context,
+                            &actor_context,
+                        )
+                    }
+                });
+                let mut frozen_object_locals: HashMap<Span, ActorHandle> = HashMap::new();
+                for (span, actor) in actor_context.object_locals.iter() {
+                    frozen_object_locals.insert(
+                        *span,
+                        if preserve_live_link_targets {
+                            actor.clone()
+                        } else {
+                            freeze_snapshot_actor_now_best_effort(
+                                Some(reg),
+                                actor,
+                                &construct_context,
+                                &actor_context,
+                            )
+                        },
+                    );
+                }
+
+                let new_actor_context = ActorContext {
+                    output_valve_signal: actor_context.output_valve_signal.clone(),
+                    piped: Some(value_actor),
+                    passed: frozen_passed,
+                    parameters: Arc::new(parameters),
+                    sequential_processing: actor_context.sequential_processing,
+                    backpressure_permit: actor_context.backpressure_permit.clone(),
+                    hold_state_update_callback: None,
+                    use_lazy_actors: actor_context.use_lazy_actors,
+                    is_snapshot_context: false,
+                    object_locals: Arc::new(frozen_object_locals),
+                    scope: {
+                        let scope_id = format!("when_arm_{arm_idx}");
+                        match &actor_context.scope {
+                            Scope::Root => Scope::Nested(scope_id),
+                            Scope::Nested(existing) => {
+                                Scope::Nested(format!("{existing}:{scope_id}"))
+                            }
+                        }
+                    },
+                    subscription_scope: Some(arm_scope),
+                    call_recorder: actor_context.call_recorder.clone(),
+                    is_restoring: actor_context.is_restoring,
+                    list_append_storage_key: actor_context.list_append_storage_key.clone(),
+                    recording_counter: actor_context.recording_counter.clone(),
+                    subscription_after_seq: None,
+                    snapshot_emission_seq: Some(source_emission),
+                    registry_scope_id: arm_registry_scope
+                        .as_ref()
+                        .map(|(id, _)| *id)
+                        .or(actor_context.registry_scope_id),
+                };
+
+                let body_expr = static_expression::Spanned {
+                    span: arm.body.span,
+                    persistence: arm.body.persistence,
+                    node: arm.body.node.clone(),
+                };
+                let new_ctx = EvaluationContext {
+                    construct_context: construct_context.clone(),
+                    actor_context: new_actor_context,
+                    reference_connector: reference_connector.clone(),
+                    link_connector: link_connector.clone(),
+                    module_loader: module_loader.clone(),
+                    source_code: source_code.clone(),
+                    function_registry_snapshot: Some(function_registry_snapshot.clone()),
+                    current_module: current_module.clone(),
+                };
+
+                let Ok(Some(result_actor)) =
+                    (if let static_expression::Expression::FunctionCall { path, arguments } =
+                        body_expr.node.clone()
+                    {
+                        evaluate_top_level_function_call_body_with_runtime_registry(
+                            reg,
+                            body_expr.span,
+                            body_expr.persistence.clone(),
+                            path,
+                            arguments,
+                            new_ctx,
+                        )
+                    } else {
+                        evaluate_expression_with_runtime_registry(Some(reg), body_expr, new_ctx)
+                    })
+                else {
+                    return;
+                };
+
+                let last_emission = Rc::new(Cell::new(None::<EmissionSeq>));
+                connect_direct_when_body_actor_with_registry(
+                    reg,
+                    &output_actor,
+                    result_actor,
+                    generation,
+                    active_generation.clone(),
+                    last_emission,
+                );
+
+                active_branch.borrow_mut().replace(DirectWhenActiveBranch {
+                    _scope_guard: scope_guard,
+                    _registry_scope_guard: arm_registry_scope.map(|(_, guard)| guard),
+                });
+                return;
+            }
+        }
+    });
+
+    if let Some(reg) = reg.as_deref_mut() {
+        let switch_branch_for_subscriber = switch_branch.clone();
+        if !piped_is_lazy {
+            if let Ok(current_value) = piped.current_value() {
+                switch_branch_for_subscriber(reg, current_value);
+            }
+
+            piped.register_direct_subscriber_with_registry(reg, {
+                let output_actor = output_actor.clone();
+                let active_branch = active_branch.clone();
+                let switch_branch = switch_branch_for_subscriber.clone();
+                move |reg, value| {
+                    if !output_actor.is_alive() {
+                        active_branch.borrow_mut().take();
+                        return false;
+                    }
+                    let Some(value) = value else {
+                        return true;
+                    };
+                    switch_branch(reg, value.clone());
+                    true
+                }
+            });
+        }
+        drain_runtime_ready_queue_with_registry(reg);
+    } else {
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            let switch_branch_for_subscriber = switch_branch.clone();
+            if !piped_is_lazy {
+                if let Ok(current_value) = piped.current_value() {
+                    switch_branch_for_subscriber(&mut reg, current_value);
+                }
+
+                piped.register_direct_subscriber_with_registry(&mut reg, {
+                    let output_actor = output_actor.clone();
+                    let active_branch = active_branch.clone();
+                    let switch_branch = switch_branch_for_subscriber.clone();
+                    move |reg, value| {
+                        if !output_actor.is_alive() {
+                            active_branch.borrow_mut().take();
+                            return false;
+                        }
+                        let Some(value) = value else {
+                            return true;
+                        };
+                        switch_branch(reg, value.clone());
+                        true
+                    }
+                });
+            }
+            drain_runtime_ready_queue_with_registry(&mut reg);
+        });
+    }
+
+    if piped_is_lazy {
+        watch_actor_current_and_future_with_registry(
+            reg.as_deref_mut(),
+            &output_actor,
+            &piped,
+            false,
+            {
+                let output_actor = output_actor.clone();
+                let switch_branch = switch_branch.clone();
+                move |reg, value| {
+                    if !output_actor.is_alive() {
+                        active_branch.borrow_mut().take();
+                        return;
+                    }
+                    switch_branch(reg, value);
+                }
+            },
+        );
+    }
+
+    Some(output_actor)
+}
+
+fn try_create_direct_state_while_actor(
+    mut reg: Option<&mut ActorRegistry>,
+    arms: &[static_expression::Arm],
+    persistence_id: PersistenceId,
+    ctx: &EvaluationContext,
+    function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
+) -> Option<ActorHandle> {
+    let piped = ctx.actor_context.piped.clone()?;
+    let piped_is_lazy = match reg.as_deref() {
+        Some(reg) => piped.has_lazy_delegate_with_registry(reg),
+        None => piped.has_lazy_delegate(),
+    };
+    if ctx.actor_context.backpressure_permit.is_some()
+        || ctx.actor_context.use_lazy_actors
+        || ctx.actor_context.hold_state_update_callback.is_some()
+        || arms.iter().any(|arm| {
+            !expression_supports_runtime_local_direct_eval_with_registry(
+                &arm.body,
+                Some(&function_registry_snapshot),
+                ctx.current_module.as_deref(),
+            ) || !pattern_supports_runtime_local_direct_match(&arm.pattern, &ctx.actor_context)
+        })
+    {
+        return None;
+    }
+
+    let output_actor = match reg.as_deref_mut() {
+        Some(reg) => {
+            create_actor_forwarding_with_registry(reg, persistence_id, ctx.actor_context.scope_id())
+        }
+        None => create_actor_forwarding(persistence_id, ctx.actor_context.scope_id()),
+    };
+    retain_actor_handles_with_registry(
+        reg.as_deref_mut(),
+        &output_actor,
+        std::iter::once(piped.clone()),
+    );
+
+    let active_generation = Rc::new(Cell::new(0u64));
+    let active_branch = Rc::new(RefCell::new(None::<DirectWhenActiveBranch>));
+    let last_condition_key = Rc::new(RefCell::new(None::<BranchConditionDedupKey>));
+    let switch_branch = Rc::new({
+        let output_actor = output_actor.clone();
+        let construct_context = ctx.construct_context.clone();
+        let actor_context = ctx.actor_context.clone();
+        let reference_connector = ctx.reference_connector.clone();
+        let link_connector = ctx.link_connector.clone();
+        let module_loader = ctx.module_loader.clone();
+        let source_code = ctx.source_code.clone();
+        let current_module = ctx.current_module.clone();
+        let arms = arms.to_vec();
+        let function_registry_snapshot = function_registry_snapshot.clone();
+        let active_generation = active_generation.clone();
+        let active_branch = active_branch.clone();
+        let last_condition_key = last_condition_key.clone();
+        move |reg: &mut ActorRegistry, value: Value| {
+            let current_key = branch_condition_dedup_key(&value);
+            {
+                let mut last_key = last_condition_key.borrow_mut();
+                if current_key.as_ref() == last_key.as_ref() {
+                    return;
+                }
+                *last_key = current_key;
+            }
+
+            active_branch.borrow_mut().take();
+            let generation = active_generation.get().wrapping_add(1);
+            active_generation.set(generation);
+            let comparison_values = resolve_comparison_values_now(&arms, &actor_context);
+            let source_emission = branch_condition_emission_seq(&value);
+
+            for (arm_idx, arm) in arms.iter().enumerate() {
+                let Some(bindings) = match_pattern_now(&arm.pattern, &value, &comparison_values)
+                else {
+                    continue;
+                };
+
+                let arm_scope = Arc::new(SubscriptionScope::new());
+                let scope_guard = ScopeGuard::new(arm_scope.clone());
+                let arm_registry_scope = actor_context.registry_scope_id.map(|parent_scope| {
+                    let scope_id = create_registry_scope_with_registry(reg, Some(parent_scope));
+                    (scope_id, ScopeDestroyGuard::new(scope_id))
+                });
+                let value_actor = create_constant_actor_with_registry(
+                    reg,
+                    PersistenceId::new(),
+                    value.clone(),
+                    actor_context.scope_id(),
+                );
+
+                let parameters = if bindings.is_empty() {
+                    actor_context.parameters.clone()
+                } else {
+                    let mut parameters = (*actor_context.parameters).clone();
+                    for (name, bound_value) in bindings {
+                        let bound_actor = create_constant_actor_with_registry(
+                            reg,
+                            PersistenceId::new(),
+                            bound_value,
+                            actor_context.scope_id(),
+                        );
+                        parameters.insert(name, bound_actor);
+                    }
+                    Arc::new(parameters)
+                };
+
+                let new_actor_context = ActorContext {
+                    output_valve_signal: actor_context.output_valve_signal.clone(),
+                    piped: Some(value_actor),
+                    passed: actor_context.passed.clone(),
+                    parameters,
+                    sequential_processing: actor_context.sequential_processing,
+                    backpressure_permit: actor_context.backpressure_permit.clone(),
+                    hold_state_update_callback: actor_context.hold_state_update_callback.clone(),
+                    use_lazy_actors: actor_context.use_lazy_actors,
+                    is_snapshot_context: false,
+                    object_locals: actor_context.object_locals.clone(),
+                    scope: {
+                        let scope_id = format!("while_arm_{}_{}", arm_idx, source_emission);
+                        match &actor_context.scope {
+                            Scope::Root => Scope::Nested(scope_id),
+                            Scope::Nested(existing) => {
+                                Scope::Nested(format!("{existing}:{scope_id}"))
+                            }
+                        }
+                    },
+                    subscription_scope: Some(arm_scope),
+                    call_recorder: actor_context.call_recorder.clone(),
+                    is_restoring: actor_context.is_restoring,
+                    list_append_storage_key: actor_context.list_append_storage_key.clone(),
+                    recording_counter: actor_context.recording_counter.clone(),
+                    subscription_after_seq: Some(source_emission),
+                    snapshot_emission_seq: Some(source_emission),
+                    registry_scope_id: arm_registry_scope
+                        .as_ref()
+                        .map(|(id, _)| *id)
+                        .or(actor_context.registry_scope_id),
+                };
+
+                let new_ctx = EvaluationContext {
+                    construct_context: construct_context.clone(),
+                    actor_context: new_actor_context,
+                    reference_connector: reference_connector.clone(),
+                    link_connector: link_connector.clone(),
+                    module_loader: module_loader.clone(),
+                    source_code: source_code.clone(),
+                    function_registry_snapshot: Some(function_registry_snapshot.clone()),
+                    current_module: current_module.clone(),
+                };
+
+                let Ok(Some(result_actor)) =
+                    (if let static_expression::Expression::FunctionCall { path, arguments } =
+                        arm.body.node.clone()
+                    {
+                        evaluate_top_level_function_call_body_with_runtime_registry(
+                            reg,
+                            arm.body.span,
+                            arm.body.persistence,
+                            path,
+                            arguments,
+                            new_ctx,
+                        )
+                    } else {
+                        evaluate_expression_with_runtime_registry(
+                            Some(reg),
+                            arm.body.clone(),
+                            new_ctx,
+                        )
+                    })
+                else {
+                    return;
+                };
+                let last_emission = Rc::new(Cell::new(None::<EmissionSeq>));
+                let last_value = Rc::new(RefCell::new(None::<Value>));
+                connect_direct_while_body_actor_with_registry(
+                    reg,
+                    &output_actor,
+                    result_actor,
+                    generation,
+                    active_generation.clone(),
+                    last_emission,
+                    last_value,
+                );
+
+                active_branch.borrow_mut().replace(DirectWhenActiveBranch {
+                    _scope_guard: scope_guard,
+                    _registry_scope_guard: arm_registry_scope.map(|(_, guard)| guard),
+                });
+                return;
+            }
+        }
+    });
+
+    if let Some(reg) = reg.as_deref_mut() {
+        let switch_branch_for_subscriber = switch_branch.clone();
+        if !piped_is_lazy {
+            if let Ok(current_value) = piped.current_value() {
+                switch_branch_for_subscriber(reg, current_value);
+            }
+
+            piped.register_direct_subscriber_with_registry(reg, {
+                let output_actor = output_actor.clone();
+                let active_branch = active_branch.clone();
+                let switch_branch = switch_branch_for_subscriber.clone();
+                move |reg, value| {
+                    if !output_actor.is_alive() {
+                        active_branch.borrow_mut().take();
+                        return false;
+                    }
+                    let Some(value) = value else {
+                        return true;
+                    };
+                    switch_branch(reg, value.clone());
+                    true
+                }
+            });
+        }
+        drain_runtime_ready_queue_with_registry(reg);
+    } else {
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            let switch_branch_for_subscriber = switch_branch.clone();
+            if !piped_is_lazy {
+                if let Ok(current_value) = piped.current_value() {
+                    switch_branch_for_subscriber(&mut reg, current_value);
+                }
+
+                piped.register_direct_subscriber_with_registry(&mut reg, {
+                    let output_actor = output_actor.clone();
+                    let active_branch = active_branch.clone();
+                    let switch_branch = switch_branch_for_subscriber.clone();
+                    move |reg, value| {
+                        if !output_actor.is_alive() {
+                            active_branch.borrow_mut().take();
+                            return false;
+                        }
+                        let Some(value) = value else {
+                            return true;
+                        };
+                        switch_branch(reg, value.clone());
+                        true
+                    }
+                });
+            }
+            drain_runtime_ready_queue_with_registry(&mut reg);
+        });
+    }
+
+    if piped_is_lazy {
+        watch_actor_current_and_future_with_registry(
+            reg.as_deref_mut(),
+            &output_actor,
+            &piped,
+            false,
+            {
+                let output_actor = output_actor.clone();
+                let switch_branch = switch_branch.clone();
+                move |reg, value| {
+                    if !output_actor.is_alive() {
+                        active_branch.borrow_mut().take();
+                        return;
+                    }
+                    switch_branch(reg, value);
+                }
+            },
+        );
+    }
+
+    Some(output_actor)
+}
+
 /// Build a THEN actor (runtime evaluation of body for each piped value).
-fn build_then_actor(
+fn build_then_actor_with_runtime_registry(
+    reg: Option<&mut ActorRegistry>,
     body: static_expression::Spanned<static_expression::Expression>,
     _span: Span,
     persistence: Option<Persistence>,
@@ -2850,6 +7733,29 @@ fn build_then_actor(
         .clone()
         .ok_or("THEN requires a piped value")?;
 
+    if reg.is_some() {
+        return try_create_direct_state_then_actor(
+            reg,
+            &body,
+            persistence_id,
+            &ctx,
+            function_registry_snapshot,
+        )
+        .ok_or_else(|| {
+            "runtime-local THEN fallback still requires direct-state body support".to_string()
+        });
+    }
+
+    if let Some(actor) = try_create_direct_state_then_actor(
+        None,
+        &body,
+        persistence_id,
+        &ctx,
+        function_registry_snapshot.clone(),
+    ) {
+        return Ok(actor);
+    }
+
     let sequential = ctx.actor_context.sequential_processing;
     let backpressure_permit = ctx.actor_context.backpressure_permit.clone();
 
@@ -2858,7 +7764,6 @@ fn build_then_actor(
     let actor_context_for_then = ctx.actor_context.clone();
     let reference_connector_for_then = ctx.reference_connector.clone();
     let link_connector_for_then = ctx.link_connector.clone();
-    let pass_through_connector_for_then = ctx.pass_through_connector.clone();
     let function_registry_for_then = function_registry_snapshot;
     let module_loader_for_then = ctx.module_loader.clone();
     let source_code_for_then = ctx.source_code.clone();
@@ -2878,7 +7783,6 @@ fn build_then_actor(
             let construct_context_clone = construct_context_for_then.clone();
             let reference_connector_clone = reference_connector_for_then.clone();
             let link_connector_clone = link_connector_for_then.clone();
-            let pass_through_connector_clone = pass_through_connector_for_then.clone();
             let function_registry_clone = function_registry_for_then.clone();
             let module_loader_clone = module_loader_for_then.clone();
             let source_code_clone = source_code_for_then.clone();
@@ -3036,7 +7940,6 @@ fn build_then_actor(
                     actor_context: new_actor_context.clone(),
                     reference_connector: reference_connector_clone,
                     link_connector: link_connector_clone,
-                    pass_through_connector: pass_through_connector_clone,
                     module_loader: module_loader_clone,
                     source_code: source_code_clone,
                     function_registry_snapshot: Some(function_registry_clone),
@@ -3049,7 +7952,9 @@ fn build_then_actor(
                     node: body_clone.node.clone(),
                 };
 
-                match evaluate_expression(body_expr, new_ctx) {
+                let body_result = evaluate_branch_body_actor(body_expr, new_ctx);
+
+                match body_result {
                     Ok(Some(result_actor)) => {
                         // Use value() for type-safe single-value semantics.
                         // value() returns a Future that resolves to exactly ONE value,
@@ -3143,15 +8048,66 @@ fn build_then_actor(
     // Use lazy actor construction when in HOLD body context for sequential state updates
     if ctx.actor_context.use_lazy_actors {
         let scope_id = ctx.actor_context.scope_id();
-        Ok(create_actor_lazy(
-            flattened_stream,
-            persistence_id,
-            scope_id,
-        ))
+        if let Some(reg) = reg {
+            Ok(create_actor_lazy_with_registry(
+                reg,
+                flattened_stream,
+                persistence_id,
+                scope_id,
+            ))
+        } else {
+            Ok(create_actor_lazy(
+                flattened_stream,
+                persistence_id,
+                scope_id,
+            ))
+        }
     } else {
         let scope_id = ctx.actor_context.scope_id();
-        Ok(create_actor(flattened_stream, persistence_id, scope_id))
+        if let Some(reg) = reg {
+            Ok(create_actor_with_registry(
+                reg,
+                flattened_stream,
+                persistence_id,
+                scope_id,
+            ))
+        } else {
+            Ok(create_actor(flattened_stream, persistence_id, scope_id))
+        }
     }
+}
+
+fn build_then_actor(
+    body: static_expression::Spanned<static_expression::Expression>,
+    span: Span,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+    function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
+) -> Result<ActorHandle, String> {
+    if ctx.actor_context.registry_scope_id.is_some() {
+        return REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            build_then_actor_with_runtime_registry(
+                Some(&mut reg),
+                body,
+                span,
+                persistence,
+                persistence_id,
+                ctx,
+                function_registry_snapshot,
+            )
+        });
+    }
+    build_then_actor_with_runtime_registry(
+        None,
+        body,
+        span,
+        persistence,
+        persistence_id,
+        ctx,
+        function_registry_snapshot,
+    )
 }
 
 /// Build a WHEN actor (pattern matching on piped values).
@@ -3209,7 +8165,8 @@ fn branch_condition_emission_dedup_key(value: &Value) -> Option<BranchConditionE
     }
 }
 
-fn build_when_actor(
+fn build_when_actor_with_runtime_registry(
+    reg: Option<&mut ActorRegistry>,
     arms: Vec<static_expression::Arm>,
     _span: Span,
     persistence: Option<Persistence>,
@@ -3223,13 +8180,35 @@ fn build_when_actor(
         .clone()
         .ok_or("WHEN requires a piped value")?;
 
+    if reg.is_some() {
+        return try_create_direct_state_when_actor(
+            reg,
+            &arms,
+            persistence_id,
+            &ctx,
+            function_registry_snapshot,
+        )
+        .ok_or_else(|| {
+            "runtime-local WHEN fallback still requires direct-state arm support".to_string()
+        });
+    }
+
+    if let Some(actor) = try_create_direct_state_when_actor(
+        None,
+        &arms,
+        persistence_id,
+        &ctx,
+        function_registry_snapshot.clone(),
+    ) {
+        return Ok(actor);
+    }
+
     let should_materialize = ctx.actor_context.backpressure_permit.is_some();
 
     let construct_context_for_when = ctx.construct_context.clone();
     let actor_context_for_when = ctx.actor_context.clone();
     let reference_connector_for_when = ctx.reference_connector.clone();
     let link_connector_for_when = ctx.link_connector.clone();
-    let pass_through_connector_for_when = ctx.pass_through_connector.clone();
     let function_registry_for_when = function_registry_snapshot;
     let module_loader_for_when = ctx.module_loader.clone();
     let source_code_for_when = ctx.source_code.clone();
@@ -3246,7 +8225,6 @@ fn build_when_actor(
             let construct_context_clone = construct_context_for_when.clone();
             let reference_connector_clone = reference_connector_for_when.clone();
             let link_connector_clone = link_connector_for_when.clone();
-            let pass_through_connector_clone = pass_through_connector_for_when.clone();
             let function_registry_clone = function_registry_for_when.clone();
             let module_loader_clone = module_loader_for_when.clone();
             let source_code_clone = source_code_for_when.clone();
@@ -3447,14 +8425,13 @@ fn build_when_actor(
                             actor_context: new_actor_context.clone(),
                             reference_connector: reference_connector_clone.clone(),
                             link_connector: link_connector_clone.clone(),
-                            pass_through_connector: pass_through_connector_clone.clone(),
                             module_loader: module_loader_clone.clone(),
                             source_code: source_code_clone.clone(),
                             function_registry_snapshot: Some(function_registry_clone.clone()),
                             current_module: current_module_clone.clone(),
                         };
 
-                        match evaluate_expression(arm.body.clone(), new_ctx) {
+                        match evaluate_branch_body_actor(arm.body.clone(), new_ctx) {
                             Ok(Some(result_actor)) => {
                                 let body_stream = if actor_context_clone.is_snapshot_context {
                                     // Snapshot contexts (for example THEN/HOLD one-shot bodies)
@@ -3624,11 +8601,54 @@ fn build_when_actor(
         }));
 
     let scope_id = ctx.actor_context.scope_id();
-    Ok(create_actor(flattened_stream, persistence_id, scope_id))
+    if let Some(reg) = reg {
+        Ok(create_actor_with_registry(
+            reg,
+            flattened_stream,
+            persistence_id,
+            scope_id,
+        ))
+    } else {
+        Ok(create_actor(flattened_stream, persistence_id, scope_id))
+    }
 }
 
 /// Build a WHILE actor (continuous processing while pattern matches).
-fn build_while_actor(
+fn build_when_actor(
+    arms: Vec<static_expression::Arm>,
+    span: Span,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+    function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
+) -> Result<ActorHandle, String> {
+    if ctx.actor_context.registry_scope_id.is_some() {
+        return REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            build_when_actor_with_runtime_registry(
+                Some(&mut reg),
+                arms,
+                span,
+                persistence,
+                persistence_id,
+                ctx,
+                function_registry_snapshot,
+            )
+        });
+    }
+    build_when_actor_with_runtime_registry(
+        None,
+        arms,
+        span,
+        persistence,
+        persistence_id,
+        ctx,
+        function_registry_snapshot,
+    )
+}
+
+fn build_while_actor_with_runtime_registry(
+    reg: Option<&mut ActorRegistry>,
     arms: Vec<static_expression::Arm>,
     _span: Span,
     persistence: Option<Persistence>,
@@ -3641,13 +8661,35 @@ fn build_while_actor(
         .piped
         .clone()
         .ok_or("WHILE requires a piped value")?;
+
+    if reg.is_some() {
+        return try_create_direct_state_while_actor(
+            reg,
+            &arms,
+            persistence_id,
+            &ctx,
+            function_registry_snapshot,
+        )
+        .ok_or_else(|| {
+            "runtime-local WHILE fallback still requires direct-state arm support".to_string()
+        });
+    }
+
+    if let Some(actor) = try_create_direct_state_while_actor(
+        None,
+        &arms,
+        persistence_id,
+        &ctx,
+        function_registry_snapshot.clone(),
+    ) {
+        return Ok(actor);
+    }
     let should_materialize = ctx.actor_context.backpressure_permit.is_some();
 
     let construct_context_for_while = ctx.construct_context.clone();
     let actor_context_for_while = Arc::new(ctx.actor_context.clone());
     let reference_connector_for_while = ctx.reference_connector.clone();
     let link_connector_for_while = ctx.link_connector.clone();
-    let pass_through_connector_for_while = ctx.pass_through_connector.clone();
     let function_registry_for_while = function_registry_snapshot;
     let module_loader_for_while = ctx.module_loader.clone();
     let source_code_for_while = ctx.source_code.clone();
@@ -3685,7 +8727,6 @@ fn build_while_actor(
         let construct_context_clone = construct_context_for_while.clone();
         let reference_connector_clone = reference_connector_for_while.clone();
         let link_connector_clone = link_connector_for_while.clone();
-        let pass_through_connector_clone = pass_through_connector_for_while.clone();
         let function_registry_clone = function_registry_for_while.clone();
         let module_loader_clone = module_loader_for_while.clone();
         let source_code_clone = source_code_for_while.clone();
@@ -3810,14 +8851,13 @@ fn build_while_actor(
                     actor_context: new_actor_context,
                     reference_connector: reference_connector_clone,
                     link_connector: link_connector_clone,
-                    pass_through_connector: pass_through_connector_clone,
                     module_loader: module_loader_clone,
                     source_code: source_code_clone,
                     function_registry_snapshot: Some(function_registry_clone),
                     current_module: current_module_clone,
                 };
 
-                match evaluate_expression(arm.body.clone(), new_ctx) {
+                match evaluate_branch_body_actor(arm.body.clone(), new_ctx) {
                     Ok(Some(result_actor)) => {
                         let construct_context_for_map = construct_context_for_body_stream.clone();
                         let actor_context_for_map = actor_context_for_body_stream.clone();
@@ -3916,7 +8956,49 @@ fn build_while_actor(
     });
 
     let scope_id = ctx.actor_context.scope_id();
-    Ok(create_actor(stream, persistence_id, scope_id))
+    if let Some(reg) = reg {
+        Ok(create_actor_with_registry(
+            reg,
+            stream,
+            persistence_id,
+            scope_id,
+        ))
+    } else {
+        Ok(create_actor(stream, persistence_id, scope_id))
+    }
+}
+
+fn build_while_actor(
+    arms: Vec<static_expression::Arm>,
+    span: Span,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+    function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
+) -> Result<ActorHandle, String> {
+    if ctx.actor_context.registry_scope_id.is_some() {
+        return REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            build_while_actor_with_runtime_registry(
+                Some(&mut reg),
+                arms,
+                span,
+                persistence,
+                persistence_id,
+                ctx,
+                function_registry_snapshot,
+            )
+        });
+    }
+    build_while_actor_with_runtime_registry(
+        None,
+        arms,
+        span,
+        persistence,
+        persistence_id,
+        ctx,
+        function_registry_snapshot,
+    )
 }
 
 /// Asynchronously extract a field value from a Value following a path of field names.
@@ -3966,7 +9048,7 @@ fn build_field_access_actor(
     path: Vec<String>,
     _span: Span,
     _persistence: Option<Persistence>,
-    persistence_id: PersistenceId,
+    _persistence_id: PersistenceId,
     ctx: EvaluationContext,
 ) -> Result<ActorHandle, String> {
     let piped = ctx
@@ -3974,95 +9056,13 @@ fn build_field_access_actor(
         .piped
         .clone()
         .ok_or("FieldAccess requires a piped value")?;
+    let mut alias_actor_context = ctx.actor_context.clone();
+    alias_actor_context.subscription_after_seq = None;
 
-    let path_display = path.join(".");
-
-    // Seed from the current piped value first, then continue with future updates.
-    // Mapped helper calls often receive a fully-constructed object before any live
-    // updates occur; using stream() alone can miss that initial object and blank the
-    // whole derived subtree.
-    let mut value_stream: LocalBoxStream<'static, Value> = piped.current_or_future_stream();
-
-    // Chain switch_map for EACH field - THE KEY FIX!
-    // When ANY field emits a new value, downstream switch_maps automatically
-    // cancel old subscriptions and re-subscribe to the new value.
-    // This prevents stale subscriptions when intermediate elements are recreated.
-    for (idx, field_name) in path.iter().enumerate() {
-        let field_name = field_name.clone();
-        let path_display_for_log = if LOG_DEBUG {
-            Some(path_display.clone())
-        } else {
-            None
-        };
-        let field_idx = idx;
-
-        value_stream = switch_map(value_stream, move |value| {
-            let field_name = field_name.clone();
-
-            if LOG_DEBUG {
-                let path_display = path_display_for_log.as_deref().unwrap_or("");
-                let value_type = match &value {
-                    Value::Object(_, _) => "Object",
-                    Value::TaggedObject(tagged, _) => tagged.tag(),
-                    Value::Tag(tag, _) => tag.tag(),
-                    Value::Text(_, _) => "Text",
-                    Value::Number(_, _) => "Number",
-                    _ => "Other",
-                };
-                zoon::println!(
-                    "[FIELD_ACCESS] .{} step {}: received {} for field '{}'",
-                    path_display,
-                    field_idx,
-                    value_type,
-                    field_name
-                );
-            }
-
-            let variable = match &value {
-                Value::Object(object, _) => object.variable(&field_name),
-                Value::TaggedObject(tagged, _) => tagged.variable(&field_name),
-                _ => None,
-            };
-
-            if let Some(var) = variable {
-                let value_actor = var.value_actor();
-                if LOG_DEBUG {
-                    let path_display = path_display_for_log.as_deref().unwrap_or("");
-                    zoon::println!(
-                        "[FIELD_ACCESS] .{} step {}: found field '{}', subscribing to actor",
-                        path_display,
-                        field_idx,
-                        field_name
-                    );
-                }
-                value_actor.current_or_future_stream()
-            } else {
-                if LOG_DEBUG {
-                    let path_display = path_display_for_log.as_deref().unwrap_or("");
-                    let value_type = match &value {
-                        Value::Object(_, _) => "Object",
-                        Value::TaggedObject(tagged, _) => tagged.tag(),
-                        Value::Tag(tag, _) => tag.tag(),
-                        Value::Text(_, _) => "Text",
-                        Value::Number(_, _) => "Number",
-                        _ => "Other",
-                    };
-                    zoon::println!(
-                        "[FIELD_ACCESS] .{} step {}: field '{}' NOT FOUND in {}",
-                        path_display,
-                        field_idx,
-                        field_name,
-                        value_type
-                    );
-                }
-                // Field not found - emit empty stream (switch_map handles this gracefully)
-                stream::empty().boxed_local()
-            }
-        });
-    }
-
-    let scope_id = ctx.actor_context.scope_id();
-    Ok(create_actor(value_stream, persistence_id, scope_id))
+    Ok(
+        create_field_path_alias_actor(alias_actor_context, piped, path)
+            .expect("non-empty field access paths should stay on the direct alias path"),
+    )
 }
 
 /// Build a HOLD actor (stateful accumulator).
@@ -4097,63 +9097,21 @@ fn build_hold_actor(
         );
     }
 
-    // Use a bounded channel to hold current state value and broadcast updates
-    // Note: Sender::try_send takes &self, so we can just clone the sender
-    let (state_sender, state_receiver) = zoon::futures_channel::mpsc::channel::<Value>(16);
-
     // Get storage for persistence
     let storage = ctx.construct_context.construct_storage.clone();
-    let storage_for_state_load = storage.clone();
     let storage_for_initial_save = storage.clone();
-    let construct_context_for_state_load = ctx.construct_context.clone();
-    let actor_context_for_state_load = ctx.actor_context.clone();
-
-    // Create a ValueActor that provides the current state to the body
-    // This is what the state_param references
-    //
-    // State stream: load stored value first (if exists), else initial_actor, then state_receiver
-    let initial_actor_for_state = initial_actor.clone();
-    let state_stream = stream::unfold(
-        (true, state_receiver), // (is_first, receiver)
-        move |(is_first, mut receiver)| {
-            let storage = storage_for_state_load.clone();
-            let initial_actor = initial_actor_for_state.clone();
-            let construct_context = construct_context_for_state_load.clone();
-            let actor_context = actor_context_for_state_load.clone();
-            async move {
-                if is_first {
-                    // Try storage first - load persisted state
-                    let loaded: Option<zoon::serde_json::Value> =
-                        storage.load_state_now(persistence_id);
-                    if let Some(json) = loaded {
-                        // Deserialize stored value
-                        let value = Value::from_json(
-                            &json,
-                            ConstructId::new("HOLD state restored from storage"),
-                            construct_context,
-                            ValueIdempotencyKey::new(),
-                            actor_context,
-                        );
-                        return Some((value, (false, receiver)));
-                    }
-                    // No stored state - fall back to the current initial actor value
-                    let initial = actor_current_value_or_wait(&initial_actor).await?;
-                    Some((initial, (false, receiver)))
-                } else {
-                    // Subsequent values from state channel (updates and resets)
-                    let value = receiver.next().await?;
-                    Some((value, (false, receiver)))
-                }
-            }
-        },
-    );
-
-    // Create state actor - initial value will come through the stream asynchronously
-    let state_actor: ActorHandle = create_actor(
-        state_stream,
-        PersistenceId::new(),
-        ctx.actor_context.scope_id(),
-    );
+    // Create a direct state actor that HOLD updates explicitly instead of routing
+    // its own internal state through a separate mpsc + stream actor wrapper.
+    let state_actor: ActorHandle =
+        create_actor_forwarding(PersistenceId::new(), ctx.actor_context.scope_id());
+    let direct_hold_initial_value = if persistence.is_none() || storage.is_disabled() {
+        initial_actor.current_value().ok()
+    } else {
+        None
+    };
+    if let Some(initial_value) = direct_hold_initial_value.clone() {
+        state_actor.store_value_directly(initial_value);
+    }
 
     // Bind the state parameter in the context so body can reference it
     let mut body_parameters = (*ctx.actor_context.parameters).clone();
@@ -4220,7 +9178,6 @@ fn build_hold_actor(
         actor_context: body_actor_context,
         reference_connector: ctx.reference_connector.clone(),
         link_connector: ctx.link_connector.clone(),
-        pass_through_connector: ctx.pass_through_connector.clone(),
         function_registry_snapshot: ctx.function_registry_snapshot.clone(),
         current_module: ctx.current_module.clone(),
         module_loader: ctx.module_loader.clone(),
@@ -4236,6 +9193,19 @@ fn build_hold_actor(
         }
     };
 
+    if let Some(initial_value) = direct_hold_initial_value {
+        if let Some(output) = try_create_direct_state_stateful_hold_actor(
+            initial_value,
+            initial_actor.clone(),
+            state_actor_for_update.clone(),
+            body_result.clone(),
+            persistence_id,
+            ctx.actor_context.scope_id(),
+        ) {
+            return Ok(Some(output));
+        }
+    }
+
     // When body produces new values, update the state
     // Note: We avoid self-reactivity by not triggering body re-evaluation
     // from state changes. Body only evaluates when its event sources fire.
@@ -4246,7 +9216,6 @@ fn build_hold_actor(
     struct HoldOutputEvent {
         value: Value,
         persist: bool,
-        reset_state: bool,
         update_state_actor: bool,
     }
 
@@ -4254,7 +9223,6 @@ fn build_hold_actor(
     let construct_context_for_initial = ctx.construct_context.clone();
     let actor_context_for_initial = ctx.actor_context.clone();
     let storage_for_output = storage.clone();
-    let state_sender_for_output = state_sender.clone();
     let state_actor_for_output = state_actor_for_update.clone();
     let scope_id = ctx.actor_context.scope_id();
 
@@ -4288,8 +9256,7 @@ fn build_hold_actor(
                             HoldOutputEvent {
                                 value: restored_value,
                                 persist: false,
-                                reset_state: false,
-                                update_state_actor: false,
+                                update_state_actor: true,
                             },
                             HoldResetInputState::ForwardingSource {
                                 source_subscription: initial_actor.stream_from_now(),
@@ -4303,8 +9270,7 @@ fn build_hold_actor(
                         HoldOutputEvent {
                             value: first_value,
                             persist: true,
-                            reset_state: false,
-                            update_state_actor: false,
+                            update_state_actor: true,
                         },
                         HoldResetInputState::ForwardingSource {
                             source_subscription,
@@ -4319,8 +9285,7 @@ fn build_hold_actor(
                         HoldOutputEvent {
                             value,
                             persist: true,
-                            reset_state: true,
-                            update_state_actor: false,
+                            update_state_actor: true,
                         },
                         HoldResetInputState::ForwardingSource {
                             source_subscription,
@@ -4334,32 +9299,28 @@ fn build_hold_actor(
     let state_update_events = body_subscription.map(move |new_value| HoldOutputEvent {
         value: new_value,
         persist: true,
-        reset_state: true,
         update_state_actor: true,
     });
 
     let output_stream = stream::select(initial_events, state_update_events)
         .scan(None::<Value>, move |last_emitted, event| {
+            let is_stale = last_emitted
+                .as_ref()
+                .is_some_and(|current| !event.value.is_emitted_after(current.emission_seq()));
             let is_duplicate = last_emitted
                 .as_ref()
                 .is_some_and(|current| crate::engine::values_equal(current, &event.value));
             let emitted_value = event.value.clone();
-            if !is_duplicate {
+            if !is_stale && !is_duplicate {
                 *last_emitted = Some(emitted_value.clone());
             }
-            let mut state_sender = state_sender_for_output.clone();
             let state_actor = state_actor_for_output.clone();
             let storage = storage_for_output.clone();
             async move {
-                if is_duplicate {
+                if is_stale || is_duplicate {
                     return Some(None);
                 }
 
-                if event.reset_state {
-                    if let Err(e) = state_sender.send(event.value.clone()).await {
-                        zoon::println!("[HOLD] Failed to send state update: {e}");
-                    }
-                }
                 if event.update_state_actor {
                     state_actor.store_value_directly(event.value.clone());
                 }
@@ -4376,6 +9337,505 @@ fn build_hold_actor(
     let output: ActorHandle = create_actor(output_stream, persistence_id, scope_id);
 
     Ok(Some(output))
+}
+
+fn build_hold_actor_with_runtime_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    initial_actor: ActorHandle,
+    state_param: String,
+    body: static_expression::Spanned<static_expression::Expression>,
+    span: Span,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+) -> Result<Option<ActorHandle>, String> {
+    if reg.is_none() {
+        return build_hold_actor(
+            initial_actor,
+            state_param,
+            body,
+            span,
+            persistence,
+            persistence_id,
+            ctx,
+        );
+    }
+    let reg = reg
+        .as_deref_mut()
+        .expect("registry should be present for direct HOLD");
+
+    let persistence_id = persistence_id.in_scope(&ctx.actor_context.scope);
+
+    if !expression_references_parameter(&body, &state_param) {
+        return build_stateless_hold_actor_with_runtime_registry(
+            Some(reg),
+            initial_actor,
+            state_param,
+            body,
+            span,
+            persistence,
+            persistence_id,
+            ctx,
+        );
+    }
+
+    let storage = ctx.construct_context.construct_storage.clone();
+    let state_actor: ActorHandle = create_actor_forwarding_with_registry(
+        reg,
+        PersistenceId::new(),
+        ctx.actor_context.scope_id(),
+    );
+    let direct_hold_initial_value = if persistence.is_none() || storage.is_disabled() {
+        initial_actor.current_value().ok()
+    } else {
+        None
+    };
+    if let Some(initial_value) = direct_hold_initial_value.clone() {
+        enqueue_actor_value_on_runtime_queue_with_registry(reg, &state_actor, initial_value);
+        drain_runtime_ready_queue_with_registry(reg);
+    }
+
+    let mut body_parameters = (*ctx.actor_context.parameters).clone();
+    body_parameters.insert(state_param.clone(), state_actor.clone());
+
+    let state_actor_for_update = state_actor.clone();
+    let state_actor_for_callback = state_actor;
+    let backpressure_permit = BackpressureCoordinator::new();
+    let permit_for_callback = backpressure_permit.clone();
+    let hold_state_update_callback: Arc<dyn Fn(Value)> = Arc::new(move |new_value: Value| {
+        state_actor_for_callback.store_value_directly(new_value);
+        permit_for_callback.release();
+    });
+
+    let body_actor_context = ActorContext {
+        output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
+        piped: None,
+        passed: ctx.actor_context.passed.clone(),
+        parameters: Arc::new(body_parameters),
+        sequential_processing: true,
+        backpressure_permit: Some(backpressure_permit),
+        hold_state_update_callback: Some(hold_state_update_callback),
+        use_lazy_actors: true,
+        is_snapshot_context: false,
+        object_locals: ctx.actor_context.object_locals.clone(),
+        scope: ctx.actor_context.scope.clone(),
+        subscription_scope: ctx.actor_context.subscription_scope.clone(),
+        call_recorder: ctx.actor_context.call_recorder.clone(),
+        is_restoring: ctx.actor_context.is_restoring,
+        list_append_storage_key: ctx.actor_context.list_append_storage_key.clone(),
+        recording_counter: ctx.actor_context.recording_counter.clone(),
+        subscription_after_seq: ctx.actor_context.subscription_after_seq,
+        snapshot_emission_seq: ctx.actor_context.snapshot_emission_seq,
+        registry_scope_id: ctx.actor_context.registry_scope_id,
+    };
+
+    let body_ctx = EvaluationContext {
+        construct_context: ctx.construct_context.clone(),
+        actor_context: body_actor_context,
+        reference_connector: ctx.reference_connector.clone(),
+        link_connector: ctx.link_connector.clone(),
+        function_registry_snapshot: ctx.function_registry_snapshot.clone(),
+        current_module: ctx.current_module.clone(),
+        module_loader: ctx.module_loader.clone(),
+        source_code: ctx.source_code.clone(),
+    };
+
+    let body_result = match evaluate_expression_with_runtime_registry(Some(reg), body, body_ctx)? {
+        Some(actor) => actor,
+        None => return Ok(None),
+    };
+
+    if let Some(initial_value) = direct_hold_initial_value {
+        if let Some(output) = try_create_direct_state_stateful_hold_actor_with_registry(
+            Some(reg),
+            initial_value,
+            initial_actor,
+            state_actor_for_update,
+            body_result,
+            persistence_id,
+            ctx.actor_context.scope_id(),
+        ) {
+            return Ok(Some(output));
+        }
+    }
+
+    Err("runtime-local HOLD fallback still requires direct-state body support".to_string())
+}
+
+fn enqueue_direct_hold_output_value_with_registry(
+    reg: &mut ActorRegistry,
+    output_actor: &ActorHandle,
+    last_emitted: &RefCell<Option<Value>>,
+    value: Value,
+) {
+    if last_emitted
+        .borrow()
+        .as_ref()
+        .is_some_and(|current| crate::engine::values_equal(current, &value))
+    {
+        return;
+    }
+    *last_emitted.borrow_mut() = Some(value.clone());
+    enqueue_actor_value_on_runtime_queue_with_registry(reg, output_actor, value);
+}
+
+fn try_create_direct_state_stateful_hold_actor(
+    initial_value: Value,
+    initial_actor: ActorHandle,
+    state_actor: ActorHandle,
+    body_result: ActorHandle,
+    persistence_id: PersistenceId,
+    scope_id: ScopeId,
+) -> Option<ActorHandle> {
+    let output = create_actor_forwarding(persistence_id, scope_id);
+    retain_actor_handles(
+        &output,
+        [
+            initial_actor.clone(),
+            state_actor.clone(),
+            body_result.clone(),
+        ],
+    );
+
+    let last_emitted = Rc::new(RefCell::new(Some(initial_value.clone())));
+    output.store_value_directly(initial_value);
+
+    let state_actor_id = state_actor.actor_id();
+    let body_result_actor_id = body_result.actor_id();
+    let initial_actor_has_current = initial_actor.current_value().is_ok();
+    let body_result_current_value = body_result.current_value().ok();
+    if let Some(current_body_value) = body_result_current_value.clone() {
+        if body_result_actor_id != state_actor_id {
+            state_actor.store_value_directly(current_body_value.clone());
+        }
+        output.store_value_directly(current_body_value.clone());
+        *last_emitted.borrow_mut() = Some(current_body_value);
+    }
+
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+
+        watch_actor_current_and_future_with_registry(
+            Some(&mut reg),
+            &output,
+            &initial_actor,
+            initial_actor_has_current,
+            {
+                let output = output.clone();
+                let state_actor = state_actor.clone();
+                let last_emitted = last_emitted.clone();
+                move |reg, value| {
+                    if !output.is_alive() {
+                        return;
+                    }
+                    enqueue_direct_hold_output_value_with_registry(
+                        reg,
+                        &output,
+                        &last_emitted,
+                        value.clone(),
+                    );
+                    enqueue_actor_value_on_runtime_queue_with_registry(reg, &state_actor, value);
+                }
+            },
+        );
+
+        watch_actor_current_and_future_with_registry(
+            Some(&mut reg),
+            &output,
+            &body_result,
+            body_result_current_value.is_some(),
+            {
+                let output = output.clone();
+                let state_actor = state_actor.clone();
+                let last_emitted = last_emitted.clone();
+                move |reg, value| {
+                    if !output.is_alive() {
+                        return;
+                    }
+                    if body_result_actor_id != state_actor_id {
+                        enqueue_actor_value_on_runtime_queue_with_registry(
+                            reg,
+                            &state_actor,
+                            value.clone(),
+                        );
+                    }
+                    enqueue_direct_hold_output_value_with_registry(
+                        reg,
+                        &output,
+                        &last_emitted,
+                        value,
+                    );
+                }
+            },
+        );
+
+        drain_runtime_ready_queue_with_registry(&mut reg);
+    });
+    crate::engine::poll_spawned_async_source_tasks_after_insertion();
+
+    Some(output)
+}
+
+fn try_create_direct_state_stateful_hold_actor_with_registry(
+    reg: Option<&mut ActorRegistry>,
+    initial_value: Value,
+    initial_actor: ActorHandle,
+    state_actor: ActorHandle,
+    body_result: ActorHandle,
+    persistence_id: PersistenceId,
+    scope_id: ScopeId,
+) -> Option<ActorHandle> {
+    let Some(reg) = reg else {
+        return try_create_direct_state_stateful_hold_actor(
+            initial_value,
+            initial_actor,
+            state_actor,
+            body_result,
+            persistence_id,
+            scope_id,
+        );
+    };
+
+    let output = create_actor_forwarding_with_registry(reg, persistence_id, scope_id);
+    retain_actor_handles_with_registry(
+        Some(reg),
+        &output,
+        [
+            initial_actor.clone(),
+            state_actor.clone(),
+            body_result.clone(),
+        ],
+    );
+
+    let last_emitted = Rc::new(RefCell::new(Some(initial_value.clone())));
+    enqueue_actor_value_on_runtime_queue_with_registry(reg, &output, initial_value);
+
+    let state_actor_id = state_actor.actor_id();
+    let body_result_actor_id = body_result.actor_id();
+    let initial_actor_has_current = initial_actor.current_value().is_ok();
+    let body_result_current_value = body_result.current_value().ok();
+    if let Some(current_body_value) = body_result_current_value.clone() {
+        if body_result_actor_id != state_actor_id {
+            enqueue_actor_value_on_runtime_queue_with_registry(
+                reg,
+                &state_actor,
+                current_body_value.clone(),
+            );
+        }
+        enqueue_actor_value_on_runtime_queue_with_registry(
+            reg,
+            &output,
+            current_body_value.clone(),
+        );
+        *last_emitted.borrow_mut() = Some(current_body_value);
+    }
+    drain_runtime_ready_queue_with_registry(reg);
+
+    watch_actor_current_and_future_with_registry(
+        Some(reg),
+        &output,
+        &initial_actor,
+        initial_actor_has_current,
+        {
+            let output = output.clone();
+            let state_actor = state_actor.clone();
+            let last_emitted = last_emitted.clone();
+            move |reg, value| {
+                if !output.is_alive() {
+                    return;
+                }
+                enqueue_direct_hold_output_value_with_registry(
+                    reg,
+                    &output,
+                    &last_emitted,
+                    value.clone(),
+                );
+                enqueue_actor_value_on_runtime_queue_with_registry(reg, &state_actor, value);
+            }
+        },
+    );
+
+    watch_actor_current_and_future_with_registry(
+        Some(reg),
+        &output,
+        &body_result,
+        body_result_current_value.is_some(),
+        {
+            let output = output.clone();
+            let state_actor = state_actor.clone();
+            let last_emitted = last_emitted.clone();
+            move |reg, value| {
+                if !output.is_alive() {
+                    return;
+                }
+                if body_result_actor_id != state_actor_id {
+                    enqueue_actor_value_on_runtime_queue_with_registry(
+                        reg,
+                        &state_actor,
+                        value.clone(),
+                    );
+                }
+                enqueue_direct_hold_output_value_with_registry(reg, &output, &last_emitted, value);
+            }
+        },
+    );
+
+    drain_runtime_ready_queue_with_registry(reg);
+    crate::engine::poll_spawned_async_source_tasks_after_insertion();
+    Some(output)
+}
+
+fn try_create_direct_state_stateless_hold_actor(
+    initial_value: Value,
+    initial_actor: ActorHandle,
+    body_result: ActorHandle,
+    persistence_id: PersistenceId,
+    scope_id: ScopeId,
+) -> Option<ActorHandle> {
+    let output = create_actor_forwarding(persistence_id, scope_id);
+    retain_actor_handles(&output, [initial_actor.clone(), body_result.clone()]);
+
+    let last_emitted = Rc::new(RefCell::new(Some(initial_value.clone())));
+    output.store_value_directly(initial_value);
+
+    let initial_actor_has_current = initial_actor.current_value().is_ok();
+    let body_result_current_value = body_result.current_value().ok();
+    if let Some(current_body_value) = body_result_current_value.clone() {
+        output.store_value_directly(current_body_value.clone());
+        *last_emitted.borrow_mut() = Some(current_body_value);
+    }
+
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+
+        watch_actor_current_and_future_with_registry(
+            Some(&mut reg),
+            &output,
+            &initial_actor,
+            initial_actor_has_current,
+            {
+                let output = output.clone();
+                let last_emitted = last_emitted.clone();
+                move |reg, value| {
+                    if !output.is_alive() {
+                        return;
+                    }
+                    enqueue_direct_hold_output_value_with_registry(
+                        reg,
+                        &output,
+                        &last_emitted,
+                        value,
+                    );
+                }
+            },
+        );
+
+        watch_actor_current_and_future_with_registry(
+            Some(&mut reg),
+            &output,
+            &body_result,
+            body_result_current_value.is_some(),
+            {
+                let output = output.clone();
+                let last_emitted = last_emitted.clone();
+                move |reg, value| {
+                    if !output.is_alive() {
+                        return;
+                    }
+                    enqueue_direct_hold_output_value_with_registry(
+                        reg,
+                        &output,
+                        &last_emitted,
+                        value,
+                    );
+                }
+            },
+        );
+
+        drain_runtime_ready_queue_with_registry(&mut reg);
+    });
+    crate::engine::poll_spawned_async_source_tasks_after_insertion();
+
+    Some(output)
+}
+
+fn try_create_direct_state_stateless_hold_actor_with_registry(
+    reg: Option<&mut ActorRegistry>,
+    initial_value: Value,
+    initial_actor: ActorHandle,
+    body_result: ActorHandle,
+    persistence_id: PersistenceId,
+    scope_id: ScopeId,
+) -> Option<ActorHandle> {
+    let Some(reg) = reg else {
+        return try_create_direct_state_stateless_hold_actor(
+            initial_value,
+            initial_actor,
+            body_result,
+            persistence_id,
+            scope_id,
+        );
+    };
+
+    let output = create_actor_forwarding_with_registry(reg, persistence_id, scope_id);
+    retain_actor_handles_with_registry(
+        Some(reg),
+        &output,
+        [initial_actor.clone(), body_result.clone()],
+    );
+
+    let last_emitted = Rc::new(RefCell::new(Some(initial_value.clone())));
+    enqueue_actor_value_on_runtime_queue_with_registry(reg, &output, initial_value);
+
+    let initial_actor_has_current = initial_actor.current_value().is_ok();
+    let body_result_current_value = body_result.current_value().ok();
+    if let Some(current_body_value) = body_result_current_value.clone() {
+        enqueue_actor_value_on_runtime_queue_with_registry(
+            reg,
+            &output,
+            current_body_value.clone(),
+        );
+        *last_emitted.borrow_mut() = Some(current_body_value);
+    }
+    drain_runtime_ready_queue_with_registry(reg);
+
+    watch_actor_current_and_future_with_registry(
+        Some(reg),
+        &output,
+        &initial_actor,
+        initial_actor_has_current,
+        {
+            let output = output.clone();
+            let last_emitted = last_emitted.clone();
+            move |reg, value| {
+                if !output.is_alive() {
+                    return;
+                }
+                enqueue_direct_hold_output_value_with_registry(reg, &output, &last_emitted, value);
+            }
+        },
+    );
+
+    watch_actor_current_and_future_with_registry(
+        Some(reg),
+        &output,
+        &body_result,
+        body_result_current_value.is_some(),
+        {
+            let output = output.clone();
+            let last_emitted = last_emitted.clone();
+            move |reg, value| {
+                if !output.is_alive() {
+                    return;
+                }
+                enqueue_direct_hold_output_value_with_registry(reg, &output, &last_emitted, value);
+            }
+        },
+    );
+
+    drain_runtime_ready_queue_with_registry(reg);
+    crate::engine::poll_spawned_async_source_tasks_after_insertion();
+    Some(output)
 }
 
 fn build_stateless_hold_actor(
@@ -4419,7 +9879,6 @@ fn build_stateless_hold_actor(
         actor_context: body_actor_context,
         reference_connector: ctx.reference_connector.clone(),
         link_connector: ctx.link_connector.clone(),
-        pass_through_connector: ctx.pass_through_connector.clone(),
         function_registry_snapshot: ctx.function_registry_snapshot.clone(),
         current_module: ctx.current_module.clone(),
         module_loader: ctx.module_loader.clone(),
@@ -4430,6 +9889,24 @@ fn build_stateless_hold_actor(
         Some(actor) => actor,
         None => return Ok(None),
     };
+
+    if let Some(initial_value) =
+        if _persistence.is_none() || ctx.construct_context.construct_storage.is_disabled() {
+            initial_actor.current_value().ok()
+        } else {
+            None
+        }
+    {
+        if let Some(output) = try_create_direct_state_stateless_hold_actor(
+            initial_value,
+            initial_actor.clone(),
+            body_result.clone(),
+            persistence_id,
+            ctx.actor_context.scope_id(),
+        ) {
+            return Ok(Some(output));
+        }
+    }
 
     let body_subscription = hold_body_current_and_future_values(body_result);
     let construct_context_for_initial = ctx.construct_context.clone();
@@ -4512,16 +9989,19 @@ fn build_stateless_hold_actor(
 
     let output_stream = stream::select(initial_events, state_update_events)
         .scan(None::<Value>, move |last_emitted, event| {
+            let is_stale = last_emitted
+                .as_ref()
+                .is_some_and(|current| !event.value.is_emitted_after(current.emission_seq()));
             let is_duplicate = last_emitted
                 .as_ref()
                 .is_some_and(|current| crate::engine::values_equal(current, &event.value));
             let emitted_value = event.value.clone();
-            if !is_duplicate {
+            if !is_stale && !is_duplicate {
                 *last_emitted = Some(emitted_value.clone());
             }
             let storage = storage_for_output.clone();
             async move {
-                if is_duplicate {
+                if is_stale || is_duplicate {
                     return Some(None);
                 }
 
@@ -4540,8 +10020,112 @@ fn build_stateless_hold_actor(
     Ok(Some(output))
 }
 
+fn build_stateless_hold_actor_with_runtime_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    initial_actor: ActorHandle,
+    state_param: String,
+    body: static_expression::Spanned<static_expression::Expression>,
+    span: Span,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+) -> Result<Option<ActorHandle>, String> {
+    if reg.is_none() {
+        return build_stateless_hold_actor(
+            initial_actor,
+            state_param,
+            body,
+            span,
+            persistence,
+            persistence_id,
+            ctx,
+        );
+    }
+
+    let body_actor_context = ActorContext {
+        output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
+        piped: None,
+        passed: ctx.actor_context.passed.clone(),
+        parameters: ctx.actor_context.parameters.clone(),
+        sequential_processing: ctx.actor_context.sequential_processing,
+        backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
+        hold_state_update_callback: None,
+        use_lazy_actors: ctx.actor_context.use_lazy_actors,
+        is_snapshot_context: false,
+        object_locals: ctx.actor_context.object_locals.clone(),
+        scope: ctx.actor_context.scope.clone(),
+        subscription_scope: ctx.actor_context.subscription_scope.clone(),
+        call_recorder: ctx.actor_context.call_recorder.clone(),
+        is_restoring: ctx.actor_context.is_restoring,
+        list_append_storage_key: ctx.actor_context.list_append_storage_key.clone(),
+        recording_counter: ctx.actor_context.recording_counter.clone(),
+        subscription_after_seq: ctx.actor_context.subscription_after_seq,
+        snapshot_emission_seq: ctx.actor_context.snapshot_emission_seq,
+        registry_scope_id: ctx.actor_context.registry_scope_id,
+    };
+
+    let body_ctx = EvaluationContext {
+        construct_context: ctx.construct_context.clone(),
+        actor_context: body_actor_context,
+        reference_connector: ctx.reference_connector.clone(),
+        link_connector: ctx.link_connector.clone(),
+        function_registry_snapshot: ctx.function_registry_snapshot.clone(),
+        current_module: ctx.current_module.clone(),
+        module_loader: ctx.module_loader.clone(),
+        source_code: ctx.source_code.clone(),
+    };
+
+    let body_result =
+        match evaluate_expression_with_runtime_registry(reg.as_deref_mut(), body, body_ctx)? {
+            Some(actor) => actor,
+            None => return Ok(None),
+        };
+
+    if let Some(initial_value) =
+        if persistence.is_none() || ctx.construct_context.construct_storage.is_disabled() {
+            initial_actor.current_value().ok()
+        } else {
+            None
+        }
+    {
+        if let Some(output) = try_create_direct_state_stateless_hold_actor_with_registry(
+            reg,
+            initial_value,
+            initial_actor,
+            body_result,
+            persistence_id,
+            ctx.actor_context.scope_id(),
+        ) {
+            return Ok(Some(output));
+        }
+    }
+
+    Err(
+        "runtime-local stateless HOLD fallback still requires direct-state body support"
+            .to_string(),
+    )
+}
+
 /// Build a TEXT { ... } literal actor with interpolation support.
 fn build_text_literal_actor(
+    parts: Vec<static_expression::TextPart>,
+    span: Span,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+) -> Result<ActorHandle, String> {
+    build_text_literal_actor_with_runtime_registry(
+        None,
+        parts,
+        span,
+        persistence,
+        persistence_id,
+        ctx,
+    )
+}
+
+fn build_text_literal_actor_with_runtime_registry(
+    mut reg: Option<&mut ActorRegistry>,
     parts: Vec<static_expression::TextPart>,
     span: Span,
     persistence: Option<Persistence>,
@@ -4556,12 +10140,14 @@ fn build_text_literal_actor(
             static_expression::TextPart::Text(text) => {
                 // Literal text part - create a constant text value
                 let text_string = text.to_string();
-                let text_actor = Text::new_arc_value_actor(
-                    ConstructInfo::new(
-                        format!("TextLiteral part"),
-                        None,
-                        format!("{span}; TextLiteral text part"),
-                    ),
+                let construct_info = ConstructInfo::new(
+                    format!("TextLiteral part"),
+                    None,
+                    format!("{span}; TextLiteral text part"),
+                );
+                let text_actor = Text::new_arc_value_actor_with_registry(
+                    reg.as_deref_mut(),
+                    construct_info,
                     ctx.construct_context.clone(),
                     persistence_id,
                     ctx.actor_context.clone(),
@@ -4580,48 +10166,43 @@ fn build_text_literal_actor(
                 let field_path: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
                 // Look up the base variable
-                let base_actor = if let Some(var_actor) =
-                    ctx.actor_context.parameters.get(base_name)
-                {
-                    Some(var_actor.clone())
-                } else if let Some(ref_span) = referenced_span {
-                    // First check object_locals for instance-specific resolution
-                    // This prevents span-based overwrites when multiple Objects are created
-                    // from the same function definition (e.g., BLOCK inside List/map)
-                    if let Some(local_actor) =
-                        ctx.actor_context.object_locals.get(ref_span).cloned()
-                    {
-                        Some(local_actor)
+                let base_actor =
+                    if let Some(var_actor) = ctx.actor_context.parameters.get(base_name) {
+                        Some(var_actor.clone())
+                    } else if let Some(ref_span) = referenced_span {
+                        // First check object_locals for instance-specific resolution
+                        // This prevents span-based overwrites when multiple Objects are created
+                        // from the same function definition (e.g., BLOCK inside List/map)
+                        if let Some(local_actor) =
+                            ctx.actor_context.object_locals.get(ref_span).cloned()
+                        {
+                            Some(local_actor)
+                        } else {
+                            // Fall back to connector-owned waiting actor for outer scope.
+                            let ref_connector = ctx.try_reference_connector().ok_or_else(|| {
+                                "ReferenceConnector dropped - program shutting down".to_string()
+                            })?;
+                            Some(ref_connector.referenceable_or_waiting_actor_with_registry(
+                                reg.as_deref_mut(),
+                                *ref_span,
+                                ctx.actor_context.scope_id(),
+                            ))
+                        }
                     } else {
-                        // Fall back to async lookup via ReferenceConnector for outer scope
-                        let ref_connector = ctx.try_reference_connector().ok_or_else(|| {
-                            "ReferenceConnector dropped - program shutting down".to_string()
-                        })?;
-                        let ref_span_copy = *ref_span;
-                        Some(create_actor_forwarding_from_future_source(
-                            async move { Some(ref_connector.referenceable(ref_span_copy).await) },
-                            PersistenceId::new(),
-                            ctx.actor_context.scope_id(),
-                        ))
-                    }
-                } else {
-                    None
-                };
+                        None
+                    };
 
                 if let Some(base_actor) = base_actor {
                     if field_path.is_empty() {
                         // Simple variable, no field access
                         part_actors.push((false, base_actor));
                     } else {
-                        let field_actor = create_actor_forwarding_from_future_source(
-                            async move {
-                                actor_field_actor_from_current_or_wait(&base_actor, &field_path)
-                                    .await
-                            },
-                            PersistenceId::new(),
-                            ctx.actor_context.scope_id(),
+                        let field_actor = create_text_interpolation_field_actor_with_registry(
+                            reg.as_deref_mut(),
+                            base_actor,
+                            field_path,
+                            ctx.actor_context.clone(),
                         );
-
                         part_actors.push((false, field_actor));
                     }
                 } else {
@@ -4652,36 +10233,20 @@ fn build_text_literal_actor(
         // Single literal text part - return as-is
         Ok(part_actors.into_iter().next().unwrap().1)
     } else {
-        // Multiple parts or interpolations - combine with combineLatest-like behavior
-        let construct_context_for_combine = ctx.construct_context.clone();
-        let span_for_combine = span;
-        let combined_stream = combine_text_part_current_and_future_values(&part_actors);
-
-        // Map combined strings directly to Text Values.
-        // IMPORTANT: Do NOT use flat_map with Text actors here!
-        // flat_map waits for inner streams to complete, but constant Text actor
-        // subscriptions never complete - they emit once then return Pending forever.
-        // This would cause flat_map to wait forever after the first value.
-        let text_value_stream = combined_stream.map(move |combined_text| {
-            Value::Text(
-                Arc::new(Text::new(
-                    ConstructInfo::new(
-                        format!("TextLiteral combined"),
-                        None,
-                        format!("{span_for_combine}; TextLiteral combined"),
-                    ),
-                    construct_context_for_combine.clone(),
-                    combined_text,
-                )),
-                ValueMetadata::new(ValueIdempotencyKey::new()),
+        Ok(
+            try_create_direct_state_text_literal_actor_with_runtime_registry(
+                reg.as_deref_mut(),
+                &part_actors,
+                span,
+                persistence_id,
+                &ctx,
             )
-        });
-
-        let scope_id = ctx.actor_context.scope_id();
-        Ok(create_actor(text_value_stream, persistence_id, scope_id))
+            .expect("text literal parts should always support direct runtime subscribers"),
+        )
     }
 }
 
+#[cfg(test)]
 fn combine_text_part_current_and_future_values(
     part_actors: &[(bool, ActorHandle)],
 ) -> LocalBoxStream<'static, String> {
@@ -4748,141 +10313,302 @@ fn build_link_setter_actor(
     evaluate_alias_immediate(alias.node, span, persistence, persistence_id, ctx)
 }
 
-/// Traverse an alias path and return the LINK sender at the end of the path.
-/// This is used by piped LinkSetter (`element |> LINK { path.to.link }`) to send
-/// the piped value to the target LINK variable.
-async fn get_link_sender_from_alias(
+/// Traverse an alias path and return the target LINK actor at the end of the path.
+/// This is used by piped LinkSetter (`element |> LINK { path.to.link }`) so the
+/// piped source can reuse normal actor forwarding instead of an extra send loop.
+fn try_get_link_target_actor_now(
     alias: static_expression::Alias,
-    ctx: EvaluationContext,
-) -> Option<NamedChannel<Value>> {
+    ctx: &EvaluationContext,
+) -> Option<ActorHandle> {
+    let (root_actor, field_path) = link_target_root_actor_and_field_path(&alias, ctx, false)?;
+    try_get_link_target_actor_from_root_now(&root_actor, &field_path)
+}
+
+fn link_target_root_actor_and_field_path(
+    alias: &static_expression::Alias,
+    ctx: &EvaluationContext,
+    allow_waiting_reference: bool,
+) -> Option<(ActorHandle, Vec<String>)> {
+    link_target_root_actor_and_field_path_with_registry(None, alias, ctx, allow_waiting_reference)
+}
+
+fn link_target_root_actor_and_field_path_with_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    alias: &static_expression::Alias,
+    ctx: &EvaluationContext,
+    allow_waiting_reference: bool,
+) -> Option<(ActorHandle, Vec<String>)> {
     match alias {
-        static_expression::Alias::WithPassed { extra_parts } => {
-            // Start from PASSED value and traverse extra_parts
-            let passed = ctx.actor_context.passed.as_ref()?;
-
-            // Prefer the already-materialized value when available. Nested objects that
-            // contain LINK placeholders can have a structural current value even when
-            // waiting for `value()` would hang on a child that never emits a normal value.
-            let mut current_value = actor_current_value_or_wait(passed).await?;
-
-            // Traverse the path
-            for (i, part) in extra_parts.iter().enumerate() {
-                let part_str = part.to_string();
-                let is_last = i == extra_parts.len() - 1;
-
-                // Get the variable from the current object
-                let variable = match &current_value {
-                    Value::Object(obj, _) => obj.variable(&part_str),
-                    Value::TaggedObject(tagged, _) => tagged.variable(&part_str),
-                    _ => {
-                        zoon::eprintln!(
-                            "[get_link_sender_from_alias] Expected object at '{}', got {}",
-                            part_str,
-                            current_value.construct_info()
-                        );
-                        return None;
-                    }
-                }?;
-
-                if is_last {
-                    // At the end of the path, this should be a LINK variable
-                    return variable.link_value_sender();
-                } else {
-                    current_value = actor_current_value_or_wait(&variable.value_actor()).await?;
-                }
-            }
-
-            None
-        }
+        static_expression::Alias::WithPassed { extra_parts } => Some((
+            ctx.actor_context.passed.as_ref()?.clone(),
+            extra_parts.iter().map(|part| part.to_string()).collect(),
+        )),
         static_expression::Alias::WithoutPassed {
             parts,
             referenced_span,
         } => {
-            // For non-PASSED aliases, use the reference connector to get the root variable
-            if parts.is_empty() {
+            if parts.len() <= 1 {
                 return None;
             }
 
-            // Get the root variable from object_locals, parameters, or reference connector
-            // Note: object_locals contains function argument actors (arg_locals) which are needed
-            // to correctly resolve LINK targets inside function calls. Without this, multiple
-            // calls to the same function would overwrite each other's LINK registrations.
             let first_part = parts.first()?.to_string();
-
             let root_actor = if let Some(param_actor) =
                 ctx.actor_context.parameters.get(&first_part).cloned()
             {
                 param_actor
             } else if let Some(ref_span) = referenced_span {
-                // First check object_locals (which includes arg_locals for function arguments)
-                // This ensures each function call instance gets its own unique actor
-                if let Some(local_actor) = ctx.actor_context.object_locals.get(&ref_span).cloned() {
+                if let Some(local_actor) = ctx.actor_context.object_locals.get(ref_span).cloned() {
                     local_actor
+                } else if allow_waiting_reference {
+                    ctx.try_reference_connector()?
+                        .referenceable_or_waiting_actor_with_registry(
+                            reg.as_deref_mut(),
+                            *ref_span,
+                            ctx.actor_context.scope_id(),
+                        )
                 } else {
-                    // Fall back to global reference connector
-                    let ref_connector = ctx.try_reference_connector()?;
-                    ref_connector.referenceable(ref_span).await
+                    return None;
                 }
             } else {
-                zoon::eprintln!(
-                    "[get_link_sender_from_alias] Cannot resolve root variable '{}'",
-                    first_part
-                );
                 return None;
             };
 
-            if parts.len() == 1 {
-                // Single-part alias pointing to a LINK variable directly is not supported
-                // without object navigation context. LINK senders are obtained from Variables,
-                // and for single-part aliases we only have a ValueActor.
-                // Multi-part paths like `obj.link_field` navigate to the Variable and work.
-                zoon::eprintln!(
-                    "[get_link_sender_from_alias] Single-part LINK alias '{}' not supported without object context",
-                    first_part
-                );
-                return None;
-            }
-
-            // Prefer current values during object traversal for the same reason as above.
-            let mut current_value = actor_current_value_or_wait(&root_actor).await?;
-
-            // Traverse the remaining path (skip first part since we already resolved it)
-            for (i, part) in parts.iter().skip(1).enumerate() {
-                let part_str = part.to_string();
-                let is_last = i == parts.len() - 2; // -2 because we skipped first
-
-                // Get the variable from the current object
-                let variable = match &current_value {
-                    Value::Object(obj, _) => obj.variable(&part_str),
-                    Value::TaggedObject(tagged, _) => tagged.variable(&part_str),
-                    _ => {
-                        zoon::eprintln!(
-                            "[get_link_sender_from_alias] Expected object at '{}', got {}",
-                            part_str,
-                            current_value.construct_info()
-                        );
-                        return None;
-                    }
-                }?;
-
-                if is_last {
-                    // At the end of the path, this should be a LINK variable
-                    let sender = variable.link_value_sender();
-                    if sender.is_none() {
-                        zoon::eprintln!(
-                            "[get_link_sender_from_alias] Final variable '{}' is not a LINK",
-                            part_str
-                        );
-                    }
-                    return sender;
-                } else {
-                    current_value = actor_current_value_or_wait(&variable.value_actor()).await?;
-                }
-            }
-
-            None
+            Some((
+                root_actor,
+                parts.iter().skip(1).map(|part| part.to_string()).collect(),
+            ))
         }
     }
+}
+
+fn try_get_link_target_actor_from_root_now(
+    root_actor: &ActorHandle,
+    field_path: &[String],
+) -> Option<ActorHandle> {
+    if field_path.is_empty() {
+        return None;
+    }
+
+    let mut current_value = actor_current_value_now(root_actor)?;
+
+    for (i, part) in field_path.iter().enumerate() {
+        let is_last = i == field_path.len() - 1;
+
+        let variable = match &current_value {
+            Value::Object(obj, _) => obj.variable(part),
+            Value::TaggedObject(tagged, _) => tagged.variable(part),
+            _ => return None,
+        }?;
+
+        if is_last {
+            if variable.link_value_sender().is_none() {
+                return None;
+            }
+            return Some(variable.value_actor());
+        }
+
+        current_value = actor_current_value_now(&variable.value_actor())?;
+    }
+
+    None
+}
+
+enum WaitingLinkTargetStep {
+    PendingCurrent,
+    MissingPath,
+    ResolvedLink(ActorHandle),
+    NextActor {
+        actor: ActorHandle,
+        remaining_field_path: Vec<String>,
+    },
+}
+
+fn waiting_link_target_step(
+    current_actor: &ActorHandle,
+    field_path: &[String],
+) -> WaitingLinkTargetStep {
+    if field_path.is_empty() {
+        return WaitingLinkTargetStep::MissingPath;
+    }
+
+    let Some(current_value) = actor_current_value_now(current_actor) else {
+        return WaitingLinkTargetStep::PendingCurrent;
+    };
+
+    let Some(variable) = (match &current_value {
+        Value::Object(object, _) => object.variable(&field_path[0]),
+        Value::TaggedObject(tagged_object, _) => tagged_object.variable(&field_path[0]),
+        _ => None,
+    }) else {
+        return WaitingLinkTargetStep::MissingPath;
+    };
+
+    if field_path.len() == 1 {
+        if variable.link_value_sender().is_none() {
+            return WaitingLinkTargetStep::MissingPath;
+        }
+        return WaitingLinkTargetStep::ResolvedLink(variable.value_actor());
+    }
+
+    WaitingLinkTargetStep::NextActor {
+        actor: variable.value_actor(),
+        remaining_field_path: field_path[1..].to_vec(),
+    }
+}
+
+fn try_connect_waiting_link_target_from_actor_path_with_registry(
+    reg: Option<&mut ActorRegistry>,
+    owner: &ActorHandle,
+    source_actor: ActorHandle,
+    current_actor: ActorHandle,
+    field_path: Vec<String>,
+) -> bool {
+    match waiting_link_target_step(&current_actor, &field_path) {
+        WaitingLinkTargetStep::ResolvedLink(link_target_actor) => {
+            match reg {
+                Some(reg) => connect_forwarding_current_and_future_with_registry(
+                    Some(reg),
+                    link_target_actor,
+                    source_actor,
+                ),
+                None => connect_forwarding_current_and_future(link_target_actor, source_actor),
+            }
+            true
+        }
+        WaitingLinkTargetStep::NextActor {
+            actor,
+            remaining_field_path,
+        } => try_connect_waiting_link_target_from_actor_path_with_registry(
+            reg,
+            owner,
+            source_actor,
+            actor,
+            remaining_field_path,
+        ),
+        WaitingLinkTargetStep::PendingCurrent => {
+            watch_actor_current_and_future_until_with_registry(
+                reg,
+                owner,
+                &current_actor,
+                false,
+                {
+                    let owner = owner.clone();
+                    let source_actor = source_actor.clone();
+                    let current_actor = current_actor.clone();
+                    let field_path = field_path.clone();
+                    move |reg, _value| {
+                        try_connect_waiting_link_target_from_actor_path_with_registry(
+                            Some(reg),
+                            &owner,
+                            source_actor.clone(),
+                            current_actor.clone(),
+                            field_path.clone(),
+                        )
+                    }
+                },
+            );
+            true
+        }
+        WaitingLinkTargetStep::MissingPath => false,
+    }
+}
+
+fn try_connect_waiting_link_target_without_scope_task(
+    alias: static_expression::Alias,
+    ctx: &EvaluationContext,
+    source_actor: ActorHandle,
+) -> bool {
+    let Some((root_actor, field_path)) = link_target_root_actor_and_field_path(&alias, ctx, true)
+    else {
+        return false;
+    };
+
+    retain_actor_handle(&source_actor, root_actor.clone());
+    try_connect_waiting_link_target_from_actor_path_with_registry(
+        None,
+        &source_actor,
+        source_actor.clone(),
+        root_actor,
+        field_path,
+    )
+}
+
+fn try_connect_waiting_link_target_without_scope_task_with_registry(
+    reg: Option<&mut ActorRegistry>,
+    alias: static_expression::Alias,
+    ctx: &EvaluationContext,
+    source_actor: ActorHandle,
+) -> bool {
+    let Some(reg) = reg else {
+        return try_connect_waiting_link_target_without_scope_task(alias, ctx, source_actor);
+    };
+
+    let Some((root_actor, field_path)) =
+        link_target_root_actor_and_field_path_with_registry(Some(reg), &alias, ctx, true)
+    else {
+        return false;
+    };
+
+    retain_actor_handles_with_registry(
+        Some(reg),
+        &source_actor,
+        std::iter::once(root_actor.clone()),
+    );
+    try_connect_waiting_link_target_from_actor_path_with_registry(
+        Some(reg),
+        &source_actor,
+        source_actor.clone(),
+        root_actor,
+        field_path,
+    )
+}
+
+fn build_link_setter_actor_with_runtime_registry(
+    reg: Option<&mut ActorRegistry>,
+    alias: static_expression::Spanned<static_expression::Alias>,
+    span: Span,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+) -> Result<ActorHandle, String> {
+    let Some(source_actor) = ctx.actor_context.piped.clone() else {
+        return build_link_setter_actor(alias, span, persistence, persistence_id, ctx);
+    };
+
+    match reg {
+        Some(reg) => {
+            if let Some(link_target_actor) = try_get_link_target_actor_now(alias.node.clone(), &ctx)
+            {
+                connect_forwarding_current_and_future_with_registry(
+                    Some(reg),
+                    link_target_actor,
+                    source_actor.clone(),
+                );
+                drain_runtime_ready_queue_with_registry(reg);
+            } else {
+                let _ = try_connect_waiting_link_target_without_scope_task_with_registry(
+                    Some(reg),
+                    alias.node.clone(),
+                    &ctx,
+                    source_actor.clone(),
+                );
+            }
+        }
+        None => {
+            if let Some(link_target_actor) = try_get_link_target_actor_now(alias.node.clone(), &ctx)
+            {
+                connect_forwarding_current_and_future(link_target_actor, source_actor.clone());
+            } else {
+                let _ = try_connect_waiting_link_target_without_scope_task(
+                    alias.node.clone(),
+                    &ctx,
+                    source_actor.clone(),
+                );
+            }
+        }
+    }
+
+    Ok(source_actor)
 }
 
 /// Build a List binding function (map, retain, every, any, sort_by).
@@ -4944,16 +10670,12 @@ fn build_list_binding_function(
     let link_connector = ctx
         .try_link_connector()
         .ok_or_else(|| "LinkConnector dropped - program shutting down".to_string())?;
-    let pass_through_connector = ctx
-        .try_pass_through_connector()
-        .ok_or_else(|| "PassThroughConnector dropped - program shutting down".to_string())?;
     let config = ListBindingConfig {
         binding_name,
         transform_expr,
         operation,
         reference_connector,
         link_connector,
-        pass_through_connector,
         source_code: ctx.source_code.clone(),
         function_registry_snapshot: ctx.function_registry_snapshot.clone(),
     };
@@ -5030,6 +10752,18 @@ fn build_list_append_with_recording(
             None => return Ok(Some(list_actor)),
         };
 
+        if !ctx.actor_context.use_lazy_actors {
+            if let Some(result_actor) = api::function_list_append_actor(
+                Arc::new(vec![list_actor.clone(), item_actor.clone()]),
+                ConstructId::new(format!("PersistenceId: {persistence_id}")),
+                persistence_id,
+                ctx.construct_context.clone(),
+                ctx.actor_context.clone(),
+            ) {
+                return Ok(Some(result_actor));
+            }
+        }
+
         // Inside HOLD-body materialization we need the appended list as an immediate concrete
         // value, not as a reactive list shell whose Push may arrive after the body snapshot.
         // Otherwise state updates like Cells overrides can materialize only the pre-append list.
@@ -5037,6 +10771,7 @@ fn build_list_append_with_recording(
             let construct_context = ctx.construct_context.clone();
             let actor_context = ctx.actor_context.clone();
             if let Some(result_value) = try_build_list_append_hold_snapshot_now(
+                None,
                 &list_actor,
                 &item_actor,
                 construct_context.clone(),
@@ -5052,22 +10787,13 @@ fn build_list_append_with_recording(
 
             let list_actor_for_snapshot = list_actor.clone();
             let item_actor_for_snapshot = item_actor.clone();
-            let result_future = async move {
-                build_list_append_hold_snapshot_value(
-                    &list_actor_for_snapshot,
-                    &item_actor_for_snapshot,
-                    construct_context,
-                    actor_context,
-                )
-                .await
-            };
-
-            let scope_id = ctx.actor_context.scope_id();
-            let result_actor = if ctx.actor_context.use_lazy_actors {
-                create_actor_lazy_from_future(result_future, PersistenceId::new(), scope_id)
-            } else {
-                create_actor_from_future(result_future, PersistenceId::new(), scope_id)
-            };
+            let result_actor = create_waiting_list_append_hold_snapshot_actor_with_registry(
+                None,
+                list_actor_for_snapshot,
+                item_actor_for_snapshot,
+                construct_context,
+                actor_context,
+            );
             return Ok(Some(result_actor));
         }
 
@@ -5273,156 +10999,296 @@ fn build_list_append_with_recording(
             }
         }
     }
-    let storage_handle = spawn_recorded_calls_storage_actor(storage_key.clone(), call_receiver);
+    spawn_recorded_calls_storage_actor(
+        ctx.actor_context.scope_id(),
+        storage_key.clone(),
+        call_receiver,
+    );
     if LOG_DEBUG {
         zoon::println!("[DEBUG] Spawned storage actor for key: {}", storage_key);
     }
 
-    // Build a custom change stream that includes restored items
-    // This replicates function_list_append logic but injects restored items after the first Replace
-
-    let function_call_id = ConstructId::new(format!("List/append:{}", persistence_id));
-    let actor_context_for_append = ctx.actor_context.clone();
-    let storage_key_for_append = storage_key.clone();
-    // Counter for generating call_ids - starts at stored_calls.len() so new items get unique IDs
-    let appending_counter = Arc::new(std::sync::atomic::AtomicUsize::new(stored_calls.len()));
-
-    // Tag changes with their source so we can ensure proper ordering
-    enum TaggedChange {
-        FromList(ListChange),
-        FromAppend(ListChange),
-        FromRestored(ListChange),
-    }
-
-    // Source list changes
-    let list_actor_for_stream = list_actor.clone();
-    let list_changes = list_actor_for_stream
-        .stream()
-        .filter_map(|value| {
-            future::ready(match value {
-                Value::List(list, _) => Some(list),
-                _ => None,
-            })
-        })
-        .flat_map(|list| list.stream())
-        .map(TaggedChange::FromList);
-
-    // New item changes (from item_actor stream)
-    let item_actor_for_stream = item_actor.clone();
-    let append_changes = item_actor_for_stream.stream().map(move |value| {
-        // Generate call_id that matches the one used during recording
-        let call_id = format!(
-            "call_{}",
-            appending_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        );
-        let origin = ListItemOrigin {
-            source_storage_key: storage_key_for_append.clone(),
-            call_id,
-        };
-        let new_item_actor = create_constant_actor_with_origin(
-            PersistenceId::new(),
-            value,
-            origin,
-            actor_context_for_append.scope_id(),
-        );
-        TaggedChange::FromAppend(ListChange::Push {
-            item: new_item_actor,
-        })
-    });
-
-    // Restored item changes (one-time stream of Push changes for each restored item)
-    // Track if we have stored calls - determines whether to override initial items
-    let had_stored_calls = !restored_items.is_empty();
-
-    let restored_changes = stream::iter(restored_items.into_iter().map(|item| {
-        if LOG_DEBUG {
-            zoon::println!("[DEBUG] Emitting restored item to change stream");
-        }
-        TaggedChange::FromRestored(ListChange::Push { item })
-    }));
-
-    // Merge all change streams, then use scan to ensure proper ordering:
-    // 1. First list Replace must come first
-    // 2. Then restored items are pushed
-    // 3. Then new appended items
-    let change_stream = stream::select(
-        stream::select(list_changes, append_changes),
-        restored_changes,
-    )
-    .scan(
-        (false, Vec::<ListChange>::new(), false, had_stored_calls), // (has_received_first_list_change, buffered_appends, restored_emitted, had_stored_calls)
-        |state, tagged_change| {
-            let (has_received_first, buffered, restored_emitted, _had_stored_calls) = state;
-
-            let changes_to_emit = match tagged_change {
-                TaggedChange::FromList(change) => {
-                    if !*has_received_first {
-                        *has_received_first = true;
-                        // Always include FromList items (default items from LIST literal)
-                        // plus restored items (dynamically added and recorded via List/append).
-                        // FromList items are fresh evaluations, not JSON-restored, so they're valid.
-                        // Buffered includes restored items and any early appends.
-                        let mut all = vec![change];
-                        all.append(buffered);
-                        all
-                    } else {
-                        // Subsequent list change - emit directly
-                        vec![change]
-                    }
-                }
-                TaggedChange::FromAppend(change) => {
-                    if *has_received_first {
-                        // Already received first list change - emit directly
-                        vec![change]
-                    } else {
-                        // Buffer until first list change arrives
-                        buffered.push(change);
-                        vec![]
-                    }
-                }
-                TaggedChange::FromRestored(change) => {
-                    if *has_received_first {
-                        // Already received first list change - emit restored item directly
-                        *restored_emitted = true;
-                        vec![change]
-                    } else {
-                        // Buffer until first list change arrives (treat like append)
-                        buffered.push(change);
-                        vec![]
-                    }
-                }
-            };
-
-            future::ready(Some(changes_to_emit))
-        },
-    )
-    .flat_map(|changes| stream::iter(changes));
-
-    // Create the result list with the combined change stream
-    let list = List::new_with_change_stream(
+    let result_actor = try_create_recorded_list_append_direct_actor(
+        list_actor,
+        item_actor,
+        restored_items,
+        storage_key,
+        stored_calls.len(),
         ConstructInfo::new(
-            function_call_id.with_child_id(ulid::Ulid::new().to_string()),
+            ConstructId::new(format!("List/append:{}", persistence_id))
+                .with_child_id(ulid::Ulid::new().to_string()),
             None,
             "List/append with restoration result",
         ),
         ctx.actor_context.clone(),
-        change_stream,
-        (list_actor, item_actor, storage_handle), // Keep these alive
-    );
-
-    let result_actor = create_constant_actor(
-        persistence_id,
-        Value::List(
-            Arc::new(list),
-            ValueMetadata::new(ValueIdempotencyKey::new()),
-        ),
-        ctx.actor_context.scope_id(),
-    );
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "recorded List/append must stay on the direct runtime path for persistence_id {:?}",
+            persistence_id
+        )
+    });
 
     Ok(Some(result_actor))
 }
 
+fn try_create_recorded_list_append_direct_actor(
+    source_list_actor: ActorHandle,
+    item_actor: ActorHandle,
+    restored_items: Vec<ActorHandle>,
+    storage_key: String,
+    initial_append_counter: usize,
+    result_construct_info: ConstructInfo,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let source_list_is_lazy = source_list_actor.has_lazy_delegate();
+    let item_is_lazy = item_actor.has_lazy_delegate();
+
+    let initial_source_list = match source_list_actor.current_value() {
+        Ok(Value::List(list, _)) => Some(list),
+        Ok(_) => return None,
+        Err(CurrentValueError::NoValueYet) => None,
+        Err(CurrentValueError::ActorDropped) => return None,
+    };
+    let restore_into_initial_snapshot = initial_source_list.is_some();
+    let mut initial_items = initial_source_list
+        .as_ref()
+        .and_then(|list| list.snapshot_now())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
+    if restore_into_initial_snapshot {
+        initial_items.extend(restored_items.iter().cloned());
+    }
+
+    let direct_result = create_direct_runtime_list_actor_with_initial_items(
+        result_construct_info,
+        actor_context.clone(),
+        vec![source_list_actor.clone(), item_actor.clone()],
+        initial_items,
+        true,
+        restore_into_initial_snapshot,
+    );
+
+    let result_actor = direct_result.actor;
+    let result_list = direct_result.list;
+    let result_construct_info = direct_result.construct_info;
+    let broadcast_change = direct_result.broadcast_change;
+    let skip_initial_source_replace = Rc::new(Cell::new(direct_result.skip_initial_source_replace));
+    let scope_id = actor_context.scope_id();
+
+    let current_source_list_key = Rc::new(Cell::new(None::<usize>));
+    let current_source_generation = Rc::new(Cell::new(0u64));
+    let current_items = Rc::new(RefCell::new(
+        result_list
+            .snapshot_now()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect::<Vec<_>>(),
+    ));
+    let current_items_ready = Rc::new(Cell::new(restore_into_initial_snapshot));
+    let pending_restored_items = Rc::new(RefCell::new(if restore_into_initial_snapshot {
+        Vec::new()
+    } else {
+        restored_items
+    }));
+    let buffered_appends = Rc::new(RefCell::new(Vec::<Value>::new()));
+
+    let append_value = Rc::new({
+        let result_list = result_list.clone();
+        let result_construct_info = result_construct_info.clone();
+        let current_items = current_items.clone();
+        let current_items_ready = current_items_ready.clone();
+        let buffered_appends = buffered_appends.clone();
+        let storage_key = storage_key.clone();
+        let appending_counter = Rc::new(Cell::new(initial_append_counter));
+        let skip_initial_source_replace = skip_initial_source_replace.clone();
+        move |reg: &mut ActorRegistry, value: Value| {
+            if skip_initial_source_replace.get() || !current_items_ready.get() {
+                buffered_appends.borrow_mut().push(value);
+                return;
+            }
+
+            let call_id = format!("call_{}", appending_counter.get());
+            appending_counter.set(appending_counter.get().wrapping_add(1));
+            let origin = ListItemOrigin {
+                source_storage_key: storage_key.clone(),
+                call_id,
+            };
+            let new_item_actor = create_constant_actor_with_origin_with_registry(
+                reg,
+                PersistenceId::new(),
+                value,
+                origin,
+                scope_id,
+            );
+            current_items.borrow_mut().push(new_item_actor.clone());
+            enqueue_list_change_on_runtime_queue_with_registry(
+                reg,
+                &result_list,
+                result_construct_info.clone(),
+                ListChange::Push {
+                    item: new_item_actor,
+                },
+                broadcast_change,
+            );
+        }
+    });
+
+    let flush_pending_restored_items = Rc::new({
+        let result_list = result_list.clone();
+        let result_construct_info = result_construct_info.clone();
+        let current_items = current_items.clone();
+        let pending_restored_items = pending_restored_items.clone();
+        move |reg: &mut ActorRegistry| {
+            let restored = std::mem::take(&mut *pending_restored_items.borrow_mut());
+            for item in restored {
+                current_items.borrow_mut().push(item.clone());
+                enqueue_list_change_on_runtime_queue_with_registry(
+                    reg,
+                    &result_list,
+                    result_construct_info.clone(),
+                    ListChange::Push { item },
+                    broadcast_change,
+                );
+            }
+        }
+    });
+
+    let flush_buffered_appends = Rc::new({
+        let append_value = append_value.clone();
+        let buffered_appends = buffered_appends.clone();
+        move |reg: &mut ActorRegistry| {
+            let buffered = std::mem::take(&mut *buffered_appends.borrow_mut());
+            for value in buffered {
+                append_value(reg, value);
+            }
+        }
+    });
+
+    let connect_source_list = Rc::new({
+        let result_actor = result_actor.clone();
+        let result_list = result_list.clone();
+        let result_construct_info = result_construct_info.clone();
+        let current_source_list_key = current_source_list_key.clone();
+        let current_source_generation = current_source_generation.clone();
+        let current_items = current_items.clone();
+        let current_items_ready = current_items_ready.clone();
+        let skip_initial_source_replace = skip_initial_source_replace.clone();
+        let flush_pending_restored_items = flush_pending_restored_items.clone();
+        let flush_buffered_appends = flush_buffered_appends.clone();
+        move |reg: &mut ActorRegistry, source_list: Arc<List>| {
+            let list_key = Arc::as_ptr(&source_list) as usize;
+            let generation = current_source_generation.get().wrapping_add(1);
+            current_source_generation.set(generation);
+            current_source_list_key.set(Some(list_key));
+
+            register_list_direct_subscriber_with_registry(reg, &source_list, {
+                let result_actor = result_actor.clone();
+                let result_list = result_list.clone();
+                let result_construct_info = result_construct_info.clone();
+                let current_source_list_key = current_source_list_key.clone();
+                let current_source_generation = current_source_generation.clone();
+                let current_items = current_items.clone();
+                let current_items_ready = current_items_ready.clone();
+                let skip_initial_source_replace = skip_initial_source_replace.clone();
+                let flush_pending_restored_items = flush_pending_restored_items.clone();
+                let flush_buffered_appends = flush_buffered_appends.clone();
+                move |reg, change| {
+                    if matches!(
+                        result_actor.current_value(),
+                        Err(CurrentValueError::ActorDropped)
+                    ) {
+                        return false;
+                    }
+                    if current_source_generation.get() != generation
+                        || current_source_list_key.get() != Some(list_key)
+                    {
+                        return false;
+                    }
+
+                    if skip_initial_source_replace.get()
+                        && matches!(&change, ListChange::Replace { .. })
+                    {
+                        skip_initial_source_replace.set(false);
+                        current_items_ready.set(true);
+                        flush_pending_restored_items(reg);
+                        flush_buffered_appends(reg);
+                        return true;
+                    }
+
+                    current_items_ready.set(true);
+                    change.clone().apply_to_vec(&mut current_items.borrow_mut());
+                    enqueue_list_change_on_runtime_queue_with_registry(
+                        reg,
+                        &result_list,
+                        result_construct_info.clone(),
+                        change.clone(),
+                        broadcast_change,
+                    );
+                    flush_pending_restored_items(reg);
+                    flush_buffered_appends(reg);
+                    true
+                }
+            });
+        }
+    });
+
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+
+        watch_actor_current_and_future_with_registry(
+            Some(&mut reg),
+            &result_actor,
+            &source_list_actor,
+            source_list_is_lazy && initial_source_list.is_some(),
+            {
+                let connect_source_list = connect_source_list.clone();
+                let current_source_list_key = current_source_list_key.clone();
+                move |reg, value| {
+                    let Value::List(source_list, _) = value else {
+                        return;
+                    };
+                    let list_key = Arc::as_ptr(&source_list) as usize;
+                    if current_source_list_key.get() != Some(list_key) {
+                        connect_source_list(reg, source_list);
+                    }
+                }
+            },
+        );
+
+        let item_skip_seed = item_is_lazy && item_actor.current_value().is_ok();
+        if item_skip_seed && let Ok(current_value) = item_actor.current_value() {
+            append_value(&mut reg, current_value);
+        }
+        watch_actor_current_and_future_with_registry(
+            Some(&mut reg),
+            &result_actor,
+            &item_actor,
+            item_skip_seed,
+            {
+                let append_value = append_value.clone();
+                move |reg, value| {
+                    append_value(reg, value);
+                }
+            },
+        );
+
+        if current_source_list_key.get().is_none()
+            && let Some(initial_source_list) = initial_source_list.as_ref()
+        {
+            connect_source_list(&mut reg, initial_source_list.clone());
+        }
+        drain_runtime_ready_queue_with_registry(&mut reg);
+    });
+
+    Some(result_actor)
+}
+
 fn try_build_list_append_hold_snapshot_now(
+    mut reg: Option<&mut ActorRegistry>,
     list_actor: &ActorHandle,
     item_actor: &ActorHandle,
     construct_context: ConstructContext,
@@ -5439,17 +11305,27 @@ fn try_build_list_append_hold_snapshot_now(
                 .map(|(_item_id, item_actor)| item_actor)
                 .collect::<Vec<_>>();
 
-            let materialized_item = try_materialize_snapshot_value_now(
-                item_value,
-                construct_context.clone(),
-                actor_context.clone(),
-            )?;
+            let materialized_item =
+                crate::engine::try_materialize_snapshot_value_now_with_registry(
+                    reg.as_deref_mut(),
+                    item_value,
+                    construct_context.clone(),
+                    actor_context.clone(),
+                )?;
 
-            let appended_item = create_constant_actor(
-                PersistenceId::new(),
-                materialized_item,
-                actor_context.scope_id(),
-            );
+            let appended_item = match reg.as_deref_mut() {
+                Some(reg) => create_constant_actor_with_registry(
+                    reg,
+                    PersistenceId::new(),
+                    materialized_item,
+                    actor_context.scope_id(),
+                ),
+                None => create_constant_actor(
+                    PersistenceId::new(),
+                    materialized_item,
+                    actor_context.scope_id(),
+                ),
+            };
             items.push(appended_item);
 
             Some(Value::List(
@@ -5468,16 +11344,26 @@ fn try_build_list_append_hold_snapshot_now(
         }
         (Some(list_value), _) => Some(list_value),
         (None, Some(item_value)) => {
-            let materialized_item = try_materialize_snapshot_value_now(
-                item_value,
-                construct_context.clone(),
-                actor_context.clone(),
-            )?;
-            let appended_item = create_constant_actor(
-                PersistenceId::new(),
-                materialized_item,
-                actor_context.scope_id(),
-            );
+            let materialized_item =
+                crate::engine::try_materialize_snapshot_value_now_with_registry(
+                    reg.as_deref_mut(),
+                    item_value,
+                    construct_context.clone(),
+                    actor_context.clone(),
+                )?;
+            let appended_item = match reg.as_deref_mut() {
+                Some(reg) => create_constant_actor_with_registry(
+                    reg,
+                    PersistenceId::new(),
+                    materialized_item,
+                    actor_context.scope_id(),
+                ),
+                None => create_constant_actor(
+                    PersistenceId::new(),
+                    materialized_item,
+                    actor_context.scope_id(),
+                ),
+            };
 
             Some(Value::List(
                 List::new_arc(
@@ -5597,6 +11483,364 @@ async fn build_list_append_hold_snapshot_value(
             ValueMetadata::new(ValueIdempotencyKey::new()),
         ),
     }
+}
+
+enum PendingSnapshotDependency {
+    Actor(ActorHandle),
+    List(Arc<List>),
+}
+
+fn first_pending_snapshot_dependency(
+    value: &Value,
+    actor_context: &ActorContext,
+) -> Option<PendingSnapshotDependency> {
+    let snapshot_actor_value_now = |actor: &ActorHandle| {
+        if let Some(emission_seq) = actor_context.snapshot_emission_seq {
+            actor.current_value_before_emission(emission_seq)
+        } else {
+            actor.current_value()
+        }
+    };
+
+    match value {
+        Value::Object(object, _) => {
+            for variable in object.variables() {
+                match snapshot_actor_value_now(&variable.value_actor()) {
+                    Ok(value) => {
+                        if let Some(dependency) =
+                            first_pending_snapshot_dependency(&value, actor_context)
+                        {
+                            return Some(dependency);
+                        }
+                    }
+                    Err(_) => {
+                        return Some(PendingSnapshotDependency::Actor(variable.value_actor()));
+                    }
+                }
+            }
+            None
+        }
+        Value::TaggedObject(tagged_object, _) => {
+            for variable in tagged_object.variables() {
+                match snapshot_actor_value_now(&variable.value_actor()) {
+                    Ok(value) => {
+                        if let Some(dependency) =
+                            first_pending_snapshot_dependency(&value, actor_context)
+                        {
+                            return Some(dependency);
+                        }
+                    }
+                    Err(_) => {
+                        return Some(PendingSnapshotDependency::Actor(variable.value_actor()));
+                    }
+                }
+            }
+            None
+        }
+        Value::List(list, _) => {
+            let Some(items) = list.snapshot_now() else {
+                return Some(PendingSnapshotDependency::List(list.clone()));
+            };
+
+            for (_, item_actor) in items {
+                match snapshot_actor_value_now(&item_actor) {
+                    Ok(value) => {
+                        if let Some(dependency) =
+                            first_pending_snapshot_dependency(&value, actor_context)
+                        {
+                            return Some(dependency);
+                        }
+                    }
+                    Err(_) => return Some(PendingSnapshotDependency::Actor(item_actor)),
+                }
+            }
+            None
+        }
+        Value::Flushed(inner, _) => first_pending_snapshot_dependency(inner, actor_context),
+        _ => None,
+    }
+}
+
+fn first_pending_list_append_hold_snapshot_dependency(
+    list_actor: &ActorHandle,
+    item_actor: &ActorHandle,
+    actor_context: &ActorContext,
+) -> Option<PendingSnapshotDependency> {
+    if let Ok(list_value) = list_actor.current_value()
+        && let Some(dependency) = first_pending_snapshot_dependency(&list_value, actor_context)
+    {
+        return Some(dependency);
+    }
+
+    if let Ok(item_value) = item_actor.current_value()
+        && let Some(dependency) = first_pending_snapshot_dependency(&item_value, actor_context)
+    {
+        return Some(dependency);
+    }
+
+    None
+}
+
+fn arm_list_append_hold_snapshot_dependency_waiter_with_registry(
+    reg: Option<&mut ActorRegistry>,
+    output: &ActorHandle,
+    dependency: PendingSnapshotDependency,
+    list_actor: &ActorHandle,
+    item_actor: &ActorHandle,
+    construct_context: &ConstructContext,
+    actor_context: &ActorContext,
+    dependency_wait_started: &Rc<Cell<bool>>,
+) {
+    dependency_wait_started.set(true);
+
+    match dependency {
+        PendingSnapshotDependency::Actor(actor) => {
+            watch_actor_current_and_future_until_with_registry(reg, output, &actor, false, {
+                let output = output.clone();
+                let list_actor = list_actor.clone();
+                let item_actor = item_actor.clone();
+                let construct_context = construct_context.clone();
+                let actor_context = actor_context.clone();
+                let dependency_wait_started = dependency_wait_started.clone();
+                move |reg, _value| {
+                    dependency_wait_started.set(false);
+                    try_publish_or_arm_list_append_hold_snapshot_with_registry(
+                        Some(reg),
+                        &output,
+                        &list_actor,
+                        &item_actor,
+                        &construct_context,
+                        &actor_context,
+                        &dependency_wait_started,
+                    );
+                    true
+                }
+            });
+        }
+        PendingSnapshotDependency::List(list) => match reg {
+            Some(reg) => {
+                crate::engine::register_list_direct_subscriber_with_registry(reg, &list, {
+                    let output = output.clone();
+                    let list_actor = list_actor.clone();
+                    let item_actor = item_actor.clone();
+                    let construct_context = construct_context.clone();
+                    let actor_context = actor_context.clone();
+                    let dependency_wait_started = dependency_wait_started.clone();
+                    move |reg, _change| {
+                        if !output.is_alive() {
+                            return false;
+                        }
+                        dependency_wait_started.set(false);
+                        try_publish_or_arm_list_append_hold_snapshot_with_registry(
+                            Some(reg),
+                            &output,
+                            &list_actor,
+                            &item_actor,
+                            &construct_context,
+                            &actor_context,
+                            &dependency_wait_started,
+                        );
+                        false
+                    }
+                });
+            }
+            None => {
+                REGISTRY.with(|reg| {
+                    let mut reg = reg.borrow_mut();
+                    crate::engine::register_list_direct_subscriber_with_registry(
+                        &mut reg,
+                        &list,
+                        {
+                            let output = output.clone();
+                            let list_actor = list_actor.clone();
+                            let item_actor = item_actor.clone();
+                            let construct_context = construct_context.clone();
+                            let actor_context = actor_context.clone();
+                            let dependency_wait_started = dependency_wait_started.clone();
+                            move |reg, _change| {
+                                if !output.is_alive() {
+                                    return false;
+                                }
+                                dependency_wait_started.set(false);
+                                try_publish_or_arm_list_append_hold_snapshot_with_registry(
+                                    Some(reg),
+                                    &output,
+                                    &list_actor,
+                                    &item_actor,
+                                    &construct_context,
+                                    &actor_context,
+                                    &dependency_wait_started,
+                                );
+                                false
+                            }
+                        },
+                    );
+                });
+            }
+        },
+    }
+}
+
+fn try_publish_or_arm_list_append_hold_snapshot_with_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    output: &ActorHandle,
+    list_actor: &ActorHandle,
+    item_actor: &ActorHandle,
+    construct_context: &ConstructContext,
+    actor_context: &ActorContext,
+    dependency_wait_started: &Rc<Cell<bool>>,
+) -> bool {
+    if !output.is_alive() {
+        return true;
+    }
+
+    if let Some(result_value) = try_build_list_append_hold_snapshot_now(
+        reg.as_deref_mut(),
+        list_actor,
+        item_actor,
+        construct_context.clone(),
+        actor_context.clone(),
+    ) {
+        match reg {
+            Some(reg) => {
+                enqueue_actor_value_on_runtime_queue_with_registry(reg, output, result_value);
+                drain_runtime_ready_queue_with_registry(reg);
+            }
+            None => {
+                REGISTRY.with(|reg| {
+                    let mut reg = reg.borrow_mut();
+                    enqueue_actor_value_on_runtime_queue_with_registry(
+                        &mut reg,
+                        output,
+                        result_value,
+                    );
+                    drain_runtime_ready_queue_with_registry(&mut reg);
+                });
+            }
+        }
+        return true;
+    }
+
+    if dependency_wait_started.get() {
+        return false;
+    }
+
+    let Some(dependency) =
+        first_pending_list_append_hold_snapshot_dependency(list_actor, item_actor, actor_context)
+    else {
+        return false;
+    };
+
+    arm_list_append_hold_snapshot_dependency_waiter_with_registry(
+        reg,
+        output,
+        dependency,
+        list_actor,
+        item_actor,
+        construct_context,
+        actor_context,
+        dependency_wait_started,
+    );
+
+    true
+}
+
+fn create_waiting_list_append_hold_snapshot_actor_with_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    list_actor: ActorHandle,
+    item_actor: ActorHandle,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> ActorHandle {
+    let output = match reg.as_deref_mut() {
+        Some(reg) => create_actor_forwarding_with_registry(
+            reg,
+            PersistenceId::new(),
+            actor_context.scope_id(),
+        ),
+        None => create_actor_forwarding(PersistenceId::new(), actor_context.scope_id()),
+    };
+    retain_actor_handles_with_registry(
+        reg.as_deref_mut(),
+        &output,
+        [list_actor.clone(), item_actor.clone()].into_iter(),
+    );
+
+    let dependency_wait_started = Rc::new(Cell::new(false));
+    if try_publish_or_arm_list_append_hold_snapshot_with_registry(
+        reg.as_deref_mut(),
+        &output,
+        &list_actor,
+        &item_actor,
+        &construct_context,
+        &actor_context,
+        &dependency_wait_started,
+    ) {
+        return output;
+    }
+
+    match reg {
+        Some(reg) => {
+            for source_actor in [&list_actor, &item_actor] {
+                watch_actor_current_and_future_until_with_registry(
+                    Some(reg),
+                    &output,
+                    source_actor,
+                    false,
+                    {
+                        let output = output.clone();
+                        let list_actor = list_actor.clone();
+                        let item_actor = item_actor.clone();
+                        let construct_context = construct_context.clone();
+                        let actor_context = actor_context.clone();
+                        let dependency_wait_started = dependency_wait_started.clone();
+                        move |reg, _value| {
+                            try_publish_or_arm_list_append_hold_snapshot_with_registry(
+                                Some(reg),
+                                &output,
+                                &list_actor,
+                                &item_actor,
+                                &construct_context,
+                                &actor_context,
+                                &dependency_wait_started,
+                            )
+                        }
+                    },
+                );
+            }
+        }
+        None => {
+            for source_actor in [&list_actor, &item_actor] {
+                watch_actor_current_and_future_until_with_registry(
+                    None,
+                    &output,
+                    source_actor,
+                    false,
+                    {
+                        let output = output.clone();
+                        let list_actor = list_actor.clone();
+                        let item_actor = item_actor.clone();
+                        let construct_context = construct_context.clone();
+                        let actor_context = actor_context.clone();
+                        let dependency_wait_started = dependency_wait_started.clone();
+                        move |reg, _value| {
+                            try_publish_or_arm_list_append_hold_snapshot_with_registry(
+                                Some(reg),
+                                &output,
+                                &list_actor,
+                                &item_actor,
+                                &construct_context,
+                                &actor_context,
+                                &dependency_wait_started,
+                            )
+                        }
+                    },
+                );
+            }
+        }
+    }
+
+    output
 }
 
 fn expression_contains_function_call(
@@ -5924,7 +12168,8 @@ fn map_entry_key_references_parameter(
 /// Call a function with stack-safe evaluation.
 /// Supports both user-defined functions and builtin functions.
 /// Returns `Ok(None)` if the function body is SKIP.
-fn call_function(
+fn call_function_with_runtime_registry(
+    mut reg: Option<&mut ActorRegistry>,
     path: Vec<String>,
     args: Vec<(String, ActorHandle)>,
     span: Span,
@@ -5996,6 +12241,30 @@ fn call_function(
         // Without this, the function body would execute immediately with the piped actor as a reference,
         // producing a value even if the piped actor never produces values.
         if let (Some(piped), Some(param_name)) = (&ctx.actor_context.piped, &piped_param_name) {
+            if let Some(actor) = try_create_live_runtime_local_piped_function_actor(
+                piped,
+                param_name,
+                &func_def,
+                &parameters,
+                persistence_id,
+                &ctx,
+            ) {
+                return Ok(Some(actor));
+            }
+
+            if let Some(actor) = try_create_direct_state_piped_function_actor(
+                reg.as_deref_mut(),
+                &path,
+                piped,
+                param_name,
+                &func_def,
+                &parameters,
+                persistence_id,
+                &ctx,
+            ) {
+                return Ok(Some(actor));
+            }
+
             // Clone everything needed for the async closure
             let piped_for_closure = piped.clone();
             let parameters_for_closure = parameters.clone();
@@ -6046,11 +12315,24 @@ fn call_function(
                 }
 
                 // Create a constant actor for this specific piped value
-                let value_actor: ActorHandle = create_constant_actor(
-                    PersistenceId::new(),
-                    piped_value,
-                    ctx_for_closure.actor_context.scope_id(),
-                );
+                let value_actor: ActorHandle =
+                    if ctx_for_closure.actor_context.registry_scope_id.is_some() {
+                        REGISTRY.with(|reg| {
+                            let mut reg = reg.borrow_mut();
+                            create_constant_actor_with_registry(
+                                &mut reg,
+                                PersistenceId::new(),
+                                piped_value,
+                                ctx_for_closure.actor_context.scope_id(),
+                            )
+                        })
+                    } else {
+                        create_constant_actor(
+                            PersistenceId::new(),
+                            piped_value,
+                            ctx_for_closure.actor_context.scope_id(),
+                        )
+                    };
 
                 // Bind the constant value actor to the parameter
                 let mut params = parameters_for_closure.clone();
@@ -6104,7 +12386,6 @@ fn call_function(
                     actor_context: new_actor_context,
                     reference_connector: ctx_for_closure.reference_connector.clone(),
                     link_connector: ctx_for_closure.link_connector.clone(),
-                    pass_through_connector: ctx_for_closure.pass_through_connector.clone(),
                     module_loader: ctx_for_closure.module_loader.clone(),
                     source_code: ctx_for_closure.source_code.clone(),
                     function_registry_snapshot: ctx_for_closure.function_registry_snapshot.clone(),
@@ -6112,7 +12393,20 @@ fn call_function(
                 };
 
                 // Evaluate the function body with this piped value
-                match evaluate_expression(func_body.clone(), new_ctx) {
+                let body_result = if new_ctx.actor_context.registry_scope_id.is_some() {
+                    REGISTRY.with(|reg| {
+                        let mut reg = reg.borrow_mut();
+                        evaluate_expression_with_runtime_registry(
+                            Some(&mut reg),
+                            func_body.clone(),
+                            new_ctx,
+                        )
+                    })
+                } else {
+                    evaluate_expression(func_body.clone(), new_ctx)
+                };
+
+                match body_result {
                     Ok(Some(result_actor)) => {
                         // Use value() for type-safe single-value semantics (like THEN does)
                         let result_stream: Pin<Box<dyn Stream<Item = Value>>> =
@@ -6131,8 +12425,15 @@ fn call_function(
             });
 
             // Create the wrapper actor
-            let wrapper_actor =
-                create_actor(result_stream, persistence_id, ctx.actor_context.scope_id());
+            let wrapper_actor = match reg.as_deref_mut() {
+                Some(reg) => create_actor_with_registry(
+                    reg,
+                    result_stream,
+                    persistence_id,
+                    ctx.actor_context.scope_id(),
+                ),
+                None => create_actor(result_stream, persistence_id, ctx.actor_context.scope_id()),
+            };
 
             return Ok(Some(wrapper_actor));
         }
@@ -6183,19 +12484,23 @@ fn call_function(
             actor_context: new_actor_context,
             reference_connector: ctx.reference_connector,
             link_connector: ctx.link_connector,
-            pass_through_connector: ctx.pass_through_connector,
             function_registry_snapshot: ctx.function_registry_snapshot,
             current_module: func_def.module_name.clone(),
             module_loader: ctx.module_loader,
             source_code: ctx.source_code,
         };
 
-        let result = evaluate_expression(func_def.body, new_ctx);
+        let result = match reg.as_deref_mut() {
+            Some(reg) => {
+                evaluate_expression_with_runtime_registry(Some(reg), func_def.body.clone(), new_ctx)
+            }
+            None => evaluate_expression(func_def.body.clone(), new_ctx),
+        };
 
         // If we have argument actors, wrap the result to keep them alive
         match result {
             Ok(Some(result_actor)) if !arg_actors.is_empty() => {
-                retain_actor_handles(&result_actor, arg_actors);
+                retain_actor_handles_with_registry(reg.as_deref_mut(), &result_actor, arg_actors);
                 return Ok(Some(result_actor));
             }
             _ => return result,
@@ -6249,16 +12554,471 @@ fn call_function(
                 registry_scope_id: ctx.actor_context.registry_scope_id,
             };
 
-            Ok(Some(FunctionCall::new_arc_value_actor(
-                construct_info,
-                ctx.construct_context,
-                call_actor_context,
-                definition,
-                builtin_args,
-            )))
+            if path_strs == ["Timer", "interval"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                let arguments = Arc::new(builtin_args.clone());
+                return Ok(Some(if call_actor_context.registry_scope_id.is_some() {
+                    REGISTRY.with(|reg| {
+                        let mut reg = reg.borrow_mut();
+                        api::function_timer_interval_actor_with_registry(
+                            &mut reg,
+                            arguments,
+                            function_call_id,
+                            persistence_id,
+                            ctx.construct_context.clone(),
+                            call_actor_context.clone(),
+                        )
+                    })
+                } else {
+                    api::function_timer_interval_actor(
+                        arguments,
+                        function_call_id,
+                        persistence_id,
+                        ctx.construct_context.clone(),
+                        call_actor_context.clone(),
+                    )
+                }));
+            }
+
+            if path_strs == ["Stream", "debounce"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                let arguments = Arc::new(builtin_args.clone());
+                return Ok(Some(if call_actor_context.registry_scope_id.is_some() {
+                    REGISTRY.with(|reg| {
+                        let mut reg = reg.borrow_mut();
+                        api::function_stream_debounce_actor_with_registry(
+                            &mut reg,
+                            arguments,
+                            function_call_id,
+                            persistence_id,
+                            ctx.construct_context.clone(),
+                            call_actor_context.clone(),
+                        )
+                    })
+                } else {
+                    api::function_stream_debounce_actor(
+                        arguments,
+                        function_call_id,
+                        persistence_id,
+                        ctx.construct_context.clone(),
+                        call_actor_context.clone(),
+                    )
+                }));
+            }
+
+            if path_strs == ["Stream", "skip"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                let arguments = Arc::new(builtin_args.clone());
+                let actor = if call_actor_context.registry_scope_id.is_some() {
+                    REGISTRY.with(|reg| {
+                        let mut reg = reg.borrow_mut();
+                        api::function_stream_skip_actor_with_registry(
+                            &mut reg,
+                            arguments,
+                            function_call_id,
+                            persistence_id,
+                            ctx.construct_context.clone(),
+                            call_actor_context.clone(),
+                        )
+                    })
+                } else {
+                    api::function_stream_skip_actor(
+                        arguments,
+                        function_call_id,
+                        persistence_id,
+                        ctx.construct_context.clone(),
+                        call_actor_context.clone(),
+                    )
+                };
+                if let Some(actor) = actor {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["Stream", "take"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                let arguments = Arc::new(builtin_args.clone());
+                let actor = if call_actor_context.registry_scope_id.is_some() {
+                    REGISTRY.with(|reg| {
+                        let mut reg = reg.borrow_mut();
+                        api::function_stream_take_actor_with_registry(
+                            &mut reg,
+                            arguments,
+                            function_call_id,
+                            persistence_id,
+                            ctx.construct_context.clone(),
+                            call_actor_context.clone(),
+                        )
+                    })
+                } else {
+                    api::function_stream_take_actor(
+                        arguments,
+                        function_call_id,
+                        persistence_id,
+                        ctx.construct_context.clone(),
+                        call_actor_context.clone(),
+                    )
+                };
+                if let Some(actor) = actor {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["Stream", "distinct"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_stream_distinct_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["Stream", "pulses"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_stream_pulses_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["Math", "sum"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_math_sum_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["Math", "round"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_math_round_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["Math", "min"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_math_min_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["Math", "max"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_math_max_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["List", "count"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_list_count_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["List", "clear"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_list_clear_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["List", "is_empty"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_list_is_empty_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["List", "is_not_empty"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_list_is_not_empty_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["List", "remove_last"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_list_remove_last_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["List", "last"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_list_last_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["List", "get"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_list_get_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["List", "latest"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_list_latest_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["List", "sum"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_list_sum_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["List", "product"] && !call_actor_context.use_lazy_actors {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                if let Some(actor) = api::function_list_product_actor(
+                    Arc::new(builtin_args.clone()),
+                    function_call_id,
+                    persistence_id,
+                    ctx.construct_context.clone(),
+                    call_actor_context.clone(),
+                ) {
+                    return Ok(Some(actor));
+                }
+            }
+
+            if path_strs == ["Element", "stripe"] {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                let arguments = Arc::new(builtin_args.clone());
+                return Ok(Some(match reg.as_deref_mut() {
+                    Some(reg) => api::function_element_stripe_actor_with_registry(
+                        reg,
+                        arguments,
+                        function_call_id,
+                        persistence_id,
+                        ctx.construct_context.clone(),
+                        call_actor_context.clone(),
+                    ),
+                    None => create_actor(
+                        api::function_element_stripe(
+                            arguments,
+                            function_call_id,
+                            persistence_id,
+                            ctx.construct_context.clone(),
+                            call_actor_context.clone(),
+                        ),
+                        PersistenceId::new(),
+                        call_actor_context.scope_id(),
+                    ),
+                }));
+            }
+
+            if path_strs == ["Element", "container"] {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                let arguments = Arc::new(builtin_args.clone());
+                return Ok(Some(match reg.as_deref_mut() {
+                    Some(reg) => api::function_element_container_actor_with_registry(
+                        reg,
+                        arguments,
+                        function_call_id,
+                        persistence_id,
+                        ctx.construct_context.clone(),
+                        call_actor_context.clone(),
+                    ),
+                    None => create_actor(
+                        api::function_element_container(
+                            arguments,
+                            function_call_id,
+                            persistence_id,
+                            ctx.construct_context.clone(),
+                            call_actor_context.clone(),
+                        ),
+                        PersistenceId::new(),
+                        call_actor_context.scope_id(),
+                    ),
+                }));
+            }
+
+            if path_strs == ["Element", "stack"] {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                let arguments = Arc::new(builtin_args.clone());
+                return Ok(Some(match reg.as_deref_mut() {
+                    Some(reg) => api::function_element_stack_actor_with_registry(
+                        reg,
+                        arguments,
+                        function_call_id,
+                        persistence_id,
+                        ctx.construct_context.clone(),
+                        call_actor_context.clone(),
+                    ),
+                    None => create_actor(
+                        api::function_element_stack(
+                            arguments,
+                            function_call_id,
+                            persistence_id,
+                            ctx.construct_context.clone(),
+                            call_actor_context.clone(),
+                        ),
+                        PersistenceId::new(),
+                        call_actor_context.scope_id(),
+                    ),
+                }));
+            }
+
+            if path_strs == ["Element", "button"] {
+                let function_call_id = ConstructId::new(format!("PersistenceId: {persistence_id}"));
+                let arguments = Arc::new(builtin_args.clone());
+                return Ok(Some(match reg.as_deref_mut() {
+                    Some(reg) => api::function_element_button_actor_with_registry(
+                        reg,
+                        arguments,
+                        function_call_id,
+                        persistence_id,
+                        ctx.construct_context.clone(),
+                        call_actor_context.clone(),
+                    ),
+                    None => create_actor(
+                        api::function_element_button(
+                            arguments,
+                            function_call_id,
+                            persistence_id,
+                            ctx.construct_context.clone(),
+                            call_actor_context.clone(),
+                        ),
+                        PersistenceId::new(),
+                        call_actor_context.scope_id(),
+                    ),
+                }));
+            }
+
+            Ok(Some(match reg {
+                Some(reg) => FunctionCall::new_arc_value_actor_with_registry(
+                    reg,
+                    construct_info,
+                    ctx.construct_context,
+                    call_actor_context,
+                    definition,
+                    builtin_args,
+                ),
+                None => FunctionCall::new_arc_value_actor(
+                    construct_info,
+                    ctx.construct_context,
+                    call_actor_context,
+                    definition,
+                    builtin_args,
+                ),
+            }))
         }
         Err(_) => Err(format!("Function '{}' not found", full_path)),
     }
+}
+
+fn call_function(
+    path: Vec<String>,
+    args: Vec<(String, ActorHandle)>,
+    span: Span,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+    use_piped_for_builtin: bool,
+    function_registry: &HashMap<String, StaticFunctionDefinition>,
+) -> Result<Option<ActorHandle>, String> {
+    call_function_with_runtime_registry(
+        None,
+        path,
+        args,
+        span,
+        persistence,
+        persistence_id,
+        ctx,
+        use_piped_for_builtin,
+        function_registry,
+    )
 }
 
 /// Pre-resolve all ValueComparison patterns in arms to concrete values.
@@ -6285,7 +13045,7 @@ async fn resolve_comparison_values(
                 if let Some(local) = actor_context.object_locals.get(ref_span) {
                     Some(local.clone())
                 } else if let Some(rc) = reference_connector.upgrade() {
-                    Some(rc.referenceable(*ref_span).await)
+                    Some(rc.referenceable_or_waiting_actor(*ref_span, actor_context.scope_id()))
                 } else {
                     None
                 }
@@ -6294,7 +13054,7 @@ async fn resolve_comparison_values(
             };
 
             if let Some(actor) = base_actor {
-                if let Ok(base_value) = actor.current_value() {
+                if let Some(base_value) = actor.current_or_future_stream().next().await {
                     if path.len() == 1 {
                         resolved.insert(base_name, base_value);
                     } else {
@@ -6573,29 +13333,37 @@ pub struct ModuleData {
     pub variables: HashMap<String, static_expression::Spanned<static_expression::Expression>>,
 }
 
-/// Request types for the module loader actor.
-enum ModuleLoaderRequest {
-    SetBaseDir(String),
-    GetBaseDir {
-        reply: oneshot::Sender<String>,
-    },
-    GetCached {
-        name: String,
-        reply: oneshot::Sender<Option<ModuleData>>,
-    },
-    Cache {
-        name: String,
-        data: ModuleData,
-    },
+struct ModuleLoaderInner {
+    base_dir: RefCell<String>,
+    cache: RefCell<HashMap<String, ModuleData>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn module_loader_log(message: &str) {
+    zoon::println!("{message}");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn module_loader_log(message: &str) {
+    println!("{message}");
+}
+
+#[cfg(target_arch = "wasm32")]
+fn module_loader_error(message: &str) {
+    zoon::eprintln!("{message}");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn module_loader_error(message: &str) {
+    eprintln!("{message}");
 }
 
 /// Module loader with caching for loading and parsing Boon modules.
 /// Resolves module paths like "Theme" to file paths and caches parsed modules.
-/// Uses actor model with channels - no locks, no RefCell.
+/// Uses direct local state instead of a background task and request channel.
 #[derive(Clone)]
 pub struct ModuleLoader {
-    request_sender: NamedChannel<ModuleLoaderRequest>,
-    _task: Arc<TaskHandle>,
+    inner: Rc<ModuleLoaderInner>,
 }
 
 impl Default for ModuleLoader {
@@ -6606,92 +13374,32 @@ impl Default for ModuleLoader {
 
 impl ModuleLoader {
     pub fn new(base_dir: impl Into<String>) -> Self {
-        let (tx, mut rx) =
-            NamedChannel::new("module_loader.requests", MODULE_LOADER_REQUEST_CAPACITY);
-        let initial_base_dir = base_dir.into();
-
-        let actor_loop = Task::start_droppable(async move {
-            let mut cache: HashMap<String, ModuleData> = HashMap::new();
-            let mut base_dir = initial_base_dir;
-
-            while let Some(request) = rx.next().await {
-                match request {
-                    ModuleLoaderRequest::SetBaseDir(dir) => {
-                        base_dir = dir;
-                    }
-                    ModuleLoaderRequest::GetBaseDir { reply } => {
-                        if reply.send(base_dir.clone()).is_err() {
-                            zoon::println!("[MODULE_LOADER] GetBaseDir reply receiver dropped");
-                        }
-                    }
-                    ModuleLoaderRequest::GetCached { name, reply } => {
-                        if reply.send(cache.get(&name).cloned()).is_err() {
-                            zoon::println!(
-                                "[MODULE_LOADER] GetCached reply receiver dropped for {}",
-                                name
-                            );
-                        }
-                    }
-                    ModuleLoaderRequest::Cache { name, data } => {
-                        cache.insert(name, data);
-                    }
-                }
-            }
-        });
-
         Self {
-            request_sender: tx,
-            _task: Arc::new(actor_loop),
+            inner: Rc::new(ModuleLoaderInner {
+                base_dir: RefCell::new(base_dir.into()),
+                cache: RefCell::new(HashMap::new()),
+            }),
         }
     }
 
     /// Set the base directory for module resolution (fire-and-forget).
     pub fn set_base_dir(&self, dir: impl Into<String>) {
-        if let Err(e) = self
-            .request_sender
-            .try_send(ModuleLoaderRequest::SetBaseDir(dir.into()))
-        {
-            zoon::eprintln!("[MODULE_LOADER] Failed to send SetBaseDir: {e}");
-        }
+        *self.inner.base_dir.borrow_mut() = dir.into();
     }
 
     /// Get the base directory (async).
     pub async fn base_dir(&self) -> String {
-        let (tx, rx) = oneshot::channel();
-        if let Err(e) = self
-            .request_sender
-            .try_send(ModuleLoaderRequest::GetBaseDir { reply: tx })
-        {
-            zoon::eprintln!("[MODULE_LOADER] Failed to send GetBaseDir: {e}");
-            return String::new();
-        }
-        rx.await.unwrap_or_default()
+        self.inner.base_dir.borrow().clone()
     }
 
     /// Get a cached module (async).
     async fn get_cached(&self, name: &str) -> Option<ModuleData> {
-        let (tx, rx) = oneshot::channel();
-        if let Err(e) = self
-            .request_sender
-            .try_send(ModuleLoaderRequest::GetCached {
-                name: name.to_string(),
-                reply: tx,
-            })
-        {
-            zoon::println!("[MODULE_LOADER] Failed to send GetCached for {}: {e}", name);
-            return None;
-        }
-        rx.await.ok().flatten()
+        self.inner.cache.borrow().get(name).cloned()
     }
 
     /// Cache a module (fire-and-forget).
     fn cache(&self, name: String, data: ModuleData) {
-        if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::Cache {
-            name: name.clone(),
-            data,
-        }) {
-            zoon::eprintln!("[MODULE_LOADER] Failed to cache module {}: {e}", name);
-        }
+        self.inner.cache.borrow_mut().insert(name, data);
     }
 
     /// Load a module by name (e.g., "Theme", "Professional", "Assets")
@@ -6738,11 +13446,10 @@ impl ModuleLoader {
 
         for path in paths_to_try {
             if let Some(source_code) = virtual_fs.read_text(&path).await {
-                zoon::println!(
+                module_loader_log(&format!(
                     "[ModuleLoader] Loading module '{}' from '{}'",
-                    module_name,
-                    path
-                );
+                    module_name, path
+                ));
                 if let Some(module_data) = parse_module(&path, &source_code) {
                     // Cache the module
                     self.cache(module_name.to_string(), module_data.clone());
@@ -6751,11 +13458,10 @@ impl ModuleLoader {
             }
         }
 
-        zoon::eprintln!(
+        module_loader_error(&format!(
             "[ModuleLoader] Could not find module '{}' (tried from base '{}')",
-            module_name,
-            base
-        );
+            module_name, base
+        ));
         None
     }
 
@@ -6799,11 +13505,11 @@ pub fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
     // Lexer
     let (tokens, errors) = lexer().parse(source_code).into_output_errors();
     if !errors.is_empty() {
-        zoon::eprintln!(
+        module_loader_error(&format!(
             "[ModuleLoader] Lex errors in '{}': {:?}",
             filename,
             errors.len()
-        );
+        ));
         return None;
     }
     let mut tokens = tokens?;
@@ -6822,7 +13528,10 @@ pub fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
         .into_output_errors();
     if !errors.is_empty() {
         for err in &errors {
-            zoon::eprintln!("[ModuleLoader] Parse error in '{}': {:?}", filename, err);
+            module_loader_error(&format!(
+                "[ModuleLoader] Parse error in '{}': {:?}",
+                filename, err
+            ));
         }
         return None;
     }
@@ -6832,11 +13541,11 @@ pub fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
     let ast = match resolve_references(ast) {
         Ok(ast) => ast,
         Err(errors) => {
-            zoon::eprintln!(
+            module_loader_error(&format!(
                 "[ModuleLoader] Reference errors in '{}': {:?}",
                 filename,
                 errors.len()
-            );
+            ));
             return None;
         }
     };
@@ -6846,11 +13555,11 @@ pub fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
         match resolve_persistence(ast, None::<Vec<Spanned<boon::parser::Expression>>>, "") {
             Ok(result) => result,
             Err(errors) => {
-                zoon::eprintln!(
+                module_loader_error(&format!(
                     "[ModuleLoader] Persistence errors in '{}': {:?}",
                     filename,
                     errors.len()
-                );
+                ));
                 return None;
             }
         };
@@ -6902,7 +13611,7 @@ pub fn evaluate(
 ) -> Result<(Arc<Object>, ConstructContext), String> {
     let function_registry = FunctionRegistry::new();
     let module_loader = ModuleLoader::default();
-    let (obj, ctx, _, _, _, _, _, _) = evaluate_with_registry(
+    let (obj, ctx, _, _, _, _, _) = evaluate_with_registry(
         source_code,
         expressions,
         states_local_storage_key,
@@ -6923,10 +13632,9 @@ pub fn evaluate(
 /// - `ModuleLoader`: Module loader for imports
 /// - `Arc<ReferenceConnector>`: Connector for variable references (MUST be dropped when done!)
 /// - `Arc<LinkConnector>`: Connector for LINK variables (MUST be dropped when done!)
-/// - `Arc<PassThroughConnector>`: Connector for LINK pass-throughs (MUST be dropped when done!)
 /// - `ScopeDestroyGuard`: Guard for the root registry scope (destroys all actor scopes on drop)
 ///
-/// IMPORTANT: The ReferenceConnector, LinkConnector, PassThroughConnector, and ScopeDestroyGuard
+/// IMPORTANT: The ReferenceConnector, LinkConnector, and ScopeDestroyGuard
 /// MUST be dropped when the program is finished (e.g., when switching examples) to allow actors
 /// to be cleaned up. The connectors hold strong references to all top-level actors, and the
 /// ScopeDestroyGuard recursively destroys all registry scopes and their actors.
@@ -6945,7 +13653,6 @@ pub fn evaluate_with_registry(
         ModuleLoader,
         Arc<ReferenceConnector>,
         Arc<LinkConnector>,
-        Arc<PassThroughConnector>,
         ScopeDestroyGuard,
     ),
     String,
@@ -6964,7 +13671,6 @@ pub fn evaluate_with_registry(
     };
     let reference_connector = Arc::new(ReferenceConnector::new());
     let link_connector = Arc::new(LinkConnector::new());
-    let pass_through_connector = Arc::new(PassThroughConnector::new());
 
     // First pass: collect function definitions and variables
     let mut variables = Vec::new();
@@ -7006,22 +13712,25 @@ pub fn evaluate_with_registry(
     }
 
     // Second pass: evaluate variables
-    let evaluated_variables: Result<Vec<_>, _> = variables
-        .into_iter()
-        .map(|variable| {
-            static_spanned_variable_into_variable(
-                variable,
-                construct_context.clone(),
-                actor_context.clone(),
-                reference_connector.clone(),
-                link_connector.clone(),
-                pass_through_connector.clone(),
-                &function_registry,
-                module_loader.clone(),
-                source_code.clone(),
-            )
-        })
-        .collect();
+    let evaluated_variables: Result<Vec<_>, _> = REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        variables
+            .into_iter()
+            .map(|variable| {
+                static_spanned_variable_into_variable_with_runtime_registry(
+                    Some(&mut reg),
+                    variable,
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    reference_connector.clone(),
+                    link_connector.clone(),
+                    &function_registry,
+                    module_loader.clone(),
+                    source_code.clone(),
+                )
+            })
+            .collect()
+    });
 
     let root_object = Object::new_arc(
         ConstructInfo::new("root", None, "root"),
@@ -7036,7 +13745,6 @@ pub fn evaluate_with_registry(
         module_loader,
         reference_connector,
         link_connector,
-        pass_through_connector,
         root_scope_guard,
     ))
 }
@@ -7048,7 +13756,30 @@ fn static_spanned_variable_into_variable(
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
-    pass_through_connector: Arc<PassThroughConnector>,
+    function_registry: &FunctionRegistry,
+    module_loader: ModuleLoader,
+    source_code: SourceCode,
+) -> Result<Arc<Variable>, String> {
+    static_spanned_variable_into_variable_with_runtime_registry(
+        None,
+        variable,
+        construct_context,
+        actor_context,
+        reference_connector,
+        link_connector,
+        function_registry,
+        module_loader,
+        source_code,
+    )
+}
+
+fn static_spanned_variable_into_variable_with_runtime_registry(
+    reg: Option<&mut ActorRegistry>,
+    variable: static_expression::Spanned<static_expression::Variable>,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+    reference_connector: Arc<ReferenceConnector>,
+    link_connector: Arc<LinkConnector>,
     function_registry: &FunctionRegistry,
     module_loader: ModuleLoader,
     source_code: SourceCode,
@@ -7080,18 +13811,29 @@ fn static_spanned_variable_into_variable(
     let scope_for_link = actor_context.scope.clone();
 
     let variable = if is_link {
-        Variable::new_link_arc(construct_info, name_string, actor_context, persistence_id)
+        match reg {
+            Some(reg) => Variable::new_link_arc_with_registry(
+                reg,
+                construct_info,
+                name_string,
+                actor_context,
+                persistence_id,
+            ),
+            None => {
+                Variable::new_link_arc(construct_info, name_string, actor_context, persistence_id)
+            }
+        }
     } else {
         Variable::new_arc(
             construct_info,
             name_string,
-            static_spanned_expression_into_value_actor(
+            static_spanned_expression_into_value_actor_with_runtime_registry(
+                reg,
                 value,
                 construct_context.clone(),
                 actor_context.clone(),
                 reference_connector.clone(),
                 link_connector.clone(),
-                pass_through_connector.clone(),
                 function_registry,
                 module_loader,
                 source_code,
@@ -7153,7 +13895,6 @@ pub fn evaluate_static_expression(
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
-    pass_through_connector: Arc<PassThroughConnector>,
     source_code: SourceCode,
 ) -> Result<ActorHandle, String> {
     evaluate_static_expression_with_registry(
@@ -7162,7 +13903,6 @@ pub fn evaluate_static_expression(
         actor_context,
         reference_connector,
         link_connector,
-        pass_through_connector,
         source_code,
         None,
     )
@@ -7176,7 +13916,28 @@ pub fn evaluate_static_expression_with_registry(
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
-    pass_through_connector: Arc<PassThroughConnector>,
+    source_code: SourceCode,
+    function_registry_snapshot: Option<Arc<FunctionRegistry>>,
+) -> Result<ActorHandle, String> {
+    evaluate_static_expression_with_runtime_registry(
+        None,
+        static_expr,
+        construct_context,
+        actor_context,
+        reference_connector,
+        link_connector,
+        source_code,
+        function_registry_snapshot,
+    )
+}
+
+pub(crate) fn evaluate_static_expression_with_runtime_registry(
+    reg: Option<&mut ActorRegistry>,
+    static_expr: &static_expression::Spanned<static_expression::Expression>,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+    reference_connector: Arc<ReferenceConnector>,
+    link_connector: Arc<LinkConnector>,
     source_code: SourceCode,
     function_registry_snapshot: Option<Arc<FunctionRegistry>>,
 ) -> Result<ActorHandle, String> {
@@ -7184,13 +13945,13 @@ pub fn evaluate_static_expression_with_registry(
     let registry = function_registry_snapshot
         .map(|snap| (*snap).clone())
         .unwrap_or_else(FunctionRegistry::new);
-    static_spanned_expression_into_value_actor(
+    static_spanned_expression_into_value_actor_with_runtime_registry(
+        reg,
         static_expr.clone(),
         construct_context,
         actor_context,
         reference_connector,
         link_connector,
-        pass_through_connector,
         &registry,
         ModuleLoader::default(),
         source_code,
@@ -7207,7 +13968,30 @@ fn static_spanned_expression_into_value_actor(
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
-    pass_through_connector: Arc<PassThroughConnector>,
+    function_registry: &FunctionRegistry,
+    module_loader: ModuleLoader,
+    source_code: SourceCode,
+) -> Result<ActorHandle, String> {
+    static_spanned_expression_into_value_actor_with_runtime_registry(
+        None,
+        expression,
+        construct_context,
+        actor_context,
+        reference_connector,
+        link_connector,
+        function_registry,
+        module_loader,
+        source_code,
+    )
+}
+
+fn static_spanned_expression_into_value_actor_with_runtime_registry(
+    reg: Option<&mut ActorRegistry>,
+    expression: static_expression::Spanned<static_expression::Expression>,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+    reference_connector: Arc<ReferenceConnector>,
+    link_connector: Arc<LinkConnector>,
     function_registry: &FunctionRegistry,
     module_loader: ModuleLoader,
     source_code: SourceCode,
@@ -7225,7 +14009,6 @@ fn static_spanned_expression_into_value_actor(
         actor_context,
         reference_connector: Arc::downgrade(&reference_connector),
         link_connector: Arc::downgrade(&link_connector),
-        pass_through_connector: Arc::downgrade(&pass_through_connector),
         module_loader,
         source_code,
         function_registry_snapshot: snapshot,
@@ -7233,7 +14016,7 @@ fn static_spanned_expression_into_value_actor(
     };
 
     // Delegate to the stack-safe evaluator
-    evaluate_expression(expression, ctx)?
+    evaluate_expression_with_runtime_registry(reg, expression, ctx)?
         .ok_or_else(|| "Top-level expression cannot be SKIP".to_string())
 }
 
@@ -8211,13 +14994,14 @@ type PatternBindings = HashMap<String, ActorHandle>;
 /// Each recorded call represents an item added to a list (e.g., new_todo() call).
 /// Calls are stored in order so they can be replayed on restoration.
 fn spawn_recorded_calls_storage_actor(
+    scope_id: ScopeId,
     storage_key: String,
     mut call_receiver: mpsc::Receiver<RecordedCall>,
-) -> TaskHandle {
+) {
     use zoon::futures_util::StreamExt;
     use zoon::{WebStorage, local_storage};
 
-    Task::start_droppable(async move {
+    start_retained_scope_task(scope_id, async move {
         // Load existing recorded calls from storage (if any)
         let mut recorded_calls: Vec<RecordedCall> =
             match local_storage().get::<Vec<RecordedCall>>(&storage_key) {
@@ -8266,15 +15050,15 @@ fn spawn_recorded_calls_storage_actor(
         if LOG_DEBUG {
             zoon::println!("[DEBUG] Storage actor for {} shutting down", storage_key);
         }
-    })
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::{FunctionRegistry, ModuleLoader, evaluate_with_registry, flatten_pipe_chain};
     use crate::engine::{
-        ActorContext, ConstructContext, ConstructId, Object, ScopeDestroyGuard, Value, Variable,
-        VirtualFilesystem,
+        ActorContext, ActorHandle, ConstructContext, ConstructId, Object, ReferenceConnector,
+        ScopeDestroyGuard, Value, Variable, VirtualFilesystem,
     };
     use boon::parser::{
         SourceCode, Spanned, Token, lexer, parser, resolve_references, span_at, static_expression,
@@ -8289,8 +15073,18 @@ mod tests {
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
     use std::time::Duration;
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+    #[cfg(target_arch = "wasm32")]
+    use zoon::Timer;
     use zoon::futures_util::stream::StreamExt;
+    #[cfg(target_arch = "wasm32")]
+    use zoon::futures_util::{FutureExt, pin_mut, select};
+    use zoon::mpsc;
     use zoon::serde_json::{self, json};
+
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_test_configure!(run_in_browser);
 
     fn latest_conformance_source() -> &'static str {
         r#"
@@ -8402,7 +15196,6 @@ pressed: increment_button.event.press |> THEN { TEXT { pressed } }
             _module_loader,
             _references,
             _links,
-            _pass_throughs,
             scope_guard,
         ) = evaluate_with_registry(
             source_code,
@@ -8414,6 +15207,705 @@ pressed: increment_button.event.press |> THEN { TEXT { pressed } }
         )
         .expect("program should evaluate");
         (root_object, construct_context, scope_guard)
+    }
+
+    #[test]
+    fn module_loader_clones_share_direct_base_dir_and_cache_state() {
+        let loader = ModuleLoader::new("");
+        let loader_clone = loader.clone();
+
+        loader.set_base_dir("components");
+        assert_eq!(
+            block_on(loader_clone.base_dir()),
+            "components",
+            "cloned module loaders should see direct shared base_dir updates"
+        );
+
+        let (_, variables) = parse_static_variables("value: 1");
+        loader.cache(
+            "Theme".to_string(),
+            super::ModuleData {
+                functions: HashMap::new(),
+                variables,
+            },
+        );
+
+        let cached = block_on(loader_clone.get_cached("Theme"))
+            .expect("cloned module loader should see cached module data");
+        let cached_expr = cached
+            .variables
+            .get("value")
+            .expect("module should contain value variable");
+        let static_expression::Expression::Literal(static_expression::Literal::Number(
+            cached_number,
+        )) = &cached_expr.node
+        else {
+            panic!("expected cached module variable to stay a number literal");
+        };
+        assert_eq!(
+            *cached_number, 1.0,
+            "cloned module loaders should share cached module data directly"
+        );
+    }
+
+    #[test]
+    fn piped_link_setter_uses_runtime_forwarding_without_scope_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: Some(scope_id),
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+
+        let sink_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let (sink_sender, _sink_receiver) = crate::engine::NamedChannel::new("test.link.sink", 8);
+        let sink = Variable::new_link_arc_with_forwarding_actor(
+            crate::engine::ConstructInfo::new("test.link.sink", None, "test link sink"),
+            "sink",
+            boon::parser::PersistenceId::new(),
+            actor_context.scope.clone(),
+            sink_actor,
+            sink_sender,
+        );
+        let ports_actor = crate::engine::create_constant_actor(
+            boon::parser::PersistenceId::new(),
+            Object::new_value(
+                crate::engine::ConstructInfo::new("test.ports", None, "test ports"),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [sink.clone()],
+            ),
+            scope_id,
+        );
+        let payload_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        payload_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new("test.payload", None, "test payload"),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.0,
+        ));
+
+        let source_code = SourceCode::new("ports.sink".to_owned());
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![source_code.slice(0, 5), source_code.slice(6, 10)],
+            referenced_span: None,
+        };
+        let ctx = super::EvaluationContext {
+            construct_context: construct_context.clone(),
+            actor_context: ActorContext {
+                parameters: Arc::new(HashMap::from([("ports".to_owned(), ports_actor)])),
+                ..actor_context
+            },
+            reference_connector: std::sync::Weak::new(),
+            link_connector: std::sync::Weak::new(),
+            function_registry_snapshot: None,
+            current_module: None,
+            module_loader: ModuleLoader::default(),
+            source_code,
+        };
+
+        let link_target_actor = super::try_get_link_target_actor_now(alias, &ctx)
+            .expect("ready nested LINK target should resolve without async waiting");
+        crate::engine::connect_forwarding_current_and_future(link_target_actor, payload_actor);
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "piped LINK setters with ready nested targets should reuse runtime forwarding instead of spawning a scope task"
+            );
+        });
+
+        let Value::Number(number, _) = sink
+            .value_actor()
+            .current_value()
+            .expect("sink LINK should receive the piped value immediately")
+        else {
+            panic!("sink LINK should resolve to a number");
+        };
+        assert_eq!(number.number(), 1.0);
+    }
+
+    #[test]
+    fn piped_link_setter_waits_for_late_root_without_scope_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: Some(scope_id),
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let reference_connector = Arc::new(ReferenceConnector::new());
+
+        let sink_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let (sink_sender, _sink_receiver) = crate::engine::NamedChannel::new("test.link.sink", 8);
+        let sink = Variable::new_link_arc_with_forwarding_actor(
+            crate::engine::ConstructInfo::new("test.link.sink.late", None, "test late link sink"),
+            "sink",
+            boon::parser::PersistenceId::new(),
+            actor_context.scope.clone(),
+            sink_actor,
+            sink_sender,
+        );
+
+        let payload_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        payload_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new("test.payload.late", None, "test late payload"),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.0,
+        ));
+
+        let source_code = SourceCode::new("ports.sink".to_owned());
+        let ref_span = span_at(0);
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![source_code.slice(0, 5), source_code.slice(6, 10)],
+            referenced_span: Some(ref_span),
+        };
+        let ctx = super::EvaluationContext {
+            construct_context: construct_context.clone(),
+            actor_context,
+            reference_connector: Arc::downgrade(&reference_connector),
+            link_connector: std::sync::Weak::new(),
+            function_registry_snapshot: None,
+            current_module: None,
+            module_loader: ModuleLoader::default(),
+            source_code,
+        };
+
+        assert!(
+            super::try_connect_waiting_link_target_without_scope_task(
+                alias,
+                &ctx,
+                payload_actor.clone(),
+            ),
+            "late-root LINK target should install the direct waiting path"
+        );
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "late-root piped LINK setter should wait through runtime subscribers instead of spawning a scope task"
+            );
+        });
+
+        assert!(
+            sink.value_actor().current_value().is_err(),
+            "sink should stay empty until the late root is registered"
+        );
+
+        let ports_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        ports_actor.store_value_directly(Object::new_value(
+            crate::engine::ConstructInfo::new("test.ports.late", None, "test late ports"),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            [sink.clone()],
+        ));
+        reference_connector.register_referenceable(ref_span, ports_actor);
+
+        let Value::Number(number, _) = sink
+            .value_actor()
+            .current_value()
+            .expect("sink LINK should resolve once the late root is registered")
+        else {
+            panic!("sink LINK should resolve to a number after late root registration");
+        };
+        assert_eq!(number.number(), 1.0);
+
+        payload_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.payload.late.update",
+                None,
+                "test late payload update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+
+        let Value::Number(number, _) = sink
+            .value_actor()
+            .current_value()
+            .expect("sink LINK should keep following payload updates after late root resolution")
+        else {
+            panic!("sink LINK should stay a number after late root update");
+        };
+        assert_eq!(number.number(), 2.0);
+    }
+
+    #[test]
+    fn piped_link_setter_waits_for_late_nested_field_without_scope_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: Some(scope_id),
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+
+        let sink_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let (sink_sender, _sink_receiver) =
+            crate::engine::NamedChannel::new("test.link.sink.nested", 8);
+        let sink = Variable::new_link_arc_with_forwarding_actor(
+            crate::engine::ConstructInfo::new(
+                "test.link.sink.nested",
+                None,
+                "test nested link sink",
+            ),
+            "sink",
+            boon::parser::PersistenceId::new(),
+            actor_context.scope.clone(),
+            sink_actor,
+            sink_sender,
+        );
+
+        let group_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let ports_actor = crate::engine::create_constant_actor(
+            boon::parser::PersistenceId::new(),
+            Object::new_value(
+                crate::engine::ConstructInfo::new("test.ports.nested", None, "test nested ports"),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        "test.ports.group.nested",
+                        None,
+                        "test nested ports group",
+                    ),
+                    "group",
+                    group_actor.clone(),
+                    boon::parser::PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            ),
+            scope_id,
+        );
+
+        let payload_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        payload_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new("test.payload.nested", None, "test nested payload"),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.0,
+        ));
+
+        let source_code = SourceCode::new("ports.group.sink".to_owned());
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![
+                source_code.slice(0, 5),
+                source_code.slice(6, 11),
+                source_code.slice(12, 16),
+            ],
+            referenced_span: None,
+        };
+        let ctx = super::EvaluationContext {
+            construct_context: construct_context.clone(),
+            actor_context: ActorContext {
+                parameters: Arc::new(HashMap::from([("ports".to_owned(), ports_actor)])),
+                ..actor_context
+            },
+            reference_connector: std::sync::Weak::new(),
+            link_connector: std::sync::Weak::new(),
+            function_registry_snapshot: None,
+            current_module: None,
+            module_loader: ModuleLoader::default(),
+            source_code,
+        };
+
+        assert!(
+            super::try_connect_waiting_link_target_without_scope_task(
+                alias,
+                &ctx,
+                payload_actor.clone(),
+            ),
+            "ready-root nested LINK target should wait through runtime subscribers"
+        );
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "ready-root nested LINK setter should wait without a fallback scope task"
+            );
+        });
+
+        assert!(
+            sink.value_actor().current_value().is_err(),
+            "sink should stay empty until the nested field actor emits"
+        );
+
+        group_actor.store_value_directly(Object::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.ports.group.value.nested",
+                None,
+                "test nested group value",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            [sink.clone()],
+        ));
+
+        let Value::Number(number, _) = sink
+            .value_actor()
+            .current_value()
+            .expect("sink LINK should resolve once the nested field actor emits")
+        else {
+            panic!("sink LINK should resolve to a number after nested field emission");
+        };
+        assert_eq!(number.number(), 1.0);
+
+        payload_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.payload.nested.update",
+                None,
+                "test nested payload update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+
+        let Value::Number(number, _) = sink.value_actor().current_value().expect(
+            "sink LINK should keep following payload updates after nested field connection",
+        ) else {
+            panic!("sink LINK should stay a number after nested field update");
+        };
+        assert_eq!(number.number(), 2.0);
+    }
+
+    #[test]
+    fn piped_link_setter_waits_for_lazy_root_with_one_scope_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: Some(scope_id),
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let reference_connector = Arc::new(ReferenceConnector::new());
+
+        let sink_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let (sink_sender, _sink_receiver) =
+            crate::engine::NamedChannel::new("test.link.sink.lazy", 8);
+        let sink = Variable::new_link_arc_with_forwarding_actor(
+            crate::engine::ConstructInfo::new("test.link.sink.lazy", None, "test lazy link sink"),
+            "sink",
+            boon::parser::PersistenceId::new(),
+            actor_context.scope.clone(),
+            sink_actor,
+            sink_sender,
+        );
+
+        let payload_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        payload_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new("test.payload.lazy", None, "test lazy payload"),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.0,
+        ));
+
+        let source_code = SourceCode::new("ports.sink".to_owned());
+        let ref_span = span_at(0);
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![source_code.slice(0, 5), source_code.slice(6, 10)],
+            referenced_span: Some(ref_span),
+        };
+        let (mut root_tx, root_rx) = mpsc::channel::<Value>(8);
+        let root_actor =
+            crate::engine::create_actor_lazy(root_rx, boon::parser::PersistenceId::new(), scope_id);
+        reference_connector.register_referenceable(ref_span, root_actor);
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let ctx = super::EvaluationContext {
+            construct_context: construct_context.clone(),
+            actor_context,
+            reference_connector: Arc::downgrade(&reference_connector),
+            link_connector: std::sync::Weak::new(),
+            function_registry_snapshot: None,
+            current_module: None,
+            module_loader: ModuleLoader::default(),
+            source_code,
+        };
+
+        assert!(
+            super::try_connect_waiting_link_target_without_scope_task(
+                alias,
+                &ctx,
+                payload_actor.clone(),
+            ),
+            "lazy-root LINK target should install the direct waiting path"
+        );
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy-root piped LINK setter should add one scope-owned watcher plus the first-demand lazy root task"
+            );
+        });
+
+        assert!(
+            sink.value_actor().current_value().is_err(),
+            "sink should stay empty until the lazy root emits its first object"
+        );
+
+        root_tx
+            .try_send(Object::new_value(
+                crate::engine::ConstructInfo::new("test.ports.lazy", None, "test lazy ports"),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [sink.clone()],
+            ))
+            .expect("lazy root object should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Number(number, _) = sink
+            .value_actor()
+            .current_value()
+            .expect("sink LINK should resolve once the lazy root emits")
+        else {
+            panic!("sink LINK should resolve to a number after lazy root emission");
+        };
+        assert_eq!(number.number(), 1.0);
+
+        payload_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.payload.lazy.update",
+                None,
+                "test lazy payload update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+
+        let Value::Number(number, _) = sink
+            .value_actor()
+            .current_value()
+            .expect("sink LINK should keep following payload updates after lazy root connection")
+        else {
+            panic!("sink LINK should stay a number after lazy root update");
+        };
+        assert_eq!(number.number(), 2.0);
+    }
+
+    #[test]
+    fn piped_link_setter_missing_path_does_not_spawn_fallback_scope_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: Some(scope_id),
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+
+        let ports_actor = crate::engine::create_constant_actor(
+            boon::parser::PersistenceId::new(),
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.ports.missing_path",
+                    None,
+                    "test missing-path ports",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [],
+            ),
+            scope_id,
+        );
+
+        let payload_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        payload_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.payload.missing_path",
+                None,
+                "test missing-path payload",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.0,
+        ));
+
+        let source_code = SourceCode::new("ports.group.sink".to_owned());
+        let alias = static_expression::Spanned {
+            span: (0..16).into(),
+            persistence: None,
+            node: static_expression::Alias::WithoutPassed {
+                parts: vec![
+                    source_code.slice(0, 5),
+                    source_code.slice(6, 11),
+                    source_code.slice(12, 16),
+                ],
+                referenced_span: None,
+            },
+        };
+        let ctx = super::EvaluationContext {
+            construct_context,
+            actor_context: ActorContext {
+                parameters: Arc::new(HashMap::from([("ports".to_owned(), ports_actor)])),
+                piped: Some(payload_actor.clone()),
+                ..actor_context
+            },
+            reference_connector: std::sync::Weak::new(),
+            link_connector: std::sync::Weak::new(),
+            function_registry_snapshot: None,
+            current_module: None,
+            module_loader: ModuleLoader::default(),
+            source_code,
+        };
+
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let result_actor = super::build_link_setter_actor_with_runtime_registry(
+            None,
+            alias,
+            (0..16).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            ctx,
+        )
+        .expect("missing-path piped LINK setter should still return the source actor");
+
+        assert_eq!(
+            result_actor.actor_id(),
+            payload_actor.actor_id(),
+            "piped LINK setter should keep returning the piped source actor"
+        );
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count,
+                "missing-path piped LINK setter should not spawn the removed fallback scope task"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_comparison_values_waits_for_late_outer_reference_without_async_source_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let reference_connector = Arc::new(ReferenceConnector::new());
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let source_code = SourceCode::new("name".to_owned());
+        let ref_span = span_at(0);
+        let arms = vec![static_expression::Arm {
+            pattern: static_expression::Pattern::ValueComparison {
+                path: vec![source_code.slice(0, 4)],
+                referenced_span: Some(ref_span),
+            },
+            body: static_expression::Spanned {
+                span: (0..0).into(),
+                persistence: None,
+                node: static_expression::Expression::Skip,
+            },
+        }];
+
+        let weak_reference_connector = Arc::downgrade(&reference_connector);
+        let mut pending_resolution = Box::pin(super::resolve_comparison_values(
+            &arms,
+            &actor_context,
+            &weak_reference_connector,
+        ));
+
+        let Poll::Pending = poll_once(pending_resolution.as_mut()) else {
+            panic!("late outer comparison reference should stay pending until registered");
+        };
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "comparison pre-resolution should wait through connector-owned actors instead of async source tasks"
+            );
+        });
+
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let name_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        name_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.resolve_comparison_values.outer_reference.current",
+                None,
+                "test resolve comparison values outer reference current",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "current",
+        ));
+        reference_connector.register_referenceable(ref_span, name_actor);
+
+        let resolved = block_on(pending_resolution);
+        let Some(Value::Text(text, _)) = resolved.get("name") else {
+            panic!(
+                "comparison value should resolve to text once the outer reference is registered"
+            );
+        };
+        assert_eq!(text.text(), "current");
     }
 
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -8458,6 +15950,24 @@ pressed: increment_button.event.press |> THEN { TEXT { pressed } }
         let mut cx = Context::from_waker(&waker);
         let mut future = std::pin::pin!(future);
         future.as_mut().poll(&mut cx)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn next_value_with_timeout(
+        stream: &mut std::pin::Pin<&mut impl StreamExt<Item = Value>>,
+        timeout_ms: u32,
+        label: &str,
+    ) -> Value {
+        let mut stream_ref = stream.as_mut();
+        let next_value = stream_ref.next();
+        let next_value = next_value.fuse();
+        let timeout = Timer::sleep(timeout_ms).fuse();
+        pin_mut!(next_value, timeout);
+
+        select! {
+            value = next_value => value.unwrap_or_else(|| panic!("{label}: stream ended unexpectedly")),
+            _ = timeout => panic!("{label}: timed out after {timeout_ms}ms"),
+        }
     }
 
     async fn send_edit_committed(
@@ -9394,6 +16904,154 @@ all_completed: completed_todos_count == 4
     }
 
     #[test]
+    fn waiting_spread_object_actor_uses_runtime_subscribers_without_future_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let spread_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let explicit_variable = Variable::new_arc(
+            crate::engine::ConstructInfo::new(
+                "test.waiting_spread_object.explicit",
+                None,
+                "test waiting spread object explicit",
+            ),
+            "explicit",
+            crate::engine::create_constant_actor(
+                boon::parser::PersistenceId::new(),
+                Value::Text(
+                    Arc::new(crate::engine::Text::new(
+                        crate::engine::ConstructInfo::new(
+                            "test.waiting_spread_object.explicit_text",
+                            None,
+                            "test waiting spread object explicit text",
+                        ),
+                        construct_context.clone(),
+                        "explicit",
+                    )),
+                    crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+                ),
+                scope_id,
+            ),
+            boon::parser::PersistenceId::new(),
+            actor_context.scope.clone(),
+        );
+
+        let result_actor = super::create_waiting_spread_struct_actor_with_registry(
+            None,
+            vec![spread_actor.clone()],
+            vec![explicit_variable],
+            boon::parser::PersistenceId::new(),
+            scope_id,
+            {
+                let construct_context = construct_context.clone();
+                move |merged_variables| {
+                    Object::new_value(
+                        crate::engine::ConstructInfo::new(
+                            "test.waiting_spread_object.result",
+                            None,
+                            "test waiting spread object result",
+                        ),
+                        construct_context.clone(),
+                        crate::engine::ValueIdempotencyKey::new(),
+                        merged_variables,
+                    )
+                }
+            },
+        );
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "late eager spread object should wait through runtime subscribers without a future wrapper task"
+            );
+        });
+
+        assert!(
+            result_actor.current_value().is_err(),
+            "result object should stay pending until the spread actor emits"
+        );
+
+        let spread_field_actor = crate::engine::create_constant_actor(
+            boon::parser::PersistenceId::new(),
+            {
+                Value::Text(
+                    Arc::new(crate::engine::Text::new(
+                        crate::engine::ConstructInfo::new(
+                            "test.waiting_spread_object.spread_text",
+                            None,
+                            "test waiting spread object spread text",
+                        ),
+                        construct_context.clone(),
+                        "from spread",
+                    )),
+                    crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+                )
+            },
+            scope_id,
+        );
+        spread_actor.store_value_directly(Object::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.waiting_spread_object.spread_value",
+                None,
+                "test waiting spread object spread value",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            [Variable::new_arc(
+                crate::engine::ConstructInfo::new(
+                    "test.waiting_spread_object.spread_var",
+                    None,
+                    "test waiting spread object spread var",
+                ),
+                "from_spread",
+                spread_field_actor,
+                boon::parser::PersistenceId::new(),
+                actor_context.scope.clone(),
+            )],
+        ));
+
+        let Value::Object(object, _) = result_actor
+            .current_value()
+            .expect("result object should resolve once the spread actor emits")
+        else {
+            panic!("result should resolve to an object");
+        };
+        let Value::Text(from_spread, _) = object
+            .expect_variable("from_spread")
+            .value_actor()
+            .current_value()
+            .expect("spread field should expose text")
+        else {
+            panic!("spread field should resolve to text");
+        };
+        let Value::Text(explicit, _) = object
+            .expect_variable("explicit")
+            .value_actor()
+            .current_value()
+            .expect("explicit field should expose text")
+        else {
+            panic!("explicit field should resolve to text");
+        };
+        assert_eq!(from_spread.text(), "from spread");
+        assert_eq!(explicit.text(), "explicit");
+    }
+
+    #[test]
     fn list_append_hold_snapshot_fast_path_returns_immediate_value_when_ready() {
         let scope_id = crate::engine::create_registry_scope(None);
         let _scope_guard = ScopeDestroyGuard::new(scope_id);
@@ -9451,6 +17109,7 @@ all_completed: completed_todos_count == 4
         );
 
         let Value::List(result_list, _) = super::try_build_list_append_hold_snapshot_now(
+            None,
             &hold_actor_context
                 .piped
                 .clone()
@@ -9593,6 +17252,164 @@ all_completed: completed_todos_count == 4
             "current",
             "async snapshot helper should append the latest current item value, not stale buffered history"
         );
+    }
+
+    #[test]
+    fn waiting_list_append_hold_snapshot_actor_uses_runtime_subscribers_for_pending_nested_list_snapshot()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let existing_item = crate::engine::Text::new_arc_value_actor(
+            crate::engine::ConstructInfo::new(
+                "test.list_append.waiting_snapshot.existing_item",
+                None,
+                "test list append waiting snapshot existing item",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            actor_context.clone(),
+            "existing",
+        );
+        let list_actor = crate::engine::create_constant_actor(
+            boon::parser::PersistenceId::new(),
+            Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        "test.list_append.waiting_snapshot.source_list",
+                        None,
+                        "test list append waiting snapshot source list",
+                    ),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    vec![existing_item],
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            ),
+            scope_id,
+        );
+
+        let (mut nested_list_tx, nested_list_rx) = mpsc::channel::<crate::engine::ListChange>(8);
+        let pending_nested_list = Arc::new(crate::engine::List::new_with_change_stream(
+            crate::engine::ConstructInfo::new(
+                "test.list_append.waiting_snapshot.pending_nested_list",
+                None,
+                "test list append waiting snapshot pending nested list",
+            ),
+            actor_context.clone(),
+            nested_list_rx,
+            (),
+        ));
+        let item_actor = crate::engine::create_constant_actor(
+            boon::parser::PersistenceId::new(),
+            Value::List(
+                pending_nested_list,
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            ),
+            scope_id,
+        );
+
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let result_actor = super::create_waiting_list_append_hold_snapshot_actor_with_registry(
+            None,
+            list_actor,
+            item_actor,
+            construct_context.clone(),
+            actor_context.clone(),
+        );
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count,
+                "waiting HOLD snapshot append should reuse runtime/list subscribers without adding another snapshot waiter task"
+            );
+        });
+
+        assert!(
+            result_actor.current_value().is_err(),
+            "result should stay pending until the nested list snapshot becomes available"
+        );
+
+        let nested_item = crate::engine::Text::new_arc_value_actor(
+            crate::engine::ConstructInfo::new(
+                "test.list_append.waiting_snapshot.nested_item",
+                None,
+                "test list append waiting snapshot nested item",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            actor_context.clone(),
+            "nested",
+        );
+        nested_list_tx
+            .try_send(crate::engine::ListChange::Replace {
+                items: Arc::from(vec![nested_item]),
+            })
+            .expect("pending nested list should accept its first replace");
+        for _ in 0..3 {
+            crate::engine::poll_test_async_source_tasks();
+        }
+
+        let Value::List(result_list, _) = result_actor
+            .current_value()
+            .expect("result should resolve once the nested list snapshot becomes available")
+        else {
+            panic!("result should resolve to a list");
+        };
+
+        let snapshot = block_on(result_list.snapshot());
+        assert_eq!(
+            snapshot.len(),
+            2,
+            "result list should contain existing and appended items"
+        );
+
+        let Value::Text(existing, _) = snapshot[0]
+            .1
+            .current_value()
+            .expect("existing item should expose current value")
+        else {
+            panic!("existing item should stay text");
+        };
+        assert_eq!(existing.text(), "existing");
+
+        let Value::List(appended_list, _) = snapshot[1]
+            .1
+            .current_value()
+            .expect("appended item should expose the materialized nested list")
+        else {
+            panic!("appended item should resolve to a list");
+        };
+        let nested_snapshot = block_on(appended_list.snapshot());
+        assert_eq!(
+            nested_snapshot.len(),
+            1,
+            "materialized appended nested list should expose its initialized snapshot"
+        );
+        let Value::Text(nested_text, _) = nested_snapshot[0]
+            .1
+            .current_value()
+            .expect("nested appended item should expose current value")
+        else {
+            panic!("nested appended item should stay text");
+        };
+        assert_eq!(nested_text.text(), "nested");
     }
 
     #[test]
@@ -9782,6 +17599,4067 @@ all_completed: completed_todos_count == 4
     }
 
     #[test]
+    fn stateful_hold_uses_direct_state_state_actor_without_extra_internal_stream_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let (_source_code, variables) =
+            parse_static_variables("counter: 0 |> HOLD state { state }");
+        let counter = variables
+            .get("counter")
+            .cloned()
+            .expect("counter variable should exist");
+        let chain = flatten_pipe_chain(counter);
+        let static_expression::Expression::Hold { state_param, body } = &chain[1].node else {
+            panic!("expected second pipe step to be HOLD");
+        };
+
+        let initial_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        initial_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.stateful_hold_direct_state.initial",
+                None,
+                "test stateful hold direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            0.0,
+        ));
+
+        let hold_actor = super::build_hold_actor(
+            initial_actor,
+            state_param.to_string(),
+            (**body).clone(),
+            chain[1].span,
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context,
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: SourceCode::new("counter: 0 |> HOLD state { state }".to_owned()),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+        )
+        .expect("stateful HOLD should evaluate")
+        .expect("stateful HOLD should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "ready direct-state HOLD should stay on runtime subscribers without internal or output stream tasks"
+            );
+        });
+
+        let Value::Number(number, _) = hold_actor
+            .current_value()
+            .expect("stateful HOLD should expose its initial current value")
+        else {
+            panic!("stateful HOLD should resolve to a number");
+        };
+        assert_eq!(number.number(), 0.0);
+    }
+
+    #[test]
+    fn stateless_hold_ready_direct_state_path_uses_no_wrapper_task_and_follows_source_updates() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let (_source_code, variables) = parse_static_variables("value: 0 |> HOLD ignored { 1 }");
+        let value_expr = variables
+            .get("value")
+            .cloned()
+            .expect("value variable should exist");
+        let chain = flatten_pipe_chain(value_expr);
+        let static_expression::Expression::Hold { state_param, body } = &chain[1].node else {
+            panic!("expected second pipe step to be HOLD");
+        };
+
+        let initial_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        initial_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.stateless_hold_direct_state.initial",
+                None,
+                "test stateless hold direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            0.0,
+        ));
+
+        let hold_actor = super::build_hold_actor(
+            initial_actor.clone(),
+            state_param.to_string(),
+            (**body).clone(),
+            chain[1].span,
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context,
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: SourceCode::new("value: 0 |> HOLD ignored { 1 }".to_owned()),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+        )
+        .expect("stateless HOLD should evaluate")
+        .expect("stateless HOLD should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "ready direct-state stateless HOLD should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(number, _) = hold_actor
+            .current_value()
+            .expect("stateless HOLD should expose current value")
+        else {
+            panic!("stateless HOLD should resolve to a number");
+        };
+        assert_eq!(
+            number.number(),
+            1.0,
+            "constant stateless HOLD body should win over the seeded source value"
+        );
+
+        initial_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.stateless_hold_direct_state.update",
+                None,
+                "test stateless hold direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+
+        let Value::Number(number, _) = hold_actor
+            .current_value()
+            .expect("stateless HOLD should still expose current value after source update")
+        else {
+            panic!("stateless HOLD should stay a number after source update");
+        };
+        assert_eq!(
+            number.number(),
+            2.0,
+            "stateless HOLD should still follow later source updates on the direct runtime path"
+        );
+    }
+
+    #[test]
+    fn stateful_hold_direct_state_path_with_lazy_body_uses_one_scope_task_and_updates_state() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let initial_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let state_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        initial_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.stateful_hold_lazy_body.initial",
+                None,
+                "test stateful hold lazy body initial",
+            ),
+            ConstructContext {
+                construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                    std::collections::BTreeMap::new(),
+                )),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            crate::engine::ValueIdempotencyKey::new(),
+            0.0,
+        ));
+        state_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.stateful_hold_lazy_body.state.initial",
+                None,
+                "test stateful hold lazy body state initial",
+            ),
+            ConstructContext {
+                construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                    std::collections::BTreeMap::new(),
+                )),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            crate::engine::ValueIdempotencyKey::new(),
+            0.0,
+        ));
+        let (mut body_tx, body_rx) = mpsc::channel::<Value>(8);
+        let body_result =
+            crate::engine::create_actor_lazy(body_rx, boon::parser::PersistenceId::new(), scope_id);
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let hold_actor = super::try_create_direct_state_stateful_hold_actor(
+            crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.stateful_hold_lazy_body.seed",
+                    None,
+                    "test stateful hold lazy body seed",
+                ),
+                ConstructContext {
+                    construct_storage: Arc::new(
+                        crate::engine::ConstructStorage::in_memory_for_tests(
+                            std::collections::BTreeMap::new(),
+                        ),
+                    ),
+                    virtual_fs: VirtualFilesystem::new(),
+                    bridge_scope_id: None,
+                    scene_ctx: None,
+                },
+                crate::engine::ValueIdempotencyKey::new(),
+                0.0,
+            ),
+            initial_actor.clone(),
+            state_actor.clone(),
+            body_result,
+            boon::parser::PersistenceId::new(),
+            scope_id,
+        )
+        .expect("lazy-body stateful HOLD should stay on the direct-state path");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy-body direct-state HOLD should add one scope-owned watcher plus the first-demand lazy body task"
+            );
+        });
+
+        let Value::Number(number, _) = hold_actor
+            .current_value()
+            .expect("stateful HOLD should expose its seeded value immediately")
+        else {
+            panic!("stateful HOLD should resolve to number");
+        };
+        assert_eq!(number.number(), 0.0);
+
+        body_tx
+            .try_send(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.stateful_hold_lazy_body.body.update",
+                    None,
+                    "test stateful hold lazy body update",
+                ),
+                ConstructContext {
+                    construct_storage: Arc::new(
+                        crate::engine::ConstructStorage::in_memory_for_tests(
+                            std::collections::BTreeMap::new(),
+                        ),
+                    ),
+                    virtual_fs: VirtualFilesystem::new(),
+                    bridge_scope_id: None,
+                    scene_ctx: None,
+                },
+                crate::engine::ValueIdempotencyKey::new(),
+                1.0,
+            ))
+            .expect("lazy body update should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Number(number, _) = hold_actor
+            .current_value()
+            .expect("stateful HOLD should follow lazy body updates")
+        else {
+            panic!("stateful HOLD should stay number after lazy body update");
+        };
+        assert_eq!(number.number(), 1.0);
+
+        let Value::Number(number, _) = state_actor
+            .current_value()
+            .expect("state actor should be updated from lazy body output")
+        else {
+            panic!("state actor should resolve to number");
+        };
+        assert_eq!(number.number(), 1.0);
+    }
+
+    #[test]
+    fn stateless_hold_direct_state_path_with_lazy_body_uses_one_scope_task_and_updates_output() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let initial_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        initial_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.stateless_hold_lazy_body.initial",
+                None,
+                "test stateless hold lazy body initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            0.0,
+        ));
+        let (mut body_tx, body_rx) = mpsc::channel::<Value>(8);
+        let body_result =
+            crate::engine::create_actor_lazy(body_rx, boon::parser::PersistenceId::new(), scope_id);
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let hold_actor = super::try_create_direct_state_stateless_hold_actor(
+            crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.stateless_hold_lazy_body.seed",
+                    None,
+                    "test stateless hold lazy body seed",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                0.0,
+            ),
+            initial_actor.clone(),
+            body_result,
+            boon::parser::PersistenceId::new(),
+            scope_id,
+        )
+        .expect("lazy-body stateless HOLD should stay on the direct-state path");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy-body direct-state stateless HOLD should add one scope-owned watcher plus the first-demand lazy body task"
+            );
+        });
+
+        let Value::Number(number, _) = hold_actor
+            .current_value()
+            .expect("stateless HOLD should expose its seeded value immediately")
+        else {
+            panic!("stateless HOLD should resolve to number");
+        };
+        assert_eq!(number.number(), 0.0);
+
+        body_tx
+            .try_send(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.stateless_hold_lazy_body.body.update",
+                    None,
+                    "test stateless hold lazy body update",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                1.0,
+            ))
+            .expect("lazy body update should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Number(number, _) = hold_actor
+            .current_value()
+            .expect("stateless HOLD should follow lazy body updates")
+        else {
+            panic!("stateless HOLD should stay number after lazy body update");
+        };
+        assert_eq!(number.number(), 1.0);
+
+        initial_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.stateless_hold_lazy_body.initial.update",
+                None,
+                "test stateless hold lazy body initial update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+
+        let Value::Number(number, _) = hold_actor
+            .current_value()
+            .expect("stateless HOLD should still follow later initial updates")
+        else {
+            panic!("stateless HOLD should stay number after later initial update");
+        };
+        assert_eq!(number.number(), 2.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_direct_state_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) = parse_static_program("FUNCTION echo_value(x) { x }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "echo_value" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("echo_value function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("echo_value"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_direct_state.initial",
+                None,
+                "test function direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            0.0,
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("echo_value")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped user-defined function should evaluate")
+        .expect("piped user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "ready direct-state piped user-defined functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(number, _) = result_actor
+            .current_value()
+            .expect("piped function actor should expose the initial current value")
+        else {
+            panic!("piped function actor should resolve to a number");
+        };
+        assert_eq!(number.number(), 0.0);
+
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_direct_state.update",
+                None,
+                "test function direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+
+        let Value::Number(number, _) = result_actor
+            .current_value()
+            .expect("piped function actor should update after direct-state source changes")
+        else {
+            panic!("piped function actor should stay a number after source update");
+        };
+        assert_eq!(number.number(), 2.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_direct_state_body_with_lazy_input_uses_one_scope_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) = parse_static_program("FUNCTION echo_value(x) { x }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "echo_value" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("echo_value function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("echo_value"), function_def);
+
+        let (mut input_tx, input_rx) = mpsc::channel::<Value>(8);
+        let input_actor = crate::engine::create_actor_lazy(
+            input_rx,
+            boon::parser::PersistenceId::new(),
+            scope_id,
+        );
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let result_actor = super::call_function(
+            vec![String::from("echo_value")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("lazy piped user-defined function should evaluate")
+        .expect("lazy piped user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy direct-state piped user-defined functions should add one scope-owned watcher plus the first-demand lazy input task"
+            );
+        });
+
+        assert!(
+            result_actor.current_value().is_err(),
+            "lazy piped function actor should stay empty until the first input arrives"
+        );
+
+        input_tx
+            .try_send(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.function_direct_state_lazy.initial",
+                    None,
+                    "test function direct state lazy initial",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                2.0,
+            ))
+            .expect("lazy piped input should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Number(number, _) = result_actor
+            .current_value()
+            .expect("lazy piped function actor should resolve after the first input arrives")
+        else {
+            panic!("lazy piped function actor should resolve to a number");
+        };
+        assert_eq!(number.number(), 2.0);
+
+        input_tx
+            .try_send(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.function_direct_state_lazy.update",
+                    None,
+                    "test function direct state lazy update",
+                ),
+                construct_context,
+                crate::engine::ValueIdempotencyKey::new(),
+                5.0,
+            ))
+            .expect("second lazy piped input should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Number(number, _) = result_actor
+            .current_value()
+            .expect("lazy piped function actor should keep following lazy input updates")
+        else {
+            panic!("lazy piped function actor should stay a number after lazy input update");
+        };
+        assert_eq!(number.number(), 5.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_scalar_equal_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) = parse_static_program("FUNCTION is_zero(x) { x == 0 }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "is_zero" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("is_zero function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("is_zero"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_equal_direct_state.initial",
+                None,
+                "test function equal direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            0.0,
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("is_zero")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped equality user-defined function should evaluate")
+        .expect("piped equality user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "scalar equality piped user-defined functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let initial_json = block_on(
+            result_actor
+                .current_value()
+                .expect("piped equality function actor should expose the initial current value")
+                .to_json(),
+        );
+        assert_eq!(initial_json, serde_json::json!({ "_tag": "True" }));
+
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_equal_direct_state.update",
+                None,
+                "test function equal direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+
+        let updated_json = block_on(
+            result_actor
+                .current_value()
+                .expect("piped equality function actor should update after source changes")
+                .to_json(),
+        );
+        assert_eq!(updated_json, serde_json::json!({ "_tag": "False" }));
+    }
+
+    #[test]
+    fn piped_user_defined_function_latest_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) = parse_static_program(
+            "FUNCTION choose_latest(x, y) {\n    LATEST {\n        x\n        y\n    }\n}",
+        );
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    mut body,
+                } if name.to_string() == "choose_latest" => {
+                    body.persistence = Some(boon::parser::Persistence {
+                        id: boon::parser::PersistenceId::new(),
+                        status: boon::parser::PersistenceStatus::NewOrChanged,
+                    });
+                    Some(super::StaticFunctionDefinition {
+                        parameters: parameters
+                            .into_iter()
+                            .map(|param| param.node.to_string())
+                            .collect(),
+                        body: *body,
+                        module_name: None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("choose_latest function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("choose_latest"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let other_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+
+        input_actor.store_value_directly(crate::engine::Text::new_value_with_emission_seq(
+            crate::engine::ConstructInfo::new(
+                "test.function_latest_direct_state.input_initial",
+                None,
+                "test function latest direct state input initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1,
+            "left",
+        ));
+        other_actor.store_value_directly(crate::engine::Text::new_value_with_emission_seq(
+            crate::engine::ConstructInfo::new(
+                "test.function_latest_direct_state.other_initial",
+                None,
+                "test function latest direct state other initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2,
+            "right",
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("choose_latest")],
+            vec![(String::from("y"), other_actor.clone())],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped latest user-defined function should evaluate")
+        .expect("piped latest user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "LATEST piped user-defined functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Text(initial_text, _) = result_actor
+            .current_value()
+            .expect("piped latest function actor should expose the initial current value")
+        else {
+            panic!("piped latest function actor should resolve to text");
+        };
+        assert_eq!(initial_text.text(), "right");
+
+        input_actor.store_value_directly(crate::engine::Text::new_value_with_emission_seq(
+            crate::engine::ConstructInfo::new(
+                "test.function_latest_direct_state.input_update",
+                None,
+                "test function latest direct state input update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            3,
+            "left-new",
+        ));
+
+        let Value::Text(updated_text, _) = result_actor
+            .current_value()
+            .expect("piped latest function actor should update after source changes")
+        else {
+            panic!("piped latest function actor should stay text after source update");
+        };
+        assert_eq!(updated_text.text(), "left-new");
+    }
+
+    #[test]
+    fn piped_user_defined_function_negate_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let source_code = SourceCode::new("negate_value x".to_owned());
+        let function_def = super::StaticFunctionDefinition {
+            parameters: vec![String::from("x")],
+            body: static_expression::Spanned {
+                span: (0..14).into(),
+                persistence: None,
+                node: static_expression::Expression::ArithmeticOperator(
+                    static_expression::ArithmeticOperator::Negate {
+                        operand: Box::new(static_expression::Spanned {
+                            span: (13..14).into(),
+                            persistence: None,
+                            node: static_expression::Expression::Alias(
+                                static_expression::Alias::WithoutPassed {
+                                    parts: vec![source_code.slice(13, 14)],
+                                    referenced_span: None,
+                                },
+                            ),
+                        }),
+                    },
+                ),
+            },
+            module_name: None,
+        };
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("negate_value"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_negate_direct_state.initial",
+                None,
+                "test function negate direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            3.0,
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("negate_value")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped negate user-defined function should evaluate")
+        .expect("piped negate user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "negate piped user-defined functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(initial_number, _) = result_actor
+            .current_value()
+            .expect("piped negate function actor should expose the initial current value")
+        else {
+            panic!("piped negate function actor should resolve to a number");
+        };
+        assert_eq!(initial_number.number(), -3.0);
+
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_negate_direct_state.update",
+                None,
+                "test function negate direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+
+        let Value::Number(updated_number, _) = result_actor
+            .current_value()
+            .expect("piped negate function actor should update after source changes")
+        else {
+            panic!("piped negate function actor should stay a number after source update");
+        };
+        assert_eq!(updated_number.number(), -2.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_round_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("rounded"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_round_direct_state.initial",
+                None,
+                "test function round direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("rounded")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped round user-defined function should evaluate")
+        .expect("piped round user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped user-defined functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(initial_number, _) = result_actor
+            .current_value()
+            .expect("piped round function actor should expose the initial current value")
+        else {
+            panic!("piped round function actor should resolve to a number");
+        };
+        assert_eq!(initial_number.number(), 1.0);
+
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_round_direct_state.update",
+                None,
+                "test function round direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::Number(updated_number, _) = result_actor
+            .current_value()
+            .expect("piped round function actor should update after source changes")
+        else {
+            panic!("piped round function actor should stay a number after source update");
+        };
+        assert_eq!(updated_number.number(), 3.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_round_body_with_lazy_input_uses_one_scope_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("rounded"), function_def);
+
+        let (mut input_tx, input_rx) = mpsc::channel::<Value>(8);
+        let input_actor = crate::engine::create_actor_lazy(
+            input_rx,
+            boon::parser::PersistenceId::new(),
+            scope_id,
+        );
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let result_actor = super::call_function(
+            vec![String::from("rounded")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("lazy piped round user-defined function should evaluate")
+        .expect("lazy piped round user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy builtin direct-actor piped user-defined functions should add one scope-owned watcher plus the first-demand lazy input task"
+            );
+        });
+
+        assert!(
+            result_actor.current_value().is_err(),
+            "lazy piped round function actor should stay empty until the first input arrives"
+        );
+
+        input_tx
+            .try_send(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.function_round_direct_state_lazy.initial",
+                    None,
+                    "test function round direct state lazy initial",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                1.2,
+            ))
+            .expect("lazy piped round input should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Number(number, _) = result_actor
+            .current_value()
+            .expect("lazy piped round function actor should resolve after first input")
+        else {
+            panic!("lazy piped round function actor should resolve to a number");
+        };
+        assert_eq!(number.number(), 1.0);
+
+        input_tx
+            .try_send(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.function_round_direct_state_lazy.update",
+                    None,
+                    "test function round direct state lazy update",
+                ),
+                construct_context,
+                crate::engine::ValueIdempotencyKey::new(),
+                2.8,
+            ))
+            .expect("second lazy piped round input should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Number(number, _) = result_actor
+            .current_value()
+            .expect("lazy piped round function actor should keep following lazy input updates")
+        else {
+            panic!("lazy piped round function actor should stay a number after update");
+        };
+        assert_eq!(number.number(), 3.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_sum_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION running_total(x) { x |> Math/sum() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "running_total" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("running_total function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("running_total"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_sum_direct_state.initial",
+                None,
+                "test function sum direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.0,
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("running_total")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped sum user-defined function should evaluate")
+        .expect("piped sum user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped Math/sum functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(initial_number, _) = result_actor
+            .current_value()
+            .expect("piped sum function actor should expose the initial current value")
+        else {
+            panic!("piped sum function actor should resolve to a number");
+        };
+        assert_eq!(initial_number.number(), 1.0);
+
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_sum_direct_state.update",
+                None,
+                "test function sum direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+
+        let Value::Number(updated_number, _) = result_actor
+            .current_value()
+            .expect("piped sum function actor should follow later source updates")
+        else {
+            panic!("piped sum function actor should stay a number after source update");
+        };
+        assert_eq!(updated_number.number(), 2.0);
+    }
+
+    #[test]
+    fn immediate_user_defined_function_with_stateful_hold_body_uses_registry_safe_construction() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION running_total(step) { 0 |> HOLD sum { sum + step } }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "running_total" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("running_total function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("running_total"), function_def);
+
+        let step_actor = crate::engine::create_constant_actor(
+            boon::parser::PersistenceId::new(),
+            crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.function_hold_immediate.step",
+                    None,
+                    "test function hold immediate step",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                1.0,
+            ),
+            scope_id,
+        );
+
+        let result_actor = super::call_function(
+            vec![String::from("running_total")],
+            vec![(String::from("step"), step_actor)],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context,
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("immediate HOLD user-defined function should evaluate")
+        .expect("immediate HOLD user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "immediate user-defined HOLD construction should stay on registry-safe direct state without extra async tasks"
+            );
+        });
+
+        let Value::Number(number, _) = result_actor
+            .current_value()
+            .expect("immediate HOLD user-defined function should expose the current state")
+        else {
+            panic!("immediate HOLD user-defined function should resolve to a number");
+        };
+        assert_eq!(number.number(), 0.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_trim_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION trimmed(x) { x |> Text/trim() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "trimmed" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("trimmed function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("trimmed"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_trim_direct_state.initial",
+                None,
+                "test function trim direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "  hi  ",
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("trimmed")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped trim user-defined function should evaluate")
+        .expect("piped trim user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped Text/trim functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Text(initial_text, _) = result_actor
+            .current_value()
+            .expect("piped trim function actor should expose the trimmed current value")
+        else {
+            panic!("piped trim function actor should resolve to text");
+        };
+        assert_eq!(initial_text.text(), "hi");
+
+        input_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_trim_direct_state.update",
+                None,
+                "test function trim direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "  bye ",
+        ));
+
+        let Value::Text(updated_text, _) = result_actor
+            .current_value()
+            .expect("piped trim function actor should update after source changes")
+        else {
+            panic!("piped trim function actor should stay a text value after source update");
+        };
+        assert_eq!(updated_text.text(), "bye");
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_text_to_number_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION parsed(x) { x |> Text/to_number() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "parsed" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("parsed function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("parsed"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_text_to_number_direct_state.initial",
+                None,
+                "test function text to number direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            " 42 ",
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("parsed")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped text-to-number user-defined function should evaluate")
+        .expect("piped text-to-number user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped Text/to_number functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(initial_number, _) = result_actor
+            .current_value()
+            .expect("piped text-to-number function actor should expose the parsed current value")
+        else {
+            panic!("piped text-to-number function actor should resolve to a number");
+        };
+        assert_eq!(initial_number.number(), 42.0);
+
+        input_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_text_to_number_direct_state.update",
+                None,
+                "test function text to number direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "NaN?",
+        ));
+
+        let Value::Tag(updated_tag, _) = result_actor.current_value().expect(
+            "piped text-to-number function actor should expose NaN tag after invalid input",
+        ) else {
+            panic!("piped text-to-number function actor should switch to a tag for invalid input");
+        };
+        assert_eq!(updated_tag.tag(), "NaN");
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_char_code_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION code(x) { x |> Text/char_code() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "code" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("code function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("code"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_text_char_code_direct_state.initial",
+                None,
+                "test function text char code direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "Ab",
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("code")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped char-code user-defined function should evaluate")
+        .expect("piped char-code user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped Text/char_code functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(initial_number, _) = result_actor
+            .current_value()
+            .expect("piped char-code function actor should expose the current code point")
+        else {
+            panic!("piped char-code function actor should resolve to a number");
+        };
+        assert_eq!(initial_number.number(), 'A' as u32 as f64);
+
+        input_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_text_char_code_direct_state.update",
+                None,
+                "test function text char code direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "z",
+        ));
+
+        let Value::Number(updated_number, _) = result_actor
+            .current_value()
+            .expect("piped char-code function actor should update after source changes")
+        else {
+            panic!("piped char-code function actor should stay a number after source update");
+        };
+        assert_eq!(updated_number.number(), 'z' as u32 as f64);
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_from_char_code_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION ch(x) { x |> Text/from_char_code() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "ch" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("ch function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("ch"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_text_from_char_code_direct_state.initial",
+                None,
+                "test function text from char code direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            'A' as u32 as f64,
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("ch")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped from-char-code user-defined function should evaluate")
+        .expect("piped from-char-code user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped Text/from_char_code functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Text(initial_text, _) = result_actor
+            .current_value()
+            .expect("piped from-char-code function actor should expose the current character")
+        else {
+            panic!("piped from-char-code function actor should resolve to text");
+        };
+        assert_eq!(initial_text.text(), "A");
+
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_text_from_char_code_direct_state.update",
+                None,
+                "test function text from char code direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            'z' as u32 as f64,
+        ));
+
+        let Value::Text(updated_text, _) = result_actor
+            .current_value()
+            .expect("piped from-char-code function actor should update after source changes")
+        else {
+            panic!(
+                "piped from-char-code function actor should stay a text value after source update"
+            );
+        };
+        assert_eq!(updated_text.text(), "z");
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_starts_with_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) = parse_static_program(
+            "FUNCTION starts_eq(x) { x |> Text/starts_with(prefix: TEXT { = }) }",
+        );
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "starts_eq" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("starts_eq function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("starts_eq"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_text_starts_with_direct_state.initial",
+                None,
+                "test function text starts_with direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "=sum(A1:A3)",
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("starts_eq")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped starts_with user-defined function should evaluate")
+        .expect("piped starts_with user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped Text/starts_with functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Tag(initial_tag, _) = result_actor
+            .current_value()
+            .expect("piped starts_with function actor should expose the current tag")
+        else {
+            panic!("piped starts_with function actor should resolve to a tag");
+        };
+        assert_eq!(initial_tag.tag(), "True");
+
+        input_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_text_starts_with_direct_state.update",
+                None,
+                "test function text starts_with direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "sum(A1:A3)",
+        ));
+
+        let Value::Tag(updated_tag, _) = result_actor
+            .current_value()
+            .expect("piped starts_with function actor should update after source changes")
+        else {
+            panic!("piped starts_with function actor should stay a tag after source update");
+        };
+        assert_eq!(updated_tag.tag(), "False");
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_modulo_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION mod_two(x) { x |> Math/modulo(divisor: 2) }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "mod_two" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("mod_two function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("mod_two"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_math_modulo_direct_state.initial",
+                None,
+                "test function math modulo direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            5.0,
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("mod_two")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped modulo user-defined function should evaluate")
+        .expect("piped modulo user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped Math/modulo functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(initial_number, _) = result_actor
+            .current_value()
+            .expect("piped modulo function actor should expose the current remainder")
+        else {
+            panic!("piped modulo function actor should resolve to a number");
+        };
+        assert_eq!(initial_number.number(), 1.0);
+
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_math_modulo_direct_state.update",
+                None,
+                "test function math modulo direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            8.0,
+        ));
+
+        let Value::Number(updated_number, _) = result_actor
+            .current_value()
+            .expect("piped modulo function actor should update after source changes")
+        else {
+            panic!("piped modulo function actor should stay a number after source update");
+        };
+        assert_eq!(updated_number.number(), 0.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_is_empty_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION blank(x) { x |> Text/is_empty() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "blank" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("blank function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("blank"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_text_is_empty_direct_state.initial",
+                None,
+                "test function text is_empty direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "",
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("blank")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped is_empty user-defined function should evaluate")
+        .expect("piped is_empty user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped Text/is_empty functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Tag(initial_tag, _) = result_actor
+            .current_value()
+            .expect("piped is_empty function actor should expose the current tag")
+        else {
+            panic!("piped is_empty function actor should resolve to a tag");
+        };
+        assert_eq!(initial_tag.tag(), "True");
+
+        input_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_text_is_empty_direct_state.update",
+                None,
+                "test function text is_empty direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "hello",
+        ));
+
+        let Value::Tag(updated_tag, _) = result_actor
+            .current_value()
+            .expect("piped is_empty function actor should update after source changes")
+        else {
+            panic!("piped is_empty function actor should stay a tag after source update");
+        };
+        assert_eq!(updated_tag.tag(), "False");
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_is_not_empty_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION present(x) { x |> Text/is_not_empty() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "present" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("present function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("present"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_text_is_not_empty_direct_state.initial",
+                None,
+                "test function text is_not_empty direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "",
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("present")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped is_not_empty user-defined function should evaluate")
+        .expect("piped is_not_empty user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped Text/is_not_empty functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Tag(initial_tag, _) = result_actor
+            .current_value()
+            .expect("piped is_not_empty function actor should expose the current tag")
+        else {
+            panic!("piped is_not_empty function actor should resolve to a tag");
+        };
+        assert_eq!(initial_tag.tag(), "False");
+
+        input_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_text_is_not_empty_direct_state.update",
+                None,
+                "test function text is_not_empty direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "hello",
+        ));
+
+        let Value::Tag(updated_tag, _) = result_actor
+            .current_value()
+            .expect("piped is_not_empty function actor should update after source changes")
+        else {
+            panic!("piped is_not_empty function actor should stay a tag after source update");
+        };
+        assert_eq!(updated_tag.tag(), "True");
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_bool_not_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION toggled(x) { x |> Bool/not() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "toggled" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("toggled function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("toggled"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Tag::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_bool_not_direct_state.initial",
+                None,
+                "test function bool not direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "False".to_string(),
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("toggled")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped bool/not user-defined function should evaluate")
+        .expect("piped bool/not user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped Bool/not functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Tag(initial_tag, _) = result_actor
+            .current_value()
+            .expect("piped bool/not function actor should expose the current tag")
+        else {
+            panic!("piped bool/not function actor should resolve to a tag");
+        };
+        assert_eq!(initial_tag.tag(), "True");
+
+        input_actor.store_value_directly(crate::engine::Tag::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_bool_not_direct_state.update",
+                None,
+                "test function bool not direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "True".to_string(),
+        ));
+
+        let Value::Tag(updated_tag, _) = result_actor
+            .current_value()
+            .expect("piped bool/not function actor should update after source changes")
+        else {
+            panic!("piped bool/not function actor should stay a tag after source update");
+        };
+        assert_eq!(updated_tag.tag(), "False");
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_bool_or_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION either(x) { x |> Bool/or(that: False) }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "either" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("either function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("either"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Tag::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_bool_or_direct_state.initial",
+                None,
+                "test function bool or direct state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "False".to_string(),
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("either")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped bool/or user-defined function should evaluate")
+        .expect("piped bool/or user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped Bool/or functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Tag(initial_tag, _) = result_actor
+            .current_value()
+            .expect("piped bool/or function actor should expose the current tag")
+        else {
+            panic!("piped bool/or function actor should resolve to a tag");
+        };
+        assert_eq!(initial_tag.tag(), "False");
+
+        input_actor.store_value_directly(crate::engine::Tag::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.function_bool_or_direct_state.update",
+                None,
+                "test function bool or direct state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "True".to_string(),
+        ));
+
+        let Value::Tag(updated_tag, _) = result_actor
+            .current_value()
+            .expect("piped bool/or function actor should update after source changes")
+        else {
+            panic!("piped bool/or function actor should stay a tag after source update");
+        };
+        assert_eq!(updated_tag.tag(), "True");
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_list_count_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let make_number_item = |label: &str, value: f64| {
+            crate::engine::create_constant_actor(
+                boon::parser::PersistenceId::new(),
+                crate::engine::Number::new_value(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.function_list_count_direct_state.item.{label}"),
+                        None,
+                        "test function list count direct state item",
+                    ),
+                    construct_context.clone(),
+                    crate::engine::ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+        let make_list_value = |label: &str, values: &[f64]| {
+            let items = values
+                .iter()
+                .enumerate()
+                .map(|(idx, value)| make_number_item(&format!("{label}.{idx}"), *value))
+                .collect::<Vec<_>>();
+            crate::engine::Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.function_list_count_direct_state.list.{label}"),
+                        None,
+                        "test function list count direct state list",
+                    ),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    items,
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            )
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION item_count(x) { x |> List/count() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "item_count" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("item_count function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("item_count"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(make_list_value("initial", &[1.0, 2.0]));
+
+        let result_actor = super::call_function(
+            vec![String::from("item_count")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped list/count user-defined function should evaluate")
+        .expect("piped list/count user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped List/count functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(initial_number, _) = result_actor
+            .current_value()
+            .expect("piped list/count function actor should expose the current length")
+        else {
+            panic!("piped list/count function actor should resolve to a number");
+        };
+        assert_eq!(initial_number.number(), 2.0);
+
+        input_actor.store_value_directly(make_list_value("updated", &[1.0, 2.0, 3.0]));
+
+        let Value::Number(updated_number, _) = result_actor
+            .current_value()
+            .expect("piped list/count function actor should update after source list switches")
+        else {
+            panic!("piped list/count function actor should stay a number after source switch");
+        };
+        assert_eq!(updated_number.number(), 3.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_list_is_empty_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let make_number_item = |label: &str, value: f64| {
+            crate::engine::create_constant_actor(
+                boon::parser::PersistenceId::new(),
+                crate::engine::Number::new_value(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.function_list_is_empty_direct_state.item.{label}"),
+                        None,
+                        "test function list is_empty direct state item",
+                    ),
+                    construct_context.clone(),
+                    crate::engine::ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+        let make_list_value = |label: &str, values: &[f64]| {
+            let items = values
+                .iter()
+                .enumerate()
+                .map(|(idx, value)| make_number_item(&format!("{label}.{idx}"), *value))
+                .collect::<Vec<_>>();
+            crate::engine::Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.function_list_is_empty_direct_state.list.{label}"),
+                        None,
+                        "test function list is_empty direct state list",
+                    ),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    items,
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            )
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION empty_list(x) { x |> List/is_empty() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "empty_list" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("empty_list function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("empty_list"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(make_list_value("initial", &[]));
+
+        let result_actor = super::call_function(
+            vec![String::from("empty_list")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped list/is_empty user-defined function should evaluate")
+        .expect("piped list/is_empty user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped List/is_empty functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Tag(initial_tag, _) = result_actor
+            .current_value()
+            .expect("piped list/is_empty function actor should expose the current tag")
+        else {
+            panic!("piped list/is_empty function actor should resolve to a tag");
+        };
+        assert_eq!(initial_tag.tag(), "True");
+
+        input_actor.store_value_directly(make_list_value("updated", &[1.0]));
+
+        let Value::Tag(updated_tag, _) = result_actor
+            .current_value()
+            .expect("piped list/is_empty function actor should update after source list switches")
+        else {
+            panic!("piped list/is_empty function actor should stay a tag after source switch");
+        };
+        assert_eq!(updated_tag.tag(), "False");
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_list_is_not_empty_body_uses_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let make_number_item = |label: &str, value: f64| {
+            crate::engine::create_constant_actor(
+                boon::parser::PersistenceId::new(),
+                crate::engine::Number::new_value(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.function_list_is_not_empty_direct_state.item.{label}"),
+                        None,
+                        "test function list is_not_empty direct state item",
+                    ),
+                    construct_context.clone(),
+                    crate::engine::ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+        let make_list_value = |label: &str, values: &[f64]| {
+            let items = values
+                .iter()
+                .enumerate()
+                .map(|(idx, value)| make_number_item(&format!("{label}.{idx}"), *value))
+                .collect::<Vec<_>>();
+            crate::engine::Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.function_list_is_not_empty_direct_state.list.{label}"),
+                        None,
+                        "test function list is_not_empty direct state list",
+                    ),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    items,
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            )
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION non_empty_list(x) { x |> List/is_not_empty() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "non_empty_list" => {
+                    Some(super::StaticFunctionDefinition {
+                        parameters: parameters
+                            .into_iter()
+                            .map(|param| param.node.to_string())
+                            .collect(),
+                        body: *body,
+                        module_name: None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("non_empty_list function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("non_empty_list"), function_def);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(make_list_value("initial", &[]));
+
+        let result_actor = super::call_function(
+            vec![String::from("non_empty_list")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped list/is_not_empty user-defined function should evaluate")
+        .expect("piped list/is_not_empty user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped List/is_not_empty functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Tag(initial_tag, _) = result_actor
+            .current_value()
+            .expect("piped list/is_not_empty function actor should expose the current tag")
+        else {
+            panic!("piped list/is_not_empty function actor should resolve to a tag");
+        };
+        assert_eq!(initial_tag.tag(), "False");
+
+        input_actor.store_value_directly(make_list_value("updated", &[1.0]));
+
+        let Value::Tag(updated_tag, _) = result_actor.current_value().expect(
+            "piped list/is_not_empty function actor should update after source list switches",
+        ) else {
+            panic!("piped list/is_not_empty function actor should stay a tag after source switch");
+        };
+        assert_eq!(updated_tag.tag(), "True");
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_list_last_body_uses_no_wrapper_task_and_follows_nested_item_updates()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let make_number_item = |label: &str, value: f64| {
+            let actor = crate::engine::create_actor_forwarding(
+                boon::parser::PersistenceId::new(),
+                scope_id,
+            );
+            actor.store_value_directly(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.function_list_last_direct_state.item.{label}"),
+                    None,
+                    "test function list last direct state item",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            crate::engine::Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.function_list_last_direct_state.list.{label}"),
+                        None,
+                        "test function list last direct state list",
+                    ),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    items,
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            )
+        };
+        let number_value = |value: f64, construct_context: ConstructContext| {
+            crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.function_list_last_direct_state.value.{value}"),
+                    None,
+                    "test function list last direct state value",
+                ),
+                construct_context,
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            )
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION last_item(x) { x |> List/last() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "last_item" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("last_item function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("last_item"), function_def);
+
+        let old_a = make_number_item("old_a", 10.0);
+        let old_b = make_number_item("old_b", 20.0);
+        let new_c = make_number_item("new_c", 30.0);
+        let new_d = make_number_item("new_d", 40.0);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(make_list_value(
+            "initial",
+            vec![old_a.clone(), old_b.clone()],
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("last_item")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped list/last user-defined function should evaluate")
+        .expect("piped list/last user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped List/last functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(initial_number, _) = result_actor
+            .current_value()
+            .expect("piped list/last function actor should expose the selected number")
+        else {
+            panic!("piped list/last function actor should resolve to a number");
+        };
+        assert_eq!(initial_number.number(), 20.0);
+
+        old_b.store_value_directly(number_value(25.0, construct_context.clone()));
+        let Value::Number(updated_number, _) = result_actor
+            .current_value()
+            .expect("piped list/last function actor should follow selected item updates")
+        else {
+            panic!("piped list/last function actor should stay a number");
+        };
+        assert_eq!(updated_number.number(), 25.0);
+
+        input_actor.store_value_directly(make_list_value(
+            "updated",
+            vec![new_c.clone(), new_d.clone()],
+        ));
+        old_b.store_value_directly(number_value(99.0, construct_context.clone()));
+        new_d.store_value_directly(number_value(45.0, construct_context));
+
+        let Value::Number(switched_number, _) = result_actor.current_value().expect(
+            "piped list/last function actor should follow current-list updates after source switch",
+        ) else {
+            panic!("piped list/last function actor should stay a number after source switch");
+        };
+        assert_eq!(switched_number.number(), 45.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_list_last_body_with_lazy_input_uses_one_scope_task_and_ignores_stale_old_selected_item_updates()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let make_number_item = |label: &str, value: f64| {
+            let actor = crate::engine::create_actor_forwarding(
+                boon::parser::PersistenceId::new(),
+                scope_id,
+            );
+            actor.store_value_directly(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.function_list_last_direct_state_lazy.item.{label}"),
+                    None,
+                    "test function list last direct state lazy item",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            crate::engine::Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.function_list_last_direct_state_lazy.list.{label}"),
+                        None,
+                        "test function list last direct state lazy list",
+                    ),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    items,
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            )
+        };
+        let number_value = |value: f64, construct_context: ConstructContext| {
+            crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.function_list_last_direct_state_lazy.value.{value}"),
+                    None,
+                    "test function list last direct state lazy value",
+                ),
+                construct_context,
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            )
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION last_item(x) { x |> List/last() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "last_item" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("last_item function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("last_item"), function_def);
+
+        let old_a = make_number_item("old_a", 10.0);
+        let old_b = make_number_item("old_b", 20.0);
+        let new_c = make_number_item("new_c", 30.0);
+        let new_d = make_number_item("new_d", 40.0);
+
+        let (mut input_tx, input_rx) = mpsc::channel::<Value>(8);
+        let input_actor = crate::engine::create_actor_lazy(
+            input_rx,
+            boon::parser::PersistenceId::new(),
+            scope_id,
+        );
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let result_actor = super::call_function(
+            vec![String::from("last_item")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("lazy piped list/last user-defined function should evaluate")
+        .expect("lazy piped list/last user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy builtin direct-actor piped List/last functions should add one scope-owned watcher plus the first-demand lazy list input task"
+            );
+        });
+
+        assert!(
+            result_actor.current_value().is_err(),
+            "lazy piped list/last function actor should stay empty until the first list arrives"
+        );
+
+        input_tx
+            .try_send(make_list_value(
+                "initial",
+                vec![old_a.clone(), old_b.clone()],
+            ))
+            .expect("lazy list/last input should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Number(initial_number, _) = result_actor
+            .current_value()
+            .expect("lazy piped list/last function actor should expose the selected number")
+        else {
+            panic!("lazy piped list/last function actor should resolve to a number");
+        };
+        assert_eq!(initial_number.number(), 20.0);
+
+        old_b.store_value_directly(number_value(25.0, construct_context.clone()));
+        let Value::Number(updated_number, _) = result_actor
+            .current_value()
+            .expect("lazy piped list/last function actor should follow selected item updates")
+        else {
+            panic!("lazy piped list/last function actor should stay a number");
+        };
+        assert_eq!(updated_number.number(), 25.0);
+
+        input_tx
+            .try_send(make_list_value(
+                "updated",
+                vec![new_c.clone(), new_d.clone()],
+            ))
+            .expect("lazy list/last source switch should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+        old_b.store_value_directly(number_value(99.0, construct_context.clone()));
+        new_d.store_value_directly(number_value(45.0, construct_context));
+
+        let Value::Number(switched_number, _) = result_actor.current_value().expect(
+            "lazy piped list/last function actor should follow current-list updates after source switch",
+        ) else {
+            panic!("lazy piped list/last function actor should stay a number after source switch");
+        };
+        assert_eq!(switched_number.number(), 45.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_list_get_body_uses_no_wrapper_task_and_ignores_stale_old_selected_item_updates()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let make_number_item = |label: &str, value: f64| {
+            let actor = crate::engine::create_actor_forwarding(
+                boon::parser::PersistenceId::new(),
+                scope_id,
+            );
+            actor.store_value_directly(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.function_list_get_direct_state.item.{label}"),
+                    None,
+                    "test function list get direct state item",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            crate::engine::Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.function_list_get_direct_state.list.{label}"),
+                        None,
+                        "test function list get direct state list",
+                    ),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    items,
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            )
+        };
+        let number_value = |value: f64, construct_context: ConstructContext| {
+            crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.function_list_get_direct_state.value.{value}"),
+                    None,
+                    "test function list get direct state value",
+                ),
+                construct_context,
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            )
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION selected_item(x) { x |> List/get(index: 2) }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "selected_item" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("selected_item function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("selected_item"), function_def);
+
+        let old_a = make_number_item("old_a", 10.0);
+        let old_b = make_number_item("old_b", 20.0);
+        let new_c = make_number_item("new_c", 30.0);
+        let new_d = make_number_item("new_d", 40.0);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(make_list_value(
+            "initial",
+            vec![old_a.clone(), old_b.clone()],
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("selected_item")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped list/get user-defined function should evaluate")
+        .expect("piped list/get user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped List/get functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(initial_number, _) = result_actor
+            .current_value()
+            .expect("piped list/get function actor should expose the selected number")
+        else {
+            panic!("piped list/get function actor should resolve to a number");
+        };
+        assert_eq!(initial_number.number(), 20.0);
+
+        old_b.store_value_directly(number_value(25.0, construct_context.clone()));
+        let Value::Number(updated_number, _) = result_actor
+            .current_value()
+            .expect("piped list/get function actor should follow selected item updates")
+        else {
+            panic!("piped list/get function actor should stay a number");
+        };
+        assert_eq!(updated_number.number(), 25.0);
+
+        input_actor.store_value_directly(make_list_value(
+            "updated",
+            vec![new_c.clone(), new_d.clone()],
+        ));
+        old_b.store_value_directly(number_value(99.0, construct_context.clone()));
+        new_d.store_value_directly(number_value(45.0, construct_context));
+
+        let Value::Number(switched_number, _) = result_actor.current_value().expect(
+            "piped list/get function actor should follow current selected item updates after source switch",
+        ) else {
+            panic!("piped list/get function actor should stay a number after source switch");
+        };
+        assert_eq!(switched_number.number(), 45.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_list_latest_body_uses_no_wrapper_task_and_ignores_stale_old_item_updates()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let number_value_with_seq = |label: &str,
+                                     emission_seq: crate::engine::EmissionSeq,
+                                     value: f64| {
+            let mut value = crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.function_list_latest_direct_state.value.{label}.{emission_seq}"),
+                    None,
+                    "test function list latest direct state value",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            );
+            value.set_emission_seq(emission_seq);
+            value
+        };
+        let make_item_actor =
+            |label: &str, emission_seq: crate::engine::EmissionSeq, value: f64| {
+                let actor = crate::engine::create_actor_forwarding(
+                    boon::parser::PersistenceId::new(),
+                    scope_id,
+                );
+                actor.store_value_directly(number_value_with_seq(label, emission_seq, value));
+                actor
+            };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            crate::engine::Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.function_list_latest_direct_state.list.{label}"),
+                        None,
+                        "test function list latest direct state list",
+                    ),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    items,
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            )
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION latest_item(x) { x |> List/latest() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "latest_item" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("latest_item function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("latest_item"), function_def);
+
+        let old_a = make_item_actor("old_a", 1, 10.0);
+        let old_b = make_item_actor("old_b", 2, 20.0);
+        let new_c = make_item_actor("new_c", 4, 30.0);
+        let new_d = make_item_actor("new_d", 3, 40.0);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(make_list_value(
+            "initial",
+            vec![old_a.clone(), old_b.clone()],
+        ));
+
+        let result_actor = super::call_function(
+            vec![String::from("latest_item")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("piped list/latest user-defined function should evaluate")
+        .expect("piped list/latest user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped List/latest functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(initial_number, _) = result_actor
+            .current_value()
+            .expect("piped list/latest function actor should expose the latest number")
+        else {
+            panic!("piped list/latest function actor should resolve to a number");
+        };
+        assert_eq!(initial_number.number(), 20.0);
+
+        input_actor.store_value_directly(make_list_value(
+            "updated",
+            vec![new_c.clone(), new_d.clone()],
+        ));
+        old_b.store_value_directly(number_value_with_seq("old_b.stale", 5, 99.0));
+        new_d.store_value_directly(number_value_with_seq("new_d.fresh", 6, 45.0));
+
+        let Value::Number(updated_number, _) = result_actor.current_value().expect(
+            "piped list/latest function actor should follow current-list latest item updates",
+        ) else {
+            panic!("piped list/latest function actor should stay a number after source switch");
+        };
+        assert_eq!(updated_number.number(), 45.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_list_sum_and_product_bodies_use_no_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let make_number_item = |label: &str, value: f64| {
+            let actor = crate::engine::create_actor_forwarding(
+                boon::parser::PersistenceId::new(),
+                scope_id,
+            );
+            actor.store_value_directly(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.function_list_aggregate_direct_state.item.{label}"),
+                    None,
+                    "test function list aggregate direct state item",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            crate::engine::Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.function_list_aggregate_direct_state.list.{label}"),
+                        None,
+                        "test function list aggregate direct state list",
+                    ),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    items,
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            )
+        };
+        let number_value = |value: f64, construct_context: ConstructContext| {
+            crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.function_list_aggregate_direct_state.value.{value}"),
+                    None,
+                    "test function list aggregate direct state value",
+                ),
+                construct_context,
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            )
+        };
+        let (source_code, expressions) = parse_static_program(
+            "FUNCTION list_sum_fn(x) { x |> List/sum() }\nFUNCTION list_product_fn(x) { x |> List/product() }",
+        );
+        let mut function_registry = FunctionRegistry::new();
+        for expr in expressions {
+            if let static_expression::Expression::Function {
+                name,
+                parameters,
+                body,
+            } = expr.node
+            {
+                function_registry.insert(
+                    name.to_string(),
+                    super::StaticFunctionDefinition {
+                        parameters: parameters
+                            .into_iter()
+                            .map(|param| param.node.to_string())
+                            .collect(),
+                        body: *body,
+                        module_name: None,
+                    },
+                );
+            }
+        }
+
+        let old_a = make_number_item("old_a", 2.0);
+        let old_b = make_number_item("old_b", 3.0);
+        let new_c = make_number_item("new_c", 5.0);
+        let new_d = make_number_item("new_d", 7.0);
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(make_list_value(
+            "initial",
+            vec![old_a.clone(), old_b.clone()],
+        ));
+
+        let make_eval_context = |input_actor: ActorHandle| super::EvaluationContext {
+            construct_context: construct_context.clone(),
+            actor_context: ActorContext {
+                piped: Some(input_actor),
+                ..actor_context.clone()
+            },
+            reference_connector: std::sync::Weak::new(),
+            link_connector: std::sync::Weak::new(),
+            module_loader: ModuleLoader::default(),
+            source_code: source_code.clone(),
+            function_registry_snapshot: None,
+            current_module: None,
+        };
+
+        let sum_actor = super::call_function(
+            vec![String::from("list_sum_fn")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            make_eval_context(input_actor.clone()),
+            false,
+            &function_registry,
+        )
+        .expect("piped list/sum user-defined function should evaluate")
+        .expect("piped list/sum user-defined function should produce an actor");
+
+        let product_actor = super::call_function(
+            vec![String::from("list_product_fn")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            make_eval_context(input_actor.clone()),
+            false,
+            &function_registry,
+        )
+        .expect("piped list/product user-defined function should evaluate")
+        .expect("piped list/product user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "builtin direct-actor piped List/sum and List/product functions should stay on runtime subscribers without wrapper tasks"
+            );
+        });
+
+        let Value::Number(initial_sum, _) = sum_actor
+            .current_value()
+            .expect("piped list/sum function actor should expose the current sum")
+        else {
+            panic!("piped list/sum function actor should resolve to a number");
+        };
+        let Value::Number(initial_product, _) = product_actor
+            .current_value()
+            .expect("piped list/product function actor should expose the current product")
+        else {
+            panic!("piped list/product function actor should resolve to a number");
+        };
+        assert_eq!(initial_sum.number(), 5.0);
+        assert_eq!(initial_product.number(), 6.0);
+
+        old_b.store_value_directly(number_value(4.0, construct_context.clone()));
+        let Value::Number(updated_sum, _) = sum_actor
+            .current_value()
+            .expect("piped list/sum function actor should follow item updates")
+        else {
+            panic!("piped list/sum function actor should stay a number");
+        };
+        let Value::Number(updated_product, _) = product_actor
+            .current_value()
+            .expect("piped list/product function actor should follow item updates")
+        else {
+            panic!("piped list/product function actor should stay a number");
+        };
+        assert_eq!(updated_sum.number(), 6.0);
+        assert_eq!(updated_product.number(), 8.0);
+
+        input_actor.store_value_directly(make_list_value(
+            "updated",
+            vec![new_c.clone(), new_d.clone()],
+        ));
+        old_b.store_value_directly(number_value(99.0, construct_context.clone()));
+        new_d.store_value_directly(number_value(11.0, construct_context));
+
+        let Value::Number(switched_sum, _) = sum_actor.current_value().expect(
+            "piped list/sum function actor should follow current-list updates after source switch",
+        ) else {
+            panic!("piped list/sum function actor should stay a number after source switch");
+        };
+        let Value::Number(switched_product, _) = product_actor.current_value().expect(
+            "piped list/product function actor should follow current-list updates after source switch",
+        ) else {
+            panic!("piped list/product function actor should stay a number after source switch");
+        };
+        assert_eq!(switched_sum.number(), 16.0);
+        assert_eq!(switched_product.number(), 55.0);
+    }
+
+    #[test]
+    fn piped_user_defined_function_builtin_list_sum_body_with_lazy_input_uses_one_scope_task_and_ignores_stale_old_item_updates()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let make_number_item = |label: &str, value: f64| {
+            let actor = crate::engine::create_actor_forwarding(
+                boon::parser::PersistenceId::new(),
+                scope_id,
+            );
+            actor.store_value_directly(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.function_list_sum_direct_state_lazy.item.{label}"),
+                    None,
+                    "test function list sum direct state lazy item",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            crate::engine::Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.function_list_sum_direct_state_lazy.list.{label}"),
+                        None,
+                        "test function list sum direct state lazy list",
+                    ),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    items,
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            )
+        };
+        let number_value = |value: f64, construct_context: ConstructContext| {
+            crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.function_list_sum_direct_state_lazy.value.{value}"),
+                    None,
+                    "test function list sum direct state lazy value",
+                ),
+                construct_context,
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            )
+        };
+        let (source_code, expressions) =
+            parse_static_program("FUNCTION list_sum_fn(x) { x |> List/sum() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "list_sum_fn" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("list_sum_fn function should parse");
+        let mut function_registry = FunctionRegistry::new();
+        function_registry.insert(String::from("list_sum_fn"), function_def);
+
+        let old_a = make_number_item("old_a", 1.0);
+        let old_b = make_number_item("old_b", 2.0);
+        let new_c = make_number_item("new_c", 3.0);
+        let new_d = make_number_item("new_d", 4.0);
+
+        let (mut input_tx, input_rx) = mpsc::channel::<Value>(8);
+        let input_actor = crate::engine::create_actor_lazy(
+            input_rx,
+            boon::parser::PersistenceId::new(),
+            scope_id,
+        );
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let result_actor = super::call_function(
+            vec![String::from("list_sum_fn")],
+            vec![],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(input_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            false,
+            &function_registry,
+        )
+        .expect("lazy piped list/sum user-defined function should evaluate")
+        .expect("lazy piped list/sum user-defined function should produce an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy builtin direct-actor piped List/sum functions should add one scope-owned watcher plus the first-demand lazy list input task"
+            );
+        });
+
+        assert!(
+            result_actor.current_value().is_err(),
+            "lazy piped list/sum function actor should stay empty until the first list arrives"
+        );
+
+        input_tx
+            .try_send(make_list_value(
+                "initial",
+                vec![old_a.clone(), old_b.clone()],
+            ))
+            .expect("lazy list/sum input should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Number(initial_sum, _) = result_actor
+            .current_value()
+            .expect("lazy piped list/sum function actor should expose the aggregate")
+        else {
+            panic!("lazy piped list/sum function actor should resolve to a number");
+        };
+        assert_eq!(initial_sum.number(), 3.0);
+
+        old_b.store_value_directly(number_value(5.0, construct_context.clone()));
+        let Value::Number(updated_sum, _) = result_actor
+            .current_value()
+            .expect("lazy piped list/sum function actor should follow item updates")
+        else {
+            panic!("lazy piped list/sum function actor should stay a number");
+        };
+        assert_eq!(updated_sum.number(), 6.0);
+
+        input_tx
+            .try_send(make_list_value(
+                "updated",
+                vec![new_c.clone(), new_d.clone()],
+            ))
+            .expect("lazy list/sum source switch should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+        old_b.store_value_directly(number_value(99.0, construct_context.clone()));
+        new_d.store_value_directly(number_value(10.0, construct_context));
+
+        let Value::Number(switched_sum, _) = result_actor.current_value().expect(
+            "lazy piped list/sum function actor should follow current-list item updates after source switch",
+        ) else {
+            panic!("lazy piped list/sum function actor should stay a number after source switch");
+        };
+        assert_eq!(switched_sum.number(), 13.0);
+    }
+
+    #[test]
     fn restored_list_append_item_stream_uses_current_value_without_replaying_stale_history() {
         let scope_id = crate::engine::create_registry_scope(None);
         let _scope_guard = ScopeDestroyGuard::new(scope_id);
@@ -9825,6 +21703,519 @@ all_completed: completed_todos_count == 4
             matches!(poll_once(stream.as_mut().next()), Poll::Pending),
             "restored List/append stream should skip buffered history and wait for future updates"
         );
+    }
+
+    #[test]
+    fn recorded_list_append_direct_actor_with_restored_ready_source_skips_initial_replace_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let list_actor_context = actor_context.clone();
+
+        let make_item_actor = |label: &str, value: f64| {
+            let actor = crate::engine::create_actor_forwarding(
+                boon::parser::PersistenceId::new(),
+                scope_id,
+            );
+            actor.store_value_directly(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.recorded_list_append_direct.item.{label}"),
+                    None,
+                    "test recorded list append direct item",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.recorded_list_append_direct.list.{label}"),
+                        None,
+                        "test recorded list append direct list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            )
+        };
+        let snapshot_numbers = |actor: &ActorHandle| {
+            let Value::List(list, _) = actor
+                .current_value()
+                .expect("recorded direct List/append actor should expose a current list value")
+            else {
+                panic!("expected list value");
+            };
+            block_on(list.snapshot())
+                .into_iter()
+                .map(|(_, item)| {
+                    let Value::Number(number, _) = item
+                        .current_value()
+                        .expect("recorded direct List/append item should expose a current number")
+                    else {
+                        panic!("expected number value");
+                    };
+                    number.number()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let old_source_item = make_item_actor("old_source", 10.0);
+        let restored_raw_item = make_item_actor("restored", 20.0);
+        let current_append_item = make_item_actor("current_append", 99.0);
+        let replacement_item = make_item_actor("replacement", 30.0);
+
+        let restored_item = super::wrap_restored_list_append_item_with_origin(
+            restored_raw_item,
+            crate::engine::ListItemOrigin {
+                source_storage_key: String::from("test.list_calls"),
+                call_id: String::from("call_0"),
+            },
+            scope_id,
+        );
+
+        let source_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        source_actor
+            .store_value_directly(make_list_value("initial", vec![old_source_item.clone()]));
+
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let result_actor = super::try_create_recorded_list_append_direct_actor(
+            source_actor.clone(),
+            current_append_item.clone(),
+            vec![restored_item],
+            String::from("test.list_calls"),
+            1,
+            crate::engine::ConstructInfo::new(
+                "test.recorded_list_append_direct.result",
+                None,
+                "test recorded list append direct result",
+            ),
+            actor_context,
+        )
+        .expect("ready recorded List/append inputs should stay on the direct path");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count,
+                "ready recorded direct List/append should not add wrapper tasks beyond the existing source actors"
+            );
+        });
+
+        assert_eq!(
+            snapshot_numbers(&result_actor),
+            vec![10.0, 20.0, 99.0],
+            "ready source items, restored items, and the current appended item should seed the direct result in order"
+        );
+
+        source_actor
+            .store_value_directly(make_list_value("updated", vec![replacement_item.clone()]));
+        old_source_item.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.recorded_list_append_direct.old_source_stale",
+                None,
+                "test recorded list append direct stale old source",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            500.0,
+        ));
+        assert_eq!(
+            snapshot_numbers(&result_actor),
+            vec![30.0],
+            "source replacement should clear prior restored/appended state and ignore stale updates from the old list"
+        );
+
+        current_append_item.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.recorded_list_append_direct.appended_fresh",
+                None,
+                "test recorded list append direct fresh appended value",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            77.0,
+        ));
+        assert_eq!(snapshot_numbers(&result_actor), vec![30.0, 77.0]);
+    }
+
+    #[test]
+    fn recorded_list_append_direct_actor_waits_for_late_source_then_replays_restored_and_current_items_once()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let list_actor_context = actor_context.clone();
+
+        let make_item_actor = |label: &str, value: f64| {
+            let actor = crate::engine::create_actor_forwarding(
+                boon::parser::PersistenceId::new(),
+                scope_id,
+            );
+            actor.store_value_directly(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.recorded_list_append_late_direct.item.{label}"),
+                    None,
+                    "test recorded list append late direct item",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.recorded_list_append_late_direct.list.{label}"),
+                        None,
+                        "test recorded list append late direct list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            )
+        };
+        let snapshot_numbers = |actor: &ActorHandle| {
+            let Value::List(list, _) = actor.current_value().expect(
+                "late recorded direct List/append actor should expose a current list value",
+            ) else {
+                panic!("expected list value");
+            };
+            block_on(list.snapshot())
+                .into_iter()
+                .map(|(_, item)| {
+                    let Value::Number(number, _) = item.current_value().expect(
+                        "late recorded direct List/append item should expose a current number",
+                    ) else {
+                        panic!("expected number value");
+                    };
+                    number.number()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let old_source_item = make_item_actor("old_source", 10.0);
+        let restored_raw_item = make_item_actor("restored", 20.0);
+        let current_append_item = make_item_actor("current_append", 99.0);
+        let replacement_item = make_item_actor("replacement", 30.0);
+
+        let restored_item = super::wrap_restored_list_append_item_with_origin(
+            restored_raw_item,
+            crate::engine::ListItemOrigin {
+                source_storage_key: String::from("test.list_calls"),
+                call_id: String::from("call_0"),
+            },
+            scope_id,
+        );
+
+        let source_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let result_actor = super::try_create_recorded_list_append_direct_actor(
+            source_actor.clone(),
+            current_append_item.clone(),
+            vec![restored_item],
+            String::from("test.list_calls"),
+            1,
+            crate::engine::ConstructInfo::new(
+                "test.recorded_list_append_late_direct.result",
+                None,
+                "test recorded list append late direct result",
+            ),
+            actor_context,
+        )
+        .expect("late recorded List/append inputs should stay on the direct path");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count,
+                "late recorded direct List/append should not add wrapper tasks beyond the existing source actors"
+            );
+        });
+
+        let Value::List(result_list, _) = result_actor.current_value().expect(
+            "late recorded direct List/append actor should expose a list shell immediately",
+        ) else {
+            panic!("expected list value");
+        };
+        assert!(
+            result_list.snapshot_now().is_none(),
+            "late recorded direct List/append should wait for the first source replace before exposing items"
+        );
+
+        source_actor
+            .store_value_directly(make_list_value("initial", vec![old_source_item.clone()]));
+        assert_eq!(
+            snapshot_numbers(&result_actor),
+            vec![10.0, 20.0, 99.0],
+            "first source replace should replay restored items before the buffered current append"
+        );
+
+        source_actor
+            .store_value_directly(make_list_value("updated", vec![replacement_item.clone()]));
+        old_source_item.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.recorded_list_append_late_direct.old_source_stale",
+                None,
+                "test recorded list append late direct stale old source",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            500.0,
+        ));
+        assert_eq!(
+            snapshot_numbers(&result_actor),
+            vec![30.0],
+            "later source replacement should reset restored/appended state and ignore stale old-list updates"
+        );
+
+        current_append_item.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.recorded_list_append_late_direct.appended_fresh",
+                None,
+                "test recorded list append late direct fresh appended value",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            77.0,
+        ));
+        assert_eq!(snapshot_numbers(&result_actor), vec![30.0, 77.0]);
+    }
+
+    #[test]
+    fn recorded_list_append_direct_actor_with_lazy_source_and_item_uses_two_scope_tasks_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let list_actor_context = actor_context.clone();
+
+        let make_item_actor = |label: &str, value: f64| {
+            let actor = crate::engine::create_actor_forwarding(
+                boon::parser::PersistenceId::new(),
+                scope_id,
+            );
+            actor.store_value_directly(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.recorded_list_append_lazy_direct.item.{label}"),
+                    None,
+                    "test recorded list append lazy direct item",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(crate::engine::List::new(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.recorded_list_append_lazy_direct.list.{label}"),
+                        None,
+                        "test recorded list append lazy direct list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                crate::engine::ValueMetadata::new(crate::engine::ValueIdempotencyKey::new()),
+            )
+        };
+        let snapshot_numbers = |actor: &ActorHandle| {
+            let Value::List(list, _) = actor.current_value().expect(
+                "lazy recorded direct List/append actor should expose a current list value",
+            ) else {
+                panic!("expected list value");
+            };
+            block_on(list.snapshot())
+                .into_iter()
+                .map(|(_, item)| {
+                    let Value::Number(number, _) = item.current_value().expect(
+                        "lazy recorded direct List/append item should expose a current number",
+                    ) else {
+                        panic!("expected number value");
+                    };
+                    number.number()
+                })
+                .collect::<Vec<_>>()
+        };
+        let poll_async_tasks = || {
+            for _ in 0..3 {
+                crate::engine::poll_test_async_source_tasks();
+            }
+        };
+
+        let old_source_item = make_item_actor("old_source", 10.0);
+        let restored_raw_item = make_item_actor("restored", 20.0);
+        let replacement_item = make_item_actor("replacement", 30.0);
+
+        let restored_item = super::wrap_restored_list_append_item_with_origin(
+            restored_raw_item,
+            crate::engine::ListItemOrigin {
+                source_storage_key: String::from("test.list_calls"),
+                call_id: String::from("call_0"),
+            },
+            scope_id,
+        );
+
+        let (mut source_tx, source_rx) = mpsc::channel::<Value>(8);
+        let source_actor = crate::engine::create_actor_lazy(
+            source_rx,
+            boon::parser::PersistenceId::new(),
+            scope_id,
+        );
+        let (mut item_tx, item_rx) = mpsc::channel::<Value>(8);
+        let item_actor =
+            crate::engine::create_actor_lazy(item_rx, boon::parser::PersistenceId::new(), scope_id);
+
+        item_tx
+            .try_send(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.recorded_list_append_lazy_direct.appended.current",
+                    None,
+                    "test recorded list append lazy direct appended current",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                99.0,
+            ))
+            .expect("lazy recorded append item should enqueue");
+        poll_async_tasks();
+
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let result_actor = super::try_create_recorded_list_append_direct_actor(
+            source_actor.clone(),
+            item_actor.clone(),
+            vec![restored_item],
+            String::from("test.list_calls"),
+            1,
+            crate::engine::ConstructInfo::new(
+                "test.recorded_list_append_lazy_direct.result",
+                None,
+                "test recorded list append lazy direct result",
+            ),
+            actor_context,
+        )
+        .expect("lazy recorded List/append inputs should stay on the direct path");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy recorded direct List/append should add one scope-owned watcher for the source list and one for the appended item"
+            );
+        });
+
+        let Value::List(result_list, _) = result_actor.current_value().expect(
+            "lazy recorded direct List/append actor should expose a list shell immediately",
+        ) else {
+            panic!("expected list value");
+        };
+        assert!(
+            result_list.snapshot_now().is_none(),
+            "lazy recorded direct List/append should wait for the first source list before exposing items"
+        );
+
+        source_tx
+            .try_send(make_list_value("initial", vec![old_source_item.clone()]))
+            .expect("lazy recorded source list should enqueue");
+        poll_async_tasks();
+        assert_eq!(
+            snapshot_numbers(&result_actor),
+            vec![10.0, 20.0, 99.0],
+            "first lazy source replace should replay restored items before the current appended item"
+        );
+
+        source_tx
+            .try_send(make_list_value("updated", vec![replacement_item.clone()]))
+            .expect("lazy recorded source list switch should enqueue");
+        poll_async_tasks();
+        old_source_item.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.recorded_list_append_lazy_direct.old_source_stale",
+                None,
+                "test recorded list append lazy direct stale old source",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            500.0,
+        ));
+        assert_eq!(
+            snapshot_numbers(&result_actor),
+            vec![30.0],
+            "lazy source replacement should reset restored/appended state and ignore stale old-list updates"
+        );
+
+        item_tx
+            .try_send(crate::engine::Number::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.recorded_list_append_lazy_direct.appended.fresh",
+                    None,
+                    "test recorded list append lazy direct appended fresh",
+                ),
+                construct_context,
+                crate::engine::ValueIdempotencyKey::new(),
+                77.0,
+            ))
+            .expect("lazy recorded appended item update should enqueue");
+        poll_async_tasks();
+        assert_eq!(snapshot_numbers(&result_actor), vec![30.0, 77.0]);
     }
 
     #[test]
@@ -10229,6 +22620,361 @@ all_completed: completed_todos_count == 4
     }
 
     #[test]
+    fn variable_persistence_direct_state_actor_uses_runtime_subscribers_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let persistence_id = boon::parser::PersistenceId::new();
+        let scoped_id = persistence_id.in_scope(&actor_context.scope);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::from([(
+                    scoped_id.to_string(),
+                    zoon::serde_json::json!("restored"),
+                )]),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let source_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.variable.persistence.direct_state.current",
+                None,
+                "test variable persistence direct state current",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "current",
+        ));
+
+        let persisted_actor = super::create_variable_persistence_actor(
+            source_actor.clone(),
+            construct_context.construct_storage.clone(),
+            persistence_id,
+            actor_context.scope.clone(),
+            construct_context.clone(),
+            actor_context.clone(),
+            false,
+        );
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state variable persistence should use runtime subscribers instead of a wrapper task"
+            );
+        });
+
+        let Value::Text(text, _) = persisted_actor
+            .current_value()
+            .expect("persisted actor should expose restored value immediately")
+        else {
+            panic!("persisted actor should resolve to text");
+        };
+        assert_eq!(text.text(), "restored");
+
+        source_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.variable.persistence.direct_state.update",
+                None,
+                "test variable persistence direct state update",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "fresh",
+        ));
+
+        let Value::Text(text, _) = persisted_actor
+            .current_value()
+            .expect("persisted actor should follow future direct-state source updates")
+        else {
+            panic!("persisted actor should stay text after source update");
+        };
+        assert_eq!(text.text(), "fresh");
+
+        let saved = construct_context
+            .construct_storage
+            .load_state_now::<zoon::serde_json::Value>(scoped_id)
+            .expect("direct-state persistence should save updated primitive values");
+        assert_eq!(saved, zoon::serde_json::json!("fresh"));
+    }
+
+    #[test]
+    fn variable_persistence_direct_state_actor_skips_first_future_source_after_restore() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let persistence_id = boon::parser::PersistenceId::new();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::from([(
+                    persistence_id.in_scope(&actor_context.scope).to_string(),
+                    zoon::serde_json::json!("restored"),
+                )]),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let source_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+
+        let persisted_actor = super::create_variable_persistence_actor(
+            source_actor.clone(),
+            construct_context.construct_storage.clone(),
+            persistence_id,
+            actor_context.scope.clone(),
+            construct_context.clone(),
+            actor_context.clone(),
+            false,
+        );
+
+        let Value::Text(text, _) = persisted_actor
+            .current_value()
+            .expect("persisted actor should expose restored value before source becomes ready")
+        else {
+            panic!("persisted actor should resolve to text");
+        };
+        assert_eq!(text.text(), "restored");
+
+        source_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.variable.persistence.skip_first_source",
+                None,
+                "test variable persistence skip first source",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "initial",
+        ));
+
+        let Value::Text(text, _) = persisted_actor.current_value().expect(
+            "persisted actor should keep restored value while skipping first source emission",
+        ) else {
+            panic!("persisted actor should stay text after skipped source emission");
+        };
+        assert_eq!(text.text(), "restored");
+
+        source_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.variable.persistence.accept_second_source",
+                None,
+                "test variable persistence accept second source",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "fresh",
+        ));
+
+        let Value::Text(text, _) = persisted_actor
+            .current_value()
+            .expect("persisted actor should accept the next fresh source emission")
+        else {
+            panic!("persisted actor should stay text after accepted source emission");
+        };
+        assert_eq!(text.text(), "fresh");
+    }
+
+    #[test]
+    fn variable_persistence_direct_state_actor_with_lazy_source_uses_one_scope_task_and_skips_first_source_after_restore()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let persistence_id = boon::parser::PersistenceId::new();
+        let scoped_id = persistence_id.in_scope(&actor_context.scope);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::from([(
+                    scoped_id.to_string(),
+                    zoon::serde_json::json!("restored"),
+                )]),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (mut source_tx, source_rx) = mpsc::channel::<Value>(8);
+        let source_actor = crate::engine::create_actor_lazy(
+            source_rx,
+            boon::parser::PersistenceId::new(),
+            scope_id,
+        );
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let persisted_actor = super::create_variable_persistence_actor(
+            source_actor,
+            construct_context.construct_storage.clone(),
+            persistence_id,
+            actor_context.scope.clone(),
+            construct_context.clone(),
+            actor_context.clone(),
+            false,
+        );
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy direct-state variable persistence should add one scope-owned watcher plus the first-demand lazy source task"
+            );
+        });
+
+        let Value::Text(text, _) = persisted_actor
+            .current_value()
+            .expect("persisted actor should expose restored value before lazy source emits")
+        else {
+            panic!("persisted actor should resolve to text");
+        };
+        assert_eq!(text.text(), "restored");
+
+        source_tx
+            .try_send(crate::engine::Text::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.variable.persistence.lazy.skip_first_source",
+                    None,
+                    "test variable persistence lazy skip first source",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                "initial",
+            ))
+            .expect("first lazy source value should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Text(text, _) = persisted_actor.current_value().expect(
+            "persisted actor should keep restored value while skipping first lazy source emission",
+        ) else {
+            panic!("persisted actor should stay text after skipped lazy source emission");
+        };
+        assert_eq!(text.text(), "restored");
+
+        source_tx
+            .try_send(crate::engine::Text::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.variable.persistence.lazy.accept_second_source",
+                    None,
+                    "test variable persistence lazy accept second source",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                "fresh",
+            ))
+            .expect("second lazy source value should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Text(text, _) = persisted_actor
+            .current_value()
+            .expect("persisted actor should accept the second lazy source emission after restore")
+        else {
+            panic!("persisted actor should stay text after accepting lazy source emission");
+        };
+        assert_eq!(text.text(), "fresh");
+
+        let saved = construct_context
+            .construct_storage
+            .load_state_now::<zoon::serde_json::Value>(scoped_id)
+            .expect("accepted lazy source value should be persisted");
+        assert_eq!(saved, zoon::serde_json::json!("fresh"));
+    }
+
+    #[test]
+    fn variable_persistence_direct_state_actor_with_lazy_source_persists_first_live_value_without_wrapper_stream()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let persistence_id = boon::parser::PersistenceId::new();
+        let scoped_id = persistence_id.in_scope(&actor_context.scope);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (mut source_tx, source_rx) = mpsc::channel::<Value>(8);
+        let source_actor = crate::engine::create_actor_lazy(
+            source_rx,
+            boon::parser::PersistenceId::new(),
+            scope_id,
+        );
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let persisted_actor = super::create_variable_persistence_actor(
+            source_actor,
+            construct_context.construct_storage.clone(),
+            persistence_id,
+            actor_context.scope.clone(),
+            construct_context.clone(),
+            actor_context.clone(),
+            false,
+        );
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy direct-state variable persistence should add one scope-owned watcher plus the first-demand lazy source task"
+            );
+        });
+
+        assert!(
+            persisted_actor.current_value().is_err(),
+            "persisted actor should stay empty until the first lazy source value arrives"
+        );
+
+        source_tx
+            .try_send(crate::engine::Text::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.variable.persistence.lazy.first_live_value",
+                    None,
+                    "test variable persistence lazy first live value",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                "fresh",
+            ))
+            .expect("lazy source value should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Text(text, _) = persisted_actor
+            .current_value()
+            .expect("persisted actor should expose the first lazy source value")
+        else {
+            panic!("persisted actor should resolve to text after lazy source value");
+        };
+        assert_eq!(text.text(), "fresh");
+
+        let saved = construct_context
+            .construct_storage
+            .load_state_now::<zoon::serde_json::Value>(scoped_id)
+            .expect("first lazy source value should be persisted");
+        assert_eq!(saved, zoon::serde_json::json!("fresh"));
+    }
+
+    #[test]
     fn text_literal_combiner_uses_current_part_values_without_replaying_stale_history() {
         let scope_id = crate::engine::create_registry_scope(None);
         let _scope_guard = ScopeDestroyGuard::new(scope_id);
@@ -10302,6 +23048,5157 @@ all_completed: completed_todos_count == 4
             matches!(poll_once(stream.as_mut().next()), Poll::Pending),
             "combined text stream should not replay stale part history once current values were seeded"
         );
+    }
+
+    #[test]
+    fn text_literal_actor_uses_runtime_subscribers_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let name_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        name_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.text_literal_direct.name.current",
+                None,
+                "test text literal direct name current",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "current",
+        ));
+
+        let source_code = SourceCode::new("TEXT { \"Hello {name}!\" }".to_owned());
+        let actor = super::build_text_literal_actor(
+            vec![
+                static_expression::TextPart::Text(source_code.slice(8, 14)),
+                static_expression::TextPart::Interpolation {
+                    var: source_code.slice(15, 19),
+                    referenced_span: None,
+                },
+                static_expression::TextPart::Text(source_code.slice(20, 21)),
+            ],
+            (0..24).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    registry_scope_id: Some(scope_id),
+                    parameters: Arc::new(HashMap::from([("name".to_owned(), name_actor.clone())])),
+                    ..ActorContext::default()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+        )
+        .expect("text literal actor should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "ready text literal interpolation should use runtime subscribers instead of a wrapper task"
+            );
+        });
+
+        let Value::Text(text, _) = actor
+            .current_value()
+            .expect("text literal actor should expose the seeded combined value")
+        else {
+            panic!("text literal actor should resolve to text");
+        };
+        assert_eq!(text.text(), "Hello current!");
+
+        name_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.text_literal_direct.name.update",
+                None,
+                "test text literal direct name update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "next",
+        ));
+
+        let Value::Text(text, _) = actor
+            .current_value()
+            .expect("text literal actor should reflect direct-state source updates")
+        else {
+            panic!("text literal actor should stay text after source update");
+        };
+        assert_eq!(text.text(), "Hello next!");
+    }
+
+    #[test]
+    fn text_literal_actor_with_lazy_interpolation_uses_one_scope_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let (mut name_tx, name_rx) = mpsc::channel::<Value>(8);
+        let name_actor =
+            crate::engine::create_actor_lazy(name_rx, boon::parser::PersistenceId::new(), scope_id);
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+        let source_code = SourceCode::new("TEXT { \"Hello {name}!\" }".to_owned());
+        let actor = super::build_text_literal_actor(
+            vec![
+                static_expression::TextPart::Text(source_code.slice(8, 14)),
+                static_expression::TextPart::Interpolation {
+                    var: source_code.slice(15, 19),
+                    referenced_span: None,
+                },
+                static_expression::TextPart::Text(source_code.slice(20, 21)),
+            ],
+            (0..24).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    registry_scope_id: Some(scope_id),
+                    parameters: Arc::new(HashMap::from([("name".to_owned(), name_actor.clone())])),
+                    ..ActorContext::default()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+        )
+        .expect("text literal actor with lazy interpolation should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy text literal interpolation should add one scope-owned watcher plus the first-demand lazy source task"
+            );
+        });
+
+        assert!(
+            actor.current_value().is_err(),
+            "text literal should stay empty until the lazy interpolation source emits"
+        );
+
+        name_tx
+            .clone()
+            .try_send(crate::engine::Text::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.text_literal_lazy.name.initial",
+                    None,
+                    "test text literal lazy name initial",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                "current",
+            ))
+            .expect("lazy interpolation source should enqueue its first value");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Text(text, _) = actor
+            .current_value()
+            .expect("text literal should resolve once the lazy interpolation source emits")
+        else {
+            panic!("text literal should resolve to text after lazy interpolation value");
+        };
+        assert_eq!(text.text(), "Hello current!");
+
+        name_tx
+            .try_send(crate::engine::Text::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.text_literal_lazy.name.update",
+                    None,
+                    "test text literal lazy name update",
+                ),
+                construct_context,
+                crate::engine::ValueIdempotencyKey::new(),
+                "next",
+            ))
+            .expect("lazy interpolation source should enqueue its update");
+        crate::engine::poll_test_async_source_tasks();
+
+        let Value::Text(text, _) = actor
+            .current_value()
+            .expect("text literal should keep following lazy interpolation updates")
+        else {
+            panic!("text literal should stay text after lazy interpolation update");
+        };
+        assert_eq!(text.text(), "Hello next!");
+    }
+
+    #[test]
+    fn text_interpolation_field_actor_follows_ready_nested_root_changes_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let leaf_actor_a =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        leaf_actor_a.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.text_interpolation.nested.leaf_a",
+                None,
+                "test text interpolation nested leaf a",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "alpha",
+        ));
+        let leaf_actor_b =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        leaf_actor_b.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.text_interpolation.nested.leaf_b",
+                None,
+                "test text interpolation nested leaf b",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta",
+        ));
+
+        let child_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let make_child_object = |leaf_actor: ActorHandle, suffix: &str| {
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.text_interpolation.nested.child.{suffix}"),
+                    None,
+                    "test text interpolation nested child",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.text_interpolation.nested.child_var.{suffix}"),
+                        None,
+                        "test text interpolation nested child var",
+                    ),
+                    "leaf",
+                    leaf_actor,
+                    boon::parser::PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        child_actor.store_value_directly(make_child_object(leaf_actor_a.clone(), "a"));
+
+        let root_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let make_root_object = |child: ActorHandle, suffix: &str| {
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.text_interpolation.nested.root.{suffix}"),
+                    None,
+                    "test text interpolation nested root",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.text_interpolation.nested.root_var.{suffix}"),
+                        None,
+                        "test text interpolation nested root var",
+                    ),
+                    "child",
+                    child,
+                    boon::parser::PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        root_actor.store_value_directly(make_root_object(child_actor.clone(), "initial"));
+
+        let field_actor = super::create_text_interpolation_field_actor(
+            root_actor,
+            vec![String::from("child"), String::from("leaf")],
+            actor_context.clone(),
+        );
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "ready nested text interpolation should reuse runtime field aliases instead of spawning a wrapper task"
+            );
+        });
+
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("nested interpolation field actor should expose initial leaf value")
+        else {
+            panic!("nested interpolation field actor should resolve to text");
+        };
+        assert_eq!(text.text(), "alpha");
+
+        child_actor.store_value_directly(make_child_object(leaf_actor_b.clone(), "b"));
+
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("nested interpolation field actor should switch to the latest child leaf")
+        else {
+            panic!("nested interpolation field actor should stay text after child switch");
+        };
+        assert_eq!(text.text(), "beta");
+
+        leaf_actor_a.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.text_interpolation.nested.leaf_a.stale",
+                None,
+                "test text interpolation nested leaf a stale",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "stale",
+        ));
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("stale leaf updates should be ignored after child switch")
+        else {
+            panic!("nested interpolation field actor should stay text after stale leaf update");
+        };
+        assert_eq!(text.text(), "beta");
+
+        leaf_actor_b.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.text_interpolation.nested.leaf_b.update",
+                None,
+                "test text interpolation nested leaf b update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "gamma",
+        ));
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("current leaf updates should still flow through the runtime alias path")
+        else {
+            panic!("nested interpolation field actor should stay text after current leaf update");
+        };
+        assert_eq!(text.text(), "gamma");
+    }
+
+    #[test]
+    fn text_interpolation_field_actor_waits_for_late_root_without_async_source_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let leaf_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        leaf_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.text_interpolation.late_root.leaf.initial",
+                None,
+                "test text interpolation late root leaf initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "alpha",
+        ));
+
+        let child_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let make_child_object = |leaf_actor: ActorHandle| {
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.text_interpolation.late_root.child",
+                    None,
+                    "test text interpolation late root child",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        "test.text_interpolation.late_root.child_var",
+                        None,
+                        "test text interpolation late root child var",
+                    ),
+                    "leaf",
+                    leaf_actor,
+                    boon::parser::PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        child_actor.store_value_directly(make_child_object(leaf_actor.clone()));
+
+        let root_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let make_root_object = |child: ActorHandle| {
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.text_interpolation.late_root.root",
+                    None,
+                    "test text interpolation late root root",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        "test.text_interpolation.late_root.root_var",
+                        None,
+                        "test text interpolation late root root var",
+                    ),
+                    "child",
+                    child,
+                    boon::parser::PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+
+        let field_actor = super::create_text_interpolation_field_actor(
+            root_actor.clone(),
+            vec![String::from("child"), String::from("leaf")],
+            actor_context.clone(),
+        );
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "late-root text interpolation should wait on runtime subscribers instead of spawning a future-source task"
+            );
+        });
+
+        assert!(
+            field_actor.current_value().is_err(),
+            "field actor should stay empty until the root becomes ready"
+        );
+
+        root_actor.store_value_directly(make_root_object(child_actor));
+
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("field actor should resolve once the root becomes ready")
+        else {
+            panic!("field actor should resolve to text once the root becomes ready");
+        };
+        assert_eq!(text.text(), "alpha");
+
+        leaf_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.text_interpolation.late_root.leaf.update",
+                None,
+                "test text interpolation late root leaf update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta",
+        ));
+
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("field actor should keep following leaf updates after late root resolution")
+        else {
+            panic!("field actor should stay text after late root leaf update");
+        };
+        assert_eq!(text.text(), "beta");
+    }
+
+    #[test]
+    fn text_literal_outer_reference_waits_without_future_source_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let reference_connector = Arc::new(ReferenceConnector::new());
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let source_code = SourceCode::new("TEXT { \"Hello {name}!\" }".to_owned());
+        let ref_span = span_at(19);
+
+        let actor = super::build_text_literal_actor(
+            vec![
+                static_expression::TextPart::Text(source_code.slice(8, 14)),
+                static_expression::TextPart::Interpolation {
+                    var: source_code.slice(15, 19),
+                    referenced_span: Some(ref_span),
+                },
+                static_expression::TextPart::Text(source_code.slice(20, 21)),
+            ],
+            (0..24).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    registry_scope_id: Some(scope_id),
+                    ..ActorContext::default()
+                },
+                reference_connector: Arc::downgrade(&reference_connector),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+        )
+        .expect("text literal with outer reference should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "outer-reference text interpolation should wait through connector-owned actors instead of future-source tasks"
+            );
+        });
+
+        assert!(
+            actor.current_value().is_err(),
+            "text literal should stay empty until the outer reference is registered"
+        );
+
+        let name_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        name_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.text_literal.outer_reference.current",
+                None,
+                "test text literal outer reference current",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "current",
+        ));
+        reference_connector.register_referenceable(ref_span, name_actor.clone());
+
+        let Value::Text(text, _) = actor
+            .current_value()
+            .expect("text literal should resolve once the outer reference is registered")
+        else {
+            panic!("text literal should resolve to text once the outer reference is ready");
+        };
+        assert_eq!(text.text(), "Hello current!");
+
+        name_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.text_literal.outer_reference.update",
+                None,
+                "test text literal outer reference update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "next",
+        ));
+
+        let Value::Text(text, _) = actor
+            .current_value()
+            .expect("text literal should keep following the resolved outer reference")
+        else {
+            panic!("text literal should stay text after outer reference update");
+        };
+        assert_eq!(text.text(), "Hello next!");
+    }
+
+    #[test]
+    fn field_access_actor_follows_ready_nested_root_changes_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let leaf_actor_a =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        leaf_actor_a.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.field_access.nested.leaf_a",
+                None,
+                "test field access nested leaf a",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "alpha",
+        ));
+        let leaf_actor_b =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        leaf_actor_b.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.field_access.nested.leaf_b",
+                None,
+                "test field access nested leaf b",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta",
+        ));
+
+        let child_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let make_child_object = |leaf_actor: ActorHandle, suffix: &str| {
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.field_access.nested.child.{suffix}"),
+                    None,
+                    "test field access nested child",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.field_access.nested.child_var.{suffix}"),
+                        None,
+                        "test field access nested child var",
+                    ),
+                    "leaf",
+                    leaf_actor,
+                    boon::parser::PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        child_actor.store_value_directly(make_child_object(leaf_actor_a.clone(), "a"));
+
+        let root_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let make_root_object = |child: ActorHandle, suffix: &str| {
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.field_access.nested.root.{suffix}"),
+                    None,
+                    "test field access nested root",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.field_access.nested.root_var.{suffix}"),
+                        None,
+                        "test field access nested root var",
+                    ),
+                    "child",
+                    child,
+                    boon::parser::PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        root_actor.store_value_directly(make_root_object(child_actor.clone(), "initial"));
+
+        let field_actor = super::build_field_access_actor(
+            vec![String::from("child"), String::from("leaf")],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(root_actor),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: SourceCode::new(".child.leaf".to_owned()),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+        )
+        .expect("field access actor should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "ready nested field access should reuse runtime field aliases instead of spawning a wrapper task"
+            );
+        });
+
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("field access actor should expose initial leaf value")
+        else {
+            panic!("field access actor should resolve to text");
+        };
+        assert_eq!(text.text(), "alpha");
+
+        child_actor.store_value_directly(make_child_object(leaf_actor_b.clone(), "b"));
+
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("field access actor should switch to the latest child leaf")
+        else {
+            panic!("field access actor should stay text after child switch");
+        };
+        assert_eq!(text.text(), "beta");
+
+        leaf_actor_a.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.field_access.nested.leaf_a.stale",
+                None,
+                "test field access nested leaf a stale",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "stale",
+        ));
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("stale leaf updates should be ignored after child switch")
+        else {
+            panic!("field access actor should stay text after stale leaf update");
+        };
+        assert_eq!(text.text(), "beta");
+
+        leaf_actor_b.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.field_access.nested.leaf_b.update",
+                None,
+                "test field access nested leaf b update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "gamma",
+        ));
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("current leaf updates should still flow through the runtime alias path")
+        else {
+            panic!("field access actor should stay text after current leaf update");
+        };
+        assert_eq!(text.text(), "gamma");
+    }
+
+    #[test]
+    fn field_access_actor_clears_when_selected_field_disappears_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let leaf_actor_a =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        leaf_actor_a.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.field_access.clear.leaf_a",
+                None,
+                "test field access clear leaf a",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "alpha",
+        ));
+        let leaf_actor_b =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        leaf_actor_b.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.field_access.clear.leaf_b",
+                None,
+                "test field access clear leaf b",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta",
+        ));
+        let unrelated_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        unrelated_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.field_access.clear.other",
+                None,
+                "test field access clear other",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "other",
+        ));
+
+        let child_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let make_child_object = |field_name: &str, field_actor: ActorHandle, suffix: &str| {
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.field_access.clear.child.{suffix}"),
+                    None,
+                    "test field access clear child",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.field_access.clear.child_var.{suffix}"),
+                        None,
+                        "test field access clear child var",
+                    ),
+                    field_name.to_owned(),
+                    field_actor,
+                    boon::parser::PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        child_actor.store_value_directly(make_child_object("leaf", leaf_actor_a.clone(), "a"));
+
+        let root_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let make_root_object = |child: ActorHandle, suffix: &str| {
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.field_access.clear.root.{suffix}"),
+                    None,
+                    "test field access clear root",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.field_access.clear.root_var.{suffix}"),
+                        None,
+                        "test field access clear root var",
+                    ),
+                    "child",
+                    child,
+                    boon::parser::PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        root_actor.store_value_directly(make_root_object(child_actor.clone(), "initial"));
+
+        let field_actor = super::build_field_access_actor(
+            vec![String::from("child"), String::from("leaf")],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(root_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: SourceCode::new(".child.leaf".to_owned()),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+        )
+        .expect("field access actor should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "ready field access should stay on runtime aliases when the selected field later disappears"
+            );
+        });
+
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("field access actor should expose the initial field value")
+        else {
+            panic!("field access actor should resolve to text");
+        };
+        assert_eq!(text.text(), "alpha");
+
+        child_actor.store_value_directly(make_child_object(
+            "other",
+            unrelated_actor.clone(),
+            "missing",
+        ));
+
+        assert!(
+            matches!(
+                field_actor.current_value(),
+                Err(crate::engine::CurrentValueError::NoValueYet)
+            ),
+            "field access actor should clear when the selected field disappears"
+        );
+
+        leaf_actor_a.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.field_access.clear.leaf_a.stale",
+                None,
+                "test field access clear leaf a stale",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "stale",
+        ));
+        assert!(
+            matches!(
+                field_actor.current_value(),
+                Err(crate::engine::CurrentValueError::NoValueYet)
+            ),
+            "stale updates from the old leaf should not re-seed the cleared field access actor"
+        );
+
+        child_actor.store_value_directly(make_child_object("leaf", leaf_actor_b.clone(), "b"));
+
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("field access actor should recover once the selected field exists again")
+        else {
+            panic!("field access actor should resolve to text after recovery");
+        };
+        assert_eq!(text.text(), "beta");
+    }
+
+    #[test]
+    fn field_access_actor_waits_for_late_root_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let leaf_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        leaf_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.field_access.late_root.leaf.initial",
+                None,
+                "test field access late root leaf initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "alpha",
+        ));
+
+        let child_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        child_actor.store_value_directly(Object::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.field_access.late_root.child",
+                None,
+                "test field access late root child",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            [Variable::new_arc(
+                crate::engine::ConstructInfo::new(
+                    "test.field_access.late_root.child_var",
+                    None,
+                    "test field access late root child var",
+                ),
+                "leaf",
+                leaf_actor.clone(),
+                boon::parser::PersistenceId::new(),
+                actor_scope.clone(),
+            )],
+        ));
+
+        let root_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+
+        let field_actor = super::build_field_access_actor(
+            vec![String::from("child"), String::from("leaf")],
+            (0..0).into(),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(root_actor.clone()),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: SourceCode::new(".child.leaf".to_owned()),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+        )
+        .expect("field access actor should build for late root");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "late-root field access should wait through runtime subscribers instead of spawning a wrapper task"
+            );
+        });
+
+        assert!(
+            field_actor.current_value().is_err(),
+            "field access actor should stay empty until the root is ready"
+        );
+
+        root_actor.store_value_directly(Object::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.field_access.late_root.root",
+                None,
+                "test field access late root root",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            [Variable::new_arc(
+                crate::engine::ConstructInfo::new(
+                    "test.field_access.late_root.root_var",
+                    None,
+                    "test field access late root root var",
+                ),
+                "child",
+                child_actor,
+                boon::parser::PersistenceId::new(),
+                actor_scope,
+            )],
+        ));
+
+        let Value::Text(text, _) = field_actor
+            .current_value()
+            .expect("field access actor should resolve once the root is ready")
+        else {
+            panic!("field access actor should resolve to text once the root is ready");
+        };
+        assert_eq!(text.text(), "alpha");
+
+        leaf_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.field_access.late_root.leaf.update",
+                None,
+                "test field access late root leaf update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta",
+        ));
+
+        let Value::Text(text, _) = field_actor.current_value().expect(
+            "field access actor should keep following leaf updates after late root resolution",
+        ) else {
+            panic!("field access actor should stay text after late root leaf update");
+        };
+        assert_eq!(text.text(), "beta");
+    }
+
+    #[test]
+    fn then_body_snapshot_context_uses_runtime_local_eval_without_inner_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let text_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        text_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_body_runtime_local.text",
+                None,
+                "test then body runtime-local text",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "ready",
+        ));
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(Object::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_body_runtime_local.object",
+                None,
+                "test then body runtime-local object",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            [Variable::new_arc(
+                crate::engine::ConstructInfo::new(
+                    "test.then_body_runtime_local.variable",
+                    None,
+                    "test then body runtime-local variable",
+                ),
+                "text",
+                text_actor,
+                boon::parser::PersistenceId::new(),
+                actor_scope.clone(),
+            )],
+        ));
+
+        let body_source = SourceCode::new("text = .text; text".to_owned());
+        let result_actor = super::evaluate_branch_body_actor(
+            static_expression::Spanned {
+                span: span_at(body_source.len()),
+                persistence: None,
+                node: static_expression::Expression::Block {
+                    variables: vec![static_expression::Spanned {
+                        span: (0..4).into(),
+                        persistence: None,
+                        node: static_expression::Variable {
+                            name: body_source.slice(0, 4),
+                            is_referenced: true,
+                            value_changed: false,
+                            value: static_expression::Spanned {
+                                span: (7..12).into(),
+                                persistence: None,
+                                node: static_expression::Expression::FieldAccess {
+                                    path: vec![body_source.slice(8, 12)],
+                                },
+                            },
+                        },
+                    }],
+                    output: Box::new(static_expression::Spanned {
+                        span: (14..18).into(),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed {
+                                parts: vec![body_source.slice(14, 18)],
+                                referenced_span: None,
+                            },
+                        ),
+                    }),
+                },
+            },
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    is_snapshot_context: true,
+                    subscription_after_seq: None,
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+        )
+        .expect("THEN body evaluation should build");
+        let result_actor = result_actor.expect("THEN body evaluation should yield an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "supported direct-state THEN body evaluation should stay on the runtime-local path without adding a wrapper task"
+            );
+        });
+
+        let emitted_json = block_on(
+            result_actor
+                .current_value()
+                .expect("THEN body result should expose its direct-state value")
+                .to_json(),
+        );
+
+        assert_eq!(emitted_json, serde_json::json!("ready"));
+    }
+
+    #[test]
+    fn then_actor_uses_direct_state_snapshot_body_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let text_actor_a =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        text_actor_a.store_value_directly(crate::engine::Text::new_value_with_emission_seq(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_direct_state.text_a.initial",
+                None,
+                "test then actor direct-state text a initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            100,
+            "alpha",
+        ));
+        let text_actor_b =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        text_actor_b.store_value_directly(crate::engine::Text::new_value_with_emission_seq(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_direct_state.text_b.initial",
+                None,
+                "test then actor direct-state text b initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            200,
+            "beta",
+        ));
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let make_object = |suffix: &str, text_actor: ActorHandle, emission_seq: u64| {
+            Object::new_value_with_emission_seq(
+                crate::engine::ConstructInfo::new(
+                    format!("test.then_actor_direct_state.object.{suffix}"),
+                    None,
+                    "test then actor direct-state object",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                emission_seq,
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.then_actor_direct_state.variable.{suffix}"),
+                        None,
+                        "test then actor direct-state variable",
+                    ),
+                    "text",
+                    text_actor,
+                    boon::parser::PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        piped_actor.store_value_directly(make_object("stale", text_actor_a.clone(), 100));
+
+        let body_source = SourceCode::new(".text".to_owned());
+        let result_actor = super::build_then_actor(
+            static_expression::Spanned {
+                span: (0..5).into(),
+                persistence: None,
+                node: static_expression::Expression::FieldAccess {
+                    path: vec![body_source.slice(1, 5)],
+                },
+            },
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("THEN actor should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state THEN actor should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        assert!(
+            matches!(
+                result_actor.current_value(),
+                Err(crate::engine::CurrentValueError::NoValueYet)
+            ),
+            "stale pre-existing piped value should be filtered out for THEN"
+        );
+
+        piped_actor.store_value_directly(make_object("fresh", text_actor_b.clone(), 300));
+
+        let fresh_json = block_on(
+            result_actor
+                .current_value()
+                .expect("fresh THEN pulse should produce a snapshot value")
+                .to_json(),
+        );
+        assert_eq!(fresh_json, serde_json::json!("beta"));
+
+        text_actor_b.store_value_directly(crate::engine::Text::new_value_with_emission_seq(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_direct_state.text_b.update",
+                None,
+                "test then actor direct-state text b update",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            400,
+            "beta-next",
+        ));
+
+        let unchanged_json = block_on(
+            result_actor
+                .current_value()
+                .expect("THEN snapshot result should not become a live subscription")
+                .to_json(),
+        );
+        assert_eq!(unchanged_json, serde_json::json!("beta"));
+
+        piped_actor.store_value_directly(make_object("fresh_again", text_actor_b, 500));
+
+        let next_json = block_on(
+            result_actor
+                .current_value()
+                .expect("next THEN pulse should re-snapshot the current field value")
+                .to_json(),
+        );
+        assert_eq!(next_json, serde_json::json!("beta-next"));
+    }
+
+    #[test]
+    fn then_actor_with_lazy_piped_input_uses_direct_state_snapshot_body_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let text_actor_a =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        text_actor_a.store_value_directly(crate::engine::Text::new_value_with_emission_seq(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_direct_state_lazy.text_a.initial",
+                None,
+                "test then actor direct-state lazy text a initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            100,
+            "alpha",
+        ));
+        let text_actor_b =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        text_actor_b.store_value_directly(crate::engine::Text::new_value_with_emission_seq(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_direct_state_lazy.text_b.initial",
+                None,
+                "test then actor direct-state lazy text b initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            200,
+            "beta",
+        ));
+
+        let make_object = |suffix: &str, text_actor: ActorHandle, emission_seq: u64| {
+            Object::new_value_with_emission_seq(
+                crate::engine::ConstructInfo::new(
+                    format!("test.then_actor_direct_state_lazy.object.{suffix}"),
+                    None,
+                    "test then actor direct-state lazy object",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                emission_seq,
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.then_actor_direct_state_lazy.variable.{suffix}"),
+                        None,
+                        "test then actor direct-state lazy variable",
+                    ),
+                    "text",
+                    text_actor,
+                    boon::parser::PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+
+        let (mut piped_tx, piped_rx) = mpsc::channel::<Value>(8);
+        let piped_actor = crate::engine::create_actor_lazy(
+            piped_rx,
+            boon::parser::PersistenceId::new(),
+            scope_id,
+        );
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+        piped_tx
+            .try_send(make_object("stale", text_actor_a.clone(), 100))
+            .expect("stale lazy piped value should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let body_source = SourceCode::new(".text".to_owned());
+        let result_actor = super::build_then_actor(
+            static_expression::Spanned {
+                span: (0..5).into(),
+                persistence: None,
+                node: static_expression::Expression::FieldAccess {
+                    path: vec![body_source.slice(1, 5)],
+                },
+            },
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("lazy-piped THEN actor should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 1,
+                "lazy-piped direct-state THEN actor should only need the first-demand lazy source task"
+            );
+        });
+
+        crate::engine::poll_test_async_source_tasks();
+        assert!(
+            matches!(
+                result_actor.current_value(),
+                Err(crate::engine::CurrentValueError::NoValueYet)
+            ),
+            "stale pre-existing lazy piped value should be filtered out for THEN"
+        );
+
+        piped_tx
+            .try_send(make_object("fresh", text_actor_b.clone(), 300))
+            .expect("fresh lazy piped value should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let fresh_json = block_on(
+            result_actor
+                .current_value()
+                .expect("fresh lazy THEN pulse should produce a snapshot value")
+                .to_json(),
+        );
+        assert_eq!(fresh_json, serde_json::json!("beta"));
+
+        text_actor_b.store_value_directly(crate::engine::Text::new_value_with_emission_seq(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_direct_state_lazy.text_b.update",
+                None,
+                "test then actor direct-state lazy text b update",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            400,
+            "beta-next",
+        ));
+
+        let unchanged_json = block_on(
+            result_actor
+                .current_value()
+                .expect("lazy THEN snapshot result should not become a live subscription")
+                .to_json(),
+        );
+        assert_eq!(unchanged_json, serde_json::json!("beta"));
+
+        piped_tx
+            .try_send(make_object("fresh_again", text_actor_b, 500))
+            .expect("next lazy piped value should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let next_json = block_on(
+            result_actor
+                .current_value()
+                .expect("next lazy THEN pulse should re-snapshot the current field value")
+                .to_json(),
+        );
+        assert_eq!(next_json, serde_json::json!("beta-next"));
+    }
+
+    #[test]
+    fn then_constant_body_drives_math_sum_across_multiple_pulses() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+
+        let body_source = SourceCode::new("1".to_owned());
+        let then_actor = super::build_then_actor(
+            static_expression::Spanned {
+                span: (0..1).into(),
+                persistence: None,
+                node: static_expression::Expression::Literal(static_expression::Literal::Number(
+                    1.0,
+                )),
+            },
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("constant-body THEN actor should build");
+
+        let sum_actor = crate::api::function_math_sum_actor(
+            Arc::new(vec![then_actor.clone()]),
+            crate::engine::ConstructId::new("test.then_constant_sum"),
+            boon::parser::PersistenceId::new(),
+            construct_context.clone(),
+            actor_context.clone(),
+        )
+        .expect("Math/sum should stay on the direct actor path for constant-body THEN output");
+
+        let make_pulse = |label: &str, emission_seq: u64| {
+            crate::engine::Text::new_value_with_emission_seq(
+                crate::engine::ConstructInfo::new(
+                    format!("test.then_constant_sum.{label}"),
+                    None,
+                    "test then constant sum pulse",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                emission_seq,
+                label.to_owned(),
+            )
+        };
+
+        piped_actor.store_value_directly(make_pulse("first", 100));
+
+        let Value::Number(first, _) = sum_actor
+            .current_value()
+            .expect("first pulse should drive the sum to 1")
+        else {
+            panic!("constant-body THEN sum should resolve to a number");
+        };
+        assert_eq!(first.number(), 1.0);
+
+        piped_actor.store_value_directly(make_pulse("second", 200));
+
+        let Value::Number(second, _) = sum_actor
+            .current_value()
+            .expect("second pulse should advance the sum to 2")
+        else {
+            panic!("constant-body THEN sum should stay a number after the second pulse");
+        };
+        assert_eq!(second.number(), 2.0);
+    }
+
+    #[test]
+    fn then_constant_body_does_not_reuse_outer_then_persistence_for_sum_dedup() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+
+        let body_source = SourceCode::new("1".to_owned());
+        let then_actor = super::build_then_actor(
+            static_expression::Spanned {
+                span: (0..1).into(),
+                persistence: None,
+                node: static_expression::Expression::Literal(static_expression::Literal::Number(
+                    1.0,
+                )),
+            },
+            span_at(0),
+            Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::Unchanged,
+            }),
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("constant-body THEN actor with outer persistence should build");
+
+        let sum_actor = crate::api::function_math_sum_actor(
+            Arc::new(vec![then_actor.clone()]),
+            crate::engine::ConstructId::new("test.then_constant_sum.outer_persistence"),
+            boon::parser::PersistenceId::new(),
+            construct_context.clone(),
+            actor_context.clone(),
+        )
+        .expect("Math/sum should stay on the direct actor path for constant-body THEN output");
+
+        let make_pulse = |label: &str, emission_seq: u64| {
+            crate::engine::Text::new_value_with_emission_seq(
+                crate::engine::ConstructInfo::new(
+                    format!("test.then_constant_sum.outer_persistence.{label}"),
+                    None,
+                    "test then constant sum pulse with outer persistence",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                emission_seq,
+                label.to_owned(),
+            )
+        };
+
+        piped_actor.store_value_directly(make_pulse("first", 100));
+
+        let Value::Number(first, _) = sum_actor
+            .current_value()
+            .expect("first pulse should drive the sum to 1")
+        else {
+            panic!("constant-body THEN sum should resolve to a number");
+        };
+        assert_eq!(first.number(), 1.0);
+
+        piped_actor.store_value_directly(make_pulse("second", 200));
+
+        let Value::Number(second, _) = sum_actor
+            .current_value()
+            .expect("second pulse should still advance the sum to 2")
+        else {
+            panic!("constant-body THEN sum should stay a number after the second pulse");
+        };
+        assert_eq!(second.number(), 2.0);
+    }
+
+    #[test]
+    fn then_constant_body_does_not_reuse_body_persistence_for_sum_dedup() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+
+        let body_source = SourceCode::new("1".to_owned());
+        let then_actor = super::build_then_actor(
+            static_expression::Spanned {
+                span: (0..1).into(),
+                persistence: Some(boon::parser::Persistence {
+                    id: boon::parser::PersistenceId::new(),
+                    status: boon::parser::PersistenceStatus::Unchanged,
+                }),
+                node: static_expression::Expression::Literal(static_expression::Literal::Number(
+                    1.0,
+                )),
+            },
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("constant-body THEN actor with body persistence should build");
+
+        let sum_actor = crate::api::function_math_sum_actor(
+            Arc::new(vec![then_actor.clone()]),
+            crate::engine::ConstructId::new("test.then_constant_sum.body_persistence"),
+            boon::parser::PersistenceId::new(),
+            construct_context.clone(),
+            actor_context.clone(),
+        )
+        .expect("Math/sum should stay on the direct actor path for constant-body THEN output");
+
+        let make_pulse = |label: &str, emission_seq: u64| {
+            crate::engine::Text::new_value_with_emission_seq(
+                crate::engine::ConstructInfo::new(
+                    format!("test.then_constant_sum.body_persistence.{label}"),
+                    None,
+                    "test then constant sum pulse with body persistence",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                emission_seq,
+                label.to_owned(),
+            )
+        };
+
+        piped_actor.store_value_directly(make_pulse("first", 100));
+
+        let Value::Number(first, _) = sum_actor
+            .current_value()
+            .expect("first pulse should drive the sum to 1")
+        else {
+            panic!("constant-body THEN sum should resolve to a number");
+        };
+        assert_eq!(first.number(), 1.0);
+
+        piped_actor.store_value_directly(make_pulse("second", 200));
+
+        let Value::Number(second, _) = sum_actor
+            .current_value()
+            .expect("second pulse should still advance the sum to 2")
+        else {
+            panic!("constant-body THEN sum should stay a number after the second pulse");
+        };
+        assert_eq!(second.number(), 2.0);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test(async)]
+    async fn interval_then_sum_chain_accumulates_multiple_browser_ticks() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let duration_actor = crate::engine::create_constant_actor(
+            boon::parser::PersistenceId::new(),
+            crate::engine::TaggedObject::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.interval_then_sum.browser.duration",
+                    None,
+                    "test interval then sum browser duration",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                "Duration",
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        "test.interval_then_sum.browser.duration.ms",
+                        None,
+                        "test interval then sum browser duration ms",
+                    ),
+                    "milliseconds",
+                    crate::engine::create_constant_actor(
+                        boon::parser::PersistenceId::new(),
+                        crate::engine::Number::new_value(
+                            crate::engine::ConstructInfo::new(
+                                "test.interval_then_sum.browser.duration.ms.value",
+                                None,
+                                "test interval then sum browser duration ms value",
+                            ),
+                            construct_context.clone(),
+                            crate::engine::ValueIdempotencyKey::new(),
+                            50.0,
+                        ),
+                        scope_id,
+                    ),
+                    boon::parser::PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            ),
+            scope_id,
+        );
+
+        let interval_actor = crate::api::function_timer_interval_actor(
+            Arc::new(vec![duration_actor]),
+            ConstructId::new("test.interval_then_sum.browser.interval"),
+            boon::parser::PersistenceId::new(),
+            construct_context.clone(),
+            actor_context.clone(),
+        );
+
+        let body_source = SourceCode::new("1".to_owned());
+        let then_actor = super::build_then_actor(
+            static_expression::Spanned {
+                span: (0..1).into(),
+                persistence: None,
+                node: static_expression::Expression::Literal(static_expression::Literal::Number(
+                    1.0,
+                )),
+            },
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(interval_actor),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("browser interval THEN actor should build");
+
+        let sum_actor = crate::api::function_math_sum_actor(
+            Arc::new(vec![then_actor]),
+            crate::engine::ConstructId::new("test.interval_then_sum.browser.sum"),
+            boon::parser::PersistenceId::new(),
+            construct_context,
+            actor_context,
+        )
+        .expect("browser interval THEN output should stay on direct Math/sum path");
+
+        let mut stream = std::pin::pin!(sum_actor.current_or_future_stream());
+        let first =
+            next_value_with_timeout(&mut stream, 2_000, "first browser interval sum tick").await;
+        let second =
+            next_value_with_timeout(&mut stream, 2_000, "second browser interval sum tick").await;
+
+        let Value::Number(first, _) = first else {
+            panic!("first browser interval sum tick should resolve to a number");
+        };
+        assert_eq!(first.number(), 1.0);
+
+        let Value::Number(second, _) = second else {
+            panic!("second browser interval sum tick should resolve to a number");
+        };
+        assert_eq!(second.number(), 2.0);
+    }
+
+    #[test]
+    fn when_style_body_uses_runtime_local_eval_and_stays_reactive_without_inner_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let text_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        text_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_body_runtime_local.text.initial",
+                None,
+                "test when body runtime-local text initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "ready",
+        ));
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let make_object = |suffix: &str, text_actor: ActorHandle| {
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    format!("test.when_body_runtime_local.object.{suffix}"),
+                    None,
+                    "test when body runtime-local object",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.when_body_runtime_local.variable.{suffix}"),
+                        None,
+                        "test when body runtime-local variable",
+                    ),
+                    "text",
+                    text_actor,
+                    boon::parser::PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        piped_actor.store_value_directly(make_object("initial", text_actor.clone()));
+
+        let body_source = SourceCode::new(".text".to_owned());
+        let result_actor = super::evaluate_branch_body_actor(
+            static_expression::Spanned {
+                span: (0..5).into(),
+                persistence: None,
+                node: static_expression::Expression::FieldAccess {
+                    path: vec![body_source.slice(1, 5)],
+                },
+            },
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    is_snapshot_context: false,
+                    subscription_after_seq: None,
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+        )
+        .expect("WHEN-style body evaluation should build")
+        .expect("WHEN-style body evaluation should yield an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "supported WHEN-style body evaluation should stay on the runtime-local path without adding a wrapper task"
+            );
+        });
+
+        let initial_json = block_on(
+            result_actor
+                .current_value()
+                .expect("WHEN-style body result should expose its direct-state value")
+                .to_json(),
+        );
+        assert_eq!(initial_json, serde_json::json!("ready"));
+
+        text_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_body_runtime_local.text.update",
+                None,
+                "test when body runtime-local text update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "next",
+        ));
+
+        let updated_json = block_on(
+            result_actor
+                .current_value()
+                .expect("WHEN-style body result should stay reactive on direct-state updates")
+                .to_json(),
+        );
+        assert_eq!(updated_json, serde_json::json!("next"));
+    }
+
+    #[test]
+    fn when_actor_switches_direct_state_matched_body_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let alpha_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        alpha_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_direct_state.alpha.initial",
+                None,
+                "test when actor direct-state alpha initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "alpha",
+        ));
+        let beta_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        beta_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_direct_state.beta.initial",
+                None,
+                "test when actor direct-state beta initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta",
+        ));
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_direct_state.condition.initial",
+                None,
+                "test when actor direct-state condition initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "a",
+        ));
+
+        let alpha_source = SourceCode::new("alpha".to_owned());
+        let beta_source = SourceCode::new("beta".to_owned());
+        let result_actor = super::build_when_actor(
+            vec![
+                static_expression::Arm {
+                    pattern: static_expression::Pattern::Literal(static_expression::Literal::Text(
+                        alpha_source.slice(0, 1),
+                    )),
+                    body: static_expression::Spanned {
+                        span: (0..5).into(),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed {
+                                parts: vec![alpha_source.slice(0, 5)],
+                                referenced_span: None,
+                            },
+                        ),
+                    },
+                },
+                static_expression::Arm {
+                    pattern: static_expression::Pattern::Literal(static_expression::Literal::Text(
+                        beta_source.slice(0, 1),
+                    )),
+                    body: static_expression::Spanned {
+                        span: (0..4).into(),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed {
+                                parts: vec![beta_source.slice(0, 4)],
+                                referenced_span: None,
+                            },
+                        ),
+                    },
+                },
+            ],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    parameters: Arc::new(HashMap::from([
+                        ("alpha".to_owned(), alpha_actor.clone()),
+                        ("beta".to_owned(), beta_actor.clone()),
+                    ])),
+                    registry_scope_id: Some(scope_id),
+                    ..ActorContext::default()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: SourceCode::new("WHEN direct-state test".to_owned()),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("WHEN actor should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state WHEN actor should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let initial_json = block_on(
+            result_actor
+                .current_value()
+                .expect("WHEN actor should expose the initial matched value")
+                .to_json(),
+        );
+        assert_eq!(initial_json, serde_json::json!("alpha"));
+
+        piped_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_direct_state.condition.switch",
+                None,
+                "test when actor direct-state condition switch",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "b",
+        ));
+
+        let switched_json = block_on(
+            result_actor
+                .current_value()
+                .expect("WHEN actor should switch to the new matched body")
+                .to_json(),
+        );
+        assert_eq!(switched_json, serde_json::json!("beta"));
+
+        alpha_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_direct_state.alpha.stale",
+                None,
+                "test when actor direct-state alpha stale",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "stale-alpha",
+        ));
+
+        let after_stale_json = block_on(
+            result_actor
+                .current_value()
+                .expect("stale old-branch updates should be ignored")
+                .to_json(),
+        );
+        assert_eq!(after_stale_json, serde_json::json!("beta"));
+
+        beta_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_direct_state.beta.update",
+                None,
+                "test when actor direct-state beta update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta-next",
+        ));
+
+        let updated_json = block_on(
+            result_actor
+                .current_value()
+                .expect("WHEN arm parameter bindings should stay frozen at match time")
+                .to_json(),
+        );
+        assert_eq!(updated_json, serde_json::json!("beta"));
+    }
+
+    #[test]
+    fn when_actor_with_lazy_piped_input_switches_direct_state_matched_body_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let alpha_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        alpha_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_direct_state_lazy.alpha.initial",
+                None,
+                "test when actor direct-state lazy alpha initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "alpha",
+        ));
+        let beta_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        beta_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_direct_state_lazy.beta.initial",
+                None,
+                "test when actor direct-state lazy beta initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta",
+        ));
+
+        let (mut piped_tx, piped_rx) = mpsc::channel::<Value>(8);
+        let piped_actor = crate::engine::create_actor_lazy(
+            piped_rx,
+            boon::parser::PersistenceId::new(),
+            scope_id,
+        );
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+        piped_tx
+            .try_send(crate::engine::Text::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.when_actor_direct_state_lazy.condition.initial",
+                    None,
+                    "test when actor direct-state lazy condition initial",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                "a",
+            ))
+            .expect("initial lazy WHEN condition should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let alpha_source = SourceCode::new("alpha".to_owned());
+        let beta_source = SourceCode::new("beta".to_owned());
+        let result_actor = super::build_when_actor(
+            vec![
+                static_expression::Arm {
+                    pattern: static_expression::Pattern::Literal(static_expression::Literal::Text(
+                        alpha_source.slice(0, 1),
+                    )),
+                    body: static_expression::Spanned {
+                        span: (0..5).into(),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed {
+                                parts: vec![alpha_source.slice(0, 5)],
+                                referenced_span: None,
+                            },
+                        ),
+                    },
+                },
+                static_expression::Arm {
+                    pattern: static_expression::Pattern::Literal(static_expression::Literal::Text(
+                        beta_source.slice(0, 1),
+                    )),
+                    body: static_expression::Spanned {
+                        span: (0..4).into(),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed {
+                                parts: vec![beta_source.slice(0, 4)],
+                                referenced_span: None,
+                            },
+                        ),
+                    },
+                },
+            ],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    parameters: Arc::new(HashMap::from([
+                        ("alpha".to_owned(), alpha_actor.clone()),
+                        ("beta".to_owned(), beta_actor.clone()),
+                    ])),
+                    registry_scope_id: Some(scope_id),
+                    ..ActorContext::default()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: SourceCode::new("WHEN lazy direct-state test".to_owned()),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("lazy-piped WHEN actor should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 1,
+                "lazy-piped direct-state WHEN actor should only need the first-demand lazy source task"
+            );
+        });
+
+        crate::engine::poll_test_async_source_tasks();
+
+        let initial_json = block_on(
+            result_actor
+                .current_value()
+                .expect("lazy WHEN actor should expose the initial matched value")
+                .to_json(),
+        );
+        assert_eq!(initial_json, serde_json::json!("alpha"));
+
+        piped_tx
+            .try_send(crate::engine::Text::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.when_actor_direct_state_lazy.condition.switch",
+                    None,
+                    "test when actor direct-state lazy condition switch",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                "b",
+            ))
+            .expect("switch lazy WHEN condition should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let switched_json = block_on(
+            result_actor
+                .current_value()
+                .expect("lazy WHEN actor should switch to the new matched body")
+                .to_json(),
+        );
+        assert_eq!(switched_json, serde_json::json!("beta"));
+
+        alpha_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_direct_state_lazy.alpha.stale",
+                None,
+                "test when actor direct-state lazy alpha stale",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "stale-alpha",
+        ));
+
+        let after_stale_json = block_on(
+            result_actor
+                .current_value()
+                .expect("lazy stale old-branch updates should be ignored")
+                .to_json(),
+        );
+        assert_eq!(after_stale_json, serde_json::json!("beta"));
+
+        beta_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_direct_state_lazy.beta.update",
+                None,
+                "test when actor direct-state lazy beta update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta-next",
+        ));
+
+        let updated_json = block_on(
+            result_actor
+                .current_value()
+                .expect("lazy WHEN arm parameter bindings should stay frozen at match time")
+                .to_json(),
+        );
+        assert_eq!(updated_json, serde_json::json!("beta"));
+    }
+
+    #[test]
+    fn while_style_body_uses_runtime_local_eval_and_filters_stale_root_updates_without_inner_wrapper_task()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let text_actor_a =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        text_actor_a.store_value_directly(crate::engine::Text::new_value_with_emission_seq(
+            crate::engine::ConstructInfo::new(
+                "test.while_body_runtime_local.text_a.initial",
+                None,
+                "test while body runtime-local text a initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            100,
+            "alpha",
+        ));
+        let text_actor_b =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        text_actor_b.store_value_directly(crate::engine::Text::new_value_with_emission_seq(
+            crate::engine::ConstructInfo::new(
+                "test.while_body_runtime_local.text_b.initial",
+                None,
+                "test while body runtime-local text b initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            200,
+            "beta",
+        ));
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let make_object = |suffix: &str, text_actor: ActorHandle, emission_seq: u64| {
+            Object::new_value_with_emission_seq(
+                crate::engine::ConstructInfo::new(
+                    format!("test.while_body_runtime_local.object.{suffix}"),
+                    None,
+                    "test while body runtime-local object",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                emission_seq,
+                [Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        format!("test.while_body_runtime_local.variable.{suffix}"),
+                        None,
+                        "test while body runtime-local variable",
+                    ),
+                    "text",
+                    text_actor,
+                    boon::parser::PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        piped_actor.store_value_directly(make_object("initial", text_actor_a.clone(), 100));
+
+        let body_source = SourceCode::new(".text".to_owned());
+        let result_actor = super::evaluate_branch_body_actor(
+            static_expression::Spanned {
+                span: (0..5).into(),
+                persistence: None,
+                node: static_expression::Expression::FieldAccess {
+                    path: vec![body_source.slice(1, 5)],
+                },
+            },
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    is_snapshot_context: false,
+                    subscription_after_seq: Some(100),
+                    snapshot_emission_seq: Some(100),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+        )
+        .expect("WHILE-style body evaluation should build")
+        .expect("WHILE-style body evaluation should yield an actor");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "supported WHILE-style body evaluation should stay on the runtime-local path without adding a wrapper task"
+            );
+        });
+
+        let initial_json = block_on(
+            result_actor
+                .current_value()
+                .expect("WHILE-style body result should expose its direct-state value")
+                .to_json(),
+        );
+        assert_eq!(initial_json, serde_json::json!("alpha"));
+
+        piped_actor.store_value_directly(make_object("update", text_actor_b.clone(), 200));
+
+        let updated_json = block_on(
+            result_actor
+                .current_value()
+                .expect("WHILE-style body result should follow current root updates")
+                .to_json(),
+        );
+        assert_eq!(updated_json, serde_json::json!("beta"));
+
+        text_actor_a.store_value_directly(crate::engine::Text::new_value_with_emission_seq(
+            crate::engine::ConstructInfo::new(
+                "test.while_body_runtime_local.text_a.stale",
+                None,
+                "test while body runtime-local text a stale",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            300,
+            "stale",
+        ));
+
+        let final_json = block_on(
+            result_actor
+                .current_value()
+                .expect("WHILE-style body result should ignore stale root branch updates")
+                .to_json(),
+        );
+        assert_eq!(final_json, serde_json::json!("beta"));
+    }
+
+    #[test]
+    fn while_actor_switches_direct_state_matched_body_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let alpha_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        alpha_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_direct_state.alpha.initial",
+                None,
+                "test while actor direct-state alpha initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "alpha",
+        ));
+        let beta_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        beta_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_direct_state.beta.initial",
+                None,
+                "test while actor direct-state beta initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta",
+        ));
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_direct_state.condition.initial",
+                None,
+                "test while actor direct-state condition initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "a",
+        ));
+
+        let alpha_source = SourceCode::new("alpha".to_owned());
+        let beta_source = SourceCode::new("beta".to_owned());
+        let result_actor = super::build_while_actor(
+            vec![
+                static_expression::Arm {
+                    pattern: static_expression::Pattern::Literal(static_expression::Literal::Text(
+                        alpha_source.slice(0, 1),
+                    )),
+                    body: static_expression::Spanned {
+                        span: (0..5).into(),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed {
+                                parts: vec![alpha_source.slice(0, 5)],
+                                referenced_span: None,
+                            },
+                        ),
+                    },
+                },
+                static_expression::Arm {
+                    pattern: static_expression::Pattern::Literal(static_expression::Literal::Text(
+                        beta_source.slice(0, 1),
+                    )),
+                    body: static_expression::Spanned {
+                        span: (0..4).into(),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed {
+                                parts: vec![beta_source.slice(0, 4)],
+                                referenced_span: None,
+                            },
+                        ),
+                    },
+                },
+            ],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    parameters: Arc::new(HashMap::from([
+                        ("alpha".to_owned(), alpha_actor.clone()),
+                        ("beta".to_owned(), beta_actor.clone()),
+                    ])),
+                    registry_scope_id: Some(scope_id),
+                    ..ActorContext::default()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: SourceCode::new("WHILE direct-state test".to_owned()),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("WHILE actor should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state WHILE actor should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let initial_json = block_on(
+            result_actor
+                .current_value()
+                .expect("WHILE actor should expose the initial matched value")
+                .to_json(),
+        );
+        assert_eq!(initial_json, serde_json::json!("alpha"));
+
+        alpha_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_direct_state.alpha.update",
+                None,
+                "test while actor direct-state alpha update",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "alpha-next",
+        ));
+
+        let alpha_updated_json = block_on(
+            result_actor
+                .current_value()
+                .expect("active WHILE arm should stay reactive")
+                .to_json(),
+        );
+        assert_eq!(alpha_updated_json, serde_json::json!("alpha-next"));
+
+        piped_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_direct_state.condition.switch",
+                None,
+                "test while actor direct-state condition switch",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "b",
+        ));
+
+        let switched_json = block_on(
+            result_actor
+                .current_value()
+                .expect("WHILE actor should switch to the new matched body")
+                .to_json(),
+        );
+        assert_eq!(switched_json, serde_json::json!("beta"));
+
+        alpha_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_direct_state.alpha.stale",
+                None,
+                "test while actor direct-state alpha stale",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "stale-alpha",
+        ));
+
+        let after_stale_json = block_on(
+            result_actor
+                .current_value()
+                .expect("stale old-arm updates should be ignored")
+                .to_json(),
+        );
+        assert_eq!(after_stale_json, serde_json::json!("beta"));
+
+        beta_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_direct_state.beta.update",
+                None,
+                "test while actor direct-state beta update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta-next",
+        ));
+
+        let beta_updated_json = block_on(
+            result_actor
+                .current_value()
+                .expect("current WHILE arm should stay reactive")
+                .to_json(),
+        );
+        assert_eq!(beta_updated_json, serde_json::json!("beta-next"));
+    }
+
+    #[test]
+    fn while_actor_with_lazy_piped_input_switches_direct_state_matched_body_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let alpha_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        alpha_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_direct_state_lazy.alpha.initial",
+                None,
+                "test while actor direct-state lazy alpha initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "alpha",
+        ));
+        let beta_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        beta_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_direct_state_lazy.beta.initial",
+                None,
+                "test while actor direct-state lazy beta initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta",
+        ));
+
+        let (mut piped_tx, piped_rx) = mpsc::channel::<Value>(8);
+        let piped_actor = crate::engine::create_actor_lazy(
+            piped_rx,
+            boon::parser::PersistenceId::new(),
+            scope_id,
+        );
+        let baseline_async_source_count =
+            crate::engine::REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+        piped_tx
+            .try_send(crate::engine::Text::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.while_actor_direct_state_lazy.condition.initial",
+                    None,
+                    "test while actor direct-state lazy condition initial",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                "a",
+            ))
+            .expect("initial lazy WHILE condition should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let alpha_source = SourceCode::new("alpha".to_owned());
+        let beta_source = SourceCode::new("beta".to_owned());
+        let result_actor = super::build_while_actor(
+            vec![
+                static_expression::Arm {
+                    pattern: static_expression::Pattern::Literal(static_expression::Literal::Text(
+                        alpha_source.slice(0, 1),
+                    )),
+                    body: static_expression::Spanned {
+                        span: (0..5).into(),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed {
+                                parts: vec![alpha_source.slice(0, 5)],
+                                referenced_span: None,
+                            },
+                        ),
+                    },
+                },
+                static_expression::Arm {
+                    pattern: static_expression::Pattern::Literal(static_expression::Literal::Text(
+                        beta_source.slice(0, 1),
+                    )),
+                    body: static_expression::Spanned {
+                        span: (0..4).into(),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed {
+                                parts: vec![beta_source.slice(0, 4)],
+                                referenced_span: None,
+                            },
+                        ),
+                    },
+                },
+            ],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    parameters: Arc::new(HashMap::from([
+                        ("alpha".to_owned(), alpha_actor.clone()),
+                        ("beta".to_owned(), beta_actor.clone()),
+                    ])),
+                    registry_scope_id: Some(scope_id),
+                    ..ActorContext::default()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: SourceCode::new("WHILE lazy direct-state test".to_owned()),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("lazy-piped WHILE actor should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 1,
+                "lazy-piped direct-state WHILE actor should only need the first-demand lazy source task"
+            );
+        });
+
+        crate::engine::poll_test_async_source_tasks();
+
+        let initial_json = block_on(
+            result_actor
+                .current_value()
+                .expect("lazy WHILE actor should expose the initial matched value")
+                .to_json(),
+        );
+        assert_eq!(initial_json, serde_json::json!("alpha"));
+
+        alpha_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_direct_state_lazy.alpha.update",
+                None,
+                "test while actor direct-state lazy alpha update",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "alpha-next",
+        ));
+
+        let alpha_updated_json = block_on(
+            result_actor
+                .current_value()
+                .expect("lazy active WHILE arm should stay reactive")
+                .to_json(),
+        );
+        assert_eq!(alpha_updated_json, serde_json::json!("alpha-next"));
+
+        piped_tx
+            .try_send(crate::engine::Text::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.while_actor_direct_state_lazy.condition.switch",
+                    None,
+                    "test while actor direct-state lazy condition switch",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                "b",
+            ))
+            .expect("switch lazy WHILE condition should enqueue");
+        crate::engine::poll_test_async_source_tasks();
+
+        let switched_json = block_on(
+            result_actor
+                .current_value()
+                .expect("lazy WHILE actor should switch to the new matched body")
+                .to_json(),
+        );
+        assert_eq!(switched_json, serde_json::json!("beta"));
+
+        alpha_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_direct_state_lazy.alpha.stale",
+                None,
+                "test while actor direct-state lazy alpha stale",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            "stale-alpha",
+        ));
+
+        let after_stale_json = block_on(
+            result_actor
+                .current_value()
+                .expect("lazy stale old-arm updates should be ignored")
+                .to_json(),
+        );
+        assert_eq!(after_stale_json, serde_json::json!("beta"));
+
+        beta_actor.store_value_directly(crate::engine::Text::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_direct_state_lazy.beta.update",
+                None,
+                "test while actor direct-state lazy beta update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            "beta-next",
+        ));
+
+        let beta_updated_json = block_on(
+            result_actor
+                .current_value()
+                .expect("lazy current WHILE arm should stay reactive")
+                .to_json(),
+        );
+        assert_eq!(beta_updated_json, serde_json::json!("beta-next"));
+    }
+
+    #[test]
+    fn then_actor_with_user_defined_function_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, expressions) = parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let body_source = SourceCode::new("rounded".to_owned());
+        let result_actor = super::build_then_actor(
+            static_expression::Spanned {
+                span: (0..7).into(),
+                persistence: Some(boon::parser::Persistence {
+                    id: boon::parser::PersistenceId::new(),
+                    status: boon::parser::PersistenceStatus::NewOrChanged,
+                }),
+                node: static_expression::Expression::FunctionCall {
+                    path: vec![body_source.slice(0, 7)],
+                    arguments: vec![],
+                },
+            },
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("THEN actor with user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "THEN with user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_user_defined_direct_state.update",
+                None,
+                "test then actor user-defined direct-state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::Number(number, _) = result_actor
+            .current_value()
+            .expect("THEN actor with user-defined direct body should expose the rounded value")
+        else {
+            panic!("THEN actor with user-defined direct body should resolve to a number");
+        };
+        assert_eq!(number.number(), 3.0);
+    }
+
+    #[test]
+    fn when_actor_with_user_defined_function_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, expressions) = parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_user_defined_direct_state.initial",
+                None,
+                "test when actor user-defined direct-state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+
+        let name_source = SourceCode::new("roundedn".to_owned());
+        let result_actor = super::build_when_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: name_source.slice(7, 8),
+                },
+                body: static_expression::Spanned {
+                    span: (0..7).into(),
+                    persistence: Some(boon::parser::Persistence {
+                        id: boon::parser::PersistenceId::new(),
+                        status: boon::parser::PersistenceStatus::NewOrChanged,
+                    }),
+                    node: static_expression::Expression::FunctionCall {
+                        path: vec![name_source.slice(0, 7)],
+                        arguments: vec![],
+                    },
+                },
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: name_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("WHEN actor with user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHEN with user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let Value::Number(initial, _) = result_actor.current_value().expect(
+            "WHEN actor with user-defined direct body should expose the initial rounded value",
+        ) else {
+            panic!("WHEN actor with user-defined direct body should resolve to a number");
+        };
+        assert_eq!(initial.number(), 1.0);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_user_defined_direct_state.update",
+                None,
+                "test when actor user-defined direct-state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::Number(updated, _) = result_actor
+            .current_value()
+            .expect("WHEN actor with user-defined direct body should update after source changes")
+        else {
+            panic!("WHEN actor with user-defined direct body should stay a number");
+        };
+        assert_eq!(updated.number(), 3.0);
+    }
+
+    #[test]
+    fn while_actor_with_user_defined_function_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, expressions) = parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_user_defined_direct_state.initial",
+                None,
+                "test while actor user-defined direct-state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+
+        let name_source = SourceCode::new("roundedn".to_owned());
+        let result_actor = super::build_while_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: name_source.slice(7, 8),
+                },
+                body: static_expression::Spanned {
+                    span: (0..7).into(),
+                    persistence: Some(boon::parser::Persistence {
+                        id: boon::parser::PersistenceId::new(),
+                        status: boon::parser::PersistenceStatus::NewOrChanged,
+                    }),
+                    node: static_expression::Expression::FunctionCall {
+                        path: vec![name_source.slice(0, 7)],
+                        arguments: vec![],
+                    },
+                },
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: name_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("WHILE actor with user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHILE with user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let Value::Number(initial, _) = result_actor.current_value().expect(
+            "WHILE actor with user-defined direct body should expose the initial rounded value",
+        ) else {
+            panic!("WHILE actor with user-defined direct body should resolve to a number");
+        };
+        assert_eq!(initial.number(), 1.0);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_user_defined_direct_state.update",
+                None,
+                "test while actor user-defined direct-state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::Number(updated, _) = result_actor
+            .current_value()
+            .expect("WHILE actor with user-defined direct body should update after source changes")
+        else {
+            panic!("WHILE actor with user-defined direct body should stay a number");
+        };
+        assert_eq!(updated.number(), 3.0);
+    }
+
+    #[test]
+    fn then_actor_with_piped_user_defined_function_body_uses_direct_state_path_without_wrapper_task()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, function_expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = function_expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let (body_source, mut body_expressions) = parse_static_program("rounded() |> Math/round()");
+        let body = body_expressions
+            .drain(..)
+            .next()
+            .expect("piped user-defined THEN body should parse");
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let result_actor = super::build_then_actor(
+            body,
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("THEN actor with piped user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "THEN with piped user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_piped_user_defined_direct_state.update",
+                None,
+                "test then actor piped user-defined direct-state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::Number(number, _) = result_actor.current_value().expect(
+            "THEN actor with piped user-defined direct body should expose the rounded value",
+        ) else {
+            panic!("THEN actor with piped user-defined direct body should resolve to a number");
+        };
+        assert_eq!(number.number(), 3.0);
+    }
+
+    #[test]
+    fn when_actor_with_piped_user_defined_function_body_uses_direct_state_path_without_wrapper_task()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, function_expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = function_expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let (body_source, mut body_expressions) = parse_static_program("rounded() |> Math/round()");
+        let body = body_expressions
+            .drain(..)
+            .next()
+            .expect("piped user-defined WHEN body should parse");
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_piped_user_defined_direct_state.initial",
+                None,
+                "test when actor piped user-defined direct-state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+
+        let name_source = SourceCode::new("value".to_owned());
+        let result_actor = super::build_when_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: name_source.slice(0, 5),
+                },
+                body,
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("WHEN actor with piped user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHEN with piped user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let Value::Number(initial, _) = result_actor.current_value().expect(
+            "WHEN actor with piped user-defined direct body should expose the initial rounded value",
+        ) else {
+            panic!("WHEN actor with piped user-defined direct body should resolve to a number");
+        };
+        assert_eq!(initial.number(), 1.0);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_piped_user_defined_direct_state.update",
+                None,
+                "test when actor piped user-defined direct-state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::Number(updated, _) = result_actor.current_value().expect(
+            "WHEN actor with piped user-defined direct body should update after source changes",
+        ) else {
+            panic!("WHEN actor with piped user-defined direct body should stay a number");
+        };
+        assert_eq!(updated.number(), 3.0);
+    }
+
+    #[test]
+    fn while_actor_with_piped_user_defined_function_body_uses_direct_state_path_without_wrapper_task()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, function_expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = function_expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let (body_source, mut body_expressions) = parse_static_program("rounded() |> Math/round()");
+        let body = body_expressions
+            .drain(..)
+            .next()
+            .expect("piped user-defined WHILE body should parse");
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_piped_user_defined_direct_state.initial",
+                None,
+                "test while actor piped user-defined direct-state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+
+        let name_source = SourceCode::new("value".to_owned());
+        let result_actor = super::build_while_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: name_source.slice(0, 5),
+                },
+                body,
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("WHILE actor with piped user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHILE with piped user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let Value::Number(initial, _) = result_actor.current_value().expect(
+            "WHILE actor with piped user-defined direct body should expose the initial rounded value",
+        ) else {
+            panic!("WHILE actor with piped user-defined direct body should resolve to a number");
+        };
+        assert_eq!(initial.number(), 1.0);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_piped_user_defined_direct_state.update",
+                None,
+                "test while actor piped user-defined direct-state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::Number(updated, _) = result_actor.current_value().expect(
+            "WHILE actor with piped user-defined direct body should update after source changes",
+        ) else {
+            panic!("WHILE actor with piped user-defined direct body should stay a number");
+        };
+        assert_eq!(updated.number(), 3.0);
+    }
+
+    #[test]
+    fn then_actor_with_block_user_defined_function_body_uses_direct_state_path_without_wrapper_task()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, function_expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = function_expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let body_source = SourceCode::new("temp = rounded(); temp".to_owned());
+        let body = static_expression::Spanned {
+            span: span_at(body_source.len()),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::Block {
+                variables: vec![static_expression::Spanned {
+                    span: (0..4).into(),
+                    persistence: None,
+                    node: static_expression::Variable {
+                        name: body_source.slice(0, 4),
+                        is_referenced: true,
+                        value_changed: false,
+                        value: static_expression::Spanned {
+                            span: (7..16).into(),
+                            persistence: None,
+                            node: static_expression::Expression::FunctionCall {
+                                path: vec![body_source.slice(7, 14)],
+                                arguments: vec![],
+                            },
+                        },
+                    },
+                }],
+                output: Box::new(static_expression::Spanned {
+                    span: (18..22).into(),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithoutPassed {
+                            parts: vec![body_source.slice(18, 22)],
+                            referenced_span: None,
+                        },
+                    ),
+                }),
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let result_actor = super::build_then_actor(
+            body,
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("THEN actor with block user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "THEN with block user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_block_user_defined_direct_state.update",
+                None,
+                "test then actor block user-defined direct-state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::Number(number, _) = result_actor.current_value().expect(
+            "THEN actor with block user-defined direct body should expose the rounded value",
+        ) else {
+            panic!("THEN actor with block user-defined direct body should resolve to a number");
+        };
+        assert_eq!(number.number(), 3.0);
+    }
+
+    #[test]
+    fn then_actor_with_list_user_defined_function_body_uses_direct_state_path_without_wrapper_task()
+    {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, function_expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = function_expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let body_source = SourceCode::new("rounded".to_owned());
+        let function_call = || static_expression::Spanned {
+            span: (0..7).into(),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::FunctionCall {
+                path: vec![body_source.slice(0, 7)],
+                arguments: vec![],
+            },
+        };
+        let body = static_expression::Spanned {
+            span: span_at(body_source.len()),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::List {
+                items: vec![function_call(), function_call()],
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let result_actor = super::build_then_actor(
+            body,
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("THEN actor with list user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "THEN with list user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_list_user_defined_direct_state.update",
+                None,
+                "test then actor list user-defined direct-state update",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::List(list, _) = result_actor
+            .current_value()
+            .expect("THEN actor with list user-defined direct body should expose a list")
+        else {
+            panic!("THEN actor with list user-defined direct body should resolve to a list");
+        };
+        let values = block_on(list.snapshot())
+            .into_iter()
+            .map(|(_, item)| {
+                let Value::Number(number, _) = item
+                    .current_value()
+                    .expect("THEN list item should expose a number")
+                else {
+                    panic!("THEN list item should resolve to a number");
+                };
+                number.number()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![3.0, 3.0]);
+    }
+
+    #[test]
+    fn when_actor_with_list_user_defined_function_body_uses_direct_state_path_without_wrapper_task()
+    {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, function_expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = function_expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let body_source = SourceCode::new("roundedvalue".to_owned());
+        let function_call = || static_expression::Spanned {
+            span: (0..7).into(),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::FunctionCall {
+                path: vec![body_source.slice(0, 7)],
+                arguments: vec![],
+            },
+        };
+        let body = static_expression::Spanned {
+            span: span_at(body_source.len()),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::List {
+                items: vec![function_call(), function_call()],
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_list_user_defined_direct_state.initial",
+                None,
+                "test when actor list user-defined direct-state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+
+        let result_actor = super::build_when_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: body_source.slice(7, 12),
+                },
+                body,
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("WHEN actor with list user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHEN with list user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let Value::List(initial_list, _) = result_actor
+            .current_value()
+            .expect("WHEN actor with list user-defined direct body should expose a list")
+        else {
+            panic!("WHEN actor with list user-defined direct body should resolve to a list");
+        };
+        let initial_values = block_on(initial_list.snapshot())
+            .into_iter()
+            .map(|(_, item)| {
+                let Value::Number(number, _) = item
+                    .current_value()
+                    .expect("WHEN list item should expose a number")
+                else {
+                    panic!("WHEN list item should resolve to a number");
+                };
+                number.number()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(initial_values, vec![1.0, 1.0]);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_list_user_defined_direct_state.update",
+                None,
+                "test when actor list user-defined direct-state update",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::List(updated_list, _) = result_actor
+            .current_value()
+            .expect("WHEN actor with list user-defined direct body should update its list")
+        else {
+            panic!("WHEN actor with list user-defined direct body should stay a list");
+        };
+        let updated_values = block_on(updated_list.snapshot())
+            .into_iter()
+            .map(|(_, item)| {
+                let Value::Number(number, _) = item
+                    .current_value()
+                    .expect("WHEN updated list item should expose a number")
+                else {
+                    panic!("WHEN updated list item should resolve to a number");
+                };
+                number.number()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updated_values, vec![3.0, 3.0]);
+    }
+
+    #[test]
+    fn while_actor_with_list_user_defined_function_body_uses_direct_state_path_without_wrapper_task()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, function_expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = function_expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let body_source = SourceCode::new("roundedvalue".to_owned());
+        let function_call = || static_expression::Spanned {
+            span: (0..7).into(),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::FunctionCall {
+                path: vec![body_source.slice(0, 7)],
+                arguments: vec![],
+            },
+        };
+        let body = static_expression::Spanned {
+            span: span_at(body_source.len()),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::List {
+                items: vec![function_call(), function_call()],
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_list_user_defined_direct_state.initial",
+                None,
+                "test while actor list user-defined direct-state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+
+        let result_actor = super::build_while_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: body_source.slice(7, 12),
+                },
+                body,
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("WHILE actor with list user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHILE with list user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let Value::List(initial_list, _) = result_actor
+            .current_value()
+            .expect("WHILE actor with list user-defined direct body should expose a list")
+        else {
+            panic!("WHILE actor with list user-defined direct body should resolve to a list");
+        };
+        let initial_values = block_on(initial_list.snapshot())
+            .into_iter()
+            .map(|(_, item)| {
+                let Value::Number(number, _) = item
+                    .current_value()
+                    .expect("WHILE list item should expose a number")
+                else {
+                    panic!("WHILE list item should resolve to a number");
+                };
+                number.number()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(initial_values, vec![1.0, 1.0]);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_list_user_defined_direct_state.update",
+                None,
+                "test while actor list user-defined direct-state update",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::List(updated_list, _) = result_actor
+            .current_value()
+            .expect("WHILE actor with list user-defined direct body should update its list")
+        else {
+            panic!("WHILE actor with list user-defined direct body should stay a list");
+        };
+        let updated_values = block_on(updated_list.snapshot())
+            .into_iter()
+            .map(|(_, item)| {
+                let Value::Number(number, _) = item
+                    .current_value()
+                    .expect("WHILE updated list item should expose a number")
+                else {
+                    panic!("WHILE updated list item should resolve to a number");
+                };
+                number.number()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updated_values, vec![3.0, 3.0]);
+    }
+
+    #[test]
+    fn then_actor_with_object_user_defined_function_body_uses_direct_state_path_without_wrapper_task()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, function_expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = function_expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let body_source = SourceCode::new("rounded echoed object".to_owned());
+        let rounded_span = span_at(7);
+        let echoed_span = (8..14).into();
+        let body = static_expression::Spanned {
+            span: span_at(body_source.len()),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::Object(static_expression::Object {
+                variables: vec![
+                    static_expression::Spanned {
+                        span: rounded_span,
+                        persistence: Some(boon::parser::Persistence {
+                            id: boon::parser::PersistenceId::new(),
+                            status: boon::parser::PersistenceStatus::NewOrChanged,
+                        }),
+                        node: static_expression::Variable {
+                            name: body_source.slice(0, 7),
+                            is_referenced: true,
+                            value_changed: false,
+                            value: static_expression::Spanned {
+                                span: rounded_span,
+                                persistence: Some(boon::parser::Persistence {
+                                    id: boon::parser::PersistenceId::new(),
+                                    status: boon::parser::PersistenceStatus::NewOrChanged,
+                                }),
+                                node: static_expression::Expression::FunctionCall {
+                                    path: vec![body_source.slice(0, 7)],
+                                    arguments: vec![],
+                                },
+                            },
+                        },
+                    },
+                    static_expression::Spanned {
+                        span: echoed_span,
+                        persistence: Some(boon::parser::Persistence {
+                            id: boon::parser::PersistenceId::new(),
+                            status: boon::parser::PersistenceStatus::NewOrChanged,
+                        }),
+                        node: static_expression::Variable {
+                            name: body_source.slice(8, 14),
+                            is_referenced: false,
+                            value_changed: false,
+                            value: static_expression::Spanned {
+                                span: rounded_span,
+                                persistence: None,
+                                node: static_expression::Expression::Alias(
+                                    static_expression::Alias::WithoutPassed {
+                                        parts: vec![body_source.slice(0, 7)],
+                                        referenced_span: Some(rounded_span),
+                                    },
+                                ),
+                            },
+                        },
+                    },
+                ],
+            }),
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let result_actor = super::build_then_actor(
+            body,
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("THEN actor with object user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "THEN with object user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_object_user_defined_direct_state.update",
+                None,
+                "test then actor object user-defined direct-state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::Object(object, _) = result_actor
+            .current_value()
+            .expect("THEN actor with object user-defined direct body should expose an object")
+        else {
+            panic!("THEN actor with object user-defined direct body should resolve to an object");
+        };
+        let Value::Number(rounded, _) = object
+            .expect_variable("rounded")
+            .value_actor()
+            .current_value()
+            .expect("rounded field should expose a number")
+        else {
+            panic!("rounded field should resolve to a number");
+        };
+        let Value::Number(echoed, _) = object
+            .expect_variable("echoed")
+            .value_actor()
+            .current_value()
+            .expect("echoed field should expose a number")
+        else {
+            panic!("echoed field should resolve to a number");
+        };
+        assert_eq!(rounded.number(), 3.0);
+        assert_eq!(echoed.number(), 3.0);
+    }
+
+    #[test]
+    fn when_actor_with_tagged_object_user_defined_function_body_uses_direct_state_path_without_wrapper_task()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, function_expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = function_expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let body_source = SourceCode::new("rounded echoed Number value".to_owned());
+        let rounded_span = span_at(7);
+        let echoed_span = (8..14).into();
+        let body = static_expression::Spanned {
+            span: span_at(body_source.len()),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::TaggedObject {
+                tag: body_source.slice(15, 21),
+                object: static_expression::Object {
+                    variables: vec![
+                        static_expression::Spanned {
+                            span: rounded_span,
+                            persistence: Some(boon::parser::Persistence {
+                                id: boon::parser::PersistenceId::new(),
+                                status: boon::parser::PersistenceStatus::NewOrChanged,
+                            }),
+                            node: static_expression::Variable {
+                                name: body_source.slice(0, 7),
+                                is_referenced: true,
+                                value_changed: false,
+                                value: static_expression::Spanned {
+                                    span: rounded_span,
+                                    persistence: Some(boon::parser::Persistence {
+                                        id: boon::parser::PersistenceId::new(),
+                                        status: boon::parser::PersistenceStatus::NewOrChanged,
+                                    }),
+                                    node: static_expression::Expression::FunctionCall {
+                                        path: vec![body_source.slice(0, 7)],
+                                        arguments: vec![],
+                                    },
+                                },
+                            },
+                        },
+                        static_expression::Spanned {
+                            span: echoed_span,
+                            persistence: Some(boon::parser::Persistence {
+                                id: boon::parser::PersistenceId::new(),
+                                status: boon::parser::PersistenceStatus::NewOrChanged,
+                            }),
+                            node: static_expression::Variable {
+                                name: body_source.slice(8, 14),
+                                is_referenced: false,
+                                value_changed: false,
+                                value: static_expression::Spanned {
+                                    span: rounded_span,
+                                    persistence: None,
+                                    node: static_expression::Expression::Alias(
+                                        static_expression::Alias::WithoutPassed {
+                                            parts: vec![body_source.slice(0, 7)],
+                                            referenced_span: Some(rounded_span),
+                                        },
+                                    ),
+                                },
+                            },
+                        },
+                    ],
+                },
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_tagged_object_user_defined_direct_state.initial",
+                None,
+                "test when actor tagged object user-defined direct-state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+
+        let result_actor = super::build_when_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: body_source.slice(22, 27),
+                },
+                body,
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("WHEN actor with tagged object user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHEN with tagged object user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let Value::TaggedObject(initial, _) = result_actor.current_value().expect(
+            "WHEN actor with tagged object user-defined direct body should expose a tagged object",
+        ) else {
+            panic!(
+                "WHEN actor with tagged object user-defined direct body should resolve to a tagged object"
+            );
+        };
+        assert_eq!(initial.tag(), "Number");
+        let Value::Number(initial_rounded, _) = initial
+            .expect_variable("rounded")
+            .value_actor()
+            .current_value()
+            .expect("initial rounded field should expose a number")
+        else {
+            panic!("initial rounded field should resolve to a number");
+        };
+        assert_eq!(initial_rounded.number(), 1.0);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_tagged_object_user_defined_direct_state.update",
+                None,
+                "test when actor tagged object user-defined direct-state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::TaggedObject(updated, _) = result_actor.current_value().expect(
+            "WHEN actor with tagged object user-defined direct body should update its tagged object",
+        ) else {
+            panic!("WHEN actor with tagged object user-defined direct body should stay a tagged object");
+        };
+        let Value::Number(updated_rounded, _) = updated
+            .expect_variable("rounded")
+            .value_actor()
+            .current_value()
+            .expect("updated rounded field should expose a number")
+        else {
+            panic!("updated rounded field should resolve to a number");
+        };
+        let Value::Number(updated_echoed, _) = updated
+            .expect_variable("echoed")
+            .value_actor()
+            .current_value()
+            .expect("updated echoed field should expose a number")
+        else {
+            panic!("updated echoed field should resolve to a number");
+        };
+        assert_eq!(updated_rounded.number(), 3.0);
+        assert_eq!(updated_echoed.number(), 3.0);
+    }
+
+    #[test]
+    fn while_actor_with_tagged_object_user_defined_function_body_uses_direct_state_path_without_wrapper_task()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, function_expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = function_expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let body_source = SourceCode::new("rounded echoed Number value".to_owned());
+        let rounded_span = span_at(7);
+        let echoed_span = (8..14).into();
+        let body = static_expression::Spanned {
+            span: span_at(body_source.len()),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::TaggedObject {
+                tag: body_source.slice(15, 21),
+                object: static_expression::Object {
+                    variables: vec![
+                        static_expression::Spanned {
+                            span: rounded_span,
+                            persistence: Some(boon::parser::Persistence {
+                                id: boon::parser::PersistenceId::new(),
+                                status: boon::parser::PersistenceStatus::NewOrChanged,
+                            }),
+                            node: static_expression::Variable {
+                                name: body_source.slice(0, 7),
+                                is_referenced: true,
+                                value_changed: false,
+                                value: static_expression::Spanned {
+                                    span: rounded_span,
+                                    persistence: Some(boon::parser::Persistence {
+                                        id: boon::parser::PersistenceId::new(),
+                                        status: boon::parser::PersistenceStatus::NewOrChanged,
+                                    }),
+                                    node: static_expression::Expression::FunctionCall {
+                                        path: vec![body_source.slice(0, 7)],
+                                        arguments: vec![],
+                                    },
+                                },
+                            },
+                        },
+                        static_expression::Spanned {
+                            span: echoed_span,
+                            persistence: Some(boon::parser::Persistence {
+                                id: boon::parser::PersistenceId::new(),
+                                status: boon::parser::PersistenceStatus::NewOrChanged,
+                            }),
+                            node: static_expression::Variable {
+                                name: body_source.slice(8, 14),
+                                is_referenced: false,
+                                value_changed: false,
+                                value: static_expression::Spanned {
+                                    span: rounded_span,
+                                    persistence: None,
+                                    node: static_expression::Expression::Alias(
+                                        static_expression::Alias::WithoutPassed {
+                                            parts: vec![body_source.slice(0, 7)],
+                                            referenced_span: Some(rounded_span),
+                                        },
+                                    ),
+                                },
+                            },
+                        },
+                    ],
+                },
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_tagged_object_user_defined_direct_state.initial",
+                None,
+                "test while actor tagged object user-defined direct-state initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+
+        let result_actor = super::build_while_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: body_source.slice(22, 27),
+                },
+                body,
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("WHILE actor with tagged object user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHILE with tagged object user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let Value::TaggedObject(initial, _) = result_actor.current_value().expect(
+            "WHILE actor with tagged object user-defined direct body should expose a tagged object",
+        ) else {
+            panic!(
+                "WHILE actor with tagged object user-defined direct body should resolve to a tagged object"
+            );
+        };
+        let Value::Number(initial_echoed, _) = initial
+            .expect_variable("echoed")
+            .value_actor()
+            .current_value()
+            .expect("initial echoed field should expose a number")
+        else {
+            panic!("initial echoed field should resolve to a number");
+        };
+        assert_eq!(initial_echoed.number(), 1.0);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_tagged_object_user_defined_direct_state.update",
+                None,
+                "test while actor tagged object user-defined direct-state update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let Value::TaggedObject(updated, _) = result_actor.current_value().expect(
+            "WHILE actor with tagged object user-defined direct body should update its tagged object",
+        ) else {
+            panic!("WHILE actor with tagged object user-defined direct body should stay a tagged object");
+        };
+        let Value::Number(updated_rounded, _) = updated
+            .expect_variable("rounded")
+            .value_actor()
+            .current_value()
+            .expect("updated rounded field should expose a number")
+        else {
+            panic!("updated rounded field should resolve to a number");
+        };
+        let Value::Number(updated_echoed, _) = updated
+            .expect_variable("echoed")
+            .value_actor()
+            .current_value()
+            .expect("updated echoed field should expose a number")
+        else {
+            panic!("updated echoed field should resolve to a number");
+        };
+        assert_eq!(updated_rounded.number(), 3.0);
+        assert_eq!(updated_echoed.number(), 3.0);
+    }
+
+    #[test]
+    fn then_actor_with_spread_object_user_defined_function_body_uses_direct_state_path_without_wrapper_task()
+     {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let (_, function_expressions) =
+            parse_static_program("FUNCTION rounded(x) { x |> Math/round() }");
+        let function_def = function_expressions
+            .into_iter()
+            .find_map(|expr| match expr.node {
+                static_expression::Expression::Function {
+                    name,
+                    parameters,
+                    body,
+                } if name.to_string() == "rounded" => Some(super::StaticFunctionDefinition {
+                    parameters: parameters
+                        .into_iter()
+                        .map(|param| param.node.to_string())
+                        .collect(),
+                    body: *body,
+                    module_name: None,
+                }),
+                _ => None,
+            })
+            .expect("rounded function should parse");
+        let registry_snapshot = Arc::new(HashMap::from([(String::from("rounded"), function_def)]));
+
+        let body_source = SourceCode::new("input rounded echoed Number value".to_owned());
+        let spread_span: boon::parser::Span = (0..0).into();
+        let rounded_span: boon::parser::Span = (6..13).into();
+        let echoed_span: boon::parser::Span = (14..20).into();
+        let body = static_expression::Spanned {
+            span: span_at(body_source.len()),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::Object(static_expression::Object {
+                variables: vec![
+                    static_expression::Spanned {
+                        span: spread_span,
+                        persistence: None,
+                        node: static_expression::Variable {
+                            name: body_source.slice(0, 0),
+                            is_referenced: false,
+                            value_changed: false,
+                            value: static_expression::Spanned {
+                                span: spread_span,
+                                persistence: None,
+                                node: static_expression::Expression::Spread {
+                                    value: Box::new(static_expression::Spanned {
+                                        span: spread_span,
+                                        persistence: None,
+                                        node: static_expression::Expression::Alias(
+                                            static_expression::Alias::WithPassed {
+                                                extra_parts: vec![],
+                                            },
+                                        ),
+                                    }),
+                                },
+                            },
+                        },
+                    },
+                    static_expression::Spanned {
+                        span: rounded_span,
+                        persistence: Some(boon::parser::Persistence {
+                            id: boon::parser::PersistenceId::new(),
+                            status: boon::parser::PersistenceStatus::NewOrChanged,
+                        }),
+                        node: static_expression::Variable {
+                            name: body_source.slice(6, 13),
+                            is_referenced: true,
+                            value_changed: false,
+                            value: static_expression::Spanned {
+                                span: rounded_span,
+                                persistence: None,
+                                node: static_expression::Expression::Pipe {
+                                    from: Box::new(static_expression::Spanned {
+                                        span: (0..5).into(),
+                                        persistence: None,
+                                        node: static_expression::Expression::Alias(
+                                            static_expression::Alias::WithPassed {
+                                                extra_parts: vec![body_source.slice(0, 5)],
+                                            },
+                                        ),
+                                    }),
+                                    to: Box::new(static_expression::Spanned {
+                                        span: rounded_span,
+                                        persistence: None,
+                                        node: static_expression::Expression::FunctionCall {
+                                            path: vec![body_source.slice(6, 13)],
+                                            arguments: vec![],
+                                        },
+                                    }),
+                                },
+                            },
+                        },
+                    },
+                    static_expression::Spanned {
+                        span: echoed_span,
+                        persistence: Some(boon::parser::Persistence {
+                            id: boon::parser::PersistenceId::new(),
+                            status: boon::parser::PersistenceStatus::NewOrChanged,
+                        }),
+                        node: static_expression::Variable {
+                            name: body_source.slice(14, 20),
+                            is_referenced: false,
+                            value_changed: false,
+                            value: static_expression::Spanned {
+                                span: rounded_span,
+                                persistence: None,
+                                node: static_expression::Expression::Alias(
+                                    static_expression::Alias::WithoutPassed {
+                                        parts: vec![body_source.slice(6, 13)],
+                                        referenced_span: Some(rounded_span),
+                                    },
+                                ),
+                            },
+                        },
+                    },
+                ],
+            }),
+        };
+
+        let input_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new("test.spread_then.input", None, "test spread input"),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+        let echoed_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        echoed_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.spread_then.echoed",
+                None,
+                "test spread echoed",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            99.0,
+        ));
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(Object::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.spread_then.object",
+                None,
+                "test spread object",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            [
+                Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        "test.spread_then.input_var",
+                        None,
+                        "test spread input var",
+                    ),
+                    "input",
+                    input_actor.clone(),
+                    boon::parser::PersistenceId::new(),
+                    actor_context.scope.clone(),
+                ),
+                Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        "test.spread_then.echoed_var",
+                        None,
+                        "test spread echoed var",
+                    ),
+                    "echoed",
+                    echoed_actor.clone(),
+                    boon::parser::PersistenceId::new(),
+                    actor_context.scope.clone(),
+                ),
+            ],
+        ));
+
+        let result_actor = super::build_then_actor(
+            body,
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            registry_snapshot,
+        )
+        .expect("THEN actor with spread object user-defined direct body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "THEN with spread object user-defined direct body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        input_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.spread_then.input_update",
+                None,
+                "test spread input update",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+        piped_actor.store_value_directly(Object::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.spread_then.object_update",
+                None,
+                "test spread object update",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            [
+                Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        "test.spread_then.input_var_update",
+                        None,
+                        "test spread input var update",
+                    ),
+                    "input",
+                    input_actor.clone(),
+                    boon::parser::PersistenceId::new(),
+                    actor_context.scope.clone(),
+                ),
+                Variable::new_arc(
+                    crate::engine::ConstructInfo::new(
+                        "test.spread_then.echoed_var_update",
+                        None,
+                        "test spread echoed var update",
+                    ),
+                    "echoed",
+                    echoed_actor.clone(),
+                    boon::parser::PersistenceId::new(),
+                    actor_context.scope.clone(),
+                ),
+            ],
+        ));
+
+        let Value::Object(object, _) = result_actor
+            .current_value()
+            .expect("THEN spread object body should expose an object")
+        else {
+            panic!("THEN spread object body should resolve to an object");
+        };
+        let Value::Number(input, _) = object
+            .expect_variable("input")
+            .value_actor()
+            .current_value()
+            .expect("spread input field should expose a number")
+        else {
+            panic!("spread input field should resolve to a number");
+        };
+        let Value::Number(echoed, _) = object
+            .expect_variable("echoed")
+            .value_actor()
+            .current_value()
+            .expect("spread echoed field should expose a number")
+        else {
+            panic!("spread echoed field should resolve to a number");
+        };
+        let Value::Number(rounded, _) = object
+            .expect_variable("rounded")
+            .value_actor()
+            .current_value()
+            .expect("spread rounded field should expose a number")
+        else {
+            panic!("spread rounded field should resolve to a number");
+        };
+        assert_eq!(input.number(), 2.8);
+        assert_eq!(rounded.number(), 3.0);
+        assert_eq!(echoed.number(), 3.0);
     }
 
     #[test]
@@ -11567,6 +29464,1772 @@ all_completed: completed_todos_count == 4
         assert_eq!(updated_formula_json, json!("7"));
         assert_eq!(initial_mapped_json, json!(["5", "15"]));
         assert_eq!(updated_mapped_json, json!(["7", "17"]));
+    }
+
+    #[test]
+    fn then_actor_with_nested_then_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let body_source = SourceCode::new("Math round value".to_owned());
+        let nested_body = static_expression::Spanned {
+            span: (0..10).into(),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::Then {
+                body: Box::new(static_expression::Spanned {
+                    span: (0..10).into(),
+                    persistence: Some(boon::parser::Persistence {
+                        id: boon::parser::PersistenceId::new(),
+                        status: boon::parser::PersistenceStatus::NewOrChanged,
+                    }),
+                    node: static_expression::Expression::Pipe {
+                        from: Box::new(static_expression::Spanned {
+                            span: (11..16).into(),
+                            persistence: None,
+                            node: static_expression::Expression::Alias(
+                                static_expression::Alias::WithPassed {
+                                    extra_parts: vec![],
+                                },
+                            ),
+                        }),
+                        to: Box::new(static_expression::Spanned {
+                            span: (0..10).into(),
+                            persistence: None,
+                            node: static_expression::Expression::FunctionCall {
+                                path: vec![body_source.slice(0, 4), body_source.slice(5, 10)],
+                                arguments: vec![],
+                            },
+                        }),
+                    },
+                }),
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let result_actor = super::build_then_actor(
+            nested_body,
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("THEN actor with nested THEN body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "nested THEN body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_nested_then.initial",
+                None,
+                "test then actor nested THEN initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+        let Value::Number(initial, _) = result_actor
+            .current_value()
+            .expect("nested THEN body should expose the rounded value")
+        else {
+            panic!("nested THEN body should resolve to a number");
+        };
+        assert_eq!(initial.number(), 3.0);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_nested_then.update",
+                None,
+                "test then actor nested THEN update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+        let Value::Number(updated, _) = result_actor
+            .current_value()
+            .expect("nested THEN body should update after source changes")
+        else {
+            panic!("nested THEN body should stay a number");
+        };
+        assert_eq!(updated.number(), 1.0);
+    }
+
+    #[test]
+    fn then_actor_with_nested_when_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let body_source = SourceCode::new("Math round value".to_owned());
+        let nested_body = static_expression::Spanned {
+            span: (0..16).into(),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::When {
+                arms: vec![static_expression::Arm {
+                    pattern: static_expression::Pattern::Alias {
+                        name: body_source.slice(11, 16),
+                    },
+                    body: static_expression::Spanned {
+                        span: (0..10).into(),
+                        persistence: Some(boon::parser::Persistence {
+                            id: boon::parser::PersistenceId::new(),
+                            status: boon::parser::PersistenceStatus::NewOrChanged,
+                        }),
+                        node: static_expression::Expression::Pipe {
+                            from: Box::new(static_expression::Spanned {
+                                span: (11..16).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Alias(
+                                    static_expression::Alias::WithPassed {
+                                        extra_parts: vec![],
+                                    },
+                                ),
+                            }),
+                            to: Box::new(static_expression::Spanned {
+                                span: (0..10).into(),
+                                persistence: None,
+                                node: static_expression::Expression::FunctionCall {
+                                    path: vec![body_source.slice(0, 4), body_source.slice(5, 10)],
+                                    arguments: vec![],
+                                },
+                            }),
+                        },
+                    },
+                }],
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let result_actor = super::build_then_actor(
+            nested_body,
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("THEN actor with nested WHEN body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "nested WHEN body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_nested_when.initial",
+                None,
+                "test then actor nested WHEN initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+        let Value::Number(initial, _) = result_actor
+            .current_value()
+            .expect("nested WHEN body should expose the rounded value")
+        else {
+            panic!("nested WHEN body should resolve to a number");
+        };
+        assert_eq!(initial.number(), 3.0);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_nested_when.update",
+                None,
+                "test then actor nested WHEN update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+        let Value::Number(updated, _) = result_actor
+            .current_value()
+            .expect("nested WHEN body should update after source changes")
+        else {
+            panic!("nested WHEN body should stay a number");
+        };
+        assert_eq!(updated.number(), 1.0);
+    }
+
+    #[test]
+    fn then_actor_with_nested_while_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let body_source = SourceCode::new("Math round value".to_owned());
+        let nested_body = static_expression::Spanned {
+            span: (0..16).into(),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::While {
+                arms: vec![static_expression::Arm {
+                    pattern: static_expression::Pattern::Alias {
+                        name: body_source.slice(11, 16),
+                    },
+                    body: static_expression::Spanned {
+                        span: (0..10).into(),
+                        persistence: Some(boon::parser::Persistence {
+                            id: boon::parser::PersistenceId::new(),
+                            status: boon::parser::PersistenceStatus::NewOrChanged,
+                        }),
+                        node: static_expression::Expression::Pipe {
+                            from: Box::new(static_expression::Spanned {
+                                span: (11..16).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Alias(
+                                    static_expression::Alias::WithPassed {
+                                        extra_parts: vec![],
+                                    },
+                                ),
+                            }),
+                            to: Box::new(static_expression::Spanned {
+                                span: (0..10).into(),
+                                persistence: None,
+                                node: static_expression::Expression::FunctionCall {
+                                    path: vec![body_source.slice(0, 4), body_source.slice(5, 10)],
+                                    arguments: vec![],
+                                },
+                            }),
+                        },
+                    },
+                }],
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let result_actor = super::build_then_actor(
+            nested_body,
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("THEN actor with nested WHILE body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "nested WHILE body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_nested_while.initial",
+                None,
+                "test then actor nested WHILE initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+        let Value::Number(initial, _) = result_actor
+            .current_value()
+            .expect("nested WHILE body should expose the rounded value")
+        else {
+            panic!("nested WHILE body should resolve to a number");
+        };
+        assert_eq!(initial.number(), 3.0);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_nested_while.update",
+                None,
+                "test then actor nested WHILE update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+        let Value::Number(updated, _) = result_actor
+            .current_value()
+            .expect("nested WHILE body should update after source changes")
+        else {
+            panic!("nested WHILE body should stay a number");
+        };
+        assert_eq!(updated.number(), 1.0);
+    }
+
+    #[test]
+    fn then_actor_with_hold_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let body_source = SourceCode::new("state".to_owned());
+        let body = static_expression::Spanned {
+            span: span_at(body_source.len()),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::Hold {
+                state_param: body_source.slice(0, 5),
+                body: Box::new(static_expression::Spanned {
+                    span: (0..5).into(),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithoutPassed {
+                            parts: vec![body_source.slice(0, 5)],
+                            referenced_span: None,
+                        },
+                    ),
+                }),
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let result_actor = super::build_then_actor(
+            body,
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("THEN actor with HOLD body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "THEN with HOLD body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_hold_body.initial",
+                None,
+                "test then actor hold body initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+        let Value::Number(initial, _) = result_actor
+            .current_value()
+            .expect("THEN with HOLD body should expose the current input value")
+        else {
+            panic!("THEN with HOLD body should resolve to a number");
+        };
+        assert_eq!(initial.number(), 2.8);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_hold_body.update",
+                None,
+                "test then actor hold body update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+        let Value::Number(updated, _) = result_actor
+            .current_value()
+            .expect("THEN with HOLD body should update after source changes")
+        else {
+            panic!("THEN with HOLD body should stay a number");
+        };
+        assert_eq!(updated.number(), 1.2);
+    }
+
+    #[test]
+    fn when_actor_with_hold_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let body_source = SourceCode::new("state value".to_owned());
+        let body = static_expression::Spanned {
+            span: span_at(5),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::Hold {
+                state_param: body_source.slice(0, 5),
+                body: Box::new(static_expression::Spanned {
+                    span: (0..5).into(),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithoutPassed {
+                            parts: vec![body_source.slice(0, 5)],
+                            referenced_span: None,
+                        },
+                    ),
+                }),
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_hold_body.initial",
+                None,
+                "test when actor hold body initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let result_actor = super::build_when_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: body_source.slice(6, 11),
+                },
+                body,
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("WHEN actor with HOLD body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHEN with HOLD body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let Value::Number(initial, _) = result_actor
+            .current_value()
+            .expect("WHEN with HOLD body should expose the current input value")
+        else {
+            panic!("WHEN with HOLD body should resolve to a number");
+        };
+        assert_eq!(initial.number(), 2.8);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_hold_body.update",
+                None,
+                "test when actor hold body update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+        let Value::Number(updated, _) = result_actor
+            .current_value()
+            .expect("WHEN with HOLD body should update after source changes")
+        else {
+            panic!("WHEN with HOLD body should stay a number");
+        };
+        assert_eq!(updated.number(), 1.2);
+    }
+
+    #[test]
+    fn while_actor_with_hold_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let body_source = SourceCode::new("state value".to_owned());
+        let body = static_expression::Spanned {
+            span: span_at(5),
+            persistence: Some(boon::parser::Persistence {
+                id: boon::parser::PersistenceId::new(),
+                status: boon::parser::PersistenceStatus::NewOrChanged,
+            }),
+            node: static_expression::Expression::Hold {
+                state_param: body_source.slice(0, 5),
+                body: Box::new(static_expression::Spanned {
+                    span: (0..5).into(),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithoutPassed {
+                            parts: vec![body_source.slice(0, 5)],
+                            referenced_span: None,
+                        },
+                    ),
+                }),
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_hold_body.initial",
+                None,
+                "test while actor hold body initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let result_actor = super::build_while_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: body_source.slice(6, 11),
+                },
+                body,
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("WHILE actor with HOLD body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHILE with HOLD body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let Value::Number(initial, _) = result_actor
+            .current_value()
+            .expect("WHILE with HOLD body should expose the current input value")
+        else {
+            panic!("WHILE with HOLD body should resolve to a number");
+        };
+        assert_eq!(initial.number(), 2.8);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_hold_body.update",
+                None,
+                "test while actor hold body update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+        let Value::Number(updated, _) = result_actor
+            .current_value()
+            .expect("WHILE with HOLD body should update after source changes")
+        else {
+            panic!("WHILE with HOLD body should stay a number");
+        };
+        assert_eq!(updated.number(), 1.2);
+    }
+
+    #[test]
+    fn then_actor_with_flush_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let body_source = SourceCode::new("PASS".to_owned());
+        let body = static_expression::Spanned {
+            span: span_at(body_source.len()),
+            persistence: None,
+            node: static_expression::Expression::Flush {
+                value: Box::new(static_expression::Spanned {
+                    span: (0..4).into(),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithPassed {
+                            extra_parts: vec![],
+                        },
+                    ),
+                }),
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let result_actor = super::build_then_actor(
+            body,
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("THEN actor with FLUSH body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "THEN with FLUSH body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_flush_body.initial",
+                None,
+                "test then actor flush body initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+        let Value::Flushed(initial, _) = result_actor
+            .current_value()
+            .expect("THEN with FLUSH body should expose a flushed value")
+        else {
+            panic!("THEN with FLUSH body should resolve to a flushed value");
+        };
+        let Value::Number(initial, _) = initial.as_ref() else {
+            panic!("THEN with FLUSH body should wrap a number");
+        };
+        assert_eq!(initial.number(), 2.8);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_flush_body.update",
+                None,
+                "test then actor flush body update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+        let Value::Flushed(updated, _) = result_actor
+            .current_value()
+            .expect("THEN with FLUSH body should update after source changes")
+        else {
+            panic!("THEN with FLUSH body should stay a flushed value");
+        };
+        let Value::Number(updated, _) = updated.as_ref() else {
+            panic!("THEN with FLUSH body should keep wrapping a number");
+        };
+        assert_eq!(updated.number(), 1.2);
+    }
+
+    #[test]
+    fn when_actor_with_flush_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let body_source = SourceCode::new("PASS value".to_owned());
+        let body = static_expression::Spanned {
+            span: span_at(4),
+            persistence: None,
+            node: static_expression::Expression::Flush {
+                value: Box::new(static_expression::Spanned {
+                    span: (0..4).into(),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithPassed {
+                            extra_parts: vec![],
+                        },
+                    ),
+                }),
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_flush_body.initial",
+                None,
+                "test when actor flush body initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let result_actor = super::build_when_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: body_source.slice(5, 10),
+                },
+                body,
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("WHEN actor with FLUSH body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHEN with FLUSH body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let Value::Flushed(initial, _) = result_actor
+            .current_value()
+            .expect("WHEN with FLUSH body should expose a flushed value")
+        else {
+            panic!("WHEN with FLUSH body should resolve to a flushed value");
+        };
+        let Value::Number(initial, _) = initial.as_ref() else {
+            panic!("WHEN with FLUSH body should wrap a number");
+        };
+        assert_eq!(initial.number(), 2.8);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_flush_body.update",
+                None,
+                "test when actor flush body update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+        let Value::Flushed(updated, _) = result_actor
+            .current_value()
+            .expect("WHEN with FLUSH body should update after source changes")
+        else {
+            panic!("WHEN with FLUSH body should stay a flushed value");
+        };
+        let Value::Number(updated, _) = updated.as_ref() else {
+            panic!("WHEN with FLUSH body should keep wrapping a number");
+        };
+        assert_eq!(updated.number(), 1.2);
+    }
+
+    #[test]
+    fn while_actor_with_flush_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let body_source = SourceCode::new("PASS value".to_owned());
+        let body = static_expression::Spanned {
+            span: span_at(4),
+            persistence: None,
+            node: static_expression::Expression::Flush {
+                value: Box::new(static_expression::Spanned {
+                    span: (0..4).into(),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithPassed {
+                            extra_parts: vec![],
+                        },
+                    ),
+                }),
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_flush_body.initial",
+                None,
+                "test while actor flush body initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            2.8,
+        ));
+
+        let result_actor = super::build_while_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: body_source.slice(5, 10),
+                },
+                body,
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: body_source.clone(),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("WHILE actor with FLUSH body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHILE with FLUSH body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        let Value::Flushed(initial, _) = result_actor
+            .current_value()
+            .expect("WHILE with FLUSH body should expose a flushed value")
+        else {
+            panic!("WHILE with FLUSH body should resolve to a flushed value");
+        };
+        let Value::Number(initial, _) = initial.as_ref() else {
+            panic!("WHILE with FLUSH body should wrap a number");
+        };
+        assert_eq!(initial.number(), 2.8);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_flush_body.update",
+                None,
+                "test while actor flush body update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            1.2,
+        ));
+        let Value::Flushed(updated, _) = result_actor
+            .current_value()
+            .expect("WHILE with FLUSH body should update after source changes")
+        else {
+            panic!("WHILE with FLUSH body should stay a flushed value");
+        };
+        let Value::Number(updated, _) = updated.as_ref() else {
+            panic!("WHILE with FLUSH body should keep wrapping a number");
+        };
+        assert_eq!(updated.number(), 1.2);
+    }
+
+    #[test]
+    fn then_actor_with_skip_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let result_actor = super::build_then_actor(
+            static_expression::Spanned {
+                span: span_at(0),
+                persistence: None,
+                node: static_expression::Expression::Skip,
+            },
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: SourceCode::new("SKIP".to_owned()),
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("THEN actor with SKIP body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "THEN with SKIP body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_skip_body.initial",
+                None,
+                "test then actor skip body initial",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            1.0,
+        ));
+        assert!(matches!(
+            result_actor.current_value(),
+            Err(crate::engine::CurrentValueError::NoValueYet)
+        ));
+    }
+
+    #[test]
+    fn when_actor_with_skip_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let source = SourceCode::new("n".to_owned());
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_skip_body.initial",
+                None,
+                "test when actor skip body initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.0,
+        ));
+
+        let result_actor = super::build_when_actor(
+            vec![
+                static_expression::Arm {
+                    pattern: static_expression::Pattern::Literal(
+                        static_expression::Literal::Number(1.0),
+                    ),
+                    body: static_expression::Spanned {
+                        span: span_at(0),
+                        persistence: None,
+                        node: static_expression::Expression::Skip,
+                    },
+                },
+                static_expression::Arm {
+                    pattern: static_expression::Pattern::Alias {
+                        name: source.slice(0, 1),
+                    },
+                    body: static_expression::Spanned {
+                        span: span_at(1),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithPassed {
+                                extra_parts: vec![],
+                            },
+                        ),
+                    },
+                },
+            ],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("WHEN actor with SKIP body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHEN with SKIP body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        assert!(matches!(
+            result_actor.current_value(),
+            Err(crate::engine::CurrentValueError::NoValueYet)
+        ));
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_skip_body.update",
+                None,
+                "test when actor skip body update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+        let Value::Number(updated, _) = result_actor
+            .current_value()
+            .expect("WHEN with SKIP body should produce a value after switching arms")
+        else {
+            panic!("WHEN with SKIP body should switch to a number");
+        };
+        assert_eq!(updated.number(), 2.0);
+    }
+
+    #[test]
+    fn while_actor_with_skip_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let source = SourceCode::new("n".to_owned());
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_skip_body.initial",
+                None,
+                "test while actor skip body initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.0,
+        ));
+
+        let result_actor = super::build_while_actor(
+            vec![
+                static_expression::Arm {
+                    pattern: static_expression::Pattern::Literal(
+                        static_expression::Literal::Number(1.0),
+                    ),
+                    body: static_expression::Spanned {
+                        span: span_at(0),
+                        persistence: None,
+                        node: static_expression::Expression::Skip,
+                    },
+                },
+                static_expression::Arm {
+                    pattern: static_expression::Pattern::Alias {
+                        name: source.slice(0, 1),
+                    },
+                    body: static_expression::Spanned {
+                        span: span_at(1),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithPassed {
+                                extra_parts: vec![],
+                            },
+                        ),
+                    },
+                },
+            ],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code: source,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("WHILE actor with SKIP body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHILE with SKIP body should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        assert!(matches!(
+            result_actor.current_value(),
+            Err(crate::engine::CurrentValueError::NoValueYet)
+        ));
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_skip_body.update",
+                None,
+                "test while actor skip body update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+        let Value::Number(updated, _) = result_actor
+            .current_value()
+            .expect("WHILE with SKIP body should produce a value after switching arms")
+        else {
+            panic!("WHILE with SKIP body should switch to a number");
+        };
+        assert_eq!(updated.number(), 2.0);
+    }
+
+    #[test]
+    fn then_actor_with_link_setter_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: Some(scope_id),
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+
+        let sink_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let (sink_sender, _sink_receiver) =
+            crate::engine::NamedChannel::new("test.link.sink.then.body", 8);
+        let sink = Variable::new_link_arc_with_forwarding_actor(
+            crate::engine::ConstructInfo::new(
+                "test.link.sink.then.body",
+                None,
+                "test then body link sink",
+            ),
+            "sink",
+            boon::parser::PersistenceId::new(),
+            actor_context.scope.clone(),
+            sink_actor,
+            sink_sender,
+        );
+        let ports_actor = crate::engine::create_constant_actor(
+            boon::parser::PersistenceId::new(),
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.ports.then.body",
+                    None,
+                    "test then body ports",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [sink.clone()],
+            ),
+            scope_id,
+        );
+
+        let source_code = SourceCode::new("ports.sink".to_owned());
+        let body = static_expression::Spanned {
+            span: span_at(10),
+            persistence: None,
+            node: static_expression::Expression::LinkSetter {
+                alias: static_expression::Spanned {
+                    span: (0..10).into(),
+                    persistence: None,
+                    node: static_expression::Alias::WithoutPassed {
+                        parts: vec![source_code.slice(0, 5), source_code.slice(6, 10)],
+                        referenced_span: None,
+                    },
+                },
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let result_actor = super::build_then_actor(
+            body,
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    parameters: Arc::new(HashMap::from([("ports".to_owned(), ports_actor)])),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("THEN actor with LinkSetter body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "THEN with LinkSetter body should stay on runtime forwarding without a wrapper task"
+            );
+        });
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_link_setter_body.initial",
+                None,
+                "test then actor link setter body initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.0,
+        ));
+
+        let Value::Number(initial, _) = result_actor
+            .current_value()
+            .expect("THEN LinkSetter body should expose the piped value")
+        else {
+            panic!("THEN LinkSetter body should resolve to a number");
+        };
+        assert_eq!(initial.number(), 1.0);
+        let Value::Number(sink_initial, _) = sink
+            .value_actor()
+            .current_value()
+            .expect("THEN LinkSetter body should forward to the LINK sink")
+        else {
+            panic!("THEN LinkSetter sink should resolve to a number");
+        };
+        assert_eq!(sink_initial.number(), 1.0);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.then_actor_link_setter_body.update",
+                None,
+                "test then actor link setter body update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+        let Value::Number(updated, _) = sink
+            .value_actor()
+            .current_value()
+            .expect("THEN LinkSetter body should keep forwarding future updates")
+        else {
+            panic!("THEN LinkSetter sink should stay a number");
+        };
+        assert_eq!(updated.number(), 2.0);
+    }
+
+    #[test]
+    fn when_actor_with_link_setter_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: Some(scope_id),
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+
+        let sink_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let (sink_sender, _sink_receiver) =
+            crate::engine::NamedChannel::new("test.link.sink.when.body", 8);
+        let sink = Variable::new_link_arc_with_forwarding_actor(
+            crate::engine::ConstructInfo::new(
+                "test.link.sink.when.body",
+                None,
+                "test when body link sink",
+            ),
+            "sink",
+            boon::parser::PersistenceId::new(),
+            actor_context.scope.clone(),
+            sink_actor,
+            sink_sender,
+        );
+        let ports_actor = crate::engine::create_constant_actor(
+            boon::parser::PersistenceId::new(),
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.ports.when.body",
+                    None,
+                    "test when body ports",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [sink.clone()],
+            ),
+            scope_id,
+        );
+
+        let source_code = SourceCode::new("ports.sink value".to_owned());
+        let body = static_expression::Spanned {
+            span: span_at(10),
+            persistence: None,
+            node: static_expression::Expression::LinkSetter {
+                alias: static_expression::Spanned {
+                    span: (0..10).into(),
+                    persistence: None,
+                    node: static_expression::Alias::WithoutPassed {
+                        parts: vec![source_code.slice(0, 5), source_code.slice(6, 10)],
+                        referenced_span: None,
+                    },
+                },
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_link_setter_body.initial",
+                None,
+                "test when actor link setter body initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.0,
+        ));
+
+        let result_actor = super::build_when_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: source_code.slice(11, 16),
+                },
+                body,
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    parameters: Arc::new(HashMap::from([("ports".to_owned(), ports_actor)])),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("WHEN actor with LinkSetter body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHEN with LinkSetter body should stay on runtime forwarding without a wrapper task"
+            );
+        });
+
+        let Value::Number(initial, _) = sink
+            .value_actor()
+            .current_value()
+            .expect("WHEN LinkSetter body should forward the initial piped value")
+        else {
+            panic!("WHEN LinkSetter sink should resolve to a number");
+        };
+        assert_eq!(initial.number(), 1.0);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.when_actor_link_setter_body.update",
+                None,
+                "test when actor link setter body update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+        let Value::Number(updated, _) = result_actor
+            .current_value()
+            .expect("WHEN LinkSetter body should keep exposing the piped value")
+        else {
+            panic!("WHEN LinkSetter result should stay a number");
+        };
+        assert_eq!(updated.number(), 2.0);
+    }
+
+    #[test]
+    fn while_actor_with_link_setter_body_uses_direct_state_path_without_wrapper_task() {
+        let scope_id = crate::engine::create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(crate::engine::ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::new(),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: Some(scope_id),
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+
+        let sink_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        let (sink_sender, _sink_receiver) =
+            crate::engine::NamedChannel::new("test.link.sink.while.body", 8);
+        let sink = Variable::new_link_arc_with_forwarding_actor(
+            crate::engine::ConstructInfo::new(
+                "test.link.sink.while.body",
+                None,
+                "test while body link sink",
+            ),
+            "sink",
+            boon::parser::PersistenceId::new(),
+            actor_context.scope.clone(),
+            sink_actor,
+            sink_sender,
+        );
+        let ports_actor = crate::engine::create_constant_actor(
+            boon::parser::PersistenceId::new(),
+            Object::new_value(
+                crate::engine::ConstructInfo::new(
+                    "test.ports.while.body",
+                    None,
+                    "test while body ports",
+                ),
+                construct_context.clone(),
+                crate::engine::ValueIdempotencyKey::new(),
+                [sink.clone()],
+            ),
+            scope_id,
+        );
+
+        let source_code = SourceCode::new("ports.sink value".to_owned());
+        let body = static_expression::Spanned {
+            span: span_at(10),
+            persistence: None,
+            node: static_expression::Expression::LinkSetter {
+                alias: static_expression::Spanned {
+                    span: (0..10).into(),
+                    persistence: None,
+                    node: static_expression::Alias::WithoutPassed {
+                        parts: vec![source_code.slice(0, 5), source_code.slice(6, 10)],
+                        referenced_span: None,
+                    },
+                },
+            },
+        };
+
+        let piped_actor =
+            crate::engine::create_actor_forwarding(boon::parser::PersistenceId::new(), scope_id);
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_link_setter_body.initial",
+                None,
+                "test while actor link setter body initial",
+            ),
+            construct_context.clone(),
+            crate::engine::ValueIdempotencyKey::new(),
+            1.0,
+        ));
+
+        let result_actor = super::build_while_actor(
+            vec![static_expression::Arm {
+                pattern: static_expression::Pattern::Alias {
+                    name: source_code.slice(11, 16),
+                },
+                body,
+            }],
+            span_at(0),
+            None,
+            boon::parser::PersistenceId::new(),
+            super::EvaluationContext {
+                construct_context: construct_context.clone(),
+                actor_context: ActorContext {
+                    piped: Some(piped_actor.clone()),
+                    parameters: Arc::new(HashMap::from([("ports".to_owned(), ports_actor)])),
+                    registry_scope_id: Some(scope_id),
+                    ..actor_context.clone()
+                },
+                reference_connector: std::sync::Weak::new(),
+                link_connector: std::sync::Weak::new(),
+                module_loader: ModuleLoader::default(),
+                source_code,
+                function_registry_snapshot: None,
+                current_module: None,
+            },
+            Arc::new(HashMap::new()),
+        )
+        .expect("WHILE actor with LinkSetter body should build");
+
+        crate::engine::REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "WHILE with LinkSetter body should stay on runtime forwarding without a wrapper task"
+            );
+        });
+
+        let Value::Number(initial, _) = sink
+            .value_actor()
+            .current_value()
+            .expect("WHILE LinkSetter body should forward the initial piped value")
+        else {
+            panic!("WHILE LinkSetter sink should resolve to a number");
+        };
+        assert_eq!(initial.number(), 1.0);
+
+        piped_actor.store_value_directly(crate::engine::Number::new_value(
+            crate::engine::ConstructInfo::new(
+                "test.while_actor_link_setter_body.update",
+                None,
+                "test while actor link setter body update",
+            ),
+            construct_context,
+            crate::engine::ValueIdempotencyKey::new(),
+            2.0,
+        ));
+        let Value::Number(updated, _) = result_actor
+            .current_value()
+            .expect("WHILE LinkSetter body should keep exposing the piped value")
+        else {
+            panic!("WHILE LinkSetter result should stay a number");
+        };
+        assert_eq!(updated.number(), 2.0);
     }
 
     #[test]

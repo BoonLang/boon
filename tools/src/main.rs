@@ -262,6 +262,17 @@ enum VerifyAction {
         no_devtools: bool,
     },
 
+    /// Run the classic Actors milestone browser traces for async and acceptance examples
+    Actors {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+
+        /// Exit nonzero if any milestone trace fails
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Run the FactoryFabric milestone browser traces for the currently supported subset
     FactoryFabric {
         /// Output JSON instead of human-readable text
@@ -783,13 +794,19 @@ fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
+            VerifyAction::Actors { json, check } => {
+                let rt = tokio::runtime::Runtime::new()?;
+                if let Err(e) = rt.block_on(commands::verify_actors::run_verify_actors(json, check))
+                {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
             VerifyAction::FactoryFabric { json, check } => {
                 let rt = tokio::runtime::Runtime::new()?;
-                if let Err(e) =
-                    rt.block_on(commands::verify_factory_fabric::run_verify_factory_fabric(
-                        json, check,
-                    ))
-                {
+                if let Err(e) = rt.block_on(
+                    commands::verify_factory_fabric::run_verify_factory_fabric(json, check),
+                ) {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }
@@ -1275,10 +1292,19 @@ async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Res
                 format!("{}.bn", name)
             };
             println!("Selecting example: {}", example_name);
+            let route = format!(
+                "/?example={}&autorun=0",
+                example_name.trim_end_matches(".bn")
+            );
+
             let response =
-                send_command_to_server(port, WsCommand::SelectExample { name: example_name })
-                    .await?;
-            print_response(response);
+                send_command_to_server(port, WsCommand::NavigateTo { path: route }).await?;
+            if let WsResponse::Error { .. } = response {
+                print_response(response);
+            } else {
+                let refresh = send_command_to_server(port, WsCommand::Refresh).await?;
+                print_response(refresh);
+            }
         }
 
         ExecAction::TestExamples {
@@ -1755,9 +1781,7 @@ fn find_element_by_text(
         }
     }
 
-    fn candidate_bounds(
-        obj: &serde_json::Map<String, serde_json::Value>,
-    ) -> Option<ElementBounds> {
+    fn candidate_bounds(obj: &serde_json::Map<String, serde_json::Value>) -> Option<ElementBounds> {
         let (Some(x), Some(y), Some(width), Some(height)) = (
             obj.get("x").and_then(|v| v.as_f64()),
             obj.get("y").and_then(|v| v.as_f64()),
@@ -1814,9 +1838,7 @@ fn find_element_by_text(
     candidates
         .into_iter()
         .min_by(|(priority_a, area_a, _), (priority_b, area_b, _)| {
-            priority_a
-                .cmp(priority_b)
-                .then_with(|| area_a.cmp(area_b))
+            priority_a.cmp(priority_b).then_with(|| area_a.cmp(area_b))
         })
         .map(|(_, _, bounds)| bounds)
 }

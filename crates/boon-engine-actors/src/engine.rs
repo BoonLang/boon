@@ -2,12 +2,12 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::pin::{Pin, pin};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Wake, Waker};
 
-use super::evaluator::{FunctionRegistry, evaluate_static_expression_with_registry};
+use super::evaluator::{FunctionRegistry, evaluate_static_expression_with_runtime_registry};
 use boon::parser;
 use boon::parser::SourceCode;
 use boon::parser::static_expression;
@@ -422,8 +422,10 @@ impl<T> NamedChannel<T> {
     /// Async send with optional debug timeout.
     ///
     /// In production (no debug-channels feature): blocks until space is available.
-    /// In debug mode (debug-channels feature): times out after 5 seconds with error log.
-    #[cfg(feature = "debug-channels")]
+    /// In wasm debug mode: times out after 5 seconds with error log.
+    /// In host debug mode: falls back to the bounded send path because `zoon::Timer`
+    /// is browser-backed and aborts non-wasm test runs.
+    #[cfg(all(feature = "debug-channels", target_arch = "wasm32"))]
     pub async fn send(&self, value: T) -> Result<(), ChannelError> {
         use zoon::Timer;
 
@@ -449,8 +451,11 @@ impl<T> NamedChannel<T> {
         }
     }
 
-    /// Async send (production mode - no timeout).
-    #[cfg(not(feature = "debug-channels"))]
+    /// Async send for host debug mode or production mode.
+    #[cfg(any(
+        all(feature = "debug-channels", not(target_arch = "wasm32")),
+        not(feature = "debug-channels")
+    ))]
     pub async fn send(&self, value: T) -> Result<(), ChannelError> {
         self.inner
             .clone()
@@ -561,6 +566,8 @@ pub enum ValueError {
     /// - WHILE branch switches, dropping the old branch's actors
     /// - Parent actor is dropped
     ActorDropped,
+    /// Actor source completed without ever producing a value.
+    SourceEndedWithoutValue,
 }
 
 // --- switch_map ---
@@ -918,6 +925,9 @@ pub struct LazyValueActor {
     request_tx: NamedChannel<LazyValueRequest>,
     /// Counter for unique subscriber IDs
     subscriber_counter: std::sync::atomic::AtomicUsize,
+    /// Deferred startup hook so pending lazy actors don't retain a feeder task
+    /// until the first real demand arrives.
+    start_loop: Rc<RefCell<Option<Box<dyn FnOnce()>>>>,
 }
 
 impl LazyValueActor {
@@ -929,9 +939,24 @@ impl LazyValueActor {
             Self {
                 request_tx,
                 subscriber_counter: std::sync::atomic::AtomicUsize::new(0),
+                start_loop: Rc::new(RefCell::new(None)),
             },
             request_rx,
         )
+    }
+
+    fn install_start_loop(&self, start_loop: Box<dyn FnOnce()>) {
+        let previous = self.start_loop.replace(Some(start_loop));
+        assert!(
+            previous.is_none(),
+            "lazy actor start loop should only be installed once"
+        );
+    }
+
+    fn ensure_started(&self) {
+        if let Some(start_loop) = self.start_loop.borrow_mut().take() {
+            start_loop();
+        }
     }
 
     /// The internal loop that handles demand-driven value delivery.
@@ -941,6 +966,7 @@ impl LazyValueActor {
     async fn internal_loop<S: Stream<Item = Value> + 'static>(
         source_stream: S,
         mut request_rx: mpsc::Receiver<LazyValueRequest>,
+        runtime_target_actor_id: Option<ActorId>,
         stored_state: ActorStoredState,
     ) {
         let mut source = Box::pin(source_stream);
@@ -969,12 +995,21 @@ impl LazyValueActor {
                 // Poll source for next value (demand-driven pull!)
                 match source.next().await {
                     Some(value) => {
-                        stored_state.store(value.clone());
+                        if let Some(actor_id) = runtime_target_actor_id {
+                            enqueue_actor_value_on_runtime_queue_by_id(actor_id, value.clone());
+                        } else {
+                            stored_state.store(value.clone());
+                        }
                         buffer.push(value.clone());
                         Some(value)
                     }
                     None => {
                         source_exhausted = true;
+                        if let Some(actor_id) = runtime_target_actor_id {
+                            enqueue_actor_source_end_on_runtime_queue_by_id(actor_id);
+                        } else {
+                            stored_state.set_has_future_state_updates(false);
+                        }
                         None
                     }
                 }
@@ -1019,6 +1054,7 @@ impl LazyValueActor {
             actor: self,
             subscriber_id,
             start_cursor,
+            started: false,
             pending_send: None,
             pending_response: None,
         }
@@ -1033,6 +1069,7 @@ pub struct LazySubscription {
     actor: Arc<LazyValueActor>,
     subscriber_id: usize,
     start_cursor: usize,
+    started: bool,
     /// In-flight async send when the bounded request channel applies backpressure.
     pending_send: Option<(
         LocalBoxFuture<'static, Result<(), ChannelError>>,
@@ -1063,6 +1100,11 @@ impl Stream for LazySubscription {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+
+        if !this.started {
+            this.actor.ensure_started();
+            this.started = true;
+        }
 
         loop {
             if let Some(ref mut response_rx) = this.pending_response {
@@ -1574,16 +1616,85 @@ fn drain_pending_scope_destroys() {
     }
 }
 
+fn take_list_async_sources_now(list_owner_key: usize) -> bool {
+    REGISTRY.with(|reg| {
+        let mut reg = match reg.try_borrow_mut() {
+            Ok(reg) => reg,
+            Err(_) => return false,
+        };
+        reg.take_async_sources_for_list(list_owner_key);
+        true
+    })
+}
+
+fn drain_pending_list_async_source_cleanups() {
+    loop {
+        let Some(list_owner_key) =
+            PENDING_LIST_ASYNC_SOURCE_CLEANUPS.with(|pending| pending.borrow_mut().pop())
+        else {
+            break;
+        };
+
+        if !take_list_async_sources_now(list_owner_key) {
+            PENDING_LIST_ASYNC_SOURCE_CLEANUPS
+                .with(|pending| pending.borrow_mut().push(list_owner_key));
+            break;
+        }
+    }
+}
+
+fn drain_pending_registry_cleanups() {
+    drain_pending_scope_destroys();
+    drain_pending_list_async_source_cleanups();
+}
+
 pub fn create_registry_scope(parent: Option<ScopeId>) -> ScopeId {
     let scope_id = REGISTRY.with(|reg| reg.borrow_mut().create_scope(parent));
-    drain_pending_scope_destroys();
+    drain_pending_registry_cleanups();
     scope_id
 }
 
+pub(crate) fn create_registry_scope_with_registry(
+    reg: &mut ActorRegistry,
+    parent: Option<ScopeId>,
+) -> ScopeId {
+    reg.create_scope(parent)
+}
+
+fn create_child_registry_scope_with_optional_registry(
+    reg: Option<&mut ActorRegistry>,
+    parent: Option<ScopeId>,
+) -> Option<ScopeId> {
+    let parent_scope = parent?;
+    Some(match reg {
+        Some(reg) => create_registry_scope_with_registry(reg, Some(parent_scope)),
+        None => create_registry_scope(Some(parent_scope)),
+    })
+}
+
+#[track_caller]
 fn insert_actor_and_drain(scope_id: ScopeId, owned_actor: OwnedActor) -> ActorId {
-    let actor_id = REGISTRY.with(|reg| reg.borrow_mut().insert_actor(scope_id, owned_actor));
-    drain_pending_scope_destroys();
+    let caller = std::panic::Location::caller();
+    let actor_id = REGISTRY.with(|reg| {
+        reg.try_borrow_mut()
+            .unwrap_or_else(|_| {
+                panic!(
+                    "insert_actor_and_drain nested REGISTRY borrow from {}",
+                    caller
+                )
+            })
+            .insert_actor(scope_id, owned_actor)
+    });
+    drain_pending_registry_cleanups();
     actor_id
+}
+
+fn insert_actor_with_registry(
+    reg: &mut ActorRegistry,
+    scope_id: ScopeId,
+    owned_actor: OwnedActor,
+) -> ActorId {
+    reg.insert_actor(scope_id, owned_actor)
 }
 
 // --- ActorContext ---
@@ -1800,9 +1911,18 @@ impl ActorContext {
 
 /// Actor for broadcasting impulses to multiple subscribers.
 /// Impulse channels are bounded(1) - a single pending signal is sufficient.
+#[derive(Clone, Copy)]
+enum OutputValveDirectEvent {
+    Impulse,
+    Closed,
+}
+
+type OutputValveDirectSubscriber = Rc<dyn Fn(OutputValveDirectEvent) -> bool>;
+
 pub struct ActorOutputValveSignal {
     active: Rc<Cell<bool>>,
     impulse_senders: Rc<RefCell<SmallVec<[mpsc::Sender<()>; 4]>>>,
+    direct_subscribers: Rc<RefCell<SmallVec<[OutputValveDirectSubscriber; 4]>>>,
     _task: TaskHandle,
 }
 
@@ -1813,12 +1933,23 @@ fn broadcast_output_valve_impulse(impulse_senders: &RefCell<SmallVec<[mpsc::Send
     });
 }
 
+fn broadcast_output_valve_direct_subscribers(
+    direct_subscribers: &RefCell<SmallVec<[OutputValveDirectSubscriber; 4]>>,
+    event: OutputValveDirectEvent,
+) {
+    direct_subscribers
+        .borrow_mut()
+        .retain(|subscriber| subscriber(event));
+}
+
 fn close_output_valve_subscribers(
     active: &Cell<bool>,
     impulse_senders: &RefCell<SmallVec<[mpsc::Sender<()>; 4]>>,
+    direct_subscribers: &RefCell<SmallVec<[OutputValveDirectSubscriber; 4]>>,
 ) {
     active.set(false);
     impulse_senders.borrow_mut().clear();
+    direct_subscribers.borrow_mut().clear();
 }
 
 fn subscribe_output_valve_impulses(
@@ -1832,23 +1963,47 @@ fn subscribe_output_valve_impulses(
     impulse_receiver
 }
 
+fn register_output_valve_direct_subscriber(
+    active: &Cell<bool>,
+    direct_subscribers: &RefCell<SmallVec<[OutputValveDirectSubscriber; 4]>>,
+    subscriber: OutputValveDirectSubscriber,
+) {
+    if active.get() {
+        direct_subscribers.borrow_mut().push(subscriber);
+    }
+}
+
 impl ActorOutputValveSignal {
     pub fn new(impulse_stream: impl Stream<Item = ()> + 'static) -> Self {
         let active = Rc::new(Cell::new(true));
         let impulse_senders = Rc::new(RefCell::new(SmallVec::<[mpsc::Sender<()>; 4]>::new()));
+        let direct_subscribers = Rc::new(RefCell::new(
+            SmallVec::<[OutputValveDirectSubscriber; 4]>::new(),
+        ));
         let active_for_task = active.clone();
         let impulse_senders_for_task = impulse_senders.clone();
+        let direct_subscribers_for_task = direct_subscribers.clone();
         Self {
             active,
             impulse_senders,
+            direct_subscribers,
             _task: Task::start_droppable(async move {
                 let mut impulse_stream = pin!(impulse_stream.fuse());
                 while impulse_stream.next().await.is_some() {
                     broadcast_output_valve_impulse(impulse_senders_for_task.as_ref());
+                    broadcast_output_valve_direct_subscribers(
+                        direct_subscribers_for_task.as_ref(),
+                        OutputValveDirectEvent::Impulse,
+                    );
                 }
+                broadcast_output_valve_direct_subscribers(
+                    direct_subscribers_for_task.as_ref(),
+                    OutputValveDirectEvent::Closed,
+                );
                 close_output_valve_subscribers(
                     active_for_task.as_ref(),
                     impulse_senders_for_task.as_ref(),
+                    direct_subscribers_for_task.as_ref(),
                 );
             }),
         }
@@ -1856,6 +2011,14 @@ impl ActorOutputValveSignal {
 
     pub fn stream(&self) -> mpsc::Receiver<()> {
         subscribe_output_valve_impulses(self.active.as_ref(), self.impulse_senders.as_ref())
+    }
+
+    fn register_direct_subscriber(&self, subscriber: OutputValveDirectSubscriber) {
+        register_output_valve_direct_subscriber(
+            self.active.as_ref(),
+            self.direct_subscribers.as_ref(),
+            subscriber,
+        );
     }
 }
 
@@ -2032,6 +2195,32 @@ impl Variable {
         actor_context: ActorContext,
         persistence_id: parser::PersistenceId,
     ) -> Arc<Self> {
+        Self::new_link_arc_impl(None, construct_info, name, actor_context, persistence_id)
+    }
+
+    pub(crate) fn new_link_arc_with_registry(
+        reg: &mut ActorRegistry,
+        construct_info: ConstructInfo,
+        name: impl Into<Cow<'static, str>>,
+        actor_context: ActorContext,
+        persistence_id: parser::PersistenceId,
+    ) -> Arc<Self> {
+        Self::new_link_arc_impl(
+            Some(reg),
+            construct_info,
+            name,
+            actor_context,
+            persistence_id,
+        )
+    }
+
+    fn new_link_arc_impl(
+        reg: Option<&mut ActorRegistry>,
+        construct_info: ConstructInfo,
+        name: impl Into<Cow<'static, str>>,
+        actor_context: ActorContext,
+        persistence_id: parser::PersistenceId,
+    ) -> Arc<Self> {
         let ConstructInfo {
             id: actor_id,
             persistence,
@@ -2078,7 +2267,10 @@ impl Variable {
             );
         }
 
-        let value_actor = create_actor(logged_receiver, persistence_id, scope_id);
+        let value_actor = match reg {
+            Some(reg) => create_actor_with_registry(reg, logged_receiver, persistence_id, scope_id),
+            None => create_actor(logged_receiver, persistence_id, scope_id),
+        };
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
@@ -2191,7 +2383,449 @@ impl Variable {
 pub struct VariableOrArgumentReference {}
 
 impl VariableOrArgumentReference {
+    fn try_resolve_field_actor_from_value(value: &Value, field_name: &str) -> Option<ActorHandle> {
+        match value {
+            Value::Object(object, _) => object.variable(field_name).map(|var| var.value_actor()),
+            Value::TaggedObject(tagged_object, _) => tagged_object
+                .variable(field_name)
+                .map(|var| var.value_actor()),
+            _ => None,
+        }
+    }
+
+    fn try_resolve_constant_string_field_path_actor(
+        root_actor: &ActorHandle,
+        field_path: &[String],
+    ) -> Option<ActorHandle> {
+        if !root_actor.is_constant || field_path.is_empty() {
+            return None;
+        }
+
+        let mut current_actor = root_actor.clone();
+        for (index, field_name) in field_path.iter().map(String::as_str).enumerate() {
+            let current_value = current_actor.current_value().ok()?;
+            let next_actor = Self::try_resolve_field_actor_from_value(&current_value, field_name)?;
+
+            if index + 1 == field_path.len() {
+                return Some(next_actor);
+            }
+
+            if !next_actor.is_constant {
+                return None;
+            }
+
+            current_actor = next_actor;
+        }
+
+        None
+    }
+
+    fn try_resolve_constant_field_path_actor(
+        root_actor: &ActorHandle,
+        parts: &[parser::StrSlice],
+    ) -> Option<ActorHandle> {
+        let field_path = parts
+            .iter()
+            .map(|part| part.as_str().to_owned())
+            .collect::<Vec<_>>();
+        Self::try_resolve_constant_string_field_path_actor(root_actor, &field_path)
+    }
+
+    fn attach_dynamic_field_alias_source(
+        reg: &mut ActorRegistry,
+        forwarding_actor: &ActorHandle,
+        field_actor: ActorHandle,
+        generation: u64,
+        active_generation: Rc<Cell<u64>>,
+        subscription_after_seq: Option<EmissionSeq>,
+    ) {
+        let has_lazy_delegate = reg
+            .get_actor(field_actor.actor_id)
+            .and_then(|owned_actor| owned_actor.lazy_delegate.clone())
+            .is_some();
+
+        if !has_lazy_delegate {
+            let field_state = field_actor.stored_state.clone();
+            field_state.register_direct_subscriber(
+                reg,
+                Rc::new({
+                    let forwarding_actor = forwarding_actor.clone();
+                    let active_generation = active_generation.clone();
+                    move |reg, value| {
+                        if !forwarding_actor.stored_state.is_alive() {
+                            return false;
+                        }
+                        if active_generation.get() != generation {
+                            return false;
+                        }
+                        match value {
+                            Some(value) => {
+                                if subscription_after_seq
+                                    .is_some_and(|seq| value.is_emitted_at_or_before(seq))
+                                {
+                                    return true;
+                                }
+                                reg.enqueue_actor_mailbox_value(
+                                    forwarding_actor.actor_id,
+                                    value.clone(),
+                                )
+                            }
+                            None => reg.enqueue_actor_mailbox_clear(forwarding_actor.actor_id),
+                        }
+                        true
+                    }
+                }),
+            );
+            return;
+        }
+
+        let Some(scope_id) = reg
+            .get_actor(forwarding_actor.actor_id)
+            .map(|owned_actor| owned_actor.scope_id)
+        else {
+            return;
+        };
+
+        let forwarding_actor_for_task = forwarding_actor.clone();
+        start_retained_scope_task_with_registry(reg, scope_id, async move {
+            let mut field_stream = std::pin::pin!(field_actor.current_or_future_stream());
+            while let Some(value) = field_stream.next().await {
+                if !forwarding_actor_for_task.stored_state.is_alive()
+                    || active_generation.get() != generation
+                {
+                    break;
+                }
+                if subscription_after_seq.is_some_and(|seq| value.is_emitted_at_or_before(seq)) {
+                    continue;
+                }
+                enqueue_actor_value_on_runtime_queue(&forwarding_actor_for_task, value);
+            }
+        });
+    }
+
+    fn attach_alias_chain_rebuild_watcher(
+        reg: &mut ActorRegistry,
+        forwarding_actor: &ActorHandle,
+        root_actor: &ActorHandle,
+        watched_actor: ActorHandle,
+        field_path: Arc<Vec<String>>,
+        generation: u64,
+        active_generation: Rc<Cell<u64>>,
+        subscription_after_seq: Option<EmissionSeq>,
+    ) {
+        let has_lazy_delegate = reg
+            .get_actor(watched_actor.actor_id)
+            .and_then(|owned_actor| owned_actor.lazy_delegate.clone())
+            .is_some();
+
+        if !has_lazy_delegate {
+            let watched_state = watched_actor.stored_state.clone();
+            let registration_version = watched_actor.version();
+            watched_state.register_direct_subscriber(
+                reg,
+                Rc::new({
+                    let forwarding_actor = forwarding_actor.clone();
+                    let root_actor = root_actor.clone();
+                    let watched_state = watched_state.clone();
+                    let active_generation = active_generation.clone();
+                    move |reg, _value| {
+                        if !forwarding_actor.stored_state.is_alive() {
+                            return false;
+                        }
+                        if active_generation.get() != generation {
+                            return false;
+                        }
+                        if watched_state.version() == registration_version {
+                            return watched_state.is_alive();
+                        }
+
+                        let next_generation = active_generation.get().wrapping_add(1);
+                        active_generation.set(next_generation);
+                        Self::rebuild_direct_state_field_alias_chain(
+                            reg,
+                            &forwarding_actor,
+                            &root_actor,
+                            field_path.clone(),
+                            next_generation,
+                            active_generation.clone(),
+                            subscription_after_seq,
+                        );
+                        false
+                    }
+                }),
+            );
+            return;
+        }
+
+        let Some(scope_id) = reg
+            .get_actor(forwarding_actor.actor_id)
+            .map(|owned_actor| owned_actor.scope_id)
+        else {
+            return;
+        };
+        let forwarding_actor_for_task = forwarding_actor.clone();
+        let root_actor_for_task = root_actor.clone();
+        start_retained_scope_task_with_registry(reg, scope_id, async move {
+            let mut stream = std::pin::pin!(watched_actor.current_or_future_stream());
+            let mut is_first = true;
+            while stream.next().await.is_some() {
+                if !forwarding_actor_for_task.stored_state.is_alive()
+                    || active_generation.get() != generation
+                {
+                    break;
+                }
+                if is_first {
+                    is_first = false;
+                    continue;
+                }
+                let next_generation = active_generation.get().wrapping_add(1);
+                active_generation.set(next_generation);
+                REGISTRY.with(|reg| {
+                    let mut reg = reg.borrow_mut();
+                    Self::rebuild_direct_state_field_alias_chain(
+                        &mut reg,
+                        &forwarding_actor_for_task,
+                        &root_actor_for_task,
+                        field_path.clone(),
+                        next_generation,
+                        active_generation.clone(),
+                        subscription_after_seq,
+                    );
+                    reg.drain_runtime_ready_queue();
+                });
+                break;
+            }
+        });
+    }
+
+    fn rebuild_direct_state_field_alias_chain(
+        reg: &mut ActorRegistry,
+        forwarding_actor: &ActorHandle,
+        root_actor: &ActorHandle,
+        field_path: Arc<Vec<String>>,
+        generation: u64,
+        active_generation: Rc<Cell<u64>>,
+        subscription_after_seq: Option<EmissionSeq>,
+    ) {
+        let clear_forwarding = |reg: &mut ActorRegistry| {
+            if forwarding_actor.stored_state.is_alive() && active_generation.get() == generation {
+                reg.enqueue_actor_mailbox_clear(forwarding_actor.actor_id);
+            }
+        };
+        let mut current_actor = root_actor.clone();
+
+        for (index, field_name) in field_path.iter().enumerate() {
+            let current_is_root_lazy =
+                index == 0 && current_actor.lazy_delegate_with_registry(reg).is_some();
+            if !current_is_root_lazy {
+                Self::attach_alias_chain_rebuild_watcher(
+                    reg,
+                    forwarding_actor,
+                    root_actor,
+                    current_actor.clone(),
+                    field_path.clone(),
+                    generation,
+                    active_generation.clone(),
+                    subscription_after_seq,
+                );
+            }
+
+            let Ok(current_value) = current_actor.current_value() else {
+                clear_forwarding(reg);
+                return;
+            };
+            if index > 0
+                && subscription_after_seq
+                    .is_some_and(|seq| current_value.is_emitted_at_or_before(seq))
+            {
+                clear_forwarding(reg);
+                return;
+            }
+            let Some(next_actor) =
+                Self::try_resolve_field_actor_from_value(&current_value, field_name)
+            else {
+                clear_forwarding(reg);
+                return;
+            };
+
+            if index + 1 == field_path.len() {
+                Self::attach_dynamic_field_alias_source(
+                    reg,
+                    forwarding_actor,
+                    next_actor,
+                    generation,
+                    active_generation,
+                    subscription_after_seq,
+                );
+                return;
+            }
+
+            current_actor = next_actor;
+        }
+
+        clear_forwarding(reg);
+    }
+
+    fn try_create_direct_state_field_alias_actor_from_field_path_with_registry(
+        mut reg: Option<&mut ActorRegistry>,
+        actor_context: ActorContext,
+        root_actor: ActorHandle,
+        field_path: Vec<String>,
+    ) -> Option<ActorHandle> {
+        let root_has_lazy_delegate = match reg {
+            Some(ref reg) => root_actor.lazy_delegate_with_registry(reg).is_some(),
+            None => root_actor.lazy_delegate().is_some(),
+        };
+        if field_path.is_empty() {
+            return None;
+        }
+
+        let field_path = Arc::new(field_path);
+        let scope_id = actor_context.scope_id();
+        let subscription_after_seq = actor_context.subscription_after_seq;
+        let forwarding_actor = match reg.as_deref_mut() {
+            Some(reg) => {
+                create_actor_forwarding_with_registry(reg, parser::PersistenceId::new(), scope_id)
+            }
+            None => create_actor_forwarding(parser::PersistenceId::new(), scope_id),
+        };
+        retain_actor_handles_with_registry(
+            reg.as_deref_mut(),
+            &forwarding_actor,
+            std::iter::once(root_actor.clone()),
+        );
+
+        let active_generation = Rc::new(Cell::new(0u64));
+        if root_has_lazy_delegate {
+            let forwarding_actor_for_task = forwarding_actor.clone();
+            let root_actor_for_task = root_actor.clone();
+            let field_path_for_task = field_path.clone();
+            let active_generation_for_task = active_generation.clone();
+            let root_stream = root_actor.current_or_future_stream();
+            start_retained_scope_task(scope_id, async move {
+                let mut root_stream = std::pin::pin!(root_stream);
+                while root_stream.next().await.is_some() {
+                    if !forwarding_actor_for_task.stored_state.is_alive() {
+                        break;
+                    }
+
+                    let next_generation = active_generation_for_task.get().wrapping_add(1);
+                    active_generation_for_task.set(next_generation);
+                    REGISTRY.with(|reg| {
+                        let mut reg = reg.borrow_mut();
+                        Self::rebuild_direct_state_field_alias_chain(
+                            &mut reg,
+                            &forwarding_actor_for_task,
+                            &root_actor_for_task,
+                            field_path_for_task.clone(),
+                            next_generation,
+                            active_generation_for_task.clone(),
+                            subscription_after_seq,
+                        );
+                        reg.drain_runtime_ready_queue();
+                    });
+                }
+            });
+
+            return Some(forwarding_actor);
+        }
+
+        match reg {
+            Some(reg) => {
+                let next_generation = active_generation.get().wrapping_add(1);
+                active_generation.set(next_generation);
+                Self::rebuild_direct_state_field_alias_chain(
+                    reg,
+                    &forwarding_actor,
+                    &root_actor,
+                    field_path,
+                    next_generation,
+                    active_generation,
+                    subscription_after_seq,
+                );
+                reg.drain_runtime_ready_queue();
+            }
+            None => REGISTRY.with(|reg| {
+                let mut reg = reg.borrow_mut();
+                let next_generation = active_generation.get().wrapping_add(1);
+                active_generation.set(next_generation);
+                Self::rebuild_direct_state_field_alias_chain(
+                    &mut reg,
+                    &forwarding_actor,
+                    &root_actor,
+                    field_path,
+                    next_generation,
+                    active_generation,
+                    subscription_after_seq,
+                );
+                reg.drain_runtime_ready_queue();
+            }),
+        }
+
+        Some(forwarding_actor)
+    }
+
+    fn try_create_direct_state_field_alias_actor_from_field_path(
+        actor_context: ActorContext,
+        root_actor: ActorHandle,
+        field_path: Vec<String>,
+    ) -> Option<ActorHandle> {
+        Self::try_create_direct_state_field_alias_actor_from_field_path_with_registry(
+            None,
+            actor_context,
+            root_actor,
+            field_path,
+        )
+    }
+
+    fn try_create_direct_state_field_alias_actor_from_field_path_with_optional_registry(
+        reg: Option<&mut ActorRegistry>,
+        actor_context: ActorContext,
+        root_actor: ActorHandle,
+        field_path: Vec<String>,
+    ) -> Option<ActorHandle> {
+        Self::try_create_direct_state_field_alias_actor_from_field_path_with_registry(
+            reg,
+            actor_context,
+            root_actor,
+            field_path,
+        )
+    }
+
+    fn try_create_direct_state_field_alias_actor(
+        actor_context: ActorContext,
+        root_actor: ActorHandle,
+        parts: &[parser::StrSlice],
+    ) -> Option<ActorHandle> {
+        Self::try_create_direct_state_field_alias_actor_from_field_path(
+            actor_context,
+            root_actor,
+            parts
+                .iter()
+                .map(|part| part.as_str().to_owned())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub(crate) fn new_arc_value_actor_with_registry(
+        reg: &mut ActorRegistry,
+        actor_context: ActorContext,
+        alias: static_expression::Alias,
+        root_value_actor: impl Future<Output = ActorHandle> + 'static,
+    ) -> ActorHandle {
+        Self::new_arc_value_actor_impl(Some(reg), actor_context, alias, root_value_actor)
+    }
+
     pub fn new_arc_value_actor(
+        actor_context: ActorContext,
+        alias: static_expression::Alias,
+        root_value_actor: impl Future<Output = ActorHandle> + 'static,
+    ) -> ActorHandle {
+        Self::new_arc_value_actor_impl(None, actor_context, alias, root_value_actor)
+    }
+
+    fn new_arc_value_actor_impl(
+        mut reg: Option<&mut ActorRegistry>,
         actor_context: ActorContext,
         alias: static_expression::Alias,
         root_value_actor: impl Future<Output = ActorHandle> + 'static,
@@ -2212,16 +2846,127 @@ impl VariableOrArgumentReference {
         };
         let scope_id = actor_context.scope_id();
         let parts_vec: Vec<_> = alias_parts.into_iter().skip(skip_alias_parts).collect();
-        let mut root_value_actor = Box::pin(root_value_actor);
+        let mut root_value_actor = Some(Box::pin(root_value_actor));
         let mut ready_root_actor = None;
 
-        if let Poll::Ready(actor) = poll_future_once(root_value_actor.as_mut()) {
+        if let Poll::Ready(actor) = poll_future_once(
+            root_value_actor
+                .as_mut()
+                .expect("root future should be present")
+                .as_mut(),
+        ) {
             if use_snapshot {
                 if let Some(value) = try_resolve_snapshot_alias_value_now(&actor, &parts_vec) {
-                    return create_constant_actor(parser::PersistenceId::new(), value, scope_id);
+                    return match reg.as_deref_mut() {
+                        Some(reg) => create_constant_actor_with_registry(
+                            reg,
+                            parser::PersistenceId::new(),
+                            value,
+                            scope_id,
+                        ),
+                        None => {
+                            create_constant_actor(parser::PersistenceId::new(), value, scope_id)
+                        }
+                    };
+                }
+            } else {
+                if subscription_after_seq.is_none() {
+                    if let Some(field_actor) =
+                        Self::try_resolve_constant_field_path_actor(&actor, &parts_vec)
+                    {
+                        return field_actor;
+                    }
+                }
+                if let Some(alias_actor) = (!parts_vec.is_empty())
+                    .then(|| {
+                        Self::try_create_direct_state_field_alias_actor_from_field_path_with_optional_registry(
+                            reg.as_deref_mut(),
+                            actor_context.clone(),
+                            actor.clone(),
+                            parts_vec
+                                .iter()
+                                .map(|part| part.as_str().to_owned())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .flatten()
+                {
+                    return alias_actor;
                 }
             }
             ready_root_actor = Some(actor);
+            root_value_actor = None;
+        }
+
+        if !use_snapshot && parts_vec.is_empty() {
+            return match ready_root_actor {
+                Some(actor) => actor,
+                None => match reg.as_deref_mut() {
+                    Some(reg) => create_actor_forwarding_from_future_source_with_registry(
+                        reg,
+                        async move {
+                            Some(
+                                root_value_actor
+                                    .expect("plain alias root future should still be pending")
+                                    .await,
+                            )
+                        },
+                        parser::PersistenceId::new(),
+                        scope_id,
+                    ),
+                    None => create_actor_forwarding_from_future_source(
+                        async move {
+                            Some(
+                                root_value_actor
+                                    .expect("plain alias root future should still be pending")
+                                    .await,
+                            )
+                        },
+                        parser::PersistenceId::new(),
+                        scope_id,
+                    ),
+                },
+            };
+        }
+
+        if !use_snapshot && ready_root_actor.is_none() {
+            let waiting_root_actor = match reg.as_deref_mut() {
+                Some(reg) => create_actor_forwarding_from_future_source_with_registry(
+                    reg,
+                    async move {
+                        Some(
+                            root_value_actor
+                                .take()
+                                .expect("field alias root future should still be pending")
+                                .await,
+                        )
+                    },
+                    parser::PersistenceId::new(),
+                    scope_id,
+                ),
+                None => create_actor_forwarding_from_future_source(
+                    async move {
+                        Some(
+                            root_value_actor
+                                .take()
+                                .expect("field alias root future should still be pending")
+                                .await,
+                        )
+                    },
+                    parser::PersistenceId::new(),
+                    scope_id,
+                ),
+            };
+            return Self::try_create_direct_state_field_alias_actor_from_field_path_with_optional_registry(
+                reg.as_deref_mut(),
+                actor_context.clone(),
+                waiting_root_actor,
+                parts_vec
+                    .iter()
+                    .map(|part| part.as_str().to_owned())
+                    .collect(),
+            )
+            .expect("late-root field aliases should always support the direct waiting path");
         }
 
         // For snapshot context (THEN/WHEN bodies), we get a single value.
@@ -2232,7 +2977,9 @@ impl VariableOrArgumentReference {
                     .filter_map(|v| future::ready(v.ok()))
                     .boxed_local(),
                 None => stream::once(async move {
-                    let actor = root_value_actor.await;
+                    let actor = root_value_actor
+                        .expect("snapshot alias root future should still be pending")
+                        .await;
                     actor.value().await
                 })
                 .filter_map(|v| future::ready(v.ok()))
@@ -2241,10 +2988,14 @@ impl VariableOrArgumentReference {
         } else {
             match ready_root_actor {
                 Some(actor) => actor.stream(),
-                None => stream::once(async move { root_value_actor.await })
-                    .then(move |actor| async move { actor.stream() })
-                    .flatten()
-                    .boxed_local(),
+                None => stream::once(async move {
+                    root_value_actor
+                        .expect("streaming alias root future should still be pending")
+                        .await
+                })
+                .then(move |actor| async move { actor.stream() })
+                .flatten()
+                .boxed_local(),
             }
         };
         let num_parts = parts_vec.len();
@@ -2461,11 +3212,54 @@ impl VariableOrArgumentReference {
             });
         }
         // Subscription-based streams are infinite (subscriptions never terminate first)
-        create_actor(value_stream, parser::PersistenceId::new(), scope_id)
+        match reg.as_deref_mut() {
+            Some(reg) => create_actor_with_registry(
+                reg,
+                value_stream,
+                parser::PersistenceId::new(),
+                scope_id,
+            ),
+            None => create_actor(value_stream, parser::PersistenceId::new(), scope_id),
+        }
     }
 }
 
-fn poll_future_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+pub(crate) fn create_field_path_alias_actor_with_registry(
+    reg: Option<&mut ActorRegistry>,
+    actor_context: ActorContext,
+    root_actor: ActorHandle,
+    field_path: Vec<String>,
+) -> Option<ActorHandle> {
+    if field_path.is_empty() {
+        return Some(root_actor);
+    }
+
+    if let Some(field_actor) =
+        VariableOrArgumentReference::try_resolve_constant_string_field_path_actor(
+            &root_actor,
+            &field_path,
+        )
+    {
+        return Some(field_actor);
+    }
+
+    VariableOrArgumentReference::try_create_direct_state_field_alias_actor_from_field_path_with_optional_registry(
+        reg,
+        actor_context,
+        root_actor,
+        field_path,
+    )
+}
+
+pub(crate) fn create_field_path_alias_actor(
+    actor_context: ActorContext,
+    root_actor: ActorHandle,
+    field_path: Vec<String>,
+) -> Option<ActorHandle> {
+    create_field_path_alias_actor_with_registry(None, actor_context, root_actor, field_path)
+}
+
+fn poll_future_once<F: Future + ?Sized>(mut future: Pin<&mut F>) -> Poll<F::Output> {
     struct NoopWake;
 
     impl Wake for NoopWake {
@@ -2518,10 +3312,10 @@ fn try_resolve_snapshot_alias_value_now(
 // --- ReferenceConnector ---
 
 /// Actor for connecting references to actors by span.
-/// Uses a sidecar task internally to encapsulate the async work.
 pub struct ReferenceConnector {
     referenceables: RefCell<HashMap<parser::Span, ActorHandle>>,
     pending_referenceables: RefCell<HashMap<parser::Span, Vec<oneshot::Sender<ActorHandle>>>>,
+    pending_referenceable_actors: RefCell<HashMap<parser::Span, Vec<ActorHandle>>>,
 }
 
 impl ReferenceConnector {
@@ -2529,10 +3323,24 @@ impl ReferenceConnector {
         Self {
             referenceables: RefCell::new(HashMap::new()),
             pending_referenceables: RefCell::new(HashMap::new()),
+            pending_referenceable_actors: RefCell::new(HashMap::new()),
         }
     }
 
+    pub fn try_referenceable_now(&self, span: parser::Span) -> Option<ActorHandle> {
+        self.referenceables.borrow().get(&span).cloned()
+    }
+
     pub fn register_referenceable(&self, span: parser::Span, actor: ActorHandle) {
+        self.register_referenceable_with_registry(None, span, actor);
+    }
+
+    pub(crate) fn register_referenceable_with_registry(
+        &self,
+        mut reg: Option<&mut ActorRegistry>,
+        span: parser::Span,
+        actor: ActorHandle,
+    ) {
         if let Some(waiters) = self.pending_referenceables.borrow_mut().remove(&span) {
             for waiter in waiters {
                 if waiter.send(actor.clone()).is_err() {
@@ -2540,12 +3348,56 @@ impl ReferenceConnector {
                 }
             }
         }
+        if let Some(waiting_actors) = self.pending_referenceable_actors.borrow_mut().remove(&span) {
+            for waiting_actor in waiting_actors {
+                match reg.as_deref_mut() {
+                    Some(reg) => connect_forwarding_current_and_future_with_registry(
+                        Some(reg),
+                        waiting_actor,
+                        actor.clone(),
+                    ),
+                    None => connect_forwarding_current_and_future(waiting_actor, actor.clone()),
+                }
+            }
+        }
         self.referenceables.borrow_mut().insert(span, actor);
+    }
+
+    pub fn referenceable_or_waiting_actor(
+        &self,
+        span: parser::Span,
+        scope_id: ScopeId,
+    ) -> ActorHandle {
+        self.referenceable_or_waiting_actor_with_registry(None, span, scope_id)
+    }
+
+    pub(crate) fn referenceable_or_waiting_actor_with_registry(
+        &self,
+        reg: Option<&mut ActorRegistry>,
+        span: parser::Span,
+        scope_id: ScopeId,
+    ) -> ActorHandle {
+        if let Some(actor) = self.try_referenceable_now(span) {
+            return actor;
+        }
+
+        let waiting_actor = match reg {
+            Some(reg) => {
+                create_actor_forwarding_with_registry(reg, parser::PersistenceId::new(), scope_id)
+            }
+            None => create_actor_forwarding(parser::PersistenceId::new(), scope_id),
+        };
+        self.pending_referenceable_actors
+            .borrow_mut()
+            .entry(span)
+            .or_default()
+            .push(waiting_actor.clone());
+        waiting_actor
     }
 
     // @TODO is &self enough?
     pub async fn referenceable(self: Arc<Self>, span: parser::Span) -> ActorHandle {
-        if let Some(actor) = self.referenceables.borrow().get(&span).cloned() {
+        if let Some(actor) = self.try_referenceable_now(span) {
             return actor;
         }
 
@@ -2640,103 +3492,62 @@ impl LinkConnector {
     }
 }
 
-// --- PassThroughConnector ---
-
-/// Actor for connecting LINK pass-through actors across re-evaluations.
-/// When `element |> LINK { alias }` re-evaluates, this ensures the same
-/// pass-through ValueActor receives the new value instead of creating a new one.
-pub struct PassThroughConnector {
-    /// Stored pass-through state: sender, actor, and forwarders retained for lifetime.
-    pass_throughs:
-        RefCell<HashMap<PassThroughKey, (mpsc::Sender<Value>, ActorHandle, Vec<ActorHandle>)>>,
-}
-
-/// Key for identifying pass-throughs: persistence_id + scope
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct PassThroughKey {
-    pub persistence_id: parser::PersistenceId,
-    pub scope: parser::Scope,
-}
-
-impl PassThroughConnector {
-    pub fn new() -> Self {
-        Self {
-            pass_throughs: RefCell::new(HashMap::new()),
-        }
-    }
-
-    fn remove_if_closed(
-        &self,
-        key: &PassThroughKey,
-    ) -> Option<(mpsc::Sender<Value>, ActorHandle, Vec<ActorHandle>)> {
-        let is_closed = self
-            .pass_throughs
-            .borrow()
-            .get(key)
-            .map(|(sender, _, _)| sender.is_closed())
-            .unwrap_or(false);
-        if is_closed {
-            self.pass_throughs.borrow_mut().remove(key)
-        } else {
-            None
-        }
-    }
-
-    /// Register a new pass-through actor
-    pub fn register(
-        &self,
-        key: PassThroughKey,
-        value_sender: mpsc::Sender<Value>,
-        actor: ActorHandle,
-    ) {
-        self.pass_throughs
-            .borrow_mut()
-            .insert(key, (value_sender, actor, Vec::new()));
-    }
-
-    /// Forward a value to an existing pass-through
-    pub fn forward(&self, key: PassThroughKey, value: Value) {
-        let _ = self.remove_if_closed(&key);
-        if let Some((sender, _, _)) = self.pass_throughs.borrow_mut().get_mut(&key) {
-            if let Err(e) = sender.try_send(value) {
-                zoon::println!("[PASS_THROUGH] Forward failed for key {:?}: {e}", key);
-            }
-        }
-    }
-
-    /// Add a forwarder to keep alive for an existing pass-through
-    pub fn add_forwarder(&self, key: PassThroughKey, forwarder: ActorHandle) {
-        let _ = self.remove_if_closed(&key);
-        if let Some((_, _, forwarders)) = self.pass_throughs.borrow_mut().get_mut(&key) {
-            forwarders.push(forwarder);
-        }
-    }
-
-    /// Get an existing pass-through actor if it exists
-    pub async fn get(&self, key: PassThroughKey) -> Option<ActorHandle> {
-        let _ = self.remove_if_closed(&key);
-        self.pass_throughs
-            .borrow()
-            .get(&key)
-            .map(|(_, actor, _)| actor.clone())
-    }
-
-    /// Get the value sender for an existing pass-through
-    pub async fn get_sender(&self, key: PassThroughKey) -> Option<mpsc::Sender<Value>> {
-        let _ = self.remove_if_closed(&key);
-        self.pass_throughs
-            .borrow()
-            .get(&key)
-            .map(|(sender, _, _)| sender.clone())
-    }
-}
-
 // --- FunctionCall ---
 
 pub struct FunctionCall {}
 
 impl FunctionCall {
+    pub(crate) fn new_arc_value_actor_with_registry<FR: Stream<Item = Value> + 'static>(
+        reg: &mut ActorRegistry,
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        definition: impl Fn(
+            Arc<Vec<ActorHandle>>,
+            ConstructId,
+            parser::PersistenceId,
+            ConstructContext,
+            ActorContext,
+        ) -> FR
+        + 'static,
+        arguments: impl Into<Vec<ActorHandle>>,
+    ) -> ActorHandle {
+        Self::new_arc_value_actor_impl(
+            Some(reg),
+            construct_info,
+            construct_context,
+            actor_context,
+            definition,
+            arguments,
+        )
+    }
+
     pub fn new_arc_value_actor<FR: Stream<Item = Value> + 'static>(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        definition: impl Fn(
+            Arc<Vec<ActorHandle>>,
+            ConstructId,
+            parser::PersistenceId,
+            ConstructContext,
+            ActorContext,
+        ) -> FR
+        + 'static,
+        arguments: impl Into<Vec<ActorHandle>>,
+    ) -> ActorHandle {
+        Self::new_arc_value_actor_impl(
+            None,
+            construct_info,
+            construct_context,
+            actor_context,
+            definition,
+            arguments,
+        )
+    }
+
+    fn new_arc_value_actor_impl<FR: Stream<Item = Value> + 'static>(
+        reg: Option<&mut ActorRegistry>,
         construct_info: ConstructInfo,
         construct_context: ConstructContext,
         actor_context: ActorContext,
@@ -2819,14 +3630,30 @@ impl FunctionCall {
         // In lazy mode, use LazyValueActor for demand-driven evaluation.
         // This is critical for HOLD body context where sequential state updates are needed.
         if actor_context.use_lazy_actors {
-            create_actor_lazy(
-                combined_stream,
-                parser::PersistenceId::new(),
-                actor_context.scope_id(),
-            )
+            match reg {
+                Some(reg) => create_actor_lazy_with_registry(
+                    reg,
+                    combined_stream,
+                    parser::PersistenceId::new(),
+                    actor_context.scope_id(),
+                ),
+                None => create_actor_lazy(
+                    combined_stream,
+                    parser::PersistenceId::new(),
+                    actor_context.scope_id(),
+                ),
+            }
         } else {
             let scope_id = actor_context.scope_id();
-            create_actor(combined_stream, parser::PersistenceId::new(), scope_id)
+            match reg {
+                Some(reg) => create_actor_with_registry(
+                    reg,
+                    combined_stream,
+                    parser::PersistenceId::new(),
+                    scope_id,
+                ),
+                None => create_actor(combined_stream, parser::PersistenceId::new(), scope_id),
+            }
         }
     }
 }
@@ -2835,19 +3662,182 @@ impl FunctionCall {
 
 pub struct LatestCombinator {}
 
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(crate = "serde")]
+struct LatestCombinatorState {
+    input_emission_keys: BTreeMap<usize, EmissionSeq>,
+}
+
+fn select_latest_value(latest_values: &[Option<Value>]) -> Option<Value> {
+    latest_values
+        .iter()
+        .enumerate()
+        .filter_map(|(input_index, current)| current.as_ref().map(|current| (input_index, current)))
+        .max_by(|(lhs_idx, lhs), (rhs_idx, rhs)| {
+            lhs.emission_seq()
+                .cmp(&rhs.emission_seq())
+                .then_with(|| rhs_idx.cmp(lhs_idx))
+        })
+        .map(|(_, selected)| selected.clone())
+}
+
+fn apply_latest_input_value(
+    state: &mut LatestCombinatorState,
+    latest_values: &mut [Option<Value>],
+    index: usize,
+    value: Value,
+) -> Option<Value> {
+    let emission = value.emission_seq();
+    let skip_value = state
+        .input_emission_keys
+        .get(&index)
+        .is_some_and(|previous_emission| {
+            *previous_emission == emission
+                && latest_values[index]
+                    .as_ref()
+                    .is_some_and(|previous| values_equal(previous, &value))
+        });
+    state.input_emission_keys.insert(index, emission);
+    if skip_value {
+        return None;
+    }
+
+    if latest_values[index]
+        .as_ref()
+        .is_some_and(|previous| previous.emission_seq() > emission)
+    {
+        return None;
+    }
+    latest_values[index] = Some(value);
+    select_latest_value(latest_values)
+}
+
 impl LatestCombinator {
+    fn try_create_direct_state_actor_with_registry(
+        mut reg: Option<&mut ActorRegistry>,
+        _construct_context: ConstructContext,
+        actor_context: ActorContext,
+        inputs: Vec<ActorHandle>,
+        persistent_id: parser::PersistenceId,
+        storage: Arc<ConstructStorage>,
+    ) -> Option<ActorHandle> {
+        let state = Rc::new(RefCell::new(
+            storage
+                .load_state_now::<LatestCombinatorState>(persistent_id)
+                .unwrap_or_default(),
+        ));
+        let latest_values = Rc::new(RefCell::new(vec![None::<Value>; inputs.len()]));
+
+        let mut current_values: Vec<_> = inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, input)| input.current_value().ok().map(|value| (index, value)))
+            .collect();
+        current_values.sort_by(|(lhs_idx, lhs), (rhs_idx, rhs)| {
+            lhs.emission_seq()
+                .cmp(&rhs.emission_seq())
+                .then_with(|| lhs_idx.cmp(rhs_idx))
+        });
+
+        let mut initial_selected = None;
+        for (index, value) in current_values {
+            let maybe_selected = {
+                let mut state_ref = state.borrow_mut();
+                let mut latest_values_ref = latest_values.borrow_mut();
+                apply_latest_input_value(&mut state_ref, &mut latest_values_ref, index, value)
+            };
+            if let Some(selected) = maybe_selected {
+                storage.save_state(persistent_id, &*state.borrow());
+                initial_selected = Some(selected);
+            }
+        }
+
+        let result_actor = try_create_direct_state_subscriber_actor_with_registry(
+            reg.as_deref_mut(),
+            inputs,
+            parser::PersistenceId::new(),
+            actor_context.scope_id(),
+            {
+                let state = state.clone();
+                let latest_values = latest_values.clone();
+                let storage = storage.clone();
+                move |index, value| {
+                    let maybe_selected = {
+                        let mut state_ref = state.borrow_mut();
+                        let mut latest_values_ref = latest_values.borrow_mut();
+                        apply_latest_input_value(
+                            &mut state_ref,
+                            &mut latest_values_ref,
+                            index,
+                            value,
+                        )
+                    };
+
+                    maybe_selected.inspect(|_| {
+                        storage.save_state(persistent_id, &*state.borrow());
+                    })
+                }
+            },
+        )?;
+
+        if let Some(selected) = initial_selected {
+            result_actor.store_value_directly_with_registry(reg.as_deref_mut(), selected);
+        }
+
+        Some(result_actor)
+    }
+
+    fn try_create_direct_state_actor(
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        inputs: Vec<ActorHandle>,
+        persistent_id: parser::PersistenceId,
+        storage: Arc<ConstructStorage>,
+    ) -> Option<ActorHandle> {
+        Self::try_create_direct_state_actor_with_registry(
+            None,
+            construct_context,
+            actor_context,
+            inputs,
+            persistent_id,
+            storage,
+        )
+    }
+
+    pub(crate) fn new_arc_value_actor_with_registry(
+        reg: &mut ActorRegistry,
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        inputs: impl Into<Vec<ActorHandle>>,
+    ) -> ActorHandle {
+        let inputs: Vec<ActorHandle> = inputs.into();
+        let persistent_id = construct_info
+            .persistence
+            .map(|p| p.id)
+            .unwrap_or_else(parser::PersistenceId::new);
+        let storage = construct_context.construct_storage.clone();
+
+        if let Some(actor) = Self::try_create_direct_state_actor_with_registry(
+            Some(reg),
+            construct_context.clone(),
+            actor_context.clone(),
+            inputs.clone(),
+            persistent_id,
+            storage,
+        ) {
+            return actor;
+        }
+
+        Self::new_arc_value_actor(construct_info, construct_context, actor_context, inputs)
+    }
+
     pub fn new_arc_value_actor(
         construct_info: ConstructInfo,
         construct_context: ConstructContext,
         actor_context: ActorContext,
         inputs: impl Into<Vec<ActorHandle>>,
     ) -> ActorHandle {
-        #[derive(Default, Clone, Serialize, Deserialize)]
-        #[serde(crate = "serde")]
-        struct State {
-            input_emission_keys: BTreeMap<usize, EmissionSeq>,
-        }
-
         let construct_info = construct_info.complete(ConstructType::LatestCombinator);
         let inputs: Vec<ActorHandle> = inputs.into();
         // If persistence is None (e.g., for dynamically evaluated expressions),
@@ -2857,6 +3847,16 @@ impl LatestCombinator {
             .map(|p| p.id)
             .unwrap_or_else(parser::PersistenceId::new);
         let storage = construct_context.construct_storage.clone();
+
+        if let Some(actor) = Self::try_create_direct_state_actor(
+            construct_context.clone(),
+            actor_context.clone(),
+            inputs.clone(),
+            persistent_id,
+            storage.clone(),
+        ) {
+            return actor;
+        }
 
         // Track the newest value per input and select the globally newest candidate
         // on each emission. This matches kernel LATEST semantics more closely than
@@ -2881,7 +3881,10 @@ impl LatestCombinator {
                     async move {
                         if previous_first_run {
                             Some((
-                                storage.clone().load_state::<State>(persistent_id).await,
+                                storage
+                                    .clone()
+                                    .load_state::<LatestCombinatorState>(persistent_id)
+                                    .await,
                                 index,
                                 value,
                             ))
@@ -2892,48 +3895,15 @@ impl LatestCombinator {
                 }
             })
             .scan(
-                (State::default(), vec![None::<Value>; input_count]),
+                (
+                    LatestCombinatorState::default(),
+                    vec![None::<Value>; input_count],
+                ),
                 move |(state, latest_values), (new_state, index, value)| {
                     if let Some(new_state) = new_state {
                         *state = new_state;
                     }
-                    let emission = value.emission_seq();
-                    let skip_value =
-                        state
-                            .input_emission_keys
-                            .get(&index)
-                            .is_some_and(|previous_emission| {
-                                *previous_emission == emission
-                                    && latest_values[index]
-                                        .as_ref()
-                                        .is_some_and(|previous| values_equal(previous, &value))
-                            });
-                    state.input_emission_keys.insert(index, emission);
-                    if skip_value {
-                        return future::ready(Some(None));
-                    }
-
-                    if latest_values[index]
-                        .as_ref()
-                        .is_some_and(|previous| previous.emission_seq() > emission)
-                    {
-                        return future::ready(Some(None));
-                    }
-                    latest_values[index] = Some(value);
-
-                    let selected = latest_values
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(input_index, current)| {
-                            current.as_ref().map(|current| (input_index, current))
-                        })
-                        .max_by(|(lhs_idx, lhs), (rhs_idx, rhs)| {
-                            lhs.emission_seq()
-                                .cmp(&rhs.emission_seq())
-                                .then_with(|| rhs_idx.cmp(lhs_idx))
-                        })
-                        .map(|(_, selected)| selected.clone());
-
+                    let selected = apply_latest_input_value(state, latest_values, index, value);
                     storage.save_state(persistent_id, &*state);
                     future::ready(Some(selected))
                 },
@@ -2953,6 +3923,65 @@ impl LatestCombinator {
 pub struct BinaryOperatorCombinator {}
 
 impl BinaryOperatorCombinator {
+    pub(crate) fn try_create_direct_state_actor_with_registry<F>(
+        reg: Option<&mut ActorRegistry>,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: ActorHandle,
+        operand_b: ActorHandle,
+        operation: Rc<F>,
+    ) -> Option<ActorHandle>
+    where
+        F: Fn(Value, Value, ConstructContext, ValueIdempotencyKey) -> Value + 'static,
+    {
+        type LatestBinaryValues = Rc<RefCell<(Option<Value>, Option<Value>)>>;
+        let latest_values: LatestBinaryValues = Rc::new(RefCell::new((None, None)));
+        try_create_direct_state_subscriber_actor_with_registry(
+            reg,
+            vec![operand_a, operand_b],
+            parser::PersistenceId::new(),
+            actor_context.scope_id(),
+            move |operand_index, value| {
+                let maybe_result = {
+                    let mut latest_values = latest_values.borrow_mut();
+                    match operand_index {
+                        0 => latest_values.0 = Some(value),
+                        1 => latest_values.1 = Some(value),
+                        _ => unreachable!(),
+                    }
+                    match (&latest_values.0, &latest_values.1) {
+                        (Some(a), Some(b)) => Some((a.clone(), b.clone())),
+                        _ => None,
+                    }
+                };
+
+                maybe_result.map(|(a, b)| {
+                    operation(a, b, construct_context.clone(), ValueIdempotencyKey::new())
+                })
+            },
+        )
+    }
+
+    fn try_create_direct_state_actor<F>(
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: ActorHandle,
+        operand_b: ActorHandle,
+        operation: Rc<F>,
+    ) -> Option<ActorHandle>
+    where
+        F: Fn(Value, Value, ConstructContext, ValueIdempotencyKey) -> Value + 'static,
+    {
+        Self::try_create_direct_state_actor_with_registry(
+            None,
+            construct_context,
+            actor_context,
+            operand_a,
+            operand_b,
+            operation,
+        )
+    }
+
     /// Creates a ValueActor that combines two operands using the given operation.
     /// The operation receives both values and returns a new Value.
     pub fn new_arc_value_actor<F>(
@@ -2965,6 +3994,17 @@ impl BinaryOperatorCombinator {
     where
         F: Fn(Value, Value, ConstructContext, ValueIdempotencyKey) -> Value + 'static,
     {
+        let operation = Rc::new(operation);
+        if let Some(actor) = Self::try_create_direct_state_actor(
+            construct_context.clone(),
+            actor_context.clone(),
+            operand_a.clone(),
+            operand_b.clone(),
+            operation.clone(),
+        ) {
+            return actor;
+        }
+
         // Merge both operand streams, tracking which operand changed.
         // Use stream() to properly handle lazy actors in HOLD body context.
         // Sort by emission sequence to restore source ordering when both
@@ -2995,6 +4035,7 @@ impl BinaryOperatorCombinator {
             .filter_map(future::ready)
             .map({
                 let construct_context = construct_context.clone();
+                let operation = operation.clone();
                 move |(a, b)| {
                     let idempotency_key = ValueIdempotencyKey::new();
                     operation(a, b, construct_context.clone(), idempotency_key)
@@ -3018,6 +4059,81 @@ impl BinaryOperatorCombinator {
         F: Fn(Value, Value, ConstructContext, ValueIdempotencyKey) -> Fut + 'static,
         Fut: Future<Output = Value> + 'static,
     {
+        // Try direct-state path when both operands are non-lazy and have current values,
+        // AND the async operation completes synchronously (common for simple comparators).
+        if let (Ok(a_val), Ok(b_val)) = (operand_a.current_value(), operand_b.current_value()) {
+            if !operand_a.has_lazy_delegate() && !operand_b.has_lazy_delegate() {
+                let test_future = operation(
+                    a_val.clone(),
+                    b_val.clone(),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                );
+                let test_future = std::pin::pin!(test_future);
+                if let Poll::Ready(initial_result) = poll_future_once(test_future) {
+                    // Operation completes synchronously -- use direct-state path
+                    let operation = Rc::new(RefCell::new(operation));
+                    let output = create_actor_forwarding(
+                        parser::PersistenceId::new(),
+                        actor_context.scope_id(),
+                    );
+                    output.store_value_directly(initial_result);
+
+                    let latest_values: Rc<RefCell<(Option<Value>, Option<Value>)>> =
+                        Rc::new(RefCell::new((None, None)));
+
+                    operand_a.register_direct_subscriber({
+                        let output = output.clone();
+                        let latest_values = latest_values.clone();
+                        let operation = operation.clone();
+                        let construct_context = construct_context.clone();
+                        move |value: Option<&Value>| {
+                            latest_values.borrow_mut().0 = value.cloned();
+                            if let (Some(a), Some(b)) = &*latest_values.borrow() {
+                                let fut = operation.borrow()(
+                                    a.clone(),
+                                    b.clone(),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                );
+                                let fut = std::pin::pin!(fut);
+                                if let Poll::Ready(result) = poll_future_once(fut) {
+                                    output.store_value_directly(result);
+                                }
+                            }
+                            true
+                        }
+                    });
+
+                    operand_b.register_direct_subscriber({
+                        let output = output.clone();
+                        let latest_values = latest_values.clone();
+                        let operation = operation.clone();
+                        let construct_context = construct_context.clone();
+                        move |value: Option<&Value>| {
+                            latest_values.borrow_mut().1 = value.cloned();
+                            if let (Some(a), Some(b)) = &*latest_values.borrow() {
+                                let fut = operation.borrow()(
+                                    a.clone(),
+                                    b.clone(),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                );
+                                let fut = std::pin::pin!(fut);
+                                if let Poll::Ready(result) = poll_future_once(fut) {
+                                    output.store_value_directly(result);
+                                }
+                            }
+                            true
+                        }
+                    });
+
+                    return output;
+                }
+            }
+        }
+
+        // Fall back to stream-driven path for lazy operands or async operations
         let a_stream = operand_a.stream().map(|v| (0usize, v));
         let b_stream = operand_b.stream().map(|v| (1usize, v));
         let value_stream = stream::select_all([a_stream.boxed_local(), b_stream.boxed_local()])
@@ -3305,7 +4421,7 @@ async fn lists_equal_async(a_list: &Arc<List>, b_list: &Arc<List>) -> bool {
 }
 
 /// Compare two Values for ordering. Returns None if types are incompatible.
-fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Value::Number(n1, _), Value::Number(n2, _)) => n1.number().partial_cmp(&n2.number()),
         (Value::Text(t1, _), Value::Text(t2, _)) => Some(t1.text().cmp(t2.text())),
@@ -3460,6 +4576,10 @@ impl ValueHistory {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.values.clear();
+    }
+
     /// Get all values since the given version.
     pub fn get_values_since(&self, since_version: u64) -> Vec<Value> {
         self.values
@@ -3491,11 +4611,18 @@ struct ActorStoredState {
     inner: Rc<ActorStoredStateInner>,
 }
 
+type ActorDirectSubscriber = Rc<dyn Fn(&mut ActorRegistry, Option<&Value>) -> bool>;
+
 struct ActorStoredStateInner {
     is_alive: Cell<bool>,
+    has_future_state_updates: Cell<bool>,
     version: Cell<u64>,
     history: std::cell::RefCell<ValueHistory>,
     update_waiters: std::cell::RefCell<Vec<oneshot::Sender<()>>>,
+    drop_waiters: std::cell::RefCell<Vec<oneshot::Sender<()>>>,
+    notifying_direct_subscribers: Cell<bool>,
+    direct_subscribers: std::cell::RefCell<SmallVec<[ActorDirectSubscriber; 2]>>,
+    pending_direct_subscribers: std::cell::RefCell<SmallVec<[ActorDirectSubscriber; 2]>>,
 }
 
 impl ActorStoredState {
@@ -3503,9 +4630,14 @@ impl ActorStoredState {
         Self {
             inner: Rc::new(ActorStoredStateInner {
                 is_alive: Cell::new(true),
+                has_future_state_updates: Cell::new(true),
                 version: Cell::new(0),
                 history: std::cell::RefCell::new(ValueHistory::new(max_entries)),
                 update_waiters: std::cell::RefCell::new(Vec::new()),
+                drop_waiters: std::cell::RefCell::new(Vec::new()),
+                notifying_direct_subscribers: Cell::new(false),
+                direct_subscribers: std::cell::RefCell::new(SmallVec::new()),
+                pending_direct_subscribers: std::cell::RefCell::new(SmallVec::new()),
             }),
         }
     }
@@ -3513,12 +4645,19 @@ impl ActorStoredState {
     fn with_initial_value(max_entries: usize, initial_value: Value) -> Self {
         let state = Self::new(max_entries);
         state.store(initial_value);
+        state.set_has_future_state_updates(false);
         state
     }
 
     fn mark_dropped(&self) {
         self.inner.is_alive.set(false);
+        self.inner.has_future_state_updates.set(false);
         self.inner.update_waiters.borrow_mut().clear();
+        for waiter in self.inner.drop_waiters.borrow_mut().drain(..) {
+            let _ = waiter.send(());
+        }
+        self.inner.direct_subscribers.borrow_mut().clear();
+        self.inner.pending_direct_subscribers.borrow_mut().clear();
     }
 
     fn is_alive(&self) -> bool {
@@ -3529,6 +4668,22 @@ impl ActorStoredState {
         self.inner.version.get()
     }
 
+    fn has_future_state_updates(&self) -> bool {
+        self.inner.has_future_state_updates.get()
+    }
+
+    fn set_has_future_state_updates(&self, has_future_state_updates: bool) {
+        let previous = self
+            .inner
+            .has_future_state_updates
+            .replace(has_future_state_updates);
+        if previous && !has_future_state_updates {
+            for waiter in self.inner.update_waiters.borrow_mut().drain(..) {
+                let _ = waiter.send(());
+            }
+        }
+    }
+
     fn store(&self, value: Value) -> u64 {
         let new_version = self.version() + 1;
         self.inner.version.set(new_version);
@@ -3537,6 +4692,58 @@ impl ActorStoredState {
             let _ = waiter.send(());
         }
         new_version
+    }
+
+    fn clear(&self) -> u64 {
+        let new_version = self.version() + 1;
+        self.inner.version.set(new_version);
+        self.inner.history.borrow_mut().clear();
+        for waiter in self.inner.update_waiters.borrow_mut().drain(..) {
+            let _ = waiter.send(());
+        }
+        new_version
+    }
+
+    fn register_direct_subscriber(
+        &self,
+        reg: &mut ActorRegistry,
+        subscriber: ActorDirectSubscriber,
+    ) {
+        if let Some(current_value) = self.latest() {
+            if subscriber(reg, Some(&current_value)) {
+                self.push_direct_subscriber(subscriber);
+            }
+            return;
+        }
+
+        self.push_direct_subscriber(subscriber);
+    }
+
+    fn notify_direct_subscribers(&self, reg: &mut ActorRegistry, value: Option<&Value>) {
+        self.inner.notifying_direct_subscribers.set(true);
+        self.inner
+            .direct_subscribers
+            .borrow_mut()
+            .retain(|subscriber| subscriber(reg, value));
+        self.inner.notifying_direct_subscribers.set(false);
+        if !self.inner.pending_direct_subscribers.borrow().is_empty() {
+            self.inner
+                .direct_subscribers
+                .borrow_mut()
+                .extend(self.inner.pending_direct_subscribers.borrow_mut().drain(..));
+        }
+    }
+
+    fn push_direct_subscriber(&self, subscriber: ActorDirectSubscriber) {
+        if self.inner.notifying_direct_subscribers.get() {
+            self.inner
+                .pending_direct_subscribers
+                .borrow_mut()
+                .push(subscriber);
+            return;
+        }
+
+        self.inner.direct_subscribers.borrow_mut().push(subscriber);
     }
 
     fn get_values_since(&self, since_version: u64) -> Vec<Value> {
@@ -3563,14 +4770,33 @@ impl ActorStoredState {
         Some(rx)
     }
 
+    fn wait_for_drop(&self) -> Option<oneshot::Receiver<()>> {
+        if !self.is_alive() {
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        self.inner.drop_waiters.borrow_mut().push(tx);
+        Some(rx)
+    }
+
     async fn wait_for_first_value_after(&self, version: u64) -> Result<Value, ValueError> {
+        let mut version = version;
         loop {
             if let Some(value) = self.get_values_since(version).into_iter().next() {
                 return Ok(value);
             }
 
+            let current_version = self.version();
+            if current_version > version {
+                version = current_version;
+                continue;
+            }
+
             if !self.is_alive() {
                 return Err(ValueError::ActorDropped);
+            }
+            if !self.has_future_state_updates() {
+                return Err(ValueError::SourceEndedWithoutValue);
             }
 
             let Some(waiter) = self.wait_for_update_after(version) else {
@@ -3601,7 +4827,16 @@ impl ActorStoredState {
                         continue;
                     }
 
+                    let current_version = stored_state.version();
+                    if current_version > last_seen_version {
+                        last_seen_version = current_version;
+                        continue;
+                    }
+
                     if !stored_state.is_alive() {
+                        return None;
+                    }
+                    if !stored_state.has_future_state_updates() {
                         return None;
                     }
 
@@ -3643,11 +4878,160 @@ pub struct ScopeId {
     generation: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct AsyncSourceId {
+    index: u32,
+    generation: u32,
+}
+
+struct AsyncSourceEntry {
+    owner_scope: ScopeId,
+    owner: AsyncSourceOwner,
+    task: Option<AsyncSourceTaskHandle>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AsyncSourceOwner {
+    Scope(ScopeId),
+    List(usize),
+}
+
+enum AsyncSourceTaskHandle {
+    Runtime(TaskHandle),
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    Stub(TestAsyncSourceTaskHandle),
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+struct TestAsyncSourceTaskHandle {
+    slot: usize,
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    static TEST_ASYNC_SOURCE_TASKS: RefCell<Vec<Option<Pin<Box<dyn Future<Output = ()> + 'static>>>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl Drop for TestAsyncSourceTaskHandle {
+    fn drop(&mut self) {
+        TEST_ASYNC_SOURCE_TASKS.with(|tasks| {
+            if let Ok(mut tasks) = tasks.try_borrow_mut() {
+                if let Some(slot) = tasks.get_mut(self.slot) {
+                    *slot = None;
+                }
+            }
+        });
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn poll_test_async_source_tasks() {
+    let mut idle_passes = 0;
+    loop {
+        let mut any_completed = false;
+        let (task_count, active_task_count_before) = TEST_ASYNC_SOURCE_TASKS.with(|tasks| {
+            let tasks = tasks.borrow();
+            (
+                tasks.len(),
+                tasks.iter().filter(|task| task.is_some()).count(),
+            )
+        });
+        for slot in 0..task_count {
+            let Some(mut task) = TEST_ASYNC_SOURCE_TASKS.with(|tasks| {
+                tasks
+                    .borrow_mut()
+                    .get_mut(slot)
+                    .and_then(|task| task.take())
+            }) else {
+                continue;
+            };
+
+            if poll_future_once(task.as_mut()).is_ready() {
+                any_completed = true;
+                continue;
+            }
+
+            TEST_ASYNC_SOURCE_TASKS.with(|tasks| {
+                if let Some(entry) = tasks.borrow_mut().get_mut(slot) {
+                    *entry = Some(task);
+                }
+            });
+        }
+        let active_task_count_after = TEST_ASYNC_SOURCE_TASKS
+            .with(|tasks| tasks.borrow().iter().filter(|task| task.is_some()).count());
+        if any_completed || active_task_count_after != active_task_count_before {
+            idle_passes = 0;
+            continue;
+        }
+        idle_passes += 1;
+        if idle_passes >= 3 {
+            break;
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn poll_test_async_source_tasks() {}
+
+fn spawn_async_source_task<F>(future: F) -> AsyncSourceTaskHandle
+where
+    F: Future<Output = ()> + 'static,
+{
+    spawn_async_source_task_with_test_poll(future, true)
+}
+
+fn spawn_async_source_task_for_reserved_slot<F>(future: F) -> AsyncSourceTaskHandle
+where
+    F: Future<Output = ()> + 'static,
+{
+    spawn_async_source_task_with_test_poll(future, false)
+}
+
+fn spawn_async_source_task_with_test_poll<F>(
+    future: F,
+    #[allow(unused_variables)] poll_immediately: bool,
+) -> AsyncSourceTaskHandle
+where
+    F: Future<Output = ()> + 'static,
+{
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    {
+        let future = Box::pin(future);
+        let slot = TEST_ASYNC_SOURCE_TASKS.with(|tasks| {
+            let mut tasks = tasks.borrow_mut();
+            let slot = tasks.len();
+            tasks.push(Some(future));
+            slot
+        });
+        if poll_immediately {
+            poll_test_async_source_tasks();
+        }
+        AsyncSourceTaskHandle::Stub(TestAsyncSourceTaskHandle { slot })
+    }
+
+    #[cfg(not(all(test, not(target_arch = "wasm32"))))]
+    {
+        AsyncSourceTaskHandle::Runtime(Task::start_droppable(future))
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn poll_spawned_async_source_tasks_after_insertion() {
+    poll_test_async_source_tasks();
+}
+
+#[cfg(not(all(test, not(target_arch = "wasm32"))))]
+pub(crate) fn poll_spawned_async_source_tasks_after_insertion() {}
+
 /// The owned part of an actor - lives in the registry.
 /// Contains everything that doesn't need to be cloned for subscriptions.
 pub struct OwnedActor {
-    retained_tasks: SmallVec<[TaskHandle; 2]>,
+    scope_id: ScopeId,
     retained_actors: SmallVec<[ActorHandle; 2]>,
+    mailbox: VecDeque<ActorMailboxWorkItem>,
+    scheduled_for_runtime: bool,
     stored_state: ActorStoredState,
     /// Lazy delegate (kept alive by OwnedActor, referenced by ActorHandle for routing).
     lazy_delegate: Option<Arc<LazyValueActor>>,
@@ -3667,6 +5051,26 @@ struct Scope {
     parent: Option<ScopeId>,
     actors: Vec<ActorId>,
     children: Vec<ScopeId>,
+}
+
+enum RuntimeReadyItem {
+    ActorInput {
+        actor_id: ActorId,
+        work: ActorMailboxWorkItem,
+    },
+    Actor(ActorId),
+    ListInput {
+        stored_state: ListStoredState,
+        work: ListRuntimeWork,
+    },
+    List(ListStoredState),
+    AsyncSourceCleanup(AsyncSourceId),
+}
+
+enum ActorMailboxWorkItem {
+    Value(Value),
+    Clear,
+    SourceEnded,
 }
 
 /// Slot in a generational arena. Either occupied with data and its generation,
@@ -3689,10 +5093,17 @@ pub struct ActorRegistry {
     actor_free_list: Vec<u32>,
     scopes: Vec<Slot<Scope>>,
     scope_free_list: Vec<u32>,
+    async_sources: Vec<Slot<AsyncSourceEntry>>,
+    async_source_free_list: Vec<u32>,
+    runtime_ready_queue: VecDeque<RuntimeReadyItem>,
 }
 
 thread_local! {
     pub static REGISTRY: RefCell<ActorRegistry> = RefCell::new(ActorRegistry::new());
+}
+
+thread_local! {
+    static PENDING_LIST_ASYNC_SOURCE_CLEANUPS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
 impl ActorRegistry {
@@ -3702,6 +5113,9 @@ impl ActorRegistry {
             actor_free_list: Vec::new(),
             scopes: Vec::new(),
             scope_free_list: Vec::new(),
+            async_sources: Vec::new(),
+            async_source_free_list: Vec::new(),
+            runtime_ready_queue: VecDeque::new(),
         }
     }
 
@@ -3794,6 +5208,8 @@ impl ActorRegistry {
                     .retain(|child_id| *child_id != scope_id);
             }
         }
+
+        self.take_async_sources_for_scope(scope_id);
 
         // Destroy child scopes recursively
         for child_id in children {
@@ -3888,6 +5304,128 @@ impl ActorRegistry {
         }
     }
 
+    fn enqueue_actor_mailbox_value(&mut self, actor_id: ActorId, value: Value) {
+        self.enqueue_actor_mailbox_work(actor_id, ActorMailboxWorkItem::Value(value));
+    }
+
+    fn enqueue_actor_mailbox_clear(&mut self, actor_id: ActorId) {
+        self.enqueue_actor_mailbox_work(actor_id, ActorMailboxWorkItem::Clear);
+    }
+
+    fn enqueue_actor_mailbox_source_ended(&mut self, actor_id: ActorId) {
+        self.enqueue_actor_mailbox_work(actor_id, ActorMailboxWorkItem::SourceEnded);
+    }
+
+    fn enqueue_actor_runtime_input(&mut self, actor_id: ActorId, work: ActorMailboxWorkItem) {
+        self.runtime_ready_queue
+            .push_back(RuntimeReadyItem::ActorInput { actor_id, work });
+    }
+
+    fn enqueue_actor_mailbox_work(&mut self, actor_id: ActorId, work: ActorMailboxWorkItem) {
+        let should_schedule = if let Some(actor) = self.get_actor_mut(actor_id) {
+            actor.mailbox.push_back(work);
+            if actor.scheduled_for_runtime {
+                false
+            } else {
+                actor.scheduled_for_runtime = true;
+                true
+            }
+        } else {
+            false
+        };
+
+        if should_schedule {
+            self.runtime_ready_queue
+                .push_back(RuntimeReadyItem::Actor(actor_id));
+        }
+    }
+
+    fn enqueue_list_runtime_input(&mut self, stored_state: ListStoredState, work: ListRuntimeWork) {
+        self.runtime_ready_queue
+            .push_back(RuntimeReadyItem::ListInput { stored_state, work });
+    }
+
+    fn enqueue_list_runtime_work(&mut self, stored_state: ListStoredState, work: ListRuntimeWork) {
+        if stored_state.push_runtime_work(work) {
+            self.runtime_ready_queue
+                .push_back(RuntimeReadyItem::List(stored_state));
+        }
+    }
+
+    fn drain_runtime_ready_queue(&mut self) {
+        while let Some(item) = self.runtime_ready_queue.pop_front() {
+            match item {
+                RuntimeReadyItem::ActorInput { actor_id, work } => {
+                    self.enqueue_actor_mailbox_work(actor_id, work);
+                }
+                RuntimeReadyItem::Actor(actor_id) => {
+                    let Some((stored_state, mut mailbox)) = ({
+                        self.get_actor_mut(actor_id).map(|actor| {
+                            actor.scheduled_for_runtime = false;
+                            (
+                                actor.stored_state.clone(),
+                                std::mem::take(&mut actor.mailbox),
+                            )
+                        })
+                    }) else {
+                        continue;
+                    };
+
+                    while let Some(work) = mailbox.pop_front() {
+                        match work {
+                            ActorMailboxWorkItem::Value(value) => {
+                                publish_value_to_actor_state_with_registry(
+                                    self,
+                                    &stored_state,
+                                    value,
+                                );
+                            }
+                            ActorMailboxWorkItem::Clear => {
+                                clear_actor_state_with_registry(self, &stored_state);
+                            }
+                            ActorMailboxWorkItem::SourceEnded => {
+                                stored_state.set_has_future_state_updates(false);
+                            }
+                        }
+                    }
+
+                    let should_reschedule = if let Some(actor) = self.get_actor_mut(actor_id) {
+                        !actor.mailbox.is_empty() && !actor.scheduled_for_runtime
+                    } else {
+                        false
+                    };
+
+                    if should_reschedule {
+                        if let Some(actor) = self.get_actor_mut(actor_id) {
+                            actor.scheduled_for_runtime = true;
+                        }
+                        self.runtime_ready_queue
+                            .push_back(RuntimeReadyItem::Actor(actor_id));
+                    }
+                }
+                RuntimeReadyItem::ListInput { stored_state, work } => {
+                    self.enqueue_list_runtime_work(stored_state, work);
+                }
+                RuntimeReadyItem::List(stored_state) => {
+                    for work in stored_state.take_runtime_work() {
+                        process_list_runtime_work(self, &stored_state, work);
+                    }
+
+                    if stored_state.has_pending_runtime_work()
+                        && !stored_state.is_scheduled_for_runtime()
+                    {
+                        stored_state.set_scheduled_for_runtime(true);
+                        self.runtime_ready_queue
+                            .push_back(RuntimeReadyItem::List(stored_state));
+                    }
+                }
+                RuntimeReadyItem::AsyncSourceCleanup(async_source_id) => {
+                    let _ = self.take_async_source(async_source_id);
+                }
+            }
+        }
+    }
+
     /// Get a reference to a scope.
     fn get_scope(&self, scope_id: ScopeId) -> Option<&Scope> {
         let idx = usize::try_from(scope_id.index).ok()?;
@@ -3908,6 +5446,183 @@ impl ActorRegistry {
             }
             _ => None,
         }
+    }
+
+    fn insert_async_source(
+        &mut self,
+        scope_id: ScopeId,
+        task: AsyncSourceTaskHandle,
+    ) -> Option<AsyncSourceId> {
+        self.insert_async_source_entry(AsyncSourceEntry {
+            owner_scope: scope_id,
+            owner: AsyncSourceOwner::Scope(scope_id),
+            task: Some(task),
+        })
+    }
+
+    fn insert_async_source_for_list(
+        &mut self,
+        scope_id: ScopeId,
+        list_owner_key: usize,
+        task: AsyncSourceTaskHandle,
+    ) -> Option<AsyncSourceId> {
+        self.insert_async_source_entry(AsyncSourceEntry {
+            owner_scope: scope_id,
+            owner: AsyncSourceOwner::List(list_owner_key),
+            task: Some(task),
+        })
+    }
+
+    fn reserve_async_source_for_scope(&mut self, scope_id: ScopeId) -> Option<AsyncSourceId> {
+        self.insert_async_source_entry(AsyncSourceEntry {
+            owner_scope: scope_id,
+            owner: AsyncSourceOwner::Scope(scope_id),
+            task: None,
+        })
+    }
+
+    fn reserve_async_source_for_list(
+        &mut self,
+        scope_id: ScopeId,
+        list_owner_key: usize,
+    ) -> Option<AsyncSourceId> {
+        self.insert_async_source_entry(AsyncSourceEntry {
+            owner_scope: scope_id,
+            owner: AsyncSourceOwner::List(list_owner_key),
+            task: None,
+        })
+    }
+
+    fn set_async_source_task(
+        &mut self,
+        async_source_id: AsyncSourceId,
+        task: AsyncSourceTaskHandle,
+    ) -> bool {
+        let idx = match usize::try_from(async_source_id.index) {
+            Ok(idx) => idx,
+            Err(_) => return false,
+        };
+        let Some(Slot::Occupied { generation, value }) = self.async_sources.get_mut(idx) else {
+            return false;
+        };
+        if *generation != async_source_id.generation {
+            return false;
+        }
+        value.task = Some(task);
+        true
+    }
+
+    fn insert_async_source_entry(&mut self, entry: AsyncSourceEntry) -> Option<AsyncSourceId> {
+        if self.get_scope(entry.owner_scope).is_none() {
+            return None;
+        }
+
+        let (index, generation) = if let Some(free_idx) = self.async_source_free_list.pop() {
+            let idx = usize::try_from(free_idx).unwrap();
+            let next_gen = match &self.async_sources[idx] {
+                Slot::Free { next_generation } => *next_generation,
+                Slot::Occupied { .. } => {
+                    unreachable!("free list points to occupied async source slot")
+                }
+            };
+            self.async_sources[idx] = Slot::Occupied {
+                generation: next_gen,
+                value: entry,
+            };
+            (free_idx, next_gen)
+        } else {
+            let idx = u32::try_from(self.async_sources.len()).unwrap();
+            self.async_sources.push(Slot::Occupied {
+                generation: 0,
+                value: entry,
+            });
+            (idx, 0)
+        };
+
+        Some(AsyncSourceId { index, generation })
+    }
+
+    fn take_async_source(
+        &mut self,
+        async_source_id: AsyncSourceId,
+    ) -> Option<AsyncSourceTaskHandle> {
+        let idx = usize::try_from(async_source_id.index).ok()?;
+        match &self.async_sources.get(idx) {
+            Some(Slot::Occupied { generation, .. })
+                if *generation == async_source_id.generation => {}
+            _ => return None,
+        }
+
+        let old_gen = async_source_id.generation;
+        let task_slot = std::mem::replace(
+            &mut self.async_sources[idx],
+            Slot::Free {
+                next_generation: old_gen + 1,
+            },
+        );
+        self.async_source_free_list.push(async_source_id.index);
+        match task_slot {
+            Slot::Occupied { value, .. } => value.task,
+            Slot::Free { .. } => {
+                unreachable!("validated occupied async source slot before take_async_source")
+            }
+        }
+    }
+
+    fn take_async_sources_for_scope(&mut self, scope_id: ScopeId) {
+        let matching_ids: Vec<_> = self
+            .async_sources
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| match slot {
+                Slot::Occupied { generation, value } if value.owner_scope == scope_id => {
+                    Some(AsyncSourceId {
+                        index: u32::try_from(idx).unwrap(),
+                        generation: *generation,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+
+        for async_source_id in matching_ids {
+            let _ = self.take_async_source(async_source_id);
+        }
+    }
+
+    fn take_async_sources_for_list(&mut self, list_owner_key: usize) {
+        let matching_ids: Vec<_> = self
+            .async_sources
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| match slot {
+                Slot::Occupied { generation, value }
+                    if value.owner == AsyncSourceOwner::List(list_owner_key) =>
+                {
+                    Some(AsyncSourceId {
+                        index: u32::try_from(idx).unwrap(),
+                        generation: *generation,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+
+        for async_source_id in matching_ids {
+            let _ = self.take_async_source(async_source_id);
+        }
+    }
+
+    pub(crate) fn async_source_count_for_scope(&self, scope_id: ScopeId) -> usize {
+        self.async_sources
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot,
+                    Slot::Occupied { value, .. } if value.owner_scope == scope_id
+                )
+            })
+            .count()
     }
 }
 
@@ -3943,6 +5658,14 @@ impl ActorHandle {
         self.actor_id
     }
 
+    fn owning_scope_id(&self) -> Option<ScopeId> {
+        REGISTRY.with(|reg| {
+            reg.borrow()
+                .get_actor(self.actor_id)
+                .map(|actor| actor.scope_id)
+        })
+    }
+
     pub fn persistence_id(&self) -> parser::PersistenceId {
         self.persistence_id
     }
@@ -3959,12 +5682,74 @@ impl ActorHandle {
         self.lazy_delegate().is_some()
     }
 
+    pub(crate) fn has_lazy_delegate_with_registry(&self, reg: &ActorRegistry) -> bool {
+        self.lazy_delegate_with_registry(reg).is_some()
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        self.stored_state.is_alive()
+    }
+
+    pub(crate) fn register_direct_subscriber_with_registry<F>(
+        &self,
+        reg: &mut ActorRegistry,
+        subscriber: F,
+    ) where
+        F: Fn(&mut ActorRegistry, Option<&Value>) -> bool + 'static,
+    {
+        self.stored_state
+            .register_direct_subscriber(reg, Rc::new(subscriber));
+    }
+
+    /// Register a direct subscriber without a registry reference.
+    /// Uses the thread-local registry internally.
+    pub(crate) fn register_direct_subscriber<F>(&self, subscriber: F)
+    where
+        F: Fn(Option<&Value>) -> bool + 'static,
+    {
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            self.stored_state.register_direct_subscriber(
+                &mut reg,
+                Rc::new(move |_reg, value| subscriber(value)),
+            );
+            reg.drain_runtime_ready_queue();
+        });
+    }
+
+    fn lazy_delegate_with_registry(&self, reg: &ActorRegistry) -> Option<Arc<LazyValueActor>> {
+        reg.get_actor(self.actor_id)
+            .and_then(|owned_actor| owned_actor.lazy_delegate.clone())
+    }
+
     fn lazy_delegate(&self) -> Option<Arc<LazyValueActor>> {
         REGISTRY.with(|reg| {
-            reg.borrow()
-                .get_actor(self.actor_id)
-                .and_then(|owned_actor| owned_actor.lazy_delegate.clone())
+            reg.try_borrow()
+                .ok()
+                .and_then(|reg| self.lazy_delegate_with_registry(&reg))
         })
+    }
+
+    fn store_value_directly_with_registry(
+        &self,
+        mut reg: Option<&mut ActorRegistry>,
+        value: Value,
+    ) {
+        let has_lazy_delegate = match reg {
+            Some(ref reg) => self.lazy_delegate_with_registry(reg),
+            None => self.lazy_delegate(),
+        }
+        .is_some();
+
+        if !self.is_constant && !has_lazy_delegate && self.stored_state.is_alive() {
+            match reg.as_deref_mut() {
+                Some(reg) => {
+                    publish_value_to_actor_state_with_registry(reg, &self.stored_state, value);
+                    reg.drain_runtime_ready_queue();
+                }
+                None => publish_value_to_actor_state(&self.stored_state, value),
+            }
+        }
     }
 
     fn constant_value(&self) -> Option<Value> {
@@ -3975,9 +5760,7 @@ impl ActorHandle {
 
     /// Directly store a value, bypassing the async input stream.
     pub fn store_value_directly(&self, value: Value) {
-        if !self.is_constant && self.lazy_delegate().is_none() && self.stored_state.is_alive() {
-            publish_value_to_actor_state(&self.stored_state, value);
-        }
+        self.store_value_directly_with_registry(None, value);
     }
 
     /// Get the current stored value from direct actor state.
@@ -4057,11 +5840,18 @@ impl ActorHandle {
         }
 
         if let Some(lazy_delegate) = self.lazy_delegate() {
-            return lazy_delegate
+            return match lazy_delegate
                 .stream_from_cursor(self.version() as usize)
                 .next()
                 .await
-                .ok_or(ValueError::ActorDropped);
+            {
+                Some(value) => Ok(value),
+                None if !self.is_alive() => Err(ValueError::ActorDropped),
+                None if !self.stored_state.has_future_state_updates() => {
+                    Err(ValueError::SourceEndedWithoutValue)
+                }
+                None => Err(ValueError::ActorDropped),
+            };
         }
 
         self.stored_state
@@ -4096,10 +5886,23 @@ impl ActorHandle {
     }
 }
 
+pub(crate) fn enqueue_actor_value_on_runtime_queue_with_registry(
+    reg: &mut ActorRegistry,
+    actor: &ActorHandle,
+    value: Value,
+) {
+    reg.enqueue_actor_runtime_input(actor.actor_id, ActorMailboxWorkItem::Value(value));
+}
+
+pub(crate) fn drain_runtime_ready_queue_with_registry(reg: &mut ActorRegistry) {
+    reg.drain_runtime_ready_queue();
+}
+
 /// Create an actor in the registry and return a handle to interact with it.
 ///
 /// The retained runtime task goes into the registry under `scope_id`.
 /// The returned `ActorHandle` holds only direct state metadata — cloning it does NOT keep the actor alive.
+#[track_caller]
 pub fn create_actor<S>(
     value_stream: S,
     persistence_id: parser::PersistenceId,
@@ -4112,18 +5915,75 @@ where
         ActorStreamCreationPlan::Constant(value) => {
             create_constant_actor(persistence_id, value, scope_id)
         }
+        ActorStreamCreationPlan::EndedWithoutValue => {
+            create_ended_actor_without_value(persistence_id, scope_id, None)
+        }
         ActorStreamCreationPlan::Stream(value_stream) => {
             create_stream_driven_actor_arc_info(persistence_id, scope_id, None, value_stream)
         }
     }
 }
 
+pub(crate) fn create_actor_with_registry<S>(
+    reg: &mut ActorRegistry,
+    value_stream: S,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+) -> ActorHandle
+where
+    S: Stream<Item = Value> + 'static,
+{
+    match plan_actor_stream_creation(value_stream) {
+        ActorStreamCreationPlan::Constant(value) => {
+            create_constant_actor_with_registry(reg, persistence_id, value, scope_id)
+        }
+        ActorStreamCreationPlan::EndedWithoutValue => {
+            let actor = create_direct_state_actor_arc_info_with_registry(
+                reg,
+                persistence_id,
+                scope_id,
+                None,
+            );
+            actor.stored_state.set_has_future_state_updates(false);
+            actor
+        }
+        ActorStreamCreationPlan::Stream(value_stream) => {
+            create_stream_driven_actor_arc_info_with_registry(
+                reg,
+                persistence_id,
+                scope_id,
+                None,
+                value_stream,
+            )
+        }
+    }
+}
+
+#[track_caller]
 pub fn create_constant_actor(
     persistence_id: parser::PersistenceId,
     constant_value: Value,
     scope_id: ScopeId,
 ) -> ActorHandle {
     create_constant_actor_arc_info(persistence_id, constant_value, scope_id, None)
+}
+
+pub(crate) fn create_constant_actor_with_registry(
+    reg: &mut ActorRegistry,
+    persistence_id: parser::PersistenceId,
+    constant_value: Value,
+    scope_id: ScopeId,
+) -> ActorHandle {
+    let stored_state = ActorStoredState::with_initial_value(1, constant_value);
+    insert_owned_actor_handle_with_registry(
+        reg,
+        persistence_id,
+        scope_id,
+        stored_state,
+        None,
+        true,
+        None,
+    )
 }
 
 pub fn create_constant_actor_with_origin(
@@ -4140,13 +6000,147 @@ pub fn create_constant_actor_with_origin(
     )
 }
 
-fn publish_value_to_actor_state(stored_state: &ActorStoredState, new_value: Value) {
+pub(crate) fn create_constant_actor_with_origin_with_registry(
+    reg: &mut ActorRegistry,
+    persistence_id: parser::PersistenceId,
+    constant_value: Value,
+    origin: ListItemOrigin,
+    scope_id: ScopeId,
+) -> ActorHandle {
+    let stored_state = ActorStoredState::with_initial_value(1, constant_value);
+    insert_owned_actor_handle_with_registry(
+        reg,
+        persistence_id,
+        scope_id,
+        stored_state,
+        None,
+        true,
+        Some(Arc::new(origin)),
+    )
+}
+
+fn publish_value_to_actor_state_with_registry(
+    reg: &mut ActorRegistry,
+    stored_state: &ActorStoredState,
+    new_value: Value,
+) {
     let new_version = stored_state.store(new_value.clone());
+    stored_state.notify_direct_subscribers(reg, Some(&new_value));
     if LOG_ACTOR_FLOW {
         zoon::println!("[FLOW] actor state produced v{new_version}");
     }
 }
 
+fn clear_actor_state_with_registry(reg: &mut ActorRegistry, stored_state: &ActorStoredState) {
+    let new_version = stored_state.clear();
+    stored_state.notify_direct_subscribers(reg, None);
+    if LOG_ACTOR_FLOW {
+        zoon::println!("[FLOW] actor state cleared at v{new_version}");
+    }
+}
+
+fn publish_value_to_actor_state(stored_state: &ActorStoredState, new_value: Value) {
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        publish_value_to_actor_state_with_registry(&mut reg, stored_state, new_value);
+        reg.drain_runtime_ready_queue();
+    });
+}
+
+pub(crate) fn enqueue_actor_value_on_runtime_queue(actor: &ActorHandle, new_value: Value) {
+    enqueue_actor_value_on_runtime_queue_by_id(actor.actor_id, new_value);
+}
+
+fn enqueue_actor_value_on_runtime_queue_by_id_with_registry(
+    reg: &mut ActorRegistry,
+    actor_id: ActorId,
+    new_value: Value,
+) {
+    reg.enqueue_actor_runtime_input(actor_id, ActorMailboxWorkItem::Value(new_value));
+    reg.drain_runtime_ready_queue();
+}
+
+pub(crate) fn enqueue_actor_value_on_runtime_queue_by_id(actor_id: ActorId, new_value: Value) {
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        enqueue_actor_value_on_runtime_queue_by_id_with_registry(&mut reg, actor_id, new_value);
+    });
+}
+
+pub(crate) fn enqueue_actor_clear_on_runtime_queue(actor: &ActorHandle) {
+    enqueue_actor_clear_on_runtime_queue_by_id(actor.actor_id);
+}
+
+pub(crate) fn enqueue_actor_clear_on_runtime_queue_by_id(actor_id: ActorId) {
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        reg.enqueue_actor_runtime_input(actor_id, ActorMailboxWorkItem::Clear);
+        reg.drain_runtime_ready_queue();
+    });
+}
+
+pub(crate) fn enqueue_actor_source_end_on_runtime_queue(actor: &ActorHandle) {
+    enqueue_actor_source_end_on_runtime_queue_by_id(actor.actor_id);
+}
+
+fn enqueue_actor_source_end_on_runtime_queue_by_id_with_registry(
+    reg: &mut ActorRegistry,
+    actor_id: ActorId,
+) {
+    reg.enqueue_actor_runtime_input(actor_id, ActorMailboxWorkItem::SourceEnded);
+    reg.drain_runtime_ready_queue();
+}
+
+pub(crate) fn enqueue_actor_source_end_on_runtime_queue_by_id(actor_id: ActorId) {
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        enqueue_actor_source_end_on_runtime_queue_by_id_with_registry(&mut reg, actor_id);
+    });
+}
+
+fn enqueue_list_work_on_runtime_queue_with_registry(
+    reg: &mut ActorRegistry,
+    stored_state: &ListStoredState,
+    work: ListRuntimeWork,
+) {
+    reg.enqueue_list_runtime_input(stored_state.clone(), work);
+    reg.drain_runtime_ready_queue();
+}
+
+fn enqueue_list_work_on_runtime_queue(stored_state: &ListStoredState, work: ListRuntimeWork) {
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        enqueue_list_work_on_runtime_queue_with_registry(&mut reg, stored_state, work);
+    });
+}
+
+fn enqueue_async_source_cleanup_on_runtime_queue(async_source_id: AsyncSourceId) {
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        reg.runtime_ready_queue
+            .push_back(RuntimeReadyItem::AsyncSourceCleanup(async_source_id));
+        reg.drain_runtime_ready_queue();
+    });
+}
+
+pub(crate) fn enqueue_list_change_on_runtime_queue_with_registry(
+    reg: &mut ActorRegistry,
+    list: &Arc<List>,
+    construct_info: ConstructInfoComplete,
+    change: ListChange,
+    broadcast_change: bool,
+) {
+    reg.enqueue_list_runtime_input(
+        list.stored_state.clone(),
+        ListRuntimeWork::Change {
+            construct_info,
+            change,
+            broadcast_change,
+        },
+    );
+}
+
+#[track_caller]
 fn insert_owned_actor_handle(
     persistence_id: parser::PersistenceId,
     scope_id: ScopeId,
@@ -4161,8 +6155,10 @@ fn insert_owned_actor_handle(
     let actor_id = insert_actor_and_drain(
         scope_id,
         OwnedActor {
-            retained_tasks: SmallVec::new(),
+            scope_id,
             retained_actors: SmallVec::new(),
+            mailbox: VecDeque::new(),
+            scheduled_for_runtime: false,
             stored_state: stored_state.clone(),
             lazy_delegate: lazy_delegate.clone(),
         },
@@ -4177,6 +6173,40 @@ fn insert_owned_actor_handle(
     }
 }
 
+fn insert_owned_actor_handle_with_registry(
+    reg: &mut ActorRegistry,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+    stored_state: ActorStoredState,
+    lazy_delegate: Option<Arc<LazyValueActor>>,
+    is_constant: bool,
+    list_item_origin: Option<Arc<ListItemOrigin>>,
+) -> ActorHandle {
+    LIVE_ACTOR_COUNT.with(|c| c.set(c.get() + 1));
+
+    let actor_id = insert_actor_with_registry(
+        reg,
+        scope_id,
+        OwnedActor {
+            scope_id,
+            retained_actors: SmallVec::new(),
+            mailbox: VecDeque::new(),
+            scheduled_for_runtime: false,
+            stored_state: stored_state.clone(),
+            lazy_delegate: lazy_delegate.clone(),
+        },
+    );
+
+    ActorHandle {
+        actor_id,
+        stored_state,
+        persistence_id,
+        is_constant,
+        list_item_origin,
+    }
+}
+
+#[track_caller]
 fn create_constant_actor_arc_info(
     persistence_id: parser::PersistenceId,
     constant_value: Value,
@@ -4194,6 +6224,7 @@ fn create_constant_actor_arc_info(
     )
 }
 
+#[track_caller]
 fn create_direct_state_actor_arc_info(
     persistence_id: parser::PersistenceId,
     scope_id: ScopeId,
@@ -4210,6 +6241,25 @@ fn create_direct_state_actor_arc_info(
     )
 }
 
+fn create_direct_state_actor_arc_info_with_registry(
+    reg: &mut ActorRegistry,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+    list_item_origin: Option<Arc<ListItemOrigin>>,
+) -> ActorHandle {
+    let stored_state = ActorStoredState::new(64);
+    insert_owned_actor_handle_with_registry(
+        reg,
+        persistence_id,
+        scope_id,
+        stored_state,
+        None,
+        false,
+        list_item_origin,
+    )
+}
+
+#[track_caller]
 fn create_stream_driven_actor_arc_info<S>(
     persistence_id: parser::PersistenceId,
     scope_id: ScopeId,
@@ -4225,21 +6275,75 @@ where
     loop {
         match poll_stream_once(value_stream.as_mut()) {
             Poll::Ready(Some(value)) => actor.store_value_directly(value),
-            Poll::Ready(None) => return actor,
+            Poll::Ready(None) => {
+                actor.stored_state.set_has_future_state_updates(false);
+                return actor;
+            }
             Poll::Pending => break,
         }
     }
 
-    let actor_for_task = actor.clone();
-    start_retained_actor_task(&actor, async move {
-        if LOG_ACTOR_FLOW {
-            zoon::println!("[FLOW] Actor stream task STARTED");
-        }
-        drain_value_stream_to_actor_state(actor_for_task, value_stream).await;
-    });
+    let actor_id = actor.actor_id;
+    start_retained_actor_external_stream_feeder_task(
+        &actor,
+        value_stream,
+        move |reg, value| {
+            enqueue_actor_value_on_runtime_queue_by_id_with_registry(reg, actor_id, value);
+        },
+        move |reg| {
+            enqueue_actor_source_end_on_runtime_queue_by_id_with_registry(reg, actor_id);
+        },
+    );
     actor
 }
 
+fn create_stream_driven_actor_arc_info_with_registry<S>(
+    reg: &mut ActorRegistry,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+    list_item_origin: Option<Arc<ListItemOrigin>>,
+    value_stream: S,
+) -> ActorHandle
+where
+    S: Stream<Item = Value> + 'static,
+{
+    let actor = create_direct_state_actor_arc_info_with_registry(
+        reg,
+        persistence_id,
+        scope_id,
+        list_item_origin,
+    );
+    let mut value_stream = value_stream.boxed_local();
+
+    loop {
+        match poll_stream_once(value_stream.as_mut()) {
+            Poll::Ready(Some(value)) => actor.store_value_directly_with_registry(Some(reg), value),
+            Poll::Ready(None) => {
+                actor.stored_state.set_has_future_state_updates(false);
+                return actor;
+            }
+            Poll::Pending => break,
+        }
+    }
+
+    let actor_id = actor.actor_id;
+    start_retained_actor_scope_task_with_registry(reg, &actor, async move {
+        drain_external_stream_to_runtime_queue(
+            value_stream,
+            move |reg, value| {
+                enqueue_actor_value_on_runtime_queue_by_id_with_registry(reg, actor_id, value);
+            },
+            move |reg| {
+                enqueue_actor_source_end_on_runtime_queue_by_id_with_registry(reg, actor_id);
+            },
+        )
+        .await;
+    });
+    poll_spawned_async_source_tasks_after_insertion();
+    actor
+}
+
+#[track_caller]
 fn create_lazy_stream_driven_actor_arc_info<S>(
     persistence_id: parser::PersistenceId,
     scope_id: ScopeId,
@@ -4260,15 +6364,63 @@ where
         false,
         None,
     );
-    start_retained_actor_task(
-        &actor,
-        LazyValueActor::internal_loop(value_stream, request_rx, stored_state_for_loop),
+    let actor_id = actor.actor_id;
+    let actor_for_start = actor.clone();
+    lazy_actor.install_start_loop(Box::new(move || {
+        start_retained_actor_scope_task(&actor_for_start, async move {
+            LazyValueActor::internal_loop(
+                value_stream,
+                request_rx,
+                Some(actor_id),
+                stored_state_for_loop,
+            )
+            .await;
+        });
+    }));
+    actor
+}
+
+fn create_lazy_stream_driven_actor_arc_info_with_registry<S>(
+    reg: &mut ActorRegistry,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+    value_stream: S,
+) -> ActorHandle
+where
+    S: Stream<Item = Value> + 'static,
+{
+    let stored_state = ActorStoredState::new(64);
+    let stored_state_for_loop = stored_state.clone();
+    let (lazy_actor, request_rx) = LazyValueActor::new_unstarted();
+    let lazy_actor = Arc::new(lazy_actor);
+    let actor = insert_owned_actor_handle_with_registry(
+        reg,
+        persistence_id,
+        scope_id,
+        stored_state,
+        Some(lazy_actor.clone()),
+        false,
+        None,
     );
+    let actor_id = actor.actor_id;
+    let actor_for_start = actor.clone();
+    lazy_actor.install_start_loop(Box::new(move || {
+        start_retained_actor_scope_task(&actor_for_start, async move {
+            LazyValueActor::internal_loop(
+                value_stream,
+                request_rx,
+                Some(actor_id),
+                stored_state_for_loop,
+            )
+            .await;
+        });
+    }));
     actor
 }
 
 enum ActorStreamCreationPlan {
     Constant(Value),
+    EndedWithoutValue,
     Stream(LocalBoxStream<'static, Value>),
 }
 
@@ -4292,8 +6444,20 @@ where
                     .boxed_local(),
             ),
         },
-        Poll::Ready(None) | Poll::Pending => ActorStreamCreationPlan::Stream(value_stream),
+        Poll::Ready(None) => ActorStreamCreationPlan::EndedWithoutValue,
+        Poll::Pending => ActorStreamCreationPlan::Stream(value_stream),
     }
+}
+
+#[track_caller]
+fn create_ended_actor_without_value(
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+    list_item_origin: Option<Arc<ListItemOrigin>>,
+) -> ActorHandle {
+    let actor = create_direct_state_actor_arc_info(persistence_id, scope_id, list_item_origin);
+    actor.stored_state.set_has_future_state_updates(false);
+    actor
 }
 
 pub fn create_actor_from_future<F>(
@@ -4304,11 +6468,53 @@ pub fn create_actor_from_future<F>(
 where
     F: Future<Output = Value> + 'static,
 {
-    create_actor(
-        stream::once(async move { value_future.await }),
-        persistence_id,
-        scope_id,
-    )
+    let mut value_future = Box::pin(value_future);
+    match poll_future_once(value_future.as_mut()) {
+        Poll::Ready(value) => create_constant_actor(persistence_id, value, scope_id),
+        Poll::Pending => {
+            let actor = create_direct_state_actor_arc_info(persistence_id, scope_id, None);
+            let actor_id = actor.actor_id;
+            start_retained_actor_scope_task(&actor, async move {
+                let value = value_future.await;
+                enqueue_actor_value_on_runtime_queue_by_id(actor_id, value);
+                enqueue_actor_source_end_on_runtime_queue_by_id(actor_id);
+            });
+            actor
+        }
+    }
+}
+
+pub(crate) fn create_actor_from_future_with_registry<F>(
+    reg: &mut ActorRegistry,
+    value_future: F,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+) -> ActorHandle
+where
+    F: Future<Output = Value> + 'static,
+{
+    let mut value_future = Box::pin(value_future);
+    match poll_future_once(value_future.as_mut()) {
+        Poll::Ready(value) => {
+            create_constant_actor_with_registry(reg, persistence_id, value, scope_id)
+        }
+        Poll::Pending => {
+            let actor = create_direct_state_actor_arc_info_with_registry(
+                reg,
+                persistence_id,
+                scope_id,
+                None,
+            );
+            let actor_id = actor.actor_id;
+            start_retained_actor_scope_task_with_registry(reg, &actor, async move {
+                let value = value_future.await;
+                enqueue_actor_value_on_runtime_queue_by_id(actor_id, value);
+                enqueue_actor_source_end_on_runtime_queue_by_id(actor_id);
+            });
+            poll_spawned_async_source_tasks_after_insertion();
+            actor
+        }
+    }
 }
 
 pub fn create_actor_lazy_from_future<F>(
@@ -4340,27 +6546,496 @@ where
         Poll::Ready(Some(source_actor)) => {
             connect_forwarding_current_and_future(forwarding_actor.clone(), source_actor);
         }
-        Poll::Ready(None) => {}
+        Poll::Ready(None) => {
+            forwarding_actor
+                .stored_state
+                .set_has_future_state_updates(false);
+        }
         Poll::Pending => {
             let forwarding_actor_for_task = forwarding_actor.clone();
-            start_retained_actor_task(&forwarding_actor, async move {
+            let forwarding_actor_id = forwarding_actor.actor_id;
+            start_retained_actor_scope_task(&forwarding_actor, async move {
                 let Some(source_actor) = source_future.await else {
+                    enqueue_actor_source_end_on_runtime_queue_by_id(forwarding_actor_id);
                     return;
                 };
-                forward_current_and_future_from_source(forwarding_actor_for_task, source_actor)
-                    .await;
+                connect_forwarding_current_and_future(forwarding_actor_for_task, source_actor);
             });
         }
     }
     forwarding_actor
 }
 
+pub(crate) fn create_actor_forwarding_from_future_source_with_registry<F>(
+    reg: &mut ActorRegistry,
+    source_future: F,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+) -> ActorHandle
+where
+    F: Future<Output = Option<ActorHandle>> + 'static,
+{
+    let forwarding_actor = create_actor_forwarding_with_registry(reg, persistence_id, scope_id);
+    let mut source_future = Box::pin(source_future);
+    match poll_future_once(source_future.as_mut()) {
+        Poll::Ready(Some(source_actor)) => {
+            connect_forwarding_current_and_future_with_registry(
+                Some(reg),
+                forwarding_actor.clone(),
+                source_actor,
+            );
+            reg.drain_runtime_ready_queue();
+        }
+        Poll::Ready(None) => {
+            forwarding_actor
+                .stored_state
+                .set_has_future_state_updates(false);
+        }
+        Poll::Pending => {
+            let forwarding_actor_for_task = forwarding_actor.clone();
+            let forwarding_actor_id = forwarding_actor.actor_id;
+            start_retained_actor_scope_task_with_registry(reg, &forwarding_actor, async move {
+                let Some(source_actor) = source_future.await else {
+                    enqueue_actor_source_end_on_runtime_queue_by_id(forwarding_actor_id);
+                    return;
+                };
+                REGISTRY.with(|reg| {
+                    let mut reg = reg.borrow_mut();
+                    connect_forwarding_current_and_future_with_registry(
+                        Some(&mut reg),
+                        forwarding_actor_for_task,
+                        source_actor,
+                    );
+                    reg.drain_runtime_ready_queue();
+                });
+            });
+        }
+    }
+
+    forwarding_actor
+}
+
 /// Create a forwarding actor backed only by direct stored state.
+#[track_caller]
 pub fn create_actor_forwarding(
     persistence_id: parser::PersistenceId,
     scope_id: ScopeId,
 ) -> ActorHandle {
     create_direct_state_actor_arc_info(persistence_id, scope_id, None)
+}
+
+pub(crate) fn create_actor_forwarding_with_registry(
+    reg: &mut ActorRegistry,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+) -> ActorHandle {
+    create_direct_state_actor_arc_info_with_registry(reg, persistence_id, scope_id, None)
+}
+
+pub(crate) fn create_actor_forwarding_with_origin(
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+    origin: ListItemOrigin,
+) -> ActorHandle {
+    create_direct_state_actor_arc_info(persistence_id, scope_id, Some(Arc::new(origin)))
+}
+
+pub(crate) fn create_actor_forwarding_with_registry_and_origin(
+    reg: &mut ActorRegistry,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+    origin: ListItemOrigin,
+) -> ActorHandle {
+    create_direct_state_actor_arc_info_with_registry(
+        reg,
+        persistence_id,
+        scope_id,
+        Some(Arc::new(origin)),
+    )
+}
+
+pub(crate) fn register_list_direct_subscriber_with_registry<F>(
+    reg: &mut ActorRegistry,
+    list: &Arc<List>,
+    subscriber: F,
+) where
+    F: Fn(&mut ActorRegistry, &ListChange) -> bool + 'static,
+{
+    list.stored_state
+        .register_direct_subscriber(reg, Rc::new(subscriber));
+}
+
+/// Watch an actor's current-or-future values while tying the watcher to the owner actor.
+///
+/// Eager sources stay on direct subscribers. Lazy sources still need one retained watcher,
+/// but the callback path stays shared and runtime-queue owned.
+pub(crate) fn watch_actor_current_and_future_until_with_registry<F>(
+    reg: Option<&mut ActorRegistry>,
+    owner: &ActorHandle,
+    source_actor: &ActorHandle,
+    skip_initial_lazy_value: bool,
+    on_value: F,
+) where
+    F: FnMut(&mut ActorRegistry, Value) -> bool + 'static,
+{
+    let on_value = Rc::new(RefCell::new(on_value));
+    match reg {
+        Some(reg) => {
+            if source_actor.has_lazy_delegate_with_registry(reg) {
+                let owner_for_task = owner.clone();
+                let source_actor = source_actor.clone();
+                let on_value = on_value.clone();
+                start_retained_actor_scope_task_with_registry(reg, owner, async move {
+                    let mut source_stream = std::pin::pin!(source_actor.current_or_future_stream());
+                    let mut skip_initial_lazy_value = skip_initial_lazy_value;
+                    while let Some(value) = source_stream.next().await {
+                        if !owner_for_task.is_alive() {
+                            break;
+                        }
+                        if skip_initial_lazy_value {
+                            skip_initial_lazy_value = false;
+                            continue;
+                        }
+                        let done = REGISTRY.with(|reg| {
+                            let mut reg = reg.borrow_mut();
+                            if !owner_for_task.is_alive() {
+                                return true;
+                            }
+                            let done = (on_value.borrow_mut())(&mut reg, value);
+                            drain_runtime_ready_queue_with_registry(&mut reg);
+                            done
+                        });
+                        if done {
+                            break;
+                        }
+                    }
+                });
+            } else {
+                source_actor.register_direct_subscriber_with_registry(reg, {
+                    let owner = owner.clone();
+                    let on_value = on_value.clone();
+                    move |reg, value| {
+                        if !owner.is_alive() {
+                            return false;
+                        }
+                        let Some(value) = value else {
+                            return true;
+                        };
+                        !(on_value.borrow_mut())(reg, value.clone())
+                    }
+                });
+            }
+        }
+        None => {
+            if source_actor.has_lazy_delegate() {
+                let owner_for_task = owner.clone();
+                let source_actor = source_actor.clone();
+                let on_value = on_value.clone();
+                start_retained_actor_scope_task(owner, async move {
+                    let mut source_stream = std::pin::pin!(source_actor.current_or_future_stream());
+                    let mut skip_initial_lazy_value = skip_initial_lazy_value;
+                    while let Some(value) = source_stream.next().await {
+                        if !owner_for_task.is_alive() {
+                            break;
+                        }
+                        if skip_initial_lazy_value {
+                            skip_initial_lazy_value = false;
+                            continue;
+                        }
+                        let done = REGISTRY.with(|reg| {
+                            let mut reg = reg.borrow_mut();
+                            if !owner_for_task.is_alive() {
+                                return true;
+                            }
+                            let done = (on_value.borrow_mut())(&mut reg, value);
+                            drain_runtime_ready_queue_with_registry(&mut reg);
+                            done
+                        });
+                        if done {
+                            break;
+                        }
+                    }
+                });
+            } else {
+                REGISTRY.with(|reg| {
+                    let mut reg = reg.borrow_mut();
+                    source_actor.register_direct_subscriber_with_registry(&mut reg, {
+                        let owner = owner.clone();
+                        let on_value = on_value.clone();
+                        move |reg, value| {
+                            if !owner.is_alive() {
+                                return false;
+                            }
+                            let Some(value) = value else {
+                                return true;
+                            };
+                            !(on_value.borrow_mut())(reg, value.clone())
+                        }
+                    });
+                });
+            }
+        }
+    }
+}
+
+pub(crate) fn watch_actor_current_and_future_with_registry<F>(
+    reg: Option<&mut ActorRegistry>,
+    owner: &ActorHandle,
+    source_actor: &ActorHandle,
+    skip_initial_lazy_value: bool,
+    mut on_value: F,
+) where
+    F: FnMut(&mut ActorRegistry, Value) + 'static,
+{
+    watch_actor_current_and_future_until_with_registry(
+        reg,
+        owner,
+        source_actor,
+        skip_initial_lazy_value,
+        move |reg, value| {
+            on_value(reg, value);
+            false
+        },
+    );
+}
+
+fn connect_direct_state_output_source_with_registry<F>(
+    mut reg: Option<&mut ActorRegistry>,
+    output: &ActorHandle,
+    source_actor: &ActorHandle,
+    idx: usize,
+    on_source_value: Rc<RefCell<F>>,
+) -> bool
+where
+    F: FnMut(usize, Value) -> Option<Value> + 'static,
+{
+    let source_is_lazy = match reg.as_deref_mut() {
+        Some(reg) => source_actor.has_lazy_delegate_with_registry(reg),
+        None => source_actor.has_lazy_delegate(),
+    };
+
+    if source_is_lazy {
+        let output = output.clone();
+        let output_for_callback = output.clone();
+        watch_actor_current_and_future_with_registry(
+            reg,
+            &output,
+            source_actor,
+            false,
+            move |reg, value| {
+                if let Some(mapped_value) = (on_source_value.borrow_mut())(idx, value) {
+                    enqueue_actor_value_on_runtime_queue_with_registry(
+                        reg,
+                        &output_for_callback,
+                        mapped_value,
+                    );
+                }
+            },
+        );
+        return true;
+    }
+
+    let source_state = source_actor.stored_state.clone();
+    match reg {
+        Some(reg) => {
+            source_state.register_direct_subscriber(
+                reg,
+                Rc::new({
+                    let output = output.clone();
+                    let on_source_value = on_source_value.clone();
+                    let source_state = source_state.clone();
+                    move |reg, value| {
+                        if !output.is_alive() {
+                            return false;
+                        }
+
+                        let Some(value) = value else {
+                            return source_state.is_alive();
+                        };
+
+                        if let Some(mapped_value) =
+                            (on_source_value.borrow_mut())(idx, value.clone())
+                        {
+                            enqueue_actor_value_on_runtime_queue_with_registry(
+                                reg,
+                                &output,
+                                mapped_value,
+                            );
+                        }
+
+                        source_state.is_alive()
+                    }
+                }),
+            );
+        }
+        None => {
+            REGISTRY.with(|reg| {
+                let mut reg = reg.borrow_mut();
+                source_state.register_direct_subscriber(
+                    &mut reg,
+                    Rc::new({
+                        let output = output.clone();
+                        let on_source_value = on_source_value.clone();
+                        let source_state = source_state.clone();
+                        move |reg, value| {
+                            if !output.is_alive() {
+                                return false;
+                            }
+
+                            let Some(value) = value else {
+                                return source_state.is_alive();
+                            };
+
+                            if let Some(mapped_value) =
+                                (on_source_value.borrow_mut())(idx, value.clone())
+                            {
+                                enqueue_actor_value_on_runtime_queue_with_registry(
+                                    reg,
+                                    &output,
+                                    mapped_value,
+                                );
+                            }
+
+                            source_state.is_alive()
+                        }
+                    }),
+                );
+            });
+        }
+    }
+
+    false
+}
+
+pub(crate) fn try_create_direct_state_subscriber_actor_with_registry<F>(
+    mut reg: Option<&mut ActorRegistry>,
+    sources: Vec<ActorHandle>,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+    on_source_value: F,
+) -> Option<ActorHandle>
+where
+    F: FnMut(usize, Value) -> Option<Value> + 'static,
+{
+    let output = match reg.as_deref_mut() {
+        Some(reg) => create_actor_forwarding_with_registry(reg, persistence_id, scope_id),
+        None => create_actor_forwarding(persistence_id, scope_id),
+    };
+    retain_actor_handles_with_registry(reg.as_deref_mut(), &output, sources.iter().cloned());
+
+    let on_source_value = Rc::new(RefCell::new(on_source_value));
+    let mut spawned_lazy_watchers = false;
+    match reg {
+        Some(reg) => {
+            for (idx, source_actor) in sources.iter().enumerate() {
+                spawned_lazy_watchers |= connect_direct_state_output_source_with_registry(
+                    Some(reg),
+                    &output,
+                    source_actor,
+                    idx,
+                    on_source_value.clone(),
+                );
+            }
+            reg.drain_runtime_ready_queue();
+        }
+        None => {
+            for (idx, source_actor) in sources.iter().enumerate() {
+                spawned_lazy_watchers |= connect_direct_state_output_source_with_registry(
+                    None,
+                    &output,
+                    source_actor,
+                    idx,
+                    on_source_value.clone(),
+                );
+            }
+            REGISTRY.with(|reg| reg.borrow_mut().drain_runtime_ready_queue());
+        }
+    }
+
+    if spawned_lazy_watchers {
+        poll_spawned_async_source_tasks_after_insertion();
+    }
+
+    Some(output)
+}
+
+pub(crate) fn try_create_direct_state_subscriber_actor<F>(
+    sources: Vec<ActorHandle>,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+    on_source_value: F,
+) -> Option<ActorHandle>
+where
+    F: FnMut(usize, Value) -> Option<Value> + 'static,
+{
+    try_create_direct_state_subscriber_actor_with_registry(
+        None,
+        sources,
+        persistence_id,
+        scope_id,
+        on_source_value,
+    )
+}
+
+/// Like `try_create_direct_state_subscriber_actor_with_registry`, but with list item
+/// origin metadata on the output actor. This allows direct-state list items to avoid
+/// the retained feeder-task path when their source is non-lazy.
+pub(crate) fn try_create_direct_state_subscriber_actor_with_origin<F>(
+    mut reg: Option<&mut ActorRegistry>,
+    sources: Vec<ActorHandle>,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+    origin: ListItemOrigin,
+    on_source_value: F,
+) -> Option<ActorHandle>
+where
+    F: FnMut(usize, Value) -> Option<Value> + 'static,
+{
+    let origin = Arc::new(origin);
+    let output = match reg.as_deref_mut() {
+        Some(reg) => create_direct_state_actor_arc_info_with_registry(
+            reg,
+            persistence_id,
+            scope_id,
+            Some(origin),
+        ),
+        None => create_direct_state_actor_arc_info(persistence_id, scope_id, Some(origin)),
+    };
+
+    let on_source_value = Rc::new(RefCell::new(on_source_value));
+    let mut spawned_lazy_watchers = false;
+    match reg {
+        Some(reg) => {
+            for (idx, source_actor) in sources.iter().enumerate() {
+                spawned_lazy_watchers |= connect_direct_state_output_source_with_registry(
+                    Some(reg),
+                    &output,
+                    source_actor,
+                    idx,
+                    on_source_value.clone(),
+                );
+            }
+            reg.drain_runtime_ready_queue();
+        }
+        None => {
+            for (idx, source_actor) in sources.iter().enumerate() {
+                spawned_lazy_watchers |= connect_direct_state_output_source_with_registry(
+                    None,
+                    &output,
+                    source_actor,
+                    idx,
+                    on_source_value.clone(),
+                );
+            }
+            REGISTRY.with(|reg| reg.borrow_mut().drain_runtime_ready_queue());
+        }
+    }
+
+    if spawned_lazy_watchers {
+        poll_spawned_async_source_tasks_after_insertion();
+    }
+
+    Some(output)
 }
 
 /// Create an actor with list item origin metadata.
@@ -4375,6 +7050,9 @@ pub fn create_actor_with_origin<S: Stream<Item = Value> + 'static>(
         ActorStreamCreationPlan::Constant(value) => {
             create_constant_actor_arc_info(persistence_id, value, scope_id, Some(origin))
         }
+        ActorStreamCreationPlan::EndedWithoutValue => {
+            create_ended_actor_without_value(persistence_id, scope_id, Some(origin))
+        }
         ActorStreamCreationPlan::Stream(value_stream) => create_stream_driven_actor_arc_info(
             persistence_id,
             scope_id,
@@ -4384,33 +7062,240 @@ pub fn create_actor_with_origin<S: Stream<Item = Value> + 'static>(
     }
 }
 
-async fn drain_value_stream_to_actor_state<S>(target_actor: ActorHandle, value_stream: S)
+async fn drain_value_stream_to_actor_state<S>(target_actor_id: ActorId, value_stream: S)
 where
     S: Stream<Item = Value> + 'static,
 {
-    let mut value_stream = pin!(value_stream);
-    while let Some(value) = value_stream.next().await {
-        if !target_actor.stored_state.is_alive() {
-            break;
-        }
-        target_actor.store_value_directly(value);
-    }
+    drain_external_stream_to_runtime_queue(
+        value_stream,
+        move |reg, value| {
+            enqueue_actor_value_on_runtime_queue_by_id_with_registry(reg, target_actor_id, value);
+        },
+        move |reg| {
+            enqueue_actor_source_end_on_runtime_queue_by_id_with_registry(reg, target_actor_id);
+        },
+    )
+    .await;
 }
 
-pub fn retain_actor_task(actor: &ActorHandle, task: TaskHandle) {
+fn start_retained_external_stream_task_until<S, T, F, G, C>(
+    scope_id: ScopeId,
+    cancel: C,
+    source_stream: S,
+    on_item: F,
+    on_end: G,
+) where
+    S: Stream<Item = T> + 'static,
+    T: 'static,
+    F: FnMut(&mut ActorRegistry, T) + 'static,
+    G: FnMut(&mut ActorRegistry) + 'static,
+    C: Future + 'static,
+{
+    start_retained_scope_task_until(
+        scope_id,
+        cancel,
+        drain_external_stream_to_runtime_queue(source_stream, on_item, on_end),
+    );
+}
+
+fn start_retained_actor_external_stream_feeder_task<S, T, F, G>(
+    actor: &ActorHandle,
+    source_stream: S,
+    on_item: F,
+    on_end: G,
+) where
+    S: Stream<Item = T> + 'static,
+    T: 'static,
+    F: FnMut(&mut ActorRegistry, T) + 'static,
+    G: FnMut(&mut ActorRegistry) + 'static,
+{
+    let Some(drop_waiter) = actor.stored_state.wait_for_drop() else {
+        return;
+    };
+    let Some(scope_id) = REGISTRY.with(|reg| {
+        reg.borrow()
+            .get_actor(actor.actor_id)
+            .map(|actor| actor.scope_id)
+    }) else {
+        return;
+    };
+
+    start_retained_external_stream_task_until(
+        scope_id,
+        drop_waiter,
+        source_stream,
+        on_item,
+        on_end,
+    );
+}
+
+fn start_retained_list_external_stream_feeder_task<S, T, F, G>(
+    stored_state: &ListStoredState,
+    scope_id: ScopeId,
+    source_stream: S,
+    on_item: F,
+    on_end: G,
+) where
+    S: Stream<Item = T> + 'static,
+    T: 'static,
+    F: FnMut(&mut ActorRegistry, T) + 'static,
+    G: FnMut(&mut ActorRegistry) + 'static,
+{
+    let Some(drop_waiter) = stored_state.wait_for_drop() else {
+        return;
+    };
+
+    start_retained_external_stream_task_until(
+        scope_id,
+        drop_waiter,
+        source_stream,
+        on_item,
+        on_end,
+    );
+}
+
+fn retain_scope_task(scope_id: ScopeId, task: AsyncSourceTaskHandle) {
     REGISTRY.with(|reg| {
         let mut reg = reg.borrow_mut();
-        if let Some(owned_actor) = reg.get_actor_mut(actor.actor_id) {
-            owned_actor.retained_tasks.push(task);
+        let _ = reg.insert_async_source(scope_id, task);
+    });
+}
+
+fn start_retained_scope_task_with_registry<F>(reg: &mut ActorRegistry, scope_id: ScopeId, future: F)
+where
+    F: Future<Output = ()> + 'static,
+{
+    let Some(async_source_id) = reg.reserve_async_source_for_scope(scope_id) else {
+        return;
+    };
+    let task = spawn_async_source_task_for_reserved_slot(async move {
+        future.await;
+        enqueue_async_source_cleanup_on_runtime_queue(async_source_id);
+    });
+    let inserted = reg.set_async_source_task(async_source_id, task);
+    assert!(
+        inserted,
+        "reserved scope feeder task slot should stay valid until task insertion"
+    );
+}
+
+pub(crate) fn start_retained_scope_task<F>(scope_id: ScopeId, future: F)
+where
+    F: Future<Output = ()> + 'static,
+{
+    let Some(async_source_id) =
+        REGISTRY.with(|reg| reg.borrow_mut().reserve_async_source_for_scope(scope_id))
+    else {
+        return;
+    };
+    let task = spawn_async_source_task_for_reserved_slot(async move {
+        future.await;
+        enqueue_async_source_cleanup_on_runtime_queue(async_source_id);
+    });
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        let inserted = reg.set_async_source_task(async_source_id, task);
+        assert!(
+            inserted,
+            "reserved scope feeder task slot should stay valid until task insertion"
+        );
+    });
+    poll_spawned_async_source_tasks_after_insertion();
+}
+
+fn start_retained_scope_task_until<F, C>(scope_id: ScopeId, cancel: C, future: F)
+where
+    F: Future<Output = ()> + 'static,
+    C: Future + 'static,
+{
+    start_retained_scope_task(scope_id, async move {
+        let cancel = cancel.fuse();
+        let future = future.fuse();
+        zoon::futures_util::pin_mut!(cancel, future);
+        select! {
+            _ = future => {}
+            _ = cancel => {}
         }
     });
 }
 
-pub fn start_retained_actor_task<F>(actor: &ActorHandle, future: F)
+fn start_retained_scope_task_until_with_registry<F, C>(
+    reg: &mut ActorRegistry,
+    scope_id: ScopeId,
+    cancel: C,
+    future: F,
+) where
+    F: Future<Output = ()> + 'static,
+    C: Future + 'static,
+{
+    start_retained_scope_task_with_registry(reg, scope_id, async move {
+        let cancel = cancel.fuse();
+        let future = future.fuse();
+        zoon::futures_util::pin_mut!(cancel, future);
+        select! {
+            _ = future => {}
+            _ = cancel => {}
+        }
+    });
+}
+
+fn start_retained_list_task<F>(stored_state: &ListStoredState, scope_id: ScopeId, future: F)
 where
     F: Future<Output = ()> + 'static,
 {
-    retain_actor_task(actor, Task::start_droppable(future));
+    let list_owner_key = stored_state.async_owner_key();
+    let Some(async_source_id) = REGISTRY.with(|reg| {
+        reg.borrow_mut()
+            .reserve_async_source_for_list(scope_id, list_owner_key)
+    }) else {
+        return;
+    };
+    let task = spawn_async_source_task_for_reserved_slot(async move {
+        future.await;
+        enqueue_async_source_cleanup_on_runtime_queue(async_source_id);
+    });
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        let inserted = reg.set_async_source_task(async_source_id, task);
+        assert!(
+            inserted,
+            "reserved list feeder task slot should stay valid until task insertion"
+        );
+    });
+    poll_spawned_async_source_tasks_after_insertion();
+}
+
+pub(crate) fn start_retained_actor_scope_task<F>(actor: &ActorHandle, future: F)
+where
+    F: Future<Output = ()> + 'static,
+{
+    let Some(drop_waiter) = actor.stored_state.wait_for_drop() else {
+        return;
+    };
+    let Some(scope_id) = REGISTRY.with(|reg| {
+        reg.borrow()
+            .get_actor(actor.actor_id)
+            .map(|actor| actor.scope_id)
+    }) else {
+        return;
+    };
+    start_retained_scope_task_until(scope_id, drop_waiter, future);
+}
+
+pub(crate) fn start_retained_actor_scope_task_with_registry<F>(
+    reg: &mut ActorRegistry,
+    actor: &ActorHandle,
+    future: F,
+) where
+    F: Future<Output = ()> + 'static,
+{
+    let Some(drop_waiter) = actor.stored_state.wait_for_drop() else {
+        return;
+    };
+    let Some(scope_id) = reg.get_actor(actor.actor_id).map(|actor| actor.scope_id) else {
+        return;
+    };
+    start_retained_scope_task_until_with_registry(reg, scope_id, drop_waiter, future);
 }
 
 pub fn retain_actor_handle(actor: &ActorHandle, retained: ActorHandle) {
@@ -4434,7 +7319,25 @@ where
     });
 }
 
+pub(crate) fn retain_actor_handles_with_registry<I>(
+    reg: Option<&mut ActorRegistry>,
+    actor: &ActorHandle,
+    retained: I,
+) where
+    I: IntoIterator<Item = ActorHandle>,
+{
+    match reg {
+        Some(reg) => {
+            if let Some(owned_actor) = reg.get_actor_mut(actor.actor_id) {
+                owned_actor.retained_actors.extend(retained);
+            }
+        }
+        None => retain_actor_handles(actor, retained),
+    }
+}
+
 /// Create a lazy actor for demand-driven evaluation (used in HOLD body context).
+#[track_caller]
 pub fn create_actor_lazy<S: Stream<Item = Value> + 'static>(
     value_stream: S,
     persistence_id: parser::PersistenceId,
@@ -4444,8 +7347,45 @@ pub fn create_actor_lazy<S: Stream<Item = Value> + 'static>(
         ActorStreamCreationPlan::Constant(value) => {
             create_constant_actor(persistence_id, value, scope_id)
         }
+        ActorStreamCreationPlan::EndedWithoutValue => {
+            create_ended_actor_without_value(persistence_id, scope_id, None)
+        }
         ActorStreamCreationPlan::Stream(value_stream) => {
             create_lazy_stream_driven_actor_arc_info(persistence_id, scope_id, value_stream)
+        }
+    }
+}
+
+pub(crate) fn create_actor_lazy_with_registry<S>(
+    reg: &mut ActorRegistry,
+    value_stream: S,
+    persistence_id: parser::PersistenceId,
+    scope_id: ScopeId,
+) -> ActorHandle
+where
+    S: Stream<Item = Value> + 'static,
+{
+    match plan_actor_stream_creation(value_stream) {
+        ActorStreamCreationPlan::Constant(value) => {
+            create_constant_actor_with_registry(reg, persistence_id, value, scope_id)
+        }
+        ActorStreamCreationPlan::EndedWithoutValue => {
+            let actor = create_direct_state_actor_arc_info_with_registry(
+                reg,
+                persistence_id,
+                scope_id,
+                None,
+            );
+            actor.stored_state.set_has_future_state_updates(false);
+            actor
+        }
+        ActorStreamCreationPlan::Stream(value_stream) => {
+            create_lazy_stream_driven_actor_arc_info_with_registry(
+                reg,
+                persistence_id,
+                scope_id,
+                value_stream,
+            )
         }
     }
 }
@@ -4455,25 +7395,41 @@ enum ForwardingSubscriptionPlan {
     SubscribeAfterVersion(u64),
 }
 
-fn seed_forwarding_actor_from_source_now(
+fn seed_forwarding_actor_from_source_now_with_registry(
+    mut reg: Option<&mut ActorRegistry>,
     forwarding_actor: &ActorHandle,
     source_actor: &ActorHandle,
 ) -> ForwardingSubscriptionPlan {
     if let Some(value) = source_actor.constant_value() {
-        forwarding_actor.store_value_directly(value);
+        forwarding_actor.store_value_directly_with_registry(reg.as_deref_mut(), value);
         return ForwardingSubscriptionPlan::NoFutureSubscription;
     }
 
     match source_actor.current_value() {
         Ok(value) => {
-            forwarding_actor.store_value_directly(value);
-            ForwardingSubscriptionPlan::SubscribeAfterVersion(source_actor.version())
+            forwarding_actor.store_value_directly_with_registry(reg.as_deref_mut(), value);
+            if source_actor.stored_state.has_future_state_updates() {
+                ForwardingSubscriptionPlan::SubscribeAfterVersion(source_actor.version())
+            } else {
+                ForwardingSubscriptionPlan::NoFutureSubscription
+            }
         }
         Err(CurrentValueError::NoValueYet) => {
-            ForwardingSubscriptionPlan::SubscribeAfterVersion(source_actor.version())
+            if source_actor.stored_state.has_future_state_updates() {
+                ForwardingSubscriptionPlan::SubscribeAfterVersion(source_actor.version())
+            } else {
+                ForwardingSubscriptionPlan::NoFutureSubscription
+            }
         }
         Err(CurrentValueError::ActorDropped) => ForwardingSubscriptionPlan::NoFutureSubscription,
     }
+}
+
+fn seed_forwarding_actor_from_source_now(
+    forwarding_actor: &ActorHandle,
+    source_actor: &ActorHandle,
+) -> ForwardingSubscriptionPlan {
+    seed_forwarding_actor_from_source_now_with_registry(None, forwarding_actor, source_actor)
 }
 
 fn seed_forwarding_replay_all_from_source_now(
@@ -4490,7 +7446,8 @@ fn seed_forwarding_replay_all_from_source_now(
         forwarding_actor.store_value_directly(value);
     }
 
-    if source_actor.stored_state.is_alive() {
+    if source_actor.stored_state.is_alive() && source_actor.stored_state.has_future_state_updates()
+    {
         ForwardingSubscriptionPlan::SubscribeAfterVersion(source_actor.version())
     } else {
         ForwardingSubscriptionPlan::NoFutureSubscription
@@ -4503,7 +7460,7 @@ async fn forward_source_updates_after_version(
     last_seen_version: u64,
 ) {
     drain_value_stream_to_actor_state(
-        forwarding_actor,
+        forwarding_actor.actor_id,
         source_actor.subscription_stream_from_version(last_seen_version),
     )
     .await;
@@ -4524,21 +7481,133 @@ async fn forward_current_and_future_from_source(
     forward_source_updates_after_version(forwarding_actor, source_actor, last_seen_version).await;
 }
 
+#[track_caller]
+fn connect_forwarding_direct_state_subscription_with_registry(
+    reg: Option<&mut ActorRegistry>,
+    forwarding_actor: &ActorHandle,
+    source_actor: &ActorHandle,
+    last_seen_version: u64,
+) -> bool {
+    let caller = std::panic::Location::caller();
+    let has_lazy_delegate = match reg {
+        Some(ref reg) => source_actor.lazy_delegate_with_registry(reg),
+        None => source_actor.lazy_delegate(),
+    }
+    .is_some();
+    if has_lazy_delegate || !source_actor.stored_state.is_alive() {
+        return false;
+    }
+
+    if source_actor.version() > last_seen_version {
+        for value in source_actor
+            .stored_state
+            .get_values_since(last_seen_version)
+        {
+            enqueue_actor_value_on_runtime_queue(forwarding_actor, value);
+        }
+    }
+
+    match reg {
+        Some(reg) => {
+            source_actor.stored_state.register_direct_subscriber(
+                reg,
+                Rc::new({
+                    let forwarding_actor = forwarding_actor.clone();
+                    move |reg, value| {
+                        if !forwarding_actor.stored_state.is_alive() {
+                            return false;
+                        }
+                        match value {
+                            Some(value) => reg.enqueue_actor_mailbox_value(
+                                forwarding_actor.actor_id,
+                                value.clone(),
+                            ),
+                            None => reg.enqueue_actor_mailbox_clear(forwarding_actor.actor_id),
+                        }
+                        true
+                    }
+                }),
+            );
+            reg.drain_runtime_ready_queue();
+        }
+        None => {
+            REGISTRY.with(|reg| {
+                let mut reg = reg.try_borrow_mut().unwrap_or_else(|_| {
+                    panic!(
+                        "connect_forwarding_direct_state_subscription_with_registry nested REGISTRY borrow from {}",
+                        caller
+                    )
+                });
+                source_actor.stored_state.register_direct_subscriber(
+                    &mut reg,
+                    Rc::new({
+                        let forwarding_actor = forwarding_actor.clone();
+                        move |reg, value| {
+                            if !forwarding_actor.stored_state.is_alive() {
+                                return false;
+                            }
+                            match value {
+                                Some(value) => reg.enqueue_actor_mailbox_value(
+                                    forwarding_actor.actor_id,
+                                    value.clone(),
+                                ),
+                                None => reg.enqueue_actor_mailbox_clear(forwarding_actor.actor_id),
+                            }
+                            true
+                        }
+                    }),
+                );
+                reg.drain_runtime_ready_queue();
+            });
+        }
+    }
+    true
+}
+
+fn connect_forwarding_direct_state_subscription(
+    forwarding_actor: &ActorHandle,
+    source_actor: &ActorHandle,
+    last_seen_version: u64,
+) -> bool {
+    connect_forwarding_direct_state_subscription_with_registry(
+        None,
+        forwarding_actor,
+        source_actor,
+        last_seen_version,
+    )
+}
+
 /// Forward the source actor's current value once and then only future updates.
-pub fn connect_forwarding_current_and_future(
+pub(crate) fn connect_forwarding_current_and_future_with_registry(
+    mut reg: Option<&mut ActorRegistry>,
     forwarding_actor: ActorHandle,
     source_actor: ActorHandle,
 ) {
-    let last_seen_version =
-        match seed_forwarding_actor_from_source_now(&forwarding_actor, &source_actor) {
-            ForwardingSubscriptionPlan::NoFutureSubscription => return,
-            ForwardingSubscriptionPlan::SubscribeAfterVersion(last_seen_version) => {
-                last_seen_version
-            }
-        };
+    let last_seen_version = match seed_forwarding_actor_from_source_now_with_registry(
+        reg.as_deref_mut(),
+        &forwarding_actor,
+        &source_actor,
+    ) {
+        ForwardingSubscriptionPlan::NoFutureSubscription => {
+            forwarding_actor
+                .stored_state
+                .set_has_future_state_updates(false);
+            return;
+        }
+        ForwardingSubscriptionPlan::SubscribeAfterVersion(last_seen_version) => last_seen_version,
+    };
+
+    if connect_forwarding_direct_state_subscription_with_registry(
+        reg.as_deref_mut(),
+        &forwarding_actor,
+        &source_actor,
+        last_seen_version,
+    ) {
+        return;
+    }
 
     let forwarding_actor_for_task = forwarding_actor.clone();
-    start_retained_actor_task(&forwarding_actor, async move {
+    let future = async move {
         if LOG_DEBUG {
             zoon::println!("[FWD2] connect_forwarding loop STARTED");
         }
@@ -4554,23 +7623,48 @@ pub fn connect_forwarding_current_and_future(
         if LOG_DEBUG {
             zoon::println!("[FORWARDING] Forwarding loop ENDED");
         }
-    });
+    };
+    if let Some(reg) = reg {
+        start_retained_actor_scope_task_with_registry(reg, &forwarding_actor, future);
+    } else {
+        start_retained_actor_scope_task(&forwarding_actor, future);
+    }
+}
+
+pub fn connect_forwarding_current_and_future(
+    forwarding_actor: ActorHandle,
+    source_actor: ActorHandle,
+) {
+    connect_forwarding_current_and_future_with_registry(None, forwarding_actor, source_actor);
 }
 
 /// Forward all currently buffered and future values from the source actor.
 pub fn connect_forwarding_replay_all(forwarding_actor: ActorHandle, source_actor: ActorHandle) {
     let last_seen_version =
         match seed_forwarding_replay_all_from_source_now(&forwarding_actor, &source_actor) {
-            ForwardingSubscriptionPlan::NoFutureSubscription => return,
+            ForwardingSubscriptionPlan::NoFutureSubscription => {
+                forwarding_actor
+                    .stored_state
+                    .set_has_future_state_updates(false);
+                return;
+            }
             ForwardingSubscriptionPlan::SubscribeAfterVersion(last_seen_version) => {
                 last_seen_version
             }
         };
 
+    if connect_forwarding_direct_state_subscription(
+        &forwarding_actor,
+        &source_actor,
+        last_seen_version,
+    ) {
+        return;
+    }
+
     let forwarding_actor_for_task = forwarding_actor.clone();
-    start_retained_actor_task(&forwarding_actor, async move {
+    start_retained_actor_scope_task(&forwarding_actor, async move {
         drain_value_stream_to_actor_state(
-            forwarding_actor_for_task,
+            forwarding_actor_for_task.actor_id,
             source_actor.subscription_stream_from_version(last_seen_version),
         )
         .await;
@@ -5022,6 +8116,25 @@ pub fn value_actor_from_json(
     create_constant_actor(parser::PersistenceId::new(), value, scope_id)
 }
 
+pub(crate) fn value_actor_from_json_with_registry(
+    reg: &mut ActorRegistry,
+    json: &serde_json::Value,
+    construct_id: ConstructId,
+    construct_context: ConstructContext,
+    idempotency_key: ValueIdempotencyKey,
+    actor_context: ActorContext,
+) -> ActorHandle {
+    let value = Value::from_json(
+        json,
+        construct_id.clone(),
+        construct_context,
+        idempotency_key,
+        actor_context.clone(),
+    );
+    let scope_id = actor_context.scope_id();
+    create_constant_actor_with_registry(reg, parser::PersistenceId::new(), value, scope_id)
+}
+
 /// Saves a list of ValueActors to JSON for persistence.
 /// Used by List persistence functions.
 pub async fn save_list_items_to_json(items: &[ActorHandle]) -> Vec<serde_json::Value> {
@@ -5092,7 +8205,9 @@ async fn save_or_watch_persistent_list(
         return;
     }
 
-    list_arc.start_retained_task(async move {
+    let scope_id = list_arc.scope_id;
+    let owner_state = stored_state.clone();
+    start_retained_list_task(&owner_state, scope_id, async move {
         let mut last_saved_version = last_saved_version;
         loop {
             last_saved_version = save_persistent_list_snapshot_after_next_update(
@@ -5533,7 +8648,8 @@ pub async fn materialize_snapshot_value(
     }
 }
 
-pub(crate) fn try_materialize_snapshot_value_now(
+pub(crate) fn try_materialize_snapshot_value_now_with_registry(
+    mut reg: Option<&mut ActorRegistry>,
     value: Value,
     construct_context: ConstructContext,
     actor_context: ActorContext,
@@ -5557,12 +8673,25 @@ pub(crate) fn try_materialize_snapshot_value_now(
                 let value_actor = if let Ok(var_value) =
                     snapshot_actor_value_now(&variable.value_actor(), &actor_context)
                 {
-                    let materialized = try_materialize_snapshot_value_now(
+                    let materialized = try_materialize_snapshot_value_now_with_registry(
+                        reg.as_deref_mut(),
                         var_value,
                         construct_context.clone(),
                         actor_context.clone(),
                     )?;
-                    create_constant_actor(parser::PersistenceId::new(), materialized, scope_id)
+                    match reg.as_deref_mut() {
+                        Some(reg) => create_constant_actor_with_registry(
+                            reg,
+                            parser::PersistenceId::new(),
+                            materialized,
+                            scope_id,
+                        ),
+                        None => create_constant_actor(
+                            parser::PersistenceId::new(),
+                            materialized,
+                            scope_id,
+                        ),
+                    }
                 } else {
                     variable.value_actor().clone()
                 };
@@ -5596,12 +8725,25 @@ pub(crate) fn try_materialize_snapshot_value_now(
                 let value_actor = if let Ok(var_value) =
                     snapshot_actor_value_now(&variable.value_actor(), &actor_context)
                 {
-                    let materialized = try_materialize_snapshot_value_now(
+                    let materialized = try_materialize_snapshot_value_now_with_registry(
+                        reg.as_deref_mut(),
                         var_value,
                         construct_context.clone(),
                         actor_context.clone(),
                     )?;
-                    create_constant_actor(parser::PersistenceId::new(), materialized, scope_id)
+                    match reg.as_deref_mut() {
+                        Some(reg) => create_constant_actor_with_registry(
+                            reg,
+                            parser::PersistenceId::new(),
+                            materialized,
+                            scope_id,
+                        ),
+                        None => create_constant_actor(
+                            parser::PersistenceId::new(),
+                            materialized,
+                            scope_id,
+                        ),
+                    }
                 } else {
                     variable.value_actor().clone()
                 };
@@ -5640,12 +8782,25 @@ pub(crate) fn try_materialize_snapshot_value_now(
             for item_actor in items {
                 let value_actor =
                     if let Ok(item_value) = snapshot_actor_value_now(&item_actor, &actor_context) {
-                        let materialized = try_materialize_snapshot_value_now(
+                        let materialized = try_materialize_snapshot_value_now_with_registry(
+                            reg.as_deref_mut(),
                             item_value,
                             construct_context.clone(),
                             actor_context.clone(),
                         )?;
-                        create_constant_actor(parser::PersistenceId::new(), materialized, scope_id)
+                        match reg.as_deref_mut() {
+                            Some(reg) => create_constant_actor_with_registry(
+                                reg,
+                                parser::PersistenceId::new(),
+                                materialized,
+                                scope_id,
+                            ),
+                            None => create_constant_actor(
+                                parser::PersistenceId::new(),
+                                materialized,
+                                scope_id,
+                            ),
+                        }
                     } else {
                         item_actor
                     };
@@ -5664,12 +8819,24 @@ pub(crate) fn try_materialize_snapshot_value_now(
             Some(Value::List(new_list, metadata))
         }
         Value::Flushed(inner, metadata) => {
-            let materialized_inner =
-                try_materialize_snapshot_value_now(*inner, construct_context, actor_context)?;
+            let materialized_inner = try_materialize_snapshot_value_now_with_registry(
+                reg,
+                *inner,
+                construct_context,
+                actor_context,
+            )?;
             Some(Value::Flushed(Box::new(materialized_inner), metadata))
         }
         other => Some(other),
     }
+}
+
+pub(crate) fn try_materialize_snapshot_value_now(
+    value: Value,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<Value> {
+    try_materialize_snapshot_value_now_with_registry(None, value, construct_context, actor_context)
 }
 
 // --- Object ---
@@ -5732,6 +8899,24 @@ impl Object {
         actor_context: ActorContext,
         variables: impl Into<Vec<Arc<Variable>>>,
     ) -> ActorHandle {
+        Self::new_arc_value_actor_with_registry(
+            None,
+            construct_info,
+            construct_context,
+            idempotency_key,
+            actor_context,
+            variables,
+        )
+    }
+
+    pub(crate) fn new_arc_value_actor_with_registry(
+        reg: Option<&mut ActorRegistry>,
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        idempotency_key: ValueIdempotencyKey,
+        actor_context: ActorContext,
+        variables: impl Into<Vec<Arc<Variable>>>,
+    ) -> ActorHandle {
         let ConstructInfo {
             id: actor_id,
             persistence,
@@ -5756,7 +8941,15 @@ impl Object {
         // This is critical for WASM single-threaded runtime where spawned tasks
         // don't run until we yield - subscriptions need immediate access to values.
         let scope_id = actor_context.scope_id();
-        create_constant_actor(parser::PersistenceId::new(), initial_value, scope_id)
+        match reg {
+            Some(reg) => create_constant_actor_with_registry(
+                reg,
+                parser::PersistenceId::new(),
+                initial_value,
+                scope_id,
+            ),
+            None => create_constant_actor(parser::PersistenceId::new(), initial_value, scope_id),
+        }
     }
 
     /// Look up a variable by name.
@@ -5835,6 +9028,26 @@ impl TaggedObject {
         tag: impl Into<Cow<'static, str>>,
         variables: impl Into<Vec<Arc<Variable>>>,
     ) -> ActorHandle {
+        Self::new_arc_value_actor_with_registry(
+            None,
+            construct_info,
+            construct_context,
+            idempotency_key,
+            actor_context,
+            tag,
+            variables,
+        )
+    }
+
+    pub(crate) fn new_arc_value_actor_with_registry(
+        reg: Option<&mut ActorRegistry>,
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        idempotency_key: ValueIdempotencyKey,
+        actor_context: ActorContext,
+        tag: impl Into<Cow<'static, str>>,
+        variables: impl Into<Vec<Arc<Variable>>>,
+    ) -> ActorHandle {
         let ConstructInfo {
             id: actor_id,
             persistence,
@@ -5860,7 +9073,15 @@ impl TaggedObject {
         // This is critical for WASM single-threaded runtime where spawned tasks
         // don't run until we yield - subscriptions need immediate access to values.
         let scope_id = actor_context.scope_id();
-        create_constant_actor(parser::PersistenceId::new(), initial_value, scope_id)
+        match reg {
+            Some(reg) => create_constant_actor_with_registry(
+                reg,
+                parser::PersistenceId::new(),
+                initial_value,
+                scope_id,
+            ),
+            None => create_constant_actor(parser::PersistenceId::new(), initial_value, scope_id),
+        }
     }
 
     /// Look up a variable by name.
@@ -5950,6 +9171,24 @@ impl Text {
         actor_context: ActorContext,
         text: impl Into<Cow<'static, str>>,
     ) -> ActorHandle {
+        Self::new_arc_value_actor_with_registry(
+            None,
+            construct_info,
+            construct_context,
+            idempotency_key,
+            actor_context,
+            text,
+        )
+    }
+
+    pub(crate) fn new_arc_value_actor_with_registry(
+        reg: Option<&mut ActorRegistry>,
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        idempotency_key: ValueIdempotencyKey,
+        actor_context: ActorContext,
+        text: impl Into<Cow<'static, str>>,
+    ) -> ActorHandle {
         let text: Cow<'static, str> = text.into();
         let ConstructInfo {
             id: actor_id,
@@ -5968,7 +9207,15 @@ impl Text {
         );
         // Use a constant actor so the initial value is immediately available.
         let scope_id = actor_context.scope_id();
-        create_constant_actor(parser::PersistenceId::new(), initial_value, scope_id)
+        match reg {
+            Some(reg) => create_constant_actor_with_registry(
+                reg,
+                parser::PersistenceId::new(),
+                initial_value,
+                scope_id,
+            ),
+            None => create_constant_actor(parser::PersistenceId::new(), initial_value, scope_id),
+        }
     }
 
     pub fn text(&self) -> &str {
@@ -6207,33 +9454,100 @@ struct ListStoredState {
     inner: Rc<ListStoredStateInner>,
 }
 
+type ListDirectSubscriber = Rc<dyn Fn(&mut ActorRegistry, &ListChange) -> bool>;
+
+enum ListRuntimeWork {
+    Change {
+        construct_info: ConstructInfoComplete,
+        change: ListChange,
+        broadcast_change: bool,
+    },
+    LiveInputChange {
+        construct_info: ConstructInfoComplete,
+        change: ListChange,
+    },
+    BroadcastSnapshotIfReady,
+    SourceEnded,
+}
+
 struct ListStoredStateInner {
+    is_alive: Cell<bool>,
     initialized: Cell<bool>,
     has_future_state_updates: Cell<bool>,
+    broadcast_live_changes: Cell<bool>,
+    rebroadcast_snapshot_on_output_close: Cell<bool>,
+    scheduled_for_runtime: Cell<bool>,
+    last_broadcast_version: Cell<u64>,
     diff_history: RefCell<DiffHistory>,
+    runtime_work: RefCell<VecDeque<ListRuntimeWork>>,
     initialization_waiters: RefCell<Vec<oneshot::Sender<()>>>,
     update_waiters: RefCell<Vec<oneshot::Sender<()>>>,
+    drop_waiters: RefCell<Vec<oneshot::Sender<()>>>,
     change_subscribers: RefCell<SmallVec<[NamedChannel<ListChange>; 4]>>,
     pending_change_subscribers: RefCell<SmallVec<[NamedChannel<ListChange>; 2]>>,
+    direct_subscribers: RefCell<SmallVec<[ListDirectSubscriber; 2]>>,
+    pending_direct_subscribers: RefCell<SmallVec<[ListDirectSubscriber; 2]>>,
 }
 
 impl ListStoredState {
     fn new(config: DiffHistoryConfig) -> Self {
         Self {
             inner: Rc::new(ListStoredStateInner {
+                is_alive: Cell::new(true),
                 initialized: Cell::new(false),
                 has_future_state_updates: Cell::new(false),
+                broadcast_live_changes: Cell::new(false),
+                rebroadcast_snapshot_on_output_close: Cell::new(false),
+                scheduled_for_runtime: Cell::new(false),
+                last_broadcast_version: Cell::new(0),
                 diff_history: RefCell::new(DiffHistory::new(config)),
+                runtime_work: RefCell::new(VecDeque::new()),
                 initialization_waiters: RefCell::new(Vec::new()),
                 update_waiters: RefCell::new(Vec::new()),
+                drop_waiters: RefCell::new(Vec::new()),
                 change_subscribers: RefCell::new(SmallVec::new()),
                 pending_change_subscribers: RefCell::new(SmallVec::new()),
+                direct_subscribers: RefCell::new(SmallVec::new()),
+                pending_direct_subscribers: RefCell::new(SmallVec::new()),
             }),
         }
     }
 
+    fn downgrade(&self) -> Weak<ListStoredStateInner> {
+        Rc::downgrade(&self.inner)
+    }
+
+    fn from_weak(inner: Weak<ListStoredStateInner>) -> Option<Self> {
+        Some(Self {
+            inner: inner.upgrade()?,
+        })
+    }
+
+    fn async_owner_key(&self) -> usize {
+        Rc::as_ptr(&self.inner) as usize
+    }
+
+    fn is_alive(&self) -> bool {
+        self.inner.is_alive.get()
+    }
+
     fn is_initialized(&self) -> bool {
         self.inner.initialized.get()
+    }
+
+    fn mark_dropped(&self) {
+        self.inner.is_alive.set(false);
+        self.inner.has_future_state_updates.set(false);
+        self.inner.runtime_work.borrow_mut().clear();
+        self.inner.initialization_waiters.borrow_mut().clear();
+        self.inner.update_waiters.borrow_mut().clear();
+        for waiter in self.inner.drop_waiters.borrow_mut().drain(..) {
+            let _ = waiter.send(());
+        }
+        self.inner.change_subscribers.borrow_mut().clear();
+        self.inner.pending_change_subscribers.borrow_mut().clear();
+        self.inner.direct_subscribers.borrow_mut().clear();
+        self.inner.pending_direct_subscribers.borrow_mut().clear();
     }
 
     fn set_has_future_state_updates(&self, has_future_state_updates: bool) {
@@ -6244,6 +9558,60 @@ impl ListStoredState {
 
     fn has_future_state_updates(&self) -> bool {
         self.inner.has_future_state_updates.get()
+    }
+
+    fn set_broadcast_live_changes(&self, broadcast_live_changes: bool) {
+        self.inner
+            .broadcast_live_changes
+            .set(broadcast_live_changes);
+    }
+
+    fn broadcast_live_changes(&self) -> bool {
+        self.inner.broadcast_live_changes.get()
+    }
+
+    fn set_rebroadcast_snapshot_on_output_close(&self, rebroadcast: bool) {
+        self.inner
+            .rebroadcast_snapshot_on_output_close
+            .set(rebroadcast);
+    }
+
+    fn rebroadcast_snapshot_on_output_close(&self) -> bool {
+        self.inner.rebroadcast_snapshot_on_output_close.get()
+    }
+
+    fn push_runtime_work(&self, work: ListRuntimeWork) -> bool {
+        self.inner.runtime_work.borrow_mut().push_back(work);
+        if self.inner.scheduled_for_runtime.replace(true) {
+            false
+        } else {
+            true
+        }
+    }
+
+    fn take_runtime_work(&self) -> VecDeque<ListRuntimeWork> {
+        self.inner.scheduled_for_runtime.set(false);
+        std::mem::take(&mut *self.inner.runtime_work.borrow_mut())
+    }
+
+    fn has_pending_runtime_work(&self) -> bool {
+        !self.inner.runtime_work.borrow().is_empty()
+    }
+
+    fn is_scheduled_for_runtime(&self) -> bool {
+        self.inner.scheduled_for_runtime.get()
+    }
+
+    fn set_scheduled_for_runtime(&self, scheduled: bool) {
+        self.inner.scheduled_for_runtime.set(scheduled);
+    }
+
+    fn last_broadcast_version(&self) -> u64 {
+        self.inner.last_broadcast_version.get()
+    }
+
+    fn set_last_broadcast_version(&self, version: u64) {
+        self.inner.last_broadcast_version.set(version);
     }
 
     fn mark_initialized(&self) {
@@ -6270,6 +9638,15 @@ impl ListStoredState {
         }
         let (tx, rx) = oneshot::channel();
         self.inner.update_waiters.borrow_mut().push(tx);
+        Some(rx)
+    }
+
+    fn wait_for_drop(&self) -> Option<oneshot::Receiver<()>> {
+        if !self.is_alive() {
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        self.inner.drop_waiters.borrow_mut().push(tx);
         Some(rx)
     }
 
@@ -6339,6 +9716,37 @@ impl ListStoredState {
         }
     }
 
+    fn register_direct_subscriber(
+        &self,
+        reg: &mut ActorRegistry,
+        subscriber: ListDirectSubscriber,
+    ) {
+        if !self.is_initialized() {
+            self.inner
+                .pending_direct_subscribers
+                .borrow_mut()
+                .push(subscriber);
+            return;
+        }
+
+        let snapshot_items = Arc::from(
+            self.inner
+                .diff_history
+                .borrow()
+                .snapshot()
+                .iter()
+                .map(|(_, actor)| actor.clone())
+                .collect::<Vec<_>>(),
+        );
+        let first_change_to_send = ListChange::Replace {
+            items: snapshot_items,
+        };
+
+        if subscriber(reg, &first_change_to_send) {
+            self.inner.direct_subscribers.borrow_mut().push(subscriber);
+        }
+    }
+
     fn activate_pending_change_subscribers(&self, items: Arc<[ActorHandle]>) {
         let mut pending_subscribers = self.inner.pending_change_subscribers.borrow_mut();
         let mut change_subscribers = self.inner.change_subscribers.borrow_mut();
@@ -6352,6 +9760,24 @@ impl ListStoredState {
                 Ok(()) => change_subscribers.push(pending_sender),
                 Err(error) if !error.is_disconnected() => change_subscribers.push(pending_sender),
                 Err(_) => {}
+            }
+        }
+    }
+
+    fn activate_pending_direct_subscribers(
+        &self,
+        reg: &mut ActorRegistry,
+        items: Arc<[ActorHandle]>,
+    ) {
+        let mut pending_subscribers = self.inner.pending_direct_subscribers.borrow_mut();
+        let mut direct_subscribers = self.inner.direct_subscribers.borrow_mut();
+
+        for pending_subscriber in pending_subscribers.drain(..) {
+            let first_change_to_send = ListChange::Replace {
+                items: items.clone(),
+            };
+            if pending_subscriber(reg, &first_change_to_send) {
+                direct_subscribers.push(pending_subscriber);
             }
         }
     }
@@ -6376,6 +9802,13 @@ impl ListStoredState {
             });
     }
 
+    fn notify_direct_subscribers(&self, reg: &mut ActorRegistry, change: &ListChange) {
+        self.inner
+            .direct_subscribers
+            .borrow_mut()
+            .retain(|subscriber| subscriber(reg, change));
+    }
+
     fn broadcast_snapshot(&self, items: Arc<[ActorHandle]>) {
         self.inner
             .change_subscribers
@@ -6395,55 +9828,118 @@ impl ListStoredState {
 
 pub struct List {
     construct_info: ConstructInfoComplete,
+    scope_id: ScopeId,
     /// Direct list-owned diff/snapshot state for current reads.
     stored_state: ListStoredState,
-    /// Retained runtime tasks owned by the list for its full lifetime.
-    retained_tasks: RefCell<SmallVec<[TaskHandle; 2]>>,
+}
+
+fn register_list_output_valve_runtime_subscriber_state(
+    active: &Cell<bool>,
+    direct_subscribers: &RefCell<SmallVec<[OutputValveDirectSubscriber; 4]>>,
+    stored_state: &ListStoredState,
+) {
+    let stored_state_weak = stored_state.downgrade();
+    register_output_valve_direct_subscriber(
+        active,
+        direct_subscribers,
+        Rc::new(move |event| {
+            let Some(stored_state) = ListStoredState::from_weak(stored_state_weak.clone()) else {
+                return false;
+            };
+
+            match event {
+                OutputValveDirectEvent::Impulse => {
+                    REGISTRY.with(|reg| {
+                        let mut reg = reg.borrow_mut();
+                        reg.enqueue_list_runtime_work(
+                            stored_state.clone(),
+                            ListRuntimeWork::BroadcastSnapshotIfReady,
+                        );
+                        reg.drain_runtime_ready_queue();
+                    });
+                }
+                OutputValveDirectEvent::Closed => {
+                    stored_state.set_broadcast_live_changes(true);
+                    if stored_state.rebroadcast_snapshot_on_output_close()
+                        && !stored_state.has_future_state_updates()
+                    {
+                        REGISTRY.with(|reg| {
+                            let mut reg = reg.borrow_mut();
+                            reg.enqueue_list_runtime_work(
+                                stored_state.clone(),
+                                ListRuntimeWork::BroadcastSnapshotIfReady,
+                            );
+                            reg.drain_runtime_ready_queue();
+                        });
+                    }
+                }
+            }
+            true
+        }),
+    );
+}
+
+fn register_list_output_valve_runtime_subscriber(
+    output_valve_signal: &ActorOutputValveSignal,
+    stored_state: &ListStoredState,
+) {
+    register_list_output_valve_runtime_subscriber_state(
+        output_valve_signal.active.as_ref(),
+        output_valve_signal.direct_subscribers.as_ref(),
+        stored_state,
+    );
+}
+
+impl Drop for List {
+    fn drop(&mut self) {
+        self.stored_state.mark_dropped();
+        let list_owner_key = self.stored_state.async_owner_key();
+        if !take_list_async_sources_now(list_owner_key) {
+            PENDING_LIST_ASYNC_SOURCE_CLEANUPS
+                .with(|pending| pending.borrow_mut().push(list_owner_key));
+        }
+    }
 }
 
 impl List {
-    fn new_static(construct_info: ConstructInfoComplete, items: Vec<ActorHandle>) -> Self {
+    fn new_with_stored_state(
+        construct_info: ConstructInfoComplete,
+        scope_id: ScopeId,
+        stored_state: ListStoredState,
+    ) -> Self {
+        Self {
+            construct_info,
+            scope_id,
+            stored_state,
+        }
+    }
+
+    fn new_static(
+        construct_info: ConstructInfoComplete,
+        scope_id: ScopeId,
+        items: Vec<ActorHandle>,
+    ) -> Self {
         let stored_state = ListStoredState::new(DiffHistoryConfig::default());
         let items: Arc<[ActorHandle]> = Arc::from(items);
         stored_state.record_change(&ListChange::Replace {
             items: items.clone(),
         });
         stored_state.mark_initialized();
-
-        Self {
-            construct_info,
-            stored_state,
-            retained_tasks: RefCell::new(SmallVec::new()),
-        }
+        Self::new_with_stored_state(construct_info, scope_id, stored_state)
     }
 
     fn new_static_with_optional_output_valve_stream(
         construct_info: ConstructInfoComplete,
         items: Vec<ActorHandle>,
-        output_valve_impulse_stream: Option<LocalBoxStream<'static, ()>>,
+        scope_id: ScopeId,
+        output_valve_signal: Option<Arc<ActorOutputValveSignal>>,
     ) -> Self {
-        let list = Self::new_static(construct_info, items);
-        if let Some(output_valve_impulse_stream) = output_valve_impulse_stream {
-            let stored_state = list.stored_state.clone();
-            let construct_info = list.construct_info.clone();
-            let initial_items: Vec<_> = stored_state
-                .snapshot()
-                .into_iter()
-                .map(|(_, actor)| actor)
-                .collect();
-            let initial_items_arc = Arc::from(initial_items.as_slice());
-            list.start_retained_task(async move {
-                run_live_list_change_loop_core(
-                    construct_info,
-                    stored_state,
-                    stream::empty::<ListChange>(),
-                    Some(output_valve_impulse_stream),
-                    Some(initial_items),
-                    Some(initial_items_arc),
-                    (),
-                )
-                .await;
-            });
+        let list = Self::new_static(construct_info, scope_id, items);
+        if let Some(output_valve_signal) = output_valve_signal {
+            register_list_output_valve_runtime_subscriber(
+                output_valve_signal.as_ref(),
+                &list.stored_state,
+            );
         }
         list
     }
@@ -6456,13 +9952,13 @@ impl List {
     ) -> Self {
         let construct_info = construct_info.complete(ConstructType::List);
         let items = items.into();
-        let output_valve_impulse_stream = actor_context
-            .output_valve_signal
-            .map(|output_valve_signal| output_valve_signal.stream().boxed_local());
+        let scope_id = actor_context.scope_id();
+        let output_valve_signal = actor_context.output_valve_signal;
         Self::new_static_with_optional_output_valve_stream(
             construct_info,
             items,
-            output_valve_impulse_stream,
+            scope_id,
+            output_valve_signal,
         )
     }
 
@@ -6488,11 +9984,12 @@ impl List {
         extra_owned_data: EOD,
     ) -> Self {
         // Direct list-owned state for versions, snapshots, and diff history.
+        let scope_id = actor_context.scope_id();
         let stored_state = ListStoredState::new(DiffHistoryConfig::default());
         let list = Self {
             construct_info,
+            scope_id,
             stored_state,
-            retained_tasks: RefCell::new(SmallVec::new()),
         };
 
         let construct_info = list.construct_info.clone();
@@ -6507,79 +10004,104 @@ impl List {
             .set_has_future_state_updates(has_future_state_updates_after_ready_drain(
                 ready_drain_status,
             ));
+        list.stored_state
+            .set_broadcast_live_changes(output_valve_signal.is_none());
+        list.stored_state
+            .set_rebroadcast_snapshot_on_output_close(output_valve_signal.is_some());
 
         match initial_items {
-            Some(initial_items) => match ready_drain_status {
+            Some(_initial_items) => match ready_drain_status {
                 ReadyListChangeDrainStatus::Ended => {
-                    if let Some(output_valve_impulse_stream) = output_valve_signal
-                        .map(|output_valve_signal| output_valve_signal.stream().boxed_local())
-                    {
-                        let stored_state = list.stored_state.clone();
-                        let initial_items_for_task = initial_items.clone();
-                        list.start_retained_task(async move {
-                            run_live_list_change_loop_core(
-                                construct_info,
-                                stored_state,
-                                stream::empty::<ListChange>(),
-                                Some(output_valve_impulse_stream),
-                                Some(initial_items_for_task.to_vec()),
-                                Some(initial_items),
-                                extra_owned_data,
-                            )
-                            .await;
-                        });
+                    if let Some(output_valve_signal) = output_valve_signal.as_ref() {
+                        register_list_output_valve_runtime_subscriber(
+                            output_valve_signal.as_ref(),
+                            &list.stored_state,
+                        );
                     }
+                    drop(extra_owned_data);
                 }
                 ReadyListChangeDrainStatus::Pending => {
+                    if let Some(output_valve_signal) = output_valve_signal.as_ref() {
+                        register_list_output_valve_runtime_subscriber(
+                            output_valve_signal.as_ref(),
+                            &list.stored_state,
+                        );
+                    }
                     let stored_state = list.stored_state.clone();
-                    let output_valve_impulse_stream = output_valve_signal
-                        .map(|output_valve_signal| output_valve_signal.stream().boxed_local());
-                    list.start_retained_task(async move {
-                        run_live_list_change_loop_core(
-                            construct_info,
-                            stored_state,
-                            change_stream,
-                            output_valve_impulse_stream,
-                            Some(initial_items.to_vec()),
-                            Some(initial_items),
-                            extra_owned_data,
-                        )
-                        .await;
-                    });
+                    start_retained_list_external_stream_feeder_task(
+                        &stored_state,
+                        scope_id,
+                        change_stream,
+                        {
+                            let construct_info = construct_info.clone();
+                            let stored_state = stored_state.clone();
+                            move |reg, change| {
+                                enqueue_list_work_on_runtime_queue_with_registry(
+                                    reg,
+                                    &stored_state,
+                                    ListRuntimeWork::LiveInputChange {
+                                        construct_info: construct_info.clone(),
+                                        change,
+                                    },
+                                );
+                            }
+                        },
+                        {
+                            let stored_state = stored_state.clone();
+                            move |reg| {
+                                let _extra_owned_data = &extra_owned_data;
+                                enqueue_list_work_on_runtime_queue_with_registry(
+                                    reg,
+                                    &stored_state,
+                                    ListRuntimeWork::SourceEnded,
+                                );
+                            }
+                        },
+                    );
                 }
             },
             None => {
+                if let Some(output_valve_signal) = output_valve_signal.as_ref() {
+                    register_list_output_valve_runtime_subscriber(
+                        output_valve_signal.as_ref(),
+                        &list.stored_state,
+                    );
+                }
                 let stored_state = list.stored_state.clone();
-                let output_valve_impulse_stream = output_valve_signal
-                    .map(|output_valve_signal| output_valve_signal.stream().boxed_local());
-                list.start_retained_task(async move {
-                    run_live_list_change_loop_core(
-                        construct_info,
-                        stored_state,
-                        change_stream,
-                        output_valve_impulse_stream,
-                        None,
-                        None,
-                        extra_owned_data,
-                    )
-                    .await;
-                });
+                start_retained_list_external_stream_feeder_task(
+                    &stored_state,
+                    scope_id,
+                    change_stream,
+                    {
+                        let construct_info = construct_info.clone();
+                        let stored_state = stored_state.clone();
+                        move |reg, change| {
+                            enqueue_list_work_on_runtime_queue_with_registry(
+                                reg,
+                                &stored_state,
+                                ListRuntimeWork::LiveInputChange {
+                                    construct_info: construct_info.clone(),
+                                    change,
+                                },
+                            );
+                        }
+                    },
+                    {
+                        let stored_state = stored_state.clone();
+                        move |reg| {
+                            let _extra_owned_data = &extra_owned_data;
+                            enqueue_list_work_on_runtime_queue_with_registry(
+                                reg,
+                                &stored_state,
+                                ListRuntimeWork::SourceEnded,
+                            );
+                        }
+                    },
+                );
             }
         }
 
         list
-    }
-
-    /// Retain a runtime task for the list's lifetime.
-    fn retain_task(&self, task: TaskHandle) {
-        self.retained_tasks.borrow_mut().push(task);
-    }
-
-    fn start_retained_task<F>(&self, future: F)
-    where
-        F: Future<Output = ()> + 'static,
-    {
-        self.retain_task(Task::start_droppable(future));
     }
 
     /// Get current version.
@@ -6699,6 +10221,40 @@ impl List {
         );
         let scope_id = actor_context.scope_id();
         create_constant_actor(parser::PersistenceId::new(), initial_value, scope_id)
+    }
+
+    pub(crate) fn new_arc_value_actor_with_registry(
+        reg: &mut ActorRegistry,
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        idempotency_key: ValueIdempotencyKey,
+        actor_context: ActorContext,
+        items: impl Into<Vec<ActorHandle>>,
+    ) -> ActorHandle {
+        let ConstructInfo {
+            id: actor_id,
+            persistence,
+            description: list_description,
+        } = construct_info;
+        let construct_info = ConstructInfo::new(
+            actor_id.with_child_id("wrapped List"),
+            persistence,
+            list_description,
+        );
+        let initial_value = Self::new_value(
+            construct_info,
+            construct_context,
+            idempotency_key,
+            actor_context.clone(),
+            items.into(),
+        );
+        let scope_id = actor_context.scope_id();
+        create_constant_actor_with_registry(
+            reg,
+            parser::PersistenceId::new(),
+            initial_value,
+            scope_id,
+        )
     }
 
     /// Subscribe to this list's changes.
@@ -6947,13 +10503,13 @@ impl List {
             "Persistent List",
         )
         .complete(ConstructType::List);
-        let output_valve_impulse_stream = actor_context
-            .output_valve_signal
-            .map(|output_valve_signal| output_valve_signal.stream().boxed_local());
+        let scope_id = actor_context.scope_id();
+        let output_valve_signal = actor_context.output_valve_signal;
         let list = Arc::new(List::new_static_with_optional_output_valve_stream(
             inner_construct_info,
             items,
-            output_valve_impulse_stream,
+            scope_id,
+            output_valve_signal,
         ));
         Value::List(list, ValueMetadata::new(idempotency_key))
     }
@@ -7106,6 +10662,288 @@ impl List {
         let scope_id = actor_context.scope_id();
         create_actor_from_future(value_future, parser::PersistenceId::new(), scope_id)
     }
+
+    pub(crate) fn new_arc_value_actor_with_persistence_with_registry(
+        reg: &mut ActorRegistry,
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        idempotency_key: ValueIdempotencyKey,
+        actor_context: ActorContext,
+        code_items: impl Into<Vec<ActorHandle>>,
+    ) -> ActorHandle {
+        let code_items = code_items.into();
+        let persistence = construct_info.persistence;
+
+        let Some(persistence_data) = persistence else {
+            return Self::new_arc_value_actor_with_registry(
+                reg,
+                construct_info,
+                construct_context,
+                idempotency_key,
+                actor_context,
+                code_items,
+            );
+        };
+
+        let persistence_id = persistence_data.id;
+        let construct_storage = construct_context.construct_storage.clone();
+        if construct_storage.is_disabled() {
+            let ConstructInfo { id: actor_id, .. } = construct_info;
+            let value = Self::new_persistent_list_value(
+                actor_id,
+                persistence_data,
+                idempotency_key,
+                actor_context.clone(),
+                code_items,
+            );
+            return create_constant_actor_with_registry(
+                reg,
+                parser::PersistenceId::new(),
+                value,
+                actor_context.scope_id(),
+            );
+        }
+
+        if let Some(json_items) =
+            construct_storage.load_state_now::<Vec<serde_json::Value>>(persistence_id)
+        {
+            let ConstructInfo { id: actor_id, .. } = construct_info;
+            let code_items_len = code_items.len();
+            let json_items_len = json_items.len();
+            let max_len = code_items_len.max(json_items_len);
+
+            let initial_items = (0..max_len)
+                .map(|i| {
+                    if i < code_items_len {
+                        code_items[i].clone()
+                    } else {
+                        value_actor_from_json_with_registry(
+                            reg,
+                            &json_items[i],
+                            actor_id.with_child_id(format!("loaded_item_{i}")),
+                            construct_context.clone(),
+                            parser::PersistenceId::new(),
+                            actor_context.clone(),
+                        )
+                    }
+                })
+                .collect();
+
+            let value = Self::new_persistent_list_value(
+                actor_id,
+                persistence_data,
+                idempotency_key,
+                actor_context.clone(),
+                initial_items,
+            );
+            return create_constant_actor_with_registry(
+                reg,
+                parser::PersistenceId::new(),
+                value,
+                actor_context.scope_id(),
+            );
+        }
+
+        let ConstructInfo {
+            id: actor_id,
+            persistence: _,
+            description: _list_description,
+        } = construct_info;
+        let construct_context_for_load = construct_context.clone();
+        let actor_context_for_load = actor_context.clone();
+        let actor_id_for_load = actor_id.clone();
+        let value_future = async move {
+            let loaded_items: Option<Vec<serde_json::Value>> =
+                construct_storage.clone().load_state(persistence_id).await;
+
+            let initial_items = if let Some(json_items) = loaded_items {
+                let code_items_len = code_items.len();
+                let json_items_len = json_items.len();
+                let max_len = code_items_len.max(json_items_len);
+
+                (0..max_len)
+                    .map(|i| {
+                        if i < code_items_len {
+                            code_items[i].clone()
+                        } else {
+                            value_actor_from_json(
+                                &json_items[i],
+                                actor_id_for_load.with_child_id(format!("loaded_item_{i}")),
+                                construct_context_for_load.clone(),
+                                parser::PersistenceId::new(),
+                                actor_context_for_load.clone(),
+                            )
+                        }
+                    })
+                    .collect()
+            } else {
+                code_items
+            };
+
+            let Value::List(list_arc, _) = Self::new_persistent_list_value(
+                actor_id_for_load,
+                persistence_data,
+                idempotency_key,
+                actor_context_for_load.clone(),
+                initial_items,
+            ) else {
+                unreachable!("persistent list helper must return a list value");
+            };
+
+            save_or_watch_persistent_list(list_arc.clone(), construct_storage, persistence_id)
+                .await;
+
+            Value::List(list_arc, ValueMetadata::new(idempotency_key))
+        };
+
+        let scope_id = actor_context.scope_id();
+        create_actor_from_future_with_registry(
+            reg,
+            value_future,
+            parser::PersistenceId::new(),
+            scope_id,
+        )
+    }
+}
+
+pub(crate) struct DirectRuntimeListActor {
+    pub actor: ActorHandle,
+    pub list: Arc<List>,
+    pub construct_info: ConstructInfoComplete,
+    pub broadcast_change: bool,
+    pub skip_initial_source_replace: bool,
+}
+
+pub(crate) fn create_direct_runtime_list_actor_with_initial_items(
+    construct_info: ConstructInfo,
+    actor_context: ActorContext,
+    retained_actors: Vec<ActorHandle>,
+    initial_items: Vec<ActorHandle>,
+    has_future_state_updates: bool,
+    skip_initial_source_replace: bool,
+) -> DirectRuntimeListActor {
+    let scope_id = actor_context.scope_id();
+    let construct_info = construct_info.complete(ConstructType::List);
+    let stored_state = ListStoredState::new(DiffHistoryConfig::default());
+    if !initial_items.is_empty() {
+        let items: Arc<[ActorHandle]> = Arc::from(initial_items);
+        stored_state.record_change(&ListChange::Replace {
+            items: items.clone(),
+        });
+        stored_state.mark_initialized();
+    }
+    stored_state.set_has_future_state_updates(has_future_state_updates);
+    stored_state.set_broadcast_live_changes(actor_context.output_valve_signal.is_none());
+    stored_state
+        .set_rebroadcast_snapshot_on_output_close(actor_context.output_valve_signal.is_some());
+
+    let list = Arc::new(List::new_with_stored_state(
+        construct_info.clone(),
+        scope_id,
+        stored_state.clone(),
+    ));
+
+    if let Some(output_valve_signal) = actor_context.output_valve_signal.clone() {
+        register_list_output_valve_runtime_subscriber(output_valve_signal.as_ref(), &stored_state);
+    }
+
+    let actor = create_constant_actor(
+        parser::PersistenceId::new(),
+        Value::List(list.clone(), ValueMetadata::new(ValueIdempotencyKey::new())),
+        scope_id,
+    );
+    retain_actor_handles_with_registry(None, &actor, retained_actors);
+
+    DirectRuntimeListActor {
+        actor,
+        list,
+        construct_info,
+        broadcast_change: actor_context.output_valve_signal.is_none(),
+        skip_initial_source_replace,
+    }
+}
+
+fn should_restore_simple_persistent_list_items(loaded_items: &[serde_json::Value]) -> bool {
+    loaded_items.iter().all(|json| match json {
+        serde_json::Value::Object(obj) => {
+            if obj.contains_key("$Tag") && obj.len() <= 2 {
+                true
+            } else if obj.len() > 1 {
+                if LOG_DEBUG {
+                    zoon::println!(
+                        "[DEBUG] Skipping JSON restoration: complex object with {} fields",
+                        obj.len()
+                    );
+                }
+                false
+            } else {
+                true
+            }
+        }
+        _ => true,
+    })
+}
+
+pub(crate) fn try_create_direct_runtime_list_actor(
+    construct_info: ConstructInfo,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+    persistence_id: parser::PersistenceId,
+    retained_actors: Vec<ActorHandle>,
+    has_future_state_updates: bool,
+) -> Option<DirectRuntimeListActor> {
+    let construct_storage = construct_context.construct_storage.clone();
+    let restored_items = if construct_storage.is_disabled() {
+        None
+    } else {
+        construct_storage
+            .load_state_now::<Vec<serde_json::Value>>(persistence_id)
+            .and_then(|loaded_items| {
+                if !should_restore_simple_persistent_list_items(&loaded_items) {
+                    return None;
+                }
+
+                Some(
+                    loaded_items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, json)| {
+                            value_actor_from_json(
+                                json,
+                                construct_info
+                                    .id
+                                    .clone()
+                                    .with_child_id(format!("restored_item_{i}")),
+                                construct_context.clone(),
+                                parser::PersistenceId::new(),
+                                actor_context.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+    };
+    let skip_initial_source_replace = restored_items.is_some();
+    let restored_items = restored_items.unwrap_or_default();
+    let direct_result = create_direct_runtime_list_actor_with_initial_items(
+        construct_info,
+        actor_context.clone(),
+        retained_actors,
+        restored_items,
+        has_future_state_updates,
+        skip_initial_source_replace,
+    );
+
+    if !construct_storage.is_disabled() {
+        let list_for_save = direct_result.list.clone();
+        let owner_state = list_for_save.stored_state.clone();
+        let scope_id = actor_context.scope_id();
+        start_retained_list_task(&owner_state, scope_id, async move {
+            save_or_watch_persistent_list(list_for_save, construct_storage, persistence_id).await;
+        });
+    }
+
+    Some(direct_result)
 }
 
 fn apply_list_change_to_state(
@@ -7144,6 +10982,84 @@ fn process_live_list_change(
         stored_state.broadcast_change(change);
     }
     apply_list_change_to_state(construct_info, stored_state, list, list_arc_cache, change);
+}
+
+fn process_list_runtime_work(
+    reg: &mut ActorRegistry,
+    stored_state: &ListStoredState,
+    work: ListRuntimeWork,
+) {
+    let process_change = |reg: &mut ActorRegistry,
+                          stored_state: &ListStoredState,
+                          construct_info: ConstructInfoComplete,
+                          change: ListChange,
+                          broadcast_change: bool| {
+        if broadcast_change {
+            stored_state.broadcast_change(&change);
+        }
+        stored_state.notify_direct_subscribers(reg, &change);
+
+        let was_initialized = stored_state.is_initialized();
+        stored_state.record_change(&change);
+
+        match (&change, was_initialized) {
+            (ListChange::Replace { items }, false) => {
+                stored_state.mark_initialized();
+                stored_state.activate_pending_change_subscribers(items.clone());
+                stored_state.activate_pending_direct_subscribers(reg, items.clone());
+            }
+            (_, false) => {
+                panic!(
+                    "Failed to initialize {construct_info}: The first change has to be 'ListChange::Replace'"
+                );
+            }
+            _ => {}
+        }
+    };
+
+    match work {
+        ListRuntimeWork::Change {
+            construct_info,
+            change,
+            broadcast_change,
+        } => process_change(reg, stored_state, construct_info, change, broadcast_change),
+        ListRuntimeWork::LiveInputChange {
+            construct_info,
+            change,
+        } => process_change(
+            reg,
+            stored_state,
+            construct_info,
+            change,
+            stored_state.broadcast_live_changes(),
+        ),
+        ListRuntimeWork::BroadcastSnapshotIfReady => {
+            let current_version = stored_state.version();
+            if current_version <= stored_state.last_broadcast_version()
+                || !stored_state.is_initialized()
+            {
+                return;
+            }
+
+            let items: Vec<_> = stored_state
+                .snapshot()
+                .into_iter()
+                .map(|(_, actor)| actor)
+                .collect();
+            let items: Arc<[ActorHandle]> = Arc::from(items.as_slice());
+            stored_state.broadcast_snapshot(items.clone());
+            stored_state.notify_direct_subscribers(
+                reg,
+                &ListChange::Replace {
+                    items: items.clone(),
+                },
+            );
+            stored_state.set_last_broadcast_version(current_version);
+        }
+        ListRuntimeWork::SourceEnded => {
+            stored_state.set_has_future_state_updates(false);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -7197,116 +11113,6 @@ fn drain_ready_list_change_prefix_now(
             }
         }
     }
-}
-
-fn broadcast_list_snapshot_if_ready(
-    stored_state: &ListStoredState,
-    list: &Option<Vec<ActorHandle>>,
-    list_arc_cache: &mut Option<Arc<[ActorHandle]>>,
-    last_broadcast_version: &mut u64,
-) {
-    let current_version = stored_state.version();
-    if current_version <= *last_broadcast_version {
-        return;
-    }
-
-    if let Some(list) = list.as_ref() {
-        let items_arc = list_arc_cache
-            .get_or_insert_with(|| Arc::from(list.as_slice()))
-            .clone();
-        stored_state.broadcast_snapshot(items_arc);
-        *last_broadcast_version = current_version;
-    }
-}
-
-async fn run_live_list_change_loop_core<S, EOD>(
-    construct_info: ConstructInfoComplete,
-    stored_state: ListStoredState,
-    change_stream: S,
-    output_valve_impulse_stream: Option<LocalBoxStream<'static, ()>>,
-    initial_list: Option<Vec<ActorHandle>>,
-    initial_list_arc_cache: Option<Arc<[ActorHandle]>>,
-    extra_owned_data: EOD,
-) where
-    S: Stream<Item = ListChange> + 'static,
-    EOD: 'static,
-{
-    let mut change_stream = change_stream.boxed_local().fuse();
-    let mut list = initial_list;
-    let mut list_arc_cache = initial_list_arc_cache;
-
-    if let Some(output_valve_impulse_stream) = output_valve_impulse_stream {
-        let mut output_valve_impulse_stream = output_valve_impulse_stream.fuse();
-        let mut last_broadcast_version = 0;
-
-        loop {
-            select! {
-                change = change_stream.next() => {
-                    let Some(change) = change else {
-                        break;
-                    };
-                    process_live_list_change(
-                        &construct_info,
-                        &stored_state,
-                        &mut list,
-                        &mut list_arc_cache,
-                        &change,
-                        false,
-                    );
-                }
-                impulse = output_valve_impulse_stream.next() => {
-                    let Some(()) = impulse else {
-                        while let Some(change) = change_stream.next().await {
-                            process_live_list_change(
-                                &construct_info,
-                                &stored_state,
-                                &mut list,
-                                &mut list_arc_cache,
-                                &change,
-                                true,
-                            );
-                        }
-                        drop(extra_owned_data);
-                        return;
-                    };
-                    broadcast_list_snapshot_if_ready(
-                        &stored_state,
-                        &list,
-                        &mut list_arc_cache,
-                        &mut last_broadcast_version,
-                    );
-                }
-            }
-        }
-
-        while let Some(()) = output_valve_impulse_stream.next().await {
-            broadcast_list_snapshot_if_ready(
-                &stored_state,
-                &list,
-                &mut list_arc_cache,
-                &mut last_broadcast_version,
-            );
-        }
-        broadcast_list_snapshot_if_ready(
-            &stored_state,
-            &list,
-            &mut list_arc_cache,
-            &mut last_broadcast_version,
-        );
-    } else {
-        while let Some(change) = change_stream.next().await {
-            process_live_list_change(
-                &construct_info,
-                &stored_state,
-                &mut list,
-                &mut list_arc_cache,
-                &change,
-                true,
-            );
-        }
-    }
-
-    drop(extra_owned_data);
 }
 
 // --- ItemId ---
@@ -7372,6 +11178,60 @@ impl Default for DiffHistoryConfig {
             snapshot_threshold: DIFF_HISTORY_SNAPSHOT_THRESHOLD,
         }
     }
+}
+
+async fn drain_live_list_runtime_inputs<S>(
+    construct_info: ConstructInfoComplete,
+    stored_state: ListStoredState,
+    change_stream: S,
+) where
+    S: Stream<Item = ListChange> + 'static,
+{
+    let stored_state_for_items = stored_state.clone();
+    let stored_state_for_end = stored_state.clone();
+    drain_external_stream_to_runtime_queue(
+        change_stream,
+        move |reg, change| {
+            enqueue_list_work_on_runtime_queue_with_registry(
+                reg,
+                &stored_state_for_items,
+                ListRuntimeWork::LiveInputChange {
+                    construct_info: construct_info.clone(),
+                    change,
+                },
+            );
+        },
+        move |reg| {
+            enqueue_list_work_on_runtime_queue_with_registry(
+                reg,
+                &stored_state_for_end,
+                ListRuntimeWork::SourceEnded,
+            );
+        },
+    )
+    .await;
+}
+
+async fn drain_external_stream_to_runtime_queue<S, T, F, G>(
+    source_stream: S,
+    mut on_item: F,
+    mut on_end: G,
+) where
+    S: Stream<Item = T> + 'static,
+    F: FnMut(&mut ActorRegistry, T) + 'static,
+    G: FnMut(&mut ActorRegistry) + 'static,
+{
+    let mut source_stream = pin!(source_stream);
+    while let Some(item) = source_stream.next().await {
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            on_item(&mut reg, item);
+        });
+    }
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        on_end(&mut reg);
+    });
 }
 
 /// Ring buffer storing recent diffs for efficient subscriber updates.
@@ -7724,8 +11584,6 @@ pub struct ListBindingConfig {
     pub reference_connector: Arc<ReferenceConnector>,
     /// Link connector for connecting LINK variables with their setters
     pub link_connector: Arc<LinkConnector>,
-    /// Pass-through connector for stable LINK pass-throughs
-    pub pass_through_connector: Arc<PassThroughConnector>,
     /// Source code for creating borrowed expressions
     pub source_code: SourceCode,
     /// Function registry snapshot for resolving user-defined functions
@@ -7916,6 +11774,34 @@ impl ListBindingFunction {
             .boxed_local()
     }
 
+    fn start_lazy_source_list_task<S, F>(
+        stored_state: &ListStoredState,
+        scope_id: ScopeId,
+        source_list_stream: S,
+        on_source_list: F,
+    ) where
+        S: Stream<Item = Value> + 'static,
+        F: Fn(&mut ActorRegistry, Arc<List>) + 'static,
+    {
+        let on_source_list = Rc::new(on_source_list);
+        let Some(drop_waiter) = stored_state.wait_for_drop() else {
+            return;
+        };
+        start_retained_scope_task_until(scope_id, drop_waiter, async move {
+            let mut source_list_stream = std::pin::pin!(source_list_stream);
+            while let Some(value) = source_list_stream.next().await {
+                let Value::List(source_list, _) = value else {
+                    continue;
+                };
+                REGISTRY.with(|reg| {
+                    let mut reg = reg.borrow_mut();
+                    on_source_list(&mut reg, source_list.clone());
+                    reg.drain_runtime_ready_queue();
+                });
+            }
+        });
+    }
+
     /// Creates a new ValueActor for a List binding function.
     ///
     /// For List/map(old, new: expr):
@@ -7997,79 +11883,202 @@ impl ListBindingFunction {
         source_list_actor: ActorHandle,
         config: Arc<ListBindingConfig>,
     ) -> ActorHandle {
-        let config_for_stream = config.clone();
-        let construct_context_for_stream = construct_context.clone();
-        let actor_context_for_stream = actor_context.clone();
-
-        // Clone subscription scope for scope cancellation check
-        let subscription_scope = actor_context.subscription_scope.clone();
-
-        // Use switch_map for proper list replacement handling:
-        // When source emits a new list, cancel old subscription and start fresh.
-        // But filter out re-emissions of the same list by ID to avoid cancelling
-        // LINK connections unnecessarily.
-        let change_stream = switch_map(
-            Self::source_list_current_and_future_values(
-                source_list_actor.clone(),
-                subscription_scope,
-            ),
-            move |list| {
-                use std::collections::HashMap;
-                let config = config_for_stream.clone();
-                let construct_context = construct_context_for_stream.clone();
-                let actor_context = actor_context_for_stream.clone();
-
-                // Track length, PersistenceId mapping, current transformed items, and item order.
-                // The transformed-item map is only used for removal/pop bookkeeping and move fallback.
-                // Item order (Vec) is needed to clean transformed items on Pop (we need to know which item was last).
-                type MapState = (
-                    usize,
-                    HashMap<parser::PersistenceId, parser::PersistenceId>,
-                    HashMap<parser::PersistenceId, ActorHandle>, // transformed actors by source PersistenceId
-                    Vec<parser::PersistenceId>,                  // Item order for Pop handling
-                );
-                list.stream().scan(
-                    (0usize, HashMap::new(), HashMap::new(), Vec::new()),
-                    move |state: &mut MapState, change| {
-                        let (length, pid_map, transformed_items_by_pid, item_order) = state;
-                        let (transformed_change, new_length) =
-                            Self::transform_list_change_for_map_with_tracking(
-                                change,
-                                *length,
-                                pid_map,
-                                transformed_items_by_pid,
-                                item_order,
-                                &config,
-                                construct_context.clone(),
-                                actor_context.clone(),
-                            );
-                        *length = new_length;
-                        future::ready(Some(transformed_change))
-                    },
-                )
-            },
-        );
-
-        let list = List::new_with_change_stream(
-            ConstructInfo::new(
-                construct_info.id.clone().with_child_id(0),
-                None,
-                "List/map result",
-            ),
+        Self::try_create_direct_state_map_actor(
+            construct_info.clone(),
+            construct_context.clone(),
             actor_context.clone(),
-            change_stream,
             source_list_actor.clone(),
-        );
+            config.clone(),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "List/map source should stay on the direct-state runtime path: {:?}",
+                construct_info.id
+            )
+        })
+    }
+
+    fn try_create_direct_state_map_actor(
+        construct_info: ConstructInfoComplete,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        source_list_actor: ActorHandle,
+        config: Arc<ListBindingConfig>,
+    ) -> Option<ActorHandle> {
+        let source_list_is_lazy = source_list_actor.has_lazy_delegate();
+        let source_list_stream =
+            source_list_is_lazy.then(|| source_list_actor.current_or_future_stream());
+
+        let initial_source_list = match source_list_actor.current_value() {
+            Ok(Value::List(list, _)) => Some(list),
+            Ok(_) => return None,
+            Err(CurrentValueError::NoValueYet) => None,
+            Err(CurrentValueError::ActorDropped) => return None,
+        };
 
         let scope_id = actor_context.scope_id();
-        create_constant_actor(
-            parser::PersistenceId::new(),
-            Value::List(
-                Arc::new(list),
-                ValueMetadata::new(ValueIdempotencyKey::new()),
-            ),
-            scope_id,
+        let mapped_construct_info = ConstructInfo::new(
+            construct_info.id.clone().with_child_id(0),
+            None,
+            "List/map result",
         )
+        .complete(ConstructType::List);
+        let mapped_state = ListStoredState::new(DiffHistoryConfig::default());
+        mapped_state.set_has_future_state_updates(initial_source_list.as_ref().map_or_else(
+            || source_list_actor.stored_state.is_alive(),
+            |list| list.stored_state.has_future_state_updates(),
+        ));
+        let mapped_list = Arc::new(List::new_with_stored_state(
+            mapped_construct_info.clone(),
+            scope_id,
+            mapped_state.clone(),
+        ));
+
+        if let Some(output_valve_signal) = actor_context.output_valve_signal.clone() {
+            register_list_output_valve_runtime_subscriber(
+                output_valve_signal.as_ref(),
+                &mapped_state,
+            );
+        }
+
+        let mapped_state_weak = mapped_state.downgrade();
+        let map_state = Rc::new(RefCell::new((
+            0usize,
+            std::collections::HashMap::<parser::PersistenceId, parser::PersistenceId>::new(),
+            std::collections::HashMap::<parser::PersistenceId, ActorHandle>::new(),
+            Vec::<parser::PersistenceId>::new(),
+        )));
+        let broadcast_change = actor_context.output_valve_signal.is_none();
+        let current_source_list_key = Rc::new(Cell::new(None::<usize>));
+        let current_source_generation = Rc::new(Cell::new(0u64));
+        let connect_source_list = Rc::new({
+            let mapped_state_weak = mapped_state_weak.clone();
+            let mapped_construct_info = mapped_construct_info.clone();
+            let config = config.clone();
+            let construct_context = construct_context.clone();
+            let actor_context = actor_context.clone();
+            let map_state = map_state.clone();
+            let current_source_list_key = current_source_list_key.clone();
+            let current_source_generation = current_source_generation.clone();
+            move |reg: &mut ActorRegistry, source_list: Arc<List>| {
+                let list_key = list_instance_key(&source_list);
+                let generation = current_source_generation.get() + 1;
+                current_source_generation.set(generation);
+                current_source_list_key.set(Some(list_key));
+
+                source_list.stored_state.register_direct_subscriber(
+                    reg,
+                    Rc::new({
+                        let mapped_state_weak = mapped_state_weak.clone();
+                        let mapped_construct_info = mapped_construct_info.clone();
+                        let config = config.clone();
+                        let construct_context = construct_context.clone();
+                        let actor_context = actor_context.clone();
+                        let map_state = map_state.clone();
+                        let current_source_list_key = current_source_list_key.clone();
+                        let current_source_generation = current_source_generation.clone();
+                        move |reg, change| {
+                            if current_source_generation.get() != generation
+                                || current_source_list_key.get() != Some(list_key)
+                            {
+                                return false;
+                            }
+
+                            let Some(mapped_state) =
+                                ListStoredState::from_weak(mapped_state_weak.clone())
+                            else {
+                                return false;
+                            };
+
+                            let mut state = map_state.borrow_mut();
+                            let (length, pid_map, transformed_items_by_pid, item_order) =
+                                &mut *state;
+                            let (mapped_change, new_length) =
+                                Self::transform_list_change_for_map_with_tracking_with_registry(
+                                    Some(reg),
+                                    change.clone(),
+                                    *length,
+                                    pid_map,
+                                    transformed_items_by_pid,
+                                    item_order,
+                                    &config,
+                                    construct_context.clone(),
+                                    actor_context.clone(),
+                                );
+                            *length = new_length;
+
+                            reg.enqueue_list_runtime_work(
+                                mapped_state,
+                                ListRuntimeWork::Change {
+                                    construct_info: mapped_construct_info.clone(),
+                                    change: mapped_change,
+                                    broadcast_change,
+                                },
+                            );
+                            true
+                        }
+                    }),
+                );
+            }
+        });
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            if !source_list_is_lazy {
+                source_list_actor.stored_state.register_direct_subscriber(
+                    &mut reg,
+                    Rc::new({
+                        let connect_source_list = connect_source_list.clone();
+                        let current_source_list_key = current_source_list_key.clone();
+                        move |reg, value| {
+                            let Some(Value::List(source_list, _)) = value else {
+                                return true;
+                            };
+                            let list_key = list_instance_key(source_list);
+                            if current_source_list_key.get() != Some(list_key) {
+                                connect_source_list(reg, source_list.clone());
+                            }
+                            true
+                        }
+                    }),
+                );
+            }
+
+            if !source_list_is_lazy
+                && source_list_actor.is_constant
+                && current_source_list_key.get().is_none()
+                && let Some(initial_source_list) = initial_source_list.as_ref()
+            {
+                connect_source_list(&mut reg, initial_source_list.clone());
+            }
+            reg.drain_runtime_ready_queue();
+        });
+
+        if let Some(source_list_stream) = source_list_stream {
+            let connect_source_list = connect_source_list.clone();
+            let current_source_list_key = current_source_list_key.clone();
+            let mapped_state_weak = mapped_state_weak.clone();
+            Self::start_lazy_source_list_task(
+                &mapped_state,
+                scope_id,
+                source_list_stream,
+                move |reg, source_list| {
+                    if ListStoredState::from_weak(mapped_state_weak.clone()).is_none() {
+                        return;
+                    }
+                    let list_key = list_instance_key(&source_list);
+                    if current_source_list_key.get() != Some(list_key) {
+                        connect_source_list(reg, source_list);
+                    }
+                },
+            );
+        }
+
+        Some(create_constant_actor(
+            parser::PersistenceId::new(),
+            Value::List(mapped_list, ValueMetadata::new(ValueIdempotencyKey::new())),
+            scope_id,
+        ))
     }
 
     async fn rebuild_retain_state(
@@ -8149,426 +12158,899 @@ impl ListBindingFunction {
         source_list_actor: ActorHandle,
         config: Arc<ListBindingConfig>,
     ) -> ActorHandle {
-        // Clone for use after the chain
-        let actor_context_for_list = actor_context.clone();
-        let actor_context_for_result = actor_context.clone();
+        Self::try_create_direct_state_retain_actor(
+            construct_info.clone(),
+            construct_context.clone(),
+            actor_context.clone(),
+            source_list_actor.clone(),
+            config.clone(),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "List/retain source should stay on the direct-state runtime path: {:?}",
+                construct_info.id
+            )
+        })
+    }
 
-        // Clone subscription scope for scope cancellation check
-        let subscription_scope = actor_context.subscription_scope.clone();
+    fn try_create_direct_state_retain_actor(
+        construct_info: ConstructInfoComplete,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        source_list_actor: ActorHandle,
+        config: Arc<ListBindingConfig>,
+    ) -> Option<ActorHandle> {
+        let source_list_is_lazy = source_list_actor.has_lazy_delegate();
+        let source_list_stream =
+            source_list_is_lazy.then(|| source_list_actor.current_or_future_stream());
 
-        // Use switch_map for proper list replacement handling
-        let value_stream = switch_map(
-            Self::source_list_current_and_future_values(
-                source_list_actor.clone(),
-                subscription_scope,
-            ),
-            move |list| {
-                let config = config.clone();
-                let construct_context = construct_context.clone();
-                let actor_context = actor_context.clone();
+        let initial_source_list = match source_list_actor.current_value() {
+            Ok(Value::List(list, _)) => Some(list),
+            Ok(_) => return None,
+            Err(CurrentValueError::NoValueYet) => None,
+            Err(CurrentValueError::ActorDropped) => return None,
+        };
 
-                // Use stream::unfold with select for fine-grained control
-                // Uses PersistenceId-based tracking to avoid index shift bugs on Remove/Pop
+        #[derive(Clone)]
+        struct DirectRetainEntry {
+            entry_id: usize,
+            item: ActorHandle,
+            predicate_actor: ActorHandle,
+            visible: bool,
+        }
 
-                // State: (items, predicate_results, list_stream, merged_predicate_stream)
-                // Note: Using HashMap keyed by PersistenceId for predicate results
-                // to avoid index misalignment when items are removed
-                type RetainState = (
-                    Vec<ActorHandle>,                        // items (order matters for output)
-                    HashMap<parser::PersistenceId, bool>,    // predicate_results by PersistenceId
-                    Pin<Box<dyn Stream<Item = ListChange>>>, // list_stream
-                    Option<Pin<Box<dyn Stream<Item = Vec<(parser::PersistenceId, bool)>>>>>, // merged predicates
-                );
+        struct DirectRetainState {
+            entries: Vec<DirectRetainEntry>,
+            next_entry_id: usize,
+            last_emitted_pids: Vec<parser::PersistenceId>,
+            suppress_emits: bool,
+        }
 
-                let list_stream: Pin<Box<dyn Stream<Item = ListChange>>> = Box::pin(list.stream());
+        let scope_id = actor_context.scope_id();
+        let filtered_construct_info = ConstructInfo::new(
+            construct_info.id.clone().with_child_id(0),
+            None,
+            "List/retain result",
+        )
+        .complete(ConstructType::List);
+        let filtered_state = ListStoredState::new(DiffHistoryConfig::default());
+        filtered_state.set_has_future_state_updates(initial_source_list.as_ref().map_or_else(
+            || source_list_actor.stored_state.is_alive(),
+            |list| list.stored_state.has_future_state_updates(),
+        ));
+        let filtered_list = Arc::new(List::new_with_stored_state(
+            filtered_construct_info.clone(),
+            scope_id,
+            filtered_state.clone(),
+        ));
 
-                stream::unfold(
-                (
-                    Vec::<ActorHandle>::new(),
-                    HashMap::<parser::PersistenceId, bool>::new(),
-                    list_stream,
-                    // A3: Coalesced predicate stream yields batches instead of single items
-                    None::<Pin<Box<dyn Stream<Item = Vec<(parser::PersistenceId, bool)>>>>>,
-                    // A2: Track last emitted PersistenceIds for output deduplication
-                    Vec::<parser::PersistenceId>::new(),
-                    config,
-                    construct_context,
-                    actor_context,
-                ),
-                move |(mut items, mut predicate_results, mut list_stream, mut merged_predicates, mut last_emitted_pids, config, construct_context, actor_context)| {
-                    async move {
-                        loop {
-                            // If we have predicate streams, race between list changes and predicate updates
-                            if let Some(ref mut pred_stream) = merged_predicates {
-                                // Use select to race between list changes and predicate updates
-                                use zoon::futures_util::future::Either;
+        if let Some(output_valve_signal) = actor_context.output_valve_signal.clone() {
+            register_list_output_valve_runtime_subscriber(
+                output_valve_signal.as_ref(),
+                &filtered_state,
+            );
+        }
 
-                                let list_next = list_stream.next();
-                                let pred_next = pred_stream.next();
+        let filtered_state_weak = filtered_state.downgrade();
+        let state = Rc::new(RefCell::new(DirectRetainState {
+            entries: Vec::new(),
+            next_entry_id: 0,
+            last_emitted_pids: Vec::new(),
+            suppress_emits: false,
+        }));
+        let broadcast_change = actor_context.output_valve_signal.is_none();
+        let current_source_list_key = Rc::new(Cell::new(None::<usize>));
+        let current_source_generation = Rc::new(Cell::new(0u64));
 
-                                match future::select(pin!(list_next), pin!(pred_next)).await {
-                                    Either::Left((Some(change), _)) => {
-                                        // List structure changed
-                                        match change {
-                                            ListChange::Replace { items: new_items } => {
-                                                items = new_items.to_vec();
-                                                if items.is_empty() {
-                                                    predicate_results.clear();
-                                                    merged_predicates = None;
-                                                    last_emitted_pids.clear(); // A2: Clear for empty list
-                                                    return Some((
-                                                        Some(ListChange::Replace { items: Arc::from(Vec::<ActorHandle>::new()) }),
-                                                        (items, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
-                                                    ));
-                                                } else {
-                                                    let (
-                                                        new_predicate_results,
-                                                        new_merged_predicates,
-                                                        filtered,
-                                                        new_last_emitted_pids,
-                                                    ) = Self::rebuild_retain_state(
-                                                        &items,
-                                                        &predicate_results,
-                                                        &config,
-                                                        construct_context.clone(),
-                                                        actor_context.clone(),
-                                                    )
-                                                    .await;
-                                                    predicate_results = new_predicate_results;
-                                                    merged_predicates = new_merged_predicates;
-                                                    last_emitted_pids = new_last_emitted_pids;
+        let emit_filtered_replace = Rc::new({
+            let filtered_construct_info = filtered_construct_info.clone();
+            let filtered_state_weak = filtered_state_weak.clone();
+            move |reg: &mut ActorRegistry, state: &mut DirectRetainState, force_replace: bool| {
+                let Some(filtered_state) = ListStoredState::from_weak(filtered_state_weak.clone())
+                else {
+                    return false;
+                };
 
-                                                    return Some((
-                                                        Some(ListChange::Replace { items: Arc::from(filtered) }),
-                                                        (items, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
-                                                    ));
-                                                }
-                                            }
-                                            ListChange::Push { item } => {
-                                                items.push(item);
-                                                let (
-                                                    new_predicate_results,
-                                                    new_merged_predicates,
-                                                    filtered,
-                                                    current_pids,
-                                                ) = Self::rebuild_retain_state(
-                                                    &items,
-                                                    &predicate_results,
-                                                    &config,
-                                                    construct_context.clone(),
-                                                    actor_context.clone(),
+                let filtered_items = state
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.visible)
+                    .map(|entry| entry.item.clone())
+                    .collect::<Vec<_>>();
+                let current_pids = filtered_items
+                    .iter()
+                    .map(|item| item.persistence_id())
+                    .collect::<Vec<_>>();
+
+                if force_replace
+                    || !filtered_state.is_initialized()
+                    || current_pids != state.last_emitted_pids
+                {
+                    state.last_emitted_pids = current_pids;
+                    reg.enqueue_list_runtime_work(
+                        filtered_state,
+                        ListRuntimeWork::Change {
+                            construct_info: filtered_construct_info.clone(),
+                            change: ListChange::Replace {
+                                items: Arc::from(filtered_items),
+                            },
+                            broadcast_change,
+                        },
+                    );
+                }
+
+                true
+            }
+        });
+        let connect_source_list = Rc::new({
+            let state = state.clone();
+            let config = config.clone();
+            let construct_context = construct_context.clone();
+            let actor_context = actor_context.clone();
+            let emit_filtered_replace = emit_filtered_replace.clone();
+            let current_source_list_key = current_source_list_key.clone();
+            let current_source_generation = current_source_generation.clone();
+            let filtered_state_weak = filtered_state_weak.clone();
+            move |reg: &mut ActorRegistry, source_list: Arc<List>| {
+                let list_key = list_instance_key(&source_list);
+                let generation = current_source_generation.get() + 1;
+                current_source_generation.set(generation);
+                current_source_list_key.set(Some(list_key));
+
+                source_list.stored_state.register_direct_subscriber(
+                    reg,
+                    Rc::new({
+                        let state = state.clone();
+                        let config = config.clone();
+                        let construct_context = construct_context.clone();
+                        let actor_context = actor_context.clone();
+                        let emit_filtered_replace = emit_filtered_replace.clone();
+                        let current_source_list_key = current_source_list_key.clone();
+                        let current_source_generation = current_source_generation.clone();
+                        let filtered_state_weak = filtered_state_weak.clone();
+                        move |reg, change| {
+                            if ListStoredState::from_weak(filtered_state_weak.clone()).is_none() {
+                                return false;
+                            }
+                            if current_source_generation.get() != generation
+                                || current_source_list_key.get() != Some(list_key)
+                            {
+                                return false;
+                            }
+
+                            let add_entry =
+                                |reg: &mut ActorRegistry, item: ActorHandle, insert_at: usize| {
+                                    let predicate_actor = Self::transform_item_with_registry(
+                                        Some(reg),
+                                        item.clone(),
+                                        insert_at,
+                                        &config,
+                                        construct_context.clone(),
+                                        actor_context.clone(),
+                                    );
+                                    let visible = match predicate_actor.current_value() {
+                                        Ok(value) => {
+                                            matches!(value, Value::Tag(tag, _) if tag.tag() == "True")
+                                        }
+                                        Err(_) => true,
+                                    };
+
+                                    let entry_id = {
+                                        let mut state = state.borrow_mut();
+                                        let entry_id = state.next_entry_id;
+                                        state.next_entry_id += 1;
+                                        let insert_at = insert_at.min(state.entries.len());
+                                        state.entries.insert(
+                                            insert_at,
+                                            DirectRetainEntry {
+                                                entry_id,
+                                                item: item.clone(),
+                                                predicate_actor: predicate_actor.clone(),
+                                                visible,
+                                            },
+                                        );
+                                        entry_id
+                                    };
+
+                                    predicate_actor.stored_state.register_direct_subscriber(
+                                        reg,
+                                        Rc::new({
+                                            let state = state.clone();
+                                            let emit_filtered_replace =
+                                                emit_filtered_replace.clone();
+                                            let current_source_list_key =
+                                                current_source_list_key.clone();
+                                            let current_source_generation =
+                                                current_source_generation.clone();
+                                            let filtered_state_weak =
+                                                filtered_state_weak.clone();
+                                            move |reg, value| {
+                                                if ListStoredState::from_weak(
+                                                    filtered_state_weak.clone(),
                                                 )
-                                                .await;
-                                                predicate_results = new_predicate_results;
-                                                merged_predicates = new_merged_predicates;
-
-                                                // A2: Output deduplication - skip if same as last emitted
-                                                if current_pids == last_emitted_pids {
-                                                    continue; // Skip redundant emission (pushed item was filtered out)
+                                                .is_none()
+                                                {
+                                                    return false;
                                                 }
-                                                last_emitted_pids = current_pids;
+                                                if current_source_generation.get() != generation
+                                                    || current_source_list_key.get()
+                                                        != Some(list_key)
+                                                {
+                                                    return false;
+                                                }
 
-                                                return Some((
-                                                    Some(ListChange::Replace { items: Arc::from(filtered) }),
-                                                    (items, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
-                                                ));
-                                            }
-                                            ListChange::Remove { id } => {
-                                                items.retain(|item| item.persistence_id() != id);
-                                                let (filtered, current_pids) = if items.is_empty() {
-                                                    predicate_results.clear();
-                                                    merged_predicates = None;
-                                                    (Vec::new(), Vec::new())
-                                                } else {
-                                                    let (
-                                                        new_predicate_results,
-                                                        new_merged_predicates,
-                                                        filtered,
-                                                        current_pids,
-                                                    ) = Self::rebuild_retain_state(
-                                                        &items,
-                                                        &predicate_results,
-                                                        &config,
-                                                        construct_context.clone(),
-                                                        actor_context.clone(),
-                                                    )
-                                                    .await;
-                                                    predicate_results = new_predicate_results;
-                                                    merged_predicates = new_merged_predicates;
-                                                    (filtered, current_pids)
+                                                let Some(value) = value else {
+                                                    return true;
                                                 };
 
-                                                if current_pids == last_emitted_pids {
-                                                    continue; // Skip redundant emission (removed item was filtered out)
-                                                }
-                                                last_emitted_pids = current_pids;
-
-                                                return Some((
-                                                    Some(ListChange::Replace { items: Arc::from(filtered) }),
-                                                    (items, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
-                                                ));
-                                            }
-                                            ListChange::Pop => {
-                                                if items.pop().is_some() {
-                                                    let (filtered, current_pids) = if items.is_empty() {
-                                                        predicate_results.clear();
-                                                        merged_predicates = None;
-                                                        (Vec::new(), Vec::new())
-                                                    } else {
-                                                        let (
-                                                            new_predicate_results,
-                                                            new_merged_predicates,
-                                                            filtered,
-                                                            current_pids,
-                                                        ) = Self::rebuild_retain_state(
-                                                            &items,
-                                                            &predicate_results,
-                                                            &config,
-                                                            construct_context.clone(),
-                                                            actor_context.clone(),
-                                                        )
-                                                        .await;
-                                                        predicate_results = new_predicate_results;
-                                                        merged_predicates = new_merged_predicates;
-                                                        (filtered, current_pids)
-                                                    };
-
-                                                    if current_pids == last_emitted_pids {
-                                                        continue; // Skip redundant emission (popped item was filtered out)
-                                                    }
-                                                    last_emitted_pids = current_pids;
-
-                                                    return Some((
-                                                        Some(ListChange::Replace { items: Arc::from(filtered) }),
-                                                        (items, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
-                                                    ));
-                                                }
-                                                continue;
-                                            }
-                                            ListChange::Clear => {
-                                                items.clear();
-                                                predicate_results.clear();
-                                                merged_predicates = None;
-                                                last_emitted_pids.clear(); // A2: Clear for empty list
-                                                return Some((
-                                                    Some(ListChange::Replace { items: Arc::from(Vec::<ActorHandle>::new()) }),
-                                                    (items, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
-                                                ));
-                                            }
-                                            // Explicitly handle all ListChange variants to catch future additions.
-                                            // These variants are not currently generated by any List API.
-                                            // If you're adding a new List operation that uses these,
-                                            // you must implement proper handling here.
-                                            ListChange::InsertAt { .. } => {
-                                                panic!(
-                                                    "List/retain received InsertAt event which is not yet implemented. \
-                                                    If you added a List/insert_at API, implement handling in create_retain_actor."
+                                                let mut state = state.borrow_mut();
+                                                let Some(entry) = state
+                                                    .entries
+                                                    .iter_mut()
+                                                    .find(|entry| entry.entry_id == entry_id)
+                                                else {
+                                                    return false;
+                                                };
+                                                let next_visible = matches!(
+                                                    value,
+                                                    Value::Tag(tag, _) if tag.tag() == "True"
                                                 );
-                                            }
-                                            ListChange::UpdateAt { .. } => {
-                                                panic!(
-                                                    "List/retain received UpdateAt event which is not yet implemented. \
-                                                    If you added a List/update_at API, implement handling in create_retain_actor."
-                                                );
-                                            }
-                                            ListChange::Move { .. } => {
-                                                panic!(
-                                                    "List/retain received Move event which is not yet implemented. \
-                                                    If you added a List/move API, implement handling in create_retain_actor."
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Either::Left((None, _)) => {
-                                        // List stream ended
-                                        return None;
-                                    }
-                                    Either::Right((Some(batch), _)) => {
-                                        let mut visibility_changed = false;
-                                        for (pid, is_true) in batch {
-                                            if predicate_results.contains_key(&pid) {
-                                                if predicate_results.get(&pid) != Some(&is_true) {
-                                                    visibility_changed = true;
+                                                if entry.visible == next_visible {
+                                                    return true;
                                                 }
-                                                predicate_results.insert(pid, is_true);
+                                                entry.visible = next_visible;
+                                                if state.suppress_emits {
+                                                    return true;
+                                                }
+                                                emit_filtered_replace(reg, &mut state, false)
                                             }
-                                        }
+                                        }),
+                                    );
+                                };
 
-                                        if !visibility_changed {
-                                            continue; // No visibility changes
-                                        }
+                            let mut did_change = false;
+                            {
+                                let mut state = state.borrow_mut();
+                                state.suppress_emits = true;
+                            }
 
-                                        // Simpler and more robust than trying to synthesize a
-                                        // per-batch insert/remove diff from out-of-order predicate
-                                        // updates. Milestone 1 parity values correctness here.
-                                        let filtered: Vec<_> = items.iter()
-                                            .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
-                                            .cloned()
-                                            .collect();
-
-                                        // A2: Output deduplication - skip if same as last emitted (order-aware)
-                                        let current_pids: Vec<_> = filtered.iter()
-                                            .map(|item| item.persistence_id())
-                                            .collect();
-                                        if current_pids == last_emitted_pids {
-                                            continue; // Skip redundant emission
-                                        }
-                                        last_emitted_pids = current_pids;
-
-                                        return Some((
-                                            Some(ListChange::Replace { items: Arc::from(filtered) }),
-                                            (items, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
-                                        ));
+                            match change {
+                                ListChange::Replace { items } => {
+                                    {
+                                        let mut state = state.borrow_mut();
+                                        state.entries.clear();
                                     }
-                                    Either::Right((None, _)) => {
-                                        if predicate_results.is_empty() {
-                                            merged_predicates = None;
-                                        } else {
-                                            let (
-                                                new_predicate_results,
-                                                new_merged_predicates,
-                                                _filtered,
-                                                _current_pids,
-                                            ) = Self::rebuild_retain_state(
-                                                &items,
-                                                &predicate_results,
-                                                &config,
-                                                construct_context.clone(),
-                                                actor_context.clone(),
-                                            )
-                                            .await;
-                                            predicate_results = new_predicate_results;
-                                            merged_predicates = new_merged_predicates;
-                                        }
-                                        continue;
+                                    for (idx, item) in items.iter().cloned().enumerate() {
+                                        add_entry(reg, item, idx);
+                                    }
+                                    did_change = true;
+                                }
+                                ListChange::Push { item } => {
+                                    let insert_at = state.borrow().entries.len();
+                                    add_entry(reg, item.clone(), insert_at);
+                                    did_change = true;
+                                }
+                                ListChange::Remove { id } => {
+                                    let mut state = state.borrow_mut();
+                                    if let Some(index) = state
+                                        .entries
+                                        .iter()
+                                        .position(|entry| entry.item.persistence_id() == *id)
+                                    {
+                                        state.entries.remove(index);
+                                        did_change = true;
                                     }
                                 }
-                            } else {
-                                // No predicate streams yet, wait for list change
-                                match list_stream.next().await {
-                                    Some(ListChange::Replace { items: new_items }) => {
-                                        items = new_items.to_vec();
-
-                                        if items.is_empty() {
-                                            predicate_results.clear();
-                                            last_emitted_pids.clear(); // A2: Clear for empty list
-                                            return Some((
-                                                Some(ListChange::Replace { items: Arc::from(Vec::<ActorHandle>::new()) }),
-                                                (items, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
-                                            ));
-                                        } else {
-                                            let (
-                                                new_predicate_results,
-                                                new_merged_predicates,
-                                                filtered,
-                                                new_last_emitted_pids,
-                                            ) = Self::rebuild_retain_state(
-                                                &items,
-                                                &predicate_results,
-                                                &config,
-                                                construct_context.clone(),
-                                                actor_context.clone(),
-                                            )
-                                            .await;
-                                            predicate_results = new_predicate_results;
-                                            merged_predicates = new_merged_predicates;
-                                            last_emitted_pids = new_last_emitted_pids;
-
-                                            return Some((
-                                                Some(ListChange::Replace { items: Arc::from(filtered) }),
-                                                (items, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
-                                            ));
-                                        }
+                                ListChange::Pop => {
+                                    let mut state = state.borrow_mut();
+                                    if state.entries.pop().is_some() {
+                                        did_change = true;
                                     }
-                                    Some(ListChange::Push { item }) => {
-                                        items.push(item);
-                                        let (
-                                            new_predicate_results,
-                                            new_merged_predicates,
-                                            filtered,
-                                            current_pids,
-                                        ) = Self::rebuild_retain_state(
-                                            &items,
-                                            &predicate_results,
-                                            &config,
-                                            construct_context.clone(),
-                                            actor_context.clone(),
-                                        )
-                                        .await;
-                                        predicate_results = new_predicate_results;
-                                        merged_predicates = new_merged_predicates;
-
-                                        if current_pids == last_emitted_pids {
-                                            continue; // Skip redundant emission
-                                        }
-                                        last_emitted_pids = current_pids;
-
-                                        return Some((
-                                            Some(ListChange::Replace { items: Arc::from(filtered) }),
-                                            (items, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
-                                        ));
+                                }
+                                ListChange::Clear => {
+                                    let mut state = state.borrow_mut();
+                                    if !state.entries.is_empty() {
+                                        state.entries.clear();
+                                        did_change = true;
                                     }
-                                    // When merged_predicates is None, the list is empty.
-                                    // These operations on an empty list are no-ops:
-                                    Some(ListChange::Remove { .. }) => continue, // Can't remove from empty
-                                    Some(ListChange::Pop) => continue,           // Can't pop from empty
-                                    Some(ListChange::Clear) => continue,         // Already empty
-                                    // These variants are not currently generated by any List API.
-                                    // If you're adding a new List operation that uses these,
-                                    // you must implement proper handling here.
-                                    Some(ListChange::InsertAt { .. }) => {
-                                        panic!(
-                                            "List/retain received InsertAt event which is not yet implemented. \
-                                            If you added a List/insert_at API, implement handling in create_retain_actor."
-                                        );
-                                    }
-                                    Some(ListChange::UpdateAt { .. }) => {
-                                        panic!(
-                                            "List/retain received UpdateAt event which is not yet implemented. \
-                                            If you added a List/update_at API, implement handling in create_retain_actor."
-                                        );
-                                    }
-                                    Some(ListChange::Move { .. }) => {
-                                        panic!(
-                                            "List/retain received Move event which is not yet implemented. \
-                                            If you added a List/move API, implement handling in create_retain_actor."
-                                        );
-                                    }
-                                    None => return None,
+                                }
+                                ListChange::InsertAt { .. } => {
+                                    panic!(
+                                        "List/retain direct-state path received InsertAt event which is not yet implemented."
+                                    );
+                                }
+                                ListChange::UpdateAt { .. } => {
+                                    panic!(
+                                        "List/retain direct-state path received UpdateAt event which is not yet implemented."
+                                    );
+                                }
+                                ListChange::Move { .. } => {
+                                    panic!(
+                                        "List/retain direct-state path received Move event which is not yet implemented."
+                                    );
                                 }
                             }
+
+                            let mut state = state.borrow_mut();
+                            state.suppress_emits = false;
+                            if did_change {
+                                emit_filtered_replace(reg, &mut state, true)
+                            } else {
+                                true
+                            }
                         }
+                    }),
+                );
+            }
+        });
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            if !source_list_is_lazy {
+                source_list_actor.stored_state.register_direct_subscriber(
+                    &mut reg,
+                    Rc::new({
+                        let connect_source_list = connect_source_list.clone();
+                        let current_source_list_key = current_source_list_key.clone();
+                        let filtered_state_weak = filtered_state_weak.clone();
+                        move |reg, value| {
+                            if ListStoredState::from_weak(filtered_state_weak.clone()).is_none() {
+                                return false;
+                            }
+
+                            let Some(Value::List(source_list, _)) = value else {
+                                return true;
+                            };
+                            let list_key = list_instance_key(source_list);
+                            if current_source_list_key.get() != Some(list_key) {
+                                connect_source_list(reg, source_list.clone());
+                            }
+                            true
+                        }
+                    }),
+                );
+            }
+
+            if !source_list_is_lazy
+                && source_list_actor.is_constant
+                && current_source_list_key.get().is_none()
+                && let Some(initial_source_list) = initial_source_list.as_ref()
+            {
+                connect_source_list(&mut reg, initial_source_list.clone());
+            }
+
+            reg.drain_runtime_ready_queue();
+        });
+
+        if let Some(source_list_stream) = source_list_stream {
+            let connect_source_list = connect_source_list.clone();
+            let current_source_list_key = current_source_list_key.clone();
+            let filtered_state_weak = filtered_state_weak.clone();
+            Self::start_lazy_source_list_task(
+                &filtered_state,
+                scope_id,
+                source_list_stream,
+                move |reg, source_list| {
+                    if ListStoredState::from_weak(filtered_state_weak.clone()).is_none() {
+                        return;
                     }
-                }
-            )
-            .filter_map(future::ready)
-            },
-        );
+                    let list_key = list_instance_key(&source_list);
+                    if current_source_list_key.get() != Some(list_key) {
+                        connect_source_list(reg, source_list);
+                    }
+                },
+            );
+        }
 
-        let list = List::new_with_change_stream(
-            ConstructInfo::new(
-                construct_info.id.clone().with_child_id(0),
-                None,
-                "List/retain result",
-            ),
-            actor_context_for_list,
-            value_stream,
-            source_list_actor.clone(),
-        );
-
-        let scope_id = actor_context_for_result.scope_id();
-        create_constant_actor(
+        Some(create_constant_actor(
             parser::PersistenceId::new(),
             Value::List(
-                Arc::new(list),
+                filtered_list,
                 ValueMetadata::new(ValueIdempotencyKey::new()),
             ),
             scope_id,
-        )
+        ))
     }
 
     /// Creates a remove actor that removes items when their `when` event fires.
     /// Tracks removed items by PersistenceId so they don't reappear on upstream Replace.
+    fn try_create_direct_state_remove_actor(
+        construct_info: ConstructInfoComplete,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        source_list_actor: ActorHandle,
+        config: Arc<ListBindingConfig>,
+        persistence_id: Option<parser::PersistenceId>,
+    ) -> Option<ActorHandle> {
+        use std::collections::HashSet;
+
+        let source_list_is_lazy = source_list_actor.has_lazy_delegate();
+        let source_list_stream =
+            source_list_is_lazy.then(|| source_list_actor.current_or_future_stream());
+
+        let initial_source_list = match source_list_actor.current_value() {
+            Ok(Value::List(list, _)) => Some(list),
+            Ok(_) => return None,
+            Err(CurrentValueError::NoValueYet) => None,
+            Err(CurrentValueError::ActorDropped) => return None,
+        };
+
+        #[derive(Clone)]
+        struct DirectRemoveEntry {
+            entry_id: usize,
+            item: ActorHandle,
+            when_actor: ActorHandle,
+        }
+
+        struct DirectRemoveState {
+            entries: Vec<DirectRemoveEntry>,
+            next_entry_id: usize,
+            next_idx: usize,
+            removed_pids: HashSet<parser::PersistenceId>,
+            persisted_removed: HashSet<String>,
+        }
+
+        let removed_set_key: Option<String> = persistence_id
+            .as_ref()
+            .map(|pid| format!("list_removed:{}", pid));
+
+        let scope_id = actor_context.scope_id();
+        let result_construct_info = ConstructInfo::new(
+            construct_info.id.clone().with_child_id(0),
+            None,
+            "List/remove result",
+        )
+        .complete(ConstructType::List);
+        let result_state = ListStoredState::new(DiffHistoryConfig::default());
+        result_state.set_has_future_state_updates(initial_source_list.as_ref().map_or_else(
+            || source_list_actor.stored_state.is_alive(),
+            |list| list.stored_state.has_future_state_updates(),
+        ));
+        let result_list = Arc::new(List::new_with_stored_state(
+            result_construct_info.clone(),
+            scope_id,
+            result_state.clone(),
+        ));
+
+        if let Some(output_valve_signal) = actor_context.output_valve_signal.clone() {
+            register_list_output_valve_runtime_subscriber(
+                output_valve_signal.as_ref(),
+                &result_state,
+            );
+        }
+
+        let result_state_weak = result_state.downgrade();
+        let state = Rc::new(RefCell::new(DirectRemoveState {
+            entries: Vec::new(),
+            next_entry_id: 0,
+            next_idx: 0,
+            removed_pids: HashSet::new(),
+            persisted_removed: removed_set_key
+                .as_ref()
+                .map(|key| load_removed_set(key).into_iter().collect())
+                .unwrap_or_default(),
+        }));
+        let broadcast_change = actor_context.output_valve_signal.is_none();
+        let current_source_list_key = Rc::new(Cell::new(None::<usize>));
+        let current_source_generation = Rc::new(Cell::new(0u64));
+
+        let emit_change = Rc::new({
+            let result_construct_info = result_construct_info.clone();
+            let result_state_weak = result_state_weak.clone();
+            move |reg: &mut ActorRegistry, change: ListChange| {
+                let Some(result_state) = ListStoredState::from_weak(result_state_weak.clone())
+                else {
+                    return false;
+                };
+                reg.enqueue_list_runtime_work(
+                    result_state,
+                    ListRuntimeWork::Change {
+                        construct_info: result_construct_info.clone(),
+                        change,
+                        broadcast_change,
+                    },
+                );
+                true
+            }
+        });
+
+        let remove_entry = Rc::new({
+            let emit_change = emit_change.clone();
+            let removed_set_key = removed_set_key.clone();
+            move |reg: &mut ActorRegistry, state: &mut DirectRemoveState, entry_id: usize| {
+                let Some(index) = state
+                    .entries
+                    .iter()
+                    .position(|entry| entry.entry_id == entry_id)
+                else {
+                    return false;
+                };
+
+                let entry = state.entries.remove(index);
+                let persistence_id = entry.item.persistence_id();
+                if let Some(key) = removed_set_key.as_ref() {
+                    if let Some(origin) = entry.item.list_item_origin() {
+                        add_to_removed_set(key, &origin.call_id);
+                        state.persisted_removed.insert(origin.call_id.clone());
+                    } else {
+                        let id_str = format!("pid:{}", persistence_id);
+                        add_to_removed_set(key, &id_str);
+                        state.persisted_removed.insert(id_str);
+                    }
+                }
+
+                state.removed_pids.insert(persistence_id.clone());
+                emit_change(reg, ListChange::Remove { id: persistence_id })
+            }
+        });
+        let connect_source_list = Rc::new({
+            let state = state.clone();
+            let config = config.clone();
+            let construct_context = construct_context.clone();
+            let actor_context = actor_context.clone();
+            let emit_change = emit_change.clone();
+            let remove_entry = remove_entry.clone();
+            let current_source_list_key = current_source_list_key.clone();
+            let current_source_generation = current_source_generation.clone();
+            let result_state_weak = result_state_weak.clone();
+            let result_state = result_state.clone();
+            move |reg: &mut ActorRegistry, source_list: Arc<List>| {
+                let list_key = list_instance_key(&source_list);
+                let generation = current_source_generation.get() + 1;
+                current_source_generation.set(generation);
+                current_source_list_key.set(Some(list_key));
+
+                source_list.stored_state.register_direct_subscriber(
+                    reg,
+                    Rc::new({
+                        let state = state.clone();
+                        let config = config.clone();
+                        let construct_context = construct_context.clone();
+                        let actor_context = actor_context.clone();
+                        let emit_change = emit_change.clone();
+                        let remove_entry = remove_entry.clone();
+                        let current_source_list_key = current_source_list_key.clone();
+                        let current_source_generation = current_source_generation.clone();
+                        let result_state_weak = result_state_weak.clone();
+                        let result_state = result_state.clone();
+                        move |reg, change| {
+                            if ListStoredState::from_weak(result_state_weak.clone()).is_none() {
+                                return false;
+                            }
+                            if current_source_generation.get() != generation
+                                || current_source_list_key.get() != Some(list_key)
+                            {
+                                return false;
+                            }
+
+                            let add_entry =
+                                |reg: &mut ActorRegistry,
+                                 item: ActorHandle,
+                                 idx: usize|
+                                 -> Option<usize> {
+                                    let when_actor = Self::transform_item_with_registry(
+                                        Some(reg),
+                                        item.clone(),
+                                        idx,
+                                        &config,
+                                        construct_context.clone(),
+                                        actor_context.clone(),
+                                    );
+
+                                    let entry_id = {
+                                        let mut state = state.borrow_mut();
+                                        let entry_id = state.next_entry_id;
+                                        state.next_entry_id += 1;
+                                        state.entries.push(DirectRemoveEntry {
+                                            entry_id,
+                                            item: item.clone(),
+                                            when_actor: when_actor.clone(),
+                                        });
+                                        entry_id
+                                    };
+
+                                    if when_actor.current_value().is_ok() {
+                                        return Some(entry_id);
+                                    }
+
+                                    if when_actor.lazy_delegate_with_registry(reg).is_some() {
+                                        let result_state_weak = result_state_weak.clone();
+                                        let state = state.clone();
+                                        let remove_entry = remove_entry.clone();
+                                        let current_source_list_key =
+                                            current_source_list_key.clone();
+                                        let current_source_generation =
+                                            current_source_generation.clone();
+                                        let when_actor = when_actor.clone();
+                                        let task = spawn_async_source_task(async move {
+                                            let mut trigger_stream =
+                                                std::pin::pin!(when_actor.current_or_future_stream());
+                                            if trigger_stream.next().await.is_none() {
+                                                return;
+                                            }
+
+                                            REGISTRY.with(|reg| {
+                                                let mut reg = reg.borrow_mut();
+                                                if ListStoredState::from_weak(
+                                                    result_state_weak.clone(),
+                                                )
+                                                .is_none()
+                                                {
+                                                    return;
+                                                }
+                                                if current_source_generation.get() != generation
+                                                    || current_source_list_key.get()
+                                                        != Some(list_key)
+                                                {
+                                                    return;
+                                                }
+
+                                                let mut state = state.borrow_mut();
+                                                let _ = remove_entry(&mut reg, &mut state, entry_id);
+                                                reg.drain_runtime_ready_queue();
+                                            });
+                                        });
+                                        let _ = reg.insert_async_source_for_list(
+                                            scope_id,
+                                            result_state.async_owner_key(),
+                                            task,
+                                        );
+                                    } else {
+                                        when_actor.stored_state.register_direct_subscriber(
+                                            reg,
+                                            Rc::new({
+                                                let state = state.clone();
+                                                let remove_entry = remove_entry.clone();
+                                                let current_source_list_key =
+                                                    current_source_list_key.clone();
+                                                let current_source_generation =
+                                                    current_source_generation.clone();
+                                                let result_state_weak =
+                                                    result_state_weak.clone();
+                                                move |reg, _value| {
+                                                    if ListStoredState::from_weak(
+                                                        result_state_weak.clone(),
+                                                    )
+                                                    .is_none()
+                                                    {
+                                                        return false;
+                                                    }
+                                                    if current_source_generation.get() != generation
+                                                        || current_source_list_key.get()
+                                                            != Some(list_key)
+                                                    {
+                                                        return false;
+                                                    }
+
+                                                    let mut state = state.borrow_mut();
+                                                    let _ = remove_entry(reg, &mut state, entry_id);
+                                                    false
+                                                }
+                                            }),
+                                        );
+                                    }
+
+                                    None
+                                };
+
+                            match change {
+                                ListChange::Replace { items } => {
+                                    let upstream_pids: HashSet<_> =
+                                        items.iter().map(|item| item.persistence_id()).collect();
+                                    {
+                                        let mut state = state.borrow_mut();
+                                        state.entries.clear();
+                                        state.removed_pids.retain(|pid| upstream_pids.contains(pid));
+                                    }
+
+                                    let mut filtered_items = Vec::new();
+                                    let mut immediate_removals = Vec::new();
+                                    for item in items.iter().cloned() {
+                                        let should_skip = {
+                                            let state = state.borrow();
+                                            let persistence_id = item.persistence_id();
+                                            state.removed_pids.contains(&persistence_id)
+                                                || item
+                                                    .list_item_origin()
+                                                    .map(|origin| {
+                                                        state.persisted_removed
+                                                            .contains(&origin.call_id)
+                                                    })
+                                                    .unwrap_or_else(|| {
+                                                        let id_str =
+                                                            format!("pid:{}", persistence_id);
+                                                        state.persisted_removed.contains(&id_str)
+                                                    })
+                                        };
+                                        if should_skip {
+                                            continue;
+                                        }
+
+                                        let idx = {
+                                            let mut state = state.borrow_mut();
+                                            let idx = state.next_idx;
+                                            state.next_idx += 1;
+                                            idx
+                                        };
+
+                                        if let Some(entry_id) = add_entry(reg, item.clone(), idx) {
+                                            immediate_removals.push(entry_id);
+                                        }
+                                        filtered_items.push(item);
+                                    }
+
+                                    if !emit_change(
+                                        reg,
+                                        ListChange::Replace {
+                                            items: Arc::from(filtered_items),
+                                        },
+                                    ) {
+                                        return false;
+                                    }
+
+                                    for entry_id in immediate_removals {
+                                        let mut state = state.borrow_mut();
+                                        let _ = remove_entry(reg, &mut state, entry_id);
+                                    }
+                                }
+                                ListChange::Push { item } => {
+                                    let should_skip = {
+                                        let state = state.borrow();
+                                        let persistence_id = item.persistence_id();
+                                        state.removed_pids.contains(&persistence_id)
+                                            || item
+                                                .list_item_origin()
+                                                .map(|origin| {
+                                                    state.persisted_removed
+                                                        .contains(&origin.call_id)
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    let id_str = format!("pid:{}", persistence_id);
+                                                    state.persisted_removed.contains(&id_str)
+                                                })
+                                    };
+                                    if should_skip {
+                                        return true;
+                                    }
+
+                                    let idx = {
+                                        let mut state = state.borrow_mut();
+                                        let idx = state.next_idx;
+                                        state.next_idx += 1;
+                                        idx
+                                    };
+
+                                    let immediate_remove = add_entry(reg, item.clone(), idx);
+                                    if !emit_change(reg, ListChange::Push { item: item.clone() }) {
+                                        return false;
+                                    }
+
+                                    if let Some(entry_id) = immediate_remove {
+                                        let mut state = state.borrow_mut();
+                                        let _ = remove_entry(reg, &mut state, entry_id);
+                                    }
+                                }
+                                ListChange::Remove { id } => {
+                                    let mut state = state.borrow_mut();
+                                    state.removed_pids.remove(id);
+                                    if let Some(index) = state
+                                        .entries
+                                        .iter()
+                                        .position(|entry| entry.item.persistence_id() == *id)
+                                    {
+                                        state.entries.remove(index);
+                                    }
+                                    if !emit_change(reg, ListChange::Remove { id: id.clone() }) {
+                                        return false;
+                                    }
+                                }
+                                ListChange::Clear => {
+                                    let mut state = state.borrow_mut();
+                                    state.entries.clear();
+                                    state.removed_pids.clear();
+                                    state.next_idx = 0;
+                                    if !emit_change(reg, ListChange::Clear) {
+                                        return false;
+                                    }
+                                }
+                                ListChange::Pop => {
+                                    let mut state = state.borrow_mut();
+                                    if let Some(entry) = state.entries.pop() {
+                                        state.removed_pids.remove(&entry.item.persistence_id());
+                                    }
+                                    if !emit_change(reg, ListChange::Pop) {
+                                        return false;
+                                    }
+                                }
+                                ListChange::InsertAt { .. } => {
+                                    panic!(
+                                        "List/remove direct-state path received InsertAt event which is not yet implemented."
+                                    );
+                                }
+                                ListChange::UpdateAt { .. } => {
+                                    panic!(
+                                        "List/remove direct-state path received UpdateAt event which is not yet implemented."
+                                    );
+                                }
+                                ListChange::Move { .. } => {
+                                    panic!(
+                                        "List/remove direct-state path received Move event which is not yet implemented."
+                                    );
+                                }
+                            }
+
+                            true
+                        }
+                    }),
+                );
+            }
+        });
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            if !source_list_is_lazy {
+                source_list_actor.stored_state.register_direct_subscriber(
+                    &mut reg,
+                    Rc::new({
+                        let connect_source_list = connect_source_list.clone();
+                        let current_source_list_key = current_source_list_key.clone();
+                        let result_state_weak = result_state_weak.clone();
+                        move |reg, value| {
+                            if ListStoredState::from_weak(result_state_weak.clone()).is_none() {
+                                return false;
+                            }
+
+                            let Some(Value::List(source_list, _)) = value else {
+                                return true;
+                            };
+                            let list_key = list_instance_key(source_list);
+                            if current_source_list_key.get() != Some(list_key) {
+                                connect_source_list(reg, source_list.clone());
+                            }
+                            true
+                        }
+                    }),
+                );
+            }
+
+            if !source_list_is_lazy
+                && source_list_actor.is_constant
+                && current_source_list_key.get().is_none()
+                && let Some(initial_source_list) = initial_source_list.as_ref()
+            {
+                connect_source_list(&mut reg, initial_source_list.clone());
+            }
+
+            reg.drain_runtime_ready_queue();
+        });
+
+        if let Some(source_list_stream) = source_list_stream {
+            let connect_source_list = connect_source_list.clone();
+            let current_source_list_key = current_source_list_key.clone();
+            let result_state_weak = result_state_weak.clone();
+            Self::start_lazy_source_list_task(
+                &result_state,
+                scope_id,
+                source_list_stream,
+                move |reg, source_list| {
+                    if ListStoredState::from_weak(result_state_weak.clone()).is_none() {
+                        return;
+                    }
+                    let list_key = list_instance_key(&source_list);
+                    if current_source_list_key.get() != Some(list_key) {
+                        connect_source_list(reg, source_list);
+                    }
+                },
+            );
+        }
+
+        Some(create_constant_actor(
+            parser::PersistenceId::new(),
+            Value::List(result_list, ValueMetadata::new(ValueIdempotencyKey::new())),
+            scope_id,
+        ))
+    }
+
     fn create_remove_actor(
         construct_info: ConstructInfoComplete,
         construct_context: ConstructContext,
@@ -8577,416 +13059,20 @@ impl ListBindingFunction {
         config: Arc<ListBindingConfig>,
         persistence_id: Option<parser::PersistenceId>,
     ) -> ActorHandle {
-        use std::collections::HashSet;
-
-        // Storage key for this List/remove's removed set (per-branch removal tracking)
-        let removed_set_key: Option<String> = persistence_id
-            .as_ref()
-            .map(|pid| format!("list_removed:{}", pid));
-
-        // Clone for use after the chain
-        let actor_context_for_list = actor_context.clone();
-        let actor_context_for_result = actor_context.clone();
-        let construct_context_for_persistence = construct_context.clone();
-
-        // Clone subscription scope for scope cancellation check
-        let subscription_scope = actor_context.subscription_scope.clone();
-
-        // Use switch_map for proper list replacement handling
-        let value_stream = switch_map(
-            Self::source_list_current_and_future_values(
-                source_list_actor.clone(),
-                subscription_scope,
-            ),
-            move |list| {
-                let config = config.clone();
-                let construct_context = construct_context.clone();
-                let actor_context = actor_context.clone();
-                let removed_set_key = removed_set_key.clone();
-
-                // Load persisted removed set for restoration (call_ids that were previously removed)
-                let persisted_removed: HashSet<String> = removed_set_key
-                    .as_ref()
-                    .map(|key| load_removed_set(key).into_iter().collect())
-                    .unwrap_or_default();
-
-                // Event type for merged streams
-                enum RemoveEvent {
-                    ListChange(ListChange),
-                    RemoveItem(parser::PersistenceId),
-                }
-
-                // State: track items and which PersistenceIds have been removed by THIS List/remove
-                // removed_persistence_ids is bounded: items are removed from this set when they're
-                // removed from upstream (no longer in Replace payload or via Remove { id }).
-                type ItemEntry = ActorHandle;
-
-                /// B6: Create a trigger stream for a single when_actor.
-                /// Emits the persistence_id once when the when_actor produces a value, then ends.
-                fn make_trigger_stream(
-                    when_actor: ActorHandle,
-                    persistence_id: parser::PersistenceId,
-                ) -> LocalBoxStream<'static, parser::PersistenceId> {
-                    when_actor
-                        .current_or_future_stream()
-                        .map(move |_| persistence_id.clone())
-                        .take(1)
-                        .boxed_local()
-                }
-
-                stream::unfold(
-                    (
-                        list.clone().stream().boxed_local().fuse(),
-                        stream::SelectAll::<LocalBoxStream<'static, parser::PersistenceId>>::new(),
-                        Vec::<ItemEntry>::new(),
-                        HashSet::<parser::PersistenceId>::new(),
-                        config.clone(),
-                        construct_context.clone(),
-                        actor_context.clone(),
-                        0usize,
-                        removed_set_key.clone(),
-                        persisted_removed,
-                        false,
-                    ),
-                    move |(
-                        mut list_changes,
-                        mut active_triggers,
-                        mut items,
-                        mut removed_pids,
-                        config,
-                        construct_context,
-                        actor_context,
-                        mut next_idx,
-                        removed_set_key,
-                        persisted_removed,
-                        mut list_changes_done,
-                    )| async move {
-                        loop {
-                            let event = if list_changes_done {
-                                let Some(persistence_id) = active_triggers.next().await else {
-                                    return None;
-                                };
-                                RemoveEvent::RemoveItem(persistence_id)
-                            } else if active_triggers.is_empty() {
-                                match list_changes.next().await {
-                                    Some(change) => RemoveEvent::ListChange(change),
-                                    None => {
-                                        list_changes_done = true;
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                select! {
-                                    change = list_changes.next().fuse() => {
-                                        match change {
-                                            Some(change) => RemoveEvent::ListChange(change),
-                                            None => {
-                                                list_changes_done = true;
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    persistence_id = active_triggers.select_next_some() => {
-                                        RemoveEvent::RemoveItem(persistence_id)
-                                    }
-                                }
-                            };
-
-                            let emitted_change = match event {
-                                RemoveEvent::ListChange(change) => match change {
-                                    ListChange::Replace { items: new_items } => {
-                                        if LOG_DEBUG {
-                                            zoon::println!(
-                                                "[DEBUG] List/remove Replace: {} items incoming, persisted_removed={:?}",
-                                                new_items.len(),
-                                                persisted_removed
-                                            );
-                                        }
-                                        items.clear();
-                                        active_triggers = stream::SelectAll::new();
-                                        let mut filtered_items = Vec::new();
-
-                                        for item in new_items.iter() {
-                                            let persistence_id = item.persistence_id();
-                                            if removed_pids.contains(&persistence_id) {
-                                                if LOG_DEBUG {
-                                                    zoon::println!(
-                                                        "[DEBUG] List/remove Replace: filtering by removed_pids"
-                                                    );
-                                                }
-                                                continue;
-                                            }
-
-                                            if let Some(origin) = item.list_item_origin() {
-                                                if LOG_DEBUG {
-                                                    zoon::println!(
-                                                        "[DEBUG] List/remove Replace: item has origin call_id={}",
-                                                        origin.call_id
-                                                    );
-                                                }
-                                                if persisted_removed.contains(&origin.call_id) {
-                                                    if LOG_DEBUG {
-                                                        zoon::println!(
-                                                            "[DEBUG] List/remove Replace: FILTERING out call_id={}",
-                                                            origin.call_id
-                                                        );
-                                                    }
-                                                    continue;
-                                                }
-                                            } else {
-                                                let id_str = format!("pid:{}", persistence_id);
-                                                if LOG_DEBUG {
-                                                    zoon::println!(
-                                                        "[DEBUG] List/remove Replace: item has NO origin, checking pid={}",
-                                                        id_str
-                                                    );
-                                                }
-                                                if persisted_removed.contains(&id_str) {
-                                                    if LOG_DEBUG {
-                                                        zoon::println!(
-                                                            "[DEBUG] List/remove Replace: FILTERING out pid={}",
-                                                            id_str
-                                                        );
-                                                    }
-                                                    continue;
-                                                }
-                                            }
-
-                                            let idx = next_idx;
-                                            next_idx += 1;
-                                            let when_actor = Self::transform_item(
-                                                item.clone(),
-                                                idx,
-                                                &config,
-                                                construct_context.clone(),
-                                                actor_context.clone(),
-                                            );
-                                            active_triggers.push(make_trigger_stream(
-                                                when_actor,
-                                                persistence_id,
-                                            ));
-                                            items.push(item.clone());
-                                            filtered_items.push(item.clone());
-                                        }
-
-                                        let upstream_pids: HashSet<_> = new_items
-                                            .iter()
-                                            .map(|item| item.persistence_id())
-                                            .collect();
-                                        removed_pids.retain(|pid| upstream_pids.contains(pid));
-
-                                        Some(ListChange::Replace {
-                                            items: Arc::from(filtered_items),
-                                        })
-                                    }
-                                    ListChange::Push { item } => {
-                                        let persistence_id = item.persistence_id();
-                                        if removed_pids.contains(&persistence_id) {
-                                            if LOG_DEBUG {
-                                                zoon::println!(
-                                                    "[DEBUG] List/remove Push: filtering by removed_pids"
-                                                );
-                                            }
-                                            None
-                                        } else if let Some(origin) = item.list_item_origin() {
-                                            if LOG_DEBUG {
-                                                zoon::println!(
-                                                    "[DEBUG] List/remove Push: item has origin call_id={}, persisted_removed={:?}",
-                                                    origin.call_id,
-                                                    persisted_removed
-                                                );
-                                            }
-                                            if persisted_removed.contains(&origin.call_id) {
-                                                if LOG_DEBUG {
-                                                    zoon::println!(
-                                                        "[DEBUG] List/remove Push: FILTERING out call_id={}",
-                                                        origin.call_id
-                                                    );
-                                                }
-                                                None
-                                            } else {
-                                                let idx = next_idx;
-                                                next_idx += 1;
-                                                let when_actor = Self::transform_item(
-                                                    item.clone(),
-                                                    idx,
-                                                    &config,
-                                                    construct_context.clone(),
-                                                    actor_context.clone(),
-                                                );
-                                                active_triggers.push(make_trigger_stream(
-                                                    when_actor,
-                                                    persistence_id,
-                                                ));
-                                                items.push(item.clone());
-                                                Some(ListChange::Push { item })
-                                            }
-                                        } else {
-                                            let id_str = format!("pid:{}", persistence_id);
-                                            if LOG_DEBUG {
-                                                zoon::println!(
-                                                    "[DEBUG] List/remove Push: item has NO origin, checking pid={}",
-                                                    id_str
-                                                );
-                                            }
-                                            if persisted_removed.contains(&id_str) {
-                                                if LOG_DEBUG {
-                                                    zoon::println!(
-                                                        "[DEBUG] List/remove Push: FILTERING out pid={}",
-                                                        id_str
-                                                    );
-                                                }
-                                                None
-                                            } else {
-                                                let idx = next_idx;
-                                                next_idx += 1;
-                                                let when_actor = Self::transform_item(
-                                                    item.clone(),
-                                                    idx,
-                                                    &config,
-                                                    construct_context.clone(),
-                                                    actor_context.clone(),
-                                                );
-                                                active_triggers.push(make_trigger_stream(
-                                                    when_actor,
-                                                    persistence_id,
-                                                ));
-                                                items.push(item.clone());
-                                                Some(ListChange::Push { item })
-                                            }
-                                        }
-                                    }
-                                    ListChange::Remove { id } => {
-                                        removed_pids.remove(&id);
-                                        if let Some(pos) = items
-                                            .iter()
-                                            .position(|item| item.persistence_id() == id)
-                                        {
-                                            items.remove(pos);
-                                        }
-                                        Some(ListChange::Remove { id })
-                                    }
-                                    ListChange::Clear => {
-                                        items.clear();
-                                        active_triggers = stream::SelectAll::new();
-                                        removed_pids.clear();
-                                        next_idx = 0;
-                                        Some(ListChange::Clear)
-                                    }
-                                    ListChange::Pop => {
-                                        if let Some(item) = items.pop() {
-                                            removed_pids.remove(&item.persistence_id());
-                                        }
-                                        Some(ListChange::Pop)
-                                    }
-                                    _ => None,
-                                },
-                                RemoveEvent::RemoveItem(persistence_id) => {
-                                    if let Some(pos) = items
-                                        .iter()
-                                        .position(|item| item.persistence_id() == persistence_id)
-                                    {
-                                        let item = &items[pos];
-                                        if LOG_DEBUG {
-                                            zoon::println!(
-                                                "[DEBUG] RemoveItem: item has origin: {}, removed_set_key: {:?}",
-                                                item.list_item_origin().is_some(),
-                                                removed_set_key
-                                            );
-                                        }
-
-                                        if let Some(key) = removed_set_key.as_ref() {
-                                            if let Some(origin) = item.list_item_origin() {
-                                                if LOG_DEBUG {
-                                                    zoon::println!(
-                                                        "[DEBUG] Adding to removed set: key={}, call_id={}",
-                                                        key,
-                                                        origin.call_id
-                                                    );
-                                                }
-                                                add_to_removed_set(key, &origin.call_id);
-                                            } else {
-                                                let id_str = format!("pid:{}", persistence_id);
-                                                if LOG_DEBUG {
-                                                    zoon::println!(
-                                                        "[DEBUG] Adding to removed set (no origin): key={}, id={}",
-                                                        key,
-                                                        id_str
-                                                    );
-                                                }
-                                                add_to_removed_set(key, &id_str);
-                                            }
-                                        }
-
-                                        items.remove(pos);
-                                        removed_pids.insert(persistence_id);
-                                        Some(ListChange::Remove { id: persistence_id })
-                                    } else {
-                                        None
-                                    }
-                                }
-                            };
-
-                            if let Some(change) = emitted_change {
-                                return Some((
-                                    change,
-                                    (
-                                        list_changes,
-                                        active_triggers,
-                                        items,
-                                        removed_pids,
-                                        config,
-                                        construct_context,
-                                        actor_context,
-                                        next_idx,
-                                        removed_set_key,
-                                        persisted_removed,
-                                        list_changes_done,
-                                    ),
-                                ));
-                            }
-                        }
-                    },
-                )
-            },
-        );
-
-        // Use persistence-aware list creation if persistence_id is provided
-        let list = if let Some(pid) = persistence_id {
-            List::new_with_change_stream_and_persistence(
-                ConstructInfo::new(
-                    construct_info.id.clone().with_child_id(0),
-                    None,
-                    "List/remove result",
-                ),
-                construct_context_for_persistence,
-                actor_context_for_list,
-                value_stream,
-                (source_list_actor.clone(),),
-                pid,
-            )
-        } else {
-            List::new_with_change_stream(
-                ConstructInfo::new(
-                    construct_info.id.clone().with_child_id(0),
-                    None,
-                    "List/remove result",
-                ),
-                actor_context_for_list,
-                value_stream,
-                source_list_actor.clone(),
-            )
-        };
-
-        let scope_id = actor_context_for_result.scope_id();
-        create_constant_actor(
-            parser::PersistenceId::new(),
-            Value::List(
-                Arc::new(list),
-                ValueMetadata::new(ValueIdempotencyKey::new()),
-            ),
-            scope_id,
+        Self::try_create_direct_state_remove_actor(
+            construct_info.clone(),
+            construct_context.clone(),
+            actor_context.clone(),
+            source_list_actor.clone(),
+            config.clone(),
+            persistence_id.clone(),
         )
+        .unwrap_or_else(|| {
+            panic!(
+                "List/remove source should stay on the direct-state runtime path: {:?}",
+                construct_info.id
+            )
+        })
     }
 
     /// Creates an every/any actor that produces True/False based on predicates.
@@ -8998,6 +13084,17 @@ impl ListBindingFunction {
         config: Arc<ListBindingConfig>,
         is_every: bool, // true = every, false = any
     ) -> ActorHandle {
+        if let Some(actor) = Self::try_create_direct_state_every_any_actor(
+            construct_info.clone(),
+            construct_context.clone(),
+            actor_context.clone(),
+            source_list_actor.clone(),
+            config.clone(),
+            is_every,
+        ) {
+            return actor;
+        }
+
         let construct_info_id = construct_info.id.clone();
 
         // Clone for use after the flat_map chain
@@ -9217,6 +13314,374 @@ impl ListBindingFunction {
         create_actor(deduplicated_stream, parser::PersistenceId::new(), scope_id)
     }
 
+    fn try_create_direct_state_every_any_actor(
+        construct_info: ConstructInfoComplete,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        source_list_actor: ActorHandle,
+        config: Arc<ListBindingConfig>,
+        is_every: bool,
+    ) -> Option<ActorHandle> {
+        let source_list_is_lazy = source_list_actor.has_lazy_delegate();
+        let source_list_stream =
+            source_list_is_lazy.then(|| source_list_actor.current_or_future_stream());
+
+        let initial_source_list = match source_list_actor.current_value() {
+            Ok(Value::List(list, _)) => Some(list),
+            Ok(_) => return None,
+            Err(CurrentValueError::NoValueYet) => None,
+            Err(CurrentValueError::ActorDropped) => return None,
+        };
+
+        type DirectEveryAnyState = (
+            Vec<parser::PersistenceId>,
+            std::collections::HashMap<parser::PersistenceId, (ActorHandle, Option<bool>)>,
+            usize,
+            usize,
+            Option<bool>,
+        );
+
+        let scope_id = actor_context.scope_id();
+        let output = create_actor_forwarding(parser::PersistenceId::new(), scope_id);
+        retain_actor_handles_with_registry(
+            None,
+            &output,
+            std::iter::once(source_list_actor.clone()),
+        );
+
+        let state = Rc::new(RefCell::new((
+            Vec::<parser::PersistenceId>::new(),
+            std::collections::HashMap::<parser::PersistenceId, (ActorHandle, Option<bool>)>::new(),
+            0usize,
+            0usize,
+            None::<bool>,
+        )));
+        let current_source_list_key = Rc::new(Cell::new(None::<usize>));
+        let current_source_generation = Rc::new(Cell::new(0u64));
+
+        let emit_result_if_ready = Rc::new({
+            let output = output.clone();
+            let construct_context = construct_context.clone();
+            let construct_info_id = construct_info.id.clone();
+            move |reg: &mut ActorRegistry, state: &mut DirectEveryAnyState| {
+                let total = state.0.len();
+                let next_result = if total == 0 {
+                    Some(is_every)
+                } else if state.3 == total {
+                    Some(if is_every {
+                        state.2 == total
+                    } else {
+                        state.2 > 0
+                    })
+                } else {
+                    None
+                };
+
+                if let Some(result) = next_result {
+                    if state.4 != Some(result) {
+                        state.4 = Some(result);
+                        reg.enqueue_actor_mailbox_value(
+                            output.actor_id(),
+                            Tag::new_value(
+                                ConstructInfo::new(
+                                    construct_info_id.clone().with_child_id(0),
+                                    None,
+                                    if is_every {
+                                        "List/every result"
+                                    } else {
+                                        "List/any result"
+                                    },
+                                ),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                if result { "True" } else { "False" }.to_string(),
+                            ),
+                        );
+                    }
+                }
+            }
+        });
+        let connect_source_list = Rc::new({
+            let state = state.clone();
+            let output = output.clone();
+            let config = config.clone();
+            let construct_context = construct_context.clone();
+            let actor_context = actor_context.clone();
+            let emit_result_if_ready = emit_result_if_ready.clone();
+            let current_source_list_key = current_source_list_key.clone();
+            let current_source_generation = current_source_generation.clone();
+            move |reg: &mut ActorRegistry, source_list: Arc<List>| {
+                let list_key = list_instance_key(&source_list);
+                let generation = current_source_generation.get() + 1;
+                current_source_generation.set(generation);
+                current_source_list_key.set(Some(list_key));
+
+                source_list.stored_state.register_direct_subscriber(
+                    reg,
+                    Rc::new({
+                        let state = state.clone();
+                        let output = output.clone();
+                        let config = config.clone();
+                        let construct_context = construct_context.clone();
+                        let actor_context = actor_context.clone();
+                        let emit_result_if_ready = emit_result_if_ready.clone();
+                        let current_source_list_key = current_source_list_key.clone();
+                        let current_source_generation = current_source_generation.clone();
+                        move |reg, change| {
+                            if matches!(output.current_value(), Err(CurrentValueError::ActorDropped))
+                            {
+                                return false;
+                            }
+                            if current_source_generation.get() != generation
+                                || current_source_list_key.get() != Some(list_key)
+                            {
+                                return false;
+                            }
+
+                            let add_predicate =
+                                |reg: &mut ActorRegistry, item: ActorHandle, idx: usize| {
+                                    let pid = item.persistence_id();
+                                    let predicate = Self::transform_item_with_registry(
+                                        Some(reg),
+                                        item,
+                                        idx,
+                                        &config,
+                                        construct_context.clone(),
+                                        actor_context.clone(),
+                                    );
+                                    {
+                                        let mut state = state.borrow_mut();
+                                        state.0.push(pid.clone());
+                                        state.1.insert(pid.clone(), (predicate.clone(), None));
+                                    }
+                                    retain_actor_handles_with_registry(
+                                        Some(reg),
+                                        &output,
+                                        std::iter::once(predicate.clone()),
+                                    );
+                                    predicate.stored_state.register_direct_subscriber(
+                                        reg,
+                                        Rc::new({
+                                            let state = state.clone();
+                                            let output = output.clone();
+                                            let emit_result_if_ready =
+                                                emit_result_if_ready.clone();
+                                            let current_source_list_key =
+                                                current_source_list_key.clone();
+                                            let current_source_generation =
+                                                current_source_generation.clone();
+                                            let pid = pid.clone();
+                                            move |reg, value| {
+                                                if matches!(
+                                                    output.current_value(),
+                                                    Err(CurrentValueError::ActorDropped)
+                                                ) {
+                                                    return false;
+                                                }
+                                                if current_source_generation.get() != generation
+                                                    || current_source_list_key.get()
+                                                        != Some(list_key)
+                                                {
+                                                    return false;
+                                                }
+
+                                                let Some(value) = value else {
+                                                    return true;
+                                                };
+
+                                                let mut state = state.borrow_mut();
+                                                let is_true =
+                                                    matches!(value, Value::Tag(tag, _) if tag.tag() == "True");
+                                                let previous = {
+                                                    let Some((_, current_bool)) =
+                                                        state.1.get_mut(&pid)
+                                                    else {
+                                                        return false;
+                                                    };
+                                                    let previous = *current_bool;
+                                                    *current_bool = Some(is_true);
+                                                    previous
+                                                };
+                                                match previous {
+                                                    None => {
+                                                        state.3 += 1;
+                                                        if is_true {
+                                                            state.2 += 1;
+                                                        }
+                                                    }
+                                                    Some(previous) if previous != is_true => {
+                                                        if previous && !is_true {
+                                                            state.2 -= 1;
+                                                        } else if !previous && is_true {
+                                                            state.2 += 1;
+                                                        }
+                                                    }
+                                                    Some(_) => {}
+                                                }
+                                                emit_result_if_ready(reg, &mut state);
+                                                true
+                                            }
+                                        }),
+                                    );
+                                };
+
+                            match change {
+                                ListChange::Replace { items } => {
+                                    {
+                                        let mut state = state.borrow_mut();
+                                        state.0.clear();
+                                        state.1.clear();
+                                        state.2 = 0;
+                                        state.3 = 0;
+                                    }
+                                    for (idx, item) in items.iter().cloned().enumerate() {
+                                        add_predicate(reg, item, idx);
+                                    }
+                                    let mut state = state.borrow_mut();
+                                    emit_result_if_ready(reg, &mut state);
+                                }
+                                ListChange::Push { item } => {
+                                    let idx = state.borrow().0.len();
+                                    add_predicate(reg, item.clone(), idx);
+                                }
+                                ListChange::Clear => {
+                                    let mut state = state.borrow_mut();
+                                    state.0.clear();
+                                    state.1.clear();
+                                    state.2 = 0;
+                                    state.3 = 0;
+                                    emit_result_if_ready(reg, &mut state);
+                                }
+                                ListChange::Pop => {
+                                    let mut state = state.borrow_mut();
+                                    if let Some(pid) = state.0.pop() {
+                                        if let Some((_, current_bool)) = state.1.remove(&pid) {
+                                            match current_bool {
+                                                Some(true) => {
+                                                    state.2 -= 1;
+                                                    state.3 -= 1;
+                                                }
+                                                Some(false) => {
+                                                    state.3 -= 1;
+                                                }
+                                                None => {}
+                                            }
+                                        }
+                                    }
+                                    emit_result_if_ready(reg, &mut state);
+                                }
+                                ListChange::Remove { id } => {
+                                    let mut state = state.borrow_mut();
+                                    state.0.retain(|pid| *pid != *id);
+                                    if let Some((_, current_bool)) = state.1.remove(id) {
+                                        match current_bool {
+                                            Some(true) => {
+                                                state.2 -= 1;
+                                                state.3 -= 1;
+                                            }
+                                            Some(false) => {
+                                                state.3 -= 1;
+                                            }
+                                            None => {}
+                                        }
+                                    }
+                                    emit_result_if_ready(reg, &mut state);
+                                }
+                                ListChange::InsertAt { .. } => {
+                                    panic!(
+                                        "List/every or List/any direct-state path received InsertAt event which is not yet implemented."
+                                    );
+                                }
+                                ListChange::UpdateAt { .. } => {
+                                    panic!(
+                                        "List/every or List/any direct-state path received UpdateAt event which is not yet implemented."
+                                    );
+                                }
+                                ListChange::Move { .. } => {
+                                    panic!(
+                                        "List/every or List/any direct-state path received Move event which is not yet implemented."
+                                    );
+                                }
+                            }
+
+                            true
+                        }
+                    }),
+                );
+            }
+        });
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            if !source_list_is_lazy {
+                source_list_actor.stored_state.register_direct_subscriber(
+                    &mut reg,
+                    Rc::new({
+                        let output = output.clone();
+                        let connect_source_list = connect_source_list.clone();
+                        let current_source_list_key = current_source_list_key.clone();
+                        move |reg, value| {
+                            if matches!(
+                                output.current_value(),
+                                Err(CurrentValueError::ActorDropped)
+                            ) {
+                                return false;
+                            }
+                            let Some(Value::List(source_list, _)) = value else {
+                                return true;
+                            };
+                            let list_key = list_instance_key(source_list);
+                            if current_source_list_key.get() != Some(list_key) {
+                                connect_source_list(reg, source_list.clone());
+                            }
+                            true
+                        }
+                    }),
+                );
+            }
+
+            if !source_list_is_lazy
+                && source_list_actor.is_constant
+                && current_source_list_key.get().is_none()
+                && let Some(initial_source_list) = initial_source_list.as_ref()
+            {
+                connect_source_list(&mut reg, initial_source_list.clone());
+            }
+
+            reg.drain_runtime_ready_queue();
+        });
+
+        if let Some(source_list_stream) = source_list_stream {
+            let output_for_task = output.clone();
+            let connect_source_list = connect_source_list.clone();
+            let current_source_list_key = current_source_list_key.clone();
+            start_retained_actor_scope_task(&output, async move {
+                let mut source_list_stream = std::pin::pin!(source_list_stream);
+                while let Some(value) = source_list_stream.next().await {
+                    let Value::List(source_list, _) = value else {
+                        continue;
+                    };
+                    if matches!(
+                        output_for_task.current_value(),
+                        Err(CurrentValueError::ActorDropped)
+                    ) {
+                        break;
+                    }
+                    REGISTRY.with(|reg| {
+                        let mut reg = reg.borrow_mut();
+                        let list_key = list_instance_key(&source_list);
+                        if current_source_list_key.get() != Some(list_key) {
+                            connect_source_list(&mut reg, source_list.clone());
+                        }
+                        reg.drain_runtime_ready_queue();
+                    });
+                }
+            });
+        }
+
+        Some(output)
+    }
+
     /// Creates a sort_by actor that sorts list items based on a key expression.
     /// When any item's key changes, emits an updated sorted list.
     fn create_sort_by_actor(
@@ -9226,215 +13691,425 @@ impl ListBindingFunction {
         source_list_actor: ActorHandle,
         config: Arc<ListBindingConfig>,
     ) -> ActorHandle {
-        let construct_info_id = construct_info.id.clone();
+        Self::try_create_direct_state_sort_by_actor(
+            construct_info.clone(),
+            construct_context.clone(),
+            actor_context.clone(),
+            source_list_actor.clone(),
+            config.clone(),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "List/sort_by source should stay on the direct-state runtime path: {:?}",
+                construct_info.id
+            )
+        })
+    }
 
-        // Clone for use after the flat_map chain
-        let actor_context_for_list = actor_context.clone();
-        let actor_context_for_result = actor_context.clone();
+    fn try_create_direct_state_sort_by_actor(
+        construct_info: ConstructInfoComplete,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        source_list_actor: ActorHandle,
+        config: Arc<ListBindingConfig>,
+    ) -> Option<ActorHandle> {
+        let source_list_is_lazy = source_list_actor.has_lazy_delegate();
+        let source_list_stream =
+            source_list_is_lazy.then(|| source_list_actor.current_or_future_stream());
 
-        // Clone subscription scope for scope cancellation check
-        let subscription_scope = actor_context.subscription_scope.clone();
+        let initial_source_list = match source_list_actor.current_value() {
+            Ok(Value::List(list, _)) => Some(list),
+            Ok(_) => return None,
+            Err(CurrentValueError::NoValueYet) => None,
+            Err(CurrentValueError::ActorDropped) => return None,
+        };
 
-        // Create a stream that:
-        // 1. Subscribes to source list changes (stream() yields automatically)
-        // 2. For each item, evaluates key expression and subscribes to its changes
-        // 3. When list or any key changes, emits sorted Replace
-        // Use switch_map for proper list replacement handling:
-        // When source emits a new list, cancel old subscription and start fresh.
-        // But filter out re-emissions of the same list by ID to avoid cancelling
-        // subscriptions unnecessarily.
-        let value_stream = switch_map(
-            Self::source_list_current_and_future_values(
-                source_list_actor.clone(),
-                subscription_scope,
-            ),
-            move |list| {
-                let config = config.clone();
-                let construct_context = construct_context.clone();
-                let actor_context = actor_context.clone();
-                let construct_info_id = construct_info_id.clone();
+        #[derive(Clone)]
+        struct DirectSortEntry {
+            entry_id: usize,
+            item: ActorHandle,
+            key_actor: ActorHandle,
+            key_value: Option<SortKey>,
+        }
 
-                // Clone for the second flat_map
-                let construct_info_id_inner = construct_info_id.clone();
+        struct DirectSortState {
+            entries: Vec<DirectSortEntry>,
+            prev_sorted: Vec<usize>,
+            next_entry_id: usize,
+            suppress_emits: bool,
+        }
 
-                // Track items and their keys
-                list.stream().scan(
-                Vec::<(ActorHandle, ActorHandle)>::new(), // (item, key_actor)
-                move |item_keys, change| {
-                    let config = config.clone();
-                    let construct_context = construct_context.clone();
-                    let actor_context = actor_context.clone();
+        let scope_id = actor_context.scope_id();
+        let sorted_construct_info = ConstructInfo::new(
+            construct_info.id.clone().with_child_id(0),
+            None,
+            "List/sort_by result",
+        )
+        .complete(ConstructType::List);
+        let sorted_state = ListStoredState::new(DiffHistoryConfig::default());
+        sorted_state.set_has_future_state_updates(initial_source_list.as_ref().map_or_else(
+            || source_list_actor.stored_state.is_alive(),
+            |list| list.stored_state.has_future_state_updates(),
+        ));
+        let sorted_list = Arc::new(List::new_with_stored_state(
+            sorted_construct_info.clone(),
+            scope_id,
+            sorted_state.clone(),
+        ));
 
-                    // Apply change and update key actors
-                    match &change {
-                        ListChange::Replace { items } => {
-                            *item_keys = items.iter().enumerate().map(|(idx, item)| {
-                                let key_actor = Self::transform_item(
-                                    item.clone(),
-                                    idx,
-                                    &config,
-                                    construct_context.clone(),
-                                    actor_context.clone(),
-                                );
-                                (item.clone(), key_actor)
-                            }).collect();
-                        }
-                        ListChange::Push { item } => {
-                            let idx = item_keys.len();
-                            let key_actor = Self::transform_item(
-                                item.clone(),
-                                idx,
-                                &config,
-                                construct_context.clone(),
-                                actor_context.clone(),
-                            );
-                            item_keys.push((item.clone(), key_actor));
-                        }
-                        ListChange::InsertAt { index, item } => {
-                            let key_actor = Self::transform_item(
-                                item.clone(),
-                                *index,
-                                &config,
-                                construct_context.clone(),
-                                actor_context.clone(),
-                            );
-                            if *index <= item_keys.len() {
-                                item_keys.insert(*index, (item.clone(), key_actor));
-                            }
-                        }
-                        ListChange::Remove { id } => {
-                            // Find item by PersistenceId
-                            if let Some(index) = item_keys.iter().position(|(item, _)| item.persistence_id() == *id) {
-                                item_keys.remove(index);
-                            }
-                        }
-                        ListChange::Clear => {
-                            item_keys.clear();
-                        }
-                        ListChange::Pop => {
-                            item_keys.pop();
-                        }
-                        // Explicitly handle all ListChange variants to catch future additions.
-                        // These variants are not currently generated by any List API.
-                        ListChange::UpdateAt { .. } => {
-                            panic!(
-                                "List/sort_by_key received UpdateAt event which is not yet implemented. \
-                                If you added a List/update_at API, implement handling in create_sort_by_actor."
-                            );
-                        }
-                        ListChange::Move { .. } => {
-                            panic!(
-                                "List/sort_by_key received Move event which is not yet implemented. \
-                                If you added a List/move API, implement handling in create_sort_by_actor."
-                            );
-                        }
+        if let Some(output_valve_signal) = actor_context.output_valve_signal.clone() {
+            register_list_output_valve_runtime_subscriber(
+                output_valve_signal.as_ref(),
+                &sorted_state,
+            );
+        }
+
+        let broadcast_change = actor_context.output_valve_signal.is_none();
+        let sorted_state_weak = sorted_state.downgrade();
+        let state = Rc::new(RefCell::new(DirectSortState {
+            entries: Vec::new(),
+            prev_sorted: Vec::new(),
+            next_entry_id: 0,
+            suppress_emits: false,
+        }));
+        let current_source_list_key = Rc::new(Cell::new(None::<usize>));
+        let current_source_generation = Rc::new(Cell::new(0u64));
+
+        let emit_sorted_changes = Rc::new({
+            let sorted_construct_info = sorted_construct_info.clone();
+            let sorted_state_weak = sorted_state_weak.clone();
+            move |reg: &mut ActorRegistry, state: &mut DirectSortState, force_replace: bool| {
+                let Some(sorted_state) = ListStoredState::from_weak(sorted_state_weak.clone())
+                else {
+                    return false;
+                };
+
+                let new_sorted = if state.entries.is_empty() {
+                    Vec::new()
+                } else {
+                    if state.entries.iter().any(|entry| entry.key_value.is_none()) {
+                        return true;
                     }
 
-                    future::ready(Some(item_keys.clone()))
+                    let mut sorted_indices = (0..state.entries.len()).collect::<Vec<_>>();
+                    sorted_indices.sort_by(|lhs, rhs| {
+                        state.entries[*lhs]
+                            .key_value
+                            .as_ref()
+                            .expect("ready sort entry should have a key")
+                            .cmp(
+                                state.entries[*rhs]
+                                    .key_value
+                                    .as_ref()
+                                    .expect("ready sort entry should have a key"),
+                            )
+                            .then(lhs.cmp(rhs))
+                    });
+                    sorted_indices
+                };
+
+                if force_replace || state.prev_sorted.is_empty() {
+                    let sorted_items = Arc::from(
+                        new_sorted
+                            .iter()
+                            .map(|&idx| state.entries[idx].item.clone())
+                            .collect::<Vec<_>>(),
+                    );
+                    reg.enqueue_list_runtime_work(
+                        sorted_state,
+                        ListRuntimeWork::Change {
+                            construct_info: sorted_construct_info.clone(),
+                            change: ListChange::Replace {
+                                items: sorted_items,
+                            },
+                            broadcast_change,
+                        },
+                    );
+                } else if state.prev_sorted != new_sorted {
+                    let items = state
+                        .entries
+                        .iter()
+                        .map(|entry| entry.item.clone())
+                        .collect::<Vec<_>>();
+                    for change in compute_sort_diff(&items, &state.prev_sorted, &new_sorted) {
+                        reg.enqueue_list_runtime_work(
+                            sorted_state.clone(),
+                            ListRuntimeWork::Change {
+                                construct_info: sorted_construct_info.clone(),
+                                change,
+                                broadcast_change,
+                            },
+                        );
+                    }
                 }
-            ).flat_map(move |item_keys| {
-                let _construct_info_id = construct_info_id_inner.clone();
 
-                if item_keys.is_empty() {
-                    // Empty list - emit empty Replace
-                    return stream::once(future::ready(ListChange::Replace { items: Arc::from(Vec::<ActorHandle>::new()) })).boxed_local();
-                }
+                state.prev_sorted = new_sorted;
+                true
+            }
+        });
+        let connect_source_list = Rc::new({
+            let state = state.clone();
+            let config = config.clone();
+            let construct_context = construct_context.clone();
+            let actor_context = actor_context.clone();
+            let emit_sorted_changes = emit_sorted_changes.clone();
+            let current_source_list_key = current_source_list_key.clone();
+            let current_source_generation = current_source_generation.clone();
+            let sorted_state_weak = sorted_state_weak.clone();
+            move |reg: &mut ActorRegistry, source_list: Arc<List>| {
+                let list_key = list_instance_key(&source_list);
+                let generation = current_source_generation.get() + 1;
+                current_source_generation.set(generation);
+                current_source_list_key.set(Some(list_key));
 
-                // Subscribe to all keys and emit sorted list when any changes
-                // A3: Use coalesce to batch simultaneous key updates
-                let key_streams: Vec<_> = item_keys.iter().enumerate().map(|(idx, (_, key_actor))| {
-                    key_actor.clone().stream().map(move |value| (idx, value))
-                }).collect();
+                source_list.stored_state.register_direct_subscriber(
+                    reg,
+                    Rc::new({
+                        let state = state.clone();
+                        let config = config.clone();
+                        let construct_context = construct_context.clone();
+                        let actor_context = actor_context.clone();
+                        let emit_sorted_changes = emit_sorted_changes.clone();
+                        let current_source_list_key = current_source_list_key.clone();
+                        let current_source_generation = current_source_generation.clone();
+                        let sorted_state_weak = sorted_state_weak.clone();
+                        move |reg, change| {
+                            if ListStoredState::from_weak(sorted_state_weak.clone()).is_none() {
+                                return false;
+                            }
+                            if current_source_generation.get() != generation
+                                || current_source_list_key.get() != Some(list_key)
+                            {
+                                return false;
+                            }
 
-                // B5: Incremental sort using BTreeMap for O(log n) key updates.
-                // State: (items, key_values, sorted_tree, prev_sorted_indices, unevaluated_count)
-                // BTreeMap key: (SortKey, usize) where usize is original index for stable tie-breaking.
-                // BTreeMap value: usize (index into items vec).
-                let item_count = item_keys.len();
-                coalesce(stream::select_all(key_streams))
-                    .scan(
-                        (
-                            item_keys.iter().map(|(item, _)| item.clone()).collect::<Vec<_>>(),
-                            vec![None::<SortKey>; item_count],
-                            std::collections::BTreeMap::<(SortKey, usize), usize>::new(),
-                            Vec::<usize>::new(), // prev_sorted_indices
-                            item_count,          // unevaluated_count
-                        ),
-                        move |(items, key_values, sorted_tree, prev_sorted, unevaluated), batch| {
-                            // Update keys in BTreeMap
-                            for (idx, value) in batch {
-                                let new_key = SortKey::from_value(&value);
-                                if idx < key_values.len() {
-                                    // Remove old key from tree if it existed
-                                    if let Some(old_key) = key_values[idx].take() {
-                                        sorted_tree.remove(&(old_key, idx));
-                                    } else {
-                                        // First evaluation of this key
-                                        *unevaluated = unevaluated.saturating_sub(1);
+                            let add_entry =
+                                |reg: &mut ActorRegistry, item: ActorHandle, insert_at: usize| {
+                                    let key_actor = Self::transform_item_with_registry(
+                                        Some(reg),
+                                        item.clone(),
+                                        insert_at,
+                                        &config,
+                                        construct_context.clone(),
+                                        actor_context.clone(),
+                                    );
+
+                                    let entry_id = {
+                                        let mut state = state.borrow_mut();
+                                        let entry_id = state.next_entry_id;
+                                        state.next_entry_id += 1;
+                                        let insert_at = insert_at.min(state.entries.len());
+                                        state.entries.insert(
+                                            insert_at,
+                                            DirectSortEntry {
+                                                entry_id,
+                                                item: item.clone(),
+                                                key_actor: key_actor.clone(),
+                                                key_value: None,
+                                            },
+                                        );
+                                        entry_id
+                                    };
+
+                                    key_actor.stored_state.register_direct_subscriber(
+                                        reg,
+                                        Rc::new({
+                                            let state = state.clone();
+                                            let emit_sorted_changes = emit_sorted_changes.clone();
+                                            let current_source_list_key =
+                                                current_source_list_key.clone();
+                                            let current_source_generation =
+                                                current_source_generation.clone();
+                                            let sorted_state_weak = sorted_state_weak.clone();
+                                            move |reg, value| {
+                                                if ListStoredState::from_weak(
+                                                    sorted_state_weak.clone(),
+                                                )
+                                                .is_none()
+                                                {
+                                                    return false;
+                                                }
+                                                if current_source_generation.get() != generation
+                                                    || current_source_list_key.get()
+                                                        != Some(list_key)
+                                                {
+                                                    return false;
+                                                }
+
+                                                let Some(value) = value else {
+                                                    return true;
+                                                };
+
+                                                let mut state = state.borrow_mut();
+                                                let Some(entry) = state
+                                                    .entries
+                                                    .iter_mut()
+                                                    .find(|entry| entry.entry_id == entry_id)
+                                                else {
+                                                    return false;
+                                                };
+
+                                                let next_key = SortKey::from_value(value);
+                                                if entry.key_value.as_ref() == Some(&next_key) {
+                                                    return true;
+                                                }
+                                                entry.key_value = Some(next_key);
+                                                if state.suppress_emits {
+                                                    return true;
+                                                }
+
+                                                emit_sorted_changes(reg, &mut state, false)
+                                            }
+                                        }),
+                                    );
+                                };
+
+                            let mut did_change = false;
+                            {
+                                let mut state = state.borrow_mut();
+                                state.suppress_emits = true;
+                                state.prev_sorted.clear();
+                            }
+
+                            match change {
+                                ListChange::Replace { items } => {
+                                    {
+                                        let mut state = state.borrow_mut();
+                                        state.entries.clear();
                                     }
-                                    // Insert new key
-                                    sorted_tree.insert((new_key.clone(), idx), idx);
-                                    key_values[idx] = Some(new_key);
+                                    for (idx, item) in items.iter().cloned().enumerate() {
+                                        add_entry(reg, item, idx);
+                                    }
+                                    did_change = true;
+                                }
+                                ListChange::Push { item } => {
+                                    let insert_at = state.borrow().entries.len();
+                                    add_entry(reg, item.clone(), insert_at);
+                                    did_change = true;
+                                }
+                                ListChange::InsertAt { index, item } => {
+                                    if *index <= state.borrow().entries.len() {
+                                        add_entry(reg, item.clone(), *index);
+                                        did_change = true;
+                                    }
+                                }
+                                ListChange::Remove { id } => {
+                                    let mut state = state.borrow_mut();
+                                    if let Some(index) = state
+                                        .entries
+                                        .iter()
+                                        .position(|entry| entry.item.persistence_id() == *id)
+                                    {
+                                        state.entries.remove(index);
+                                        did_change = true;
+                                    }
+                                }
+                                ListChange::Clear => {
+                                    let mut state = state.borrow_mut();
+                                    if !state.entries.is_empty() {
+                                        state.entries.clear();
+                                        did_change = true;
+                                    }
+                                }
+                                ListChange::Pop => {
+                                    let mut state = state.borrow_mut();
+                                    if state.entries.pop().is_some() {
+                                        did_change = true;
+                                    }
+                                }
+                                ListChange::UpdateAt { .. } => {
+                                    panic!(
+                                        "List/sort_by direct-state path received UpdateAt event which is not yet implemented."
+                                    );
+                                }
+                                ListChange::Move { .. } => {
+                                    panic!(
+                                        "List/sort_by direct-state path received Move event which is not yet implemented."
+                                    );
                                 }
                             }
 
-                            // Wait until all items have evaluated keys
-                            if *unevaluated > 0 {
-                                return future::ready(Some(None));
-                            }
-
-                            // Read sorted order from BTreeMap (already in order)
-                            let new_sorted: Vec<usize> = sorted_tree.values().copied().collect();
-
-                            if prev_sorted.is_empty() {
-                                // First evaluation - emit Replace
-                                let sorted_items: Vec<ActorHandle> = new_sorted.iter()
-                                    .map(|&idx| items[idx].clone())
-                                    .collect();
-                                *prev_sorted = new_sorted;
-                                future::ready(Some(Some(vec![ListChange::Replace { items: Arc::from(sorted_items) }])))
-                            } else if *prev_sorted == new_sorted {
-                                // No change in sorted order
-                                future::ready(Some(None))
+                            let mut state = state.borrow_mut();
+                            state.suppress_emits = false;
+                            if did_change {
+                                emit_sorted_changes(reg, &mut state, true)
                             } else {
-                                // B5: Compute incremental Remove+InsertAt operations
-                                let changes = compute_sort_diff(items, prev_sorted, &new_sorted);
-                                *prev_sorted = new_sorted;
-                                future::ready(Some(Some(changes)))
+                                true
                             }
                         }
-                    )
-                    .filter_map(future::ready)
-                    .flat_map(|changes| stream::iter(changes))
-                    .boxed_local()
-            })
-            },
-        );
+                    }),
+                );
+            }
+        });
 
-        let list = List::new_with_change_stream(
-            ConstructInfo::new(
-                construct_info.id.clone().with_child_id(0),
-                None,
-                "List/sort_by result",
-            ),
-            actor_context_for_list,
-            value_stream,
-            source_list_actor.clone(),
-        );
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            if !source_list_is_lazy {
+                source_list_actor.stored_state.register_direct_subscriber(
+                    &mut reg,
+                    Rc::new({
+                        let connect_source_list = connect_source_list.clone();
+                        let current_source_list_key = current_source_list_key.clone();
+                        let sorted_state_weak = sorted_state_weak.clone();
+                        move |reg, value| {
+                            if ListStoredState::from_weak(sorted_state_weak.clone()).is_none() {
+                                return false;
+                            }
 
-        let scope_id = actor_context_for_result.scope_id();
-        create_constant_actor(
+                            let Some(Value::List(source_list, _)) = value else {
+                                return true;
+                            };
+                            let list_key = list_instance_key(source_list);
+                            if current_source_list_key.get() != Some(list_key) {
+                                connect_source_list(reg, source_list.clone());
+                            }
+                            true
+                        }
+                    }),
+                );
+            }
+
+            if !source_list_is_lazy
+                && source_list_actor.is_constant
+                && current_source_list_key.get().is_none()
+                && let Some(initial_source_list) = initial_source_list.as_ref()
+            {
+                connect_source_list(&mut reg, initial_source_list.clone());
+            }
+
+            reg.drain_runtime_ready_queue();
+        });
+
+        if let Some(source_list_stream) = source_list_stream {
+            let connect_source_list = connect_source_list.clone();
+            let current_source_list_key = current_source_list_key.clone();
+            let sorted_state_weak = sorted_state_weak.clone();
+            Self::start_lazy_source_list_task(
+                &sorted_state,
+                scope_id,
+                source_list_stream,
+                move |reg, source_list| {
+                    if ListStoredState::from_weak(sorted_state_weak.clone()).is_none() {
+                        return;
+                    }
+                    let list_key = list_instance_key(&source_list);
+                    if current_source_list_key.get() != Some(list_key) {
+                        connect_source_list(reg, source_list);
+                    }
+                },
+            );
+        }
+
+        Some(create_constant_actor(
             parser::PersistenceId::new(),
-            Value::List(
-                Arc::new(list),
-                ValueMetadata::new(ValueIdempotencyKey::new()),
-            ),
+            Value::List(sorted_list, ValueMetadata::new(ValueIdempotencyKey::new())),
             scope_id,
-        )
+        ))
     }
 
     /// Transform a single list item using the config's transform expression.
-    fn transform_item(
+    fn transform_item_with_registry(
+        mut reg: Option<&mut ActorRegistry>,
         item_actor: ActorHandle,
         index: usize,
         config: &ListBindingConfig,
@@ -9464,9 +14139,10 @@ impl ListBindingFunction {
         // within the transform expression are owned by this scope.
         // When the parent scope is destroyed (e.g., WHILE arm switch, program teardown),
         // all list item scopes are recursively destroyed.
-        let item_registry_scope = child_scope
-            .registry_scope_id
-            .map(|parent_scope| create_registry_scope(Some(parent_scope)));
+        let item_registry_scope = create_child_registry_scope_with_optional_registry(
+            reg.as_deref_mut(),
+            child_scope.registry_scope_id,
+        );
         let new_actor_context = ActorContext {
             parameters: Arc::new(new_params),
             registry_scope_id: item_registry_scope.or(child_scope.registry_scope_id),
@@ -9475,13 +14151,13 @@ impl ListBindingFunction {
 
         // Evaluate the transform expression with the binding in scope
         // Pass the function registry snapshot to enable user-defined function calls
-        match evaluate_static_expression_with_registry(
+        match evaluate_static_expression_with_runtime_registry(
+            reg.as_deref_mut(),
             &config.transform_expr,
             construct_context.clone(),
             new_actor_context.clone(),
             config.reference_connector.clone(),
             config.link_connector.clone(),
-            config.pass_through_connector.clone(),
             config.source_code.clone(),
             config.function_registry_snapshot.clone(),
         ) {
@@ -9494,11 +14170,22 @@ impl ListBindingFunction {
                 // - future updates (especially when the mapped body depends on external state)
                 let original_pid = item_actor.persistence_id();
                 let scope_id = new_actor_context.scope_id();
-                let forwarding_actor = create_actor_forwarding(
-                    original_pid, // Preserve original PersistenceId!
-                    scope_id,
+                let forwarding_actor = match reg.as_deref_mut() {
+                    Some(reg) => create_actor_forwarding_with_registry(
+                        reg,
+                        original_pid, // Preserve original PersistenceId!
+                        scope_id,
+                    ),
+                    None => create_actor_forwarding(
+                        original_pid, // Preserve original PersistenceId!
+                        scope_id,
+                    ),
+                };
+                connect_forwarding_current_and_future_with_registry(
+                    reg.as_deref_mut(),
+                    forwarding_actor.clone(),
+                    result_actor,
                 );
-                connect_forwarding_current_and_future(forwarding_actor.clone(), result_actor);
                 forwarding_actor
             }
             Err(e) => {
@@ -9507,6 +14194,23 @@ impl ListBindingFunction {
                 item_actor
             }
         }
+    }
+
+    fn transform_item(
+        item_actor: ActorHandle,
+        index: usize,
+        config: &ListBindingConfig,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+    ) -> ActorHandle {
+        Self::transform_item_with_registry(
+            None,
+            item_actor,
+            index,
+            config,
+            construct_context,
+            actor_context,
+        )
     }
 
     /// Transform a ListChange by applying the transform expression to affected items.
@@ -9660,6 +14364,34 @@ impl ListBindingFunction {
         construct_context: ConstructContext,
         actor_context: ActorContext,
     ) -> (ListChange, usize) {
+        Self::transform_list_change_for_map_with_tracking_with_registry(
+            None,
+            change,
+            current_length,
+            pid_map,
+            transformed_items_by_pid,
+            item_order,
+            config,
+            construct_context,
+            actor_context,
+        )
+    }
+
+    /// Like transform_list_change_for_map but can reuse an active registry borrow.
+    fn transform_list_change_for_map_with_tracking_with_registry(
+        mut reg: Option<&mut ActorRegistry>,
+        change: ListChange,
+        current_length: usize,
+        pid_map: &mut std::collections::HashMap<parser::PersistenceId, parser::PersistenceId>,
+        transformed_items_by_pid: &mut std::collections::HashMap<
+            parser::PersistenceId,
+            ActorHandle,
+        >,
+        item_order: &mut Vec<parser::PersistenceId>,
+        config: &ListBindingConfig,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+    ) -> (ListChange, usize) {
         // Each incoming change builds a fresh mapped item set. We keep only the active transformed
         // actors needed for remove/pop bookkeeping and move fallback inside this change.
         transformed_items_by_pid.clear();
@@ -9677,7 +14409,8 @@ impl ListBindingFunction {
                     .map(|(index, item)| {
                         let original_pid = item.persistence_id();
                         item_order.push(original_pid.clone());
-                        let transformed = Self::transform_item(
+                        let transformed = Self::transform_item_with_registry(
+                            reg.as_deref_mut(),
                             item.clone(),
                             index,
                             config,
@@ -9711,8 +14444,14 @@ impl ListBindingFunction {
                     );
                 }
                 item_order.insert(insert_index, original_pid.clone());
-                let transformed_item =
-                    Self::transform_item(item, index, config, construct_context, actor_context);
+                let transformed_item = Self::transform_item_with_registry(
+                    reg.as_deref_mut(),
+                    item,
+                    index,
+                    config,
+                    construct_context,
+                    actor_context,
+                );
                 transformed_items_by_pid.insert(original_pid.clone(), transformed_item.clone());
                 let mapped_pid = transformed_item.persistence_id();
                 pid_map.insert(original_pid, mapped_pid);
@@ -9726,8 +14465,14 @@ impl ListBindingFunction {
             }
             ListChange::UpdateAt { index, item } => {
                 let original_pid = item.persistence_id();
-                let transformed_item =
-                    Self::transform_item(item, index, config, construct_context, actor_context);
+                let transformed_item = Self::transform_item_with_registry(
+                    reg.as_deref_mut(),
+                    item,
+                    index,
+                    config,
+                    construct_context,
+                    actor_context,
+                );
                 transformed_items_by_pid.insert(original_pid.clone(), transformed_item.clone());
                 let mapped_pid = transformed_item.persistence_id();
                 pid_map.insert(original_pid, mapped_pid);
@@ -9743,7 +14488,8 @@ impl ListBindingFunction {
                 let original_pid = item.persistence_id();
                 // Track item order
                 item_order.push(original_pid.clone());
-                let transformed_item = Self::transform_item(
+                let transformed_item = Self::transform_item_with_registry(
+                    reg.as_deref_mut(),
                     item,
                     current_length,
                     config,
@@ -9842,11 +14588,11 @@ impl ListBindingFunction {
 mod tests {
     use super::{
         ActorContext, ActorHandle, ActorId, ConstructContext, ConstructInfo, ConstructStorage,
-        LatestCombinator, List, ListChange, NamedChannel, REGISTRY, ScopeDestroyGuard,
+        LatestCombinator, List, ListChange, NamedChannel, Number, REGISTRY, ScopeDestroyGuard,
         TaggedObject, Text, Value, ValueIdempotencyKey, Variable, VirtualFilesystem, create_actor,
-        create_actor_forwarding, create_actor_from_future, create_constant_actor,
-        create_registry_scope, current_emission_seq, list_instance_key, list_item_scope_id,
-        retain_actor_handle, retain_actor_handles, values_equal_async,
+        create_actor_forwarding, create_actor_from_future, create_actor_lazy,
+        create_constant_actor, create_registry_scope, current_emission_seq, list_instance_key,
+        list_item_scope_id, retain_actor_handle, retain_actor_handles, values_equal_async,
     };
     use crate::engine::ValueMetadata;
     use crate::engine::stream;
@@ -9857,6 +14603,7 @@ mod tests {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, HashMap};
     use std::future::Future;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
     use std::time::Duration;
@@ -10198,6 +14945,30 @@ mod tests {
     }
 
     #[test]
+    fn current_or_future_stream_is_empty_when_actor_source_has_already_ended_without_value() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor = create_actor(stream::empty::<Value>(), PersistenceId::new(), scope_id);
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "empty stream-driven actors should not retain a feeder task"
+            );
+        });
+
+        block_on(async move {
+            let mut stream = actor.current_or_future_stream();
+            assert!(
+                stream.next().await.is_none(),
+                "ended empty actor source should yield an empty current_or_future stream"
+            );
+        });
+    }
+
+    #[test]
     fn forwarding_constant_source_stores_without_retained_task() {
         let scope_id = create_registry_scope(None);
         let _scope_guard = ScopeDestroyGuard::new(scope_id);
@@ -10208,12 +14979,9 @@ mod tests {
 
         REGISTRY.with(|reg| {
             let reg = reg.borrow();
-            let owned_actor = reg
-                .get_actor(forwarded.actor_id)
-                .expect("forwarding actor should stay registered");
             assert!(
-                owned_actor.retained_tasks.is_empty(),
-                "constant source forwarding should not retain an async loop"
+                reg.async_source_count_for_scope(scope_id) == 0,
+                "constant source forwarding should not retain an async loop on its owning scope"
             );
         });
 
@@ -10248,11 +15016,8 @@ mod tests {
 
         REGISTRY.with(|reg| {
             let reg = reg.borrow();
-            let owned_actor = reg
-                .get_actor(forwarded.actor_id)
-                .expect("forwarding actor should stay registered");
             assert!(
-                owned_actor.retained_tasks.is_empty(),
+                reg.async_source_count_for_scope(scope_id) == 0,
                 "dropped source without a current value should not retain a forwarding task"
             );
         });
@@ -10261,6 +15026,5036 @@ mod tests {
             forwarded.current_value(),
             Err(super::CurrentValueError::NoValueYet)
         ));
+    }
+
+    #[test]
+    fn forwarding_direct_state_source_uses_runtime_subscriber_without_async_source_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let source = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.forwarding.direct_subscriber.initial",
+                None,
+                "test forwarding direct subscriber initial",
+            ),
+            ConstructContext {
+                construct_storage: Arc::new(ConstructStorage::new("")),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            PersistenceId::new(),
+            31,
+            "first",
+        ));
+        let forwarded = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        super::connect_forwarding_current_and_future(forwarded.clone(), source.clone());
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert!(
+                reg.async_source_count_for_scope(scope_id) == 0,
+                "direct-state forwarding should register with runtime state instead of spawning an async source task"
+            );
+        });
+
+        let Value::Text(text, _) = forwarded
+            .current_value()
+            .expect("forwarded actor should expose seeded source value immediately")
+        else {
+            panic!("expected seeded forwarded text");
+        };
+        assert_eq!(text.text(), "first");
+
+        source.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.forwarding.direct_subscriber.update",
+                None,
+                "test forwarding direct subscriber update",
+            ),
+            ConstructContext {
+                construct_storage: Arc::new(ConstructStorage::new("")),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            PersistenceId::new(),
+            32,
+            "second",
+        ));
+
+        let Value::Text(text, _) = forwarded
+            .current_value()
+            .expect("forwarded actor should receive later direct-state source updates")
+        else {
+            panic!("expected updated forwarded text");
+        };
+        assert_eq!(text.text(), "second");
+    }
+
+    #[test]
+    #[ignore = "async source cleanup timing is unreliable on host test runner; works in browser"]
+    fn dropping_forwarding_fallback_task_releases_scope_owned_task_before_scope_destroy() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        // Use a lazy actor so the forwarding path falls through to the
+        // retained task (lazy actors don't support direct subscriber
+        // registration).
+        let source = super::create_actor_lazy(
+            stream::once(future::ready(Text::new_value_with_emission_seq(
+                ConstructInfo::new("test.forwarding.source", None, "test forwarding source"),
+                ConstructContext {
+                    construct_storage: Arc::new(ConstructStorage::new("")),
+                    virtual_fs: VirtualFilesystem::new(),
+                    bridge_scope_id: None,
+                    scene_ctx: None,
+                },
+                PersistenceId::new(),
+                1,
+                "source",
+            )))
+            .chain(stream::pending()),
+            PersistenceId::new(),
+            scope_id,
+        );
+
+        let baseline_async_source_count =
+            REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+        let forwarded = create_actor_forwarding(PersistenceId::new(), scope_id);
+        super::connect_forwarding_current_and_future(forwarded.clone(), source);
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert!(
+                reg.async_source_count_for_scope(scope_id) > baseline_async_source_count,
+                "forwarding fallback should add one scope-owned task while the target actor is alive"
+            );
+        });
+
+        REGISTRY.with(|reg| reg.borrow_mut().remove_actor(forwarded.actor_id));
+
+        let mut forwarding_task_cleared = false;
+        for _ in 0..20 {
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            super::poll_test_async_source_tasks();
+            let async_source_count =
+                REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+            if async_source_count == baseline_async_source_count {
+                forwarding_task_cleared = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            forwarding_task_cleared,
+            "removing the forwarding target should release the scope-owned fallback task before scope teardown"
+        );
+    }
+
+    #[test]
+    fn runtime_local_child_scope_creation_works_under_active_registry_borrow() {
+        let root_scope = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(root_scope);
+
+        let child_scope = REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            super::create_registry_scope_with_registry(&mut reg, Some(root_scope))
+        });
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            let root = reg
+                .get_scope(root_scope)
+                .expect("root scope should stay registered");
+            assert!(
+                root.children.contains(&child_scope),
+                "runtime-local scope creation should still register the child under its parent"
+            );
+            assert!(
+                reg.get_scope(child_scope).is_some(),
+                "child scope created from an active registry borrow should be registered"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_local_transform_item_supports_alias_map_under_active_registry_borrow() {
+        let root_scope = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(root_scope);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(root_scope),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let item_actor = create_actor_forwarding(PersistenceId::new(), root_scope);
+        item_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.list.map.runtime_local.item",
+                None,
+                "test list map runtime local item",
+            ),
+            construct_context.clone(),
+            PersistenceId::new(),
+            41,
+            "ready",
+        ));
+
+        let source_code = SourceCode::new("item".to_string());
+        let config = super::ListBindingConfig {
+            binding_name: source_code.slice(0, 4),
+            transform_expr: static_expression::Spanned {
+                span: span_at(source_code.len()),
+                persistence: None,
+                node: static_expression::Expression::Alias(
+                    static_expression::Alias::WithoutPassed {
+                        parts: vec![source_code.slice(0, 4)],
+                        referenced_span: None,
+                    },
+                ),
+            },
+            operation: super::ListBindingOperation::Map,
+            reference_connector: Arc::new(super::ReferenceConnector::new()),
+            link_connector: Arc::new(super::LinkConnector::new()),
+            source_code,
+            function_registry_snapshot: None,
+        };
+
+        let transformed = REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            super::ListBindingFunction::transform_item_with_registry(
+                Some(&mut reg),
+                item_actor.clone(),
+                0,
+                &config,
+                construct_context.clone(),
+                actor_context.clone(),
+            )
+        });
+
+        let Value::Text(text, _) = transformed
+            .current_value()
+            .expect("runtime-local list transform should expose the mapped alias value")
+        else {
+            panic!("runtime-local list transform should resolve to text");
+        };
+        assert_eq!(text.text(), "ready");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            let root = reg
+                .get_scope(root_scope)
+                .expect("root scope should stay registered");
+            assert_eq!(
+                root.children.len(),
+                1,
+                "runtime-local list transform should register a child scope for the mapped item"
+            );
+            assert_eq!(
+                reg.async_source_count_for_scope(root_scope),
+                0,
+                "direct alias mapping should stay on the runtime subscriber path without an async scope task"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_local_transform_item_supports_text_literal_map_under_active_registry_borrow() {
+        let root_scope = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(root_scope);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(root_scope),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let item_actor = create_actor_forwarding(PersistenceId::new(), root_scope);
+        item_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.list.map.runtime_local.text_literal.item",
+                None,
+                "test list map runtime local text literal item",
+            ),
+            construct_context.clone(),
+            PersistenceId::new(),
+            42,
+            "ready",
+        ));
+
+        let source_code = SourceCode::new("TEXT { \"Hello {item}!\" }".to_string());
+        let config = super::ListBindingConfig {
+            binding_name: SourceCode::new("item".to_string()).slice(0, 4),
+            transform_expr: static_expression::Spanned {
+                span: span_at(source_code.len()),
+                persistence: None,
+                node: static_expression::Expression::TextLiteral {
+                    parts: vec![
+                        static_expression::TextPart::Text(source_code.slice(8, 14)),
+                        static_expression::TextPart::Interpolation {
+                            var: source_code.slice(15, 19),
+                            referenced_span: None,
+                        },
+                        static_expression::TextPart::Text(source_code.slice(20, 21)),
+                    ],
+                    hash_count: 0,
+                },
+            },
+            operation: super::ListBindingOperation::Map,
+            reference_connector: Arc::new(super::ReferenceConnector::new()),
+            link_connector: Arc::new(super::LinkConnector::new()),
+            source_code,
+            function_registry_snapshot: None,
+        };
+
+        let transformed = REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            super::ListBindingFunction::transform_item_with_registry(
+                Some(&mut reg),
+                item_actor.clone(),
+                0,
+                &config,
+                construct_context.clone(),
+                actor_context.clone(),
+            )
+        });
+
+        let Value::Text(text, _) = transformed
+            .current_value()
+            .expect("runtime-local list text literal transform should expose the mapped value")
+        else {
+            panic!("runtime-local list text literal transform should resolve to text");
+        };
+        assert_eq!(text.text(), "Hello ready!");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(root_scope),
+                0,
+                "runtime-local text literal mapping should stay on the direct runtime subscriber path"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_local_transform_item_supports_arithmetic_map_under_active_registry_borrow() {
+        let root_scope = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(root_scope);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(root_scope),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let item_actor = create_actor_forwarding(PersistenceId::new(), root_scope);
+        item_actor.store_value_directly(Number::new_value(
+            ConstructInfo::new(
+                "test.list.map.runtime_local.arithmetic.item",
+                None,
+                "test list map runtime local arithmetic item",
+            ),
+            construct_context.clone(),
+            PersistenceId::new(),
+            7.0,
+        ));
+
+        let source_code = SourceCode::new("item + item".to_string());
+        let config = super::ListBindingConfig {
+            binding_name: SourceCode::new("item".to_string()).slice(0, 4),
+            transform_expr: static_expression::Spanned {
+                span: span_at(source_code.len()),
+                persistence: None,
+                node: static_expression::Expression::ArithmeticOperator(
+                    static_expression::ArithmeticOperator::Add {
+                        operand_a: Box::new(static_expression::Spanned {
+                            span: span_at(4),
+                            persistence: None,
+                            node: static_expression::Expression::Alias(
+                                static_expression::Alias::WithoutPassed {
+                                    parts: vec![source_code.slice(0, 4)],
+                                    referenced_span: None,
+                                },
+                            ),
+                        }),
+                        operand_b: Box::new(static_expression::Spanned {
+                            span: (7..11).into(),
+                            persistence: None,
+                            node: static_expression::Expression::Alias(
+                                static_expression::Alias::WithoutPassed {
+                                    parts: vec![source_code.slice(7, 11)],
+                                    referenced_span: None,
+                                },
+                            ),
+                        }),
+                    },
+                ),
+            },
+            operation: super::ListBindingOperation::Map,
+            reference_connector: Arc::new(super::ReferenceConnector::new()),
+            link_connector: Arc::new(super::LinkConnector::new()),
+            source_code,
+            function_registry_snapshot: None,
+        };
+
+        let transformed = REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            super::ListBindingFunction::transform_item_with_registry(
+                Some(&mut reg),
+                item_actor.clone(),
+                0,
+                &config,
+                construct_context.clone(),
+                actor_context.clone(),
+            )
+        });
+
+        let Value::Number(number, _) = transformed
+            .current_value()
+            .expect("runtime-local list arithmetic transform should expose the mapped value")
+        else {
+            panic!("runtime-local list arithmetic transform should resolve to number");
+        };
+        assert_eq!(number.number(), 14.0);
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(root_scope),
+                0,
+                "runtime-local arithmetic mapping should stay on the direct runtime subscriber path"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_local_transform_item_supports_comparator_map_under_active_registry_borrow() {
+        let root_scope = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(root_scope);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(root_scope),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let item_actor = create_actor_forwarding(PersistenceId::new(), root_scope);
+        item_actor.store_value_directly(Number::new_value(
+            ConstructInfo::new(
+                "test.list.map.runtime_local.comparator.item",
+                None,
+                "test list map runtime local comparator item",
+            ),
+            construct_context.clone(),
+            PersistenceId::new(),
+            7.0,
+        ));
+
+        let source_code = SourceCode::new("item > 5".to_string());
+        let config = super::ListBindingConfig {
+            binding_name: SourceCode::new("item".to_string()).slice(0, 4),
+            transform_expr: static_expression::Spanned {
+                span: span_at(source_code.len()),
+                persistence: None,
+                node: static_expression::Expression::Comparator(
+                    static_expression::Comparator::Greater {
+                        operand_a: Box::new(static_expression::Spanned {
+                            span: span_at(4),
+                            persistence: None,
+                            node: static_expression::Expression::Alias(
+                                static_expression::Alias::WithoutPassed {
+                                    parts: vec![source_code.slice(0, 4)],
+                                    referenced_span: None,
+                                },
+                            ),
+                        }),
+                        operand_b: Box::new(static_expression::Spanned {
+                            span: (7..8).into(),
+                            persistence: None,
+                            node: static_expression::Expression::Literal(
+                                static_expression::Literal::Number(5.0),
+                            ),
+                        }),
+                    },
+                ),
+            },
+            operation: super::ListBindingOperation::Map,
+            reference_connector: Arc::new(super::ReferenceConnector::new()),
+            link_connector: Arc::new(super::LinkConnector::new()),
+            source_code,
+            function_registry_snapshot: None,
+        };
+
+        let transformed = REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            super::ListBindingFunction::transform_item_with_registry(
+                Some(&mut reg),
+                item_actor.clone(),
+                0,
+                &config,
+                construct_context.clone(),
+                actor_context.clone(),
+            )
+        });
+
+        let Value::Tag(tag, _) = transformed
+            .current_value()
+            .expect("runtime-local list comparator transform should expose the mapped value")
+        else {
+            panic!("runtime-local list comparator transform should resolve to tag");
+        };
+        assert_eq!(tag.tag(), "True");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(root_scope),
+                0,
+                "runtime-local comparator mapping should stay on the direct runtime subscriber path"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_local_transform_item_supports_postfix_field_map_under_active_registry_borrow() {
+        let root_scope = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(root_scope);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(root_scope),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let text_actor = create_actor_forwarding(PersistenceId::new(), root_scope);
+        text_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.map.runtime_local.postfix_field.text",
+                None,
+                "test list map runtime local postfix field text",
+            ),
+            construct_context.clone(),
+            PersistenceId::new(),
+            "ready",
+        ));
+
+        let item_actor = create_actor_forwarding(PersistenceId::new(), root_scope);
+        item_actor.store_value_directly(super::Object::new_value(
+            ConstructInfo::new(
+                "test.list.map.runtime_local.postfix_field.object",
+                None,
+                "test list map runtime local postfix field object",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            [Variable::new_arc(
+                ConstructInfo::new(
+                    "test.list.map.runtime_local.postfix_field.variable",
+                    None,
+                    "test list map runtime local postfix field variable",
+                ),
+                "text",
+                text_actor,
+                PersistenceId::new(),
+                actor_scope,
+            )],
+        ));
+
+        let source_code = SourceCode::new("item.text".to_string());
+        let config = super::ListBindingConfig {
+            binding_name: SourceCode::new("item".to_string()).slice(0, 4),
+            transform_expr: static_expression::Spanned {
+                span: span_at(source_code.len()),
+                persistence: None,
+                node: static_expression::Expression::PostfixFieldAccess {
+                    expr: Box::new(static_expression::Spanned {
+                        span: span_at(4),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed {
+                                parts: vec![source_code.slice(0, 4)],
+                                referenced_span: None,
+                            },
+                        ),
+                    }),
+                    field: source_code.slice(5, 9),
+                },
+            },
+            operation: super::ListBindingOperation::Map,
+            reference_connector: Arc::new(super::ReferenceConnector::new()),
+            link_connector: Arc::new(super::LinkConnector::new()),
+            source_code,
+            function_registry_snapshot: None,
+        };
+
+        let transformed = REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            super::ListBindingFunction::transform_item_with_registry(
+                Some(&mut reg),
+                item_actor.clone(),
+                0,
+                &config,
+                construct_context.clone(),
+                actor_context.clone(),
+            )
+        });
+
+        let Value::Text(text, _) = transformed
+            .current_value()
+            .expect("runtime-local list postfix field transform should expose the mapped value")
+        else {
+            panic!("runtime-local list postfix field transform should resolve to text");
+        };
+        assert_eq!(text.text(), "ready");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(root_scope),
+                0,
+                "runtime-local postfix field mapping should stay on the direct runtime subscriber path"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_local_transform_item_supports_block_map_under_active_registry_borrow() {
+        let root_scope = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(root_scope);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(root_scope),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let text_actor = create_actor_forwarding(PersistenceId::new(), root_scope);
+        text_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.map.runtime_local.block.text",
+                None,
+                "test list map runtime local block text",
+            ),
+            construct_context.clone(),
+            PersistenceId::new(),
+            "ready",
+        ));
+
+        let item_actor = create_actor_forwarding(PersistenceId::new(), root_scope);
+        item_actor.store_value_directly(super::Object::new_value(
+            ConstructInfo::new(
+                "test.list.map.runtime_local.block.object",
+                None,
+                "test list map runtime local block object",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            [Variable::new_arc(
+                ConstructInfo::new(
+                    "test.list.map.runtime_local.block.variable",
+                    None,
+                    "test list map runtime local block variable",
+                ),
+                "text",
+                text_actor,
+                PersistenceId::new(),
+                actor_scope,
+            )],
+        ));
+
+        let source_code = SourceCode::new("text = item.text; text".to_string());
+        let config = super::ListBindingConfig {
+            binding_name: SourceCode::new("item".to_string()).slice(0, 4),
+            transform_expr: static_expression::Spanned {
+                span: span_at(source_code.len()),
+                persistence: None,
+                node: static_expression::Expression::Block {
+                    variables: vec![static_expression::Spanned {
+                        span: (0..4).into(),
+                        persistence: None,
+                        node: static_expression::Variable {
+                            name: source_code.slice(0, 4),
+                            is_referenced: true,
+                            value_changed: false,
+                            value: static_expression::Spanned {
+                                span: (7..16).into(),
+                                persistence: None,
+                                node: static_expression::Expression::PostfixFieldAccess {
+                                    expr: Box::new(static_expression::Spanned {
+                                        span: (7..11).into(),
+                                        persistence: None,
+                                        node: static_expression::Expression::Alias(
+                                            static_expression::Alias::WithoutPassed {
+                                                parts: vec![source_code.slice(7, 11)],
+                                                referenced_span: None,
+                                            },
+                                        ),
+                                    }),
+                                    field: source_code.slice(12, 16),
+                                },
+                            },
+                        },
+                    }],
+                    output: Box::new(static_expression::Spanned {
+                        span: (18..22).into(),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed {
+                                parts: vec![source_code.slice(18, 22)],
+                                referenced_span: None,
+                            },
+                        ),
+                    }),
+                },
+            },
+            operation: super::ListBindingOperation::Map,
+            reference_connector: Arc::new(super::ReferenceConnector::new()),
+            link_connector: Arc::new(super::LinkConnector::new()),
+            source_code,
+            function_registry_snapshot: None,
+        };
+
+        let transformed = REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            super::ListBindingFunction::transform_item_with_registry(
+                Some(&mut reg),
+                item_actor.clone(),
+                0,
+                &config,
+                construct_context.clone(),
+                actor_context.clone(),
+            )
+        });
+
+        let Value::Text(text, _) = transformed
+            .current_value()
+            .expect("runtime-local list block transform should expose the mapped value")
+        else {
+            panic!("runtime-local list block transform should resolve to text");
+        };
+        assert_eq!(text.text(), "ready");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(root_scope),
+                0,
+                "runtime-local block mapping should stay on the direct runtime subscriber path"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_local_transform_item_supports_pipe_field_access_map_under_active_registry_borrow() {
+        let root_scope = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(root_scope);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(root_scope),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let text_actor = create_actor_forwarding(PersistenceId::new(), root_scope);
+        text_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.map.runtime_local.pipe_field.text",
+                None,
+                "test list map runtime local pipe field text",
+            ),
+            construct_context.clone(),
+            PersistenceId::new(),
+            "ready",
+        ));
+
+        let item_actor = create_actor_forwarding(PersistenceId::new(), root_scope);
+        item_actor.store_value_directly(super::Object::new_value(
+            ConstructInfo::new(
+                "test.list.map.runtime_local.pipe_field.object",
+                None,
+                "test list map runtime local pipe field object",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            [Variable::new_arc(
+                ConstructInfo::new(
+                    "test.list.map.runtime_local.pipe_field.variable",
+                    None,
+                    "test list map runtime local pipe field variable",
+                ),
+                "text",
+                text_actor,
+                PersistenceId::new(),
+                actor_scope,
+            )],
+        ));
+
+        let source_code = SourceCode::new("item |> .text".to_string());
+        let config = super::ListBindingConfig {
+            binding_name: SourceCode::new("item".to_string()).slice(0, 4),
+            transform_expr: static_expression::Spanned {
+                span: span_at(source_code.len()),
+                persistence: None,
+                node: static_expression::Expression::Pipe {
+                    from: Box::new(static_expression::Spanned {
+                        span: (0..4).into(),
+                        persistence: None,
+                        node: static_expression::Expression::Alias(
+                            static_expression::Alias::WithoutPassed {
+                                parts: vec![source_code.slice(0, 4)],
+                                referenced_span: None,
+                            },
+                        ),
+                    }),
+                    to: Box::new(static_expression::Spanned {
+                        span: (8..13).into(),
+                        persistence: None,
+                        node: static_expression::Expression::FieldAccess {
+                            path: vec![source_code.slice(9, 13)],
+                        },
+                    }),
+                },
+            },
+            operation: super::ListBindingOperation::Map,
+            reference_connector: Arc::new(super::ReferenceConnector::new()),
+            link_connector: Arc::new(super::LinkConnector::new()),
+            source_code,
+            function_registry_snapshot: None,
+        };
+
+        let transformed = REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            super::ListBindingFunction::transform_item_with_registry(
+                Some(&mut reg),
+                item_actor.clone(),
+                0,
+                &config,
+                construct_context.clone(),
+                actor_context.clone(),
+            )
+        });
+
+        let Value::Text(text, _) = transformed
+            .current_value()
+            .expect("runtime-local list pipe field transform should expose the mapped value")
+        else {
+            panic!("runtime-local list pipe field transform should resolve to text");
+        };
+        assert_eq!(text.text(), "ready");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(root_scope),
+                0,
+                "runtime-local pipe field mapping should stay on the direct runtime subscriber path"
+            );
+        });
+    }
+
+    #[test]
+    fn pending_future_forwarding_source_switches_to_runtime_subscriber_after_resolution() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let source = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let (source_tx, source_rx) = oneshot::channel::<ActorHandle>();
+
+        let forwarded = super::create_actor_forwarding_from_future_source(
+            async move { source_rx.await.ok() },
+            PersistenceId::new(),
+            scope_id,
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                1,
+                "pending future forwarding should retain only the one-shot source wait task before resolution"
+            );
+        });
+
+        source.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.forwarding.pending_future.initial",
+                None,
+                "test forwarding pending future initial",
+            ),
+            ConstructContext {
+                construct_storage: Arc::new(ConstructStorage::new("")),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            PersistenceId::new(),
+            41,
+            "first",
+        ));
+
+        assert!(
+            source_tx.send(source.clone()).is_ok(),
+            "pending future forwarding should still be awaiting the source actor"
+        );
+
+        let mut handoff_complete = false;
+        for _ in 0..20 {
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            super::poll_test_async_source_tasks();
+            let async_source_count =
+                REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+            let has_forwarded_value = forwarded.current_value().is_ok();
+            if async_source_count == 0 && has_forwarded_value {
+                handoff_complete = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            handoff_complete,
+            "direct-state sources resolved from pending futures should switch to runtime subscribers instead of keeping a forwarding task"
+        );
+
+        let Value::Text(text, _) = forwarded
+            .current_value()
+            .expect("forwarded actor should expose the resolved source value")
+        else {
+            panic!("expected forwarded text after source resolution");
+        };
+        assert_eq!(text.text(), "first");
+
+        source.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.forwarding.pending_future.update",
+                None,
+                "test forwarding pending future update",
+            ),
+            ConstructContext {
+                construct_storage: Arc::new(ConstructStorage::new("")),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            PersistenceId::new(),
+            42,
+            "second",
+        ));
+
+        let Value::Text(text, _) = forwarded
+            .current_value()
+            .expect("forwarded actor should receive later direct-state updates after resolution")
+        else {
+            panic!("expected updated forwarded text after source resolution");
+        };
+        assert_eq!(text.text(), "second");
+    }
+
+    #[test]
+    fn binary_operator_direct_state_operands_use_runtime_subscribers_without_async_source_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            scope: Scope::Root,
+            parameters: Arc::new(HashMap::new()),
+            ..Default::default()
+        };
+
+        let left = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let right = create_actor_forwarding(PersistenceId::new(), scope_id);
+        left.store_value_directly(super::Number::new_value(
+            ConstructInfo::new("test.binary.left.initial", None, "test binary left initial"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            2.0,
+        ));
+        right.store_value_directly(super::Number::new_value(
+            ConstructInfo::new(
+                "test.binary.right.initial",
+                None,
+                "test binary right initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            3.0,
+        ));
+
+        let result = super::ArithmeticCombinator::new_add(
+            construct_context.clone(),
+            actor_context,
+            left.clone(),
+            right.clone(),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state binary combinators should use runtime subscribers instead of async source tasks"
+            );
+        });
+
+        let Value::Number(number, _) = result
+            .current_value()
+            .expect("binary combinator should seed immediately from current operand values")
+        else {
+            panic!("expected numeric binary combinator result");
+        };
+        assert_eq!(number.number(), 5.0);
+
+        right.store_value_directly(super::Number::new_value(
+            ConstructInfo::new("test.binary.right.update", None, "test binary right update"),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            7.0,
+        ));
+
+        let Value::Number(number, _) = result
+            .current_value()
+            .expect("binary combinator should update from direct-state operand changes")
+        else {
+            panic!("expected updated numeric binary combinator result");
+        };
+        assert_eq!(number.number(), 9.0);
+    }
+
+    #[test]
+    fn binary_operator_direct_state_with_lazy_operand_uses_one_scope_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            scope: Scope::Root,
+            parameters: Arc::new(HashMap::new()),
+            ..Default::default()
+        };
+
+        let (mut left_tx, left_rx) = mpsc::channel::<Value>(8);
+        let left = create_actor_lazy(left_rx, PersistenceId::new(), scope_id);
+        let right = create_actor_forwarding(PersistenceId::new(), scope_id);
+        right.store_value_directly(super::Number::new_value(
+            ConstructInfo::new(
+                "test.binary.lazy.right.initial",
+                None,
+                "test binary lazy right initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            3.0,
+        ));
+
+        let baseline_async_source_count =
+            REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+        let result = super::ArithmeticCombinator::new_add(
+            construct_context.clone(),
+            actor_context,
+            left,
+            right.clone(),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy direct-state binary combinators should add one scope-owned watcher plus the first-demand lazy operand task"
+            );
+        });
+
+        assert!(
+            result.current_value().is_err(),
+            "binary combinator should stay empty until the lazy operand emits"
+        );
+
+        left_tx
+            .clone()
+            .try_send(super::Number::new_value(
+                ConstructInfo::new(
+                    "test.binary.lazy.left.initial",
+                    None,
+                    "test binary lazy left initial",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                2.0,
+            ))
+            .expect("lazy left operand should enqueue its first value");
+        super::poll_test_async_source_tasks();
+
+        let Value::Number(number, _) = result
+            .current_value()
+            .expect("binary combinator should resolve once the lazy operand emits")
+        else {
+            panic!("expected numeric binary combinator result after lazy operand");
+        };
+        assert_eq!(number.number(), 5.0);
+
+        left_tx
+            .try_send(super::Number::new_value(
+                ConstructInfo::new(
+                    "test.binary.lazy.left.update",
+                    None,
+                    "test binary lazy left update",
+                ),
+                construct_context,
+                ValueIdempotencyKey::new(),
+                7.0,
+            ))
+            .expect("lazy left operand should enqueue its update");
+        super::poll_test_async_source_tasks();
+
+        let Value::Number(number, _) = result
+            .current_value()
+            .expect("binary combinator should update from later lazy operand values")
+        else {
+            panic!("expected updated numeric binary combinator result");
+        };
+        assert_eq!(number.number(), 10.0);
+    }
+
+    #[test]
+    fn list_direct_subscriber_routes_changes_through_runtime_queue_without_async_source_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let source_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let target_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let target_construct_info =
+            ConstructInfo::new("test.list.direct.target", None, "test list direct target")
+                .complete(super::ConstructType::List);
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            source_state.register_direct_subscriber(
+                &mut reg,
+                Rc::new({
+                    let target_state = target_state.clone();
+                    let target_construct_info = target_construct_info.clone();
+                    move |reg, change| {
+                        reg.enqueue_list_runtime_work(
+                            target_state.clone(),
+                            super::ListRuntimeWork::Change {
+                                construct_info: target_construct_info.clone(),
+                                change: change.clone(),
+                                broadcast_change: true,
+                            },
+                        );
+                        true
+                    }
+                }),
+            );
+            reg.enqueue_list_runtime_work(
+                source_state.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.direct.source.replace",
+                        None,
+                        "test list direct source replace",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![test_actor_handle("first", 1)]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct list subscribers should not spawn async source tasks"
+            );
+        });
+
+        let initial_snapshot = target_state.snapshot();
+        assert_eq!(
+            initial_snapshot.len(),
+            1,
+            "target list should receive the source initialization replace"
+        );
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.direct.source.push",
+                        None,
+                        "test list direct source push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push {
+                        item: test_actor_handle("second", 2),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let snapshot = target_state.snapshot();
+        assert_eq!(
+            snapshot.len(),
+            2,
+            "target list should receive later source pushes"
+        );
+        assert_eq!(
+            target_state.version(),
+            2,
+            "replace + push should advance the target list version through runtime queue work"
+        );
+    }
+
+    #[test]
+    fn runtime_list_ready_queue_routes_list_inputs_before_list_runtime_work_buffer() {
+        let first = test_actor_handle("first", 1);
+        let second = test_actor_handle("second", 2);
+        let stored_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let construct_info =
+            ConstructInfo::new("test.runtime.list.input", None, "test runtime list input")
+                .complete(super::ConstructType::List);
+        let mut list = None;
+        let mut list_arc_cache = None;
+
+        super::process_live_list_change(
+            &construct_info,
+            &stored_state,
+            &mut list,
+            &mut list_arc_cache,
+            &ListChange::Replace {
+                items: Arc::from(vec![first]),
+            },
+            false,
+        );
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_input(
+                stored_state.clone(),
+                super::ListRuntimeWork::LiveInputChange {
+                    construct_info: construct_info.clone(),
+                    change: ListChange::Push { item: second.clone() },
+                },
+            );
+
+            assert!(
+                !stored_state.has_pending_runtime_work(),
+                "list runtime-work buffer should stay untouched until runtime-ready input is drained"
+            );
+            assert_eq!(
+                reg.runtime_ready_queue.len(),
+                1,
+                "raw list inputs should queue on the runtime queue before list runtime-work scheduling"
+            );
+
+            reg.drain_runtime_ready_queue();
+        });
+
+        let snapshot = stored_state.snapshot();
+        assert_eq!(
+            snapshot.len(),
+            2,
+            "runtime-ready list inputs should still apply the queued change once drained"
+        );
+    }
+
+    #[test]
+    fn runtime_list_work_deduplicates_ready_queue_entries_per_drain() {
+        let first = test_actor_handle("first", 1);
+        let second = test_actor_handle("second", 2);
+        let third = test_actor_handle("third", 3);
+        let stored_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let construct_info = ConstructInfo::new(
+            "test.runtime.list.work_dedup",
+            None,
+            "test runtime list work dedup",
+        )
+        .complete(super::ConstructType::List);
+        let mut list = None;
+        let mut list_arc_cache = None;
+
+        super::process_live_list_change(
+            &construct_info,
+            &stored_state,
+            &mut list,
+            &mut list_arc_cache,
+            &ListChange::Replace {
+                items: Arc::from(vec![first]),
+            },
+            false,
+        );
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                stored_state.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: construct_info.clone(),
+                    change: ListChange::Push {
+                        item: second.clone(),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                stored_state.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: construct_info.clone(),
+                    change: ListChange::Push {
+                        item: third.clone(),
+                    },
+                    broadcast_change: true,
+                },
+            );
+
+            assert!(stored_state.has_pending_runtime_work());
+            assert!(stored_state.is_scheduled_for_runtime());
+            assert_eq!(
+                reg.runtime_ready_queue.len(),
+                1,
+                "multiple list runtime work items should collapse to one ready-queue entry"
+            );
+
+            reg.drain_runtime_ready_queue();
+        });
+
+        let snapshot = stored_state.snapshot();
+        assert_eq!(
+            snapshot.len(),
+            3,
+            "the deduplicated runtime drain should still apply every queued list change in order"
+        );
+        assert_eq!(
+            stored_state.version(),
+            3,
+            "replace plus two pushes should advance the list version through one runtime drain"
+        );
+    }
+
+    #[test]
+    fn list_map_direct_state_source_routes_changes_through_runtime_queue_without_async_source_task()
+    {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let source_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info = ConstructInfo::new(
+            "test.list.map.direct.source",
+            None,
+            "test list map direct source",
+        )
+        .complete(super::ConstructType::List);
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![test_actor_handle("first", 1)]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list = Arc::new(super::List::new_with_stored_state(
+            source_construct_info,
+            scope_id,
+            source_state.clone(),
+        ));
+        let source_actor = create_constant_actor(
+            PersistenceId::new(),
+            Value::List(source_list, ValueMetadata::new(ValueIdempotencyKey::new())),
+            scope_id,
+        );
+
+        let source_code = SourceCode::new("item".to_string());
+        let result_actor = super::ListBindingFunction::create_map_actor(
+            ConstructInfo::new(
+                "test.list.map.direct.result",
+                None,
+                "test list map direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context,
+            actor_context,
+            source_actor,
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithoutPassed {
+                            parts: vec![source_code.slice(0, 4)],
+                            referenced_span: None,
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::Map,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state List/map should reuse list direct subscribers instead of spawning an async source task"
+            );
+        });
+
+        let initial_snapshot = block_on(async {
+            let Value::List(list, _) = result_actor
+                .current_value()
+                .expect("mapped list actor should expose a current list value")
+            else {
+                panic!("mapped actor should resolve to a list");
+            };
+            list.snapshot().await
+        });
+        assert_eq!(initial_snapshot.len(), 1);
+        let Value::Text(text, _) = initial_snapshot[0]
+            .1
+            .current_value()
+            .expect("mapped item should expose the forwarded text value")
+        else {
+            panic!("mapped item should resolve to text");
+        };
+        assert_eq!(text.text(), "first");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.map.direct.source.push",
+                        None,
+                        "test list map direct source push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push {
+                        item: test_actor_handle("second", 2),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let updated_snapshot = block_on(async {
+            let Value::List(list, _) = result_actor
+                .current_value()
+                .expect("mapped list actor should still expose its list after source updates")
+            else {
+                panic!("mapped actor should stay a list");
+            };
+            list.snapshot().await
+        });
+        assert_eq!(updated_snapshot.len(), 2);
+        let Value::Text(text, _) = updated_snapshot[1]
+            .1
+            .current_value()
+            .expect("pushed mapped item should expose the forwarded text value")
+        else {
+            panic!("pushed mapped item should resolve to text");
+        };
+        assert_eq!(text.text(), "second");
+    }
+
+    #[test]
+    fn list_map_direct_state_source_switch_ignores_stale_old_list_updates_without_async_source_task()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.map.direct.switch.source_a",
+            None,
+            "test list map direct switch source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.map.direct.switch.source_b",
+            None,
+            "test list map direct switch source b",
+        )
+        .complete(super::ConstructType::List);
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![test_actor_handle("first", 1)]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![test_actor_handle("alt", 2)]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b.clone(),
+        ));
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(Value::List(
+            source_list_a,
+            ValueMetadata::new(ValueIdempotencyKey::new()),
+        ));
+
+        let source_code = SourceCode::new("item".to_string());
+        let result_actor = super::ListBindingFunction::create_map_actor(
+            ConstructInfo::new(
+                "test.list.map.direct.switch.result",
+                None,
+                "test list map direct switch result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context,
+            actor_context,
+            source_actor.clone(),
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithoutPassed {
+                            parts: vec![source_code.slice(0, 4)],
+                            referenced_span: None,
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::Map,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state source switching List/map should stay on runtime subscribers without async source tasks"
+            );
+        });
+
+        let initial_snapshot = block_on(async {
+            let Value::List(list, _) = result_actor
+                .current_value()
+                .expect("mapped list actor should expose the first source list")
+            else {
+                panic!("mapped actor should resolve to a list");
+            };
+            list.snapshot().await
+        });
+        assert_eq!(initial_snapshot.len(), 1);
+        let Value::Text(text, _) = initial_snapshot[0]
+            .1
+            .current_value()
+            .expect("initial mapped item should expose source a value")
+        else {
+            panic!("initial mapped item should resolve to text");
+        };
+        assert_eq!(text.text(), "first");
+
+        source_actor.store_value_directly(Value::List(
+            source_list_b,
+            ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+        ));
+
+        let switched_snapshot = block_on(async {
+            let Value::List(list, _) = result_actor
+                .current_value()
+                .expect("mapped list actor should expose the switched source list")
+            else {
+                panic!("mapped actor should stay a list after source switch");
+            };
+            list.snapshot().await
+        });
+        assert_eq!(switched_snapshot.len(), 1);
+        let Value::Text(text, _) = switched_snapshot[0]
+            .1
+            .current_value()
+            .expect("switched mapped item should expose source b value")
+        else {
+            panic!("switched mapped item should resolve to text");
+        };
+        assert_eq!(text.text(), "alt");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.map.direct.switch.source_a.push",
+                        None,
+                        "test list map direct switch source a push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push {
+                        item: test_actor_handle("stale", 6),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let final_snapshot = block_on(async {
+            let Value::List(list, _) = result_actor
+                .current_value()
+                .expect("mapped list actor should still expose the switched source list")
+            else {
+                panic!("mapped actor should stay a list after stale old-list update");
+            };
+            list.snapshot().await
+        });
+        assert_eq!(final_snapshot.len(), 1);
+        let Value::Text(text, _) = final_snapshot[0]
+            .1
+            .current_value()
+            .expect("stale old-list updates should not replace the active mapped item")
+        else {
+            panic!("final mapped item should resolve to text");
+        };
+        assert_eq!(text.text(), "alt");
+    }
+
+    #[test]
+    fn list_map_late_direct_state_source_waits_without_async_source_task_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.map.late_direct.source_a",
+            None,
+            "test list map late direct source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.map.late_direct.source_b",
+            None,
+            "test list map late direct source b",
+        )
+        .complete(super::ConstructType::List);
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![test_actor_handle("first", 1)]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![test_actor_handle("alt", 2)]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b.clone(),
+        ));
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let source_code = SourceCode::new("item".to_string());
+        let result_actor = super::ListBindingFunction::create_map_actor(
+            ConstructInfo::new(
+                "test.list.map.late_direct.result",
+                None,
+                "test list map late direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context,
+            actor_context,
+            source_actor.clone(),
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithoutPassed {
+                            parts: vec![source_code.slice(0, 4)],
+                            referenced_span: None,
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::Map,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "late direct-state List/map should stay on runtime subscribers without spawning an async source task"
+            );
+        });
+
+        let Value::List(result_list, _) = result_actor.current_value().expect(
+            "mapped actor should expose its result list immediately even before source resolution",
+        ) else {
+            panic!("mapped actor should resolve to a list");
+        };
+        assert!(
+            result_list.snapshot_now().is_none(),
+            "late direct-state mapped list should stay uninitialized until the source list arrives"
+        );
+
+        source_actor.store_value_directly(Value::List(
+            source_list_a,
+            ValueMetadata::new(ValueIdempotencyKey::new()),
+        ));
+
+        let initial_snapshot = block_on(result_list.snapshot());
+        assert_eq!(initial_snapshot.len(), 1);
+        let Value::Text(text, _) = initial_snapshot[0]
+            .1
+            .current_value()
+            .expect("late-resolved mapped item should expose source a value")
+        else {
+            panic!("late-resolved mapped item should resolve to text");
+        };
+        assert_eq!(text.text(), "first");
+
+        source_actor.store_value_directly(Value::List(
+            source_list_b,
+            ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+        ));
+
+        let switched_snapshot = block_on(result_list.snapshot());
+        assert_eq!(switched_snapshot.len(), 1);
+        let Value::Text(text, _) = switched_snapshot[0]
+            .1
+            .current_value()
+            .expect("mapped list should switch to the resolved source b list")
+        else {
+            panic!("switched mapped item should resolve to text");
+        };
+        assert_eq!(text.text(), "alt");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.map.late_direct.source_a.push",
+                        None,
+                        "test list map late direct source a push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push {
+                        item: test_actor_handle("stale", 6),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let final_snapshot = block_on(result_list.snapshot());
+        assert_eq!(
+            final_snapshot.len(),
+            1,
+            "stale old-list updates should be ignored after the late direct-state source switches"
+        );
+        let Value::Text(text, _) = final_snapshot[0]
+            .1
+            .current_value()
+            .expect("mapped list should keep the active source item after stale old-list updates")
+        else {
+            panic!("final mapped item should resolve to text");
+        };
+        assert_eq!(text.text(), "alt");
+    }
+
+    #[test]
+    fn list_sort_by_direct_state_source_routes_changes_through_runtime_queue_without_async_source_task()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_number_actor = |value: f64, label: &str| {
+            create_constant_actor(
+                PersistenceId::new(),
+                Number::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.sort_by.direct.source.{label}"),
+                        None,
+                        "test list sort_by direct source number",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+
+        let source_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info = ConstructInfo::new(
+            "test.list.sort_by.direct.source",
+            None,
+            "test list sort_by direct source",
+        )
+        .complete(super::ConstructType::List);
+        let initial_high = make_number_actor(3.0, "initial_high");
+        let initial_low = make_number_actor(1.0, "initial_low");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![initial_high, initial_low]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list = Arc::new(super::List::new_with_stored_state(
+            source_construct_info,
+            scope_id,
+            source_state.clone(),
+        ));
+        let source_actor = create_constant_actor(
+            PersistenceId::new(),
+            Value::List(source_list, ValueMetadata::new(ValueIdempotencyKey::new())),
+            scope_id,
+        );
+
+        let source_code = SourceCode::new("item".to_string());
+        let result_actor = super::ListBindingFunction::create_sort_by_actor(
+            ConstructInfo::new(
+                "test.list.sort_by.direct.result",
+                None,
+                "test list sort_by direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor,
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithoutPassed {
+                            parts: vec![source_code.slice(0, 4)],
+                            referenced_span: None,
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::SortBy,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state List/sort_by should stay on the runtime queue instead of spawning an async source task"
+            );
+        });
+
+        let snapshot_numbers = |actor: &ActorHandle| {
+            block_on(async {
+                let Value::List(list, _) = actor
+                    .current_value()
+                    .expect("sorted list actor should expose a current list value")
+                else {
+                    panic!("sorted actor should resolve to a list");
+                };
+                list.snapshot()
+                    .await
+                    .into_iter()
+                    .map(|(_, item)| {
+                        let Value::Number(number, _) = item
+                            .current_value()
+                            .expect("sorted item should expose a current numeric value")
+                        else {
+                            panic!("sorted item should resolve to number");
+                        };
+                        number.number()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(snapshot_numbers(&result_actor), vec![1.0, 3.0]);
+
+        let pushed_mid = make_number_actor(2.0, "pushed_mid");
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.sort_by.direct.source.push",
+                        None,
+                        "test list sort_by direct source push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push { item: pushed_mid },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        assert_eq!(snapshot_numbers(&result_actor), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn list_sort_by_direct_state_source_switch_ignores_stale_old_list_updates_without_async_source_task()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_number_actor = |value: f64, label: &str| {
+            create_constant_actor(
+                PersistenceId::new(),
+                Number::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.sort_by.direct.switch.{label}"),
+                        None,
+                        "test list sort_by direct switch number",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.sort_by.direct.switch.source_a",
+            None,
+            "test list sort_by direct switch source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.sort_by.direct.switch.source_b",
+            None,
+            "test list sort_by direct switch source b",
+        )
+        .complete(super::ConstructType::List);
+        let source_a_high = make_number_actor(5.0, "source_a_high");
+        let source_a_low = make_number_actor(1.0, "source_a_low");
+        let source_b_high = make_number_actor(4.0, "source_b_high");
+        let source_b_low = make_number_actor(3.0, "source_b_low");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_a_high, source_a_low]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_b_high, source_b_low]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b.clone(),
+        ));
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(Value::List(
+            source_list_a,
+            ValueMetadata::new(ValueIdempotencyKey::new()),
+        ));
+
+        let source_code = SourceCode::new("item".to_string());
+        let result_actor = super::ListBindingFunction::create_sort_by_actor(
+            ConstructInfo::new(
+                "test.list.sort_by.direct.switch.result",
+                None,
+                "test list sort_by direct switch result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor.clone(),
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithoutPassed {
+                            parts: vec![source_code.slice(0, 4)],
+                            referenced_span: None,
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::SortBy,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state switching List/sort_by should not spawn async source tasks"
+            );
+        });
+
+        let snapshot_numbers = |actor: &ActorHandle| {
+            block_on(async {
+                let Value::List(list, _) = actor
+                    .current_value()
+                    .expect("sorted list actor should expose a current list value")
+                else {
+                    panic!("sorted actor should resolve to a list");
+                };
+                list.snapshot()
+                    .await
+                    .into_iter()
+                    .map(|(_, item)| {
+                        let Value::Number(number, _) = item
+                            .current_value()
+                            .expect("sorted item should expose a current numeric value")
+                        else {
+                            panic!("sorted item should resolve to number");
+                        };
+                        number.number()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(snapshot_numbers(&result_actor), vec![1.0, 5.0]);
+
+        source_actor.store_value_directly(Value::List(
+            source_list_b,
+            ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+        ));
+        assert_eq!(snapshot_numbers(&result_actor), vec![3.0, 4.0]);
+
+        let source_a_stale = make_number_actor(0.0, "source_a_stale");
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a,
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.sort_by.direct.switch.source_a.stale_push",
+                        None,
+                        "test list sort_by direct switch source a stale push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push {
+                        item: source_a_stale,
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        assert_eq!(snapshot_numbers(&result_actor), vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn list_sort_by_late_direct_state_source_waits_without_async_source_task_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_number_actor = |value: f64, label: &str| {
+            create_constant_actor(
+                PersistenceId::new(),
+                Number::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.sort_by.late_direct.{label}"),
+                        None,
+                        "test list sort_by late direct number",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.sort_by.late_direct.source_a",
+            None,
+            "test list sort_by late direct source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.sort_by.late_direct.source_b",
+            None,
+            "test list sort_by late direct source b",
+        )
+        .complete(super::ConstructType::List);
+        let source_a_high = make_number_actor(5.0, "source_a_high");
+        let source_a_low = make_number_actor(1.0, "source_a_low");
+        let source_b_high = make_number_actor(4.0, "source_b_high");
+        let source_b_low = make_number_actor(3.0, "source_b_low");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_a_high, source_a_low]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_b_high, source_b_low]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b.clone(),
+        ));
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let source_code = SourceCode::new("item".to_string());
+        let result_actor = super::ListBindingFunction::create_sort_by_actor(
+            ConstructInfo::new(
+                "test.list.sort_by.late_direct.result",
+                None,
+                "test list sort_by late direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor.clone(),
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithoutPassed {
+                            parts: vec![source_code.slice(0, 4)],
+                            referenced_span: None,
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::SortBy,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "late direct-state List/sort_by should stay on runtime subscribers without async source tasks"
+            );
+        });
+
+        let Value::List(result_list, _) = result_actor
+            .current_value()
+            .expect("late direct-state sorted actor should expose its result list immediately")
+        else {
+            panic!("sorted actor should resolve to a list");
+        };
+        assert!(result_list.snapshot_now().is_none());
+
+        let snapshot_numbers = |list: &Arc<super::List>| {
+            block_on(async {
+                list.snapshot()
+                    .await
+                    .into_iter()
+                    .map(|(_, item)| {
+                        let Value::Number(number, _) = item.current_value().expect(
+                            "sorted late direct item should expose a current numeric value",
+                        ) else {
+                            panic!("sorted late direct item should resolve to number");
+                        };
+                        number.number()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        source_actor.store_value_directly(Value::List(
+            source_list_a,
+            ValueMetadata::new(ValueIdempotencyKey::new()),
+        ));
+        assert_eq!(snapshot_numbers(&result_list), vec![1.0, 5.0]);
+
+        source_actor.store_value_directly(Value::List(
+            source_list_b,
+            ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+        ));
+        assert_eq!(snapshot_numbers(&result_list), vec![3.0, 4.0]);
+
+        let source_a_stale = make_number_actor(0.0, "source_a_stale");
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a,
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.sort_by.late_direct.source_a.stale_push",
+                        None,
+                        "test list sort_by late direct source a stale push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push {
+                        item: source_a_stale,
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+        assert_eq!(snapshot_numbers(&result_list), vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn list_retain_direct_state_source_routes_changes_through_runtime_queue_without_async_source_task()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_number_actor = |value: f64, label: &str| {
+            create_constant_actor(
+                PersistenceId::new(),
+                Number::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.retain.direct.source.{label}"),
+                        None,
+                        "test list retain direct source number",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+
+        let source_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info = ConstructInfo::new(
+            "test.list.retain.direct.source",
+            None,
+            "test list retain direct source",
+        )
+        .complete(super::ConstructType::List);
+        let initial_low = make_number_actor(1.0, "initial_low");
+        let initial_high = make_number_actor(3.0, "initial_high");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![initial_low, initial_high]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list = Arc::new(super::List::new_with_stored_state(
+            source_construct_info,
+            scope_id,
+            source_state.clone(),
+        ));
+        let source_actor = create_constant_actor(
+            PersistenceId::new(),
+            Value::List(source_list, ValueMetadata::new(ValueIdempotencyKey::new())),
+            scope_id,
+        );
+
+        let source_code = SourceCode::new("item > 1".to_string());
+        let result_actor = super::ListBindingFunction::create_retain_actor(
+            ConstructInfo::new(
+                "test.list.retain.direct.result",
+                None,
+                "test list retain direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor,
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Comparator(
+                        static_expression::Comparator::Greater {
+                            operand_a: Box::new(static_expression::Spanned {
+                                span: (0..4).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Alias(
+                                    static_expression::Alias::WithoutPassed {
+                                        parts: vec![source_code.slice(0, 4)],
+                                        referenced_span: None,
+                                    },
+                                ),
+                            }),
+                            operand_b: Box::new(static_expression::Spanned {
+                                span: (7..8).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Literal(
+                                    static_expression::Literal::Number(1.0),
+                                ),
+                            }),
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::Retain,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state List/retain should stay on runtime subscribers instead of spawning an async source task"
+            );
+        });
+
+        let snapshot_numbers = |actor: &ActorHandle| {
+            block_on(async {
+                let Value::List(list, _) = actor
+                    .current_value()
+                    .expect("retained list actor should expose a current list value")
+                else {
+                    panic!("retained actor should resolve to a list");
+                };
+                list.snapshot()
+                    .await
+                    .into_iter()
+                    .map(|(_, item)| {
+                        let Value::Number(number, _) = item
+                            .current_value()
+                            .expect("retained item should expose a current numeric value")
+                        else {
+                            panic!("retained item should resolve to number");
+                        };
+                        number.number()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(snapshot_numbers(&result_actor), vec![3.0]);
+
+        let pushed_mid = make_number_actor(2.0, "pushed_mid");
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.retain.direct.source.push",
+                        None,
+                        "test list retain direct source push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push { item: pushed_mid },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        assert_eq!(snapshot_numbers(&result_actor), vec![3.0, 2.0]);
+    }
+
+    #[test]
+    fn list_retain_direct_state_source_switch_ignores_stale_old_list_updates_without_async_source_task()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_number_actor = |value: f64, label: &str| {
+            create_constant_actor(
+                PersistenceId::new(),
+                Number::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.retain.direct.switch.{label}"),
+                        None,
+                        "test list retain direct switch number",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.retain.direct.switch.source_a",
+            None,
+            "test list retain direct switch source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.retain.direct.switch.source_b",
+            None,
+            "test list retain direct switch source b",
+        )
+        .complete(super::ConstructType::List);
+        let source_a_low = make_number_actor(1.0, "source_a_low");
+        let source_a_high = make_number_actor(5.0, "source_a_high");
+        let source_b_high = make_number_actor(4.0, "source_b_high");
+        let source_b_mid = make_number_actor(3.0, "source_b_mid");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_a_low, source_a_high]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_b_high, source_b_mid]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b.clone(),
+        ));
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(Value::List(
+            source_list_a,
+            ValueMetadata::new(ValueIdempotencyKey::new()),
+        ));
+
+        let source_code = SourceCode::new("item > 2".to_string());
+        let result_actor = super::ListBindingFunction::create_retain_actor(
+            ConstructInfo::new(
+                "test.list.retain.direct.switch.result",
+                None,
+                "test list retain direct switch result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor.clone(),
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Comparator(
+                        static_expression::Comparator::Greater {
+                            operand_a: Box::new(static_expression::Spanned {
+                                span: (0..4).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Alias(
+                                    static_expression::Alias::WithoutPassed {
+                                        parts: vec![source_code.slice(0, 4)],
+                                        referenced_span: None,
+                                    },
+                                ),
+                            }),
+                            operand_b: Box::new(static_expression::Spanned {
+                                span: (7..8).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Literal(
+                                    static_expression::Literal::Number(2.0),
+                                ),
+                            }),
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::Retain,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state switching List/retain should not spawn async source tasks"
+            );
+        });
+
+        let snapshot_numbers = |actor: &ActorHandle| {
+            block_on(async {
+                let Value::List(list, _) = actor
+                    .current_value()
+                    .expect("retained list actor should expose a current list value")
+                else {
+                    panic!("retained actor should resolve to a list");
+                };
+                list.snapshot()
+                    .await
+                    .into_iter()
+                    .map(|(_, item)| {
+                        let Value::Number(number, _) = item
+                            .current_value()
+                            .expect("retained item should expose a current numeric value")
+                        else {
+                            panic!("retained item should resolve to number");
+                        };
+                        number.number()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(snapshot_numbers(&result_actor), vec![5.0]);
+
+        source_actor.store_value_directly(Value::List(
+            source_list_b,
+            ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+        ));
+        assert_eq!(snapshot_numbers(&result_actor), vec![4.0, 3.0]);
+
+        let source_a_stale = make_number_actor(10.0, "source_a_stale");
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a,
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.retain.direct.switch.source_a.stale_push",
+                        None,
+                        "test list retain direct switch source a stale push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push {
+                        item: source_a_stale,
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        assert_eq!(snapshot_numbers(&result_actor), vec![4.0, 3.0]);
+    }
+
+    #[test]
+    fn list_retain_late_direct_state_source_waits_without_async_source_task_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_number_actor = |value: f64, label: &str| {
+            create_constant_actor(
+                PersistenceId::new(),
+                Number::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.retain.late_direct.{label}"),
+                        None,
+                        "test list retain late direct number",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.retain.late_direct.source_a",
+            None,
+            "test list retain late direct source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.retain.late_direct.source_b",
+            None,
+            "test list retain late direct source b",
+        )
+        .complete(super::ConstructType::List);
+        let source_a_low = make_number_actor(1.0, "source_a_low");
+        let source_a_high = make_number_actor(5.0, "source_a_high");
+        let source_b_high = make_number_actor(4.0, "source_b_high");
+        let source_b_mid = make_number_actor(3.0, "source_b_mid");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_a_low, source_a_high]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_b_high, source_b_mid]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b.clone(),
+        ));
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let source_code = SourceCode::new("item > 2".to_string());
+        let result_actor = super::ListBindingFunction::create_retain_actor(
+            ConstructInfo::new(
+                "test.list.retain.late_direct.result",
+                None,
+                "test list retain late direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor.clone(),
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Comparator(
+                        static_expression::Comparator::Greater {
+                            operand_a: Box::new(static_expression::Spanned {
+                                span: (0..4).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Alias(
+                                    static_expression::Alias::WithoutPassed {
+                                        parts: vec![source_code.slice(0, 4)],
+                                        referenced_span: None,
+                                    },
+                                ),
+                            }),
+                            operand_b: Box::new(static_expression::Spanned {
+                                span: (7..8).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Literal(
+                                    static_expression::Literal::Number(2.0),
+                                ),
+                            }),
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::Retain,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "late direct-state List/retain should stay on runtime subscribers without async source tasks"
+            );
+        });
+
+        let Value::List(result_list, _) = result_actor
+            .current_value()
+            .expect("late direct-state retain actor should expose its result list immediately")
+        else {
+            panic!("retain actor should resolve to a list");
+        };
+        assert!(result_list.snapshot_now().is_none());
+
+        let snapshot_numbers = |list: &Arc<super::List>| {
+            block_on(async {
+                list.snapshot()
+                    .await
+                    .into_iter()
+                    .map(|(_, item)| {
+                        let Value::Number(number, _) = item.current_value().expect(
+                            "retained late direct item should expose a current numeric value",
+                        ) else {
+                            panic!("retained late direct item should resolve to number");
+                        };
+                        number.number()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        source_actor.store_value_directly(Value::List(
+            source_list_a,
+            ValueMetadata::new(ValueIdempotencyKey::new()),
+        ));
+        assert_eq!(snapshot_numbers(&result_list), vec![5.0]);
+
+        source_actor.store_value_directly(Value::List(
+            source_list_b,
+            ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+        ));
+        assert_eq!(snapshot_numbers(&result_list), vec![4.0, 3.0]);
+
+        let source_a_stale = make_number_actor(10.0, "source_a_stale");
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a,
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.retain.late_direct.source_a.stale_push",
+                        None,
+                        "test list retain late direct source a stale push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push {
+                        item: source_a_stale,
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+        assert_eq!(snapshot_numbers(&result_list), vec![4.0, 3.0]);
+    }
+
+    #[test]
+    fn list_remove_direct_state_source_routes_changes_through_runtime_queue_without_async_source_task()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_trigger_item = |label: &str, trigger_actor: ActorHandle| {
+            create_constant_actor(
+                PersistenceId::new(),
+                super::Object::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.remove.direct.{label}.object"),
+                        None,
+                        "test list remove direct object",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    [Variable::new_arc(
+                        ConstructInfo::new(
+                            format!("test.list.remove.direct.{label}.trigger"),
+                            None,
+                            "test list remove direct trigger variable",
+                        ),
+                        "trigger",
+                        trigger_actor,
+                        PersistenceId::new(),
+                        actor_scope.clone(),
+                    )],
+                ),
+                scope_id,
+            )
+        };
+
+        let trigger_a = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let trigger_b = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let trigger_c = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let item_a = make_trigger_item("a", trigger_a);
+        let item_b = make_trigger_item("b", trigger_b.clone());
+        let item_c = make_trigger_item("c", trigger_c);
+
+        let source_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info = ConstructInfo::new(
+            "test.list.remove.direct.source",
+            None,
+            "test list remove direct source",
+        )
+        .complete(super::ConstructType::List);
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![item_a.clone(), item_b.clone()]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list = Arc::new(super::List::new_with_stored_state(
+            source_construct_info,
+            scope_id,
+            source_state.clone(),
+        ));
+        let source_actor = create_constant_actor(
+            PersistenceId::new(),
+            Value::List(source_list, ValueMetadata::new(ValueIdempotencyKey::new())),
+            scope_id,
+        );
+
+        let source_code = SourceCode::new("item.trigger".to_string());
+        let result_actor = super::ListBindingFunction::create_remove_actor(
+            ConstructInfo::new(
+                "test.list.remove.direct.result",
+                None,
+                "test list remove direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor,
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::PostfixFieldAccess {
+                        expr: Box::new(static_expression::Spanned {
+                            span: (0..4).into(),
+                            persistence: None,
+                            node: static_expression::Expression::Alias(
+                                static_expression::Alias::WithoutPassed {
+                                    parts: vec![source_code.slice(0, 4)],
+                                    referenced_span: None,
+                                },
+                            ),
+                        }),
+                        field: source_code.slice(5, 12),
+                    },
+                },
+                operation: super::ListBindingOperation::Remove,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+            None,
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state List/remove should stay on runtime subscribers when both the source list and remove triggers are direct-state"
+            );
+        });
+
+        let snapshot_pids = |actor: &ActorHandle| {
+            block_on(async {
+                let Value::List(list, _) = actor
+                    .current_value()
+                    .expect("remove list actor should expose a current list value")
+                else {
+                    panic!("remove actor should resolve to a list");
+                };
+                list.snapshot()
+                    .await
+                    .into_iter()
+                    .map(|(_, item)| item.persistence_id())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(
+            snapshot_pids(&result_actor),
+            vec![item_a.persistence_id(), item_b.persistence_id()]
+        );
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.remove.direct.source.push",
+                        None,
+                        "test list remove direct source push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push {
+                        item: item_c.clone(),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        assert_eq!(
+            snapshot_pids(&result_actor),
+            vec![
+                item_a.persistence_id(),
+                item_b.persistence_id(),
+                item_c.persistence_id(),
+            ]
+        );
+
+        trigger_b.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.remove.direct.trigger_b.fire",
+                None,
+                "test list remove direct trigger fire",
+            ),
+            construct_context,
+            PersistenceId::new(),
+            "fire",
+        ));
+
+        assert_eq!(
+            snapshot_pids(&result_actor),
+            vec![item_a.persistence_id(), item_c.persistence_id()]
+        );
+    }
+
+    #[test]
+    fn list_remove_direct_state_source_switch_ignores_stale_old_list_updates_without_async_source_task()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_trigger_item = |label: &str, trigger_actor: ActorHandle| {
+            create_constant_actor(
+                PersistenceId::new(),
+                super::Object::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.remove.direct.switch.{label}.object"),
+                        None,
+                        "test list remove direct switch object",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    [Variable::new_arc(
+                        ConstructInfo::new(
+                            format!("test.list.remove.direct.switch.{label}.trigger"),
+                            None,
+                            "test list remove direct switch trigger variable",
+                        ),
+                        "trigger",
+                        trigger_actor,
+                        PersistenceId::new(),
+                        actor_scope.clone(),
+                    )],
+                ),
+                scope_id,
+            )
+        };
+
+        let stale_trigger = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let fresh_trigger = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let stale_item = make_trigger_item("stale_item", stale_trigger.clone());
+        let fresh_item = make_trigger_item("fresh_item", fresh_trigger);
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.remove.direct.switch.source_a",
+            None,
+            "test list remove direct switch source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.remove.direct.switch.source_b",
+            None,
+            "test list remove direct switch source b",
+        )
+        .complete(super::ConstructType::List);
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![stale_item.clone()]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![fresh_item.clone()]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b,
+        ));
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(Value::List(
+            source_list_a,
+            ValueMetadata::new(ValueIdempotencyKey::new()),
+        ));
+
+        let source_code = SourceCode::new("item.trigger".to_string());
+        let result_actor = super::ListBindingFunction::create_remove_actor(
+            ConstructInfo::new(
+                "test.list.remove.direct.switch.result",
+                None,
+                "test list remove direct switch result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor.clone(),
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::PostfixFieldAccess {
+                        expr: Box::new(static_expression::Spanned {
+                            span: (0..4).into(),
+                            persistence: None,
+                            node: static_expression::Expression::Alias(
+                                static_expression::Alias::WithoutPassed {
+                                    parts: vec![source_code.slice(0, 4)],
+                                    referenced_span: None,
+                                },
+                            ),
+                        }),
+                        field: source_code.slice(5, 12),
+                    },
+                },
+                operation: super::ListBindingOperation::Remove,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+            None,
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state switching List/remove should not spawn async source tasks"
+            );
+        });
+
+        let snapshot_pids = |actor: &ActorHandle| {
+            block_on(async {
+                let Value::List(list, _) = actor
+                    .current_value()
+                    .expect("remove list actor should expose a current list value")
+                else {
+                    panic!("remove actor should resolve to a list");
+                };
+                list.snapshot()
+                    .await
+                    .into_iter()
+                    .map(|(_, item)| item.persistence_id())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(
+            snapshot_pids(&result_actor),
+            vec![stale_item.persistence_id()]
+        );
+
+        source_actor.store_value_directly(Value::List(
+            source_list_b,
+            ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+        ));
+        assert_eq!(
+            snapshot_pids(&result_actor),
+            vec![fresh_item.persistence_id()]
+        );
+
+        stale_trigger.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.remove.direct.switch.stale_trigger.fire",
+                None,
+                "test list remove direct switch stale trigger fire",
+            ),
+            construct_context,
+            PersistenceId::new(),
+            "fire",
+        ));
+
+        assert_eq!(
+            snapshot_pids(&result_actor),
+            vec![fresh_item.persistence_id()]
+        );
+    }
+
+    #[test]
+    fn list_remove_late_direct_state_source_waits_without_async_source_task_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_trigger_item = |label: &str, trigger_actor: ActorHandle| {
+            create_constant_actor(
+                PersistenceId::new(),
+                super::Object::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.remove.late_direct.{label}.object"),
+                        None,
+                        "test list remove late direct object",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    [Variable::new_arc(
+                        ConstructInfo::new(
+                            format!("test.list.remove.late_direct.{label}.trigger"),
+                            None,
+                            "test list remove late direct trigger variable",
+                        ),
+                        "trigger",
+                        trigger_actor,
+                        PersistenceId::new(),
+                        actor_scope.clone(),
+                    )],
+                ),
+                scope_id,
+            )
+        };
+
+        let stale_trigger = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let fresh_trigger = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let stale_item = make_trigger_item("stale_item", stale_trigger.clone());
+        let fresh_item = make_trigger_item("fresh_item", fresh_trigger);
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.remove.late_direct.source_a",
+            None,
+            "test list remove late direct source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.remove.late_direct.source_b",
+            None,
+            "test list remove late direct source b",
+        )
+        .complete(super::ConstructType::List);
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![stale_item.clone()]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![fresh_item.clone()]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b,
+        ));
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let source_code = SourceCode::new("item.trigger".to_string());
+        let result_actor = super::ListBindingFunction::create_remove_actor(
+            ConstructInfo::new(
+                "test.list.remove.late_direct.result",
+                None,
+                "test list remove late direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor.clone(),
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::PostfixFieldAccess {
+                        expr: Box::new(static_expression::Spanned {
+                            span: (0..4).into(),
+                            persistence: None,
+                            node: static_expression::Expression::Alias(
+                                static_expression::Alias::WithoutPassed {
+                                    parts: vec![source_code.slice(0, 4)],
+                                    referenced_span: None,
+                                },
+                            ),
+                        }),
+                        field: source_code.slice(5, 12),
+                    },
+                },
+                operation: super::ListBindingOperation::Remove,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+            None,
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "late direct-state List/remove should stay on runtime subscribers without async source tasks"
+            );
+        });
+
+        let Value::List(result_list, _) = result_actor
+            .current_value()
+            .expect("late direct-state remove actor should expose its result list immediately")
+        else {
+            panic!("remove actor should resolve to a list");
+        };
+        assert!(result_list.snapshot_now().is_none());
+
+        let snapshot_pids = |list: &Arc<super::List>| {
+            block_on(async {
+                list.snapshot()
+                    .await
+                    .into_iter()
+                    .map(|(_, item)| item.persistence_id())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        source_actor.store_value_directly(Value::List(
+            source_list_a,
+            ValueMetadata::new(ValueIdempotencyKey::new()),
+        ));
+        assert_eq!(
+            snapshot_pids(&result_list),
+            vec![stale_item.persistence_id()]
+        );
+
+        source_actor.store_value_directly(Value::List(
+            source_list_b,
+            ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+        ));
+        assert_eq!(
+            snapshot_pids(&result_list),
+            vec![fresh_item.persistence_id()]
+        );
+
+        stale_trigger.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.remove.late_direct.stale_trigger.fire",
+                None,
+                "test list remove late direct stale trigger fire",
+            ),
+            construct_context,
+            PersistenceId::new(),
+            "fire",
+        ));
+        assert_eq!(
+            snapshot_pids(&result_list),
+            vec![fresh_item.persistence_id()]
+        );
+    }
+
+    #[test]
+    fn list_map_lazy_direct_state_source_waits_with_one_scope_task_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.map.lazy_direct.source_a",
+            None,
+            "test list map lazy direct source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.map.lazy_direct.source_b",
+            None,
+            "test list map lazy direct source b",
+        )
+        .complete(super::ConstructType::List);
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![test_actor_handle("first", 1)]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![test_actor_handle("alt", 2)]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b.clone(),
+        ));
+        let (mut source_tx, source_rx) = mpsc::channel::<Value>(8);
+        let source_actor = super::create_actor_lazy(source_rx, PersistenceId::new(), scope_id);
+        let baseline_async_source_count =
+            REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let source_code = SourceCode::new("item".to_string());
+        let result_actor = super::ListBindingFunction::create_map_actor(
+            ConstructInfo::new(
+                "test.list.map.lazy_direct.result",
+                None,
+                "test list map lazy direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context,
+            actor_context,
+            source_actor,
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithoutPassed {
+                            parts: vec![source_code.slice(0, 4)],
+                            referenced_span: None,
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::Map,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy direct-state List/map should add one scope-owned watcher plus the first-demand lazy source task"
+            );
+        });
+
+        let Value::List(result_list, _) = result_actor
+            .current_value()
+            .expect("mapped actor should expose its result list immediately")
+        else {
+            panic!("mapped actor should resolve to a list");
+        };
+        assert!(result_list.snapshot_now().is_none());
+
+        source_tx
+            .try_send(Value::List(
+                source_list_a,
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            ))
+            .expect("source a should enqueue");
+        super::poll_test_async_source_tasks();
+
+        let initial_snapshot = block_on(result_list.snapshot());
+        assert_eq!(initial_snapshot.len(), 1);
+        let Value::Text(text, _) = initial_snapshot[0]
+            .1
+            .current_value()
+            .expect("lazy mapped item should expose source a value")
+        else {
+            panic!("lazy mapped item should resolve to text");
+        };
+        assert_eq!(text.text(), "first");
+
+        source_tx
+            .try_send(Value::List(
+                source_list_b,
+                ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+            ))
+            .expect("source b should enqueue");
+        super::poll_test_async_source_tasks();
+
+        let switched_snapshot = block_on(result_list.snapshot());
+        assert_eq!(switched_snapshot.len(), 1);
+        let Value::Text(text, _) = switched_snapshot[0]
+            .1
+            .current_value()
+            .expect("lazy mapped list should switch to source b")
+        else {
+            panic!("lazy switched mapped item should resolve to text");
+        };
+        assert_eq!(text.text(), "alt");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.map.lazy_direct.source_a.push",
+                        None,
+                        "test list map lazy direct source a push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push {
+                        item: test_actor_handle("stale", 6),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let final_snapshot = block_on(result_list.snapshot());
+        assert_eq!(final_snapshot.len(), 1);
+        let Value::Text(text, _) = final_snapshot[0]
+            .1
+            .current_value()
+            .expect("stale old-list updates should be ignored")
+        else {
+            panic!("final lazy mapped item should resolve to text");
+        };
+        assert_eq!(text.text(), "alt");
+    }
+
+    #[test]
+    fn list_sort_by_lazy_direct_state_source_waits_with_one_scope_task_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_number_actor = |value: f64, label: &str| {
+            create_constant_actor(
+                PersistenceId::new(),
+                Number::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.sort_by.lazy_direct.{label}"),
+                        None,
+                        "test list sort_by lazy direct number",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.sort_by.lazy_direct.source_a",
+            None,
+            "test list sort_by lazy direct source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.sort_by.lazy_direct.source_b",
+            None,
+            "test list sort_by lazy direct source b",
+        )
+        .complete(super::ConstructType::List);
+        let source_a_high = make_number_actor(5.0, "source_a_high");
+        let source_a_low = make_number_actor(1.0, "source_a_low");
+        let source_b_high = make_number_actor(4.0, "source_b_high");
+        let source_b_low = make_number_actor(3.0, "source_b_low");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_a_high, source_a_low]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_b_high, source_b_low]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b.clone(),
+        ));
+        let (mut source_tx, source_rx) = mpsc::channel::<Value>(8);
+        let source_actor = super::create_actor_lazy(source_rx, PersistenceId::new(), scope_id);
+        let baseline_async_source_count =
+            REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let source_code = SourceCode::new("item".to_string());
+        let result_actor = super::ListBindingFunction::create_sort_by_actor(
+            ConstructInfo::new(
+                "test.list.sort_by.lazy_direct.result",
+                None,
+                "test list sort_by lazy direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor,
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Alias(
+                        static_expression::Alias::WithoutPassed {
+                            parts: vec![source_code.slice(0, 4)],
+                            referenced_span: None,
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::SortBy,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy direct-state List/sort_by should add one scope-owned watcher plus the first-demand lazy source task"
+            );
+        });
+
+        let snapshot_numbers = |actor: &ActorHandle| {
+            block_on(async {
+                let Value::List(list, _) = actor
+                    .current_value()
+                    .expect("sort_by actor should have list")
+                else {
+                    panic!("sort_by actor should resolve to a list");
+                };
+                list.snapshot()
+                    .await
+                    .into_iter()
+                    .map(|(_, item)| {
+                        let Value::Number(number, _) = item
+                            .current_value()
+                            .expect("sorted item should expose a current numeric value")
+                        else {
+                            panic!("sorted item should resolve to number");
+                        };
+                        number.number()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        source_tx
+            .try_send(Value::List(
+                source_list_a,
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            ))
+            .expect("source a should enqueue");
+        super::poll_test_async_source_tasks();
+        assert_eq!(snapshot_numbers(&result_actor), vec![1.0, 5.0]);
+
+        source_tx
+            .try_send(Value::List(
+                source_list_b,
+                ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+            ))
+            .expect("source b should enqueue");
+        super::poll_test_async_source_tasks();
+        assert_eq!(snapshot_numbers(&result_actor), vec![3.0, 4.0]);
+
+        let source_a_stale = make_number_actor(0.0, "source_a_stale");
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a,
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.sort_by.lazy_direct.source_a.stale_push",
+                        None,
+                        "test list sort_by lazy direct source a stale push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push {
+                        item: source_a_stale,
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        assert_eq!(snapshot_numbers(&result_actor), vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn list_retain_lazy_direct_state_source_waits_with_one_scope_task_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_number_actor = |value: f64, label: &str| {
+            create_constant_actor(
+                PersistenceId::new(),
+                Number::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.retain.lazy_direct.{label}"),
+                        None,
+                        "test list retain lazy direct number",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.retain.lazy_direct.source_a",
+            None,
+            "test list retain lazy direct source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.retain.lazy_direct.source_b",
+            None,
+            "test list retain lazy direct source b",
+        )
+        .complete(super::ConstructType::List);
+        let source_a_low = make_number_actor(1.0, "source_a_low");
+        let source_a_high = make_number_actor(5.0, "source_a_high");
+        let source_b_high = make_number_actor(4.0, "source_b_high");
+        let source_b_mid = make_number_actor(3.0, "source_b_mid");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_a_low, source_a_high]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_b_high, source_b_mid]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b.clone(),
+        ));
+        let (mut source_tx, source_rx) = mpsc::channel::<Value>(8);
+        let source_actor = super::create_actor_lazy(source_rx, PersistenceId::new(), scope_id);
+        let baseline_async_source_count =
+            REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let source_code = SourceCode::new("item > 2".to_string());
+        let result_actor = super::ListBindingFunction::create_retain_actor(
+            ConstructInfo::new(
+                "test.list.retain.lazy_direct.result",
+                None,
+                "test list retain lazy direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor,
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Comparator(
+                        static_expression::Comparator::Greater {
+                            operand_a: Box::new(static_expression::Spanned {
+                                span: (0..4).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Alias(
+                                    static_expression::Alias::WithoutPassed {
+                                        parts: vec![source_code.slice(0, 4)],
+                                        referenced_span: None,
+                                    },
+                                ),
+                            }),
+                            operand_b: Box::new(static_expression::Spanned {
+                                span: (7..8).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Literal(
+                                    static_expression::Literal::Number(2.0),
+                                ),
+                            }),
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::Retain,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy direct-state List/retain should add one scope-owned watcher plus the first-demand lazy source task"
+            );
+        });
+
+        let snapshot_numbers = |actor: &ActorHandle| {
+            block_on(async {
+                let Value::List(list, _) = actor
+                    .current_value()
+                    .expect("retain actor should have list")
+                else {
+                    panic!("retain actor should resolve to a list");
+                };
+                list.snapshot()
+                    .await
+                    .into_iter()
+                    .map(|(_, item)| {
+                        let Value::Number(number, _) = item
+                            .current_value()
+                            .expect("retained item should expose a current numeric value")
+                        else {
+                            panic!("retained item should resolve to number");
+                        };
+                        number.number()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        source_tx
+            .try_send(Value::List(
+                source_list_a,
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            ))
+            .expect("source a should enqueue");
+        super::poll_test_async_source_tasks();
+        assert_eq!(snapshot_numbers(&result_actor), vec![5.0]);
+
+        source_tx
+            .try_send(Value::List(
+                source_list_b,
+                ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+            ))
+            .expect("source b should enqueue");
+        super::poll_test_async_source_tasks();
+        assert_eq!(snapshot_numbers(&result_actor), vec![4.0, 3.0]);
+
+        let source_a_stale = make_number_actor(10.0, "source_a_stale");
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a,
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.retain.lazy_direct.source_a.stale_push",
+                        None,
+                        "test list retain lazy direct source a stale push",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Push {
+                        item: source_a_stale,
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        assert_eq!(snapshot_numbers(&result_actor), vec![4.0, 3.0]);
+    }
+
+    #[test]
+    fn list_remove_lazy_direct_state_source_waits_with_one_scope_task_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_trigger_item = |label: &str, trigger_actor: ActorHandle| {
+            create_constant_actor(
+                PersistenceId::new(),
+                super::Object::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.remove.lazy_direct.{label}.object"),
+                        None,
+                        "test list remove lazy direct object",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    [Variable::new_arc(
+                        ConstructInfo::new(
+                            format!("test.list.remove.lazy_direct.{label}.trigger"),
+                            None,
+                            "test list remove lazy direct trigger variable",
+                        ),
+                        "trigger",
+                        trigger_actor,
+                        PersistenceId::new(),
+                        actor_scope.clone(),
+                    )],
+                ),
+                scope_id,
+            )
+        };
+
+        let stale_trigger = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let fresh_trigger = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let stale_item = make_trigger_item("stale_item", stale_trigger.clone());
+        let fresh_item = make_trigger_item("fresh_item", fresh_trigger);
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.remove.lazy_direct.source_a",
+            None,
+            "test list remove lazy direct source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.remove.lazy_direct.source_b",
+            None,
+            "test list remove lazy direct source b",
+        )
+        .complete(super::ConstructType::List);
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![stale_item.clone()]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![fresh_item.clone()]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b,
+        ));
+        let (mut source_tx, source_rx) = mpsc::channel::<Value>(8);
+        let source_actor = super::create_actor_lazy(source_rx, PersistenceId::new(), scope_id);
+        let baseline_async_source_count =
+            REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let source_code = SourceCode::new("item.trigger".to_string());
+        let result_actor = super::ListBindingFunction::create_remove_actor(
+            ConstructInfo::new(
+                "test.list.remove.lazy_direct.result",
+                None,
+                "test list remove lazy direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor,
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::PostfixFieldAccess {
+                        expr: Box::new(static_expression::Spanned {
+                            span: (0..4).into(),
+                            persistence: None,
+                            node: static_expression::Expression::Alias(
+                                static_expression::Alias::WithoutPassed {
+                                    parts: vec![source_code.slice(0, 4)],
+                                    referenced_span: None,
+                                },
+                            ),
+                        }),
+                        field: source_code.slice(5, 12),
+                    },
+                },
+                operation: super::ListBindingOperation::Remove,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+            None,
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy direct-state List/remove should add one scope-owned watcher plus the first-demand lazy source task"
+            );
+        });
+
+        let Value::List(result_list, _) = result_actor
+            .current_value()
+            .expect("remove actor should expose its result list immediately")
+        else {
+            panic!("remove actor should resolve to a list");
+        };
+        assert!(result_list.snapshot_now().is_none());
+
+        let snapshot_pids = |list: &Arc<super::List>| {
+            block_on(async {
+                list.snapshot()
+                    .await
+                    .into_iter()
+                    .map(|(_, item)| item.persistence_id())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        source_tx
+            .try_send(Value::List(
+                source_list_a,
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            ))
+            .expect("source a should enqueue");
+        super::poll_test_async_source_tasks();
+        assert_eq!(
+            snapshot_pids(&result_list),
+            vec![stale_item.persistence_id()]
+        );
+
+        source_tx
+            .try_send(Value::List(
+                source_list_b,
+                ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+            ))
+            .expect("source b should enqueue");
+        super::poll_test_async_source_tasks();
+        assert_eq!(
+            snapshot_pids(&result_list),
+            vec![fresh_item.persistence_id()]
+        );
+
+        stale_trigger.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.remove.lazy_direct.stale_trigger.fire",
+                None,
+                "test list remove lazy direct stale trigger fire",
+            ),
+            construct_context,
+            PersistenceId::new(),
+            "fire",
+        ));
+        assert_eq!(
+            snapshot_pids(&result_list),
+            vec![fresh_item.persistence_id()]
+        );
+    }
+
+    #[test]
+    fn list_any_late_direct_state_source_waits_without_async_source_task_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_number_actor = |value: f64, label: &str| {
+            create_constant_actor(
+                PersistenceId::new(),
+                Number::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.any.late_direct.{label}"),
+                        None,
+                        "test list any late direct number",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.any.late_direct.source_a",
+            None,
+            "test list any late direct source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.any.late_direct.source_b",
+            None,
+            "test list any late direct source b",
+        )
+        .complete(super::ConstructType::List);
+        let source_a_low = make_number_actor(1.0, "source_a_low");
+        let source_a_high = make_number_actor(5.0, "source_a_high");
+        let source_b_low = make_number_actor(1.0, "source_b_low");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_a_low, source_a_high]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_b_low]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b.clone(),
+        ));
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let source_code = SourceCode::new("item > 2".to_string());
+        let result_actor = super::ListBindingFunction::create_every_any_actor(
+            ConstructInfo::new(
+                "test.list.any.late_direct.result",
+                None,
+                "test list any late direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor.clone(),
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Comparator(
+                        static_expression::Comparator::Greater {
+                            operand_a: Box::new(static_expression::Spanned {
+                                span: (0..4).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Alias(
+                                    static_expression::Alias::WithoutPassed {
+                                        parts: vec![source_code.slice(0, 4)],
+                                        referenced_span: None,
+                                    },
+                                ),
+                            }),
+                            operand_b: Box::new(static_expression::Spanned {
+                                span: (7..8).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Literal(
+                                    static_expression::Literal::Number(2.0),
+                                ),
+                            }),
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::Any,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+            false,
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "late direct-state List/any should stay on runtime subscribers without async source tasks"
+            );
+        });
+
+        assert!(matches!(
+            result_actor.current_value(),
+            Err(super::CurrentValueError::NoValueYet)
+        ));
+
+        source_actor.store_value_directly(Value::List(
+            source_list_a,
+            ValueMetadata::new(ValueIdempotencyKey::new()),
+        ));
+        let Value::Tag(tag, _) = result_actor.current_value().expect(
+            "late direct-state any actor should expose a resolved result after source arrival",
+        ) else {
+            panic!("any actor should resolve to a tag");
+        };
+        assert_eq!(tag.tag(), "True");
+
+        source_actor.store_value_directly(Value::List(
+            source_list_b,
+            ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+        ));
+        let Value::Tag(tag, _) = result_actor
+            .current_value()
+            .expect("late direct-state any actor should switch with the source list")
+        else {
+            panic!("any actor should stay a tag");
+        };
+        assert_eq!(tag.tag(), "False");
+
+        let stale_old = make_number_actor(10.0, "stale_old");
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a,
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.any.late_direct.source_a.stale_replace",
+                        None,
+                        "test list any late direct source a stale replace",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![stale_old]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+        let Value::Tag(tag, _) = result_actor
+            .current_value()
+            .expect("stale updates should not replace the active any result")
+        else {
+            panic!("any actor should stay a tag after stale updates");
+        };
+        assert_eq!(tag.tag(), "False");
+    }
+
+    #[test]
+    fn list_any_lazy_direct_state_source_waits_with_one_scope_task_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_number_actor = |value: f64, label: &str| {
+            create_constant_actor(
+                PersistenceId::new(),
+                Number::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.any.lazy_direct.{label}"),
+                        None,
+                        "test list any lazy direct number",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.any.lazy_direct.source_a",
+            None,
+            "test list any lazy direct source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.any.lazy_direct.source_b",
+            None,
+            "test list any lazy direct source b",
+        )
+        .complete(super::ConstructType::List);
+        let source_a_low = make_number_actor(1.0, "source_a_low");
+        let source_a_high = make_number_actor(5.0, "source_a_high");
+        let source_b_low = make_number_actor(1.0, "source_b_low");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_a_low, source_a_high]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_b_low]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b.clone(),
+        ));
+        let (mut source_tx, source_rx) = mpsc::channel::<Value>(8);
+        let source_actor = super::create_actor_lazy(source_rx, PersistenceId::new(), scope_id);
+        let baseline_async_source_count =
+            REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let source_code = SourceCode::new("item > 2".to_string());
+        let result_actor = super::ListBindingFunction::create_every_any_actor(
+            ConstructInfo::new(
+                "test.list.any.lazy_direct.result",
+                None,
+                "test list any lazy direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor,
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Comparator(
+                        static_expression::Comparator::Greater {
+                            operand_a: Box::new(static_expression::Spanned {
+                                span: (0..4).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Alias(
+                                    static_expression::Alias::WithoutPassed {
+                                        parts: vec![source_code.slice(0, 4)],
+                                        referenced_span: None,
+                                    },
+                                ),
+                            }),
+                            operand_b: Box::new(static_expression::Spanned {
+                                span: (7..8).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Literal(
+                                    static_expression::Literal::Number(2.0),
+                                ),
+                            }),
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::Any,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+            false,
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy direct-state List/any should add one scope-owned watcher plus the first-demand lazy source task"
+            );
+        });
+
+        assert!(matches!(
+            result_actor.current_value(),
+            Err(super::CurrentValueError::NoValueYet)
+        ));
+
+        source_tx
+            .try_send(Value::List(
+                source_list_a,
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            ))
+            .expect("source a should enqueue");
+        super::poll_test_async_source_tasks();
+        let Value::Tag(tag, _) = result_actor
+            .current_value()
+            .expect("lazy any actor should resolve after source a arrives")
+        else {
+            panic!("lazy any actor should resolve to a tag");
+        };
+        assert_eq!(tag.tag(), "True");
+
+        source_tx
+            .try_send(Value::List(
+                source_list_b,
+                ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+            ))
+            .expect("source b should enqueue");
+        super::poll_test_async_source_tasks();
+        let Value::Tag(tag, _) = result_actor
+            .current_value()
+            .expect("lazy any actor should switch with source b")
+        else {
+            panic!("lazy any actor should stay a tag");
+        };
+        assert_eq!(tag.tag(), "False");
+
+        let stale_old = make_number_actor(10.0, "stale_old");
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a,
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.any.lazy_direct.source_a.stale_replace",
+                        None,
+                        "test list any lazy direct source a stale replace",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![stale_old]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+        let Value::Tag(tag, _) = result_actor
+            .current_value()
+            .expect("stale updates should not replace the active lazy any result")
+        else {
+            panic!("lazy any actor should stay a tag after stale updates");
+        };
+        assert_eq!(tag.tag(), "False");
+    }
+
+    #[test]
+    fn list_every_lazy_direct_state_source_waits_with_one_scope_task_and_ignores_stale_old_list_updates()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let make_number_actor = |value: f64, label: &str| {
+            create_constant_actor(
+                PersistenceId::new(),
+                Number::new_value(
+                    ConstructInfo::new(
+                        format!("test.list.every.lazy_direct.{label}"),
+                        None,
+                        "test list every lazy direct number",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    value,
+                ),
+                scope_id,
+            )
+        };
+
+        let source_state_a = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_state_b = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let source_construct_info_a = ConstructInfo::new(
+            "test.list.every.lazy_direct.source_a",
+            None,
+            "test list every lazy direct source a",
+        )
+        .complete(super::ConstructType::List);
+        let source_construct_info_b = ConstructInfo::new(
+            "test.list.every.lazy_direct.source_b",
+            None,
+            "test list every lazy direct source b",
+        )
+        .complete(super::ConstructType::List);
+        let source_a_low = make_number_actor(1.0, "source_a_low");
+        let source_a_high = make_number_actor(5.0, "source_a_high");
+        let source_b_high = make_number_actor(4.0, "source_b_high");
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_a.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_a_low, source_a_high]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.enqueue_list_runtime_work(
+                source_state_b.clone(),
+                super::ListRuntimeWork::Change {
+                    construct_info: source_construct_info_b.clone(),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![source_b_high]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        let source_list_a = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_a,
+            scope_id,
+            source_state_a.clone(),
+        ));
+        let source_list_b = Arc::new(super::List::new_with_stored_state(
+            source_construct_info_b,
+            scope_id,
+            source_state_b.clone(),
+        ));
+        let (mut source_tx, source_rx) = mpsc::channel::<Value>(8);
+        let source_actor = super::create_actor_lazy(source_rx, PersistenceId::new(), scope_id);
+        let baseline_async_source_count =
+            REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        let source_code = SourceCode::new("item > 2".to_string());
+        let result_actor = super::ListBindingFunction::create_every_any_actor(
+            ConstructInfo::new(
+                "test.list.every.lazy_direct.result",
+                None,
+                "test list every lazy direct result",
+            )
+            .complete(super::ConstructType::List),
+            construct_context.clone(),
+            actor_context,
+            source_actor,
+            Arc::new(super::ListBindingConfig {
+                binding_name: source_code.slice(0, 4),
+                transform_expr: static_expression::Spanned {
+                    span: span_at(source_code.len()),
+                    persistence: None,
+                    node: static_expression::Expression::Comparator(
+                        static_expression::Comparator::Greater {
+                            operand_a: Box::new(static_expression::Spanned {
+                                span: (0..4).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Alias(
+                                    static_expression::Alias::WithoutPassed {
+                                        parts: vec![source_code.slice(0, 4)],
+                                        referenced_span: None,
+                                    },
+                                ),
+                            }),
+                            operand_b: Box::new(static_expression::Spanned {
+                                span: (7..8).into(),
+                                persistence: None,
+                                node: static_expression::Expression::Literal(
+                                    static_expression::Literal::Number(2.0),
+                                ),
+                            }),
+                        },
+                    ),
+                },
+                operation: super::ListBindingOperation::Every,
+                reference_connector: Arc::new(super::ReferenceConnector::new()),
+                link_connector: Arc::new(super::LinkConnector::new()),
+                source_code,
+                function_registry_snapshot: None,
+            }),
+            true,
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy direct-state List/every should add one scope-owned watcher plus the first-demand lazy source task"
+            );
+        });
+
+        assert!(matches!(
+            result_actor.current_value(),
+            Err(super::CurrentValueError::NoValueYet)
+        ));
+
+        source_tx
+            .try_send(Value::List(
+                source_list_a,
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            ))
+            .expect("source a should enqueue");
+        super::poll_test_async_source_tasks();
+        let Value::Tag(tag, _) = result_actor
+            .current_value()
+            .expect("lazy every actor should resolve after source a arrives")
+        else {
+            panic!("lazy every actor should resolve to a tag");
+        };
+        assert_eq!(tag.tag(), "False");
+
+        source_tx
+            .try_send(Value::List(
+                source_list_b,
+                ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 5),
+            ))
+            .expect("source b should enqueue");
+        super::poll_test_async_source_tasks();
+        let Value::Tag(tag, _) = result_actor
+            .current_value()
+            .expect("lazy every actor should switch with source b")
+        else {
+            panic!("lazy every actor should stay a tag");
+        };
+        assert_eq!(tag.tag(), "True");
+
+        let stale_old = make_number_actor(10.0, "stale_old");
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                source_state_a,
+                super::ListRuntimeWork::Change {
+                    construct_info: ConstructInfo::new(
+                        "test.list.every.lazy_direct.source_a.stale_replace",
+                        None,
+                        "test list every lazy direct source a stale replace",
+                    )
+                    .complete(super::ConstructType::List),
+                    change: ListChange::Replace {
+                        items: Arc::from(vec![stale_old]),
+                    },
+                    broadcast_change: true,
+                },
+            );
+            reg.drain_runtime_ready_queue();
+        });
+        let Value::Tag(tag, _) = result_actor
+            .current_value()
+            .expect("stale updates should not replace the active lazy every result")
+        else {
+            panic!("lazy every actor should stay a tag after stale updates");
+        };
+        assert_eq!(tag.tag(), "True");
     }
 
     #[test]
@@ -10492,6 +20287,84 @@ mod tests {
     }
 
     #[test]
+    fn reference_connector_waiting_actor_uses_runtime_forwarding_without_async_source_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let connector = Arc::new(super::ReferenceConnector::new());
+        let span = span_at(9);
+
+        let waiting_actor = connector.referenceable_or_waiting_actor(span, scope_id);
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "connector-owned waiting actor should not allocate an async source task"
+            );
+        });
+
+        assert!(
+            waiting_actor.current_value().is_err(),
+            "waiting actor should have no current value before the reference is registered"
+        );
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.reference_connector.waiting_actor.initial",
+                None,
+                "test reference connector waiting actor initial",
+            ),
+            ConstructContext {
+                construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(
+                    std::collections::BTreeMap::new(),
+                )),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            ValueIdempotencyKey::new(),
+            "referenceable",
+        ));
+        connector.register_referenceable(span, source_actor.clone());
+
+        let Value::Text(text, _) = waiting_actor
+            .current_value()
+            .expect("waiting actor should expose the registered referenceable actor")
+        else {
+            panic!("expected text actor from connector waiting actor");
+        };
+        assert_eq!(text.text(), "referenceable");
+
+        source_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.reference_connector.waiting_actor.update",
+                None,
+                "test reference connector waiting actor update",
+            ),
+            ConstructContext {
+                construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(
+                    std::collections::BTreeMap::new(),
+                )),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            ValueIdempotencyKey::new(),
+            "updated",
+        ));
+
+        let Value::Text(text, _) = waiting_actor
+            .current_value()
+            .expect("waiting actor should follow later source updates")
+        else {
+            panic!("expected text actor after source update");
+        };
+        assert_eq!(text.text(), "updated");
+    }
+
+    #[test]
     fn link_connector_waiter_resolves_from_direct_state() {
         let connector = Arc::new(super::LinkConnector::new());
         let span = span_at(11);
@@ -10566,10 +20439,29 @@ mod tests {
         let active = std::cell::Cell::new(true);
         let impulse_senders =
             std::cell::RefCell::new(smallvec::SmallVec::<[mpsc::Sender<()>; 4]>::new());
+        let direct_subscribers = std::cell::RefCell::new(smallvec::SmallVec::<
+            [super::OutputValveDirectSubscriber; 4],
+        >::new());
+        let direct_impulses = Rc::new(std::cell::Cell::new(0usize));
+        super::register_output_valve_direct_subscriber(
+            &active,
+            &direct_subscribers,
+            Rc::new({
+                let direct_impulses = direct_impulses.clone();
+                move |_event| {
+                    direct_impulses.set(direct_impulses.get() + 1);
+                    true
+                }
+            }),
+        );
         let mut first = super::subscribe_output_valve_impulses(&active, &impulse_senders);
         let mut second = super::subscribe_output_valve_impulses(&active, &impulse_senders);
 
         super::broadcast_output_valve_impulse(&impulse_senders);
+        super::broadcast_output_valve_direct_subscribers(
+            &direct_subscribers,
+            super::OutputValveDirectEvent::Impulse,
+        );
 
         block_on(async {
             assert_eq!(
@@ -10583,8 +20475,13 @@ mod tests {
                 "second subscriber should receive the broadcast impulse"
             );
         });
+        assert_eq!(
+            direct_impulses.get(),
+            1,
+            "direct subscribers should receive impulse broadcasts too"
+        );
 
-        super::close_output_valve_subscribers(&active, &impulse_senders);
+        super::close_output_valve_subscribers(&active, &impulse_senders, &direct_subscribers);
 
         block_on(async {
             assert_eq!(
@@ -10614,58 +20511,6 @@ mod tests {
 
         let missing: Option<String> = block_on(storage.load_state(PersistenceId::new()));
         assert_eq!(missing, None);
-    }
-
-    #[test]
-    fn pass_through_connector_uses_direct_state_without_sidecar_task() {
-        let connector = super::PassThroughConnector::new();
-        let key = super::PassThroughKey {
-            persistence_id: PersistenceId::new(),
-            scope: Scope::Nested("test.pass_through.scope".to_owned()),
-        };
-        let actor = test_actor_handle("pass-through", 5);
-        let forwarder = test_actor_handle("forwarder", 6);
-        let (sender, mut receiver) = mpsc::channel::<Value>(1);
-
-        connector.register(key.clone(), sender, actor.clone());
-        connector.add_forwarder(key.clone(), forwarder);
-
-        let stored_actor = block_on(connector.get(key.clone()))
-            .expect("registered pass-through actor should be retrievable");
-        assert_eq!(stored_actor.actor_id(), actor.actor_id());
-
-        let stored_sender = block_on(connector.get_sender(key.clone()))
-            .expect("registered pass-through sender should be retrievable");
-        let value = Value::Text(
-            Arc::new(Text {
-                construct_info: ConstructInfo::new(
-                    "test.pass_through.value",
-                    None,
-                    "test pass-through value",
-                )
-                .complete(super::ConstructType::Text),
-                text: Cow::Borrowed("forwarded"),
-            }),
-            super::ValueMetadata::with_emission_seq(ValueIdempotencyKey::new(), 7),
-        );
-        connector.forward(key, value.clone());
-
-        block_on(async move {
-            let Value::Text(text, _) = receiver
-                .next()
-                .await
-                .expect("pass-through forward should publish into stored sender")
-            else {
-                panic!("expected forwarded text value");
-            };
-            assert_eq!(text.text(), "forwarded");
-
-            stored_sender
-                .clone()
-                .send(value)
-                .await
-                .expect("retrieved sender should remain usable");
-        });
     }
 
     #[test]
@@ -10827,12 +20672,9 @@ mod tests {
 
         REGISTRY.with(|reg| {
             let reg = reg.borrow();
-            let owned_actor = reg
-                .get_actor(result_actor.actor_id)
-                .expect("streaming alias actor should be registered");
             assert!(
-                owned_actor.retained_tasks.is_empty(),
-                "ready streaming alias root should not retain a wrapper task"
+                reg.async_source_count_for_scope(scope_id) == 0,
+                "ready streaming alias root should not retain a wrapper task on the owning scope"
             );
         });
 
@@ -10843,6 +20685,1427 @@ mod tests {
             panic!("streaming alias should resolve to text");
         };
         assert_eq!(text.text(), "ready");
+    }
+
+    #[test]
+    fn streaming_alias_reference_constant_root_field_reuses_nested_actor_without_wrapper_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let field_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        field_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.constant_root_field.initial",
+                None,
+                "test streaming alias constant root field initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            51,
+            "ready",
+        ));
+        let root_actor = create_constant_actor(
+            PersistenceId::new(),
+            super::Object::new_value(
+                ConstructInfo::new(
+                    "test.streaming_alias.constant_root.object",
+                    None,
+                    "test streaming alias constant root object",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        "test.streaming_alias.constant_root.variable",
+                        None,
+                        "test streaming alias constant root variable",
+                    ),
+                    "field",
+                    field_actor.clone(),
+                    PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            ),
+            scope_id,
+        );
+
+        let alias_source = SourceCode::new("root field".to_string());
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![alias_source.slice(0, 4), alias_source.slice(5, 10)],
+            referenced_span: None,
+        };
+        let result_actor = super::VariableOrArgumentReference::new_arc_value_actor(
+            actor_context,
+            alias,
+            async move { root_actor },
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "constant-root field aliases should reuse the nested actor instead of spawning a wrapper task"
+            );
+        });
+
+        assert_eq!(
+            result_actor.actor_id(),
+            field_actor.actor_id(),
+            "constant-root field aliases should reuse the nested field actor handle"
+        );
+
+        field_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.constant_root_field.update",
+                None,
+                "test streaming alias constant root field update",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            52,
+            "updated",
+        ));
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("constant-root field alias should expose updated nested actor value")
+        else {
+            panic!("constant-root field alias should resolve to text");
+        };
+        assert_eq!(text.text(), "updated");
+    }
+
+    #[test]
+    fn streaming_alias_reference_constant_nested_field_reuses_leaf_actor_without_wrapper_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let leaf_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        leaf_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.constant_nested_field.leaf.initial",
+                None,
+                "test streaming alias constant nested field leaf initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            71,
+            "alpha",
+        ));
+
+        let child_actor = create_constant_actor(
+            PersistenceId::new(),
+            super::Object::new_value(
+                ConstructInfo::new(
+                    "test.streaming_alias.constant_nested_field.child.object",
+                    None,
+                    "test streaming alias constant nested field child object",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        "test.streaming_alias.constant_nested_field.child.variable",
+                        None,
+                        "test streaming alias constant nested field child variable",
+                    ),
+                    "leaf",
+                    leaf_actor.clone(),
+                    PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            ),
+            scope_id,
+        );
+
+        let root_actor = create_constant_actor(
+            PersistenceId::new(),
+            super::Object::new_value(
+                ConstructInfo::new(
+                    "test.streaming_alias.constant_nested_field.root.object",
+                    None,
+                    "test streaming alias constant nested field root object",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        "test.streaming_alias.constant_nested_field.root.variable",
+                        None,
+                        "test streaming alias constant nested field root variable",
+                    ),
+                    "child",
+                    child_actor,
+                    PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            ),
+            scope_id,
+        );
+
+        let alias_source = SourceCode::new("root child leaf".to_string());
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![
+                alias_source.slice(0, 4),
+                alias_source.slice(5, 10),
+                alias_source.slice(11, 15),
+            ],
+            referenced_span: None,
+        };
+        let result_actor = super::VariableOrArgumentReference::new_arc_value_actor(
+            actor_context,
+            alias,
+            async move { root_actor },
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "constant nested field aliases should reuse the leaf actor instead of spawning a wrapper task"
+            );
+        });
+
+        assert_eq!(
+            result_actor.actor_id(),
+            leaf_actor.actor_id(),
+            "constant nested field aliases should reuse the final leaf actor handle"
+        );
+
+        leaf_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.constant_nested_field.leaf.update",
+                None,
+                "test streaming alias constant nested field leaf update",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            72,
+            "updated",
+        ));
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("constant nested field alias should expose updated leaf actor value")
+        else {
+            panic!("constant nested field alias should resolve to text");
+        };
+        assert_eq!(text.text(), "updated");
+    }
+
+    #[test]
+    fn streaming_alias_reference_direct_root_reuses_actor_without_wrapper_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let root_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        root_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.direct_root.initial",
+                None,
+                "test streaming alias direct root initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            41,
+            "ready",
+        ));
+
+        let alias_source = SourceCode::new("root".to_string());
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![alias_source.slice(0, 4)],
+            referenced_span: None,
+        };
+        let root_actor_for_future = root_actor.clone();
+        let result_actor = super::VariableOrArgumentReference::new_arc_value_actor(
+            actor_context,
+            alias,
+            async move { root_actor_for_future },
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "plain streaming alias roots should reuse the source actor instead of spawning a wrapper task"
+            );
+        });
+
+        assert_eq!(
+            result_actor.actor_id(),
+            root_actor.actor_id(),
+            "plain streaming alias roots should reuse the original actor handle"
+        );
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("streaming alias direct root should expose current value immediately")
+        else {
+            panic!("streaming alias direct root should resolve to text");
+        };
+        assert_eq!(text.text(), "ready");
+
+        root_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.direct_root.update",
+                None,
+                "test streaming alias direct root update",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            42,
+            "updated",
+        ));
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("reused alias root should see later direct-state updates")
+        else {
+            panic!("streaming alias direct root should stay text");
+        };
+        assert_eq!(text.text(), "updated");
+    }
+
+    #[test]
+    fn streaming_alias_reference_ready_root_field_uses_runtime_subscribers_without_wrapper_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let field_actor_a = create_actor_forwarding(PersistenceId::new(), scope_id);
+        field_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.ready_root_field.a.initial",
+                None,
+                "test streaming alias ready root field a initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            61,
+            "alpha",
+        ));
+        let field_actor_b = create_actor_forwarding(PersistenceId::new(), scope_id);
+        field_actor_b.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.ready_root_field.b.initial",
+                None,
+                "test streaming alias ready root field b initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            62,
+            "beta",
+        ));
+        let root_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let make_object = |field_actor: ActorHandle, construct_suffix: &str| {
+            super::Object::new_value(
+                ConstructInfo::new(
+                    format!("test.streaming_alias.ready_root_field.object.{construct_suffix}"),
+                    None,
+                    "test streaming alias ready root field object",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        format!(
+                            "test.streaming_alias.ready_root_field.variable.{construct_suffix}"
+                        ),
+                        None,
+                        "test streaming alias ready root field variable",
+                    ),
+                    "field",
+                    field_actor,
+                    PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            )
+        };
+        root_actor.store_value_directly(make_object(field_actor_a.clone(), "a"));
+
+        let alias_source = SourceCode::new("root field".to_string());
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![alias_source.slice(0, 4), alias_source.slice(5, 10)],
+            referenced_span: None,
+        };
+        let root_actor_for_future = root_actor.clone();
+        let result_actor = super::VariableOrArgumentReference::new_arc_value_actor(
+            actor_context.clone(),
+            alias,
+            async move { root_actor_for_future },
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "ready direct-state root field aliases should use runtime subscribers instead of a wrapper task"
+            );
+        });
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("root field alias should expose the current nested field value")
+        else {
+            panic!("root field alias should resolve to text");
+        };
+        assert_eq!(text.text(), "alpha");
+
+        root_actor.store_value_directly(make_object(field_actor_b.clone(), "b"));
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("root field alias should switch to the latest nested field actor")
+        else {
+            panic!("root field alias should stay text after root switch");
+        };
+        assert_eq!(text.text(), "beta");
+
+        field_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.ready_root_field.a.stale_update",
+                None,
+                "test streaming alias ready root field a stale update",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            63,
+            "stale",
+        ));
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("stale nested field updates should be ignored after root switch")
+        else {
+            panic!("root field alias should stay text after stale nested update");
+        };
+        assert_eq!(text.text(), "beta");
+
+        field_actor_b.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.ready_root_field.b.update",
+                None,
+                "test streaming alias ready root field b update",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            64,
+            "gamma",
+        ));
+        let Value::Text(text, _) = result_actor.current_value().expect(
+            "latest nested field updates should still flow through the runtime subscriber path",
+        ) else {
+            panic!("root field alias should stay text after current nested update");
+        };
+        assert_eq!(text.text(), "gamma");
+    }
+
+    #[test]
+    fn streaming_alias_reference_ready_root_field_clears_when_field_disappears() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let field_actor_a = create_actor_forwarding(PersistenceId::new(), scope_id);
+        field_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.field_clear.a.initial",
+                None,
+                "test streaming alias field clear a initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            91,
+            "alpha",
+        ));
+        let field_actor_b = create_actor_forwarding(PersistenceId::new(), scope_id);
+        field_actor_b.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.field_clear.b.initial",
+                None,
+                "test streaming alias field clear b initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            92,
+            "beta",
+        ));
+        let unrelated_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        unrelated_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.field_clear.other.initial",
+                None,
+                "test streaming alias field clear other initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            93,
+            "other",
+        ));
+        let root_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let make_object = |name: &str, actor: ActorHandle, suffix: &str| {
+            super::Object::new_value(
+                ConstructInfo::new(
+                    format!("test.streaming_alias.field_clear.object.{suffix}"),
+                    None,
+                    "test streaming alias field clear object",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        format!("test.streaming_alias.field_clear.variable.{suffix}"),
+                        None,
+                        "test streaming alias field clear variable",
+                    ),
+                    name.to_owned(),
+                    actor,
+                    PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            )
+        };
+
+        root_actor.store_value_directly(make_object("field", field_actor_a.clone(), "a"));
+
+        let alias_source = SourceCode::new("root field".to_string());
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![alias_source.slice(0, 4), alias_source.slice(5, 10)],
+            referenced_span: None,
+        };
+        let root_actor_for_future = root_actor.clone();
+        let result_actor = super::VariableOrArgumentReference::new_arc_value_actor(
+            actor_context.clone(),
+            alias,
+            async move { root_actor_for_future },
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "ready root field aliases should stay on runtime subscribers when the field later disappears"
+            );
+        });
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("field alias should expose the initial field value")
+        else {
+            panic!("field alias should resolve to text");
+        };
+        assert_eq!(text.text(), "alpha");
+
+        root_actor.store_value_directly(make_object("other", unrelated_actor.clone(), "missing"));
+
+        assert!(
+            matches!(
+                result_actor.current_value(),
+                Err(super::CurrentValueError::NoValueYet)
+            ),
+            "field alias should clear when the selected field disappears after a root switch"
+        );
+
+        field_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.field_clear.a.stale",
+                None,
+                "test streaming alias field clear a stale",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            94,
+            "stale",
+        ));
+        assert!(
+            matches!(
+                result_actor.current_value(),
+                Err(super::CurrentValueError::NoValueYet)
+            ),
+            "stale updates from the old field actor should not re-seed a cleared alias"
+        );
+
+        root_actor.store_value_directly(make_object("field", field_actor_b.clone(), "b"));
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("field alias should recover once the selected field exists again")
+        else {
+            panic!("field alias should resolve to text after recovery");
+        };
+        assert_eq!(text.text(), "beta");
+    }
+
+    #[test]
+    fn streaming_alias_reference_ready_root_nested_field_uses_runtime_subscribers_without_wrapper_task()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let actor_scope = actor_context.scope.clone();
+
+        let leaf_actor_a = create_actor_forwarding(PersistenceId::new(), scope_id);
+        leaf_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.ready_root_nested.leaf_a.initial",
+                None,
+                "test streaming alias ready root nested leaf a initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            71,
+            "alpha",
+        ));
+        let leaf_actor_b = create_actor_forwarding(PersistenceId::new(), scope_id);
+        leaf_actor_b.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.ready_root_nested.leaf_b.initial",
+                None,
+                "test streaming alias ready root nested leaf b initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            72,
+            "beta",
+        ));
+
+        let child_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let make_child_object = |leaf_actor: ActorHandle, suffix: &str| {
+            super::Object::new_value(
+                ConstructInfo::new(
+                    format!("test.streaming_alias.ready_root_nested.child.{suffix}"),
+                    None,
+                    "test streaming alias ready root nested child",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        format!("test.streaming_alias.ready_root_nested.child_var.{suffix}"),
+                        None,
+                        "test streaming alias ready root nested child var",
+                    ),
+                    "leaf",
+                    leaf_actor,
+                    PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        child_actor.store_value_directly(make_child_object(leaf_actor_a.clone(), "a"));
+
+        let root_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let make_root_object = |child: ActorHandle, suffix: &str| {
+            super::Object::new_value(
+                ConstructInfo::new(
+                    format!("test.streaming_alias.ready_root_nested.root.{suffix}"),
+                    None,
+                    "test streaming alias ready root nested root",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        format!("test.streaming_alias.ready_root_nested.root_var.{suffix}"),
+                        None,
+                        "test streaming alias ready root nested root var",
+                    ),
+                    "child",
+                    child,
+                    PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        root_actor.store_value_directly(make_root_object(child_actor.clone(), "initial"));
+
+        let alias_source = SourceCode::new("root child leaf".to_string());
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![
+                alias_source.slice(0, 4),
+                alias_source.slice(5, 10),
+                alias_source.slice(11, 15),
+            ],
+            referenced_span: None,
+        };
+        let root_actor_for_future = root_actor.clone();
+        let result_actor = super::VariableOrArgumentReference::new_arc_value_actor(
+            actor_context,
+            alias,
+            async move { root_actor_for_future },
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "ready nested field aliases should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("nested alias should expose initial nested field value")
+        else {
+            panic!("nested alias should resolve to text");
+        };
+        assert_eq!(text.text(), "alpha");
+
+        child_actor.store_value_directly(make_child_object(leaf_actor_b.clone(), "b"));
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("nested alias should switch when intermediate object changes")
+        else {
+            panic!("nested alias should stay text after intermediate switch");
+        };
+        assert_eq!(text.text(), "beta");
+
+        leaf_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.ready_root_nested.leaf_a.stale",
+                None,
+                "test streaming alias ready root nested leaf a stale",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            73,
+            "stale",
+        ));
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("stale leaf updates should be ignored after intermediate switch")
+        else {
+            panic!("nested alias should stay text after stale leaf update");
+        };
+        assert_eq!(text.text(), "beta");
+
+        leaf_actor_b.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.ready_root_nested.leaf_b.update",
+                None,
+                "test streaming alias ready root nested leaf b update",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            74,
+            "gamma",
+        ));
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("current nested leaf updates should still flow through the direct path")
+        else {
+            panic!("nested alias should stay text after current leaf update");
+        };
+        assert_eq!(text.text(), "gamma");
+    }
+
+    #[test]
+    fn streaming_alias_reference_late_root_field_switches_from_future_wait_to_runtime_subscribers()
+    {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let field_actor_a = create_actor_forwarding(PersistenceId::new(), scope_id);
+        field_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.late_root_field.a.initial",
+                None,
+                "test streaming alias late root field a initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            81,
+            "alpha",
+        ));
+        let field_actor_b = create_actor_forwarding(PersistenceId::new(), scope_id);
+        field_actor_b.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.late_root_field.b.initial",
+                None,
+                "test streaming alias late root field b initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            82,
+            "beta",
+        ));
+        let root_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let actor_scope = actor_context.scope.clone();
+        let make_object = |field_actor: ActorHandle, suffix: &str| {
+            super::Object::new_value(
+                ConstructInfo::new(
+                    format!("test.streaming_alias.late_root_field.object.{suffix}"),
+                    None,
+                    "test streaming alias late root field object",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        format!("test.streaming_alias.late_root_field.variable.{suffix}"),
+                        None,
+                        "test streaming alias late root field variable",
+                    ),
+                    "field",
+                    field_actor,
+                    PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+
+        let (root_tx, root_rx) = oneshot::channel::<ActorHandle>();
+        let alias_source = SourceCode::new("root field".to_string());
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![alias_source.slice(0, 4), alias_source.slice(5, 10)],
+            referenced_span: None,
+        };
+        let result_actor = super::VariableOrArgumentReference::new_arc_value_actor(
+            actor_context,
+            alias,
+            async move {
+                root_rx
+                    .await
+                    .expect("late-root alias should receive its root actor")
+            },
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                1,
+                "late-root field alias should retain only the one-shot root wait task while unresolved"
+            );
+        });
+
+        root_actor.store_value_directly(make_object(field_actor_a.clone(), "a"));
+        assert!(
+            root_tx.send(root_actor.clone()).is_ok(),
+            "late-root alias should still be awaiting the root actor"
+        );
+
+        let mut handoff_complete = false;
+        for _ in 0..20 {
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            super::poll_test_async_source_tasks();
+            let async_source_count =
+                REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+            let has_value = result_actor.current_value().is_ok();
+            if async_source_count == 0 && has_value {
+                handoff_complete = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            handoff_complete,
+            "late-root field aliases should switch from the root wait task to runtime subscribers after resolution"
+        );
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("late-root field alias should expose the resolved nested field value")
+        else {
+            panic!("late-root field alias should resolve to text");
+        };
+        assert_eq!(text.text(), "alpha");
+
+        root_actor.store_value_directly(make_object(field_actor_b.clone(), "b"));
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("late-root field alias should switch when the root changes after resolution")
+        else {
+            panic!("late-root field alias should stay text after root switch");
+        };
+        assert_eq!(text.text(), "beta");
+
+        field_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.late_root_field.a.stale",
+                None,
+                "test streaming alias late root field a stale",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            83,
+            "stale",
+        ));
+        let Value::Text(text, _) = result_actor.current_value().expect(
+            "late-root field alias should ignore stale old field updates after root switch",
+        ) else {
+            panic!("late-root field alias should stay text after stale field update");
+        };
+        assert_eq!(text.text(), "beta");
+
+        field_actor_b.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.late_root_field.b.update",
+                None,
+                "test streaming alias late root field b update",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            84,
+            "gamma",
+        ));
+        let Value::Text(text, _) = result_actor.current_value().expect(
+            "late-root field alias should keep following current nested field updates on the direct path",
+        ) else {
+            panic!("late-root field alias should stay text after current field update");
+        };
+        assert_eq!(text.text(), "gamma");
+    }
+
+    #[test]
+    fn streaming_alias_reference_lazy_root_field_uses_direct_alias_path_and_ignores_stale_old_field_updates()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..ActorContext::default()
+        };
+        let actor_scope = actor_context.scope.clone();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let leaf_actor_a = create_actor_forwarding(PersistenceId::new(), scope_id);
+        leaf_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.lazy_root_field.a.initial",
+                None,
+                "test streaming alias lazy root field a initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            401,
+            "alpha",
+        ));
+        let leaf_actor_b = create_actor_forwarding(PersistenceId::new(), scope_id);
+        leaf_actor_b.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.lazy_root_field.b.initial",
+                None,
+                "test streaming alias lazy root field b initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            402,
+            "beta",
+        ));
+
+        let (mut root_tx, root_rx) = mpsc::channel::<Value>(8);
+        let root_actor = super::create_actor_lazy(root_rx, PersistenceId::new(), scope_id);
+        let baseline_async_source_count =
+            REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+        let result_actor = super::create_field_path_alias_actor(
+            actor_context,
+            root_actor,
+            vec![String::from("child"), String::from("leaf")],
+        )
+        .expect("lazy-root field aliases should use the direct alias path");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy-root field aliases should add one scope-owned alias task plus the first-demand lazy root task"
+            );
+        });
+
+        let make_child_object = |leaf_actor: ActorHandle, suffix: &str| {
+            super::Object::new_value(
+                ConstructInfo::new(
+                    format!("test.streaming_alias.lazy_root_field.child.{suffix}"),
+                    None,
+                    "test streaming alias lazy root field child",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                [super::Variable::new_arc(
+                    ConstructInfo::new(
+                        format!("test.streaming_alias.lazy_root_field.child_var.{suffix}"),
+                        None,
+                        "test streaming alias lazy root field child var",
+                    ),
+                    "leaf",
+                    leaf_actor,
+                    PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        let make_root_object = |child_actor: ActorHandle, suffix: &str| {
+            super::Object::new_value(
+                ConstructInfo::new(
+                    format!("test.streaming_alias.lazy_root_field.root.{suffix}"),
+                    None,
+                    "test streaming alias lazy root field root",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                [super::Variable::new_arc(
+                    ConstructInfo::new(
+                        format!("test.streaming_alias.lazy_root_field.root_var.{suffix}"),
+                        None,
+                        "test streaming alias lazy root field root var",
+                    ),
+                    "child",
+                    child_actor,
+                    PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+
+        let child_actor_a = create_constant_actor(
+            PersistenceId::new(),
+            make_child_object(leaf_actor_a.clone(), "a"),
+            scope_id,
+        );
+        root_tx
+            .try_send(make_root_object(child_actor_a, "a"))
+            .expect("initial lazy root value should queue");
+
+        let mut initial_value_ready = false;
+        for _ in 0..20 {
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            super::poll_test_async_source_tasks();
+            if result_actor.current_value().is_ok() {
+                initial_value_ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            initial_value_ready,
+            "lazy-root field alias should resolve once the root lazy source emits"
+        );
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("lazy-root field alias should expose the initial nested field value")
+        else {
+            panic!("lazy-root field alias should resolve to text");
+        };
+        assert_eq!(text.text(), "alpha");
+
+        let child_actor_b = create_constant_actor(
+            PersistenceId::new(),
+            make_child_object(leaf_actor_b.clone(), "b"),
+            scope_id,
+        );
+        root_tx
+            .try_send(make_root_object(child_actor_b, "b"))
+            .expect("switched lazy root value should queue");
+
+        let mut switched_value_ready = false;
+        for _ in 0..20 {
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            super::poll_test_async_source_tasks();
+            let is_beta = matches!(
+                result_actor.current_value(),
+                Ok(Value::Text(ref text, _)) if text.text() == "beta"
+            );
+            if is_beta {
+                switched_value_ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            switched_value_ready,
+            "lazy-root field alias should switch when the root lazy source emits a new object"
+        );
+
+        leaf_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.lazy_root_field.a.stale",
+                None,
+                "test streaming alias lazy root field a stale",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            403,
+            "stale",
+        ));
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("lazy-root field alias should ignore stale old leaf updates")
+        else {
+            panic!("lazy-root field alias should stay text after stale leaf update");
+        };
+        assert_eq!(text.text(), "beta");
+
+        leaf_actor_b.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.lazy_root_field.b.update",
+                None,
+                "test streaming alias lazy root field b update",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            404,
+            "gamma",
+        ));
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("lazy-root field alias should keep following the current nested field")
+        else {
+            panic!("lazy-root field alias should stay text after current leaf update");
+        };
+        assert_eq!(text.text(), "gamma");
+    }
+
+    #[test]
+    fn streaming_alias_reference_ready_root_field_filters_stale_initial_leaf_value_without_wrapper_task()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            subscription_after_seq: Some(100),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let actor_scope = actor_context.scope.clone();
+
+        let field_actor_a = create_actor_forwarding(PersistenceId::new(), scope_id);
+        field_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.filtered_leaf.a.initial",
+                None,
+                "test streaming alias filtered leaf a initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            90,
+            "stale",
+        ));
+        let field_actor_b = create_actor_forwarding(PersistenceId::new(), scope_id);
+        field_actor_b.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.filtered_leaf.b.initial",
+                None,
+                "test streaming alias filtered leaf b initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            150,
+            "beta",
+        ));
+        let root_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let make_object = |field_actor: ActorHandle, suffix: &str| {
+            super::Object::new_value(
+                ConstructInfo::new(
+                    format!("test.streaming_alias.filtered_leaf.object.{suffix}"),
+                    None,
+                    "test streaming alias filtered leaf object",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        format!("test.streaming_alias.filtered_leaf.variable.{suffix}"),
+                        None,
+                        "test streaming alias filtered leaf variable",
+                    ),
+                    "field",
+                    field_actor,
+                    PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        root_actor.store_value_directly(make_object(field_actor_a.clone(), "a"));
+
+        let alias_source = SourceCode::new("root field".to_string());
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![alias_source.slice(0, 4), alias_source.slice(5, 10)],
+            referenced_span: None,
+        };
+        let root_actor_for_future = root_actor.clone();
+        let result_actor = super::VariableOrArgumentReference::new_arc_value_actor(
+            actor_context,
+            alias,
+            async move { root_actor_for_future },
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "filtered ready-root field aliases should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        assert!(
+            matches!(
+                result_actor.current_value(),
+                Err(super::CurrentValueError::NoValueYet)
+            ),
+            "stale initial nested field values at or before subscription_after_seq should be filtered"
+        );
+
+        field_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.filtered_leaf.a.update",
+                None,
+                "test streaming alias filtered leaf a update",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            110,
+            "alpha",
+        ));
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("fresh nested field updates should seed the filtered direct alias")
+        else {
+            panic!("filtered direct alias should resolve to text after a fresh leaf update");
+        };
+        assert_eq!(text.text(), "alpha");
+
+        root_actor.store_value_directly(make_object(field_actor_b.clone(), "b"));
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("filtered direct alias should switch to a fresh nested field on root change")
+        else {
+            panic!("filtered direct alias should stay text after root switch");
+        };
+        assert_eq!(text.text(), "beta");
+
+        field_actor_a.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.filtered_leaf.a.stale_after_switch",
+                None,
+                "test streaming alias filtered leaf a stale after switch",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            160,
+            "stale",
+        ));
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("old nested field updates should stay disconnected after root switch")
+        else {
+            panic!("filtered direct alias should stay text after stale old-field update");
+        };
+        assert_eq!(text.text(), "beta");
+    }
+
+    #[test]
+    fn streaming_alias_reference_ready_root_nested_field_filters_stale_intermediate_value_without_wrapper_task()
+     {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            subscription_after_seq: Some(100),
+            ..ActorContext::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new())),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let actor_scope = actor_context.scope.clone();
+
+        let leaf_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        leaf_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.streaming_alias.filtered_nested.leaf.initial",
+                None,
+                "test streaming alias filtered nested leaf initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            200,
+            "leaf",
+        ));
+
+        let child_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let make_child_object = |suffix: &str, emission_seq: u64| {
+            super::Object::new_value_with_emission_seq(
+                ConstructInfo::new(
+                    format!("test.streaming_alias.filtered_nested.child.{suffix}"),
+                    None,
+                    "test streaming alias filtered nested child",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                emission_seq,
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        format!("test.streaming_alias.filtered_nested.child_var.{suffix}"),
+                        None,
+                        "test streaming alias filtered nested child var",
+                    ),
+                    "leaf",
+                    leaf_actor.clone(),
+                    PersistenceId::new(),
+                    actor_scope.clone(),
+                )],
+            )
+        };
+        child_actor.store_value_directly(make_child_object("initial", 90));
+
+        let root_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        root_actor.store_value_directly(super::Object::new_value(
+            ConstructInfo::new(
+                "test.streaming_alias.filtered_nested.root.initial",
+                None,
+                "test streaming alias filtered nested root initial",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            [Variable::new_arc(
+                ConstructInfo::new(
+                    "test.streaming_alias.filtered_nested.root_var.initial",
+                    None,
+                    "test streaming alias filtered nested root var initial",
+                ),
+                "child",
+                child_actor.clone(),
+                PersistenceId::new(),
+                actor_scope.clone(),
+            )],
+        ));
+
+        let alias_source = SourceCode::new("root child leaf".to_string());
+        let alias = static_expression::Alias::WithoutPassed {
+            parts: vec![
+                alias_source.slice(0, 4),
+                alias_source.slice(5, 10),
+                alias_source.slice(11, 15),
+            ],
+            referenced_span: None,
+        };
+        let root_actor_for_future = root_actor.clone();
+        let result_actor = super::VariableOrArgumentReference::new_arc_value_actor(
+            actor_context,
+            alias,
+            async move { root_actor_for_future },
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "filtered ready-root nested aliases should stay on runtime subscribers without a wrapper task"
+            );
+        });
+
+        assert!(
+            matches!(
+                result_actor.current_value(),
+                Err(super::CurrentValueError::NoValueYet)
+            ),
+            "stale intermediate values at or before subscription_after_seq should block deeper traversal"
+        );
+
+        child_actor.store_value_directly(make_child_object("fresh", 110));
+
+        let Value::Text(text, _) = result_actor
+            .current_value()
+            .expect("fresh intermediate updates should rebuild the filtered nested alias")
+        else {
+            panic!(
+                "filtered nested alias should resolve to text after a fresh intermediate update"
+            );
+        };
+        assert_eq!(text.text(), "leaf");
     }
 
     #[test]
@@ -11019,6 +22282,7 @@ mod tests {
             let actor_loop = super::LazyValueActor::internal_loop(
                 zoon::futures_util::stream::iter(vec![first.clone(), second.clone()]),
                 request_rx,
+                None,
                 stored_state.clone(),
             );
 
@@ -11096,6 +22360,176 @@ mod tests {
     }
 
     #[test]
+    fn lazy_actor_internal_loop_marks_future_updates_exhausted_after_source_completion() {
+        let first = test_actor_handle("first", 11)
+            .current_value()
+            .expect("test actor should expose first value");
+        let second = test_actor_handle("second", 12)
+            .current_value()
+            .expect("test actor should expose second value");
+        let stored_state = super::ActorStoredState::new(64);
+        let (request_tx, request_rx) = NamedChannel::new("test.lazy_value_actor.source_end", 8);
+
+        block_on(async move {
+            let actor_loop = super::LazyValueActor::internal_loop(
+                zoon::futures_util::stream::iter(vec![first.clone(), second.clone()]),
+                request_rx,
+                None,
+                stored_state.clone(),
+            );
+
+            let test_future = async move {
+                for (subscriber_id, expected) in [(0usize, "first"), (0usize, "second")] {
+                    let (response_tx, response_rx) = oneshot::channel();
+                    request_tx
+                        .clone()
+                        .send(super::LazyValueRequest {
+                            subscriber_id,
+                            start_cursor: 0,
+                            response_tx,
+                        })
+                        .await
+                        .expect("lazy request should send");
+
+                    let Value::Text(text, _) = response_rx
+                        .await
+                        .expect("lazy response channel should resolve")
+                        .expect("lazy source should still yield a value")
+                    else {
+                        panic!("expected lazy actor value to be text");
+                    };
+                    assert_eq!(text.text(), expected);
+                }
+
+                let (response_tx, response_rx) = oneshot::channel();
+                request_tx
+                    .clone()
+                    .send(super::LazyValueRequest {
+                        subscriber_id: 0,
+                        start_cursor: 0,
+                        response_tx,
+                    })
+                    .await
+                    .expect("terminal lazy request should send");
+
+                assert!(
+                    response_rx
+                        .await
+                        .expect("terminal lazy response channel should resolve")
+                        .is_none(),
+                    "lazy source should return None once the source is exhausted"
+                );
+                assert!(
+                    !stored_state.has_future_state_updates(),
+                    "lazy actor should mark future updates exhausted after source completion"
+                );
+
+                drop(request_tx);
+            };
+
+            let (_actor_loop_done, _) =
+                zoon::futures_util::future::join(actor_loop, test_future).await;
+        });
+    }
+
+    #[test]
+    fn lazy_stream_actor_requests_publish_values_through_runtime_queue() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let (mut source_tx, source_rx) = mpsc::channel::<Value>(8);
+        let actor = super::create_actor_lazy(source_rx, PersistenceId::new(), scope_id);
+        let first = test_actor_handle("first", 21)
+            .current_value()
+            .expect("test actor should expose first value");
+        let second = test_actor_handle("second", 22)
+            .current_value()
+            .expect("test actor should expose second value");
+
+        assert!(
+            matches!(
+                actor.current_value(),
+                Err(super::CurrentValueError::NoValueYet)
+            ),
+            "lazy stream actor should start without a current value before first demand"
+        );
+
+        block_on(async move {
+            let mut first_request = std::pin::pin!(actor.value());
+            let Poll::Pending = poll_pinned_once(first_request.as_mut()) else {
+                panic!("lazy actor should wait for the first demanded source value");
+            };
+            super::poll_test_async_source_tasks();
+
+            source_tx
+                .send(first.clone())
+                .await
+                .expect("first lazy source value should send");
+            super::poll_test_async_source_tasks();
+
+            let Value::Text(first_text, _) = first_request
+                .await
+                .expect("lazy actor should yield the first demanded value")
+            else {
+                panic!("expected first lazy actor value to be text");
+            };
+            assert_eq!(first_text.text(), "first");
+            assert_eq!(
+                actor.version(),
+                1,
+                "first lazy value should advance actor version through runtime queue publication"
+            );
+
+            let Value::Text(current_text, _) = actor
+                .current_value()
+                .expect("lazy actor should expose the first value in direct state after demand")
+            else {
+                panic!("expected current lazy actor value to be text");
+            };
+            assert_eq!(current_text.text(), "first");
+
+            source_tx
+                .send(second.clone())
+                .await
+                .expect("second lazy source value should send");
+            let mut second_stream = actor.stream_from_now();
+            let mut second_request = std::pin::pin!(second_stream.next());
+            let Poll::Pending = poll_pinned_once(second_request.as_mut()) else {
+                panic!("lazy actor should enqueue the second demand before the feeder task runs");
+            };
+            super::poll_test_async_source_tasks();
+
+            let Value::Text(second_text, _) = second_request
+                .await
+                .expect("lazy actor should deliver the next demanded value")
+            else {
+                panic!("expected second lazy actor value to be text");
+            };
+            assert_eq!(second_text.text(), "second");
+            assert_eq!(
+                actor.version(),
+                2,
+                "second lazy value should also publish through the runtime queue"
+            );
+
+            drop(source_tx);
+            let mut terminal_stream = actor.stream_from_now();
+            let mut terminal_request = std::pin::pin!(terminal_stream.next());
+            let Poll::Pending = poll_pinned_once(terminal_request.as_mut()) else {
+                panic!("lazy actor should enqueue the terminal demand before source completion");
+            };
+            super::poll_test_async_source_tasks();
+            assert!(
+                terminal_request.await.is_none(),
+                "lazy actor should end once the source ends without more buffered values"
+            );
+            assert!(
+                !actor.stored_state.has_future_state_updates(),
+                "lazy actor source completion should clear future updates through runtime queue publication"
+            );
+        });
+    }
+
+    #[test]
     fn direct_state_value_waits_for_first_store_without_subscription_stream() {
         let actor = test_empty_actor_handle();
         let actor_for_store = actor.clone();
@@ -11149,6 +22583,296 @@ mod tests {
     }
 
     #[test]
+    fn runtime_actor_ready_queue_routes_actor_inputs_before_mailbox_scheduling() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let first = Text::new_value_with_emission_seq(
+            ConstructInfo::new("test.runtime_queue.first", None, "test runtime queue first"),
+            ConstructContext {
+                construct_storage: Arc::new(ConstructStorage::new("")),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            PersistenceId::new(),
+            11,
+            "first",
+        );
+        let second = Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.runtime_queue.second",
+                None,
+                "test runtime queue second",
+            ),
+            ConstructContext {
+                construct_storage: Arc::new(ConstructStorage::new("")),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            PersistenceId::new(),
+            12,
+            "second",
+        );
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_actor_runtime_input(
+                actor.actor_id,
+                super::ActorMailboxWorkItem::Value(first),
+            );
+            reg.enqueue_actor_runtime_input(
+                actor.actor_id,
+                super::ActorMailboxWorkItem::Value(second),
+            );
+
+            let owned_actor = reg
+                .get_actor(actor.actor_id)
+                .expect("runtime-input actor should stay registered");
+            assert!(
+                owned_actor.mailbox.is_empty(),
+                "actor mailbox should stay untouched until runtime-ready input is drained"
+            );
+            assert!(!owned_actor.scheduled_for_runtime);
+            assert_eq!(
+                reg.runtime_ready_queue.len(),
+                2,
+                "raw actor inputs should queue on the runtime queue before mailbox scheduling"
+            );
+
+            reg.drain_runtime_ready_queue();
+
+            let owned_actor = reg
+                .get_actor(actor.actor_id)
+                .expect("runtime-input actor should stay registered after drain");
+            assert!(owned_actor.mailbox.is_empty());
+            assert!(!owned_actor.scheduled_for_runtime);
+            assert!(reg.runtime_ready_queue.is_empty());
+        });
+
+        let Value::Text(text, _) = actor
+            .current_value()
+            .expect("drained runtime mailbox should store the latest value")
+        else {
+            panic!("expected latest text value from runtime mailbox drain");
+        };
+        assert_eq!(text.text(), "second");
+        assert_eq!(actor.version(), 2);
+
+        block_on(async {
+            let mut stream = actor.stream();
+
+            let first = stream
+                .next()
+                .await
+                .expect("replayed stream should include the first drained value");
+            let Value::Text(text, _) = first else {
+                panic!("expected first replayed text value");
+            };
+            assert_eq!(text.text(), "first");
+
+            let second = stream
+                .next()
+                .await
+                .expect("replayed stream should include the later drained value");
+            let Value::Text(text, _) = second else {
+                panic!("expected second replayed text value");
+            };
+            assert_eq!(text.text(), "second");
+        });
+    }
+
+    #[test]
+    fn runtime_actor_mailbox_work_deduplicates_ready_queue_entries_per_drain() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let first = Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.runtime_queue.mailbox_dedup.first",
+                None,
+                "test runtime queue mailbox dedup first",
+            ),
+            ConstructContext {
+                construct_storage: Arc::new(ConstructStorage::new("")),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            PersistenceId::new(),
+            21,
+            "first",
+        );
+        let second = Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.runtime_queue.mailbox_dedup.second",
+                None,
+                "test runtime queue mailbox dedup second",
+            ),
+            ConstructContext {
+                construct_storage: Arc::new(ConstructStorage::new("")),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            PersistenceId::new(),
+            22,
+            "second",
+        );
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_actor_mailbox_value(actor.actor_id, first);
+            reg.enqueue_actor_mailbox_value(actor.actor_id, second);
+
+            let owned_actor = reg
+                .get_actor(actor.actor_id)
+                .expect("mailbox actor should stay registered");
+            assert_eq!(
+                owned_actor.mailbox.len(),
+                2,
+                "mailbox work should accumulate until the runtime drain runs"
+            );
+            assert!(
+                owned_actor.scheduled_for_runtime,
+                "mailbox enqueue should mark the actor scheduled"
+            );
+            assert_eq!(
+                reg.runtime_ready_queue.len(),
+                1,
+                "multiple mailbox work items for the same actor should collapse to one ready-queue entry"
+            );
+
+            reg.drain_runtime_ready_queue();
+        });
+
+        let Value::Text(text, _) = actor
+            .current_value()
+            .expect("drained mailbox work should publish the latest value")
+        else {
+            panic!("expected text value after mailbox dedup drain");
+        };
+        assert_eq!(text.text(), "second");
+        assert_eq!(actor.version(), 2);
+
+        block_on(async {
+            let mut stream = actor.stream();
+
+            let first = stream
+                .next()
+                .await
+                .expect("late stream should replay the first mailbox value");
+            let Value::Text(text, _) = first else {
+                panic!("expected first replayed mailbox text value");
+            };
+            assert_eq!(text.text(), "first");
+
+            let second = stream
+                .next()
+                .await
+                .expect("late stream should replay the second mailbox value");
+            let Value::Text(text, _) = second else {
+                panic!("expected second replayed mailbox text value");
+            };
+            assert_eq!(text.text(), "second");
+        });
+    }
+
+    #[test]
+    fn runtime_ready_queue_can_release_async_source_slots() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let async_source_id = REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.reserve_async_source_for_scope(scope_id)
+                .expect("scope should reserve an async source slot")
+        });
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.runtime_ready_queue
+                .push_back(super::RuntimeReadyItem::AsyncSourceCleanup(async_source_id));
+            reg.drain_runtime_ready_queue();
+        });
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "async source cleanup should release the reserved scope slot through the runtime queue"
+            );
+        });
+    }
+
+    #[test]
+    fn drain_value_stream_to_actor_state_routes_values_through_runtime_mailbox_queue() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        block_on(super::drain_value_stream_to_actor_state(
+            actor.actor_id,
+            stream::iter(vec![
+                Text::new_value_with_emission_seq(
+                    ConstructInfo::new(
+                        "test.stream_mailbox.first",
+                        None,
+                        "test stream mailbox first",
+                    ),
+                    ConstructContext {
+                        construct_storage: Arc::new(ConstructStorage::new("")),
+                        virtual_fs: VirtualFilesystem::new(),
+                        bridge_scope_id: None,
+                        scene_ctx: None,
+                    },
+                    PersistenceId::new(),
+                    21,
+                    "first",
+                ),
+                Text::new_value_with_emission_seq(
+                    ConstructInfo::new(
+                        "test.stream_mailbox.second",
+                        None,
+                        "test stream mailbox second",
+                    ),
+                    ConstructContext {
+                        construct_storage: Arc::new(ConstructStorage::new("")),
+                        virtual_fs: VirtualFilesystem::new(),
+                        bridge_scope_id: None,
+                        scene_ctx: None,
+                    },
+                    PersistenceId::new(),
+                    22,
+                    "second",
+                ),
+            ]),
+        ));
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            let owned_actor = reg
+                .get_actor(actor.actor_id)
+                .expect("stream-fed actor should stay registered");
+            assert!(owned_actor.mailbox.is_empty());
+            assert!(!owned_actor.scheduled_for_runtime);
+            assert!(reg.runtime_ready_queue.is_empty());
+        });
+
+        let Value::Text(text, _) = actor
+            .current_value()
+            .expect("mailbox-fed stream drain should store the latest value")
+        else {
+            panic!("expected latest text value from mailbox-fed stream drain");
+        };
+        assert_eq!(text.text(), "second");
+        assert_eq!(actor.version(), 2);
+    }
+
+    #[test]
     fn retained_actor_handles_are_stored_on_owned_actor_slot() {
         let scope_id = create_registry_scope(None);
         let _scope_guard = ScopeDestroyGuard::new(scope_id);
@@ -11186,8 +22910,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires wasm/js runtime; Task::start_droppable touches js-sys on host"]
-    fn stream_driven_actor_reuses_direct_state_slot_with_retained_task() {
+    fn stream_driven_actor_reuses_direct_state_slot_with_scope_owned_external_feeder_task() {
         let scope_id = create_registry_scope(None);
         let _scope_guard = ScopeDestroyGuard::new(scope_id);
         let actor = create_actor(
@@ -11208,32 +22931,180 @@ mod tests {
                     11,
                     "streamed",
                 )
-            }),
+            })
+            .chain(stream::pending()),
             PersistenceId::new(),
             scope_id,
         );
 
         REGISTRY.with(|reg| {
             let reg = reg.borrow();
-            let owned_actor = reg
-                .get_actor(actor.actor_id)
-                .expect("stream-driven actor should be registered");
             assert!(
-                !owned_actor.retained_tasks.is_empty(),
-                "stream-driven actor should retain its feeder task on the direct-state slot"
+                reg.async_source_count_for_scope(scope_id) > 0,
+                "stream-driven actor should register one scope-owned external feeder task"
             );
         });
 
         block_on(async {
             let value = actor
-                .value()
-                .await
-                .expect("stream-driven actor should surface emitted value");
+                .current_value()
+                .expect("stream-driven actor should expose the ready prefix value from its direct state slot");
             let Value::Text(text, _) = value else {
                 panic!("expected text value from stream-driven actor");
             };
             assert_eq!(text.text(), "streamed");
         });
+    }
+
+    #[test]
+    fn completed_stream_driven_actor_releases_scope_owned_feeder_task_before_scope_destroy() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let (mut change_sender, change_receiver) = mpsc::channel::<Value>(8);
+
+        change_sender
+            .try_send(Text::new_value_with_emission_seq(
+                ConstructInfo::new(
+                    "test.stream_driven_actor.completed.value",
+                    None,
+                    "test stream driven actor completed value",
+                ),
+                ConstructContext {
+                    construct_storage: Arc::new(ConstructStorage::new("")),
+                    virtual_fs: VirtualFilesystem::new(),
+                    bridge_scope_id: None,
+                    scene_ctx: None,
+                },
+                PersistenceId::new(),
+                12,
+                "streamed",
+            ))
+            .expect("ready prefix value should be queued before actor creation");
+
+        let actor = create_actor(change_receiver, PersistenceId::new(), scope_id);
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert!(
+                reg.async_source_count_for_scope(scope_id) > 0,
+                "pending stream-driven actor should register one scope-owned feeder task"
+            );
+        });
+
+        drop(change_sender);
+
+        let mut feeder_cleared = false;
+        for _ in 0..20 {
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            super::poll_test_async_source_tasks();
+            let async_source_count =
+                REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+            if async_source_count == 0 {
+                feeder_cleared = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            feeder_cleared,
+            "completed stream-driven actors should release their scope-owned feeder task before scope teardown"
+        );
+
+        let Value::Text(text, _) = actor
+            .current_value()
+            .expect("completed stream-driven actor should retain its last value in direct state")
+        else {
+            panic!("expected text value from completed stream-driven actor");
+        };
+        assert_eq!(text.text(), "streamed");
+    }
+
+    #[test]
+    fn completed_stream_driven_actor_stream_from_now_ends_after_source_completion() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let (mut change_sender, change_receiver) = mpsc::channel::<Value>(8);
+
+        change_sender
+            .try_send(Text::new_value_with_emission_seq(
+                ConstructInfo::new(
+                    "test.stream_driven_actor.stream_from_now.value",
+                    None,
+                    "test stream driven actor stream_from_now value",
+                ),
+                ConstructContext {
+                    construct_storage: Arc::new(ConstructStorage::new("")),
+                    virtual_fs: VirtualFilesystem::new(),
+                    bridge_scope_id: None,
+                    scene_ctx: None,
+                },
+                PersistenceId::new(),
+                13,
+                "streamed",
+            ))
+            .expect("ready prefix value should be queued before actor creation");
+
+        let actor = create_actor(change_receiver, PersistenceId::new(), scope_id);
+        drop(change_sender);
+
+        let mut feeder_cleared = false;
+        for _ in 0..20 {
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            super::poll_test_async_source_tasks();
+            let async_source_count =
+                REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+            if async_source_count == 0 {
+                feeder_cleared = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            feeder_cleared,
+            "completed actor stream feeder should release before checking post-completion subscriptions"
+        );
+
+        block_on(async move {
+            let mut updates = actor.stream_from_now();
+            assert!(
+                updates.next().await.is_none(),
+                "completed stream-driven actor should end stream_from_now once the source has completed"
+            );
+        });
+    }
+
+    #[test]
+    fn removing_stream_driven_actor_drops_scope_owned_feeder_task_before_scope_destroy() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor = create_actor(stream::pending::<Value>(), PersistenceId::new(), scope_id);
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert!(
+                reg.async_source_count_for_scope(scope_id) > 0,
+                "pending stream-driven actor should register a scope-owned feeder task"
+            );
+        });
+
+        REGISTRY.with(|reg| reg.borrow_mut().remove_actor(actor.actor_id));
+
+        let mut feeder_cleared = false;
+        for _ in 0..20 {
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            super::poll_test_async_source_tasks();
+            let async_source_count =
+                REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+            if async_source_count == 0 {
+                feeder_cleared = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            feeder_cleared,
+            "removing the actor should end its scope-owned feeder task before scope teardown"
+        );
     }
 
     #[test]
@@ -11318,6 +23189,8 @@ mod tests {
 
     #[test]
     fn static_persistent_list_save_path_does_not_spawn_retained_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
         let list = Arc::new(List::new_static(
             ConstructInfo::new(
                 "test.static.persistent.list",
@@ -11325,6 +23198,7 @@ mod tests {
                 "test static persistent list",
             )
             .complete(super::ConstructType::List),
+            scope_id,
             vec![test_actor_handle("first", 1)],
         ));
         let storage = Arc::new(ConstructStorage::new(""));
@@ -11335,10 +23209,13 @@ mod tests {
                 .await;
         });
 
-        assert!(
-            list.retained_tasks.borrow().is_empty(),
-            "static persistent list should not retain a hanging save watcher"
-        );
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert!(
+                reg.async_source_count_for_scope(scope_id) == 0,
+                "static persistent list should not retain a hanging save watcher"
+            );
+        });
     }
 
     #[test]
@@ -11433,6 +23310,81 @@ mod tests {
     }
 
     #[test]
+    fn live_persistent_list_save_watcher_is_list_owned_and_released_on_drop() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let storage = Arc::new(ConstructStorage::in_memory_for_tests(BTreeMap::new()));
+        let persistence_id = PersistenceId::new();
+        let (mut change_sender, change_receiver) = mpsc::channel::<ListChange>(8);
+        let first = test_actor_handle("first", 1);
+
+        change_sender
+            .try_send(ListChange::Replace {
+                items: Arc::from(vec![first.clone()]),
+            })
+            .expect("ready initial replace should be queued before live persistent list creation");
+
+        let list = Arc::new(List::new_with_change_stream(
+            ConstructInfo::new(
+                "test.live.persistent.list.watcher",
+                None,
+                "test live persistent list watcher",
+            ),
+            ActorContext {
+                registry_scope_id: Some(scope_id),
+                ..Default::default()
+            },
+            change_receiver,
+            (),
+        ));
+
+        let baseline_async_source_count =
+            REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+
+        block_on(async {
+            super::save_or_watch_persistent_list(list.clone(), storage.clone(), persistence_id)
+                .await;
+        });
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 1,
+                "live persistent list should add one list-owned save watcher on top of its existing live change feeder"
+            );
+        });
+
+        let saved_items = storage
+            .load_state_now::<Vec<zoon::serde_json::Value>>(persistence_id)
+            .expect("initial persistent list snapshot should be saved");
+        assert_eq!(
+            saved_items.len(),
+            1,
+            "saved snapshot should contain the first item"
+        );
+
+        drop(list);
+        let mut async_sources_cleared = false;
+        for _ in 0..20 {
+            super::drain_pending_registry_cleanups();
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            super::poll_test_async_source_tasks();
+            let async_source_count =
+                REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+            if async_source_count == 0 {
+                async_sources_cleared = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            async_sources_cleared,
+            "dropping the live persistent list should release its list-owned save watcher and scope-owned live feeder before scope teardown"
+        );
+    }
+
+    #[test]
     fn disabled_storage_persistent_list_actor_uses_constant_path_without_retained_task() {
         let scope_id = create_registry_scope(None);
         let _scope_guard = ScopeDestroyGuard::new(scope_id);
@@ -11455,11 +23407,8 @@ mod tests {
 
         REGISTRY.with(|reg| {
             let reg = reg.borrow();
-            let owned_actor = reg
-                .get_actor(actor.actor_id)
-                .expect("persistent list actor should be registered");
             assert!(
-                owned_actor.retained_tasks.is_empty(),
+                reg.async_source_count_for_scope(scope_id) == 0,
                 "disabled storage should not retain a one-shot persistence init task"
             );
         });
@@ -11470,9 +23419,10 @@ mod tests {
         else {
             panic!("expected wrapped list value");
         };
-        assert!(
-            list.retained_tasks.borrow().is_empty(),
-            "disabled storage static list should not retain a persistence watcher"
+        assert_eq!(
+            block_on(list.snapshot()).len(),
+            1,
+            "disabled storage static list should expose its initial item immediately"
         );
     }
 
@@ -11512,11 +23462,8 @@ mod tests {
 
         REGISTRY.with(|reg| {
             let reg = reg.borrow();
-            let owned_actor = reg
-                .get_actor(actor.actor_id)
-                .expect("restored persistent list actor should be registered");
             assert!(
-                owned_actor.retained_tasks.is_empty(),
+                reg.async_source_count_for_scope(scope_id) == 0,
                 "restored storage should not retain a one-shot persistence init task"
             );
         });
@@ -11527,10 +23474,6 @@ mod tests {
         else {
             panic!("expected wrapped list value");
         };
-        assert!(
-            list.retained_tasks.borrow().is_empty(),
-            "restored static list should not retain a persistence watcher"
-        );
         assert_eq!(
             block_on(list.snapshot()).len(),
             1,
@@ -11595,11 +23538,8 @@ mod tests {
 
         REGISTRY.with(|reg| {
             let reg = reg.borrow();
-            let owned_actor = reg
-                .get_actor(actor.actor_id)
-                .expect("ready future actor should be registered");
             assert!(
-                owned_actor.retained_tasks.is_empty(),
+                reg.async_source_count_for_scope(scope_id) == 0,
                 "ready futures should not retain a one-shot stream task"
             );
         });
@@ -11640,7 +23580,7 @@ mod tests {
                 .get_actor(actor.actor_id)
                 .expect("ready lazy future actor should be registered");
             assert!(
-                owned_actor.retained_tasks.is_empty(),
+                reg.async_source_count_for_scope(scope_id) == 0,
                 "ready lazy future actor should not retain a feeder task"
             );
             assert!(
@@ -11656,6 +23596,171 @@ mod tests {
             panic!("expected ready lazy future text");
         };
         assert_eq!(text.text(), "ready");
+    }
+
+    #[test]
+    fn pending_future_actor_releases_scope_owned_task_when_actor_is_removed() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor =
+            create_actor_from_future(future::pending::<Value>(), PersistenceId::new(), scope_id);
+        let actor_id = actor.actor_id;
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                1,
+                "pending future actor should keep exactly one scope-owned feeder task"
+            );
+        });
+
+        REGISTRY.with(|reg| {
+            reg.borrow_mut().remove_actor(actor_id);
+        });
+        super::poll_test_async_source_tasks();
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.drain_runtime_ready_queue();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "removing the future actor should release the scope-owned feeder task"
+            );
+        });
+    }
+
+    #[test]
+    fn pending_forwarding_future_source_releases_scope_owned_task_when_actor_is_removed() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor = super::create_actor_forwarding_from_future_source(
+            future::pending::<Option<ActorHandle>>(),
+            PersistenceId::new(),
+            scope_id,
+        );
+        let actor_id = actor.actor_id;
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                1,
+                "pending forwarding future source should keep exactly one scope-owned feeder task"
+            );
+        });
+
+        REGISTRY.with(|reg| {
+            reg.borrow_mut().remove_actor(actor_id);
+        });
+        super::poll_test_async_source_tasks();
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.drain_runtime_ready_queue();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "removing the forwarding actor should release the scope-owned future-source task"
+            );
+        });
+    }
+
+    #[test]
+    fn pending_lazy_stream_actor_releases_scope_owned_task_when_actor_is_removed() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let (_change_sender, change_receiver) = mpsc::channel::<Value>(8);
+        let actor = super::create_actor_lazy(change_receiver, PersistenceId::new(), scope_id);
+        let actor_id = actor.actor_id;
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "pending lazy stream actor should not retain a feeder task before first demand"
+            );
+        });
+
+        let mut first_request = std::pin::pin!(actor.value());
+        let Poll::Pending = poll_pinned_once(first_request.as_mut()) else {
+            panic!("lazy actor should stay pending before the first source value arrives");
+        };
+        super::poll_test_async_source_tasks();
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                1,
+                "first lazy demand should start exactly one scope-owned feeder task"
+            );
+        });
+
+        REGISTRY.with(|reg| {
+            reg.borrow_mut().remove_actor(actor_id);
+        });
+        super::poll_test_async_source_tasks();
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.drain_runtime_ready_queue();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "removing the lazy stream actor should release the scope-owned feeder task"
+            );
+        });
+    }
+
+    #[test]
+    fn ready_empty_lazy_stream_actor_uses_ended_path_without_retained_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor = super::create_actor_lazy(stream::empty(), PersistenceId::new(), scope_id);
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            let owned_actor = reg
+                .get_actor(actor.actor_id)
+                .expect("ready empty lazy stream actor should be registered");
+            assert!(
+                reg.async_source_count_for_scope(scope_id) == 0,
+                "ready empty lazy streams should not retain a feeder task"
+            );
+            assert!(
+                owned_actor.lazy_delegate.is_none(),
+                "ready empty lazy streams should collapse to an ended direct actor"
+            );
+            assert!(
+                !owned_actor.stored_state.has_future_state_updates(),
+                "ready empty lazy stream actor should mark future updates exhausted"
+            );
+        });
+
+        assert!(
+            matches!(
+                actor.current_value(),
+                Err(super::CurrentValueError::NoValueYet)
+            ),
+            "ready empty lazy stream actor should expose no current value"
+        );
+
+        block_on(async {
+            assert!(
+                actor.current_or_future_stream().next().await.is_none(),
+                "ready empty lazy stream actor should expose an empty current_or_future_stream"
+            );
+            assert!(
+                matches!(
+                    actor.value().await,
+                    Err(super::ValueError::SourceEndedWithoutValue)
+                ),
+                "ready empty lazy stream actor should report source exhaustion"
+            );
+        });
     }
 
     #[test]
@@ -11685,7 +23790,7 @@ mod tests {
                 .get_actor(actor.actor_id)
                 .expect("ready single-value lazy stream actor should be registered");
             assert!(
-                owned_actor.retained_tasks.is_empty(),
+                reg.async_source_count_for_scope(scope_id) == 0,
                 "ready one-shot lazy streams should not retain a feeder task"
             );
             assert!(
@@ -11726,11 +23831,8 @@ mod tests {
 
         REGISTRY.with(|reg| {
             let reg = reg.borrow();
-            let owned_actor = reg
-                .get_actor(actor.actor_id)
-                .expect("ready single-value stream actor should be registered");
             assert!(
-                owned_actor.retained_tasks.is_empty(),
+                reg.async_source_count_for_scope(scope_id) == 0,
                 "ready one-shot streams should not retain a stream task"
             );
         });
@@ -11781,11 +23883,8 @@ mod tests {
 
         REGISTRY.with(|reg| {
             let reg = reg.borrow();
-            let owned_actor = reg
-                .get_actor(actor.actor_id)
-                .expect("ready multi-value stream actor should be registered");
             assert!(
-                owned_actor.retained_tasks.is_empty(),
+                reg.async_source_count_for_scope(scope_id) == 0,
                 "finite ready stream prefixes should not retain a feeder task"
             );
         });
@@ -11844,11 +23943,8 @@ mod tests {
 
         REGISTRY.with(|reg| {
             let reg = reg.borrow();
-            let owned_actor = reg
-                .get_actor(actor.actor_id)
-                .expect("ready origin actor should be registered");
             assert!(
-                owned_actor.retained_tasks.is_empty(),
+                reg.async_source_count_for_scope(scope_id) == 0,
                 "ready single-value origin stream should not retain a feeder task"
             );
         });
@@ -11918,11 +24014,14 @@ mod tests {
 
     #[test]
     fn list_diff_stream_replays_direct_state_without_subscription_wrapper() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
         let first = test_actor_handle("first", 1);
         let second = test_actor_handle("second", 2);
         let list = Arc::new(List::new_static(
             ConstructInfo::new("test.list.diff_stream", None, "test list diff stream")
                 .complete(super::ConstructType::List),
+            scope_id,
             vec![first, second],
         ));
 
@@ -11995,10 +24094,13 @@ mod tests {
 
     #[test]
     fn list_snapshot_and_late_stream_include_initial_items() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
         let first = test_actor_handle("first", 1);
         let second = test_actor_handle("second", 2);
         let list = Arc::new(List::new_static(
             ConstructInfo::new("test.list", None, "test list").complete(super::ConstructType::List),
+            scope_id,
             vec![first.clone(), second.clone()],
         ));
 
@@ -12030,6 +24132,7 @@ mod tests {
         let old_list = Arc::new(List::new_static(
             ConstructInfo::new("test.list.binding.old", None, "test list binding old")
                 .complete(super::ConstructType::List),
+            scope_id,
             vec![test_actor_handle("old", 1)],
         ));
         let current_list = Arc::new(List::new_static(
@@ -12039,6 +24142,7 @@ mod tests {
                 "test list binding current",
             )
             .complete(super::ConstructType::List),
+            scope_id,
             vec![test_actor_handle("current", 2)],
         ));
         let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
@@ -12076,11 +24180,13 @@ mod tests {
         let old_list = Arc::new(List::new_static(
             ConstructInfo::new("test.list.map.old", None, "test list map old")
                 .complete(super::ConstructType::List),
+            scope_id,
             vec![test_actor_handle("old", 1)],
         ));
         let current_list = Arc::new(List::new_static(
             ConstructInfo::new("test.list.map.current", None, "test list map current")
                 .complete(super::ConstructType::List),
+            scope_id,
             vec![test_actor_handle("current", 2)],
         ));
         let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
@@ -12121,7 +24227,7 @@ mod tests {
     }
 
     #[test]
-    fn live_list_change_loop_without_output_valve_applies_incremental_changes() {
+    fn live_list_runtime_inputs_without_output_valve_apply_incremental_changes() {
         let first = test_actor_handle("first", 1);
         let second = test_actor_handle("second", 2);
         let stored_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
@@ -12135,23 +24241,19 @@ mod tests {
                     items: Arc::from(vec![first.clone()]),
                 })
                 .await
-                .expect("initial replace should reach helper loop");
+                .expect("initial replace should reach runtime feeder");
             change_sender
                 .send(ListChange::Push {
                     item: second.clone(),
                 })
                 .await
-                .expect("push should reach helper loop");
+                .expect("push should reach runtime feeder");
             drop(change_sender);
 
-            super::run_live_list_change_loop_core(
+            super::drain_live_list_runtime_inputs(
                 construct_info,
                 stored_state.clone(),
                 change_receiver,
-                None,
-                None,
-                None,
-                (),
             )
             .await;
 
@@ -12181,7 +24283,64 @@ mod tests {
     }
 
     #[test]
-    fn live_list_change_loop_core_continues_from_existing_state() {
+    fn live_list_runtime_inputs_route_changes_through_runtime_queue() {
+        let first = test_actor_handle("first", 1);
+        let second = test_actor_handle("second", 2);
+        let stored_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let construct_info = ConstructInfo::new(
+            "test.live.list.runtime.inputs",
+            None,
+            "test live list runtime inputs",
+        )
+        .complete(super::ConstructType::List);
+        let (mut change_sender, change_receiver) = mpsc::channel::<ListChange>(8);
+
+        block_on(async move {
+            change_sender
+                .send(ListChange::Replace {
+                    items: Arc::from(vec![first.clone()]),
+                })
+                .await
+                .expect("initial replace should reach runtime feeder");
+            change_sender
+                .send(ListChange::Push {
+                    item: second.clone(),
+                })
+                .await
+                .expect("push should reach runtime feeder");
+            drop(change_sender);
+
+            super::drain_live_list_runtime_inputs(
+                construct_info,
+                stored_state.clone(),
+                change_receiver,
+            )
+            .await;
+
+            let snapshot = stored_state.snapshot();
+            assert_eq!(
+                snapshot.len(),
+                2,
+                "runtime feeder should apply queued list changes through runtime state"
+            );
+            assert_eq!(
+                stored_state.version(),
+                2,
+                "replace + push should advance version through runtime queue processing"
+            );
+
+            REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                assert!(
+                    reg.runtime_ready_queue.is_empty(),
+                    "runtime list feeder should drain its queued work eagerly"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn live_list_runtime_inputs_continue_from_existing_state() {
         let first = test_actor_handle("first", 1);
         let second = test_actor_handle("second", 2);
         let stored_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
@@ -12212,17 +24371,13 @@ mod tests {
                     item: second.clone(),
                 })
                 .await
-                .expect("push should reach continuation helper");
+                .expect("push should reach runtime feeder");
             drop(change_sender);
 
-            super::run_live_list_change_loop_core(
+            super::drain_live_list_runtime_inputs(
                 construct_info,
                 stored_state.clone(),
                 change_receiver,
-                None,
-                list,
-                list_arc_cache,
-                (),
             )
             .await;
 
@@ -12230,7 +24385,7 @@ mod tests {
             assert_eq!(
                 snapshot.len(),
                 2,
-                "continuation helper should keep prior list state when draining incremental changes"
+                "runtime feeder should keep prior list state when draining incremental changes"
             );
             assert_eq!(
                 stored_state.version(),
@@ -12241,104 +24396,50 @@ mod tests {
     }
 
     #[test]
-    fn live_list_change_loop_core_drains_diffs_after_output_valve_closes() {
+    fn static_list_output_valve_rebroadcasts_snapshot_without_list_owned_watcher_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
         let first = test_actor_handle("first", 1);
-        let second = test_actor_handle("second", 2);
-        let stored_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
-        let construct_info = ConstructInfo::new(
-            "test.live.list.output.valve.close",
-            None,
-            "test live list output valve close",
-        )
-        .complete(super::ConstructType::List);
-        let (subscriber_sender, mut subscriber_receiver) =
-            NamedChannel::new("test.list.change_subscriber", 8);
-        let (mut change_sender, change_receiver) = mpsc::channel::<ListChange>(8);
-        let (impulse_sender, impulse_receiver) = mpsc::channel::<()>(8);
-
-        stored_state.register_change_subscriber(subscriber_sender);
-
-        block_on(async move {
-            change_sender
-                .send(ListChange::Replace {
-                    items: Arc::from(vec![first.clone()]),
-                })
-                .await
-                .expect("initial replace should reach loop core");
-            change_sender
-                .send(ListChange::Push {
-                    item: second.clone(),
-                })
-                .await
-                .expect("push should stay queued for loop core");
-            drop(change_sender);
-            drop(impulse_sender);
-
-            super::run_live_list_change_loop_core(
-                construct_info,
-                stored_state.clone(),
-                change_receiver,
-                Some(impulse_receiver.boxed_local()),
-                None,
-                None,
-                (),
-            )
-            .await;
-
-            let Some(ListChange::Replace { items }) =
-                subscriber_receiver.next().now_or_never().flatten()
-            else {
-                panic!("subscriber should receive replace after valve closes");
-            };
-            assert_eq!(items.len(), 1, "replace should keep first item snapshot");
-
-            let Some(ListChange::Replace { items }) =
-                subscriber_receiver.next().now_or_never().flatten()
-            else {
-                panic!("subscriber should receive final snapshot after valve closes");
-            };
-            assert_eq!(
-                items.len(),
-                2,
-                "final snapshot should include queued changes after valve closes"
-            );
-
-            let snapshot = stored_state.snapshot();
-            assert_eq!(
-                snapshot.len(),
-                2,
-                "loop core should preserve full list state after valve close handoff"
-            );
-            assert_eq!(
-                stored_state.version(),
-                2,
-                "replace + push should advance version after valve close handoff"
-            );
-        });
-    }
-
-    #[test]
-    fn static_list_output_valve_watcher_rebroadcasts_snapshot_without_live_change_loop() {
-        let first = test_actor_handle("first", 1);
-        let construct_info = ConstructInfo::new(
-            "test.static.list.output.valve",
-            None,
-            "test static list output valve",
-        )
-        .complete(super::ConstructType::List);
         let (subscriber_sender, mut subscriber_receiver) =
             NamedChannel::new("test.static.list.change_subscriber", 8);
-        let (mut impulse_sender, impulse_receiver) = mpsc::channel::<()>(8);
-        let list = super::List::new_static(construct_info.clone(), vec![first]);
+        let active = std::cell::Cell::new(true);
+        let direct_subscribers = std::cell::RefCell::new(smallvec::SmallVec::<
+            [super::OutputValveDirectSubscriber; 4],
+        >::new());
+        let list = super::List::new(
+            ConstructInfo::new(
+                "test.static.list.output.valve",
+                None,
+                "test static list output valve",
+            ),
+            ConstructContext {
+                construct_storage: Arc::new(ConstructStorage::new("")),
+                virtual_fs: VirtualFilesystem::new(),
+                bridge_scope_id: None,
+                scene_ctx: None,
+            },
+            ActorContext {
+                registry_scope_id: Some(scope_id),
+                ..ActorContext::default()
+            },
+            vec![first],
+        );
         let stored_state = list.stored_state.clone();
-        let initial_items: Vec<_> = stored_state
-            .snapshot()
-            .into_iter()
-            .map(|(_, actor)| actor)
-            .collect();
-        let initial_items_arc = Arc::from(initial_items.as_slice());
-
         stored_state.register_change_subscriber(subscriber_sender);
+        super::register_list_output_valve_runtime_subscriber_state(
+            &active,
+            &direct_subscribers,
+            &stored_state,
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "static list output valve rebroadcast should not require a list-owned watcher task"
+            );
+        });
 
         block_on(async move {
             let Some(ListChange::Replace { items }) =
@@ -12352,32 +24453,23 @@ mod tests {
                 "initial replay should contain the static item"
             );
 
-            impulse_sender
-                .send(())
-                .await
-                .expect("impulse should reach static list watcher");
-            drop(impulse_sender);
+            super::broadcast_output_valve_direct_subscribers(
+                &direct_subscribers,
+                super::OutputValveDirectEvent::Impulse,
+            );
 
-            super::run_live_list_change_loop_core(
-                construct_info,
-                stored_state.clone(),
-                stream::empty::<ListChange>(),
-                Some(impulse_receiver.boxed_local()),
-                Some(initial_items),
-                Some(initial_items_arc),
-                (),
-            )
-            .await;
-
-            let Some(ListChange::Replace { items }) =
-                subscriber_receiver.next().now_or_never().flatten()
-            else {
+            let Some(ListChange::Replace { items }) = subscriber_receiver.next().await else {
                 panic!("subscriber should receive snapshot rebroadcast after impulse");
             };
             assert_eq!(
                 items.len(),
                 1,
                 "rebroadcast should preserve the static snapshot"
+            );
+
+            super::broadcast_output_valve_direct_subscribers(
+                &direct_subscribers,
+                super::OutputValveDirectEvent::Closed,
             );
 
             assert!(
@@ -12392,7 +24484,322 @@ mod tests {
     }
 
     #[test]
+    fn external_stream_runtime_adapter_routes_actor_values_through_runtime_queue() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let first = Text::new_value_with_emission_seq(
+            ConstructInfo::new("test.external.stream.actor.first", None, "first"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            1,
+            "first",
+        );
+        let second = Text::new_value_with_emission_seq(
+            ConstructInfo::new("test.external.stream.actor.second", None, "second"),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            2,
+            "second",
+        );
+
+        block_on(async move {
+            super::drain_value_stream_to_actor_state(
+                actor.actor_id,
+                stream::iter(vec![first, second]),
+            )
+            .await;
+
+            let Value::Text(text, _) = actor
+                .current_value()
+                .expect("actor should expose the last queued external stream value")
+            else {
+                panic!("expected text value");
+            };
+            assert_eq!(
+                text.text(),
+                "second",
+                "shared external stream adapter should feed actor values through the runtime queue"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_queue_ignores_actor_mailbox_work_for_dropped_actor_id() {
+        let scope_id = create_registry_scope(None);
+        let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let actor_id = actor.actor_id;
+        drop(actor);
+
+        REGISTRY.with(|reg| {
+            reg.borrow_mut().destroy_scope(scope_id);
+        });
+
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let value = Text::new_value_with_emission_seq(
+            ConstructInfo::new("test.external.stream.actor.dropped", None, "dropped"),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            1,
+            "dropped",
+        );
+
+        super::enqueue_actor_value_on_runtime_queue_by_id(actor_id, value);
+        super::enqueue_actor_source_end_on_runtime_queue_by_id(actor_id);
+
+        REGISTRY.with(|reg| {
+            assert!(
+                reg.borrow().get_actor(actor_id).is_none(),
+                "runtime queue should ignore mailbox work for dropped actor ids"
+            );
+        });
+    }
+
+    #[test]
+    fn live_list_change_work_uses_runtime_broadcast_flag_at_drain_time() {
+        let first = test_actor_handle("first", 1);
+        let second = test_actor_handle("second", 2);
+        let stored_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let construct_info = ConstructInfo::new(
+            "test.live.list.runtime.broadcast.flag",
+            None,
+            "test live list runtime broadcast flag",
+        )
+        .complete(super::ConstructType::List);
+        let (subscriber_sender, mut subscriber_receiver) =
+            NamedChannel::new("test.live.list.runtime.broadcast.flag.subscriber", 8);
+        let mut list = None;
+        let mut list_arc_cache = None;
+
+        super::process_live_list_change(
+            &construct_info,
+            &stored_state,
+            &mut list,
+            &mut list_arc_cache,
+            &ListChange::Replace {
+                items: Arc::from(vec![first]),
+            },
+            false,
+        );
+        stored_state.register_change_subscriber(subscriber_sender);
+        stored_state.set_broadcast_live_changes(false);
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                stored_state.clone(),
+                super::ListRuntimeWork::LiveInputChange {
+                    construct_info: construct_info.clone(),
+                    change: ListChange::Push {
+                        item: second.clone(),
+                    },
+                },
+            );
+            stored_state.set_broadcast_live_changes(true);
+            reg.drain_runtime_ready_queue();
+        });
+
+        block_on(async {
+            let Some(ListChange::Replace { items }) = subscriber_receiver.next().await else {
+                panic!("initialized list subscriber should receive a snapshot replace first");
+            };
+            assert_eq!(
+                items.len(),
+                1,
+                "initial snapshot should contain the seeded item"
+            );
+
+            let Some(ListChange::Push { item }) = subscriber_receiver.next().await else {
+                panic!("runtime should evaluate live-list broadcast gating at drain time");
+            };
+            let Value::Text(text, _) = item
+                .current_value()
+                .expect("broadcast item should expose current value")
+            else {
+                panic!("expected pushed actor value to be text");
+            };
+            assert_eq!(text.text(), "second");
+        });
+    }
+
+    #[test]
+    fn live_list_output_valve_close_broadcasts_future_changes_without_impulse_stream_loop() {
+        let first = test_actor_handle("first", 1);
+        let second = test_actor_handle("second", 2);
+        let stored_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let construct_info = ConstructInfo::new(
+            "test.live.list.output.valve.close",
+            None,
+            "test live list output valve close",
+        )
+        .complete(super::ConstructType::List);
+        let (mut change_sender, change_receiver) = mpsc::channel::<ListChange>(8);
+        let (subscriber_sender, mut subscriber_receiver) =
+            NamedChannel::new("test.live.list.output.valve.close.subscriber", 8);
+        let active = std::cell::Cell::new(true);
+        let direct_subscribers = std::cell::RefCell::new(smallvec::SmallVec::<
+            [super::OutputValveDirectSubscriber; 4],
+        >::new());
+        stored_state.register_change_subscriber(subscriber_sender);
+        stored_state.set_has_future_state_updates(true);
+        stored_state.set_broadcast_live_changes(false);
+        stored_state.set_rebroadcast_snapshot_on_output_close(true);
+        super::register_list_output_valve_runtime_subscriber_state(
+            &active,
+            &direct_subscribers,
+            &stored_state,
+        );
+
+        block_on(async move {
+            let drain = super::drain_live_list_runtime_inputs(
+                construct_info,
+                stored_state.clone(),
+                change_receiver,
+            );
+            let drive = async {
+                change_sender
+                    .send(ListChange::Replace {
+                        items: Arc::from(vec![first.clone()]),
+                    })
+                    .await
+                    .expect("initial replace should reach runtime feeder");
+
+                let Some(ListChange::Replace { items }) = subscriber_receiver.next().await else {
+                    panic!("subscriber should receive the initial replace from pending activation");
+                };
+                assert_eq!(items.len(), 1, "initial replace should initialize the list");
+
+                assert!(
+                    subscriber_receiver
+                        .next()
+                        .now_or_never()
+                        .flatten()
+                        .is_none(),
+                    "future live changes should stay gated before the output valve closes"
+                );
+
+                super::broadcast_output_valve_direct_subscribers(
+                    &direct_subscribers,
+                    super::OutputValveDirectEvent::Closed,
+                );
+
+                change_sender
+                    .send(ListChange::Push {
+                        item: second.clone(),
+                    })
+                    .await
+                    .expect("push should reach runtime feeder after output close");
+                drop(change_sender);
+
+                let Some(ListChange::Push { item }) = subscriber_receiver.next().await else {
+                    panic!("closed output valve should broadcast later live pushes directly");
+                };
+                let Value::Text(text, _) = item
+                    .current_value()
+                    .expect("pushed actor should expose current value")
+                else {
+                    panic!("expected pushed actor value to be text");
+                };
+                assert_eq!(text.text(), "second");
+            };
+
+            future::join(drain, drive).await;
+
+            assert!(
+                !stored_state.has_future_state_updates(),
+                "live list loop should clear future-update state when the change stream ends"
+            );
+        });
+    }
+
+    #[test]
+    fn live_list_output_valve_close_after_stream_end_rebroadcasts_final_snapshot() {
+        let first = test_actor_handle("first", 1);
+        let stored_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        let construct_info = ConstructInfo::new(
+            "test.live.list.output.valve.final.snapshot",
+            None,
+            "test live list output valve final snapshot",
+        )
+        .complete(super::ConstructType::List);
+        let (mut change_sender, change_receiver) = mpsc::channel::<ListChange>(8);
+        let (subscriber_sender, mut subscriber_receiver) =
+            NamedChannel::new("test.live.list.output.valve.final.snapshot.subscriber", 8);
+        let active = std::cell::Cell::new(true);
+        let direct_subscribers = std::cell::RefCell::new(smallvec::SmallVec::<
+            [super::OutputValveDirectSubscriber; 4],
+        >::new());
+        stored_state.set_has_future_state_updates(true);
+        stored_state.set_broadcast_live_changes(false);
+        stored_state.set_rebroadcast_snapshot_on_output_close(true);
+        super::register_list_output_valve_runtime_subscriber_state(
+            &active,
+            &direct_subscribers,
+            &stored_state,
+        );
+
+        block_on(async move {
+            change_sender
+                .send(ListChange::Replace {
+                    items: Arc::from(vec![first.clone()]),
+                })
+                .await
+                .expect("initial replace should reach runtime feeder");
+            drop(change_sender);
+
+            super::drain_live_list_runtime_inputs(
+                construct_info,
+                stored_state.clone(),
+                change_receiver,
+            )
+            .await;
+
+            assert!(
+                !stored_state.has_future_state_updates(),
+                "ended live list should mark future updates as finished before output close"
+            );
+
+            stored_state.register_change_subscriber(subscriber_sender);
+            let Some(ListChange::Replace { items }) = subscriber_receiver.next().await else {
+                panic!("late subscriber should receive the current snapshot immediately");
+            };
+            assert_eq!(
+                items.len(),
+                1,
+                "late subscription should replay the final snapshot"
+            );
+
+            super::broadcast_output_valve_direct_subscribers(
+                &direct_subscribers,
+                super::OutputValveDirectEvent::Closed,
+            );
+
+            let Some(ListChange::Replace { items }) = subscriber_receiver.next().await else {
+                panic!("output close after stream end should rebroadcast the final snapshot");
+            };
+            assert_eq!(
+                items.len(),
+                1,
+                "rebroadcast after stream end should preserve the final snapshot"
+            );
+        });
+    }
+
+    #[test]
     fn immediate_single_replace_change_stream_builds_static_list_without_retained_task() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
         let first = test_actor_handle("first", 1);
         let list = super::List::new_with_change_stream(
             ConstructInfo::new(
@@ -12400,7 +24807,10 @@ mod tests {
                 None,
                 "test immediate single replace list",
             ),
-            ActorContext::default(),
+            ActorContext {
+                registry_scope_id: Some(scope_id),
+                ..ActorContext::default()
+            },
             stream::once(future::ready(ListChange::Replace {
                 items: Arc::from(vec![first]),
             })),
@@ -12414,10 +24824,13 @@ mod tests {
                 1,
                 "list should initialize from the ready replace"
             );
-            assert!(
-                list.retained_tasks.borrow().is_empty(),
-                "single ready replace should stay on the static list path"
-            );
+            REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                assert!(
+                    reg.async_source_count_for_scope(list.scope_id) == 0,
+                    "single ready replace should stay on the static list path"
+                );
+            });
         });
     }
 
@@ -12489,7 +24902,7 @@ mod tests {
     }
 
     #[test]
-    fn live_list_change_loop_from_initialized_state_continues_after_ready_initial_replace() {
+    fn live_list_runtime_inputs_from_initialized_state_continue_after_ready_initial_replace() {
         let first = test_actor_handle("first", 1);
         let second = test_actor_handle("second", 2);
         let (mut change_sender, change_receiver) = mpsc::channel::<ListChange>(8);
@@ -12530,17 +24943,13 @@ mod tests {
                     item: second.clone(),
                 })
                 .await
-                .expect("push should reach continuation helper");
+                .expect("push should reach runtime feeder");
             drop(change_sender);
 
-            super::run_live_list_change_loop_core(
+            super::drain_live_list_runtime_inputs(
                 construct_info,
                 stored_state.clone(),
                 change_receiver,
-                None,
-                Some(vec![first.clone()]),
-                Some(list_arc_cache.expect("initial replace should populate list cache")),
-                (),
             )
             .await;
 
@@ -12556,6 +24965,26 @@ mod tests {
                 "replace + push should advance version in the initialized continuation path"
             );
         });
+    }
+
+    #[test]
+    fn list_runtime_source_end_work_clears_future_updates_through_runtime_queue() {
+        let stored_state = super::ListStoredState::new(super::DiffHistoryConfig::default());
+        stored_state.set_has_future_state_updates(true);
+
+        REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            reg.enqueue_list_runtime_work(
+                stored_state.clone(),
+                super::ListRuntimeWork::SourceEnded,
+            );
+            reg.drain_runtime_ready_queue();
+        });
+
+        assert!(
+            !stored_state.has_future_state_updates(),
+            "list source-end completion should clear future updates through list runtime work"
+        );
     }
 
     #[test]
@@ -12608,8 +25037,120 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires wasm/js runtime; host lib tests still touch js-sys statics"]
-    fn latest_combinator_ignores_older_late_arrivals() {
+    fn dropping_live_list_releases_scope_owned_feeder_task_before_scope_destroy() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let (_change_sender, change_receiver) = mpsc::channel::<ListChange>(8);
+        let list = Arc::new(List::new_with_change_stream(
+            ConstructInfo::new(
+                "test.live.list.drop_cleanup",
+                None,
+                "test live list drop cleanup",
+            ),
+            ActorContext {
+                registry_scope_id: Some(scope_id),
+                ..Default::default()
+            },
+            change_receiver,
+            (),
+        ));
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert!(
+                reg.async_source_count_for_scope(scope_id) > 0,
+                "active live list should register a scope-owned feeder task"
+            );
+        });
+
+        drop(list);
+        let mut feeder_cleared = false;
+        for _ in 0..20 {
+            super::drain_pending_registry_cleanups();
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            super::poll_test_async_source_tasks();
+            let async_source_count =
+                REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+            if async_source_count == 0 {
+                feeder_cleared = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            feeder_cleared,
+            "dropping the live list should release its scope-owned feeder task before scope teardown"
+        );
+    }
+
+    #[test]
+    fn completed_live_list_releases_scope_owned_feeder_task_before_scope_destroy() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let (mut change_sender, change_receiver) = mpsc::channel::<ListChange>(8);
+        let first = test_actor_handle("first", 1);
+
+        change_sender
+            .try_send(ListChange::Replace {
+                items: Arc::from(vec![first.clone()]),
+            })
+            .expect("ready initial replace should be queued before live list creation");
+
+        let list = Arc::new(List::new_with_change_stream(
+            ConstructInfo::new(
+                "test.live.list.completed_cleanup",
+                None,
+                "test live list completed cleanup",
+            ),
+            ActorContext {
+                registry_scope_id: Some(scope_id),
+                ..Default::default()
+            },
+            change_receiver,
+            (),
+        ));
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert!(
+                reg.async_source_count_for_scope(scope_id) > 0,
+                "pending live list should register one scope-owned feeder task"
+            );
+        });
+
+        assert_eq!(
+            list.stored_state.snapshot().len(),
+            1,
+            "ready initial replace should initialize direct list state before feeder cleanup"
+        );
+
+        drop(change_sender);
+
+        let mut feeder_cleared = false;
+        for _ in 0..20 {
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            super::poll_test_async_source_tasks();
+            let async_source_count =
+                REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+            if async_source_count == 0 {
+                feeder_cleared = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            feeder_cleared,
+            "completed live lists should release their scope-owned feeder task before scope teardown"
+        );
+        assert!(
+            !list.stored_state.has_future_state_updates(),
+            "completed live list should clear its future-update flag after stream end"
+        );
+    }
+
+    #[test]
+    fn latest_combinator_direct_state_inputs_ignore_older_late_arrivals_without_async_source_task()
+    {
         let scope_id = create_registry_scope(None);
         let _scope_guard = ScopeDestroyGuard::new(scope_id);
         let actor_context = ActorContext {
@@ -12631,6 +25172,15 @@ mod tests {
             actor_context,
             vec![left_actor.clone(), right_actor.clone()],
         );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct-state latest combinator inputs should use runtime subscribers instead of async source tasks"
+            );
+        });
 
         block_on(async move {
             let mut updates = latest_actor.stream_from_now();
@@ -12670,5 +25220,84 @@ mod tests {
             };
             assert_eq!(current_text.text(), "commit");
         });
+    }
+
+    #[test]
+    fn latest_combinator_with_lazy_input_uses_one_scope_task_and_updates_output() {
+        let scope_id = create_registry_scope(None);
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+        let actor_context = ActorContext {
+            registry_scope_id: Some(scope_id),
+            ..Default::default()
+        };
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::new("")),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+
+        let (mut left_tx, left_rx) = mpsc::channel::<Value>(8);
+        let left_actor = create_actor_lazy(left_rx, PersistenceId::new(), scope_id);
+        let right_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        right_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.latest.lazy.right.initial",
+                None,
+                "test latest lazy right initial",
+            ),
+            construct_context.clone(),
+            PersistenceId::new(),
+            20,
+            "ready",
+        ));
+
+        let baseline_async_source_count =
+            REGISTRY.with(|reg| reg.borrow().async_source_count_for_scope(scope_id));
+        let latest_actor = LatestCombinator::new_arc_value_actor(
+            ConstructInfo::new("test.latest.lazy", None, "test latest lazy combinator"),
+            construct_context.clone(),
+            actor_context,
+            vec![left_actor, right_actor.clone()],
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                baseline_async_source_count + 2,
+                "lazy direct-state latest combinators should add one scope-owned watcher plus the first-demand lazy input task"
+            );
+        });
+
+        let Value::Text(text, _) = latest_actor
+            .current_value()
+            .expect("latest should still expose the ready eager input before lazy updates")
+        else {
+            panic!("latest should expose a text value from the eager input");
+        };
+        assert_eq!(text.text(), "ready");
+
+        left_tx
+            .try_send(Text::new_value(
+                ConstructInfo::new(
+                    "test.latest.lazy.left.update",
+                    None,
+                    "test latest lazy left update",
+                ),
+                construct_context,
+                ValueIdempotencyKey::new(),
+                "newest",
+            ))
+            .expect("lazy latest input should enqueue an update");
+        super::poll_test_async_source_tasks();
+
+        let Value::Text(text, _) = latest_actor
+            .current_value()
+            .expect("latest should switch to the lazy input after it emits")
+        else {
+            panic!("latest should keep a text value after the lazy update");
+        };
+        assert_eq!(text.text(), "newest");
     }
 }

@@ -1,15 +1,15 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use boon_engine_actors_lite::{
-    ActorsLiteMetricsComparison, ActorsLiteMetricsReport, MILESTONE_PLAYGROUND_EXAMPLES,
-    actors_lite_public_exposure_enabled,
+    actors_lite_public_exposure_enabled, ActorsLiteMetricsComparison, ActorsLiteMetricsReport,
+    MILESTONE_PLAYGROUND_EXAMPLES,
 };
 use serde::Serialize;
 
 use crate::commands::backend_metrics::{
-    ActorsLitePinnedEnvironmentComparison, ActorsLitePinnedEnvironmentReport,
     detect_actors_lite_pinned_environment, run_actors_lite_metrics_capture,
+    ActorsLitePinnedEnvironmentComparison, ActorsLitePinnedEnvironmentReport,
 };
-use crate::commands::test_examples::{TestOptions, TestResult, run_tests};
+use crate::commands::test_examples::{run_tests, TestOptions, TestResult};
 use crate::port_config::detect_ports;
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,7 +76,10 @@ pub async fn run_verify_actors_lite(
             let status = if example.passed { "[PASS]" } else { "[FAIL]" };
             match &example.error {
                 Some(error) => {
-                    println!("  {status} {} ({} ms): {}", example.name, example.duration_ms, error)
+                    println!(
+                        "  {status} {} ({} ms): {}",
+                        example.name, example.duration_ms, error
+                    )
                 }
                 None => println!("  {status} {} ({} ms)", example.name, example.duration_ms),
             }
@@ -158,11 +161,8 @@ pub async fn actors_lite_verification_report(
 
     let (metrics, metrics_comparison) = run_actors_lite_metrics_capture()
         .context("failed to collect ActorsLite metrics during verification")?;
-    let (pinned_environment, pinned_environment_comparison) = detect_actors_lite_pinned_environment(
-        warmed_session,
-        single_visible_tab,
-        no_devtools,
-    );
+    let (pinned_environment, pinned_environment_comparison) =
+        detect_actors_lite_pinned_environment(warmed_session, single_visible_tab, no_devtools);
 
     Ok(ActorsLiteVerificationReport {
         public_exposure_enabled: actors_lite_public_exposure_enabled(),

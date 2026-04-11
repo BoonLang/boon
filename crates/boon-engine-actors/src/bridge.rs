@@ -844,7 +844,7 @@ pub fn object_with_document_to_element_signal(
     // CRITICAL: Use switch_map (not flat_map) because the inner stream is infinite.
     // When example is switched, the document changes and we MUST switch to the new
     // root_element stream. flat_map would stay subscribed to the old one forever.
-    let element_stream = switch_map(root_actor.clone().stream(), move |value| {
+    let element_stream = switch_map(root_actor.current_or_future_stream(), move |value| {
         let resolved_root = if render_root.is_scene() {
             resolve_scene_root(&value.expect_object())
         } else {
@@ -866,7 +866,7 @@ pub fn object_with_document_to_element_signal(
             root_element_var
                 .value_actor()
                 .clone()
-                .stream()
+                .current_or_future_stream()
                 .map(move |v| (v, scene_ctx.clone()))
         })
     })
@@ -966,6 +966,717 @@ fn visible_signal_from_settings(
             })
         })
     })
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::object_with_document_to_element_signal;
+    use crate::engine::{Value, VirtualFilesystem};
+    use crate::interpreter;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+    use zoon::futures_util::{FutureExt, StreamExt, future::select, pin_mut};
+    use zoon::js_sys::Date;
+    use zoon::{El, Timer, start_app, web_sys};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    async fn next_value_with_timeout<S>(stream: &mut S, timeout_ms: u32, context: &str) -> Value
+    where
+        S: zoon::futures_util::stream::Stream<Item = Value> + Unpin,
+    {
+        let next_value = stream.next().fuse();
+        let timeout = Timer::sleep(timeout_ms).fuse();
+        pin_mut!(next_value);
+        pin_mut!(timeout);
+
+        match select(next_value, timeout).await {
+            zoon::futures_util::future::Either::Left((Some(value), _)) => value,
+            zoon::futures_util::future::Either::Left((None, _)) => {
+                panic!("{context}: stream ended before emitting a value")
+            }
+            zoon::futures_util::future::Either::Right((_, _)) => {
+                panic!("{context}: timed out waiting for the next value")
+            }
+        }
+    }
+
+    async fn wait_for_mount_text_value_at_least(
+        mount: &web_sys::Element,
+        minimum: i64,
+        timeout_ms: u32,
+        context: &str,
+    ) -> i64 {
+        let deadline = Date::now() + timeout_ms as f64;
+        loop {
+            let text = mount.text_content().unwrap_or_default();
+            if let Ok(value) = text.trim().parse::<i64>()
+                && value >= minimum
+            {
+                return value;
+            }
+
+            assert!(
+                Date::now() < deadline,
+                "{context}: timed out waiting for preview text to reach at least {minimum}",
+            );
+            Timer::sleep(10).await;
+        }
+    }
+
+    async fn wait_for_mount_text_value_at_most(
+        mount: &web_sys::Element,
+        maximum: i64,
+        timeout_ms: u32,
+        context: &str,
+    ) -> i64 {
+        let deadline = Date::now() + timeout_ms as f64;
+        loop {
+            let text = mount.text_content().unwrap_or_default();
+            if let Ok(value) = text.trim().parse::<i64>()
+                && value <= maximum
+            {
+                return value;
+            }
+
+            assert!(
+                Date::now() < deadline,
+                "{context}: timed out waiting for preview text to reach at most {maximum}",
+            );
+            Timer::sleep(10).await;
+        }
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn interpreted_interval_document_root_element_updates_across_multiple_ticks() {
+        let source = r#"
+document:
+    Duration[milliseconds: 50]
+    |> Timer/interval()
+    |> THEN { 1 }
+    |> Math/sum()
+    |> Document/new()
+"#;
+
+        let (
+            object,
+            _construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = interpreter::run_with_registry(
+            "bridge_interval_root_actor_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("interval root actor test source should run");
+
+        let document_object = object
+            .expect_variable("document")
+            .value_actor()
+            .current_value()
+            .expect("document variable should resolve immediately")
+            .expect_object();
+        let root_element_actor = document_object
+            .expect_variable("root_element")
+            .value_actor();
+
+        Timer::sleep(20).await;
+        assert!(
+            root_element_actor.current_value().is_err(),
+            "document root element actor should stay empty before the first interval tick",
+        );
+
+        Timer::sleep(80).await;
+        let Value::Number(first, _) = root_element_actor
+            .current_value()
+            .expect("document root element actor should resolve after the first interval tick")
+        else {
+            panic!("document root element actor should be a number after the first interval tick");
+        };
+        assert_eq!(first.number(), 1.0);
+
+        Timer::sleep(80).await;
+        let Value::Number(second, _) = root_element_actor.current_value().expect(
+            "document root element actor should keep updating after the second interval tick",
+        ) else {
+            panic!(
+                "document root element actor should stay a number after the second interval tick"
+            );
+        };
+        assert_eq!(second.number(), 2.0);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn interpreted_interval_document_root_element_stream_updates_across_multiple_ticks() {
+        let source = r#"
+document:
+    Duration[milliseconds: 50]
+    |> Timer/interval()
+    |> THEN { 1 }
+    |> Math/sum()
+    |> Document/new()
+"#;
+
+        let (
+            object,
+            _construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = interpreter::run_with_registry(
+            "bridge_interval_root_stream_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("interval root actor stream test source should run");
+
+        let document_object = object
+            .expect_variable("document")
+            .value_actor()
+            .current_value()
+            .expect("document variable should resolve immediately")
+            .expect_object();
+        let root_element_actor = document_object
+            .expect_variable("root_element")
+            .value_actor();
+
+        let stream = root_element_actor.current_or_future_stream();
+        pin_mut!(stream);
+
+        let first = next_value_with_timeout(
+            &mut stream,
+            2_000,
+            "parsed document root element stream first tick",
+        )
+        .await;
+        let second = next_value_with_timeout(
+            &mut stream,
+            2_000,
+            "parsed document root element stream second tick",
+        )
+        .await;
+
+        let Value::Number(first, _) = first else {
+            panic!("first parsed document root element stream tick should be a number");
+        };
+        assert_eq!(first.number(), 1.0);
+
+        let Value::Number(second, _) = second else {
+            panic!("second parsed document root element stream tick should be a number");
+        };
+        assert_eq!(second.number(), 2.0);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn document_bridge_interval_preview_updates_across_multiple_ticks() {
+        let window = web_sys::window().expect("window should exist in browser tests");
+        let document = window
+            .document()
+            .expect("document should exist in browser tests");
+        let mount_id = "boon-actors-bridge-interval-preview-test";
+
+        if let Some(existing_mount) = document.get_element_by_id(mount_id) {
+            existing_mount.remove();
+        }
+
+        let mount = document
+            .create_element("div")
+            .expect("test mount element should be creatable");
+        mount.set_id(mount_id);
+        document
+            .body()
+            .expect("document body should exist")
+            .append_child(&mount)
+            .expect("test mount should append to body");
+
+        let source = r#"
+document:
+    Duration[milliseconds: 50]
+    |> Timer/interval()
+    |> THEN { 1 }
+    |> Math/sum()
+    |> Document/new()
+"#;
+
+        let (
+            object,
+            construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = interpreter::run_with_registry(
+            "bridge_interval_preview_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("interval preview test source should run");
+
+        start_app(Some(mount_id), move || {
+            El::new().child_signal(object_with_document_to_element_signal(
+                object.clone(),
+                construct_context.clone(),
+            ))
+        });
+
+        Timer::sleep(20).await;
+        assert_eq!(
+            mount.text_content().unwrap_or_default().trim(),
+            "",
+            "preview bridge should stay empty before the first interval tick",
+        );
+
+        let first_visible = wait_for_mount_text_value_at_least(
+            &mount,
+            1,
+            2_000,
+            "preview bridge first visible interval value",
+        )
+        .await;
+        assert!(
+            first_visible >= 1,
+            "preview bridge should eventually show at least the first accumulated tick",
+        );
+
+        let second_visible = wait_for_mount_text_value_at_least(
+            &mount,
+            first_visible + 1,
+            2_000,
+            "preview bridge subsequent interval value",
+        )
+        .await;
+        assert!(
+            second_visible > first_visible,
+            "preview bridge should keep updating after the first visible interval tick",
+        );
+
+        mount.remove();
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn document_bridge_interval_hold_preview_updates_across_multiple_ticks() {
+        let window = web_sys::window().expect("window should exist in browser tests");
+        let document = window
+            .document()
+            .expect("document should exist in browser tests");
+        let mount_id = "boon-actors-bridge-interval-hold-preview-test";
+
+        if let Some(existing_mount) = document.get_element_by_id(mount_id) {
+            existing_mount.remove();
+        }
+
+        let mount = document
+            .create_element("div")
+            .expect("test mount element should be creatable");
+        mount.set_id(mount_id);
+        document
+            .body()
+            .expect("document body should exist")
+            .append_child(&mount)
+            .expect("test mount should append to body");
+
+        let source = r#"
+tick: Duration[milliseconds: 50] |> Timer/interval()
+
+counter:
+    0
+    |> HOLD counter {
+        tick |> THEN { counter + 1 }
+    }
+    |> Stream/skip(count: 1)
+
+document: counter |> Document/new()
+"#;
+
+        let (
+            object,
+            construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = interpreter::run_with_registry(
+            "bridge_interval_hold_preview_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("interval_hold preview test source should run");
+
+        start_app(Some(mount_id), move || {
+            El::new().child_signal(object_with_document_to_element_signal(
+                object.clone(),
+                construct_context.clone(),
+            ))
+        });
+
+        Timer::sleep(20).await;
+        assert_eq!(
+            mount.text_content().unwrap_or_default().trim(),
+            "",
+            "interval_hold preview should stay empty before the first tick",
+        );
+
+        let first_visible = wait_for_mount_text_value_at_least(
+            &mount,
+            1,
+            2_000,
+            "interval_hold preview first visible value",
+        )
+        .await;
+        assert!(first_visible >= 1);
+
+        let second_visible = wait_for_mount_text_value_at_least(
+            &mount,
+            first_visible + 1,
+            2_000,
+            "interval_hold preview subsequent value",
+        )
+        .await;
+        assert!(
+            second_visible > first_visible,
+            "interval_hold preview should keep updating after the first visible tick",
+        );
+
+        mount.remove();
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn document_bridge_then_preview_waits_for_trigger_before_updating() {
+        let window = web_sys::window().expect("window should exist in browser tests");
+        let document = window
+            .document()
+            .expect("document should exist in browser tests");
+        let mount_id = "boon-actors-bridge-then-preview-test";
+
+        if let Some(existing_mount) = document.get_element_by_id(mount_id) {
+            existing_mount.remove();
+        }
+
+        let mount = document
+            .create_element("div")
+            .expect("test mount element should be creatable");
+        mount.set_id(mount_id);
+        document
+            .body()
+            .expect("document body should exist")
+            .append_child(&mount)
+            .expect("test mount should append to body");
+
+        let source = r#"
+tick: Duration[milliseconds: 40] |> Timer/interval()
+trigger: Duration[milliseconds: 180] |> Timer/interval()
+
+input:
+    0
+    |> HOLD sum {
+        tick |> THEN { sum + 1 }
+    }
+
+captured: trigger |> THEN { input }
+
+document: captured |> Document/new()
+"#;
+
+        let (
+            object,
+            construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = interpreter::run_with_registry(
+            "bridge_then_preview_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("then preview test source should run");
+
+        start_app(Some(mount_id), move || {
+            El::new().child_signal(object_with_document_to_element_signal(
+                object.clone(),
+                construct_context.clone(),
+            ))
+        });
+
+        Timer::sleep(100).await;
+        assert_eq!(
+            mount.text_content().unwrap_or_default().trim(),
+            "",
+            "THEN preview should stay empty before the first trigger fires",
+        );
+
+        let first_visible = wait_for_mount_text_value_at_least(
+            &mount,
+            2,
+            2_000,
+            "THEN preview first captured value",
+        )
+        .await;
+        assert!(
+            first_visible >= 2,
+            "THEN preview should capture an accumulated input snapshot after the trigger",
+        );
+
+        let second_visible = wait_for_mount_text_value_at_least(
+            &mount,
+            first_visible + 1,
+            2_000,
+            "THEN preview second captured value",
+        )
+        .await;
+        assert!(
+            second_visible > first_visible,
+            "later THEN triggers should capture newer snapshots",
+        );
+
+        mount.remove();
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn document_bridge_when_preview_ignores_ticks_until_branch_switch() {
+        let window = web_sys::window().expect("window should exist in browser tests");
+        let document = window
+            .document()
+            .expect("document should exist in browser tests");
+        let mount_id = "boon-actors-bridge-when-preview-test";
+
+        if let Some(existing_mount) = document.get_element_by_id(mount_id) {
+            existing_mount.remove();
+        }
+
+        let mount = document
+            .create_element("div")
+            .expect("test mount element should be creatable");
+        mount.set_id(mount_id);
+        document
+            .body()
+            .expect("document body should exist")
+            .append_child(&mount)
+            .expect("test mount should append to body");
+
+        let source = r#"
+tick_a: Duration[milliseconds: 40] |> Timer/interval()
+tick_b: Duration[milliseconds: 60] |> Timer/interval()
+switch: Duration[milliseconds: 180] |> Timer/interval() |> THEN { Subtraction }
+
+input_a:
+    0
+    |> HOLD sum {
+        tick_a |> THEN { sum + 1 }
+    }
+
+input_b:
+    0
+    |> HOLD sum {
+        tick_b |> THEN { sum + 10 }
+    }
+
+operation: LATEST {
+    Addition
+    switch
+}
+
+current_result: operation |> WHEN {
+    Addition => input_a + input_b
+    Subtraction => input_a - input_b
+}
+
+document: current_result |> Document/new()
+"#;
+
+        let (
+            object,
+            construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = interpreter::run_with_registry(
+            "bridge_when_preview_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("when preview test source should run");
+
+        start_app(Some(mount_id), move || {
+            El::new().child_signal(object_with_document_to_element_signal(
+                object.clone(),
+                construct_context.clone(),
+            ))
+        });
+
+        Timer::sleep(20).await;
+        assert_eq!(
+            mount.text_content().unwrap_or_default().trim(),
+            "0",
+            "WHEN preview should expose the initial branch result immediately",
+        );
+
+        Timer::sleep(120).await;
+        assert_eq!(
+            mount.text_content().unwrap_or_default().trim(),
+            "0",
+            "WHEN preview should ignore active-branch input ticks before the branch changes",
+        );
+
+        let switched = wait_for_mount_text_value_at_most(
+            &mount,
+            -1,
+            2_000,
+            "WHEN preview switched branch value",
+        )
+        .await;
+        assert!(
+            switched < 0,
+            "WHEN preview should recompute once the selected branch changes",
+        );
+
+        mount.remove();
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn document_bridge_while_preview_keeps_updating_for_active_branch() {
+        let window = web_sys::window().expect("window should exist in browser tests");
+        let document = window
+            .document()
+            .expect("document should exist in browser tests");
+        let mount_id = "boon-actors-bridge-while-preview-test";
+
+        if let Some(existing_mount) = document.get_element_by_id(mount_id) {
+            existing_mount.remove();
+        }
+
+        let mount = document
+            .create_element("div")
+            .expect("test mount element should be creatable");
+        mount.set_id(mount_id);
+        document
+            .body()
+            .expect("document body should exist")
+            .append_child(&mount)
+            .expect("test mount should append to body");
+
+        let source = r#"
+tick_a: Duration[milliseconds: 40] |> Timer/interval()
+tick_b: Duration[milliseconds: 60] |> Timer/interval()
+switch: Duration[milliseconds: 180] |> Timer/interval() |> THEN { Subtraction }
+
+input_a:
+    0
+    |> HOLD sum {
+        tick_a |> THEN { sum + 1 }
+    }
+
+input_b:
+    0
+    |> HOLD sum {
+        tick_b |> THEN { sum + 10 }
+    }
+
+operation: LATEST {
+    Addition
+    switch
+}
+
+current_result: operation |> WHILE {
+    Addition => input_a + input_b
+    Subtraction => input_a - input_b
+}
+
+document: current_result |> Document/new()
+"#;
+
+        let (
+            object,
+            construct_context,
+            _registry,
+            _module_loader,
+            _reference_connector,
+            _link_connector,
+            _root_scope_guard,
+        ) = interpreter::run_with_registry(
+            "bridge_while_preview_test.bn",
+            source,
+            "",
+            "",
+            "",
+            VirtualFilesystem::new(),
+            None,
+        )
+        .expect("while preview test source should run");
+
+        start_app(Some(mount_id), move || {
+            El::new().child_signal(object_with_document_to_element_signal(
+                object.clone(),
+                construct_context.clone(),
+            ))
+        });
+
+        Timer::sleep(20).await;
+        assert_eq!(
+            mount.text_content().unwrap_or_default().trim(),
+            "0",
+            "WHILE preview should expose the initial branch result immediately",
+        );
+
+        let first_live = wait_for_mount_text_value_at_least(
+            &mount,
+            1,
+            1_000,
+            "WHILE preview first active-branch update",
+        )
+        .await;
+        assert!(
+            first_live > 0,
+            "WHILE preview should keep updating while the initial branch stays active",
+        );
+
+        let switched = wait_for_mount_text_value_at_most(
+            &mount,
+            -1,
+            2_000,
+            "WHILE preview switched branch value",
+        )
+        .await;
+        assert!(
+            switched < 0,
+            "WHILE preview should switch to the new branch result once the operation changes",
+        );
+
+        mount.remove();
+    }
 }
 
 /// Create a reactive disabled signal from a settings variable.

@@ -1,9 +1,9 @@
 use anyhow::{bail, Context, Result};
 use boon_engine_actors_lite::{
-    ActorsLiteMetricsComparison, ActorsLiteMetricsReport, actors_lite_metrics_snapshot,
+    actors_lite_metrics_snapshot, ActorsLiteMetricsComparison, ActorsLiteMetricsReport,
 };
 use boon_engine_factory_fabric::{
-    FactoryFabricMetricsComparison, FactoryFabricMetricsReport, factory_fabric_metrics_snapshot,
+    factory_fabric_metrics_snapshot, FactoryFabricMetricsComparison, FactoryFabricMetricsReport,
 };
 use boon_engine_wasm::{
     cells_backend_metrics_snapshot, CellsBackendComparison, CellsBackendMetricsReport,
@@ -258,11 +258,8 @@ pub fn run_actors_lite_metrics(
     no_devtools: bool,
 ) -> Result<()> {
     let (report, comparison) = run_actors_lite_metrics_capture()?;
-    let (environment, environment_comparison) = detect_actors_lite_pinned_environment(
-        warmed_session,
-        single_visible_tab,
-        no_devtools,
-    );
+    let (environment, environment_comparison) =
+        detect_actors_lite_pinned_environment(warmed_session, single_visible_tab, no_devtools);
 
     if json {
         println!(
@@ -298,9 +295,7 @@ pub fn run_actors_lite_metrics(
         );
         println!(
             "Pinned session flags: warmed={}, single_visible_tab={}, no_devtools={}",
-            environment.warmed_session,
-            environment.single_visible_tab,
-            environment.no_devtools
+            environment.warmed_session, environment.single_visible_tab, environment.no_devtools
         );
         println!(
             "RuntimeCore: actor creation p50 {:.3} ms, send latency p50 {:.3} ms, throughput {:.1} msg/s, peak actors {}, peak queue depth {}",
@@ -434,8 +429,14 @@ pub fn run_factory_fabric_metrics(json: bool, check: bool) -> Result<()> {
         println!(
             "  Cells Dynamic: cold mount {:.3} ms, steady-state edit p50 {:.3} ms, p95 {:.3} ms",
             report.cells_dynamic.cold_mount_to_stable_first_paint_millis,
-            report.cells_dynamic.steady_state_single_cell_edit_to_paint.p50_ms,
-            report.cells_dynamic.steady_state_single_cell_edit_to_paint.p95_ms
+            report
+                .cells_dynamic
+                .steady_state_single_cell_edit_to_paint
+                .p50_ms,
+            report
+                .cells_dynamic
+                .steady_state_single_cell_edit_to_paint
+                .p95_ms
         );
         println!(
             "    retained creates/deletes max: {}/{}, dirty count max: {}, function-instance reuse min: {:.3}, recreated mapped scopes max: {}",
@@ -445,7 +446,10 @@ pub fn run_factory_fabric_metrics(json: bool, check: bool) -> Result<()> {
             report.cells_dynamic.function_instance_reuse_hit_rate_min,
             report.cells_dynamic.recreated_mapped_scope_count_max
         );
-        println!("  Supported examples: {}", report.supported_examples.join(", "));
+        println!(
+            "  Supported examples: {}",
+            report.supported_examples.join(", ")
+        );
     }
 
     if check && !comparison.all_pass() {

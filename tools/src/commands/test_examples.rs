@@ -12,8 +12,8 @@ use crate::ws_server::{
 };
 
 use super::expected::{
-    ExpectedSpec, MatchMode, ParsedAction, matches_inline, parse_interaction_sequences,
-    shared_example_parsed_sequences, validate_required_shared_sequences,
+    matches_inline, parse_interaction_sequences, shared_example_parsed_sequences,
+    validate_required_shared_sequences, ExpectedSpec, MatchMode, OutputSpec, ParsedAction,
 };
 
 /// Options for test-examples command
@@ -98,6 +98,20 @@ fn post_refresh_delay_ms(initial_delay_ms: u64) -> u64 {
     // Keep a modest settle floor so the first example after extension reconnect has time
     // to finish wiring the page API before that explicit run.
     std::cmp::max(initial_delay_ms, 500)
+}
+
+fn should_reselect_example_after_refresh(
+    engine: Option<&str>,
+    target_file_already_loaded: bool,
+) -> bool {
+    engine == Some("ActorsLite") && !target_file_already_loaded
+}
+
+fn normalize_immediate_initial_preview(preview: Option<String>) -> Option<String> {
+    match preview.as_deref() {
+        None | Some("Run to see preview") => Some(String::new()),
+        _ => preview,
+    }
 }
 
 async fn send_command_with_timeout(
@@ -191,10 +205,7 @@ fn is_retryable_browser_error(message: &str) -> bool {
         || lower.contains("cannot find context with specified id")
 }
 
-async fn wait_for_non_retry_preview_text(
-    port: u16,
-    timeout: Duration,
-) -> Result<Option<String>> {
+async fn wait_for_non_retry_preview_text(port: u16, timeout: Duration) -> Result<Option<String>> {
     let start = Instant::now();
     let mut last_preview = None;
 
@@ -213,12 +224,9 @@ async fn wait_for_non_retry_preview_text(
 }
 
 async fn get_actors_lite_debug(port: u16) -> Result<Option<String>> {
-    let response = send_command_with_timeout(
-        port,
-        WsCommand::GetActorsLiteDebug,
-        Duration::from_secs(3),
-    )
-    .await?;
+    let response =
+        send_command_with_timeout(port, WsCommand::GetActorsLiteDebug, Duration::from_secs(3))
+            .await?;
 
     match response {
         WsResponse::ActorsLiteDebug { value } => Ok(value),
@@ -236,6 +244,10 @@ fn preview_needs_retry(preview: Option<&str>) -> bool {
     }
 }
 
+fn timer_category_requires_immediate_initial_match(output: &OutputSpec) -> bool {
+    matches!(output.r#match, MatchMode::Exact) && output.text.as_deref().map(str::trim) == Some("")
+}
+
 async fn clear_preview_input_memory(port: u16) -> Result<()> {
     let expression = r#"(function() {
         window.__boonLastPreviewTextInput = null;
@@ -246,7 +258,7 @@ async fn clear_preview_input_memory(port: u16) -> Result<()> {
         window.__boonLastPreviewTextSelectionEnd = null;
         return true;
     })()"#
-    .to_string();
+        .to_string();
 
     for attempt in 0..3 {
         let response = send_command_with_timeout(
@@ -282,8 +294,9 @@ async fn clear_preview_input_memory(port: u16) -> Result<()> {
 }
 
 async fn inject_example_code(port: u16, filename: &str, path: &Path) -> Result<()> {
-    let code = std::fs::read_to_string(path)
-        .map_err(|error| anyhow::anyhow!("Failed to read example '{}': {}", path.display(), error))?;
+    let code = std::fs::read_to_string(path).map_err(|error| {
+        anyhow::anyhow!("Failed to read example '{}': {}", path.display(), error)
+    })?;
     wait_for_playground_api_ready(port, Duration::from_secs(10)).await?;
 
     for attempt in 0..2 {
@@ -315,30 +328,44 @@ async fn inject_example_code(port: u16, filename: &str, path: &Path) -> Result<(
 }
 
 async fn trigger_run_then_capture(port: u16, _engine: Option<&str>) -> Result<Option<String>> {
-    let response = if _engine == Some("ActorsLite") {
-        send_command_to_server(
-            port,
-            WsCommand::EvalJs {
-                expression: r#"(function() {
-                    if (window.boonPlayground && typeof window.boonPlayground.run === 'function') {
-                        window.boonPlayground.run();
-                        return { ok: true, path: 'playground-api' };
-                    }
-                    return { ok: false, reason: 'window.boonPlayground.run unavailable' };
-                })()"#
-                    .to_string(),
-            },
-        )
-        .await?
-    } else {
-        send_command_to_server(port, WsCommand::TriggerRun).await?
-    };
+    let response = send_command_to_server(
+        port,
+        WsCommand::EvalJs {
+            expression: r#"(function() {
+                if (window.boonPlayground && typeof window.boonPlayground.run === 'function') {
+                    window.boonPlayground.run();
+                    return { ok: true, path: 'playground-api' };
+                }
+                return { ok: false, reason: 'window.boonPlayground.run unavailable' };
+            })()"#
+                .to_string(),
+        },
+    )
+    .await?;
+    if let WsResponse::Success { data } = &response {
+        let payload = match data {
+            Some(serde_json::Value::Object(map)) => Some(serde_json::Value::Object(map.clone())),
+            Some(serde_json::Value::String(json)) => serde_json::from_str(json).ok(),
+            _ => None,
+        };
+        if let Some(payload) = payload {
+            if payload.get("ok").and_then(|value| value.as_bool()) == Some(false) {
+                anyhow::bail!(
+                    "TriggerRun failed: {}",
+                    payload
+                        .get("reason")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("window.boonPlayground.run unavailable")
+                );
+            }
+        }
+    }
     if let WsResponse::Error { message } = response {
         let lower = message.to_ascii_lowercase();
         if _engine == Some("ActorsLite")
             && (lower.contains("timeout") || lower.contains("runtime.evaluate"))
         {
-            return match run_and_capture_initial(port).await {
+            return match run_and_capture_initial(port, true).await {
                 Ok(initial_preview) => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     wait_for_preview_to_settle(port).await;
@@ -370,24 +397,24 @@ async fn trigger_run_then_capture_immediate(
     port: u16,
     engine: Option<&str>,
 ) -> Result<Option<String>> {
-    let response = if engine == Some("ActorsLite") {
-        send_command_to_server(
-            port,
-            WsCommand::EvalJs {
-                expression: r#"(function() {
+    if engine != Some("ActorsLite") {
+        return run_and_capture_initial(port, false).await;
+    }
+
+    let response = send_command_to_server(
+        port,
+        WsCommand::EvalJs {
+            expression: r#"(function() {
                     if (window.boonPlayground && typeof window.boonPlayground.run === 'function') {
                         window.boonPlayground.run();
                         return { ok: true, path: 'playground-api' };
                     }
                     return { ok: false, reason: 'window.boonPlayground.run unavailable' };
                 })()"#
-                    .to_string(),
-            },
-        )
-        .await?
-    } else {
-        send_command_to_server(port, WsCommand::TriggerRun).await?
-    };
+                .to_string(),
+        },
+    )
+    .await?;
     if let WsResponse::Error { message } = response {
         anyhow::bail!("TriggerRun failed: {}", message);
     }
@@ -417,10 +444,13 @@ async fn trigger_run_until_preview_ready(
     Ok(preview)
 }
 
-async fn run_and_capture_initial(port: u16) -> Result<Option<String>> {
-    let response =
-        send_command_with_timeout(port, WsCommand::RunAndCaptureInitial, Duration::from_secs(10))
-            .await?;
+async fn run_and_capture_initial(port: u16, retry_on_placeholder: bool) -> Result<Option<String>> {
+    let response = send_command_with_timeout(
+        port,
+        WsCommand::RunAndCaptureInitial,
+        Duration::from_secs(10),
+    )
+    .await?;
     match response {
         WsResponse::RunAndCaptureInitial {
             success,
@@ -430,7 +460,7 @@ async fn run_and_capture_initial(port: u16) -> Result<Option<String>> {
             if !success {
                 anyhow::bail!("RunAndCaptureInitial reported failure");
             }
-            if initial_preview == "Run to see preview" {
+            if retry_on_placeholder && initial_preview == "Run to see preview" {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 let retry = send_command_with_timeout(
                     port,
@@ -497,7 +527,11 @@ async fn wait_for_playground_api_ready(port: u16, timeout: Duration) -> Result<(
     );
 }
 
-async fn wait_for_current_file(port: u16, expected_filename: &str, timeout: Duration) -> Result<()> {
+async fn wait_for_current_file(
+    port: u16,
+    expected_filename: &str,
+    timeout: Duration,
+) -> Result<()> {
     let start = Instant::now();
     let expected_json = serde_json::to_string(expected_filename)?;
     while start.elapsed() < timeout {
@@ -511,10 +545,7 @@ async fn wait_for_current_file(port: u16, expected_filename: &str, timeout: Dura
                         }}
                         return {{
                             ready: true,
-                            currentFile: window.boonPlayground.getCurrentFile(),
-                            codeLength: (typeof window.boonPlayground.getCode === 'function'
-                                ? window.boonPlayground.getCode().length
-                                : null)
+                            currentFile: window.boonPlayground.getCurrentFile()
                         }};
                     }})()"#
                 ),
@@ -540,9 +571,7 @@ async fn wait_for_current_file(port: u16, expected_filename: &str, timeout: Dura
         };
 
         let current_file = value.get("currentFile").and_then(|v| v.as_str());
-        let code_length = value.get("codeLength").and_then(|v| v.as_u64());
-        let has_code = code_length.map(|len| len > 0).unwrap_or(true);
-        if current_file == Some(expected_filename) && has_code {
+        if current_file == Some(expected_filename) {
             return Ok(());
         }
 
@@ -682,9 +711,13 @@ async fn refresh_to_example(
             keys.forEach(function(k) { localStorage.removeItem(k); });
             return keys.length;
         })()"#;
-        let _ = send_command_to_server(port, WsCommand::EvalJs {
-            expression: clear_expression.to_string(),
-        }).await;
+        let _ = send_command_to_server(
+            port,
+            WsCommand::EvalJs {
+                expression: clear_expression.to_string(),
+            },
+        )
+        .await;
     }
 
     if engine == Some("ActorsLite") {
@@ -703,20 +736,36 @@ async fn refresh_to_example(
         tokio::time::sleep(Duration::from_millis(min_delay_ms)).await;
         wait_for_playground_api_ready(port, Duration::from_secs(10)).await?;
     }
+
+    let response =
+        send_command_to_server(port, WsCommand::SetPersistence { enabled: false }).await?;
+    if let WsResponse::Error { message } = response {
+        anyhow::bail!("Disable persistence failed: {}", message);
+    }
+
     clear_preview_input_memory(port).await?;
 
-    let response = send_command_to_server(
-        port,
-        WsCommand::SelectExample {
-            name: select_name.to_string(),
-        },
-    )
-    .await?;
-    if let WsResponse::Error { message } = response {
-        anyhow::bail!("SelectExample failed for '{}': {}", select_name, message);
+    let target_file_already_loaded =
+        wait_for_current_file(port, editor_filename, Duration::from_secs(3))
+            .await
+            .is_ok();
+
+    if should_reselect_example_after_refresh(engine, target_file_already_loaded) {
+        let response = send_command_to_server(
+            port,
+            WsCommand::SelectExample {
+                name: select_name.to_string(),
+            },
+        )
+        .await?;
+        if let WsResponse::Error { message } = response {
+            anyhow::bail!("SelectExample failed for '{}': {}", select_name, message);
+        }
+        wait_for_current_file(port, editor_filename, Duration::from_secs(10)).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    } else {
+        wait_for_current_file(port, editor_filename, Duration::from_secs(10)).await?;
     }
-    wait_for_current_file(port, editor_filename, Duration::from_secs(10)).await?;
-    tokio::time::sleep(Duration::from_millis(150)).await;
 
     if engine == Some("ActorsLite") {
         inject_example_code(port, editor_filename, example_path).await?;
@@ -784,8 +833,14 @@ async fn refresh_to_example(
             return trigger_run_then_capture_immediate(port, engine).await;
         }
 
-        let initial_preview = get_preview_text(port).await?;
-        if preview_needs_retry(initial_preview.as_deref()) {
+        let initial_preview = if capture_stable_initial_preview {
+            trigger_run_then_capture(port, engine).await?
+        } else {
+            normalize_immediate_initial_preview(
+                trigger_run_then_capture_immediate(port, engine).await?,
+            )
+        };
+        if capture_stable_initial_preview && preview_needs_retry(initial_preview.as_deref()) {
             return trigger_run_then_capture(port, engine).await;
         }
         return Ok(initial_preview);
@@ -880,7 +935,7 @@ async fn refresh_to_example(
         return trigger_run_then_capture_immediate(port, engine).await;
     }
 
-    match run_and_capture_initial(port).await {
+    match run_and_capture_initial(port, true).await {
         Ok(initial_preview) => {
             if engine == Some("ActorsLite") {
                 let summary = initial_preview
@@ -902,10 +957,7 @@ async fn refresh_to_example(
                     example_name, error
                 );
             }
-            let is_timeout = error
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("timeout");
+            let is_timeout = error.to_string().to_ascii_lowercase().contains("timeout");
             if !is_timeout {
                 return Err(error);
             }
@@ -919,7 +971,7 @@ async fn refresh_to_example(
                 Ok(initial_preview)
             } else {
                 tokio::time::sleep(Duration::from_millis(750)).await;
-                let initial_preview = run_and_capture_initial(port).await?;
+                let initial_preview = run_and_capture_initial(port, true).await?;
                 wait_for_initial_interaction_settle(port).await;
                 Ok(initial_preview)
             }
@@ -1740,8 +1792,7 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
     let spec = ExpectedSpec::from_file(&example.expected_path)?;
     let parsed_sequences = parse_interaction_sequences(&spec.sequence)?;
     validate_required_shared_sequences(&example.name, &parsed_sequences)?;
-    let sequences =
-        shared_example_parsed_sequences(&example.name).unwrap_or(parsed_sequences);
+    let sequences = shared_example_parsed_sequences(&example.name).unwrap_or(parsed_sequences);
     let is_timer_category = matches!(spec.test.category.as_deref(), Some("timer"));
     let persistence_enabled = !opts.skip_persistence && !spec.persistence.is_empty();
 
@@ -1795,11 +1846,7 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
     // transitions. This keeps browser verification aligned with the plan's
     // "fresh Wasm example in the real browser" goal and avoids inherited
     // memory pressure from heavy examples like Cells.
-    let refresh_delay = if is_timer_category {
-        std::cmp::max(spec.timing.initial_delay, 2000)
-    } else {
-        post_refresh_delay_ms(spec.timing.initial_delay)
-    };
+    let refresh_delay = post_refresh_delay_ms(spec.timing.initial_delay);
     if opts.engine.as_deref() == Some("ActorsLite") {
         println!(
             "[ActorsLite harness] start example '{}' (initial_delay={}ms, refresh_delay={}ms, sequences={})",
@@ -1899,7 +1946,10 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
         if let Some(initial_preview) = initial_preview {
             match spec.output.matches(&initial_preview) {
                 Ok(true) => (true, initial_preview),
-                Ok(false) if !is_timer_category => {
+                Ok(false)
+                    if !is_timer_category
+                        || !timer_category_requires_immediate_initial_match(&spec.output) =>
+                {
                     let initial_result = wait_for_output(
                         opts.port,
                         &spec.output,
@@ -1990,9 +2040,7 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
         if opts.engine.as_deref() == Some("ActorsLite") {
             println!(
                 "[ActorsLite harness] sequence '{}' for '{}'",
-                seq.description
-                    .as_deref()
-                    .unwrap_or("<unnamed sequence>"),
+                seq.description.as_deref().unwrap_or("<unnamed sequence>"),
                 example.name
             );
         }
@@ -2003,15 +2051,14 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
                 println!("  -> {:?}", parsed);
             }
             last_action = Some(parsed.clone());
-            if let Err(e) =
-                execute_action(
-                    opts.port,
-                    opts.engine.as_deref(),
-                    parsed,
-                    &mut preferred_input_index,
-                    opts.verbose,
-                )
-                .await
+            if let Err(e) = execute_action(
+                opts.port,
+                opts.engine.as_deref(),
+                parsed,
+                &mut preferred_input_index,
+                opts.verbose,
+            )
+            .await
             {
                 let mut error_text = e.to_string();
                 if opts.engine.as_deref() == Some("ActorsLite") {
@@ -2022,13 +2069,13 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
                 }
                 // Action failed (including assertions) - record as test failure
                 steps.push(StepResult {
-                        description: seq
-                            .description
-                            .clone()
-                            .unwrap_or_else(|| format!("{:?}", parsed)),
-                        passed: false,
-                        actual: Some(error_text.clone()),
-                        expected: None,
+                    description: seq
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| format!("{:?}", parsed)),
+                    passed: false,
+                    actual: Some(error_text.clone()),
+                    expected: None,
                 });
                 return Ok(TestResult {
                     name: example.name.clone(),
@@ -2045,34 +2092,33 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
 
         // Check expected output if specified
         if let Some(ref expected) = seq.expect {
-            let step_result = if is_timer_category
-                && matches!(last_action, Some(ParsedAction::Wait { .. }))
-            {
-                wait_for_inline_output_after_explicit_wait(
-                    opts.port,
-                    expected,
-                    &seq.expect_match,
-                    500,
-                )
-                .await
-            } else if matches!(last_action, Some(ParsedAction::Wait { .. })) {
-                wait_for_inline_output_after_explicit_wait(
-                    opts.port,
-                    expected,
-                    &seq.expect_match,
-                    1200,
-                )
-                .await
-            } else {
-                wait_for_inline_output(
-                    opts.port,
-                    expected,
-                    &seq.expect_match,
-                    spec.timing.timeout,
-                    spec.timing.poll_interval,
-                )
-                .await
-            };
+            let step_result =
+                if is_timer_category && matches!(last_action, Some(ParsedAction::Wait { .. })) {
+                    wait_for_inline_output_after_explicit_wait(
+                        opts.port,
+                        expected,
+                        &seq.expect_match,
+                        500,
+                    )
+                    .await
+                } else if matches!(last_action, Some(ParsedAction::Wait { .. })) {
+                    wait_for_inline_output_after_explicit_wait(
+                        opts.port,
+                        expected,
+                        &seq.expect_match,
+                        1200,
+                    )
+                    .await
+                } else {
+                    wait_for_inline_output(
+                        opts.port,
+                        expected,
+                        &seq.expect_match,
+                        spec.timing.timeout,
+                        spec.timing.poll_interval,
+                    )
+                    .await
+                };
 
             let (passed, actual) = match step_result {
                 Ok(text) => (true, text),
@@ -2772,7 +2818,9 @@ async fn focused_preview_debug_via_eval(port: u16) -> Result<String> {
     match response {
         WsResponse::Success { data: Some(value) } => Ok(value.to_string()),
         WsResponse::Success { data: None } => Ok("null".to_string()),
-        WsResponse::Error { message } => anyhow::bail!("Focused preview debug eval failed: {}", message),
+        WsResponse::Error { message } => {
+            anyhow::bail!("Focused preview debug eval failed: {}", message)
+        }
         _ => anyhow::bail!("Unexpected response for focused preview debug eval"),
     }
 }
@@ -2815,11 +2863,16 @@ async fn preview_text_input_properties_via_eval(
         WsResponse::Success {
             data: Some(serde_json::Value::Object(value)),
         } => Ok((
-            value.get("found").and_then(|v| v.as_bool()).unwrap_or(false),
-            value.get("placeholder")
+            value
+                .get("found")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            value
+                .get("placeholder")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
-            value.get("value")
+            value
+                .get("value")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         )),
@@ -2828,11 +2881,16 @@ async fn preview_text_input_properties_via_eval(
         } => {
             let value: serde_json::Value = serde_json::from_str(&json)?;
             Ok((
-                value.get("found").and_then(|v| v.as_bool()).unwrap_or(false),
-                value.get("placeholder")
+                value
+                    .get("found")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                value
+                    .get("placeholder")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
-                value.get("value")
+                value
+                    .get("value")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
             ))
@@ -2883,7 +2941,10 @@ async fn preview_button_disabled_via_eval(port: u16, index: u32) -> Result<(bool
         WsResponse::Success {
             data: Some(serde_json::Value::Object(value)),
         } => Ok((
-            value.get("found").and_then(|v| v.as_bool()).unwrap_or(false),
+            value
+                .get("found")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             value
                 .get("disabled")
                 .and_then(|v| v.as_bool())
@@ -2899,7 +2960,10 @@ async fn preview_button_disabled_via_eval(port: u16, index: u32) -> Result<(bool
         } => {
             let value: serde_json::Value = serde_json::from_str(&json)?;
             Ok((
-                value.get("found").and_then(|v| v.as_bool()).unwrap_or(false),
+                value
+                    .get("found")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 value
                     .get("disabled")
                     .and_then(|v| v.as_bool())
@@ -3089,7 +3153,9 @@ async fn dispatch_preview_special_key_via_eval(port: u16, key: &str) -> Result<b
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false))
         }
-        WsResponse::Error { message } => anyhow::bail!("Preview special key eval failed: {}", message),
+        WsResponse::Error { message } => {
+            anyhow::bail!("Preview special key eval failed: {}", message)
+        }
         _ => Ok(false),
     }
 }
@@ -3251,7 +3317,9 @@ async fn type_preview_text_via_eval(port: u16, text: &str) -> Result<bool> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false))
         }
-        WsResponse::Error { message } => anyhow::bail!("Preview type text eval failed: {}", message),
+        WsResponse::Error { message } => {
+            anyhow::bail!("Preview type text eval failed: {}", message)
+        }
         _ => Ok(false),
     }
 }
@@ -3346,16 +3414,14 @@ async fn append_preview_text_via_eval(port: u16, text: &str) -> Result<bool> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false))
         }
-        WsResponse::Error { message } => anyhow::bail!("Preview append text eval failed: {}", message),
+        WsResponse::Error { message } => {
+            anyhow::bail!("Preview append text eval failed: {}", message)
+        }
         _ => Ok(false),
     }
 }
 
-async fn click_button_near_text_via_eval(
-    port: u16,
-    text: &str,
-    button_text: &str,
-) -> Result<bool> {
+async fn click_button_near_text_via_eval(port: u16, text: &str, button_text: &str) -> Result<bool> {
     let response = send_command_to_server(
         port,
         WsCommand::EvalJs {
@@ -3488,7 +3554,9 @@ async fn click_button_near_text_via_eval(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false))
         }
-        WsResponse::Error { message } => anyhow::bail!("Click button near text eval failed: {}", message),
+        WsResponse::Error { message } => {
+            anyhow::bail!("Click button near text eval failed: {}", message)
+        }
         _ => Ok(false),
     }
 }
@@ -3682,11 +3750,7 @@ async fn get_preview_stability_snapshot(port: u16) -> Result<(String, Option<Str
                 let _ = write!(
                     &mut signature,
                     "|{}@{:.0},{:.0},{:.0},{:.0}",
-                    element.direct_text,
-                    element.x,
-                    element.y,
-                    element.width,
-                    element.height
+                    element.direct_text, element.x, element.y, element.width, element.height
                 );
             }
             Some(signature)
@@ -3837,9 +3901,13 @@ async fn execute_action(
                     keys.forEach(function(k) { localStorage.removeItem(k); });
                     return keys.length;
                 })()"#;
-                let _ = send_command_to_server(port, WsCommand::EvalJs {
-                    expression: clear_expression.to_string(),
-                }).await;
+                let _ = send_command_to_server(
+                    port,
+                    WsCommand::EvalJs {
+                        expression: clear_expression.to_string(),
+                    },
+                )
+                .await;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
@@ -3862,7 +3930,8 @@ async fn execute_action(
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
             if matches!(key.as_str(), "Enter" | "Escape" | "Backspace" | "Delete") {
-                let changed = wait_for_preview_change_then_settle(port, before_snapshot.clone()).await;
+                let changed =
+                    wait_for_preview_change_then_settle(port, before_snapshot.clone()).await;
                 if !changed {
                     wait_for_preview_to_settle(port).await;
                 }
@@ -3967,9 +4036,7 @@ async fn execute_action(
                 }
                 if let Err(first_err) = wait_for_focused_text_input_suffix(port, text).await {
                     let focused_index = get_current_focused_input_index(port).await?;
-                    let retry_index = focused_index
-                        .or(*preferred_input_index)
-                        .or(Some(0));
+                    let retry_index = focused_index.or(*preferred_input_index).or(Some(0));
                     if let Some(index) = retry_index {
                         *preferred_input_index = Some(index);
                         let response =
@@ -4029,8 +4096,7 @@ async fn execute_action(
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let changed =
-                wait_for_preview_change_then_settle(port, before_snapshot.clone()).await;
+            let changed = wait_for_preview_change_then_settle(port, before_snapshot.clone()).await;
             if !changed {
                 let bounds = wait_for_preview_element_bounds_by_text(port, text, false).await?;
                 let x = bounds.x + bounds.width / 2;
@@ -4063,12 +4129,11 @@ async fn execute_action(
             if primary_error.is_some() || !changed {
                 if !click_button_by_index_via_eval(port, *index).await? {
                     if let Some(message) = primary_error {
-                        anyhow::bail!(
-                            "Click button failed: {}; eval fallback failed",
-                            message
-                        );
+                        anyhow::bail!("Click button failed: {}; eval fallback failed", message);
                     }
-                    anyhow::bail!("Click button failed: no preview change and eval fallback failed");
+                    anyhow::bail!(
+                        "Click button failed: no preview change and eval fallback failed"
+                    );
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 let _ = wait_for_preview_change_then_settle(port, before_snapshot).await;
@@ -4225,22 +4290,24 @@ async fn execute_action(
             let (x, y) = loop {
                 let response = send_command_to_server(port, WsCommand::GetPreviewElements).await?;
                 match response {
-                    WsResponse::PreviewElements { data } => match locate_cells_cell(&data, *row, *column) {
-                        Ok(lookup) => {
-                            let x = (lookup.cell.x + (lookup.cell.width / 2.0)).round() as i32;
-                            let y = (lookup.cell.y + (lookup.cell.height / 2.0)).round() as i32;
-                            break (x, y);
-                        }
-                        Err(error) => {
-                            let retryable =
-                                error.contains("row label") || error.contains("cell (");
-                            if retryable && Instant::now() < lookup_deadline {
-                                tokio::time::sleep(Duration::from_millis(200)).await;
-                                continue;
+                    WsResponse::PreviewElements { data } => {
+                        match locate_cells_cell(&data, *row, *column) {
+                            Ok(lookup) => {
+                                let x = (lookup.cell.x + (lookup.cell.width / 2.0)).round() as i32;
+                                let y = (lookup.cell.y + (lookup.cell.height / 2.0)).round() as i32;
+                                break (x, y);
                             }
-                            anyhow::bail!("Double-click cells cell failed: {}", error);
+                            Err(error) => {
+                                let retryable =
+                                    error.contains("row label") || error.contains("cell (");
+                                if retryable && Instant::now() < lookup_deadline {
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                    continue;
+                                }
+                                anyhow::bail!("Double-click cells cell failed: {}", error);
+                            }
                         }
-                    },
+                    }
                     WsResponse::Error { message } => {
                         anyhow::bail!("Double-click cells cell failed: {}", message);
                     }
@@ -4476,9 +4543,8 @@ async fn execute_action(
                         let mut last_input_index = actual_index;
                         if actual_index.is_none()
                             || last_tag_name.is_none()
-                            || input_index.is_some_and(|expected_idx| {
-                                actual_index != Some(expected_idx)
-                            })
+                            || input_index
+                                .is_some_and(|expected_idx| actual_index != Some(expected_idx))
                         {
                             let (fallback_tag_name, fallback_input_index) =
                                 focused_preview_input_via_eval(port).await?;
@@ -4582,7 +4648,8 @@ async fn execute_action(
             }
         }
         ParsedAction::AssertInputPlaceholder { index, expected } => {
-            let (found, placeholder, _) = preview_text_input_properties_via_eval(port, *index).await?;
+            let (found, placeholder, _) =
+                preview_text_input_properties_via_eval(port, *index).await?;
             if !found {
                 anyhow::bail!("Assert input placeholder failed: input {} not found", index);
             }
@@ -5010,7 +5077,8 @@ async fn execute_action(
             let deadline = Instant::now() + Duration::from_secs(5);
 
             loop {
-                let (found, _, value) = preview_text_input_properties_via_eval(port, *index).await?;
+                let (found, _, value) =
+                    preview_text_input_properties_via_eval(port, *index).await?;
                 let last_error = if !found {
                     format!("Assert input value failed: input {} not found", index)
                 } else {
@@ -5252,7 +5320,9 @@ fn preview_element_infos(data: &serde_json::Value) -> Vec<PreviewElementInfo> {
                 height: obj.get("height")?.as_f64()?,
             })
         })
-        .filter(|element| !element.direct_text.is_empty() && element.width > 0.0 && element.height > 0.0)
+        .filter(|element| {
+            !element.direct_text.is_empty() && element.width > 0.0 && element.height > 0.0
+        })
         .collect()
 }
 
@@ -5289,9 +5359,7 @@ fn find_preview_element_bounds_by_text(
         }
     }
 
-    fn candidate_bounds(
-        obj: &serde_json::Map<String, serde_json::Value>,
-    ) -> Option<ElementBounds> {
+    fn candidate_bounds(obj: &serde_json::Map<String, serde_json::Value>) -> Option<ElementBounds> {
         let (Some(x), Some(y), Some(width), Some(height)) = (
             obj.get("x").and_then(|v| v.as_f64()),
             obj.get("y").and_then(|v| v.as_f64()),
@@ -5348,9 +5416,7 @@ fn find_preview_element_bounds_by_text(
     candidates
         .into_iter()
         .min_by(|(priority_a, area_a, _), (priority_b, area_b, _)| {
-            priority_a
-                .cmp(priority_b)
-                .then_with(|| area_a.cmp(area_b))
+            priority_a.cmp(priority_b).then_with(|| area_a.cmp(area_b))
         })
         .map(|(_, _, bounds)| bounds)
 }
@@ -5373,7 +5439,9 @@ async fn wait_for_preview_element_bounds_by_text(
     loop {
         let response = send_command_to_server(port, WsCommand::GetPreviewElements).await?;
         let bounds = match response {
-            WsResponse::PreviewElements { data } => find_preview_element_bounds_by_text(&data, text, exact),
+            WsResponse::PreviewElements { data } => {
+                find_preview_element_bounds_by_text(&data, text, exact)
+            }
             WsResponse::Error { message } => anyhow::bail!("Click text failed: {}", message),
             _ => anyhow::bail!("Unexpected response for GetPreviewElements"),
         };
@@ -5389,7 +5457,10 @@ async fn wait_for_preview_element_bounds_by_text(
         }
 
         if Instant::now() >= deadline {
-            anyhow::bail!("Click text failed: no stable element found containing '{}'", text);
+            anyhow::bail!(
+                "Click text failed: no stable element found containing '{}'",
+                text
+            );
         }
 
         tokio::time::sleep(Duration::from_millis(75)).await;
@@ -5725,9 +5796,11 @@ async fn save_screenshot(port: u16, path: &str) -> Result<()> {
 }
 
 async fn get_preview(port: u16) -> Result<String> {
-    Ok(wait_for_non_retry_preview_text(port, Duration::from_millis(1500))
-        .await?
-        .unwrap_or_default())
+    Ok(
+        wait_for_non_retry_preview_text(port, Duration::from_millis(1500))
+            .await?
+            .unwrap_or_default(),
+    )
 }
 
 async fn get_console(port: u16) -> Result<Vec<String>> {
@@ -5925,4 +5998,79 @@ fn find_examples_dir() -> Result<PathBuf> {
     }
 
     anyhow::bail!("Could not find examples directory. Run from project root or use --examples-dir")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_immediate_initial_preview, should_reselect_example_after_refresh,
+        timer_category_requires_immediate_initial_match,
+    };
+    use crate::commands::expected::{MatchMode, OutputSpec};
+
+    #[test]
+    fn actors_harness_skips_reselect_when_target_file_is_already_loaded() {
+        assert!(!should_reselect_example_after_refresh(Some("Actors"), true));
+        assert!(!should_reselect_example_after_refresh(Some("DD"), true));
+        assert!(!should_reselect_example_after_refresh(None, true));
+    }
+
+    #[test]
+    fn harness_reselects_when_target_file_is_not_loaded_or_engine_needs_injection() {
+        assert!(should_reselect_example_after_refresh(Some("Actors"), false));
+        assert!(should_reselect_example_after_refresh(
+            Some("ActorsLite"),
+            true
+        ));
+        assert!(should_reselect_example_after_refresh(
+            Some("ActorsLite"),
+            false
+        ));
+    }
+
+    #[test]
+    fn immediate_capture_treats_placeholder_as_empty_preview() {
+        assert_eq!(
+            normalize_immediate_initial_preview(None),
+            Some(String::new())
+        );
+        assert_eq!(
+            normalize_immediate_initial_preview(Some("Run to see preview".to_string())),
+            Some(String::new())
+        );
+        assert_eq!(
+            normalize_immediate_initial_preview(Some("1".to_string())),
+            Some("1".to_string())
+        );
+    }
+
+    #[test]
+    fn timer_category_initial_wait_is_reserved_for_exact_empty_output() {
+        let exact_empty = OutputSpec {
+            r#match: MatchMode::Exact,
+            text: Some(String::new()),
+            pattern: None,
+        };
+        assert!(timer_category_requires_immediate_initial_match(
+            &exact_empty
+        ));
+
+        let exact_non_empty = OutputSpec {
+            r#match: MatchMode::Exact,
+            text: Some("Timer".to_string()),
+            pattern: None,
+        };
+        assert!(!timer_category_requires_immediate_initial_match(
+            &exact_non_empty
+        ));
+
+        let contains_output = OutputSpec {
+            r#match: MatchMode::Contains,
+            text: Some("Timer".to_string()),
+            pattern: None,
+        };
+        assert!(!timer_category_requires_immediate_initial_match(
+            &contains_output
+        ));
+    }
 }

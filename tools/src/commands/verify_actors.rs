@@ -1,7 +1,4 @@
 use anyhow::{bail, Context, Result};
-use boon_engine_factory_fabric::{
-    factory_fabric_metrics_snapshot, FactoryFabricMetricsComparison, SUPPORTED_PLAYGROUND_EXAMPLES,
-};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -10,7 +7,7 @@ use crate::port_config::detect_ports;
 use crate::ws_server::{send_command_to_server, Command as WsCommand, Response as WsResponse};
 
 #[derive(Debug, Clone, Serialize)]
-pub struct FactoryFabricExampleVerification {
+pub struct ActorsExampleVerification {
     pub name: String,
     pub passed: bool,
     pub duration_ms: u128,
@@ -19,33 +16,29 @@ pub struct FactoryFabricExampleVerification {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct FactoryFabricVerificationReport {
+pub struct ActorsVerificationReport {
     pub engine_exposed: bool,
     pub engine_status_ok: bool,
-    pub unsupported_error_smoke_ok: bool,
-    pub metrics_gate_ok: bool,
-    pub examples: Vec<FactoryFabricExampleVerification>,
+    pub examples: Vec<ActorsExampleVerification>,
 }
 
-impl FactoryFabricVerificationReport {
+impl ActorsVerificationReport {
     #[must_use]
     pub fn all_pass(&self) -> bool {
         self.engine_exposed
             && self.engine_status_ok
-            && self.unsupported_error_smoke_ok
-            && self.metrics_gate_ok
             && self.examples.iter().all(|example| example.passed)
     }
 }
 
-pub async fn run_verify_factory_fabric(json: bool, check: bool) -> Result<()> {
+pub async fn run_verify_actors(json: bool, check: bool) -> Result<()> {
     let ports = detect_ports();
-    let report = factory_fabric_verification_report(ports.ws_port, ports.playground_port).await?;
+    let report = actors_verification_report(ports.ws_port, ports.playground_port).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("FactoryFabric Verification");
+        println!("Actors Verification");
         println!(
             "  Engine exposed: {}",
             if report.engine_exposed {
@@ -57,22 +50,6 @@ pub async fn run_verify_factory_fabric(json: bool, check: bool) -> Result<()> {
         println!(
             "  Engine status contract: {}",
             if report.engine_status_ok {
-                "PASS"
-            } else {
-                "FAIL"
-            }
-        );
-        println!(
-            "  Unsupported example smoke: {}",
-            if report.unsupported_error_smoke_ok {
-                "PASS"
-            } else {
-                "FAIL"
-            }
-        );
-        println!(
-            "  Metrics gate: {}",
-            if report.metrics_gate_ok {
                 "PASS"
             } else {
                 "FAIL"
@@ -94,7 +71,7 @@ pub async fn run_verify_factory_fabric(json: bool, check: bool) -> Result<()> {
 
     if check && !report.all_pass() {
         bail!(
-            "FactoryFabric verification failed:\n{}",
+            "Actors verification failed:\n{}",
             serde_json::to_string_pretty(&report)?
         );
     }
@@ -102,18 +79,18 @@ pub async fn run_verify_factory_fabric(json: bool, check: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn factory_fabric_verification_report(
+pub async fn actors_verification_report(
     port: u16,
     playground_port: u16,
-) -> Result<FactoryFabricVerificationReport> {
+) -> Result<ActorsVerificationReport> {
     send_command_to_server(
         port,
         WsCommand::SetEngine {
-            engine: "FactoryFabric".to_string(),
+            engine: "Actors".to_string(),
         },
     )
     .await
-    .context("failed to select FactoryFabric engine for verification")?;
+    .context("failed to select Actors engine for verification")?;
     send_command_to_server(
         port,
         WsCommand::SelectExample {
@@ -121,20 +98,20 @@ pub async fn factory_fabric_verification_report(
         },
     )
     .await
-    .context("failed to select counter example for FactoryFabric verification")?;
+    .context("failed to select counter example for Actors verification")?;
     send_command_to_server(port, WsCommand::TriggerRun)
         .await
-        .context("failed to trigger counter run for FactoryFabric verification")?;
+        .context("failed to trigger counter run for Actors verification")?;
     let _ = wait_for_preview_text(port)
         .await
-        .context("failed to confirm counter preview before FactoryFabric verification")?;
+        .context("failed to confirm counter preview before Actors verification")?;
 
     let engine_info = eval_page_api(port, "window.boonPlayground.getEngine()")
         .await
-        .context("failed to fetch page engine info during FactoryFabric verification")?;
+        .context("failed to fetch page engine info during Actors verification")?;
     let engine_status = eval_page_api(port, "window.boonPlayground.getEngineStatus()")
         .await
-        .context("failed to fetch page engine status during FactoryFabric verification")?;
+        .context("failed to fetch page engine status during Actors verification")?;
 
     let engine_exposed = engine_info
         .get("availableEngines")
@@ -143,7 +120,7 @@ pub async fn factory_fabric_verification_report(
             engines
                 .iter()
                 .filter_map(Value::as_str)
-                .any(|engine| engine == "FactoryFabric")
+                .any(|engine| engine == "Actors")
         })
         && engine_info
             .get("displayAvailableEngines")
@@ -152,12 +129,12 @@ pub async fn factory_fabric_verification_report(
                 engines
                     .iter()
                     .filter_map(Value::as_str)
-                    .any(|engine| engine == "FactoryFabric")
+                    .any(|engine| engine == "Actors")
             });
     let engine_status_ok = engine_status
         .get("engine")
         .and_then(Value::as_str)
-        .is_some_and(|engine| engine == "FactoryFabric")
+        .is_some_and(|engine| engine == "Actors")
         && engine_status
             .get("supported")
             .and_then(Value::as_bool)
@@ -166,16 +143,9 @@ pub async fn factory_fabric_verification_report(
             .get("quiescent")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    let unsupported_error_smoke_ok = verify_unsupported_example_smoke(port)
-        .await
-        .context("failed to verify FactoryFabric unsupported-example explicit error contract")?;
-    let metrics_report = factory_fabric_metrics_snapshot()
-        .map_err(anyhow::Error::msg)
-        .context("failed to compute FactoryFabric metrics during verification")?;
-    let metrics_gate_ok = FactoryFabricMetricsComparison::from_report(&metrics_report).all_pass();
 
     let mut examples = Vec::new();
-    for filter in SUPPORTED_PLAYGROUND_EXAMPLES {
+    for filter in verification_example_filters() {
         let results = run_tests(TestOptions {
             port,
             playground_port,
@@ -185,11 +155,17 @@ pub async fn factory_fabric_verification_report(
             verbose: false,
             examples_dir: None,
             no_launch: false,
-            engine: Some("FactoryFabric".to_string()),
-            skip_persistence: true,
+            engine: Some("Actors".to_string()),
+            skip_persistence: false,
         })
         .await
-        .with_context(|| format!("failed to run FactoryFabric example filter '{filter}'"))?;
+        .with_context(|| format!("failed to run Actors example filter '{filter}'"))?;
+        if results.is_empty() {
+            bail!(
+                "Actors verification filter '{}' produced no matching browser test example",
+                filter
+            );
+        }
         if results.len() != 1 || results[0].name != *filter {
             let discovered = results
                 .iter()
@@ -197,7 +173,7 @@ pub async fn factory_fabric_verification_report(
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "FactoryFabric verification filter '{}' resolved to unexpected example set: [{}]",
+                "Actors verification filter '{}' resolved to unexpected example set: [{}]",
                 filter,
                 discovered
             );
@@ -205,11 +181,9 @@ pub async fn factory_fabric_verification_report(
         examples.extend(results.into_iter().map(into_example_verification));
     }
 
-    Ok(FactoryFabricVerificationReport {
+    Ok(ActorsVerificationReport {
         engine_exposed,
         engine_status_ok,
-        unsupported_error_smoke_ok,
-        metrics_gate_ok,
         examples,
     })
 }
@@ -228,58 +202,6 @@ async fn eval_page_api(port: u16, expression: &str) -> Result<Value> {
         WsResponse::Error { message } => bail!("page eval failed: {message}"),
         other => bail!("unexpected EvalJs response: {other:?}"),
     }
-}
-
-async fn verify_unsupported_example_smoke(port: u16) -> Result<bool> {
-    send_command_to_server(
-        port,
-        WsCommand::SelectExample {
-            name: "counter.bn".to_string(),
-        },
-    )
-    .await
-    .context("failed to select counter example for unsupported smoke")?;
-    send_command_to_server(
-        port,
-        WsCommand::InjectCode {
-            code: "broken: 1".to_string(),
-            filename: Some("counter.bn".to_string()),
-        },
-    )
-    .await
-    .context("failed to inject unsupported custom code for FactoryFabric smoke")?;
-    send_command_to_server(port, WsCommand::TriggerRun)
-        .await
-        .context("failed to trigger unsupported custom run")?;
-
-    let preview = wait_for_preview_text(port)
-        .await
-        .context("failed to read preview text for unsupported FactoryFabric smoke")?;
-    let status = eval_page_api(port, "window.boonPlayground.getEngineStatus()")
-        .await
-        .context("failed to fetch engine status after unsupported custom run")?;
-
-    send_command_to_server(
-        port,
-        WsCommand::SelectExample {
-            name: "counter.bn".to_string(),
-        },
-    )
-    .await
-    .context("failed to restore counter example after unsupported smoke")?;
-    send_command_to_server(port, WsCommand::TriggerRun)
-        .await
-        .context("failed to rerun counter after unsupported smoke")?;
-
-    Ok(preview.contains("FactoryFabric")
-        && status
-            .get("engine")
-            .and_then(Value::as_str)
-            .is_some_and(|engine| engine == "FactoryFabric")
-        && !status
-            .get("supported")
-            .and_then(Value::as_bool)
-            .unwrap_or(true))
 }
 
 async fn wait_for_preview_text(port: u16) -> Result<String> {
@@ -303,12 +225,49 @@ async fn wait_for_preview_text(port: u16) -> Result<String> {
     bail!("preview text did not stabilize before timeout")
 }
 
-fn into_example_verification(result: TestResult) -> FactoryFabricExampleVerification {
-    FactoryFabricExampleVerification {
+fn into_example_verification(result: TestResult) -> ActorsExampleVerification {
+    ActorsExampleVerification {
         name: result.name,
         passed: result.passed,
         duration_ms: result.duration.as_millis(),
         skipped: result.skipped,
         error: result.error,
+    }
+}
+
+fn verification_example_filters() -> &'static [&'static str] {
+    &[
+        "interval",
+        "interval_hold",
+        "timer",
+        "then",
+        "when",
+        "while",
+        "todo_mvc",
+        "cells",
+        "cells_dynamic",
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verification_example_filters;
+
+    #[test]
+    fn verification_filters_cover_async_and_acceptance_examples() {
+        assert_eq!(
+            verification_example_filters(),
+            &[
+                "interval",
+                "interval_hold",
+                "timer",
+                "then",
+                "when",
+                "while",
+                "todo_mvc",
+                "cells",
+                "cells_dynamic",
+            ]
+        );
     }
 }

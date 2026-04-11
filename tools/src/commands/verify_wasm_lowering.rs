@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use boon_engine_wasm::{WasmLoweringReport, official_7guis_wasm_lowering_report};
+use boon_engine_wasm::{official_7guis_wasm_lowering_report, WasmLoweringReport};
 
 pub fn run_verify_wasm_lowering(json: bool, check: bool) -> Result<()> {
     let report: WasmLoweringReport = official_7guis_wasm_lowering_report();
