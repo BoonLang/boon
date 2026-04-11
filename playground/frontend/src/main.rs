@@ -16,10 +16,7 @@ use boon::platform::browser::common::EngineType;
 #[cfg(feature = "engine-actors")]
 use boon_engine_actors::{
     bridge::object_with_document_to_element_signal,
-    engine::{
-        LinkConnector, Object, PassThroughConnector, ReferenceConnector, ScopeDestroyGuard,
-        VirtualFilesystem,
-    },
+    engine::{LinkConnector, Object, ReferenceConnector, ScopeDestroyGuard, VirtualFilesystem},
     evaluator::{FunctionRegistry, StaticFunctionDefinition},
     interpreter,
 };
@@ -781,7 +778,6 @@ struct ActorsPreviewKeepalive {
     object: Arc<Object>,
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
-    pass_through_connector: Arc<PassThroughConnector>,
     root_scope_guard: ScopeDestroyGuard,
 }
 
@@ -3453,7 +3449,6 @@ impl Playground {
                 _module_loader,
                 reference_connector,
                 link_connector,
-                pass_through_connector,
                 root_scope_guard,
             )) = evaluation_result
             {
@@ -3463,7 +3458,6 @@ impl Playground {
                         object: object.clone(),
                         reference_connector,
                         link_connector,
-                        pass_through_connector,
                         root_scope_guard,
                     });
                 El::new()

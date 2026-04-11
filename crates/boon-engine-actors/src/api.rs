@@ -1,10 +1,12 @@
+use std::cell::{Cell, RefCell};
 use std::future;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use zoon::Timer;
 use zoon::futures_channel::mpsc;
 use zoon::futures_util::{
-    FutureExt, SinkExt, pin_mut, select,
+    FutureExt, pin_mut, select,
     stream::{self, LocalBoxStream, Stream, StreamExt},
 };
 use zoon::{Closure, JsCast, JsValue, SendWrapper, UnwrapThrowExt, history, window};
@@ -1602,6 +1604,227 @@ pub fn function_element_link(
     )))
 }
 
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[serde(crate = "serde")]
+struct MathSumState {
+    input_value_idempotency_key: Option<ValueIdempotencyKey>,
+    sum: f64,
+    output_value_idempotency_key: Option<ValueIdempotencyKey>,
+}
+
+fn math_sum_result_value(
+    function_call_id: &ConstructId,
+    construct_context: &ConstructContext,
+    result_version: u64,
+    sum: f64,
+    idempotency_key: ValueIdempotencyKey,
+) -> Value {
+    Number::new_value(
+        ConstructInfo::new(
+            function_call_id.with_child_id(format!("Math/sum result v.{result_version}")),
+            None,
+            "Math/sum(..) -> Number",
+        ),
+        construct_context.clone(),
+        idempotency_key,
+        sum,
+    )
+}
+
+pub fn function_math_sum_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [argument_increment] = arguments.as_slice() else {
+        panic!("Unexpected argument count")
+    };
+    if argument_increment.has_lazy_delegate() {
+        return None;
+    }
+
+    let output_actor = create_actor_forwarding(PersistenceId::new(), actor_context.scope_id());
+    retain_actor_handles(&output_actor, arguments.iter().cloned());
+
+    let storage = construct_context.construct_storage.clone();
+    let state = Rc::new(RefCell::new(
+        storage
+            .load_state_now::<MathSumState>(function_call_persistence_id)
+            .unwrap_or_default(),
+    ));
+    let result_version = Rc::new(Cell::new(0u64));
+
+    {
+        let restored = *state.borrow();
+        if let Some(idempotency_key) = restored.output_value_idempotency_key {
+            output_actor.store_value_directly(math_sum_result_value(
+                &function_call_id,
+                &construct_context,
+                result_version.get(),
+                restored.sum,
+                idempotency_key,
+            ));
+            result_version.set(result_version.get() + 1);
+        }
+    }
+
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        argument_increment.register_direct_subscriber_with_registry(&mut reg, {
+            let output_actor = output_actor.clone();
+            let argument_increment = argument_increment.clone();
+            let state = state.clone();
+            let storage = storage.clone();
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            let result_version = result_version.clone();
+            move |reg, value| {
+                if !output_actor.is_alive() {
+                    return false;
+                }
+
+                let next_output = {
+                    let mut state = state.borrow_mut();
+                    let input_key = value.idempotency_key();
+                    if state.input_value_idempotency_key == Some(input_key) {
+                        None
+                    } else {
+                        state.input_value_idempotency_key = Some(input_key);
+                        state.sum += value.clone().expect_number().number();
+                        let output_key = ValueIdempotencyKey::new();
+                        state.output_value_idempotency_key = Some(output_key);
+                        storage.save_state(function_call_persistence_id, &*state);
+
+                        let version = result_version.get();
+                        result_version.set(version + 1);
+                        Some(math_sum_result_value(
+                            &function_call_id,
+                            &construct_context,
+                            version,
+                            state.sum,
+                            output_key,
+                        ))
+                    }
+                };
+
+                if let Some(output_value) = next_output {
+                    enqueue_actor_value_on_runtime_queue_with_registry(
+                        reg,
+                        &output_actor,
+                        output_value,
+                    );
+                }
+
+                argument_increment.is_alive()
+            }
+        });
+
+        drain_runtime_ready_queue_with_registry(&mut reg);
+    });
+
+    Some(output_actor)
+}
+
+pub(crate) fn function_math_sum_actor_with_registry(
+    reg: &mut ActorRegistry,
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [argument_increment] = arguments.as_slice() else {
+        panic!("Unexpected argument count")
+    };
+    if argument_increment.has_lazy_delegate_with_registry(reg) {
+        return None;
+    }
+
+    let output_actor =
+        create_actor_forwarding_with_registry(reg, PersistenceId::new(), actor_context.scope_id());
+    retain_actor_handles_with_registry(Some(reg), &output_actor, arguments.iter().cloned());
+
+    let storage = construct_context.construct_storage.clone();
+    let state = Rc::new(RefCell::new(
+        storage
+            .load_state_now::<MathSumState>(function_call_persistence_id)
+            .unwrap_or_default(),
+    ));
+    let result_version = Rc::new(Cell::new(0u64));
+
+    {
+        let restored = *state.borrow();
+        if let Some(idempotency_key) = restored.output_value_idempotency_key {
+            enqueue_actor_value_on_runtime_queue_with_registry(
+                reg,
+                &output_actor,
+                math_sum_result_value(
+                    &function_call_id,
+                    &construct_context,
+                    result_version.get(),
+                    restored.sum,
+                    idempotency_key,
+                ),
+            );
+            result_version.set(result_version.get() + 1);
+        }
+    }
+
+    argument_increment.register_direct_subscriber_with_registry(reg, {
+        let output_actor = output_actor.clone();
+        let argument_increment = argument_increment.clone();
+        let state = state.clone();
+        let storage = storage.clone();
+        let function_call_id = function_call_id.clone();
+        let construct_context = construct_context.clone();
+        let result_version = result_version.clone();
+        move |reg, value| {
+            if !output_actor.is_alive() {
+                return false;
+            }
+
+            let next_output = {
+                let mut state = state.borrow_mut();
+                let input_key = value.idempotency_key();
+                if state.input_value_idempotency_key == Some(input_key) {
+                    None
+                } else {
+                    state.input_value_idempotency_key = Some(input_key);
+                    state.sum += value.clone().expect_number().number();
+                    let output_key = ValueIdempotencyKey::new();
+                    state.output_value_idempotency_key = Some(output_key);
+                    storage.save_state(function_call_persistence_id, &*state);
+
+                    let version = result_version.get();
+                    result_version.set(version + 1);
+                    Some(math_sum_result_value(
+                        &function_call_id,
+                        &construct_context,
+                        version,
+                        state.sum,
+                        output_key,
+                    ))
+                }
+            };
+
+            if let Some(output_value) = next_output {
+                enqueue_actor_value_on_runtime_queue_with_registry(
+                    reg,
+                    &output_actor,
+                    output_value,
+                );
+            }
+
+            argument_increment.is_alive()
+        }
+    });
+
+    drain_runtime_ready_queue_with_registry(reg);
+    Some(output_actor)
+}
+
 // @TODO refactor
 /// ```text
 /// Math/sum(increment<Number>) -> Number
@@ -1613,14 +1836,6 @@ pub fn function_math_sum(
     construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
-    #[serde(crate = "serde")]
-    struct State {
-        input_value_idempotency_key: Option<ValueIdempotencyKey>,
-        sum: f64,
-        output_value_idempotency_key: Option<ValueIdempotencyKey>,
-    }
-
     let [argument_increment] = arguments.as_slice() else {
         panic!("Unexpected argument count")
     };
@@ -1630,25 +1845,28 @@ pub fn function_math_sum(
     stream::once({
         let storage = storage.clone();
         async move {
-            let loaded: Option<State> = storage.load_state(function_call_persistence_id).await;
+            let loaded: Option<MathSumState> =
+                storage.load_state(function_call_persistence_id).await;
             loaded
         }
     })
     .filter_map(future::ready)
     .chain(
         stream::once(async move {
-            argument_increment_for_chain.stream().map(|value| State {
-                input_value_idempotency_key: Some(value.idempotency_key()),
-                sum: value.expect_number().number(),
-                output_value_idempotency_key: None,
-            })
+            argument_increment_for_chain
+                .stream()
+                .map(|value| MathSumState {
+                    input_value_idempotency_key: Some(value.idempotency_key()),
+                    sum: value.expect_number().number(),
+                    output_value_idempotency_key: None,
+                })
         })
         .flatten(),
     )
     // @TODO refactor with async closure once possible?
-    .scan(State::default(), {
+    .scan(MathSumState::default(), {
         move |state,
-              State {
+              MathSumState {
                   input_value_idempotency_key,
                   sum: number,
                   output_value_idempotency_key,
@@ -1682,15 +1900,12 @@ pub fn function_math_sum(
     .map({
         let mut result_version = 0u64;
         move |(sum, idempotency_key)| {
-            let value = Number::new_value(
-                ConstructInfo::new(
-                    function_call_id.with_child_id(format!("Math/sum result v.{result_version}")),
-                    None,
-                    "Math/sum(..) -> Number",
-                ),
-                construct_context.clone(),
-                idempotency_key,
+            let value = math_sum_result_value(
+                &function_call_id,
+                &construct_context,
+                result_version,
                 sum,
+                idempotency_key,
             );
             result_version += 1;
             value
@@ -1721,6 +1936,120 @@ pub fn function_math_round(
             number.round(),
         )
     })
+}
+
+pub fn function_math_round_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [argument_number] = arguments.as_slice() else {
+        panic!("Math/round expects 1 argument")
+    };
+    if argument_number.has_lazy_delegate() {
+        return None;
+    }
+
+    let output_actor = create_actor_forwarding(PersistenceId::new(), actor_context.scope_id());
+    retain_actor_handles(&output_actor, arguments.iter().cloned());
+
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        argument_number.register_direct_subscriber_with_registry(&mut reg, {
+            let output_actor = output_actor.clone();
+            let argument_number = argument_number.clone();
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move |reg, value| {
+                if !output_actor.is_alive() {
+                    return false;
+                }
+
+                let number = match &value {
+                    Value::Number(n, _) => n.number(),
+                    _ => panic!("Math/round expects a Number value"),
+                };
+                enqueue_actor_value_on_runtime_queue_with_registry(
+                    reg,
+                    &output_actor,
+                    Number::new_value(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(0),
+                            None,
+                            "Math/round result",
+                        ),
+                        construct_context.clone(),
+                        ValueIdempotencyKey::new(),
+                        number.round(),
+                    ),
+                );
+
+                argument_number.is_alive()
+            }
+        });
+
+        drain_runtime_ready_queue_with_registry(&mut reg);
+    });
+
+    Some(output_actor)
+}
+
+pub(crate) fn function_math_round_actor_with_registry(
+    reg: &mut ActorRegistry,
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [argument_number] = arguments.as_slice() else {
+        panic!("Math/round expects 1 argument")
+    };
+    if argument_number.has_lazy_delegate_with_registry(reg) {
+        return None;
+    }
+
+    let output_actor =
+        create_actor_forwarding_with_registry(reg, PersistenceId::new(), actor_context.scope_id());
+    retain_actor_handles_with_registry(Some(reg), &output_actor, arguments.iter().cloned());
+
+    argument_number.register_direct_subscriber_with_registry(reg, {
+        let output_actor = output_actor.clone();
+        let argument_number = argument_number.clone();
+        let function_call_id = function_call_id.clone();
+        let construct_context = construct_context.clone();
+        move |reg, value| {
+            if !output_actor.is_alive() {
+                return false;
+            }
+
+            let number = match &value {
+                Value::Number(n, _) => n.number(),
+                _ => panic!("Math/round expects a Number value"),
+            };
+            enqueue_actor_value_on_runtime_queue_with_registry(
+                reg,
+                &output_actor,
+                Number::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "Math/round result",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    number.round(),
+                ),
+            );
+
+            argument_number.is_alive()
+        }
+    });
+
+    drain_runtime_ready_queue_with_registry(reg);
+    Some(output_actor)
 }
 
 /// Math/min(a, b) -> Number
@@ -1773,6 +2102,86 @@ pub fn function_math_min(
         .filter_map(future::ready)
 }
 
+pub fn function_math_min_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [argument_a, argument_b] = arguments.as_slice() else {
+        panic!("Math/min expects 2 arguments")
+    };
+    if argument_a.has_lazy_delegate() || argument_b.has_lazy_delegate() {
+        return None;
+    }
+
+    Some(BinaryOperatorCombinator::new_arc_value_actor(
+        construct_context,
+        actor_context,
+        argument_a.clone(),
+        argument_b.clone(),
+        |a, b, ctx, key| {
+            let a = match &a {
+                Value::Number(n, _) => n.number(),
+                _ => panic!("Math/min expects Number arguments"),
+            };
+            let b = match &b {
+                Value::Number(n, _) => n.number(),
+                _ => panic!("Math/min expects Number arguments"),
+            };
+            Number::new_value(
+                ConstructInfo::new("math_min_result", None, "Math/min result"),
+                ctx,
+                key,
+                a.min(b),
+            )
+        },
+    ))
+}
+
+pub(crate) fn function_math_min_actor_with_registry(
+    reg: &mut ActorRegistry,
+    arguments: Arc<Vec<ActorHandle>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [argument_a, argument_b] = arguments.as_slice() else {
+        panic!("Math/min expects 2 arguments")
+    };
+    if argument_a.has_lazy_delegate_with_registry(reg)
+        || argument_b.has_lazy_delegate_with_registry(reg)
+    {
+        return None;
+    }
+
+    BinaryOperatorCombinator::try_create_direct_state_actor_with_registry(
+        Some(reg),
+        construct_context,
+        actor_context,
+        argument_a.clone(),
+        argument_b.clone(),
+        Rc::new(|a, b, ctx, key| {
+            let a = match &a {
+                Value::Number(n, _) => n.number(),
+                _ => panic!("Math/min expects Number arguments"),
+            };
+            let b = match &b {
+                Value::Number(n, _) => n.number(),
+                _ => panic!("Math/min expects Number arguments"),
+            };
+            Number::new_value(
+                ConstructInfo::new("math_min_result", None, "Math/min result"),
+                ctx,
+                key,
+                a.min(b),
+            )
+        }),
+    )
+}
+
 /// Math/max(a, b) -> Number
 pub fn function_math_max(
     arguments: Arc<Vec<ActorHandle>>,
@@ -1823,6 +2232,86 @@ pub fn function_math_max(
         .filter_map(future::ready)
 }
 
+pub fn function_math_max_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [argument_a, argument_b] = arguments.as_slice() else {
+        panic!("Math/max expects 2 arguments")
+    };
+    if argument_a.has_lazy_delegate() || argument_b.has_lazy_delegate() {
+        return None;
+    }
+
+    Some(BinaryOperatorCombinator::new_arc_value_actor(
+        construct_context,
+        actor_context,
+        argument_a.clone(),
+        argument_b.clone(),
+        |a, b, ctx, key| {
+            let a = match &a {
+                Value::Number(n, _) => n.number(),
+                _ => panic!("Math/max expects Number arguments"),
+            };
+            let b = match &b {
+                Value::Number(n, _) => n.number(),
+                _ => panic!("Math/max expects Number arguments"),
+            };
+            Number::new_value(
+                ConstructInfo::new("math_max_result", None, "Math/max result"),
+                ctx,
+                key,
+                a.max(b),
+            )
+        },
+    ))
+}
+
+pub(crate) fn function_math_max_actor_with_registry(
+    reg: &mut ActorRegistry,
+    arguments: Arc<Vec<ActorHandle>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [argument_a, argument_b] = arguments.as_slice() else {
+        panic!("Math/max expects 2 arguments")
+    };
+    if argument_a.has_lazy_delegate_with_registry(reg)
+        || argument_b.has_lazy_delegate_with_registry(reg)
+    {
+        return None;
+    }
+
+    BinaryOperatorCombinator::try_create_direct_state_actor_with_registry(
+        Some(reg),
+        construct_context,
+        actor_context,
+        argument_a.clone(),
+        argument_b.clone(),
+        Rc::new(|a, b, ctx, key| {
+            let a = match &a {
+                Value::Number(n, _) => n.number(),
+                _ => panic!("Math/max expects Number arguments"),
+            };
+            let b = match &b {
+                Value::Number(n, _) => n.number(),
+                _ => panic!("Math/max expects Number arguments"),
+            };
+            Number::new_value(
+                ConstructInfo::new("math_max_result", None, "Math/max result"),
+                ctx,
+                key,
+                a.max(b),
+            )
+        }),
+    )
+}
+
 // @TODO remember configuration?
 /// ```text
 /// Timer/interval(duration<Duration[seconds<Number> | milliseconds<Number>]>) -> []
@@ -1850,25 +2339,101 @@ pub fn function_timer_interval(
         })
         .filter_map(future::ready);
 
-    let (tick_sender, tick_receiver) = mpsc::channel::<Value>(16);
+    type DurationSub = stream::Fuse<LocalBoxStream<'static, u32>>;
+    type IntervalState = (Option<DurationSub>, Option<u32>, u64);
 
-    let driver = zoon::Task::start_droppable(async move {
-        let mut tick_sender = tick_sender;
-        let mut duration_stream = Box::pin(duration_stream.fuse());
+    stream::unfold(
+        (Some(duration_stream.boxed_local().fuse()), None, 0u64),
+        move |state: IntervalState| {
+            let construct_context = construct_context.clone();
+            let function_call_id = function_call_id.clone();
+            async move {
+                let (duration_opt, mut current_milliseconds, result_version) = state;
+                let mut duration_stream = duration_opt.expect("duration stream should be present");
+
+                loop {
+                    let Some(milliseconds) = current_milliseconds else {
+                        current_milliseconds = duration_stream.next().await;
+                        if current_milliseconds.is_none() {
+                            return None;
+                        }
+                        continue;
+                    };
+
+                    let next_duration = duration_stream.next().fuse();
+                    let interval_sleep = Timer::sleep(milliseconds).fuse();
+                    pin_mut!(next_duration);
+                    pin_mut!(interval_sleep);
+
+                    select! {
+                        next_milliseconds = next_duration => {
+                            match next_milliseconds {
+                                Some(next_milliseconds) => current_milliseconds = Some(next_milliseconds),
+                                None => return None,
+                            }
+                        }
+                        _ = interval_sleep => {
+                            let output_value = Object::new_value(
+                                ConstructInfo::new(
+                                    function_call_id.with_child_id(format!("Timer/interval result v.{result_version}")),
+                                    None,
+                                    "Timer/interval(.. ) -> [..]",
+                                ),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                [],
+                            );
+                            return Some((output_value, (Some(duration_stream), current_milliseconds, result_version + 1)));
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+pub fn function_timer_interval_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> ActorHandle {
+    let [argument_duration] = arguments.as_slice() else {
+        panic!("Unexpected argument count")
+    };
+
+    let output_actor = create_actor_forwarding(PersistenceId::new(), actor_context.scope_id());
+    retain_actor_handles(&output_actor, arguments.iter().cloned());
+
+    let duration_stream = duration_actor_current_and_future_ms(argument_duration.clone())
+        .scan(None::<u32>, |last_ms, milliseconds| {
+            let normalized_ms = milliseconds.round().max(0.0).min(u32::MAX as f64) as u32;
+            if *last_ms == Some(normalized_ms) {
+                future::ready(Some(None))
+            } else {
+                *last_ms = Some(normalized_ms);
+                future::ready(Some(Some(normalized_ms)))
+            }
+        })
+        .filter_map(future::ready);
+
+    let output_actor_for_task = output_actor.clone();
+    start_retained_actor_scope_task(&output_actor, async move {
+        let mut duration_stream = duration_stream.boxed_local().fuse();
         let mut current_milliseconds = None::<u32>;
         let mut result_version = 0u64;
 
         loop {
             let Some(milliseconds) = current_milliseconds else {
-                current_milliseconds = duration_stream.as_mut().next().await;
+                current_milliseconds = duration_stream.next().await;
                 if current_milliseconds.is_none() {
-                    break;
+                    return;
                 }
                 continue;
             };
 
-            let mut duration_stream_ref = duration_stream.as_mut();
-            let next_duration = duration_stream_ref.next().fuse();
+            let next_duration = duration_stream.next().fuse();
             let interval_sleep = Timer::sleep(milliseconds).fuse();
             pin_mut!(next_duration);
             pin_mut!(interval_sleep);
@@ -1877,10 +2442,14 @@ pub fn function_timer_interval(
                 next_milliseconds = next_duration => {
                     match next_milliseconds {
                         Some(next_milliseconds) => current_milliseconds = Some(next_milliseconds),
-                        None => break,
+                        None => return,
                     }
                 }
                 _ = interval_sleep => {
+                    if !output_actor_for_task.is_alive() {
+                        return;
+                    }
+
                     let output_value = Object::new_value(
                         ConstructInfo::new(
                             function_call_id.with_child_id(format!("Timer/interval result v.{result_version}")),
@@ -1891,24 +2460,14 @@ pub fn function_timer_interval(
                         ValueIdempotencyKey::new(),
                         [],
                     );
-                    if tick_sender.send(output_value).await.is_err() {
-                        break;
-                    }
+                    enqueue_actor_value_on_runtime_queue(&output_actor_for_task, output_value);
                     result_version += 1;
                 }
             }
         }
     });
 
-    stream::unfold(
-        (tick_receiver, driver),
-        |(mut receiver, driver)| async move {
-            receiver
-                .next()
-                .await
-                .map(|value| (value, (receiver, driver)))
-        },
-    )
+    output_actor
 }
 
 // --- Text functions ---
@@ -2368,6 +2927,1204 @@ fn list_length_stream(list_actor: ActorHandle) -> LocalBoxStream<'static, usize>
         .boxed_local()
 }
 
+fn try_create_list_length_direct_actor_with_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    source_list_actor: ActorHandle,
+    actor_context: ActorContext,
+    on_length: impl FnMut(usize) -> Option<Value> + 'static,
+) -> Option<ActorHandle> {
+    let has_lazy_source = match reg {
+        Some(ref reg) => source_list_actor.has_lazy_delegate_with_registry(reg),
+        None => source_list_actor.has_lazy_delegate(),
+    };
+    if has_lazy_source {
+        return None;
+    }
+
+    let Value::List(initial_source_list, _) = source_list_actor.current_value().ok()? else {
+        return None;
+    };
+
+    let output_actor = match reg.as_deref_mut() {
+        Some(reg) => create_actor_forwarding_with_registry(
+            reg,
+            PersistenceId::new(),
+            actor_context.scope_id(),
+        ),
+        None => create_actor_forwarding(PersistenceId::new(), actor_context.scope_id()),
+    };
+    retain_actor_handles_with_registry(
+        reg.as_deref_mut(),
+        &output_actor,
+        std::iter::once(source_list_actor.clone()),
+    );
+
+    let current_source_list_key = Rc::new(Cell::new(None::<usize>));
+    let current_source_generation = Rc::new(Cell::new(0u64));
+    let current_length = Rc::new(Cell::new(None::<usize>));
+    let on_length = Rc::new(RefCell::new(on_length));
+
+    let connect_source_list = Rc::new({
+        let output_actor = output_actor.clone();
+        let current_source_list_key = current_source_list_key.clone();
+        let current_source_generation = current_source_generation.clone();
+        let current_length = current_length.clone();
+        let on_length = on_length.clone();
+        move |reg: &mut ActorRegistry, source_list: Arc<List>| {
+            let list_key = Arc::as_ptr(&source_list) as usize;
+            let generation = current_source_generation.get() + 1;
+            current_source_generation.set(generation);
+            current_source_list_key.set(Some(list_key));
+
+            register_list_direct_subscriber_with_registry(reg, &source_list, {
+                let output_actor = output_actor.clone();
+                let current_source_list_key = current_source_list_key.clone();
+                let current_source_generation = current_source_generation.clone();
+                let current_length = current_length.clone();
+                let on_length = on_length.clone();
+                move |reg, change| {
+                    if matches!(
+                        output_actor.current_value(),
+                        Err(CurrentValueError::ActorDropped)
+                    ) {
+                        return false;
+                    }
+                    if current_source_generation.get() != generation
+                        || current_source_list_key.get() != Some(list_key)
+                    {
+                        return false;
+                    }
+
+                    let previous_length = current_length.get().unwrap_or(0);
+                    let next_length = match change {
+                        ListChange::Replace { items } => items.len(),
+                        ListChange::Push { .. } | ListChange::InsertAt { .. } => {
+                            previous_length.saturating_add(1)
+                        }
+                        ListChange::Remove { .. } | ListChange::Pop => {
+                            previous_length.saturating_sub(1)
+                        }
+                        ListChange::Clear => 0,
+                        ListChange::UpdateAt { .. } | ListChange::Move { .. } => previous_length,
+                    };
+
+                    if current_length.get() != Some(next_length) {
+                        current_length.set(Some(next_length));
+                        if let Some(value) = (on_length.borrow_mut())(next_length) {
+                            enqueue_actor_value_on_runtime_queue_with_registry(
+                                reg,
+                                &output_actor,
+                                value,
+                            );
+                        }
+                    }
+
+                    true
+                }
+            });
+        }
+    });
+
+    match reg {
+        Some(reg) => {
+            source_list_actor.register_direct_subscriber_with_registry(reg, {
+                let output_actor = output_actor.clone();
+                let connect_source_list = connect_source_list.clone();
+                let current_source_list_key = current_source_list_key.clone();
+                move |reg, value| {
+                    if matches!(
+                        output_actor.current_value(),
+                        Err(CurrentValueError::ActorDropped)
+                    ) {
+                        return false;
+                    }
+                    let Value::List(source_list, _) = value else {
+                        return true;
+                    };
+                    let list_key = Arc::as_ptr(&source_list) as usize;
+                    if current_source_list_key.get() != Some(list_key) {
+                        connect_source_list(reg, source_list.clone());
+                    }
+                    true
+                }
+            });
+
+            if current_source_list_key.get().is_none() {
+                connect_source_list(reg, initial_source_list.clone());
+            }
+            drain_runtime_ready_queue_with_registry(reg);
+        }
+        None => {
+            REGISTRY.with(|reg| {
+                let mut reg = reg.borrow_mut();
+                source_list_actor.register_direct_subscriber_with_registry(&mut reg, {
+                    let output_actor = output_actor.clone();
+                    let connect_source_list = connect_source_list.clone();
+                    let current_source_list_key = current_source_list_key.clone();
+                    move |reg, value| {
+                        if matches!(
+                            output_actor.current_value(),
+                            Err(CurrentValueError::ActorDropped)
+                        ) {
+                            return false;
+                        }
+                        let Value::List(source_list, _) = value else {
+                            return true;
+                        };
+                        let list_key = Arc::as_ptr(&source_list) as usize;
+                        if current_source_list_key.get() != Some(list_key) {
+                            connect_source_list(reg, source_list.clone());
+                        }
+                        true
+                    }
+                });
+
+                if current_source_list_key.get().is_none() {
+                    connect_source_list(&mut reg, initial_source_list.clone());
+                }
+                drain_runtime_ready_queue_with_registry(&mut reg);
+            });
+        }
+    }
+
+    Some(output_actor)
+}
+
+fn try_create_list_selected_item_direct_actor_with_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    source_list_actor: ActorHandle,
+    index_actor: Option<ActorHandle>,
+    actor_context: ActorContext,
+    on_missing: impl Fn() -> Option<Value> + 'static,
+    select_actor: impl Fn(bool, &[ActorHandle], Option<Option<usize>>) -> DirectSelectedActorState
+    + 'static,
+) -> Option<ActorHandle> {
+    let has_lazy_source = match reg {
+        Some(ref reg) => {
+            source_list_actor.has_lazy_delegate_with_registry(reg)
+                || index_actor
+                    .as_ref()
+                    .is_some_and(|index_actor| index_actor.has_lazy_delegate_with_registry(reg))
+        }
+        None => {
+            source_list_actor.has_lazy_delegate()
+                || index_actor
+                    .as_ref()
+                    .is_some_and(ActorHandle::has_lazy_delegate)
+        }
+    };
+    if has_lazy_source {
+        return None;
+    }
+
+    let Value::List(initial_source_list, _) = source_list_actor.current_value().ok()? else {
+        return None;
+    };
+
+    let output_actor = match reg.as_deref_mut() {
+        Some(reg) => create_actor_forwarding_with_registry(
+            reg,
+            PersistenceId::new(),
+            actor_context.scope_id(),
+        ),
+        None => create_actor_forwarding(PersistenceId::new(), actor_context.scope_id()),
+    };
+    retain_actor_handles_with_registry(
+        reg.as_deref_mut(),
+        &output_actor,
+        std::iter::once(source_list_actor.clone()).chain(index_actor.clone()),
+    );
+
+    let current_source_list_key = Rc::new(Cell::new(None::<usize>));
+    let current_source_generation = Rc::new(Cell::new(0u64));
+    let current_items_ready = Rc::new(Cell::new(false));
+    let current_items = Rc::new(RefCell::new(Vec::<ActorHandle>::new()));
+    let current_index = Rc::new(Cell::new(None::<Option<usize>>));
+    let current_selection = Rc::new(Cell::new(None::<SelectedActorKey>));
+    let selected_generation = Rc::new(Cell::new(0u64));
+    let on_missing = Rc::new(on_missing);
+    let select_actor = Rc::new(select_actor);
+
+    let recompute_selection = Rc::new({
+        let output_actor = output_actor.clone();
+        let current_items_ready = current_items_ready.clone();
+        let current_items = current_items.clone();
+        let current_index = current_index.clone();
+        let current_selection = current_selection.clone();
+        let selected_generation = selected_generation.clone();
+        let on_missing = on_missing.clone();
+        let select_actor = select_actor.clone();
+        move |reg: &mut ActorRegistry| {
+            let next_selection = {
+                let items = current_items.borrow();
+                select_actor(
+                    current_items_ready.get(),
+                    items.as_slice(),
+                    current_index.get(),
+                )
+            };
+            let next_key = match &next_selection {
+                DirectSelectedActorState::Pending => SelectedActorKey::Pending,
+                DirectSelectedActorState::Missing => SelectedActorKey::Missing,
+                DirectSelectedActorState::Actor(actor) => SelectedActorKey::Actor(actor.actor_id()),
+            };
+            if current_selection.get() == Some(next_key) {
+                return;
+            }
+            current_selection.set(Some(next_key));
+            let generation = selected_generation.get().wrapping_add(1);
+            selected_generation.set(generation);
+
+            match next_selection {
+                DirectSelectedActorState::Pending => {}
+                DirectSelectedActorState::Actor(selected_actor) => {
+                    if let Ok(current_value) = selected_actor.current_value() {
+                        enqueue_actor_value_on_runtime_queue_with_registry(
+                            reg,
+                            &output_actor,
+                            current_value,
+                        );
+                    }
+                    selected_actor.register_direct_subscriber_with_registry(reg, {
+                        let output_actor = output_actor.clone();
+                        let selected_generation = selected_generation.clone();
+                        move |reg, value| {
+                            if !output_actor.is_alive() || selected_generation.get() != generation {
+                                return false;
+                            }
+                            enqueue_actor_value_on_runtime_queue_with_registry(
+                                reg,
+                                &output_actor,
+                                value.clone(),
+                            );
+                            true
+                        }
+                    });
+                }
+                DirectSelectedActorState::Missing => {
+                    if let Some(value) = on_missing() {
+                        enqueue_actor_value_on_runtime_queue_with_registry(
+                            reg,
+                            &output_actor,
+                            value,
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    let connect_source_list = Rc::new({
+        let current_source_list_key = current_source_list_key.clone();
+        let current_source_generation = current_source_generation.clone();
+        let current_items_ready = current_items_ready.clone();
+        let current_items = current_items.clone();
+        let recompute_selection = recompute_selection.clone();
+        move |reg: &mut ActorRegistry, source_list: Arc<List>| {
+            let list_key = Arc::as_ptr(&source_list) as usize;
+            let generation = current_source_generation.get().wrapping_add(1);
+            current_source_generation.set(generation);
+            current_source_list_key.set(Some(list_key));
+            current_items_ready.set(false);
+
+            register_list_direct_subscriber_with_registry(reg, &source_list, {
+                let current_source_list_key = current_source_list_key.clone();
+                let current_source_generation = current_source_generation.clone();
+                let current_items_ready = current_items_ready.clone();
+                let current_items = current_items.clone();
+                let recompute_selection = recompute_selection.clone();
+                move |reg, change| {
+                    if current_source_generation.get() != generation
+                        || current_source_list_key.get() != Some(list_key)
+                    {
+                        return false;
+                    }
+                    current_items_ready.set(true);
+                    change.clone().apply_to_vec(&mut current_items.borrow_mut());
+                    recompute_selection(reg);
+                    true
+                }
+            });
+        }
+    });
+
+    match reg {
+        Some(reg) => {
+            source_list_actor.register_direct_subscriber_with_registry(reg, {
+                let output_actor = output_actor.clone();
+                let connect_source_list = connect_source_list.clone();
+                let current_source_list_key = current_source_list_key.clone();
+                move |reg, value| {
+                    if matches!(
+                        output_actor.current_value(),
+                        Err(CurrentValueError::ActorDropped)
+                    ) {
+                        return false;
+                    }
+                    let Value::List(source_list, _) = value else {
+                        return true;
+                    };
+                    let list_key = Arc::as_ptr(source_list) as usize;
+                    if current_source_list_key.get() != Some(list_key) {
+                        connect_source_list(reg, source_list.clone());
+                    }
+                    true
+                }
+            });
+
+            if let Some(index_actor) = index_actor.as_ref() {
+                index_actor.register_direct_subscriber_with_registry(reg, {
+                    let current_index = current_index.clone();
+                    let recompute_selection = recompute_selection.clone();
+                    move |reg, value| {
+                        let Value::Number(number, _) = value else {
+                            return true;
+                        };
+                        current_index.set(Some(if number.number() >= 1.0 {
+                            Some((number.number() as usize).saturating_sub(1))
+                        } else {
+                            None
+                        }));
+                        recompute_selection(reg);
+                        true
+                    }
+                });
+            } else {
+                current_index.set(Some(None));
+            }
+
+            if current_source_list_key.get().is_none() {
+                connect_source_list(reg, initial_source_list.clone());
+            }
+            drain_runtime_ready_queue_with_registry(reg);
+        }
+        None => {
+            REGISTRY.with(|reg| {
+                let mut reg = reg.borrow_mut();
+                source_list_actor.register_direct_subscriber_with_registry(&mut reg, {
+                    let output_actor = output_actor.clone();
+                    let connect_source_list = connect_source_list.clone();
+                    let current_source_list_key = current_source_list_key.clone();
+                    move |reg, value| {
+                        if matches!(
+                            output_actor.current_value(),
+                            Err(CurrentValueError::ActorDropped)
+                        ) {
+                            return false;
+                        }
+                        let Value::List(source_list, _) = value else {
+                            return true;
+                        };
+                        let list_key = Arc::as_ptr(source_list) as usize;
+                        if current_source_list_key.get() != Some(list_key) {
+                            connect_source_list(reg, source_list.clone());
+                        }
+                        true
+                    }
+                });
+
+                if let Some(index_actor) = index_actor.as_ref() {
+                    index_actor.register_direct_subscriber_with_registry(&mut reg, {
+                        let current_index = current_index.clone();
+                        let recompute_selection = recompute_selection.clone();
+                        move |reg, value| {
+                            let Value::Number(number, _) = value else {
+                                return true;
+                            };
+                            current_index.set(Some(if number.number() >= 1.0 {
+                                Some((number.number() as usize).saturating_sub(1))
+                            } else {
+                                None
+                            }));
+                            recompute_selection(reg);
+                            true
+                        }
+                    });
+                } else {
+                    current_index.set(Some(None));
+                }
+
+                if current_source_list_key.get().is_none() {
+                    connect_source_list(&mut reg, initial_source_list.clone());
+                }
+                drain_runtime_ready_queue_with_registry(&mut reg);
+            });
+        }
+    }
+
+    Some(output_actor)
+}
+
+struct ListNumberAggregateState {
+    values: Vec<f64>,
+    initialized: Vec<bool>,
+    pending_count: usize,
+}
+
+fn try_create_list_number_aggregate_direct_actor_with_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    source_list_actor: ActorHandle,
+    actor_context: ActorContext,
+    initial_value: f64,
+    aggregate: impl Fn(&[f64]) -> f64 + 'static,
+    make_result: impl Fn(f64) -> Value + 'static,
+) -> Option<ActorHandle> {
+    let has_lazy_source = match reg {
+        Some(ref reg) => source_list_actor.has_lazy_delegate_with_registry(reg),
+        None => source_list_actor.has_lazy_delegate(),
+    };
+    if has_lazy_source {
+        return None;
+    }
+
+    let Value::List(initial_source_list, _) = source_list_actor.current_value().ok()? else {
+        return None;
+    };
+
+    let output_actor = match reg.as_deref_mut() {
+        Some(reg) => create_actor_forwarding_with_registry(
+            reg,
+            PersistenceId::new(),
+            actor_context.scope_id(),
+        ),
+        None => create_actor_forwarding(PersistenceId::new(), actor_context.scope_id()),
+    };
+    retain_actor_handles_with_registry(
+        reg.as_deref_mut(),
+        &output_actor,
+        std::iter::once(source_list_actor.clone()),
+    );
+
+    let current_source_list_key = Rc::new(Cell::new(None::<usize>));
+    let current_source_generation = Rc::new(Cell::new(0u64));
+    let current_items_generation = Rc::new(Cell::new(0u64));
+    let current_items = Rc::new(RefCell::new(Vec::<ActorHandle>::new()));
+    let aggregate_state = Rc::new(RefCell::new(ListNumberAggregateState {
+        values: Vec::new(),
+        initialized: Vec::new(),
+        pending_count: 0,
+    }));
+    let aggregate = Rc::new(aggregate);
+    let make_result = Rc::new(make_result);
+
+    let rebuild_item_subscriptions = Rc::new({
+        let output_actor = output_actor.clone();
+        let current_items_generation = current_items_generation.clone();
+        let current_items = current_items.clone();
+        let aggregate_state = aggregate_state.clone();
+        let aggregate = aggregate.clone();
+        let make_result = make_result.clone();
+        move |reg: &mut ActorRegistry| {
+            let generation = current_items_generation.get().wrapping_add(1);
+            current_items_generation.set(generation);
+            let items = current_items.borrow().clone();
+
+            {
+                let mut aggregate_state = aggregate_state.borrow_mut();
+                aggregate_state.values = vec![initial_value; items.len()];
+                aggregate_state.initialized = vec![false; items.len()];
+                aggregate_state.pending_count = items.len();
+            }
+
+            if items.is_empty() {
+                enqueue_actor_value_on_runtime_queue_with_registry(
+                    reg,
+                    &output_actor,
+                    make_result(initial_value),
+                );
+                return;
+            }
+
+            for (idx, item) in items.into_iter().enumerate() {
+                item.register_direct_subscriber_with_registry(reg, {
+                    let output_actor = output_actor.clone();
+                    let current_items_generation = current_items_generation.clone();
+                    let aggregate_state = aggregate_state.clone();
+                    let aggregate = aggregate.clone();
+                    let make_result = make_result.clone();
+                    move |reg, value| {
+                        if !output_actor.is_alive() || current_items_generation.get() != generation
+                        {
+                            return false;
+                        }
+
+                        let next_value = {
+                            let mut aggregate_state = aggregate_state.borrow_mut();
+                            if let Value::Number(number, _) = value {
+                                aggregate_state.values[idx] = number.number();
+                            }
+                            if !aggregate_state.initialized[idx] {
+                                aggregate_state.initialized[idx] = true;
+                                aggregate_state.pending_count =
+                                    aggregate_state.pending_count.saturating_sub(1);
+                            }
+                            (aggregate_state.pending_count == 0)
+                                .then(|| aggregate(aggregate_state.values.as_slice()))
+                        };
+
+                        if let Some(next_value) = next_value {
+                            enqueue_actor_value_on_runtime_queue_with_registry(
+                                reg,
+                                &output_actor,
+                                make_result(next_value),
+                            );
+                        }
+
+                        true
+                    }
+                });
+            }
+        }
+    });
+
+    let connect_source_list = Rc::new({
+        let current_source_list_key = current_source_list_key.clone();
+        let current_source_generation = current_source_generation.clone();
+        let current_items = current_items.clone();
+        let rebuild_item_subscriptions = rebuild_item_subscriptions.clone();
+        move |reg: &mut ActorRegistry, source_list: Arc<List>| {
+            let list_key = Arc::as_ptr(&source_list) as usize;
+            let generation = current_source_generation.get().wrapping_add(1);
+            current_source_generation.set(generation);
+            current_source_list_key.set(Some(list_key));
+
+            register_list_direct_subscriber_with_registry(reg, &source_list, {
+                let current_source_list_key = current_source_list_key.clone();
+                let current_source_generation = current_source_generation.clone();
+                let current_items = current_items.clone();
+                let rebuild_item_subscriptions = rebuild_item_subscriptions.clone();
+                move |reg, change| {
+                    if current_source_generation.get() != generation
+                        || current_source_list_key.get() != Some(list_key)
+                    {
+                        return false;
+                    }
+                    change.clone().apply_to_vec(&mut current_items.borrow_mut());
+                    rebuild_item_subscriptions(reg);
+                    true
+                }
+            });
+        }
+    });
+
+    match reg {
+        Some(reg) => {
+            source_list_actor.register_direct_subscriber_with_registry(reg, {
+                let output_actor = output_actor.clone();
+                let connect_source_list = connect_source_list.clone();
+                let current_source_list_key = current_source_list_key.clone();
+                move |reg, value| {
+                    if matches!(
+                        output_actor.current_value(),
+                        Err(CurrentValueError::ActorDropped)
+                    ) {
+                        return false;
+                    }
+                    let Value::List(source_list, _) = value else {
+                        return true;
+                    };
+                    let list_key = Arc::as_ptr(source_list) as usize;
+                    if current_source_list_key.get() != Some(list_key) {
+                        connect_source_list(reg, source_list.clone());
+                    }
+                    true
+                }
+            });
+
+            if current_source_list_key.get().is_none() {
+                connect_source_list(reg, initial_source_list.clone());
+            }
+            drain_runtime_ready_queue_with_registry(reg);
+        }
+        None => {
+            REGISTRY.with(|reg| {
+                let mut reg = reg.borrow_mut();
+                source_list_actor.register_direct_subscriber_with_registry(&mut reg, {
+                    let output_actor = output_actor.clone();
+                    let connect_source_list = connect_source_list.clone();
+                    let current_source_list_key = current_source_list_key.clone();
+                    move |reg, value| {
+                        if matches!(
+                            output_actor.current_value(),
+                            Err(CurrentValueError::ActorDropped)
+                        ) {
+                            return false;
+                        }
+                        let Value::List(source_list, _) = value else {
+                            return true;
+                        };
+                        let list_key = Arc::as_ptr(source_list) as usize;
+                        if current_source_list_key.get() != Some(list_key) {
+                            connect_source_list(reg, source_list.clone());
+                        }
+                        true
+                    }
+                });
+
+                if current_source_list_key.get().is_none() {
+                    connect_source_list(&mut reg, initial_source_list.clone());
+                }
+                drain_runtime_ready_queue_with_registry(&mut reg);
+            });
+        }
+    }
+
+    Some(output_actor)
+}
+
+fn try_create_list_latest_direct_actor_with_registry(
+    mut reg: Option<&mut ActorRegistry>,
+    source_list_actor: ActorHandle,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let has_lazy_source = match reg {
+        Some(ref reg) => source_list_actor.has_lazy_delegate_with_registry(reg),
+        None => source_list_actor.has_lazy_delegate(),
+    };
+    if has_lazy_source {
+        return None;
+    }
+
+    let Value::List(initial_source_list, _) = source_list_actor.current_value().ok()? else {
+        return None;
+    };
+
+    let output_actor = match reg.as_deref_mut() {
+        Some(reg) => create_actor_forwarding_with_registry(
+            reg,
+            PersistenceId::new(),
+            actor_context.scope_id(),
+        ),
+        None => create_actor_forwarding(PersistenceId::new(), actor_context.scope_id()),
+    };
+    retain_actor_handles_with_registry(
+        reg.as_deref_mut(),
+        &output_actor,
+        std::iter::once(source_list_actor.clone()),
+    );
+
+    let current_source_list_key = Rc::new(Cell::new(None::<usize>));
+    let current_source_generation = Rc::new(Cell::new(0u64));
+    let current_items_generation = Rc::new(Cell::new(0u64));
+    let current_items = Rc::new(RefCell::new(Vec::<ActorHandle>::new()));
+
+    let rebuild_item_subscriptions = Rc::new({
+        let output_actor = output_actor.clone();
+        let current_items_generation = current_items_generation.clone();
+        let current_items = current_items.clone();
+        move |reg: &mut ActorRegistry| {
+            let generation = current_items_generation.get().wrapping_add(1);
+            current_items_generation.set(generation);
+            let items = current_items.borrow().clone();
+
+            for item in items {
+                if let Ok(current_value) = item.current_value() {
+                    enqueue_actor_value_on_runtime_queue_with_registry(
+                        reg,
+                        &output_actor,
+                        current_value,
+                    );
+                }
+                item.register_direct_subscriber_with_registry(reg, {
+                    let output_actor = output_actor.clone();
+                    let current_items_generation = current_items_generation.clone();
+                    move |reg, value| {
+                        if !output_actor.is_alive() || current_items_generation.get() != generation
+                        {
+                            return false;
+                        }
+                        enqueue_actor_value_on_runtime_queue_with_registry(
+                            reg,
+                            &output_actor,
+                            value.clone(),
+                        );
+                        true
+                    }
+                });
+            }
+        }
+    });
+
+    let connect_source_list = Rc::new({
+        let current_source_list_key = current_source_list_key.clone();
+        let current_source_generation = current_source_generation.clone();
+        let current_items = current_items.clone();
+        let rebuild_item_subscriptions = rebuild_item_subscriptions.clone();
+        move |reg: &mut ActorRegistry, source_list: Arc<List>| {
+            let list_key = Arc::as_ptr(&source_list) as usize;
+            let generation = current_source_generation.get().wrapping_add(1);
+            current_source_generation.set(generation);
+            current_source_list_key.set(Some(list_key));
+
+            register_list_direct_subscriber_with_registry(reg, &source_list, {
+                let current_source_list_key = current_source_list_key.clone();
+                let current_source_generation = current_source_generation.clone();
+                let current_items = current_items.clone();
+                let rebuild_item_subscriptions = rebuild_item_subscriptions.clone();
+                move |reg, change| {
+                    if current_source_generation.get() != generation
+                        || current_source_list_key.get() != Some(list_key)
+                    {
+                        return false;
+                    }
+                    change.clone().apply_to_vec(&mut current_items.borrow_mut());
+                    rebuild_item_subscriptions(reg);
+                    true
+                }
+            });
+        }
+    });
+
+    match reg {
+        Some(reg) => {
+            source_list_actor.register_direct_subscriber_with_registry(reg, {
+                let output_actor = output_actor.clone();
+                let connect_source_list = connect_source_list.clone();
+                let current_source_list_key = current_source_list_key.clone();
+                move |reg, value| {
+                    if matches!(
+                        output_actor.current_value(),
+                        Err(CurrentValueError::ActorDropped)
+                    ) {
+                        return false;
+                    }
+                    let Value::List(source_list, _) = value else {
+                        return true;
+                    };
+                    let list_key = Arc::as_ptr(source_list) as usize;
+                    if current_source_list_key.get() != Some(list_key) {
+                        connect_source_list(reg, source_list.clone());
+                    }
+                    true
+                }
+            });
+
+            if current_source_list_key.get().is_none() {
+                connect_source_list(reg, initial_source_list.clone());
+            }
+            drain_runtime_ready_queue_with_registry(reg);
+        }
+        None => {
+            REGISTRY.with(|reg| {
+                let mut reg = reg.borrow_mut();
+                source_list_actor.register_direct_subscriber_with_registry(&mut reg, {
+                    let output_actor = output_actor.clone();
+                    let connect_source_list = connect_source_list.clone();
+                    let current_source_list_key = current_source_list_key.clone();
+                    move |reg, value| {
+                        if matches!(
+                            output_actor.current_value(),
+                            Err(CurrentValueError::ActorDropped)
+                        ) {
+                            return false;
+                        }
+                        let Value::List(source_list, _) = value else {
+                            return true;
+                        };
+                        let list_key = Arc::as_ptr(source_list) as usize;
+                        if current_source_list_key.get() != Some(list_key) {
+                            connect_source_list(reg, source_list.clone());
+                        }
+                        true
+                    }
+                });
+
+                if current_source_list_key.get().is_none() {
+                    connect_source_list(&mut reg, initial_source_list.clone());
+                }
+                drain_runtime_ready_queue_with_registry(&mut reg);
+            });
+        }
+    }
+
+    Some(output_actor)
+}
+
+fn try_create_triggered_list_direct_actor(
+    source_list_actor: ActorHandle,
+    trigger_actor: ActorHandle,
+    result_construct_info: ConstructInfo,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+    persistence_id: PersistenceId,
+    apply_trigger: impl Fn(&mut Vec<ActorHandle>) -> Option<ListChange> + 'static,
+) -> Option<ActorHandle> {
+    if source_list_actor.has_lazy_delegate() || trigger_actor.has_lazy_delegate() {
+        return None;
+    }
+
+    let Value::List(initial_source_list, _) = source_list_actor.current_value().ok()? else {
+        return None;
+    };
+
+    let direct_result = try_create_direct_runtime_list_actor(
+        result_construct_info,
+        construct_context,
+        actor_context,
+        persistence_id,
+        vec![source_list_actor.clone(), trigger_actor.clone()],
+        true,
+    )?;
+
+    let result_actor = direct_result.actor;
+    let result_list = direct_result.list;
+    let result_construct_info = direct_result.construct_info;
+    let broadcast_change = direct_result.broadcast_change;
+    let skip_initial_source_replace = Rc::new(Cell::new(direct_result.skip_initial_source_replace));
+
+    let current_source_list_key = Rc::new(Cell::new(None::<usize>));
+    let current_source_generation = Rc::new(Cell::new(0u64));
+    let current_items = Rc::new(RefCell::new(
+        result_list
+            .snapshot_now()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect::<Vec<_>>(),
+    ));
+    let current_items_ready = Rc::new(Cell::new(result_list.snapshot_now().is_some()));
+    let has_pending_trigger = Rc::new(Cell::new(false));
+    let apply_trigger = Rc::new(apply_trigger);
+
+    let emit_trigger_if_ready = Rc::new({
+        let result_list = result_list.clone();
+        let result_construct_info = result_construct_info.clone();
+        let current_items = current_items.clone();
+        let current_items_ready = current_items_ready.clone();
+        let has_pending_trigger = has_pending_trigger.clone();
+        let apply_trigger = apply_trigger.clone();
+        move |reg: &mut ActorRegistry| {
+            if !current_items_ready.get() {
+                has_pending_trigger.set(true);
+                return;
+            }
+
+            has_pending_trigger.set(false);
+            if let Some(change) = apply_trigger(&mut current_items.borrow_mut()) {
+                enqueue_list_change_on_runtime_queue_with_registry(
+                    reg,
+                    &result_list,
+                    result_construct_info.clone(),
+                    change,
+                    broadcast_change,
+                );
+            }
+        }
+    });
+
+    let connect_source_list = Rc::new({
+        let result_actor = result_actor.clone();
+        let result_list = result_list.clone();
+        let result_construct_info = result_construct_info.clone();
+        let current_source_list_key = current_source_list_key.clone();
+        let current_source_generation = current_source_generation.clone();
+        let current_items = current_items.clone();
+        let current_items_ready = current_items_ready.clone();
+        let skip_initial_source_replace = skip_initial_source_replace.clone();
+        let has_pending_trigger = has_pending_trigger.clone();
+        let emit_trigger_if_ready = emit_trigger_if_ready.clone();
+        move |reg: &mut ActorRegistry, source_list: Arc<List>| {
+            let list_key = Arc::as_ptr(&source_list) as usize;
+            let generation = current_source_generation.get().wrapping_add(1);
+            current_source_generation.set(generation);
+            current_source_list_key.set(Some(list_key));
+
+            register_list_direct_subscriber_with_registry(reg, &source_list, {
+                let result_actor = result_actor.clone();
+                let result_list = result_list.clone();
+                let result_construct_info = result_construct_info.clone();
+                let current_source_list_key = current_source_list_key.clone();
+                let current_source_generation = current_source_generation.clone();
+                let current_items = current_items.clone();
+                let current_items_ready = current_items_ready.clone();
+                let skip_initial_source_replace = skip_initial_source_replace.clone();
+                let has_pending_trigger = has_pending_trigger.clone();
+                let emit_trigger_if_ready = emit_trigger_if_ready.clone();
+                move |reg, change| {
+                    if matches!(
+                        result_actor.current_value(),
+                        Err(CurrentValueError::ActorDropped)
+                    ) {
+                        return false;
+                    }
+                    if current_source_generation.get() != generation
+                        || current_source_list_key.get() != Some(list_key)
+                    {
+                        return false;
+                    }
+
+                    if skip_initial_source_replace.get()
+                        && matches!(&change, ListChange::Replace { .. })
+                    {
+                        skip_initial_source_replace.set(false);
+                        current_items_ready.set(true);
+                        return true;
+                    }
+
+                    current_items_ready.set(true);
+                    change.clone().apply_to_vec(&mut current_items.borrow_mut());
+                    enqueue_list_change_on_runtime_queue_with_registry(
+                        reg,
+                        &result_list,
+                        result_construct_info.clone(),
+                        change.clone(),
+                        broadcast_change,
+                    );
+
+                    if has_pending_trigger.get() {
+                        emit_trigger_if_ready(reg);
+                    }
+                    true
+                }
+            });
+        }
+    });
+
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+
+        source_list_actor.register_direct_subscriber_with_registry(&mut reg, {
+            let result_actor = result_actor.clone();
+            let connect_source_list = connect_source_list.clone();
+            let current_source_list_key = current_source_list_key.clone();
+            move |reg, value| {
+                if matches!(
+                    result_actor.current_value(),
+                    Err(CurrentValueError::ActorDropped)
+                ) {
+                    return false;
+                }
+                let Value::List(source_list, _) = value else {
+                    return true;
+                };
+                let list_key = Arc::as_ptr(source_list) as usize;
+                if current_source_list_key.get() != Some(list_key) {
+                    connect_source_list(reg, source_list.clone());
+                }
+                true
+            }
+        });
+
+        trigger_actor.register_direct_subscriber_with_registry(&mut reg, {
+            let result_actor = result_actor.clone();
+            let emit_trigger_if_ready = emit_trigger_if_ready.clone();
+            move |reg, _value| {
+                if matches!(
+                    result_actor.current_value(),
+                    Err(CurrentValueError::ActorDropped)
+                ) {
+                    return false;
+                }
+                emit_trigger_if_ready(reg);
+                true
+            }
+        });
+
+        if current_source_list_key.get().is_none() {
+            connect_source_list(&mut reg, initial_source_list.clone());
+        }
+        drain_runtime_ready_queue_with_registry(&mut reg);
+    });
+
+    Some(result_actor)
+}
+
+fn try_create_list_append_direct_actor(
+    source_list_actor: ActorHandle,
+    item_actor: ActorHandle,
+    result_construct_info: ConstructInfo,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+    persistence_id: PersistenceId,
+) -> Option<ActorHandle> {
+    if source_list_actor.has_lazy_delegate() || item_actor.has_lazy_delegate() {
+        return None;
+    }
+
+    let Value::List(initial_source_list, _) = source_list_actor.current_value().ok()? else {
+        return None;
+    };
+
+    let direct_result = try_create_direct_runtime_list_actor(
+        result_construct_info,
+        construct_context,
+        actor_context.clone(),
+        persistence_id,
+        vec![source_list_actor.clone(), item_actor.clone()],
+        true,
+    )?;
+
+    let result_actor = direct_result.actor;
+    let result_list = direct_result.list;
+    let result_construct_info = direct_result.construct_info;
+    let broadcast_change = direct_result.broadcast_change;
+    let skip_initial_source_replace = Rc::new(Cell::new(direct_result.skip_initial_source_replace));
+    let scope_id = actor_context.scope_id();
+
+    let current_source_list_key = Rc::new(Cell::new(None::<usize>));
+    let current_source_generation = Rc::new(Cell::new(0u64));
+    let current_items = Rc::new(RefCell::new(
+        result_list
+            .snapshot_now()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect::<Vec<_>>(),
+    ));
+    let current_items_ready = Rc::new(Cell::new(result_list.snapshot_now().is_some()));
+    let buffered_appends = Rc::new(RefCell::new(Vec::<Value>::new()));
+
+    let append_value = Rc::new({
+        let result_list = result_list.clone();
+        let result_construct_info = result_construct_info.clone();
+        let current_items = current_items.clone();
+        let current_items_ready = current_items_ready.clone();
+        let buffered_appends = buffered_appends.clone();
+        move |reg: &mut ActorRegistry, value: Value| {
+            if !current_items_ready.get() {
+                buffered_appends.borrow_mut().push(value);
+                return;
+            }
+
+            let new_item_actor =
+                create_constant_actor_with_registry(reg, PersistenceId::new(), value, scope_id);
+            current_items.borrow_mut().push(new_item_actor.clone());
+            enqueue_list_change_on_runtime_queue_with_registry(
+                reg,
+                &result_list,
+                result_construct_info.clone(),
+                ListChange::Push {
+                    item: new_item_actor,
+                },
+                broadcast_change,
+            );
+        }
+    });
+
+    let flush_buffered_appends = Rc::new({
+        let append_value = append_value.clone();
+        let buffered_appends = buffered_appends.clone();
+        move |reg: &mut ActorRegistry| {
+            let buffered = std::mem::take(&mut *buffered_appends.borrow_mut());
+            for value in buffered {
+                append_value(reg, value);
+            }
+        }
+    });
+
+    let connect_source_list = Rc::new({
+        let result_actor = result_actor.clone();
+        let result_list = result_list.clone();
+        let result_construct_info = result_construct_info.clone();
+        let current_source_list_key = current_source_list_key.clone();
+        let current_source_generation = current_source_generation.clone();
+        let current_items = current_items.clone();
+        let current_items_ready = current_items_ready.clone();
+        let skip_initial_source_replace = skip_initial_source_replace.clone();
+        let flush_buffered_appends = flush_buffered_appends.clone();
+        move |reg: &mut ActorRegistry, source_list: Arc<List>| {
+            let list_key = Arc::as_ptr(&source_list) as usize;
+            let generation = current_source_generation.get().wrapping_add(1);
+            current_source_generation.set(generation);
+            current_source_list_key.set(Some(list_key));
+
+            register_list_direct_subscriber_with_registry(reg, &source_list, {
+                let result_actor = result_actor.clone();
+                let result_list = result_list.clone();
+                let result_construct_info = result_construct_info.clone();
+                let current_source_list_key = current_source_list_key.clone();
+                let current_source_generation = current_source_generation.clone();
+                let current_items = current_items.clone();
+                let current_items_ready = current_items_ready.clone();
+                let skip_initial_source_replace = skip_initial_source_replace.clone();
+                let flush_buffered_appends = flush_buffered_appends.clone();
+                move |reg, change| {
+                    if matches!(
+                        result_actor.current_value(),
+                        Err(CurrentValueError::ActorDropped)
+                    ) {
+                        return false;
+                    }
+                    if current_source_generation.get() != generation
+                        || current_source_list_key.get() != Some(list_key)
+                    {
+                        return false;
+                    }
+
+                    if skip_initial_source_replace.get()
+                        && matches!(&change, ListChange::Replace { .. })
+                    {
+                        skip_initial_source_replace.set(false);
+                        current_items_ready.set(true);
+                        flush_buffered_appends(reg);
+                        return true;
+                    }
+
+                    current_items_ready.set(true);
+                    change.clone().apply_to_vec(&mut current_items.borrow_mut());
+                    enqueue_list_change_on_runtime_queue_with_registry(
+                        reg,
+                        &result_list,
+                        result_construct_info.clone(),
+                        change.clone(),
+                        broadcast_change,
+                    );
+                    flush_buffered_appends(reg);
+                    true
+                }
+            });
+        }
+    });
+
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+
+        source_list_actor.register_direct_subscriber_with_registry(&mut reg, {
+            let result_actor = result_actor.clone();
+            let connect_source_list = connect_source_list.clone();
+            let current_source_list_key = current_source_list_key.clone();
+            move |reg, value| {
+                if matches!(
+                    result_actor.current_value(),
+                    Err(CurrentValueError::ActorDropped)
+                ) {
+                    return false;
+                }
+                let Value::List(source_list, _) = value else {
+                    return true;
+                };
+                let list_key = Arc::as_ptr(source_list) as usize;
+                if current_source_list_key.get() != Some(list_key) {
+                    connect_source_list(reg, source_list.clone());
+                }
+                true
+            }
+        });
+
+        item_actor.register_direct_subscriber_with_registry(&mut reg, {
+            let result_actor = result_actor.clone();
+            let append_value = append_value.clone();
+            move |reg, value| {
+                if matches!(
+                    result_actor.current_value(),
+                    Err(CurrentValueError::ActorDropped)
+                ) {
+                    return false;
+                }
+                append_value(reg, value.clone());
+                true
+            }
+        });
+
+        if current_source_list_key.get().is_none() {
+            connect_source_list(&mut reg, initial_source_list.clone());
+        }
+        drain_runtime_ready_queue_with_registry(&mut reg);
+    });
+
+    Some(result_actor)
+}
+
 fn current_list_items_stream(list: Arc<List>) -> LocalBoxStream<'static, Vec<ActorHandle>> {
     list.stream()
         .scan(
@@ -2432,6 +4189,73 @@ pub fn function_list_count(
     })
 }
 
+pub fn function_list_count_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/count expects 1 argument")
+    };
+    try_create_list_length_direct_actor_with_registry(
+        None,
+        source_list_actor.clone(),
+        actor_context,
+        {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move |current_len| {
+                Some(Number::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "List/count result",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    current_len as f64,
+                ))
+            }
+        },
+    )
+}
+
+pub(crate) fn function_list_count_actor_with_registry(
+    reg: &mut ActorRegistry,
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/count expects 1 argument")
+    };
+    try_create_list_length_direct_actor_with_registry(
+        Some(reg),
+        source_list_actor.clone(),
+        actor_context,
+        {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move |current_len| {
+                Some(Number::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "List/count result",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    current_len as f64,
+                ))
+            }
+        },
+    )
+}
+
 /// List/is_not_empty() -> Tag (True/False)
 /// Checks if the piped list is not empty (inverse of List/is_empty)
 /// Deduplicated: only emits when the result actually changes
@@ -2455,6 +4279,140 @@ pub fn function_list_is_not_empty(
             tag.to_string(),
         )
     })
+}
+
+pub fn function_list_is_empty_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/is_empty expects 1 argument")
+    };
+    try_create_list_length_direct_actor_with_registry(
+        None,
+        source_list_actor.clone(),
+        actor_context,
+        {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move |current_len| {
+                Some(Tag::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "List/is_empty result",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    if current_len == 0 { "True" } else { "False" }.to_string(),
+                ))
+            }
+        },
+    )
+}
+
+pub(crate) fn function_list_is_empty_actor_with_registry(
+    reg: &mut ActorRegistry,
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/is_empty expects 1 argument")
+    };
+    try_create_list_length_direct_actor_with_registry(
+        Some(reg),
+        source_list_actor.clone(),
+        actor_context,
+        {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move |current_len| {
+                Some(Tag::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "List/is_empty result",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    if current_len == 0 { "True" } else { "False" }.to_string(),
+                ))
+            }
+        },
+    )
+}
+
+pub fn function_list_is_not_empty_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/is_not_empty expects 1 argument")
+    };
+    try_create_list_length_direct_actor_with_registry(
+        None,
+        source_list_actor.clone(),
+        actor_context,
+        {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move |current_len| {
+                Some(Tag::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "List/is_not_empty result",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    if current_len == 0 { "False" } else { "True" }.to_string(),
+                ))
+            }
+        },
+    )
+}
+
+pub(crate) fn function_list_is_not_empty_actor_with_registry(
+    reg: &mut ActorRegistry,
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/is_not_empty expects 1 argument")
+    };
+    try_create_list_length_direct_actor_with_registry(
+        Some(reg),
+        source_list_actor.clone(),
+        actor_context,
+        {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move |current_len| {
+                Some(Tag::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "List/is_not_empty result",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    if current_len == 0 { "False" } else { "True" }.to_string(),
+                ))
+            }
+        },
+    )
 }
 
 /// List/append(item: value) -> List
@@ -2567,6 +4525,31 @@ pub fn function_list_append(
     .right_stream()
 }
 
+pub fn function_list_append_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor, item_actor] = arguments.as_slice() else {
+        return None;
+    };
+
+    try_create_list_append_direct_actor(
+        source_list_actor.clone(),
+        item_actor.clone(),
+        ConstructInfo::new(
+            function_call_id.with_child_id(ulid::Ulid::new().to_string()),
+            None,
+            "List/append result",
+        ),
+        construct_context,
+        actor_context,
+        function_call_persistence_id,
+    )
+}
+
 /// List/clear(on: stream) -> List
 /// Clears all items from the list when the trigger stream emits any value
 pub fn function_list_clear(
@@ -2664,6 +4647,32 @@ pub fn function_list_clear(
     .right_stream()
 }
 
+pub fn function_list_clear_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor, trigger_actor] = arguments.as_slice() else {
+        return None;
+    };
+
+    try_create_triggered_list_direct_actor(
+        source_list_actor.clone(),
+        trigger_actor.clone(),
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "List/clear result"),
+        construct_context,
+        actor_context,
+        function_call_persistence_id,
+        |items| {
+            clear_source_storage_for_items(items);
+            items.clear();
+            Some(ListChange::Clear)
+        },
+    )
+}
+
 /// Clear recorded calls storage for all items that have source origins.
 /// Called when List/clear triggers to ensure items don't restore on next Run.
 fn clear_source_storage_for_items(items: &[ActorHandle]) {
@@ -2708,6 +4717,65 @@ pub fn function_list_last(
         Some(actor) => actor.current_or_future_stream(),
         None => stream::empty().boxed_local(),
     })
+}
+
+pub fn function_list_last_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/last expects 1 argument")
+    };
+    try_create_list_selected_item_direct_actor_with_registry(
+        None,
+        source_list_actor.clone(),
+        None,
+        actor_context,
+        || None,
+        move |items_ready, items, _| {
+            if !items_ready {
+                DirectSelectedActorState::Pending
+            } else {
+                items.last().cloned().map_or(
+                    DirectSelectedActorState::Missing,
+                    DirectSelectedActorState::Actor,
+                )
+            }
+        },
+    )
+}
+
+pub(crate) fn function_list_last_actor_with_registry(
+    reg: &mut ActorRegistry,
+    arguments: Arc<Vec<ActorHandle>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/last expects 1 argument")
+    };
+    try_create_list_selected_item_direct_actor_with_registry(
+        Some(reg),
+        source_list_actor.clone(),
+        None,
+        actor_context,
+        || None,
+        move |items_ready, items, _| {
+            if !items_ready {
+                DirectSelectedActorState::Pending
+            } else {
+                items.last().cloned().map_or(
+                    DirectSelectedActorState::Missing,
+                    DirectSelectedActorState::Actor,
+                )
+            }
+        },
+    )
 }
 
 /// List/remove_last() -> List
@@ -2816,6 +4884,39 @@ pub fn function_list_remove_last(
     .right_stream()
 }
 
+pub fn function_list_remove_last_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor, trigger_actor] = arguments.as_slice() else {
+        return None;
+    };
+
+    try_create_triggered_list_direct_actor(
+        source_list_actor.clone(),
+        trigger_actor.clone(),
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "List/remove_last result list",
+        ),
+        construct_context,
+        actor_context,
+        function_call_persistence_id,
+        |items| {
+            if items.is_empty() {
+                None
+            } else {
+                items.pop();
+                Some(ListChange::Pop)
+            }
+        },
+    )
+}
+
 /// List/latest() -> Value
 /// Merges a list of streams, emitting whenever any stream produces a value
 /// Returns the value from the stream that most recently produced
@@ -2844,6 +4945,41 @@ pub fn function_list_latest(
                 .boxed_local()
         }
     })
+}
+
+pub fn function_list_latest_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/latest expects 1 argument")
+    };
+    try_create_list_latest_direct_actor_with_registry(
+        None,
+        source_list_actor.clone(),
+        actor_context,
+    )
+}
+
+pub(crate) fn function_list_latest_actor_with_registry(
+    reg: &mut ActorRegistry,
+    arguments: Arc<Vec<ActorHandle>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/latest expects 1 argument")
+    };
+    try_create_list_latest_direct_actor_with_registry(
+        Some(reg),
+        source_list_actor.clone(),
+        actor_context,
+    )
 }
 
 // --- Router functions ---
@@ -3184,6 +5320,26 @@ async fn resolve_value_for_log_with_timeout(value: Value, timeout_ms: u32) -> St
     resolve_value_for_log(value, timeout_ms).await
 }
 
+#[cfg(target_arch = "wasm32")]
+fn emit_log_info(message: &str) {
+    zoon::println!("{message}");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn emit_log_info(message: &str) {
+    println!("{message}");
+}
+
+#[cfg(target_arch = "wasm32")]
+fn emit_log_error(message: &str) {
+    zoon::eprintln!("{message}");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn emit_log_error(message: &str) {
+    eprintln!("{message}");
+}
+
 /// Helper to extract log options from a 'with' object parameter.
 /// The 'with' object can contain:
 /// - 'label': Text label for the log message
@@ -3255,39 +5411,21 @@ pub fn function_log_info(
     let value_actor = arguments[0].clone();
     let with_actor = arguments.get(1).cloned();
 
-    // Create a bounded channel for log requests - actor model compliant pattern
-    let (log_sender, log_receiver) = mpsc::channel::<(Value, Option<ActorHandle>)>(16);
-
-    // Create a retained task that processes log messages
-    let log_actor = zoon::Task::start_droppable(async move {
-        let mut receiver = log_receiver;
-        while let Some((value, with_actor)) = receiver.next().await {
-            // Extract options (label and timeout) from 'with' object
+    value_actor.stream().then(move |value| {
+        let with_actor = with_actor.clone();
+        async move {
             let options = if let Some(with) = with_actor {
                 extract_log_options_from_with(with).await
             } else {
                 LogOptions::default()
             };
-            // Resolve value with the configured timeout
-            let value_str = resolve_value_for_log_with_timeout(value, options.timeout_ms).await;
-            // Log with or without label
+            let value_str =
+                resolve_value_for_log_with_timeout(value.clone(), options.timeout_ms).await;
             match options.label {
                 Some(label) if !label.is_empty() => {
-                    zoon::println!("[INFO] {}: {}", label, value_str)
+                    emit_log_info(&format!("[INFO] {}: {}", label, value_str))
                 }
-                _ => zoon::println!("[INFO] {}", value_str),
-            }
-        }
-    });
-
-    value_actor.stream().then(move |value| {
-        let mut sender = log_sender.clone();
-        let with_actor = with_actor.clone();
-        let _log_actor = &log_actor;
-        async move {
-            // Send log request to the actor (backpressure if channel full)
-            if sender.send((value.clone(), with_actor)).await.is_err() {
-                zoon::eprintln!("[Log/info] Failed to send log request - receiver dropped");
+                _ => emit_log_info(&format!("[INFO] {}", value_str)),
             }
             value
         }
@@ -3311,39 +5449,21 @@ pub fn function_log_error(
     let value_actor = arguments[0].clone();
     let with_actor = arguments.get(1).cloned();
 
-    // Create a bounded channel for log requests - actor model compliant pattern
-    let (log_sender, log_receiver) = mpsc::channel::<(Value, Option<ActorHandle>)>(16);
-
-    // Create a retained task that processes log messages
-    let log_actor = zoon::Task::start_droppable(async move {
-        let mut receiver = log_receiver;
-        while let Some((value, with_actor)) = receiver.next().await {
-            // Extract options (label and timeout) from 'with' object
+    value_actor.stream().then(move |value| {
+        let with_actor = with_actor.clone();
+        async move {
             let options = if let Some(with) = with_actor {
                 extract_log_options_from_with(with).await
             } else {
                 LogOptions::default()
             };
-            // Resolve value with the configured timeout
-            let value_str = resolve_value_for_log_with_timeout(value, options.timeout_ms).await;
-            // Log with or without label
+            let value_str =
+                resolve_value_for_log_with_timeout(value.clone(), options.timeout_ms).await;
             match options.label {
                 Some(label) if !label.is_empty() => {
-                    zoon::eprintln!("[ERROR] {}: {}", label, value_str)
+                    emit_log_error(&format!("[ERROR] {}: {}", label, value_str))
                 }
-                _ => zoon::eprintln!("[ERROR] {}", value_str),
-            }
-        }
-    });
-
-    value_actor.stream().then(move |value| {
-        let mut sender = log_sender.clone();
-        let with_actor = with_actor.clone();
-        let _log_actor = &log_actor;
-        async move {
-            // Send log request to the actor (backpressure if channel full)
-            if sender.send((value.clone(), with_actor)).await.is_err() {
-                zoon::eprintln!("[Log/error] Failed to send log request - receiver dropped");
+                _ => emit_log_error(&format!("[ERROR] {}", value_str)),
             }
             value
         }
@@ -4071,6 +6191,107 @@ pub fn function_stream_skip(
     })
 }
 
+pub fn function_stream_skip_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let stream_actor = arguments[0].clone();
+    let count_actor = arguments[1].clone();
+    if stream_actor.has_lazy_delegate() || count_actor.has_lazy_delegate() {
+        return None;
+    }
+
+    #[derive(Default)]
+    struct SkipState {
+        skip_count: usize,
+        skipped: usize,
+        count_received: bool,
+        buffer: std::collections::VecDeque<Value>,
+    }
+
+    let output_actor = create_actor_forwarding(PersistenceId::new(), actor_context.scope_id());
+    retain_actor_handles(&output_actor, arguments.iter().cloned());
+
+    let state = Rc::new(RefCell::new(SkipState::default()));
+    let process_stream_value = {
+        let output_actor = output_actor.clone();
+        let state = state.clone();
+        move |reg: &mut ActorRegistry, value: Value| {
+            let mut state = state.borrow_mut();
+            if !state.count_received {
+                state.buffer.push_back(value);
+                return;
+            }
+            if state.skipped < state.skip_count {
+                state.skipped += 1;
+            } else {
+                enqueue_actor_value_on_runtime_queue_with_registry(reg, &output_actor, value);
+            }
+        }
+    };
+    let process_count_value = {
+        let output_actor = output_actor.clone();
+        let state = state.clone();
+        move |reg: &mut ActorRegistry, value: Value| {
+            let next_skip_count = match &value {
+                Value::Number(num, _) => num.number().max(0.0).min(usize::MAX as f64) as usize,
+                _ => 0,
+            };
+
+            let mut state = state.borrow_mut();
+            state.skip_count = next_skip_count;
+            state.skipped = 0;
+            state.count_received = true;
+
+            while let Some(buffered) = state.buffer.pop_front() {
+                if state.skipped < state.skip_count {
+                    state.skipped += 1;
+                } else {
+                    enqueue_actor_value_on_runtime_queue_with_registry(
+                        reg,
+                        &output_actor,
+                        buffered,
+                    );
+                }
+            }
+        }
+    };
+
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+
+        stream_actor.register_direct_subscriber_with_registry(&mut reg, {
+            let output_actor = output_actor.clone();
+            let stream_actor = stream_actor.clone();
+            move |reg, value| {
+                if !output_actor.is_alive() {
+                    return false;
+                }
+                process_stream_value(reg, value.clone());
+                stream_actor.is_alive()
+            }
+        });
+        count_actor.register_direct_subscriber_with_registry(&mut reg, {
+            let output_actor = output_actor.clone();
+            let count_actor = count_actor.clone();
+            move |reg, value| {
+                if !output_actor.is_alive() {
+                    return false;
+                }
+                process_count_value(reg, value.clone());
+                count_actor.is_alive()
+            }
+        });
+
+        drain_runtime_ready_queue_with_registry(&mut reg);
+    });
+
+    Some(output_actor)
+}
+
 /// Stream/take(count) -> Stream<Value>
 /// Takes only the first N values from the piped stream.
 /// When `count` changes, the take counter resets.
@@ -4214,6 +6435,105 @@ pub fn function_stream_take(
     })
 }
 
+pub fn function_stream_take_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let stream_actor = arguments[0].clone();
+    let count_actor = arguments[1].clone();
+    if stream_actor.has_lazy_delegate() || count_actor.has_lazy_delegate() {
+        return None;
+    }
+
+    #[derive(Default)]
+    struct TakeState {
+        take_count: usize,
+        taken: usize,
+        count_received: bool,
+        buffer: std::collections::VecDeque<Value>,
+    }
+
+    let output_actor = create_actor_forwarding(PersistenceId::new(), actor_context.scope_id());
+    retain_actor_handles(&output_actor, arguments.iter().cloned());
+
+    let state = Rc::new(RefCell::new(TakeState::default()));
+    let process_stream_value = {
+        let output_actor = output_actor.clone();
+        let state = state.clone();
+        move |reg: &mut ActorRegistry, value: Value| {
+            let mut state = state.borrow_mut();
+            if !state.count_received {
+                state.buffer.push_back(value);
+                return;
+            }
+            if state.taken < state.take_count {
+                state.taken += 1;
+                enqueue_actor_value_on_runtime_queue_with_registry(reg, &output_actor, value);
+            }
+        }
+    };
+    let process_count_value = {
+        let output_actor = output_actor.clone();
+        let state = state.clone();
+        move |reg: &mut ActorRegistry, value: Value| {
+            let next_take_count = match &value {
+                Value::Number(num, _) => num.number().max(0.0).min(usize::MAX as f64) as usize,
+                _ => 0,
+            };
+
+            let mut state = state.borrow_mut();
+            state.take_count = next_take_count;
+            state.taken = 0;
+            state.count_received = true;
+
+            while let Some(buffered) = state.buffer.pop_front() {
+                if state.taken < state.take_count {
+                    state.taken += 1;
+                    enqueue_actor_value_on_runtime_queue_with_registry(
+                        reg,
+                        &output_actor,
+                        buffered,
+                    );
+                }
+            }
+        }
+    };
+
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+
+        stream_actor.register_direct_subscriber_with_registry(&mut reg, {
+            let output_actor = output_actor.clone();
+            let stream_actor = stream_actor.clone();
+            move |reg, value| {
+                if !output_actor.is_alive() {
+                    return false;
+                }
+                process_stream_value(reg, value.clone());
+                stream_actor.is_alive()
+            }
+        });
+        count_actor.register_direct_subscriber_with_registry(&mut reg, {
+            let output_actor = output_actor.clone();
+            let count_actor = count_actor.clone();
+            move |reg, value| {
+                if !output_actor.is_alive() {
+                    return false;
+                }
+                process_count_value(reg, value.clone());
+                count_actor.is_alive()
+            }
+        });
+
+        drain_runtime_ready_queue_with_registry(&mut reg);
+    });
+
+    Some(output_actor)
+}
+
 /// Stream/distinct() -> Stream<Value>
 /// Suppresses consecutive duplicate values.
 pub fn function_stream_distinct(
@@ -4238,6 +6558,51 @@ pub fn function_stream_distinct(
             }
         })
         .filter_map(future::ready)
+}
+
+pub fn function_stream_distinct_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let stream_actor = arguments[0].clone();
+    if stream_actor.has_lazy_delegate() {
+        return None;
+    }
+
+    let output_actor = create_actor_forwarding(PersistenceId::new(), actor_context.scope_id());
+    retain_actor_handles(&output_actor, arguments.iter().cloned());
+
+    let last_key = Rc::new(RefCell::new(None::<ValueIdempotencyKey>));
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        stream_actor.register_direct_subscriber_with_registry(&mut reg, {
+            let output_actor = output_actor.clone();
+            let stream_actor = stream_actor.clone();
+            let last_key = last_key.clone();
+            move |reg, value| {
+                if !output_actor.is_alive() {
+                    return false;
+                }
+                let current_key = value.idempotency_key();
+                let should_emit = last_key.borrow().map_or(true, |key| key != current_key);
+                *last_key.borrow_mut() = Some(current_key);
+                if should_emit {
+                    enqueue_actor_value_on_runtime_queue_with_registry(
+                        reg,
+                        &output_actor,
+                        value.clone(),
+                    );
+                }
+                stream_actor.is_alive()
+            }
+        });
+        drain_runtime_ready_queue_with_registry(&mut reg);
+    });
+
+    Some(output_actor)
 }
 
 /// Stream/pulses() -> Stream<Number>
@@ -4285,6 +6650,61 @@ pub fn function_stream_pulses(
     // Subscribe to count actor and generate pulses for each count value
     count_actor_current_and_future_values(count_actor)
         .flat_map(move |v| stream::iter(make_pulses(&v)))
+}
+
+pub fn function_stream_pulses_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let count_actor = arguments[0].clone();
+    if count_actor.has_lazy_delegate() {
+        return None;
+    }
+
+    let output_actor = create_actor_forwarding(PersistenceId::new(), actor_context.scope_id());
+    retain_actor_handles(&output_actor, arguments.iter().cloned());
+
+    REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        count_actor.register_direct_subscriber_with_registry(&mut reg, {
+            let output_actor = output_actor.clone();
+            let count_actor = count_actor.clone();
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move |reg, value| {
+                if !output_actor.is_alive() {
+                    return false;
+                }
+                let pulse_count = match value {
+                    Value::Number(num, _) => num.number() as u64,
+                    _ => 0,
+                };
+                for n in 1..=pulse_count {
+                    enqueue_actor_value_on_runtime_queue_with_registry(
+                        reg,
+                        &output_actor,
+                        Number::new_value(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(format!("pulse_{}", n)),
+                                None,
+                                "Stream/pulses result",
+                            ),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            n as f64,
+                        ),
+                    );
+                }
+                count_actor.is_alive()
+            }
+        });
+        drain_runtime_ready_queue_with_registry(&mut reg);
+    });
+
+    Some(output_actor)
 }
 
 /// Stream/debounce(duration) -> Stream<Value>
@@ -4396,6 +6816,87 @@ pub fn function_stream_debounce(
             }
         }
     })
+}
+
+pub fn function_stream_debounce_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> ActorHandle {
+    let stream_actor = arguments[0].clone();
+    let duration_actor = arguments[1].clone();
+
+    let output_actor = create_actor_forwarding(PersistenceId::new(), actor_context.scope_id());
+    retain_actor_handles(&output_actor, arguments.iter().cloned());
+
+    let output_actor_for_task = output_actor.clone();
+    start_retained_actor_scope_task(&output_actor, async move {
+        let mut input_stream = stream_actor.stream().boxed_local().fuse();
+        let mut duration_stream = duration_actor_current_and_future_ms(duration_actor)
+            .boxed_local()
+            .fuse();
+        let mut pending = None::<Value>;
+        let mut duration_ms = 0.0f64;
+
+        loop {
+            if pending.is_some() && duration_ms > 0.0 {
+                let mut timer = Box::pin(
+                    Timer::sleep(duration_ms.round().max(0.0).min(u32::MAX as f64) as u32).fuse(),
+                );
+
+                select! {
+                    new_value = input_stream.next() => {
+                        match new_value {
+                            Some(value) => pending = Some(value),
+                            None => {
+                                if let Some(value) = pending.take() {
+                                    if !output_actor_for_task.is_alive() {
+                                        return;
+                                    }
+                                    enqueue_actor_value_on_runtime_queue(&output_actor_for_task, value);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    new_duration = duration_stream.next() => {
+                        if let Some(next_duration_ms) = new_duration {
+                            duration_ms = next_duration_ms;
+                        }
+                    }
+                    _ = timer.as_mut() => {
+                        if let Some(value) = pending.take() {
+                            if !output_actor_for_task.is_alive() {
+                                return;
+                            }
+                            enqueue_actor_value_on_runtime_queue(&output_actor_for_task, value);
+                        }
+                    }
+                }
+            } else {
+                select! {
+                    new_value = input_stream.next() => {
+                        match new_value {
+                            Some(value) => pending = Some(value),
+                            None => return,
+                        }
+                    }
+                    new_duration = duration_stream.next() => {
+                        match new_duration {
+                            Some(next_duration_ms) => duration_ms = next_duration_ms,
+                            None => {
+                                duration_ms = 0.0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    output_actor
 }
 
 // --- Directory functions ---
@@ -4833,8 +7334,15 @@ pub fn function_text_from_char_code(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectedActorKey {
+    Pending,
     Missing,
     Actor(ActorId),
+}
+
+enum DirectSelectedActorState {
+    Pending,
+    Missing,
+    Actor(ActorHandle),
 }
 
 fn dedupe_selected_actor_stream<S>(source: S) -> LocalBoxStream<'static, Option<ActorHandle>>
@@ -4895,6 +7403,101 @@ pub fn function_list_get(
                     "OutOfBounds".to_string(),
                 )))
                 .boxed_local(),
+            }
+        },
+    )
+}
+
+pub fn function_list_get_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor, index_actor] = arguments.as_slice() else {
+        panic!("List/get expects 2 arguments, got {}", arguments.len())
+    };
+    try_create_list_selected_item_direct_actor_with_registry(
+        None,
+        source_list_actor.clone(),
+        Some(index_actor.clone()),
+        actor_context,
+        {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move || {
+                Some(Tag::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "List/get OutOfBounds",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    "OutOfBounds".to_string(),
+                ))
+            }
+        },
+        move |items_ready, items, current_index| {
+            if !items_ready {
+                return DirectSelectedActorState::Pending;
+            }
+            match current_index {
+                None => DirectSelectedActorState::Pending,
+                Some(Some(index)) => items.get(index).cloned().map_or(
+                    DirectSelectedActorState::Missing,
+                    DirectSelectedActorState::Actor,
+                ),
+                Some(None) => DirectSelectedActorState::Missing,
+            }
+        },
+    )
+}
+
+pub(crate) fn function_list_get_actor_with_registry(
+    reg: &mut ActorRegistry,
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor, index_actor] = arguments.as_slice() else {
+        panic!("List/get expects 2 arguments, got {}", arguments.len())
+    };
+    try_create_list_selected_item_direct_actor_with_registry(
+        Some(reg),
+        source_list_actor.clone(),
+        Some(index_actor.clone()),
+        actor_context,
+        {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move || {
+                Some(Tag::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "List/get OutOfBounds",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    "OutOfBounds".to_string(),
+                ))
+            }
+        },
+        move |items_ready, items, current_index| {
+            if !items_ready {
+                return DirectSelectedActorState::Pending;
+            }
+            match current_index {
+                None => DirectSelectedActorState::Pending,
+                Some(Some(index)) => items.get(index).cloned().map_or(
+                    DirectSelectedActorState::Missing,
+                    DirectSelectedActorState::Actor,
+                ),
+                Some(None) => DirectSelectedActorState::Missing,
             }
         },
     )
@@ -5071,6 +7674,69 @@ pub fn function_list_sum(
     })
 }
 
+pub fn function_list_sum_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/sum expects 1 argument")
+    };
+    try_create_list_number_aggregate_direct_actor_with_registry(
+        None,
+        source_list_actor.clone(),
+        actor_context,
+        0.0,
+        |values| values.iter().sum(),
+        {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move |result| {
+                Number::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "List/sum result"),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    result,
+                )
+            }
+        },
+    )
+}
+
+pub(crate) fn function_list_sum_actor_with_registry(
+    reg: &mut ActorRegistry,
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/sum expects 1 argument")
+    };
+    try_create_list_number_aggregate_direct_actor_with_registry(
+        Some(reg),
+        source_list_actor.clone(),
+        actor_context,
+        0.0,
+        |values| values.iter().sum(),
+        {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move |result| {
+                Number::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "List/sum result"),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    result,
+                )
+            }
+        },
+    )
+}
+
 /// List/product(list) -> Number
 /// Returns the product of all Number items in the list. Empty list → 1.
 /// Re-emits whenever any item value changes.
@@ -5093,6 +7759,77 @@ pub fn function_list_product(
             |values| values.iter().product(),
         )
     })
+}
+
+pub fn function_list_product_actor(
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/product expects 1 argument")
+    };
+    try_create_list_number_aggregate_direct_actor_with_registry(
+        None,
+        source_list_actor.clone(),
+        actor_context,
+        1.0,
+        |values| values.iter().product(),
+        {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move |result| {
+                Number::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "List/product result",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    result,
+                )
+            }
+        },
+    )
+}
+
+pub(crate) fn function_list_product_actor_with_registry(
+    reg: &mut ActorRegistry,
+    arguments: Arc<Vec<ActorHandle>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Option<ActorHandle> {
+    let [source_list_actor] = arguments.as_slice() else {
+        panic!("List/product expects 1 argument")
+    };
+    try_create_list_number_aggregate_direct_actor_with_registry(
+        Some(reg),
+        source_list_actor.clone(),
+        actor_context,
+        1.0,
+        |values| values.iter().product(),
+        {
+            let function_call_id = function_call_id.clone();
+            let construct_context = construct_context.clone();
+            move |result| {
+                Number::new_value(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(0),
+                        None,
+                        "List/product result",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    result,
+                )
+            }
+        },
+    )
 }
 
 // --- Math functions (Cells spreadsheet) ---
@@ -5154,6 +7891,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
+    use zoon::serde_json;
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         struct ThreadWake(std::thread::Thread);
@@ -5308,6 +8046,38 @@ mod tests {
 
         let rendered = block_on(resolve_actor_value_for_log(actor, 1));
         assert_eq!(rendered, "ready");
+    }
+
+    #[test]
+    fn log_info_passes_through_current_value_without_background_log_task() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+
+        let actor = create_constant_actor(
+            PersistenceId::new(),
+            Text::new_value(
+                ConstructInfo::new("test.log.info.current", None, "test log info current"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "ready",
+            ),
+            scope_id,
+        );
+
+        let arguments = Arc::new(vec![actor]);
+        let mut stream = std::pin::pin!(function_log_info(
+            arguments,
+            ConstructId::from("test.log.info"),
+            PersistenceId::new(),
+            construct_context,
+            actor_context,
+        ));
+
+        let Poll::Ready(Some(Value::Text(text, _))) = poll_once(stream.as_mut().next()) else {
+            panic!("Log/info should pass through the current value immediately");
+        };
+        assert_eq!(text.text(), "ready");
     }
 
     #[test]
@@ -5622,6 +8392,1867 @@ mod tests {
             matches!(poll_once(stream.as_mut().next()), Poll::Pending),
             "duration actor helper should skip stale buffered duration history and wait for future updates"
         );
+    }
+
+    #[test]
+    fn timer_interval_stream_does_not_register_extra_scope_task_before_actor_wrap() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let duration_actor = create_constant_actor(
+            PersistenceId::new(),
+            TaggedObject::new_value(
+                ConstructInfo::new(
+                    "test.timer.interval.duration",
+                    None,
+                    "test timer interval duration",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "Duration",
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        "test.timer.interval.duration.ms",
+                        None,
+                        "test timer interval duration ms",
+                    ),
+                    "milliseconds",
+                    create_constant_actor(
+                        PersistenceId::new(),
+                        number_value(0.0, construct_context.clone()),
+                        scope_id,
+                    ),
+                    PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            ),
+            scope_id,
+        );
+
+        let _interval_stream = function_timer_interval(
+            Arc::new(vec![duration_actor]),
+            ConstructId::new("test.timer.interval"),
+            PersistenceId::new(),
+            construct_context,
+            actor_context,
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "Timer/interval should stay a pure source stream until the actor runtime owns the feeder task"
+            );
+        });
+    }
+
+    #[test]
+    fn timer_interval_direct_actor_uses_single_actor_owned_timer_task() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let duration_actor = create_constant_actor(
+            PersistenceId::new(),
+            TaggedObject::new_value(
+                ConstructInfo::new(
+                    "test.timer.interval.direct.duration",
+                    None,
+                    "test timer interval direct duration",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "Duration",
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        "test.timer.interval.direct.duration.ms",
+                        None,
+                        "test timer interval direct duration ms",
+                    ),
+                    "milliseconds",
+                    create_constant_actor(
+                        PersistenceId::new(),
+                        number_value(1.0, construct_context.clone()),
+                        scope_id,
+                    ),
+                    PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            ),
+            scope_id,
+        );
+
+        let _interval_actor = function_timer_interval_actor(
+            Arc::new(vec![duration_actor]),
+            ConstructId::new("test.timer.interval.direct"),
+            PersistenceId::new(),
+            construct_context,
+            actor_context,
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                1,
+                "direct Timer/interval should use one actor-owned timer task instead of the generic builtin stream wrapper path"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_debounce_direct_actor_uses_single_actor_owned_timer_task() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let duration_actor = create_constant_actor(
+            PersistenceId::new(),
+            TaggedObject::new_value(
+                ConstructInfo::new(
+                    "test.stream.debounce.direct.duration",
+                    None,
+                    "test stream debounce direct duration",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "Duration",
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        "test.stream.debounce.direct.duration.ms",
+                        None,
+                        "test stream debounce direct duration ms",
+                    ),
+                    "milliseconds",
+                    create_constant_actor(
+                        PersistenceId::new(),
+                        number_value(1.0, construct_context.clone()),
+                        scope_id,
+                    ),
+                    PersistenceId::new(),
+                    actor_context.scope.clone(),
+                )],
+            ),
+            scope_id,
+        );
+
+        let _debounced_actor = function_stream_debounce_actor(
+            Arc::new(vec![source_actor, duration_actor]),
+            ConstructId::new("test.stream.debounce.direct"),
+            PersistenceId::new(),
+            construct_context,
+            actor_context,
+        );
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                1,
+                "direct Stream/debounce should use one actor-owned timer task instead of the generic builtin stream wrapper path"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_skip_direct_actor_uses_runtime_subscribers_without_wrapper_task() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new("test.stream.skip.old", None, "test stream skip old"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            1,
+            "old",
+        ));
+        source_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new("test.stream.skip.current", None, "test stream skip current"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            2,
+            "current",
+        ));
+
+        let count_actor = create_constant_actor(
+            PersistenceId::new(),
+            number_value(1.0, construct_context.clone()),
+            scope_id,
+        );
+
+        let skip_actor = function_stream_skip_actor(
+            Arc::new(vec![source_actor.clone(), count_actor]),
+            ConstructId::new("test.stream.skip"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct stream skip actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct Stream/skip should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        assert!(
+            matches!(
+                skip_actor.current_value(),
+                Err(CurrentValueError::NoValueYet)
+            ),
+            "direct Stream/skip should skip the current input value when count is 1"
+        );
+
+        source_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new("test.stream.skip.next", None, "test stream skip next"),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            3,
+            "next",
+        ));
+
+        let Value::Text(text, _) = skip_actor
+            .current_value()
+            .expect("direct Stream/skip should expose the first value after the skipped one")
+        else {
+            panic!("expected text value");
+        };
+        assert_eq!(text.text(), "next");
+    }
+
+    #[test]
+    fn stream_take_direct_actor_uses_runtime_subscribers_without_wrapper_task() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new("test.stream.take.current", None, "test stream take current"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            2,
+            "current",
+        ));
+
+        let count_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        count_actor.store_value_directly(number_value(1.0, construct_context.clone()));
+
+        let take_actor = function_stream_take_actor(
+            Arc::new(vec![source_actor.clone(), count_actor.clone()]),
+            ConstructId::new("test.stream.take"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct stream take actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct Stream/take should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        let Value::Text(text, _) = take_actor
+            .current_value()
+            .expect("direct Stream/take should expose the current input value when count is 1")
+        else {
+            panic!("expected text value");
+        };
+        assert_eq!(text.text(), "current");
+
+        source_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new("test.stream.take.ignored", None, "test stream take ignored"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            3,
+            "ignored",
+        ));
+
+        let Value::Text(text, _) = take_actor
+            .current_value()
+            .expect("direct Stream/take should keep the already taken value")
+        else {
+            panic!("expected text value");
+        };
+        assert_eq!(text.text(), "current");
+
+        count_actor.store_value_directly(number_value(2.0, construct_context.clone()));
+        source_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.stream.take.accepted",
+                None,
+                "test stream take accepted",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            4,
+            "accepted",
+        ));
+
+        let Value::Text(text, _) = take_actor
+            .current_value()
+            .expect("direct Stream/take should accept a new value after count reset")
+        else {
+            panic!("expected text value");
+        };
+        assert_eq!(text.text(), "accepted");
+    }
+
+    #[test]
+    fn stream_distinct_direct_actor_uses_runtime_subscribers_without_wrapper_task() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let shared_key = ValueIdempotencyKey::new();
+        source_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.stream.distinct.current",
+                None,
+                "test stream distinct current",
+            ),
+            construct_context.clone(),
+            shared_key,
+            1,
+            "current",
+        ));
+
+        let distinct_actor = function_stream_distinct_actor(
+            Arc::new(vec![source_actor.clone()]),
+            ConstructId::new("test.stream.distinct"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct stream distinct actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct Stream/distinct should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        let Value::Text(text, _) = distinct_actor
+            .current_value()
+            .expect("direct Stream/distinct should expose the current value")
+        else {
+            panic!("expected text value");
+        };
+        assert_eq!(text.text(), "current");
+
+        source_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.stream.distinct.duplicate",
+                None,
+                "test stream distinct duplicate",
+            ),
+            construct_context.clone(),
+            shared_key,
+            2,
+            "duplicate",
+        ));
+
+        let Value::Text(text, _) = distinct_actor
+            .current_value()
+            .expect("duplicate idempotency key should keep the prior distinct value")
+        else {
+            panic!("expected text value");
+        };
+        assert_eq!(text.text(), "current");
+
+        source_actor.store_value_directly(Text::new_value_with_emission_seq(
+            ConstructInfo::new(
+                "test.stream.distinct.fresh",
+                None,
+                "test stream distinct fresh",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            3,
+            "fresh",
+        ));
+
+        let Value::Text(text, _) = distinct_actor
+            .current_value()
+            .expect("new idempotency key should update the distinct actor")
+        else {
+            panic!("expected text value");
+        };
+        assert_eq!(text.text(), "fresh");
+    }
+
+    #[test]
+    fn stream_pulses_direct_actor_uses_runtime_subscribers_without_wrapper_task() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let count_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        count_actor.store_value_directly(number_value(3.0, construct_context.clone()));
+
+        let pulses_actor = function_stream_pulses_actor(
+            Arc::new(vec![count_actor.clone()]),
+            ConstructId::new("test.stream.pulses"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct stream pulses actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct Stream/pulses should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        let Value::Number(number, _) = pulses_actor
+            .current_value()
+            .expect("direct Stream/pulses should expose the last current pulse")
+        else {
+            panic!("expected number value");
+        };
+        assert_eq!(number.number(), 3.0);
+
+        block_on(async move {
+            let mut future_pulses = pulses_actor.stream_from_now();
+            count_actor.store_value_directly(number_value(2.0, construct_context));
+
+            let Some(Value::Number(first, _)) = future_pulses.next().await else {
+                panic!("direct Stream/pulses should emit the first pulse after count change");
+            };
+            let Some(Value::Number(second, _)) = future_pulses.next().await else {
+                panic!("direct Stream/pulses should emit the second pulse after count change");
+            };
+            assert_eq!(first.number(), 1.0);
+            assert_eq!(second.number(), 2.0);
+        });
+    }
+
+    #[test]
+    fn math_sum_direct_actor_uses_runtime_subscribers_without_wrapper_task() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let increment_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        increment_actor.store_value_directly(number_value(1.0, construct_context.clone()));
+
+        let sum_actor = function_math_sum_actor(
+            Arc::new(vec![increment_actor.clone()]),
+            ConstructId::new("test.math.sum"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct Math/sum actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct Math/sum should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        let Value::Number(number, _) = sum_actor
+            .current_value()
+            .expect("direct Math/sum should expose the accumulated current value")
+        else {
+            panic!("expected number value");
+        };
+        assert_eq!(number.number(), 1.0);
+
+        increment_actor.store_value_directly(number_value(2.0, construct_context));
+
+        let Value::Number(number, _) = sum_actor
+            .current_value()
+            .expect("direct Math/sum should keep the running accumulated value")
+        else {
+            panic!("expected number value");
+        };
+        assert_eq!(number.number(), 3.0);
+    }
+
+    #[test]
+    fn math_sum_direct_actor_restores_sum_without_double_counting_current_input() {
+        let persistence_id = PersistenceId::new();
+        let restored_input_key = ValueIdempotencyKey::new();
+        let restored_output_key = ValueIdempotencyKey::new();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::from([(
+                    persistence_id.to_string(),
+                    serde_json::json!({
+                        "input_value_idempotency_key": restored_input_key,
+                        "sum": 5.0,
+                        "output_value_idempotency_key": restored_output_key,
+                    }),
+                )]),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let increment_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        increment_actor.store_value_directly(Number::new_value(
+            ConstructInfo::new(
+                "test.math.sum.restore.current",
+                None,
+                "test math sum restore current",
+            ),
+            construct_context.clone(),
+            restored_input_key,
+            5.0,
+        ));
+
+        let sum_actor = function_math_sum_actor(
+            Arc::new(vec![increment_actor.clone()]),
+            ConstructId::new("test.math.sum.restore"),
+            persistence_id,
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct Math/sum actor should restore from in-memory persistence");
+
+        let Value::Number(number, metadata) = sum_actor
+            .current_value()
+            .expect("restored direct Math/sum should expose the restored value")
+        else {
+            panic!("expected number value");
+        };
+        assert_eq!(number.number(), 5.0);
+        assert_eq!(
+            metadata.idempotency_key, restored_output_key,
+            "restored direct Math/sum should preserve the stored output idempotency key"
+        );
+
+        increment_actor.store_value_directly(number_value(4.0, construct_context.clone()));
+
+        let Value::Number(number, _) = sum_actor
+            .current_value()
+            .expect("fresh increment should advance the restored sum")
+        else {
+            panic!("expected number value");
+        };
+        assert_eq!(number.number(), 9.0);
+
+        let restored_state: serde_json::Value = construct_context
+            .construct_storage
+            .load_state_now(persistence_id)
+            .expect("restored direct Math/sum should keep persistence updated");
+        assert_eq!(restored_state["sum"], serde_json::json!(9.0));
+    }
+
+    #[test]
+    fn math_round_direct_actor_uses_runtime_subscribers_without_wrapper_task() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let number_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        number_actor.store_value_directly(number_value(1.6, construct_context.clone()));
+
+        let round_actor = function_math_round_actor(
+            Arc::new(vec![number_actor.clone()]),
+            ConstructId::new("test.math.round"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct Math/round actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct Math/round should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        let Value::Number(number, _) = round_actor
+            .current_value()
+            .expect("direct Math/round should expose the rounded current value")
+        else {
+            panic!("expected number value");
+        };
+        assert_eq!(number.number(), 2.0);
+
+        number_actor.store_value_directly(number_value(2.4, construct_context));
+
+        let Value::Number(number, _) = round_actor
+            .current_value()
+            .expect("direct Math/round should update when the input changes")
+        else {
+            panic!("expected number value");
+        };
+        assert_eq!(number.number(), 2.0);
+    }
+
+    #[test]
+    fn math_min_and_max_direct_actors_use_runtime_subscribers_without_wrapper_task() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let a_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        let b_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        a_actor.store_value_directly(number_value(10.0, construct_context.clone()));
+        b_actor.store_value_directly(number_value(4.0, construct_context.clone()));
+
+        let min_actor = function_math_min_actor(
+            Arc::new(vec![a_actor.clone(), b_actor.clone()]),
+            ConstructId::new("test.math.min"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context.clone(),
+        )
+        .expect("direct Math/min actor should be available for direct-state inputs");
+        let max_actor = function_math_max_actor(
+            Arc::new(vec![a_actor.clone(), b_actor.clone()]),
+            ConstructId::new("test.math.max"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct Math/max actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct Math/min and Math/max should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        let Value::Number(number, _) = min_actor
+            .current_value()
+            .expect("direct Math/min should expose the current minimum")
+        else {
+            panic!("expected number value");
+        };
+        assert_eq!(number.number(), 4.0);
+
+        let Value::Number(number, _) = max_actor
+            .current_value()
+            .expect("direct Math/max should expose the current maximum")
+        else {
+            panic!("expected number value");
+        };
+        assert_eq!(number.number(), 10.0);
+
+        a_actor.store_value_directly(number_value(1.0, construct_context));
+
+        let Value::Number(number, _) = min_actor
+            .current_value()
+            .expect("direct Math/min should update when operands change")
+        else {
+            panic!("expected number value");
+        };
+        assert_eq!(number.number(), 1.0);
+
+        let Value::Number(number, _) = max_actor
+            .current_value()
+            .expect("direct Math/max should keep the larger operand after updates")
+        else {
+            panic!("expected number value");
+        };
+        assert_eq!(number.number(), 4.0);
+    }
+
+    #[test]
+    fn list_last_direct_actor_uses_runtime_subscribers_without_wrapper_task_and_ignores_stale_old_last_item_updates()
+     {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let list_actor_context = actor_context.clone();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let make_item_actor = |label: &str, value: f64| {
+            let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+            actor.store_value_directly(Number::new_value(
+                ConstructInfo::new(
+                    format!("test.list.last.direct.item.{label}"),
+                    None,
+                    "test list last direct item",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(List::new(
+                    ConstructInfo::new(
+                        format!("test.list.last.direct.list.{label}"),
+                        None,
+                        "test list last direct list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            )
+        };
+        let expect_current_number = |actor: &ActorHandle| -> f64 {
+            let Value::Number(number, _) = actor
+                .current_value()
+                .expect("direct List/last actor should expose the selected current number")
+            else {
+                panic!("expected number value");
+            };
+            number.number()
+        };
+
+        let old_a = make_item_actor("old_a", 10.0);
+        let old_b = make_item_actor("old_b", 20.0);
+        let new_c = make_item_actor("new_c", 30.0);
+        let new_d = make_item_actor("new_d", 40.0);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(make_list_value(
+            "initial",
+            vec![old_a.clone(), old_b.clone()],
+        ));
+
+        let last_actor = function_list_last_actor(
+            Arc::new(vec![source_actor.clone()]),
+            ConstructId::new("test.list.last.direct"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct List/last actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct List/last should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        assert_eq!(expect_current_number(&last_actor), 20.0);
+
+        old_b.store_value_directly(number_value(25.0, construct_context.clone()));
+        assert_eq!(expect_current_number(&last_actor), 25.0);
+
+        source_actor.store_value_directly(make_list_value(
+            "updated",
+            vec![new_c.clone(), new_d.clone()],
+        ));
+        assert_eq!(expect_current_number(&last_actor), 40.0);
+
+        old_b.store_value_directly(number_value(99.0, construct_context.clone()));
+        assert_eq!(expect_current_number(&last_actor), 40.0);
+
+        new_d.store_value_directly(number_value(45.0, construct_context));
+        assert_eq!(expect_current_number(&last_actor), 45.0);
+    }
+
+    #[test]
+    fn list_get_direct_actor_uses_runtime_subscribers_without_wrapper_task_and_ignores_stale_old_selected_item_updates()
+     {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let list_actor_context = actor_context.clone();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let make_item_actor = |label: &str, value: f64| {
+            let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+            actor.store_value_directly(Number::new_value(
+                ConstructInfo::new(
+                    format!("test.list.get.direct.item.{label}"),
+                    None,
+                    "test list get direct item",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(List::new(
+                    ConstructInfo::new(
+                        format!("test.list.get.direct.list.{label}"),
+                        None,
+                        "test list get direct list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            )
+        };
+        let expect_current_number = |actor: &ActorHandle| -> f64 {
+            let Value::Number(number, _) = actor
+                .current_value()
+                .expect("direct List/get actor should expose the selected current number")
+            else {
+                panic!("expected number value");
+            };
+            number.number()
+        };
+
+        let old_a = make_item_actor("old_a", 10.0);
+        let old_b = make_item_actor("old_b", 20.0);
+        let new_c = make_item_actor("new_c", 30.0);
+        let new_d = make_item_actor("new_d", 40.0);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(make_list_value(
+            "initial",
+            vec![old_a.clone(), old_b.clone()],
+        ));
+
+        let index_actor = create_constant_actor(
+            PersistenceId::new(),
+            number_value(2.0, construct_context.clone()),
+            scope_id,
+        );
+
+        let get_actor = function_list_get_actor(
+            Arc::new(vec![source_actor.clone(), index_actor]),
+            ConstructId::new("test.list.get.direct"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct List/get actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct List/get should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        assert_eq!(expect_current_number(&get_actor), 20.0);
+
+        old_b.store_value_directly(number_value(25.0, construct_context.clone()));
+        assert_eq!(expect_current_number(&get_actor), 25.0);
+
+        source_actor.store_value_directly(make_list_value(
+            "updated",
+            vec![new_c.clone(), new_d.clone()],
+        ));
+        assert_eq!(expect_current_number(&get_actor), 40.0);
+
+        old_b.store_value_directly(number_value(99.0, construct_context.clone()));
+        assert_eq!(expect_current_number(&get_actor), 40.0);
+
+        new_d.store_value_directly(number_value(45.0, construct_context));
+        assert_eq!(expect_current_number(&get_actor), 45.0);
+    }
+
+    #[test]
+    fn list_latest_direct_actor_uses_runtime_subscribers_without_wrapper_task_and_ignores_stale_old_item_updates()
+     {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let list_actor_context = actor_context.clone();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let number_value_with_seq = |label: &str, emission_seq: EmissionSeq, value: f64| {
+            let mut value = Number::new_value(
+                ConstructInfo::new(
+                    format!("test.list.latest.direct.value.{label}.{emission_seq}"),
+                    None,
+                    "test list latest direct value",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                value,
+            );
+            value.set_emission_seq(emission_seq);
+            value
+        };
+        let make_item_actor = |label: &str, emission_seq: EmissionSeq, value: f64| {
+            let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+            actor.store_value_directly(number_value_with_seq(label, emission_seq, value));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(List::new(
+                    ConstructInfo::new(
+                        format!("test.list.latest.direct.list.{label}"),
+                        None,
+                        "test list latest direct list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            )
+        };
+        let expect_current_number = |actor: &ActorHandle| -> f64 {
+            let Value::Number(number, _) = actor
+                .current_value()
+                .expect("direct List/latest actor should expose the latest current number")
+            else {
+                panic!("expected number value");
+            };
+            number.number()
+        };
+
+        let old_a = make_item_actor("old_a", 1, 10.0);
+        let old_b = make_item_actor("old_b", 2, 20.0);
+        let new_c = make_item_actor("new_c", 4, 30.0);
+        let new_d = make_item_actor("new_d", 3, 40.0);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(make_list_value(
+            "initial",
+            vec![old_a.clone(), old_b.clone()],
+        ));
+
+        let latest_actor = function_list_latest_actor(
+            Arc::new(vec![source_actor.clone()]),
+            ConstructId::new("test.list.latest.direct"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct List/latest actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct List/latest should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        assert_eq!(expect_current_number(&latest_actor), 20.0);
+
+        source_actor.store_value_directly(make_list_value(
+            "updated",
+            vec![new_c.clone(), new_d.clone()],
+        ));
+        assert_eq!(
+            expect_current_number(&latest_actor),
+            40.0,
+            "direct List/latest should follow the newest current item on the current list path"
+        );
+
+        old_b.store_value_directly(number_value_with_seq("old_b.stale", 5, 99.0));
+        assert_eq!(expect_current_number(&latest_actor), 40.0);
+
+        new_d.store_value_directly(number_value_with_seq("new_d.fresh", 6, 45.0));
+        assert_eq!(expect_current_number(&latest_actor), 45.0);
+    }
+
+    #[test]
+    fn list_clear_direct_actor_uses_runtime_subscribers_without_wrapper_task_and_replays_current_trigger_once()
+     {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let list_actor_context = actor_context.clone();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let make_item_actor = |label: &str, value: f64| {
+            let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+            actor.store_value_directly(Number::new_value(
+                ConstructInfo::new(
+                    format!("test.list.clear.direct.item.{label}"),
+                    None,
+                    "test list clear direct item",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(List::new(
+                    ConstructInfo::new(
+                        format!("test.list.clear.direct.list.{label}"),
+                        None,
+                        "test list clear direct list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            )
+        };
+        let snapshot_numbers = |actor: &ActorHandle| {
+            let Value::List(list, _) = actor
+                .current_value()
+                .expect("direct List/clear actor should expose a current list value")
+            else {
+                panic!("expected list value");
+            };
+            block_on(list.snapshot())
+                .into_iter()
+                .map(|(_, item)| {
+                    let Value::Number(number, _) = item
+                        .current_value()
+                        .expect("direct List/clear item should expose a current number")
+                    else {
+                        panic!("expected number value");
+                    };
+                    number.number()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let old_a = make_item_actor("old_a", 10.0);
+        let old_b = make_item_actor("old_b", 20.0);
+        let new_c = make_item_actor("new_c", 30.0);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(make_list_value(
+            "initial",
+            vec![old_a.clone(), old_b.clone()],
+        ));
+
+        let trigger_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        trigger_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.clear.direct.trigger.current",
+                None,
+                "test list clear direct current trigger",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "clear",
+        ));
+
+        let clear_actor = function_list_clear_actor(
+            Arc::new(vec![source_actor.clone(), trigger_actor.clone()]),
+            ConstructId::new("test.list.clear.direct"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct List/clear actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct List/clear should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        assert_eq!(snapshot_numbers(&clear_actor), Vec::<f64>::new());
+
+        source_actor.store_value_directly(make_list_value("updated", vec![new_c.clone()]));
+        assert_eq!(snapshot_numbers(&clear_actor), vec![30.0]);
+    }
+
+    #[test]
+    fn list_clear_direct_actor_restores_saved_items_and_skips_initial_source_replace() {
+        let persistence_id = PersistenceId::new();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::from([(
+                    persistence_id.to_string(),
+                    serde_json::json!([1.0, 2.0]),
+                )]),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let actor_context = test_actor_context();
+        let list_actor_context = actor_context.clone();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let make_item_actor = |label: &str, value: f64| {
+            let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+            actor.store_value_directly(Number::new_value(
+                ConstructInfo::new(
+                    format!("test.list.clear.restore.item.{label}"),
+                    None,
+                    "test list clear restore item",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(List::new(
+                    ConstructInfo::new(
+                        format!("test.list.clear.restore.list.{label}"),
+                        None,
+                        "test list clear restore list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            )
+        };
+        let snapshot_numbers = |actor: &ActorHandle| {
+            let Value::List(list, _) = actor
+                .current_value()
+                .expect("restored direct List/clear actor should expose a current list value")
+            else {
+                panic!("expected list value");
+            };
+            block_on(list.snapshot())
+                .into_iter()
+                .map(|(_, item)| {
+                    let Value::Number(number, _) = item
+                        .current_value()
+                        .expect("restored direct List/clear item should expose a current number")
+                    else {
+                        panic!("expected number value");
+                    };
+                    number.number()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let source_item = make_item_actor("source", 10.0);
+        let refreshed_item = make_item_actor("refreshed", 30.0);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(make_list_value("initial", vec![source_item]));
+
+        let trigger_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        trigger_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.clear.restore.trigger.current",
+                None,
+                "test list clear restore current trigger",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "clear",
+        ));
+
+        let clear_actor = function_list_clear_actor(
+            Arc::new(vec![source_actor.clone(), trigger_actor]),
+            ConstructId::new("test.list.clear.restore"),
+            persistence_id,
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("restored direct List/clear actor should stay on the direct path");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                1,
+                "restored direct List/clear should only retain the list-owned persistence watcher"
+            );
+        });
+
+        assert_eq!(
+            snapshot_numbers(&clear_actor),
+            Vec::<f64>::new(),
+            "saved items should seed the direct list, the first source replace should be skipped, and the current trigger should clear once"
+        );
+
+        source_actor.store_value_directly(make_list_value("updated", vec![refreshed_item]));
+        assert_eq!(snapshot_numbers(&clear_actor), vec![30.0]);
+    }
+
+    #[test]
+    fn list_append_direct_actor_uses_runtime_subscribers_without_wrapper_task_and_resets_on_source_replace()
+     {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let list_actor_context = actor_context.clone();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let make_item_actor = |label: &str, value: f64| {
+            let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+            actor.store_value_directly(Number::new_value(
+                ConstructInfo::new(
+                    format!("test.list.append.direct.item.{label}"),
+                    None,
+                    "test list append direct item",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(List::new(
+                    ConstructInfo::new(
+                        format!("test.list.append.direct.list.{label}"),
+                        None,
+                        "test list append direct list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            )
+        };
+        let snapshot_numbers = |actor: &ActorHandle| {
+            let Value::List(list, _) = actor
+                .current_value()
+                .expect("direct List/append actor should expose a current list value")
+            else {
+                panic!("expected list value");
+            };
+            block_on(list.snapshot())
+                .into_iter()
+                .map(|(_, item)| {
+                    let Value::Number(number, _) = item
+                        .current_value()
+                        .expect("direct List/append item should expose a current number")
+                    else {
+                        panic!("expected number value");
+                    };
+                    number.number()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let old_a = make_item_actor("old_a", 10.0);
+        let old_b = make_item_actor("old_b", 20.0);
+        let new_c = make_item_actor("new_c", 30.0);
+        let appended_current = create_actor_forwarding(PersistenceId::new(), scope_id);
+        appended_current.store_value_directly(Number::new_value(
+            ConstructInfo::new(
+                "test.list.append.direct.appended.current",
+                None,
+                "test list append direct appended current",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            99.0,
+        ));
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(make_list_value(
+            "initial",
+            vec![old_a.clone(), old_b.clone()],
+        ));
+
+        let append_actor = function_list_append_actor(
+            Arc::new(vec![source_actor.clone(), appended_current.clone()]),
+            ConstructId::new("test.list.append.direct"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct List/append actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct List/append should use runtime subscribers instead of wrapper tasks when storage is disabled"
+            );
+        });
+
+        assert_eq!(snapshot_numbers(&append_actor), vec![10.0, 20.0, 99.0]);
+
+        source_actor.store_value_directly(make_list_value("updated", vec![new_c.clone()]));
+        assert_eq!(
+            snapshot_numbers(&append_actor),
+            vec![30.0],
+            "upstream source replace should reset prior appended state until the item actor emits again"
+        );
+
+        appended_current.store_value_directly(Number::new_value(
+            ConstructInfo::new(
+                "test.list.append.direct.appended.fresh",
+                None,
+                "test list append direct appended fresh",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            77.0,
+        ));
+        assert_eq!(snapshot_numbers(&append_actor), vec![30.0, 77.0]);
+    }
+
+    #[test]
+    fn list_append_direct_actor_restores_saved_items_and_skips_initial_source_replace() {
+        let persistence_id = PersistenceId::new();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::from([(
+                    persistence_id.to_string(),
+                    serde_json::json!([1.0, 2.0]),
+                )]),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let actor_context = test_actor_context();
+        let list_actor_context = actor_context.clone();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let make_item_actor = |label: &str, value: f64| {
+            let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+            actor.store_value_directly(Number::new_value(
+                ConstructInfo::new(
+                    format!("test.list.append.restore.item.{label}"),
+                    None,
+                    "test list append restore item",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(List::new(
+                    ConstructInfo::new(
+                        format!("test.list.append.restore.list.{label}"),
+                        None,
+                        "test list append restore list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            )
+        };
+        let snapshot_numbers = |actor: &ActorHandle| {
+            let Value::List(list, _) = actor
+                .current_value()
+                .expect("restored direct List/append actor should expose a current list value")
+            else {
+                panic!("expected list value");
+            };
+            block_on(list.snapshot())
+                .into_iter()
+                .map(|(_, item)| {
+                    let Value::Number(number, _) = item
+                        .current_value()
+                        .expect("restored direct List/append item should expose a current number")
+                    else {
+                        panic!("expected number value");
+                    };
+                    number.number()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let source_item = make_item_actor("source", 10.0);
+        let appended_current = make_item_actor("appended_current", 99.0);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(make_list_value("initial", vec![source_item]));
+
+        let append_actor = function_list_append_actor(
+            Arc::new(vec![source_actor, appended_current.clone()]),
+            ConstructId::new("test.list.append.restore"),
+            persistence_id,
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("restored direct List/append actor should stay on the direct path");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                1,
+                "restored direct List/append should only retain the list-owned persistence watcher"
+            );
+        });
+
+        assert_eq!(
+            snapshot_numbers(&append_actor),
+            vec![1.0, 2.0, 99.0],
+            "saved items should seed the direct list and the first source replace should be skipped"
+        );
+
+        appended_current.store_value_directly(Number::new_value(
+            ConstructInfo::new(
+                "test.list.append.restore.appended_fresh",
+                None,
+                "test list append restore appended fresh",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            77.0,
+        ));
+        assert_eq!(snapshot_numbers(&append_actor), vec![1.0, 2.0, 99.0, 77.0]);
+    }
+
+    #[test]
+    fn list_remove_last_direct_actor_uses_runtime_subscribers_without_wrapper_task_and_replays_current_trigger_once()
+     {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let list_actor_context = actor_context.clone();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let make_item_actor = |label: &str, value: f64| {
+            let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+            actor.store_value_directly(Number::new_value(
+                ConstructInfo::new(
+                    format!("test.list.remove_last.direct.item.{label}"),
+                    None,
+                    "test list remove_last direct item",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(List::new(
+                    ConstructInfo::new(
+                        format!("test.list.remove_last.direct.list.{label}"),
+                        None,
+                        "test list remove_last direct list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            )
+        };
+        let snapshot_numbers = |actor: &ActorHandle| {
+            let Value::List(list, _) = actor
+                .current_value()
+                .expect("direct List/remove_last actor should expose a current list value")
+            else {
+                panic!("expected list value");
+            };
+            block_on(list.snapshot())
+                .into_iter()
+                .map(|(_, item)| {
+                    let Value::Number(number, _) = item
+                        .current_value()
+                        .expect("direct List/remove_last item should expose a current number")
+                    else {
+                        panic!("expected number value");
+                    };
+                    number.number()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let old_a = make_item_actor("old_a", 10.0);
+        let old_b = make_item_actor("old_b", 20.0);
+        let new_c = make_item_actor("new_c", 30.0);
+        let new_d = make_item_actor("new_d", 40.0);
+        let new_e = make_item_actor("new_e", 50.0);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(make_list_value(
+            "initial",
+            vec![old_a.clone(), old_b.clone()],
+        ));
+
+        let trigger_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        trigger_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.remove_last.direct.trigger.current",
+                None,
+                "test list remove_last direct current trigger",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "pop",
+        ));
+
+        let remove_last_actor = function_list_remove_last_actor(
+            Arc::new(vec![source_actor.clone(), trigger_actor.clone()]),
+            ConstructId::new("test.list.remove_last.direct"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct List/remove_last actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct List/remove_last should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        assert_eq!(snapshot_numbers(&remove_last_actor), vec![10.0]);
+
+        source_actor.store_value_directly(make_list_value(
+            "updated",
+            vec![new_c.clone(), new_d.clone(), new_e.clone()],
+        ));
+        assert_eq!(snapshot_numbers(&remove_last_actor), vec![30.0, 40.0, 50.0]);
+
+        trigger_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.remove_last.direct.trigger.fresh",
+                None,
+                "test list remove_last direct fresh trigger",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            "pop-again",
+        ));
+        assert_eq!(snapshot_numbers(&remove_last_actor), vec![30.0, 40.0]);
+    }
+
+    #[test]
+    fn list_remove_last_direct_actor_restores_saved_items_and_skips_initial_source_replace() {
+        let persistence_id = PersistenceId::new();
+        let construct_context = ConstructContext {
+            construct_storage: Arc::new(ConstructStorage::in_memory_for_tests(
+                std::collections::BTreeMap::from([(
+                    persistence_id.to_string(),
+                    serde_json::json!([1.0, 2.0, 3.0]),
+                )]),
+            )),
+            virtual_fs: VirtualFilesystem::new(),
+            bridge_scope_id: None,
+            scene_ctx: None,
+        };
+        let actor_context = test_actor_context();
+        let list_actor_context = actor_context.clone();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let make_item_actor = |label: &str, value: f64| {
+            let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+            actor.store_value_directly(Number::new_value(
+                ConstructInfo::new(
+                    format!("test.list.remove_last.restore.item.{label}"),
+                    None,
+                    "test list remove_last restore item",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(List::new(
+                    ConstructInfo::new(
+                        format!("test.list.remove_last.restore.list.{label}"),
+                        None,
+                        "test list remove_last restore list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            )
+        };
+        let snapshot_numbers = |actor: &ActorHandle| {
+            let Value::List(list, _) = actor.current_value().expect(
+                "restored direct List/remove_last actor should expose a current list value",
+            ) else {
+                panic!("expected list value");
+            };
+            block_on(list.snapshot())
+                .into_iter()
+                .map(|(_, item)| {
+                    let Value::Number(number, _) = item.current_value().expect(
+                        "restored direct List/remove_last item should expose a current number",
+                    ) else {
+                        panic!("expected number value");
+                    };
+                    number.number()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let source_item = make_item_actor("source", 10.0);
+        let refreshed_c = make_item_actor("refreshed_c", 30.0);
+        let refreshed_d = make_item_actor("refreshed_d", 40.0);
+        let refreshed_e = make_item_actor("refreshed_e", 50.0);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(make_list_value("initial", vec![source_item]));
+
+        let trigger_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        trigger_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.remove_last.restore.trigger.current",
+                None,
+                "test list remove_last restore current trigger",
+            ),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "pop",
+        ));
+
+        let remove_last_actor = function_list_remove_last_actor(
+            Arc::new(vec![source_actor.clone(), trigger_actor.clone()]),
+            ConstructId::new("test.list.remove_last.restore"),
+            persistence_id,
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("restored direct List/remove_last actor should stay on the direct path");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                1,
+                "restored direct List/remove_last should only retain the list-owned persistence watcher"
+            );
+        });
+
+        assert_eq!(
+            snapshot_numbers(&remove_last_actor),
+            vec![1.0, 2.0],
+            "saved items should seed the direct list, the first source replace should be skipped, and the current trigger should remove one restored item"
+        );
+
+        source_actor.store_value_directly(make_list_value(
+            "updated",
+            vec![
+                refreshed_c.clone(),
+                refreshed_d.clone(),
+                refreshed_e.clone(),
+            ],
+        ));
+        assert_eq!(snapshot_numbers(&remove_last_actor), vec![30.0, 40.0, 50.0]);
+
+        trigger_actor.store_value_directly(Text::new_value(
+            ConstructInfo::new(
+                "test.list.remove_last.restore.trigger.fresh",
+                None,
+                "test list remove_last restore fresh trigger",
+            ),
+            construct_context,
+            ValueIdempotencyKey::new(),
+            "pop-again",
+        ));
+        assert_eq!(snapshot_numbers(&remove_last_actor), vec![30.0, 40.0]);
+    }
+
+    #[test]
+    fn list_sum_direct_actor_uses_runtime_subscribers_without_wrapper_task_and_ignores_stale_old_item_updates()
+     {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let list_actor_context = actor_context.clone();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let make_item_actor = |label: &str, value: f64| {
+            let actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+            actor.store_value_directly(Number::new_value(
+                ConstructInfo::new(
+                    format!("test.list.sum.direct.item.{label}"),
+                    None,
+                    "test list sum direct item",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                value,
+            ));
+            actor
+        };
+        let make_list_value = |label: &str, items: Vec<ActorHandle>| {
+            Value::List(
+                Arc::new(List::new(
+                    ConstructInfo::new(
+                        format!("test.list.sum.direct.list.{label}"),
+                        None,
+                        "test list sum direct list",
+                    ),
+                    construct_context.clone(),
+                    list_actor_context.clone(),
+                    items,
+                )),
+                ValueMetadata::new(ValueIdempotencyKey::new()),
+            )
+        };
+        let expect_current_number = |actor: &ActorHandle| -> f64 {
+            let Value::Number(number, _) = actor
+                .current_value()
+                .expect("direct List/sum actor should expose the current number")
+            else {
+                panic!("expected number value");
+            };
+            number.number()
+        };
+
+        let old_a = make_item_actor("old_a", 10.0);
+        let old_b = make_item_actor("old_b", 20.0);
+        let new_c = make_item_actor("new_c", 30.0);
+        let new_d = make_item_actor("new_d", 40.0);
+
+        let source_actor = create_actor_forwarding(PersistenceId::new(), scope_id);
+        source_actor.store_value_directly(make_list_value(
+            "initial",
+            vec![old_a.clone(), old_b.clone()],
+        ));
+
+        let sum_actor = function_list_sum_actor(
+            Arc::new(vec![source_actor.clone()]),
+            ConstructId::new("test.list.sum.direct"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct List/sum actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct List/sum should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        assert_eq!(expect_current_number(&sum_actor), 30.0);
+
+        old_b.store_value_directly(number_value(25.0, construct_context.clone()));
+        assert_eq!(expect_current_number(&sum_actor), 35.0);
+
+        source_actor.store_value_directly(make_list_value(
+            "updated",
+            vec![new_c.clone(), new_d.clone()],
+        ));
+        assert_eq!(expect_current_number(&sum_actor), 70.0);
+
+        old_b.store_value_directly(number_value(99.0, construct_context.clone()));
+        assert_eq!(expect_current_number(&sum_actor), 70.0);
+
+        new_d.store_value_directly(number_value(45.0, construct_context));
+        assert_eq!(expect_current_number(&sum_actor), 75.0);
+    }
+
+    #[test]
+    fn list_product_direct_actor_waits_for_all_items_before_emitting_without_wrapper_task() {
+        let construct_context = test_construct_context();
+        let actor_context = test_actor_context();
+        let scope_id = actor_context.scope_id();
+        let _scope_guard = ScopeDestroyGuard::new(scope_id);
+
+        let first_item = create_constant_actor(
+            PersistenceId::new(),
+            number_value(2.0, construct_context.clone()),
+            scope_id,
+        );
+        let second_item = create_actor_forwarding(PersistenceId::new(), scope_id);
+
+        let list_value = List::new_value(
+            ConstructInfo::new("test.list.product.direct", None, "test list product direct"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            actor_context.clone(),
+            vec![first_item, second_item.clone()],
+        );
+        let list_actor = create_constant_actor(PersistenceId::new(), list_value, scope_id);
+
+        let product_actor = function_list_product_actor(
+            Arc::new(vec![list_actor]),
+            ConstructId::new("test.function.list_product.direct"),
+            PersistenceId::new(),
+            construct_context.clone(),
+            actor_context,
+        )
+        .expect("direct List/product actor should be available for direct-state inputs");
+
+        REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            assert_eq!(
+                reg.async_source_count_for_scope(scope_id),
+                0,
+                "direct List/product should use runtime subscribers instead of wrapper tasks"
+            );
+        });
+
+        assert!(
+            matches!(
+                product_actor.current_value(),
+                Err(CurrentValueError::NoValueYet)
+            ),
+            "direct List/product should wait until all items expose a first value"
+        );
+
+        second_item.store_value_directly(number_value(3.0, construct_context));
+
+        let Value::Number(number, _) = product_actor
+            .current_value()
+            .expect("direct List/product should emit once all items are initialized")
+        else {
+            panic!("expected number value");
+        };
+        assert_eq!(number.number(), 6.0);
     }
 
     #[test]

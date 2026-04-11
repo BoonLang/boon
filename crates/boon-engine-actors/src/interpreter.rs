@@ -13,8 +13,8 @@ const LOG_SOURCE_AND_AST: bool = false;
 
 use crate::{
     engine::{
-        ConstructContext, LinkConnector, Object, PassThroughConnector, ReferenceConnector,
-        ScopeDestroyGuard, VirtualFilesystem,
+        ConstructContext, LinkConnector, Object, ReferenceConnector, ScopeDestroyGuard,
+        VirtualFilesystem,
     },
     evaluator::{FunctionRegistry, ModuleLoader, evaluate_with_registry},
 };
@@ -41,7 +41,6 @@ pub fn run(
     ConstructContext,
     Arc<ReferenceConnector>,
     Arc<LinkConnector>,
-    Arc<PassThroughConnector>,
     ScopeDestroyGuard,
 )> {
     let states_local_storage_key = states_local_storage_key.into();
@@ -169,14 +168,12 @@ pub fn run(
             _module_loader,
             reference_connector,
             link_connector,
-            pass_through_connector,
             root_scope_guard,
         )) => Some((
             root_object,
             construct_context,
             reference_connector,
             link_connector,
-            pass_through_connector,
             root_scope_guard,
         )),
         Err(error) => {
@@ -233,7 +230,6 @@ pub fn run_with_registry(
     ModuleLoader,
     Arc<ReferenceConnector>,
     Arc<LinkConnector>,
-    Arc<PassThroughConnector>,
     ScopeDestroyGuard,
 )> {
     let states_local_storage_key = states_local_storage_key.into();
@@ -351,7 +347,6 @@ pub fn run_with_registry(
             module_loader,
             reference_connector,
             link_connector,
-            pass_through_connector,
             root_scope_guard,
         )) => Some((
             root_object,
@@ -360,7 +355,6 @@ pub fn run_with_registry(
             module_loader,
             reference_connector,
             link_connector,
-            pass_through_connector,
             root_scope_guard,
         )),
         Err(error) => {
